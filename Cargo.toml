@@ -3,4 +3,23 @@ name = "parrot"
 version = "0.1.0"
 edition = "2024"
 
+# Main library dependencies
 [dependencies]
+parrot-api = { path = "./parrot-api" }
+
+# Specific dependencies for example code
+[[example]]
+name = "hello"
+path = "examples/hello.rs"
+
+[[example]]
+name = "framework"
+path = "examples/framework.rs"
+
+[[example]]
+name = "strategy"
+path = "examples/strategy/simple.rs"
+
+# example needs specific dependencies, you can add them like this
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }  # example
