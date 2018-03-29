@@ -1,0 +1,15 @@
+[package]
+name = "parrot-api"
+version = "0.1.0"
+edition = "2021"
+description = "An abstract Actor programming model interface layer"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2.0.11"
+futures = "0.3"
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
+anyhow = "1.0" 
