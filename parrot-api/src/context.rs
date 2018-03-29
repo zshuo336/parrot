@@ -1,13 +1,14 @@
 use std::time::Duration;
 use std::any::Any;
+use std::sync::Arc;
+use std::hash::Hash;
 use async_trait::async_trait;
-use crate::actor::{Actor};
+use crate::actor::Actor;
 use crate::errors::ActorError;
 use crate::address::{ActorPath, ActorRef};
 use crate::message::{Message, MessageEnvelope};
 use crate::supervisor::SupervisorStrategyType;
-use std::sync::Arc;
-use std::hash::Hash;
+use crate::stream::StreamRegistry;
 
 /// Actor spawning trait for specific actor types
 #[async_trait]
@@ -72,6 +73,9 @@ pub trait ActorContext: Send {
     
     /// Get Actor path
     fn path(&self) -> &ActorPath;
+
+    /// Get stream registry
+    fn stream_registry(&mut self) -> &mut dyn StreamRegistry;
 }
 
 /// Actor context extension trait for message handling
