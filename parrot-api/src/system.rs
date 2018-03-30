@@ -7,6 +7,7 @@ use crate::address::{ActorPath, ActorRef};
 use crate::runtime::RuntimeConfig;
 use crate::message::Message;
 use crate::supervisor::SupervisorStrategyType;
+use crate::context::ActorContext;
 
 /// System error type
 #[derive(thiserror::Error, Debug)]
@@ -74,7 +75,7 @@ pub trait ActorSystem: Send + Sync + 'static {
     /// Create a top-level actor from boxed components
     async fn spawn_root_boxed(
         &self,
-        actor: Box<dyn Actor<Config = Box<dyn Any + Send>>>,
+        actor: Box<dyn Actor<Config = Box<dyn Any + Send>, Context = dyn ActorContext>>,
         config: Box<dyn Any + Send>,
     ) -> Result<Box<dyn ActorRef>, SystemError>;
     
