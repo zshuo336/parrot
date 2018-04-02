@@ -1,4 +1,8 @@
 Cargo.lock
 target/
 gitcmd.sh
-.DS_Store
+# .DS_Store
+.d*
+.D*
+.C*
+.c*
