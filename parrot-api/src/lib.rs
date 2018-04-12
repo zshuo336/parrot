@@ -76,4 +76,7 @@ pub use context::ActorContext;
 pub use message::{Message, MessageEnvelope, MessageOptions, MessagePriority};
 pub use supervisor::{SupervisionDecision, SupervisorStrategy};
 pub use system::{ActorSystem, ActorSystemConfig, SystemError}; 
-pub use stream::{StreamHandler, StreamRegistry, StreamRegistryExt, ActorStreamHandler}; 
+pub use stream::{StreamHandler, StreamRegistry, StreamRegistryExt, ActorStreamHandler};
+
+// Re-export the derive macro
+pub use parrot_api_derive::Message; 

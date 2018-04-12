@@ -63,7 +63,7 @@ pub type BoxedMessage = Box<dyn Any + Send>;
 
 /// Result type for actor operations.
 ///
-/// This type combines a generic success type with the actor system's error type.
+/// This type combines a generic success type with the actor system's error type.q
 /// Used throughout the system for operations that can fail, providing
 /// consistent error handling.
 ///

@@ -1,0 +1,12 @@
+[package]
+name = "parrot-api-derive-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dev-dependencies]
+parrot-api = { path = "../parrot-api" }
+parrot-api-derive = { path = "../parrot-api-derive" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true } 

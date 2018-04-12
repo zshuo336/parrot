@@ -1,25 +1,18 @@
-[package]
-name = "parrot"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "parrot",
+    "parrot-api",
+    "parrot-api-derive",
+    "parrot-api-derive-tests"
+]
 
-# Main library dependencies
-[dependencies]
-parrot-api = { path = "./parrot-api" }
-
-# Specific dependencies for example code
-[[example]]
-name = "hello"
-path = "examples/hello.rs"
-
-[[example]]
-name = "framework"
-path = "examples/framework.rs"
-
-[[example]]
-name = "strategy"
-path = "examples/strategy/simple.rs"
-
-# example needs specific dependencies, you can add them like this
-[dev-dependencies]
-tokio = { version = "1.0", features = ["full"] }  # example
+[workspace.dependencies]
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+darling = "0.20"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2.0"
