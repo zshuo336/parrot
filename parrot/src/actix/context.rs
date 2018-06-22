@@ -1,183 +1,228 @@
 use std::time::Duration;
-use actix::{Actor as ActixActor, Context as ActixContext, SpawnHandle, Handler, AsyncContext, dev::ActorFuture};
-use async_trait::async_trait;
-use std::any::Any;
+use std::sync::Arc;
+
+use actix::{Context as ActixContextInner, Actor as ActixActor, Addr};
 use parrot_api::{
-    context::{ActorContext, ActorSpawner},
+    context::{ActorContext, ActorSpawner, StreamRegistry},
     address::{ActorPath, ActorRef},
-    types::{BoxedMessage, BoxedFuture, ActorResult, BoxedActorRef},
-    supervisor::{SupervisorStrategyType, DefaultStrategy},
-    stream::StreamRegistry,
+    types::{BoxedActorRef, BoxedMessage, ActorResult, BoxedFuture},
     errors::ActorError,
     actor::Actor,
-    message::MessageEnvelope,
+    supervisor::SupervisorStrategyType,
 };
-use super::actor::ContextConverter;
-use super::message::{ActixMessageWrapper, wrap_message};
+use crate::actix::{ActorBase, ActixActorRef, message::ActixMessageWrapper};
 
-// Wrapper around actix Context to implement ActorContext trait
-pub struct ActixActorContext<A>
-where
-    A: ActixActor<Context = ActixContext<A>> + Actor + Send + Sync + 'static,
-{
-    inner: ActixContext<A>,
+/// ActixContext is the implementation of ActorContext for the Actix backend.
+pub struct ActixContext<'a, A: ActixActor> {
+    ctx: &'a mut ActixContextInner<ActorBase<A>>,
     path: ActorPath,
-    parent: Option<BoxedActorRef>,
     children: Vec<BoxedActorRef>,
     receive_timeout: Option<Duration>,
     supervisor_strategy: SupervisorStrategyType,
-    stream_registry: Box<dyn StreamRegistry + Send + Sync>,
 }
 
-impl<A> ActixActorContext<A>
-where
-    A: ActixActor<Context = ActixContext<A>> + Actor + Send + Sync + 'static,
-{
-    pub fn new(
-        inner: ActixContext<A>,
-        path: ActorPath,
-        parent: Option<BoxedActorRef>,
-        stream_registry: Box<dyn StreamRegistry + Send + Sync>,
-    ) -> Self {
+impl<'a, A: ActixActor> ActixContext<'a, A> {
+    pub fn new(ctx: &'a mut ActixContextInner<ActorBase<A>>) -> Self {
+        let addr = ctx.address();
+        let path = ActorPath {
+            path: format!("/user/{}", addr.id()),
+            target: Arc::new(()),
+        };
+        
         Self {
-            inner,
+            ctx,
             path,
-            parent,
             children: Vec::new(),
             receive_timeout: None,
-            supervisor_strategy: SupervisorStrategyType::Default(DefaultStrategy::StopOnFailure),
-            stream_registry,
+            supervisor_strategy: SupervisorStrategyType::OneForOne,
         }
     }
-
-    // 内部方法，创建消息封装
-    fn create_envelope(&self, msg: BoxedMessage) -> MessageEnvelope {
-        MessageEnvelope::new(msg, Some(self.get_self_ref()), None)
-    }
 }
 
-impl<A> ContextConverter<A> for ActixActorContext<A>
-where
-    A: ActixActor<Context = ActixContext<A>> + Actor + Send + Sync + 'static,
-{
-    type ActixActor = A;
-    
-    fn to_actix_context(ctx: &mut dyn ActorContext) -> &mut ActixContext<Self::ActixActor> {
-        let ctx = unsafe {
-            &mut *(ctx as *mut dyn ActorContext as *mut ActixActorContext<A>)
-        };
-        &mut ctx.inner
-    }
-
-    fn from_actix_context(ctx: &mut ActixContext<Self::ActixActor>) -> &mut dyn ActorContext {
-        unimplemented!()
-    }
-}
-
-#[async_trait]
-impl<A> ActorContext for ActixActorContext<A>
-where
-    A: ActixActor<Context = ActixContext<A>> + Actor + Send + Sync + 'static,
-    Box<dyn ActorFuture<A, Output = ()>>: Send + Sync,
-{
+impl<'a, A: ActixActor> ActorContext for ActixContext<'a, A> {
     fn get_self_ref(&self) -> BoxedActorRef {
-        // Create and return a BoxedActorRef for this actor
-        unimplemented!()
+        let addr = self.ctx.address();
+        Box::new(ActixActorRef::new(addr))
     }
 
-    fn stop<'a>(&'a mut self) -> BoxedFuture<'a, ActorResult<()>> {
+    fn stop<'b>(&'b mut self) -> BoxedFuture<'b, ActorResult<()>> {
         Box::pin(async move {
-            self.inner.stop();
+            self.ctx.stop();
             Ok(())
         })
     }
 
-    fn send<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn send<'b>(&'b self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'b, ActorResult<()>> {
         Box::pin(async move {
-            // 在内部创建消息封装
-            let envelope = self.create_envelope(msg);
-            
-            // 发送消息并等待响应
-            target.send(Box::new(envelope) as BoxedMessage).await
+            if let Some(target_ref) = target.as_any().downcast_ref::<ActixActorRef<A>>() {
+                // Create message envelope
+                let envelope = parrot_api::message::MessageEnvelope::new_generic(msg, None, None);
+                
+                // Convert to ActixMessageWrapper
+                let wrapper = ActixMessageWrapper { envelope };
+                
+                // Send message to actor
+                let _ = target_ref.addr.do_send(wrapper);
+                Ok(())
+            } else {
+                Err(ActorError::MessageDeliveryFailure("Invalid actor reference type".to_string()))
+            }
         })
     }
 
-    fn ask<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn ask<'b>(&'b self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'b, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            target.send(Box::new(MessageEnvelope::new(msg, None, None)) as BoxedMessage).await
+            if let Some(target_ref) = target.as_any().downcast_ref::<ActixActorRef<A>>() {
+                // Create message envelope
+                let envelope = parrot_api::message::MessageEnvelope::new_generic(msg, None, None);
+                
+                // Convert to ActixMessageWrapper
+                let wrapper = ActixMessageWrapper { envelope };
+                
+                // Send message to actor and await response
+                let result = target_ref.addr.send(wrapper).await
+                    .map_err(|e| ActorError::MessageDeliveryFailure(e.to_string()))?;
+                    
+                result
+            } else {
+                Err(ActorError::MessageDeliveryFailure("Invalid actor reference type".to_string()))
+            }
         })
     }
 
-    fn schedule_once<'a>(
-        &'a self,
-        target: BoxedActorRef,
-        msg: BoxedMessage,
-        delay: Duration,
-    ) -> BoxedFuture<'a, ActorResult<()>> {
+    fn schedule_once<'b>(&'b self, target: BoxedActorRef, msg: BoxedMessage, delay: Duration) -> BoxedFuture<'b, ActorResult<()>> {
         Box::pin(async move {
-            // Schedule message using actix Context::notify_later
-            Ok(())
+            if let Some(target_ref) = target.as_any().downcast_ref::<ActixActorRef<A>>() {
+                // Create message envelope
+                let envelope = parrot_api::message::MessageEnvelope::new_generic(msg, None, None);
+                
+                // Convert to ActixMessageWrapper
+                let wrapper = ActixMessageWrapper { envelope };
+                
+                // Schedule message
+                let _ = target_ref.addr.send_later(wrapper, delay);
+                Ok(())
+            } else {
+                Err(ActorError::MessageDeliveryFailure("Invalid actor reference type".to_string()))
+            }
         })
     }
 
-    fn schedule_periodic<'a>(
-        &'a self,
-        target: BoxedActorRef,
-        msg: BoxedMessage,
-        initial_delay: Duration,
-        interval: Duration,
-    ) -> BoxedFuture<'a, ActorResult<()>> {
+    fn schedule_periodic<'b>(&'b self, target: BoxedActorRef, msg: BoxedMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'b, ActorResult<()>> {
         Box::pin(async move {
-            // Schedule periodic message using actix Context::notify_interval
-            Ok(())
+            if let Some(target_ref) = target.as_any().downcast_ref::<ActixActorRef<A>>() {
+                // Create message envelope
+                let envelope = parrot_api::message::MessageEnvelope::new_generic(msg.clone(), None, None);
+                
+                // Convert to ActixMessageWrapper
+                let wrapper = ActixMessageWrapper { envelope };
+                
+                // Schedule initial message
+                let _ = target_ref.addr.send_later(wrapper, initial_delay);
+                
+                // Set up periodic messages
+                let addr = target_ref.addr.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(initial_delay).await;
+                    
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        
+                        // Create new envelope for each message
+                        let envelope = parrot_api::message::MessageEnvelope::new_generic(msg.clone(), None, None);
+                        let wrapper = ActixMessageWrapper { envelope };
+                        
+                        // Send message
+                        if addr.send(wrapper).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                
+                Ok(())
+            } else {
+                Err(ActorError::MessageDeliveryFailure("Invalid actor reference type".to_string()))
+            }
         })
     }
 
-    fn watch<'a>(&'a mut self, target: BoxedActorRef) -> BoxedFuture<'a, ActorResult<()>> {
+    fn watch<'b>(&'b mut self, target: BoxedActorRef) -> BoxedFuture<'b, ActorResult<()>> {
         Box::pin(async move {
-            // Implement actor watching using actix Context::watch
-            Ok(())
+            if let Some(target_ref) = target.as_any().downcast_ref::<ActixActorRef<A>>() {
+                // Watch the actor address
+                self.ctx.watch(target_ref.addr.clone().recipient());
+                Ok(())
+            } else {
+                Err(ActorError::MessageDeliveryFailure("Invalid actor reference type".to_string()))
+            }
         })
     }
 
-    fn unwatch<'a>(&'a mut self, target: BoxedActorRef) -> BoxedFuture<'a, ActorResult<()>> {
+    fn unwatch<'b>(&'b mut self, target: BoxedActorRef) -> BoxedFuture<'b, ActorResult<()>> {
         Box::pin(async move {
-            // Implement actor unwatching
-            Ok(())
+            if let Some(target_ref) = target.as_any().downcast_ref::<ActixActorRef<A>>() {
+                // Unwatch the actor address
+                self.ctx.unwatch(target_ref.addr.clone().recipient());
+                Ok(())
+            } else {
+                Err(ActorError::MessageDeliveryFailure("Invalid actor reference type".to_string()))
+            }
         })
     }
 
     fn parent(&self) -> Option<BoxedActorRef> {
-        self.parent.clone()
+        None // Actix doesn't have a built-in parent-child relationship
     }
-
+    
     fn children(&self) -> Vec<BoxedActorRef> {
         self.children.clone()
     }
-
+    
     fn set_receive_timeout(&mut self, timeout: Option<Duration>) {
         self.receive_timeout = timeout;
+        if let Some(duration) = timeout {
+            self.ctx.run_later(duration, |_, _| {
+                // Handle timeout
+            });
+        }
     }
-
+    
     fn receive_timeout(&self) -> Option<Duration> {
         self.receive_timeout
     }
-
+    
     fn set_supervisor_strategy(&mut self, strategy: SupervisorStrategyType) {
         self.supervisor_strategy = strategy;
     }
-
+    
     fn path(&self) -> &ActorPath {
         &self.path
     }
 
     fn stream_registry(&mut self) -> &mut dyn StreamRegistry {
-        self.stream_registry.as_mut()
+        // Not implemented yet
+        unimplemented!("Stream registry not implemented for ActixContext")
     }
 
     fn spawner(&mut self) -> &mut dyn ActorSpawner {
-        // Return the actor spawner implementation
-        unimplemented!()
+        // Not implemented yet
+        unimplemented!("Actor spawner not implemented for ActixContext")
     }
+}
 
+// Implementation of ActorSpawner for ActixContext
+impl<'a, A: ActixActor> ActorSpawner for ActixContext<'a, A> {
+    fn spawn<'b>(&'b self, actor: BoxedMessage, config: BoxedMessage) -> BoxedFuture<'b, ActorResult<BoxedActorRef>> {
+        Box::pin(async move {
+            // Not implemented yet
+            Err(ActorError::NotImplemented("Actor spawning not implemented for ActixContext".to_string()))
+        })
+    }
+    
+    fn spawn_with_strategy<'b>(&'b self, actor: BoxedMessage, config: BoxedMessage, strategy: SupervisorStrategyType) -> BoxedFuture<'b, ActorResult<BoxedActorRef>> {
+        Box::pin(async move {
+            // Not implemented yet
+            Err(ActorError::NotImplemented("Actor spawning with strategy not implemented for ActixContext".to_string()))
+        })
+    }
 } 

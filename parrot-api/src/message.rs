@@ -286,6 +286,41 @@ pub trait Message: Send + 'static {
 
 }
 
+/// Trait combining Any and Message functionalities, but making it object safe
+/// by erasing the associated types with runtime type checks.
+pub trait AnyMessage: Any + Send {
+    /// Get message type for runtime type information
+    fn message_type(&self) -> &'static str;
+    
+    /// Message validation
+    fn validate(&self) -> Result<(), crate::errors::ActorError>;
+    
+    /// Message priority
+    fn priority(&self) -> crate::message::MessagePriority;
+    
+    /// Message options
+    fn message_options(&self) -> Option<crate::message::MessageOptions>;
+}
+
+/// Implement AnyMessage for any type that implements Message
+impl<T: Any + Message + Send> AnyMessage for T {
+    fn message_type(&self) -> &'static str {
+        <T as Message>::message_type(self)
+    }
+    
+    fn validate(&self) -> Result<(), crate::errors::ActorError> {
+        <T as Message>::validate(self)
+    }
+    
+    fn priority(&self) -> crate::message::MessagePriority {
+        <T as Message>::priority(self)
+    }
+    
+    fn message_options(&self) -> Option<crate::message::MessageOptions> {
+        <T as Message>::message_options(self)
+    }
+}
+
 /// Message options for controlling delivery and processing
 #[derive(Debug)]
 pub struct MessageOptions {

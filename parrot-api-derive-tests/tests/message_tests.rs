@@ -2,6 +2,7 @@ use parrot_api::{Message, MessagePriority};
 use parrot_api::{HIGH, LOW, NORMAL, CRITICAL, BACKGROUND};
 use parrot_api::message::BackoffStrategy;
 use serde::{Serialize, Deserialize};
+use parrot_api_derive::Message;
 
 // Test basic message without any attributes
 #[derive(Message, Debug, PartialEq, Clone)]

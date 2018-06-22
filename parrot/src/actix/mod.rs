@@ -3,13 +3,19 @@
 mod actor;
 mod address;
 mod context;
-mod system;
 mod runtime;
+mod system;
 mod message;
 
-pub use actor::*;
-pub use address::*;
-pub use context::*;
-pub use system::*;
-pub use runtime::*;
-pub use message::*; 
+// Export public API
+pub use actor::{ActorBase, IntoActorBase};
+pub use context::ActixContext;
+pub use system::ActixActorSystem;
+pub use message::{
+    ActixMessageWrapper, 
+    MessageConverter,
+    ActixMessageHandler,
+    MessageEnvelopeExt
+};
+pub use address::ActixActorRef;
+pub use runtime::ActixRuntime; 

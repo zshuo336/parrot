@@ -12,6 +12,7 @@ use super::message::{ActixMessageWrapper, wrap_message, ActixMessageHandler};
 use super::actor::StopMessage;
 use std::any::Any;
 use uuid;
+use std::marker::PhantomData;
 
 /// # ActixActorRef
 ///
@@ -30,7 +31,7 @@ where
     A: ActixActor + Handler<super::actor::StopMessage>
 {
     /// The underlying Actix actor address
-    addr: Addr<A>,
+    pub addr: Addr<A>,
     /// The actor's path in the system hierarchy
     path: String,
 }
@@ -44,7 +45,8 @@ impl<A: ActixActor> ActixActorRef<A> {
     ///
     /// ## Returns
     /// A new ActixActorRef instance
-    pub fn new(addr: Addr<A>, path: String) -> Self {
+    pub fn new(addr: Addr<A>) -> Self {
+        let path = ActorPath::new(&format!("/user/{}", addr.id()));
         Self { addr, path }
     }
 

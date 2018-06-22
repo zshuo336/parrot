@@ -1,27 +1,39 @@
 use std::any::Any;
-use actix::{Actor as ActixActor, Context as ActixContext, Handler, Message as ActixMessage};
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+use actix::{Actor as ActixActorTrait, Context as ActixContextInner, Handler, Message as ActixMessage, ResponseFuture, Supervised};
 use async_trait::async_trait;
 use parrot_api::{
-    actor::{Actor as ParrotActor, ActorConfig, ActorState},
-    context::ActorContext as ParrotActorContext,
+    actor::{Actor, ActorConfig, ActorState},
     errors::ActorError,
     types::{BoxedMessage, BoxedFuture, ActorResult},
     message::{Message, MessageEnvelope},
 };
-use crate::actix::message::{ActixMessageWrapper, ActixMessageHandler};
+use crate::actix::context::ActixContext;
+use crate::actix::message::{MessageConverter, ActixMessageHandler, ActixMessageWrapper};
 
-// Wrapper around actix Actor to implement ParrotActor trait
-pub struct ActixActorWrapper<A>
+/// Marker trait for types that can be converted into ActorBase
+pub trait IntoActorBase: Actor {
+    fn into_actor_base(self) -> ActorBase<Self>;
+}
+
+/// Actix-based actor implementation
+/// 
+/// This is the main actor type that users will interact with.
+/// It wraps a user-defined actor type and handles the conversion
+/// between Parrot message types and Actix message types.
+pub struct ActorBase<A>
 where
-    A: ActixActor,
+    A: Actor<Context = ActixContext>,
 {
     inner: A,
     state: ActorState,
 }
 
-impl<A> ActixActorWrapper<A>
+impl<A> ActorBase<A>
 where
-    A: ActixActor,
+    A: Actor<Context = ActixContext>,
 {
     pub fn new(actor: A) -> Self {
         Self {
@@ -31,23 +43,7 @@ where
     }
 }
 
-// Implement actix Actor trait for ActixActorWrapper
-impl<A> ActixActor for ActixActorWrapper<A>
-where
-    A: ActixActor,
-{
-    type Context = ActixContext<Self>;
-
-    fn started(&mut self, _ctx: &mut Self::Context) {
-        self.state = ActorState::Running;
-    }
-
-    fn stopped(&mut self, _ctx: &mut Self::Context) {
-        self.state = ActorState::Stopped;
-    }
-}
-
-// Configuration for ActixActorWrapper
+/// Configuration for ActixActor
 #[derive(Default)]
 pub struct ActixActorConfig {
     // Add any actix-specific configuration here
@@ -55,106 +51,138 @@ pub struct ActixActorConfig {
 
 impl ActorConfig for ActixActorConfig {}
 
-// Implement ParrotActor for ActixActorWrapper
-#[async_trait]
-impl<A> ParrotActor for ActixActorWrapper<A>
+/// Implementation of actix Actor trait for ActorBase
+impl<A> ActixActorTrait for ActorBase<A>
 where
-    A: ActixActor + Send + 'static,
+    A: Actor<Context = ActixContext> + 'static,
 {
-    type Config = ActixActorConfig;
-    type Context = dyn ParrotActorContext;
+    type Context = ActixContextInner<Self>;
 
-    fn init<'a>(&'a mut self, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
-            self.state = ActorState::Running;
-            Ok(())
-        })
+    fn started(&mut self, ctx: &mut Self::Context) {
+        self.state = ActorState::Running;
+        
+        // Create ActixContext to pass to the inner actor
+        let mut actor_ctx = ActixContext::new(ctx);
+        
+        // Initialize the inner actor
+        let future = self.inner.init(&mut actor_ctx);
+        ctx.wait(future.map(|_| ()));
     }
 
-    fn receive_message<'a>(
-        &'a mut self,
-        msg: BoxedMessage,
-        ctx: &'a mut Self::Context,
-    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async move {
-            // Convert BoxedMessage to concrete message type
-            // Handle the message using actix's Handler trait
-            // Return the result as BoxedMessage
-            Err(ActorError::MessageHandlingError(
-                "Message handling not implemented".to_string(),
-            ))
-        })
+    fn stopping(&mut self, _ctx: &mut Self::Context) -> actix::Running {
+        self.state = ActorState::Stopping;
+        actix::Running::Stop
     }
 
-    fn state(&self) -> ActorState {
-        self.state
+    fn stopped(&mut self, _ctx: &mut Self::Context) {
+        self.state = ActorState::Stopped;
     }
 }
 
-pub trait MessageConverter<M: Message> {
-    type ActixMessage: ActixMessage<Result = M::Result>;
-    fn to_actix(msg: M) -> Self::ActixMessage;
-    fn from_actix(msg: Self::ActixMessage) -> M;
-}
-
-pub trait ContextConverter<A: ParrotActor> {
-    type ActixActor: ActixActor<Context = ActixContext<Self::ActixActor>>;
-    fn to_actix_context(ctx: &mut dyn ParrotActorContext) -> &mut ActixContext<Self::ActixActor>;
-    fn from_actix_context(ctx: &mut ActixContext<Self::ActixActor>) -> &mut dyn ParrotActorContext;
-} 
-
-// Implement default supervision strategy
-impl<A> actix::Supervised for ActixActorWrapper<A>
+/// Implementation of supervision strategy for ActorBase
+impl<A> Supervised for ActorBase<A>
 where
-    A: ActixActor,
+    A: Actor<Context = ActixContext> + 'static,
 {
-    fn restarting(&mut self, _ctx: &mut ActixContext<Self>) {
+    fn restarting(&mut self, ctx: &mut ActixContextInner<Self>) {
         self.state = ActorState::Starting;
+        // Reset the actor state and prepare for restart
+        let mut actor_ctx = ActixContext::new(ctx);
+        let _ = self.inner.init(&mut actor_ctx);
     }
 }
 
-// Implement ActixMessageHandler for ActixActorWrapper
-impl<A> ActixMessageHandler for ActixActorWrapper<A>
+/// Message handler for ActorBase
+/// Processes generic MessageEnvelope and forwards to the inner actor
+impl<A> Handler<ActixMessageWrapper> for ActorBase<A>
 where
-    A: ActixActor + Send + 'static,
+    A: Actor<Context = ActixContext> + 'static,
 {
-    fn handle_parrot_message(&mut self, msg: MessageEnvelope) -> ActorResult<BoxedMessage> {
-        // Default implementation - can be overridden
-        Err(ActorError::MessageHandlingError(
-            "Message handling not implemented".to_string(),
-        ))
+    type Result = ResponseFuture<Result<BoxedMessage, ActorError>>;
+
+    fn handle(&mut self, msg: ActixMessageWrapper, ctx: &mut ActixContextInner<Self>) -> Self::Result {
+        let envelope = msg.envelope;
+        let payload = envelope.payload;
+        
+        // Create ActixContext to pass to the inner actor
+        let mut actor_ctx = ActixContext::new(ctx);
+        
+        // Call the inner actor's receive_message method
+        let fut = self.inner.receive_message(payload, &mut actor_ctx);
+        
+        Box::pin(async move {
+            fut.await
+        })
     }
 }
 
-// Implement Handler for ActixMessageWrapper
-impl<A> Handler<ActixMessageWrapper> for ActixActorWrapper<A>
-where
-    A: ActixActor + Send + 'static,
-{
-    type Result = ActorResult<BoxedMessage>;
-
-    fn handle(&mut self, msg: ActixMessageWrapper, _ctx: &mut actix::Context<Self>) -> Self::Result {
-        self.handle_parrot_message(msg.envelope)
-    }
-}
-
-// 定义停止消息类型
-#[derive(Debug, Clone)]
+/// Message for actor stopping
+#[derive(Debug)]
 pub struct StopMessage;
 
-// 实现消息特性
-impl actix::Message for StopMessage {
+impl ActixMessage for StopMessage {
     type Result = ();
 }
 
-// 为ActixActorWrapper实现StopMessage的处理
-impl<A> Handler<StopMessage> for ActixActorWrapper<A>
+/// Handler for stop message
+impl<A> Handler<StopMessage> for ActorBase<A>
 where
-    A: ActixActor + Send + 'static,
+    A: Actor<Context = ActixContext> + 'static,
 {
     type Result = ();
 
-    fn handle(&mut self, _: StopMessage, ctx: &mut actix::Context<Self>) -> Self::Result {
-        actix::ActorContext::stop(ctx);
+    fn handle(&mut self, _: StopMessage, ctx: &mut ActixContextInner<Self>) {
+        self.state = ActorState::Stopping;
+        ctx.stop();
+    }
+}
+
+/// Actor reference for ActixActor
+pub struct ActixActorRef<M: Message + 'static> {
+    addr: actix::Addr<ActorBase<A>>,
+    _marker: PhantomData<M>,
+}
+
+impl<M: Message + 'static> ActixActorRef<M> {
+    pub fn new(addr: actix::Addr<ActorBase<A>>) -> Self {
+        Self {
+            addr,
+            _marker: PhantomData,
+        }
+    }
+    
+    /// Send a message to the actor
+    pub async fn send<T: Message + 'static>(&self, msg: T) -> Result<T::Result, ActorError> {
+        // Create message envelope
+        let envelope = MessageEnvelope::new(msg, None, None);
+        
+        // Convert to ActixMessageWrapper
+        let wrapper = ActixMessageWrapper { envelope };
+        
+        // Send message to actor
+        let result = self.addr.send(wrapper).await
+            .map_err(|e| ActorError::MessageDeliveryFailure(e.to_string()))?;
+            
+        // Extract and convert result
+        match result {
+            Ok(boxed) => {
+                T::extract_result(boxed)
+            },
+            Err(e) => Err(e),
+        }
+    }
+    
+    /// Send a message without waiting for response
+    pub fn do_send<T: Message + 'static>(&self, msg: T) -> Result<(), ActorError> {
+        // Create message envelope
+        let envelope = MessageEnvelope::new(msg, None, None);
+        
+        // Convert to ActixMessageWrapper
+        let wrapper = ActixMessageWrapper { envelope };
+        
+        // Send message to actor
+        self.addr.do_send(wrapper);
+        
+        Ok(())
     }
 } 

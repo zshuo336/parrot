@@ -71,6 +71,8 @@ pub mod errors;
 pub mod stream;
 pub mod types;
 pub mod priority;
+pub mod macros;
+
 
 pub use actor::{Actor, ActorConfig, ActorFactory, ActorState};
 pub use address::{ActorPath, ActorRef};
@@ -79,8 +81,6 @@ pub use message::{Message, MessageEnvelope, MessageOptions, MessagePriority};
 pub use supervisor::{SupervisionDecision, SupervisorStrategy};
 pub use system::{ActorSystem, ActorSystemConfig, SystemError}; 
 pub use stream::{StreamHandler, StreamRegistry, StreamRegistryExt, ActorStreamHandler};
+
 // Re-export priority constants for convenience
 pub use priority::{BACKGROUND, LOW, NORMAL, HIGH, CRITICAL};
-
-// Re-export the derive macro
-pub use parrot_api_derive::Message; 
