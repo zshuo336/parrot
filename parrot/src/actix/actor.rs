@@ -25,7 +25,8 @@ pub trait IntoActorBase: Actor {
 /// between Parrot message types and Actix message types.
 pub struct ActorBase<A>
 where
-    A: Actor<Context = ActixContext>,
+    A: Actor,
+    A::Context: 'static,
 {
     inner: A,
     state: ActorState,
@@ -33,7 +34,8 @@ where
 
 impl<A> ActorBase<A>
 where
-    A: Actor<Context = ActixContext>,
+    A: Actor,
+    A::Context: 'static,
 {
     pub fn new(actor: A) -> Self {
         Self {
@@ -54,7 +56,8 @@ impl ActorConfig for ActixActorConfig {}
 /// Implementation of actix Actor trait for ActorBase
 impl<A> ActixActorTrait for ActorBase<A>
 where
-    A: Actor<Context = ActixContext> + 'static,
+    A: Actor + 'static,
+    A::Context: 'static,
 {
     type Context = ActixContextInner<Self>;
 
@@ -82,7 +85,8 @@ where
 /// Implementation of supervision strategy for ActorBase
 impl<A> Supervised for ActorBase<A>
 where
-    A: Actor<Context = ActixContext> + 'static,
+    A: Actor + 'static,
+    A::Context: 'static,
 {
     fn restarting(&mut self, ctx: &mut ActixContextInner<Self>) {
         self.state = ActorState::Starting;
@@ -96,7 +100,8 @@ where
 /// Processes generic MessageEnvelope and forwards to the inner actor
 impl<A> Handler<ActixMessageWrapper> for ActorBase<A>
 where
-    A: Actor<Context = ActixContext> + 'static,
+    A: Actor + 'static,
+    A::Context: 'static,
 {
     type Result = ResponseFuture<Result<BoxedMessage, ActorError>>;
 
@@ -127,7 +132,8 @@ impl ActixMessage for StopMessage {
 /// Handler for stop message
 impl<A> Handler<StopMessage> for ActorBase<A>
 where
-    A: Actor<Context = ActixContext> + 'static,
+    A: Actor + 'static,
+    A::Context: 'static,
 {
     type Result = ();
 
@@ -138,12 +144,18 @@ where
 }
 
 /// Actor reference for ActixActor
-pub struct ActixActorRef<M: Message + 'static> {
+pub struct ActixActorRef<A>
+where
+    A: Actor + 'static,
+{
     addr: actix::Addr<ActorBase<A>>,
-    _marker: PhantomData<M>,
+    _marker: PhantomData<A>,
 }
 
-impl<M: Message + 'static> ActixActorRef<M> {
+impl<A> ActixActorRef<A>
+where
+    A: Actor + 'static,
+{
     pub fn new(addr: actix::Addr<ActorBase<A>>) -> Self {
         Self {
             addr,
@@ -154,7 +166,7 @@ impl<M: Message + 'static> ActixActorRef<M> {
     /// Send a message to the actor
     pub async fn send<T: Message + 'static>(&self, msg: T) -> Result<T::Result, ActorError> {
         // Create message envelope
-        let envelope = MessageEnvelope::new(msg, None, None);
+        let envelope = msg.into_envelope();
         
         // Convert to ActixMessageWrapper
         let wrapper = ActixMessageWrapper { envelope };

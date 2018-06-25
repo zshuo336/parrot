@@ -38,17 +38,17 @@ struct PongActor {
 impl PingActor {
     async fn handle_message<M: Message>(&mut self, msg: M, ctx: &mut parrot::actix::ActixContext) 
         -> ActorResult<M::Result> {
-        if let Some(ping) = msg.downcast_ref::<Ping>() {
-            println!("PingActor received Ping({})", ping.0);
-            self.count += 1;
-            return Ok(self.count);
-        }
-        
-        if let Some(pong) = msg.downcast_ref::<Pong>() {
-            return Ok(format!("PingActor got Pong({})", pong.0));
-        }
-        
-        Err(ActorError::UnknownMessage)
+        match_message!(self, msg,
+            Ping => |actor: &mut Self, ping: &Ping| {
+                println!("PingActor received Ping({})", ping.0);
+                actor.count += 1;
+                actor.count
+            },
+            Pong => |_: &mut Self, pong: &Pong| {
+                format!("PingActor got Pong({})", pong.0)
+            },
+            _ => Err(ActorError::UnknownMessage),
+        )
     }
 }
 
