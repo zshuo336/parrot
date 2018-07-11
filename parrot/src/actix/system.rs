@@ -1,156 +1,191 @@
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
-
-use actix::System as ActixSystemInner;
+use actix::System as ActixSystem;
 use async_trait::async_trait;
-use parrot_api::{
-    system::{ActorSystem, ActorSystemConfig, SystemError, SystemStatus},
-    actor::Actor,
-    address::{ActorPath, ActorRef},
-    types::{BoxedActorRef, ActorResult},
-    message::Message,
-};
-use crate::actix::{
-    actor::{ActorBase, ActixActorRef},
-    context::ActixContext,
-};
-use uuid::Uuid;
+use anyhow::anyhow;
+use parrot_api::system::{ActorSystemConfig, SystemError, SystemStatus, SystemState, SystemResources};
+use parrot_api::actor::Actor as ParrotActor;
+use parrot_api::address::ActorRef;
+use parrot_api::message::Message;
+use parrot_api::types::{BoxedActorRef, ActorResult};
+use crate::actix::actor::ActixActor;
+use crate::actix::reference::ActixActorRef;
+use std::time::Duration;
 
-/// Actix implementation of the Actor System
+/// ActixActorSystem implements the actor system for Actix
+/// 
+/// # Overview
+/// Core system for managing actors in the Actix backend
+/// 
+/// # Key Responsibilities
+/// - Create and manage actors
+/// - Track actor references
+/// - Handle system-wide operations
+/// - Mediate broadcast messages
+/// 
+/// # Implementation Details
+/// - Wraps an actix::System instance
+/// - Manages actor address mappings
+/// - Handles actor lifecycle
+/// - Provides supervision capabilities
 pub struct ActixActorSystem {
-    system: Arc<ActixSystemInner>,
-    config: ActorSystemConfig,
+    /// Underlying Actix system
+    system: Arc<ActixSystem>,
+    /// Registry of active actors by path
     actors: RwLock<HashMap<String, BoxedActorRef>>,
+    /// System configuration
+    config: ActorSystemConfig,
 }
 
 impl ActixActorSystem {
     /// Create a new ActixActorSystem
+    /// 
+    /// # Parameters
+    /// - `config`: System configuration parameters
+    /// 
+    /// # Returns
+    /// A new ActixActorSystem instance or error
     pub async fn new() -> Result<Self, SystemError> {
-        // Create a new actix system
-        let system = ActixSystemInner::new();
+        // Create a new Actix system with default settings
+        let _ = actix::System::new();
         
         Ok(Self {
-            system: Arc::new(system),
-            config: ActorSystemConfig::default(),
+            system: Arc::new(ActixSystem::current()),
             actors: RwLock::new(HashMap::new()),
+            config: ActorSystemConfig::default(),
         })
     }
     
-    /// Create actor and register it with the system
-    pub async fn spawn_root_typed<A: Actor<Context = ActixContext> + 'static>(
+    /// Spawn a root-level actor
+    /// 
+    /// # Type Parameters
+    /// - `A`: Actor type implementing ParrotActor
+    /// 
+    /// # Parameters
+    /// - `actor`: Actor instance to spawn
+    /// - `config`: Actor configuration
+    /// 
+    /// # Returns
+    /// Reference to the created actor or error
+    pub async fn spawn_root_typed<A: ParrotActor + 'static>(
         &self,
         actor: A,
-        config: A::Config,
+        _config: A::Config,
     ) -> Result<Box<dyn ActorRef>, SystemError> {
-        // Create a unique path for the actor
-        let path = format!("/user/{}", Uuid::new_v4());
-        let actor_path = ActorPath::new(&path);
+        // Create ActixActor wrapper
+        let actor_base = ActixActor::new(actor);
         
-        // Convert to ActorBase
-        let actor_base = ActorBase::new(actor);
-        
-        // Start the actor
+        // Start the actor in Actix
         let addr = actor_base.start();
         
-        // Create actor reference
-        let actor_ref = Box::new(ActixActorRef::new(addr)) as BoxedActorRef;
+        // Generate actor path
+        let path = format!("actix://{}", addr.clone());
         
-        // Register the actor
+        // Create actor reference
+        let actor_ref = Box::new(ActixActorRef::new(addr, path.clone())) as Box<dyn ActorRef>;
+        
+        // Register actor
         let mut actors = self.actors.write().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire write lock"))
+            SystemError::Other(anyhow!("Failed to acquire write lock"))
         })?;
         
-        actors.insert(path, actor_ref.clone());
+        actors.insert(path, actor_ref.clone_boxed());
         
         Ok(actor_ref)
     }
     
-    /// Look up actor by path
-    pub async fn get_actor(&self, path: &ActorPath) -> Option<BoxedActorRef> {
+    /// Get an actor by its path
+    /// 
+    /// # Parameters
+    /// - `path`: The actor's path
+    /// 
+    /// # Returns
+    /// Reference to the actor if found
+    pub async fn get_actor(&self, path: &String) -> Option<BoxedActorRef> {
         let actors = match self.actors.read() {
-            Ok(guard) => guard,
+            Ok(actors) => actors,
             Err(_) => return None,
         };
         
-        actors.get(path.path()).cloned()
+        actors.get(path).map(|actor_ref| actor_ref.clone_boxed())
     }
     
-    /// Broadcast a message to all actors in the system
+    /// Broadcast a message to all actors
+    /// 
+    /// # Type Parameters
+    /// - `M`: Message type implementing Message
+    /// 
+    /// # Parameters
+    /// - `msg`: Message to broadcast
+    /// 
+    /// # Returns
+    /// Success or error
     pub async fn broadcast<M: Message + Clone + 'static>(&self, msg: M) -> Result<(), SystemError> {
-        let actors = self.actors.read().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire read lock"))
-        })?;
+        let actors = match self.actors.read() {
+            Ok(actors) => actors,
+            Err(_) => return Err(SystemError::Other(anyhow!("Failed to acquire read lock"))),
+        };
         
         for actor_ref in actors.values() {
-            let _ = actor_ref.send(Box::new(msg.clone()));
+            // Use the ActorRefExt::tell method to send the message without waiting for a response
+            // Clone the message for each actor
+            let actor_ref_clone = actor_ref.clone_boxed();
+            let msg_clone = msg.clone();
+            
+            // Spawn a task to send the message
+            tokio::spawn(async move {
+                let boxed_msg = Box::new(msg_clone) as Box<dyn std::any::Any + Send>;
+                let _ = actor_ref_clone.send(boxed_msg).await;
+            });
         }
         
         Ok(())
     }
     
     /// Shutdown the actor system
+    /// 
+    /// # Returns
+    /// Success or error
     pub async fn shutdown(self) -> Result<(), SystemError> {
-        // Clear actors
-        let mut actors = self.actors.write().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire write lock"))
-        })?;
+        // Stop all actors
+        {
+            let actors = match self.actors.read() {
+                Ok(actors) => actors,
+                Err(_) => return Err(SystemError::Other(anyhow!("Failed to acquire read lock"))),
+            };
+            
+            for actor_ref in actors.values() {
+                // Spawn a task to stop the actor
+                let actor_ref_clone = actor_ref.clone_boxed();
+                tokio::spawn(async move {
+                    let _ = actor_ref_clone.stop().await;
+                });
+            }
+        }
         
-        actors.clear();
+        // Wait for actors to stop (could add a timeout here)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         
-        // Stop the actix system
-        match Arc::try_unwrap(self.system) {
-            Ok(system) => {
-                system.stop();
-                Ok(())
+        // Stop the Actix system
+        actix::System::current().stop();
+        
+        Ok(())
+    }
+    
+    /// Get status of the actor system
+    /// 
+    /// # Returns
+    /// Current system status
+    pub fn status(&self) -> SystemStatus {
+        SystemStatus {
+            state: SystemState::Running,
+            active_actors: self.actors.read().map(|a| a.len()).unwrap_or(0),
+            uptime: Duration::from_secs(0), // 实际应用中应该计算真实运行时间
+            resources: SystemResources {
+                cpu_usage: 0.0,
+                memory_usage: 0,
+                thread_count: 1,
             },
-            Err(_) => Err(SystemError::ShutdownError("Failed to stop actor system: still has references".to_string())),
         }
-    }
-}
-
-#[async_trait]
-impl ActorSystem for ActixActorSystem {
-    async fn start(config: ActorSystemConfig) -> Result<Self, SystemError> {
-        Self::new().await
-    }
-
-    async fn spawn_root_typed<A: Actor + 'static>(
-        &self,
-        actor: A,
-        config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError> {
-        if let Ok(actor) = actor.downcast::<dyn Actor<Context = ActixContext>>() {
-            self.spawn_root_typed(actor, config).await
-        } else {
-            Err(SystemError::Other(anyhow::anyhow!(
-                "Actor cannot be downcasted to ActixContext-compatible actor"
-            )))
-        }
-    }
-
-    async fn spawn_root_boxed(
-        &self,
-        actor: Box<dyn Actor<Config = Box<dyn std::any::Any + Send>, Context = dyn parrot_api::context::ActorContext>>,
-        config: Box<dyn std::any::Any + Send>,
-    ) -> Result<Box<dyn ActorRef>, SystemError> {
-        Err(SystemError::NotImplemented(
-            "Type-erased actor creation not implemented".to_string()
-        ))
-    }
-
-    async fn get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
-        self.get_actor(path).await
-    }
-
-    async fn broadcast<M: Message + Clone + 'static>(&self, msg: M) -> Result<(), SystemError> {
-        self.broadcast(msg).await
-    }
-
-    fn status(&self) -> SystemStatus {
-        SystemStatus::default()
-    }
-
-    async fn shutdown(self) -> Result<(), SystemError> {
-        self.shutdown().await
     }
 } 

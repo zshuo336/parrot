@@ -10,6 +10,8 @@ use parrot_api::supervisor::{SupervisorStrategyType, OneForOneStrategy, Supervis
 use std::time::Duration;
 use std::sync::{Arc, Mutex, RwLock};
 use async_trait::async_trait;
+use std::ptr::NonNull;
+use std::any::Any;
 
 // Integration test environment
 // -----------------
@@ -92,6 +94,10 @@ impl Actor for GreeterActor {
             // Echo back unknown messages
             Ok(msg)
         })
+    }
+
+    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
     }
 
     fn before_stop<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {

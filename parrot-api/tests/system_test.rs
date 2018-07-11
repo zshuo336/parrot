@@ -11,6 +11,7 @@ use std::time::Duration;
 use std::sync::{Arc, Mutex, RwLock};
 use std::any::Any;
 use async_trait::async_trait;
+use std::ptr::NonNull;
 
 // Mock Context for tests
 #[derive(Default)]
@@ -46,6 +47,11 @@ impl Actor for TestActor {
             self.processed_messages += 1;
             Ok(msg) // Echo back the message
         })
+    }
+
+    // This is not used in the test actor
+    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
     }
 
     fn state(&self) -> ActorState {

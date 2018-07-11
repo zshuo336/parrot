@@ -36,36 +36,38 @@ struct PongActor {
 }
 
 impl PingActor {
-    async fn handle_message<M: Message>(&mut self, msg: M, ctx: &mut parrot::actix::ActixContext) 
+    async fn handle_message<M: Message>(&mut self, msg: M, ctx: &mut parrot::actix::ActixContext<Self>) 
         -> ActorResult<M::Result> {
-        match_message!(self, msg,
-            Ping => |actor: &mut Self, ping: &Ping| {
+        
+        if let Some(ping) = msg.downcast_ref::<Ping>() {
                 println!("PingActor received Ping({})", ping.0);
-                actor.count += 1;
-                actor.count
-            },
-            Pong => |_: &mut Self, pong: &Pong| {
-                format!("PingActor got Pong({})", pong.0)
-            },
-            _ => Err(ActorError::UnknownMessage),
-        )
+            self.count += 1;
+            return Ok(Box::new(self.count) as Box<dyn std::any::Any + Send>);
+        }
+        
+        if let Some(pong) = msg.downcast_ref::<Pong>() {
+            return Ok(Box::new(format!("PingActor got Pong({})", pong.0)) as Box<dyn std::any::Any + Send>);
+        }
+        
+        Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
 }
 
 impl PongActor {
-    async fn handle_message<M: Message>(&mut self, msg: M, ctx: &mut parrot::actix::ActixContext) 
+    async fn handle_message<M: Message>(&mut self, msg: M, ctx: &mut parrot::actix::ActixContext<Self>) 
         -> ActorResult<M::Result> {
+        
         if let Some(ping) = msg.downcast_ref::<Ping>() {
             println!("PongActor received Ping({})", ping.0);
             self.count += 1;
-            return Ok(self.count);
+            return Ok(Box::new(self.count) as Box<dyn std::any::Any + Send>);
         }
         
         if let Some(pong) = msg.downcast_ref::<Pong>() {
-            return Ok(format!("PongActor got Pong({})", pong.0));
+            return Ok(Box::new(format!("PongActor got Pong({})", pong.0)) as Box<dyn std::any::Any + Send>);
         }
         
-        Err(ActorError::UnknownMessage)
+        Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
 }
 
@@ -88,10 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send messages
     for i in 0..5 {
-        let ping_result = ping_ref.send(Ping(i)).await?;
+        let ping_result = ping_ref.ask(Ping(i)).await?;
         println!("PingActor response: {}", ping_result);
         
-        let pong_result = pong_ref.send(Ping(i)).await?;
+        let pong_result = pong_ref.ask(Ping(i)).await?;
         println!("PongActor response: {}", pong_result);
         
         tokio::time::sleep(Duration::from_millis(100)).await;

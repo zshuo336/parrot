@@ -45,12 +45,14 @@
 //! }
 //! ```
 
+use std::any::Any;
 use std::future::Future;
+use std::ptr::NonNull;
 use crate::context::ActorContext;
 use crate::address::ActorRef;
 use crate::errors::ActorError;
 use crate::types::{BoxedMessage, BoxedFuture, ActorResult, BoxedActorRef};
-
+use crate::message::Message;
 /// Actor lifecycle states that represent the current status of an actor in the system.
 /// 
 /// The state transitions typically follow this order:
@@ -126,6 +128,7 @@ pub trait Actor: Send + 'static {
     /// Context type providing access to actor system services
     type Context: ?Sized + Send;
 
+
     /// Initialize the actor with system resources and configuration.
     /// 
     /// Called once before the actor starts processing messages. Use this method to:
@@ -158,6 +161,8 @@ pub trait Actor: Send + 'static {
     /// # Returns
     /// `ActorResult<BoxedMessage>` containing the response message or error
     fn receive_message<'a>(&'a mut self, msg: BoxedMessage, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
+
+    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>>;
 
     /// Handle an item from a stream.
     /// 

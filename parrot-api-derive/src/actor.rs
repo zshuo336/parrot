@@ -149,6 +149,13 @@ fn generate_actix_implementation(
                 })
             }
             
+            fn receive_message_with_engine<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: NonNull<dyn Any>)
+                -> Option<parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
+                    // Call the user's message handler implementation
+                    // This will be implemented separately by the user
+                    self.handle_message_engine(msg, ctx, engine_ctx)
+            }
+
             fn state(&self) -> parrot_api::actor::ActorState {
                 // Default implementation returns Running
                 parrot_api::actor::ActorState::Running

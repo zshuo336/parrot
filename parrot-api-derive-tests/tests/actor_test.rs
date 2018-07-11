@@ -7,6 +7,7 @@ use parrot_api::{match_message, message_response_ok};
 
 use std::fmt::Debug;
 use std::any::Any;
+use std::ptr::NonNull;
 
 // Constants for engine selection
 pub const ACTIX: &str = "actix";
@@ -83,6 +84,48 @@ pub struct ComplexMessage {
 #[message(result = "u32")]
 pub struct CounterMsg(pub u32);
 
+// Additional messages for engine testing
+#[derive(Message, Clone, Debug)]
+#[message(result = "u64")]
+pub struct Multiply(pub u32);
+
+#[derive(Message, Clone, Debug)]
+#[message(result = "u64")]
+pub struct GetEngineCounter;
+
+#[derive(Message, Clone, Debug)]
+#[message(result = "u32")]
+pub struct SetMode(pub u32);
+
+#[derive(Message, Clone, Debug)]
+#[message(result = "String")]
+pub struct InvalidOperation;
+
+// Different operation modes
+#[derive(Debug, PartialEq)]
+pub enum EngineMode {
+    Normal = 0,
+    ReadOnly = 1,
+    ErrorProne = 2,
+}
+
+impl From<u32> for EngineMode {
+    fn from(value: u32) -> Self {
+        match value {
+            1 => EngineMode::ReadOnly,
+            2 => EngineMode::ErrorProne,
+            _ => EngineMode::Normal,
+        }
+    }
+}
+
+// Engine context for testing
+#[derive(Debug)]
+pub struct TestEngineContext {
+    pub multiplier: u32,
+    pub mode: EngineMode,
+}
+
 // ==================== Actor Implementations ====================
 
 // 1. Using default engine (actix), explicitly specifying EmptyConfig
@@ -118,6 +161,11 @@ impl DefaultActor {
             }
         )
     }
+
+    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
+    }
+
 }
 
 // 2. Using string to specify engine
@@ -142,6 +190,10 @@ impl StringEngineActor {
         
         Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
+    
+    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
+    }
 }
 
 // 3. Using constant to specify engine
@@ -165,6 +217,10 @@ impl ConstantEngineActor {
         }
         
         Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
+    }
+    
+    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
     }
 }
 
@@ -191,6 +247,10 @@ impl ComplexConfigActor {
         
         Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
+    
+    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
+    }
 }
 
 // 5. Simple actor from simplified test
@@ -214,6 +274,10 @@ impl SimpleActor {
         }
         
         Err(ActorError::MessageHandlingError("Unknown message".to_string()))
+    }
+    
+    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
     }
 }
 
@@ -254,6 +318,101 @@ impl<T: Debug + Clone + Send + 'static> GenericActor<T> {
         
         Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
+    
+    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
+    }
+}
+
+// Actor with engine context handling
+#[derive(ParrotActor, Debug)]
+#[ParrotActor(engine = "actix")]
+pub struct EngineAwareActor {
+    counter: u32,
+    engine_counter: u64,
+    last_operation: Option<String>,
+}
+
+impl EngineAwareActor {
+    pub fn new() -> Self {
+        Self {
+            counter: 0,
+            engine_counter: 0,
+            last_operation: None,
+        }
+    }
+    
+    pub async fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext) 
+        -> ActorResult<BoxedMessage> {
+        match_message!(self, msg,
+            Increment => |actor: &mut Self, inc: &Increment| {
+                actor.counter += inc.0;
+                actor.last_operation = Some("increment".to_string());
+                actor.counter
+            },
+            GetStatus => |_: &mut Self, _: &GetStatus| {
+                "regular".to_string()
+            },
+            Reset => |actor: &mut Self, _: &Reset| {
+                actor.counter = 0;
+                actor.last_operation = Some("reset".to_string());
+                ()
+            }
+        )
+    }
+    
+    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        // Only process if we can downcast to our expected engine context type
+        let engine_ctx_ref = unsafe { engine_ctx.as_ref() };
+        if let Some(ctx) = engine_ctx_ref.downcast_ref::<TestEngineContext>() {
+            // First check operation mode
+            match ctx.mode {
+                EngineMode::ErrorProne => {
+                    // In error mode, always return an error
+                    return Some(Err(ActorError::MessageHandlingError("Engine is in error mode".to_string())));
+                },
+                EngineMode::ReadOnly => {
+                    // In read-only mode, only handle read operations
+                    if msg.downcast_ref::<GetEngineCounter>().is_none() && 
+                       msg.downcast_ref::<GetStatus>().is_none() {
+                        return Some(Err(ActorError::MessageHandlingError(
+                            "Engine is in read-only mode".to_string())));
+                    }
+                },
+                EngineMode::Normal => {
+                    // Normal processing continues below
+                }
+            }
+            
+            // Process different message types
+            if let Some(increment) = msg.downcast_ref::<Increment>() {
+                let amount = increment.0 as u64 * ctx.multiplier as u64;
+                self.engine_counter += amount;
+                self.last_operation = Some("engine_increment".to_string());
+                return Some(Ok(Box::new(self.engine_counter) as BoxedMessage));
+            } else if let Some(multiply) = msg.downcast_ref::<Multiply>() {
+                if self.engine_counter == 0 {
+                    self.engine_counter = 1;
+                }
+                self.engine_counter *= multiply.0 as u64 * ctx.multiplier as u64;
+                self.last_operation = Some("engine_multiply".to_string());
+                return Some(Ok(Box::new(self.engine_counter) as BoxedMessage));
+            } else if let Some(_) = msg.downcast_ref::<GetEngineCounter>() {
+                return Some(Ok(Box::new(self.engine_counter) as BoxedMessage));
+            } else if let Some(_) = msg.downcast_ref::<Reset>() {
+                self.engine_counter = 0;
+                self.last_operation = Some("engine_reset".to_string());
+                return Some(Ok(Box::new(()) as BoxedMessage));
+            } else if let Some(_) = msg.downcast_ref::<SetMode>() {
+                // SetMode is handled normally since it doesn't modify actor state
+                return Some(Ok(Box::new("mode_set".to_string()) as BoxedMessage));
+            } else if let Some(_) = msg.downcast_ref::<InvalidOperation>() {
+                return Some(Err(ActorError::MessageHandlingError("Invalid operation requested".to_string())));
+            }
+        }
+        
+        None // Fall back to regular message handling
+    }
 }
 
 // ==================== Manual Actor Implementation (for comparison) ====================
@@ -292,6 +451,10 @@ impl Actor for ManualActor {
             
             Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
         })
+    }
+    
+    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
     }
     
     fn state(&self) -> ActorState {
@@ -507,4 +670,365 @@ mod tests {
             assert_eq!(manual_val, simple_val, "Both implementations should behave identically");
         }
     }
-} 
+
+    #[tokio::test]
+    async fn test_receive_message_with_engine() {
+        // Create actor instances for testing
+        let mut derived_actor = DefaultActor { counter: 0 };
+        let mut manual_actor = ManualActor::new();
+        let mut ctx = parrot::actix::ActixContext::default();
+        
+        // Create engine context data
+        let engine_data = 42u32;
+        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+        
+        // Prepare a test message
+        let increment_msg = Box::new(Increment(5)) as BoxedMessage;
+        
+        // Test the derive macro's receive_message_with_engine implementation
+        let derived_result = derived_actor.receive_message_with_engine(increment_msg, &mut ctx, engine_ctx);
+        
+        // Create a new message since the previous one was moved
+        let increment_msg2 = Box::new(Increment(5)) as BoxedMessage;
+        
+        // Test the manually implemented receive_message_with_engine
+        let manual_result = manual_actor.receive_message_with_engine(increment_msg2, &mut ctx, engine_ctx);
+        
+        // Both should return None (default behavior)
+        assert!(derived_result.is_none(), "ParrotActor derive macro's receive_message_with_engine should return None");
+        assert!(manual_result.is_none(), "Manually implemented receive_message_with_engine should return None");
+        
+        // Ensure normal message handling still works
+        let normal_msg = Box::new(Increment(7)) as BoxedMessage;
+        let normal_result = derived_actor.receive_message(normal_msg, &mut ctx).await;
+        assert!(normal_result.is_ok());
+        assert_eq!(derived_actor.counter, 7);
+        
+        // Clean up raw pointer
+        unsafe {
+            let _ = Box::from_raw(engine_ctx.as_ptr());
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_receive_message_with_engine_all_types() {
+        // Create instances of all actor types
+        let mut default_actor = DefaultActor { counter: 0 };
+        let mut string_engine_actor = StringEngineActor { counter: 0 };
+        let mut constant_engine_actor = ConstantEngineActor { counter: 0 };
+        let mut complex_config_actor = ComplexConfigActor { 
+            counter: 0,
+            config: MyConfig { timeout: 10 }
+        };
+        let mut simple_actor = SimpleActor::new();
+        let mut generic_actor = GenericActor { value: vec![1, 2, 3] };
+        
+        let mut ctx = parrot::actix::ActixContext::default();
+        
+        // Create engine context data
+        let engine_data = 42u32;
+        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+        
+        // Prepare a test message
+        let increment_msg = Box::new(Increment(5)) as BoxedMessage;
+        
+        // Test receive_message_with_engine for each actor
+        let default_result = default_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ctx);
+        let string_result = string_engine_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ctx);
+        let constant_result = constant_engine_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ctx);
+        let complex_result = complex_config_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ctx);
+        let simple_result = simple_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ctx);
+        let generic_result = generic_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ctx);
+        
+        // All derived actors should return None
+        assert!(default_result.is_none(), "DefaultActor's receive_message_with_engine should return None");
+        assert!(string_result.is_none(), "StringEngineActor's receive_message_with_engine should return None");
+        assert!(constant_result.is_none(), "ConstantEngineActor's receive_message_with_engine should return None");
+        assert!(complex_result.is_none(), "ComplexConfigActor's receive_message_with_engine should return None");
+        assert!(simple_result.is_none(), "SimpleActor's receive_message_with_engine should return None");
+        assert!(generic_result.is_none(), "GenericActor's receive_message_with_engine should return None");
+        
+        // Clean up raw pointer
+        unsafe {
+            let _ = Box::from_raw(engine_ctx.as_ptr());
+        }
+    }
+
+    // Tests for engine message handling using handle_message_engine
+    #[tokio::test]
+    async fn test_handle_message_engine() {
+        // Create engine-aware actor
+        let mut actor = EngineAwareActor::new();
+        let mut ctx = parrot::actix::ActixContext::default();
+        
+        // Create normal mode engine context
+        let engine_ctx = TestEngineContext {
+            multiplier: 2,
+            mode: EngineMode::Normal,
+        };
+        let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_ctx) as Box<dyn Any>)) };
+        
+        // Test Increment with engine context
+        let result = actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ptr);
+        assert!(result.is_some(), "Should handle the message with engine context");
+        
+        if let Some(Ok(boxed)) = result {
+            let value = boxed.downcast::<u64>().unwrap();
+            assert_eq!(*value, 10); // 5 * 2 = 10
+            assert_eq!(actor.engine_counter, 10);
+            assert_eq!(actor.last_operation, Some("engine_increment".to_string()));
+        } else {
+            panic!("Expected Some(Ok) result for increment with engine");
+        }
+        
+        // Test Multiply with engine context
+        let result = actor.receive_message_with_engine(Box::new(Multiply(3)) as BoxedMessage, &mut ctx, engine_ptr);
+        assert!(result.is_some());
+        
+        if let Some(Ok(boxed)) = result {
+            let value = boxed.downcast::<u64>().unwrap();
+            assert_eq!(*value, 60); // 10 * 3 * 2 = 60
+            assert_eq!(actor.engine_counter, 60);
+            assert_eq!(actor.last_operation, Some("engine_multiply".to_string()));
+        } else {
+            panic!("Expected Some(Ok) result for multiply with engine");
+        }
+        
+        // Test GetEngineCounter
+        let result = actor.receive_message_with_engine(Box::new(GetEngineCounter) as BoxedMessage, &mut ctx, engine_ptr);
+        assert!(result.is_some());
+        
+        if let Some(Ok(boxed)) = result {
+            let value = boxed.downcast::<u64>().unwrap();
+            assert_eq!(*value, 60);
+        } else {
+            panic!("Expected Some(Ok) result for get engine counter");
+        }
+        
+        // Test Reset
+        let result = actor.receive_message_with_engine(Box::new(Reset) as BoxedMessage, &mut ctx, engine_ptr);
+        assert!(result.is_some());
+        
+        if let Some(Ok(_)) = result {
+            assert_eq!(actor.engine_counter, 0);
+            assert_eq!(actor.last_operation, Some("engine_reset".to_string()));
+        } else {
+            panic!("Expected Some(Ok) result for reset with engine");
+        }
+        
+        // Clean up raw pointer
+        unsafe {
+            let _ = Box::from_raw(engine_ptr.as_ptr());
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_handle_message_engine_readonly_mode() {
+        // Create engine-aware actor
+        let mut actor = EngineAwareActor::new();
+        let mut ctx = parrot::actix::ActixContext::default();
+        
+        // Set initial counter value for testing
+        actor.engine_counter = 100;
+        
+        // Create read-only mode engine context
+        let engine_ctx = TestEngineContext {
+            multiplier: 2,
+            mode: EngineMode::ReadOnly,
+        };
+        let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_ctx) as Box<dyn Any>)) };
+        
+        // Test read operation (should succeed)
+        let result = actor.receive_message_with_engine(Box::new(GetEngineCounter) as BoxedMessage, &mut ctx, engine_ptr);
+        assert!(result.is_some());
+        
+        if let Some(Ok(boxed)) = result {
+            let value = boxed.downcast::<u64>().unwrap();
+            assert_eq!(*value, 100);
+        } else {
+            panic!("Expected Some(Ok) result for read operation in readonly mode");
+        }
+        
+        // Test write operation (should fail)
+        let result = actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ptr);
+        assert!(result.is_some());
+        
+        if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
+            assert_eq!(msg, "Engine is in read-only mode");
+            assert_eq!(actor.engine_counter, 100); // Should not change
+        } else {
+            panic!("Expected Some(Err) result for write operation in readonly mode");
+        }
+        
+        // Clean up raw pointer
+        unsafe {
+            let _ = Box::from_raw(engine_ptr.as_ptr());
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_handle_message_engine_error_mode() {
+        // Create engine-aware actor
+        let mut actor = EngineAwareActor::new();
+        let mut ctx = parrot::actix::ActixContext::default();
+        
+        // Create error-prone mode engine context
+        let engine_ctx = TestEngineContext {
+            multiplier: 2,
+            mode: EngineMode::ErrorProne,
+        };
+        let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_ctx) as Box<dyn Any>)) };
+        
+        // Test different message types - all should fail
+        let messages = [
+            Box::new(Increment(5)) as BoxedMessage,
+            Box::new(Multiply(3)) as BoxedMessage,
+            Box::new(GetEngineCounter) as BoxedMessage,
+            Box::new(Reset) as BoxedMessage,
+        ];
+        
+        for (i, msg) in messages.iter().enumerate() {
+            // Clone the message content
+            let message: BoxedMessage = match i {
+                0 => Box::new(Increment(5)),
+                1 => Box::new(Multiply(3)),
+                2 => Box::new(GetEngineCounter),
+                3 => Box::new(Reset),
+                _ => unreachable!(),
+            };
+            
+            let result = actor.receive_message_with_engine(message, &mut ctx, engine_ptr);
+            assert!(result.is_some(), "Message {} should be handled", i);
+            
+            if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
+                assert_eq!(msg, "Engine is in error mode");
+            } else {
+                panic!("Expected Some(Err) for message {} in error mode", i);
+            }
+        }
+        
+        // Clean up raw pointer
+        unsafe {
+            let _ = Box::from_raw(engine_ptr.as_ptr());
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_handle_message_engine_invalid_operation() {
+        // Create engine-aware actor
+        let mut actor = EngineAwareActor::new();
+        let mut ctx = parrot::actix::ActixContext::default();
+        
+        // Create normal mode engine context
+        let engine_ctx = TestEngineContext {
+            multiplier: 2,
+            mode: EngineMode::Normal,
+        };
+        let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_ctx) as Box<dyn Any>)) };
+        
+        // Test invalid operation
+        let result = actor.receive_message_with_engine(Box::new(InvalidOperation) as BoxedMessage, 
+                                                      &mut ctx, engine_ptr);
+        assert!(result.is_some());
+        
+        if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
+            assert_eq!(msg, "Invalid operation requested");
+        } else {
+            panic!("Expected Some(Err) result for invalid operation");
+        }
+        
+        // Clean up raw pointer
+        unsafe {
+            let _ = Box::from_raw(engine_ptr.as_ptr());
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_handle_message_engine_fallback() {
+        // Create engine-aware actor
+        let mut actor = EngineAwareActor::new();
+        let mut ctx = parrot::actix::ActixContext::default();
+        
+        // Create an incompatible engine context type
+        let wrong_ctx = 42u32;
+        let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(wrong_ctx) as Box<dyn Any>)) };
+        
+        // Should fall back to regular message handling
+        let result = actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, 
+                                                      &mut ctx, engine_ptr);
+        assert!(result.is_none(), "Should return None for fallback with incompatible context");
+        
+        // Test that regular message handling still works
+        let normal_result = actor.receive_message(Box::new(Increment(5)) as BoxedMessage, &mut ctx).await;
+        assert!(normal_result.is_ok());
+        assert_eq!(actor.counter, 5);
+        assert_eq!(actor.engine_counter, 0); // Unchanged
+        assert_eq!(actor.last_operation, Some("increment".to_string()));
+        
+        // Clean up raw pointer
+        unsafe {
+            let _ = Box::from_raw(engine_ptr.as_ptr());
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_handle_message_engine_sequential_operations() {
+        // Create engine-aware actor
+        let mut actor = EngineAwareActor::new();
+        let mut ctx = parrot::actix::ActixContext::default();
+        
+        // Create normal mode engine context
+        let engine_ctx = TestEngineContext {
+            multiplier: 2,
+            mode: EngineMode::Normal,
+        };
+        let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_ctx) as Box<dyn Any>)) };
+        
+        // Define sequence of operations and expected values
+        let operations = [
+            (0, Box::new(Increment(10)) as BoxedMessage, 20), // 0 + (10*2) = 20
+            (1, Box::new(Multiply(3)) as BoxedMessage, 120),  // 20 * (3*2) = 120
+            (2, Box::new(GetEngineCounter) as BoxedMessage, 120), // Still 120
+            (3, Box::new(Reset) as BoxedMessage, 0),          // Reset to 0
+            (4, Box::new(Increment(15)) as BoxedMessage, 30), // 0 + (15*2) = 30
+        ];
+        
+        for (i, message, expected) in operations.iter() {
+            // Create a new message for each operation
+            let msg: BoxedMessage = match i {
+                0 => Box::new(Increment(10)),
+                1 => Box::new(Multiply(3)),
+                2 => Box::new(GetEngineCounter),
+                3 => Box::new(Reset),
+                4 => Box::new(Increment(15)),
+                _ => unreachable!(),
+            };
+            
+            let result = actor.receive_message_with_engine(msg, &mut ctx, engine_ptr);
+            assert!(result.is_some(), "Operation {} should return Some", i);
+            
+            match result {
+                Some(Ok(boxed)) => {
+                    if *i != 3 { // Skip Reset (returns unit)
+                        let value = boxed.downcast::<u64>().unwrap_or_else(|_| 
+                            panic!("Expected u64 value for operation {}", i)
+                        );
+                        assert_eq!(*value, *expected as u64, 
+                                  "Operation {} should return {}", i, expected);
+                    }
+                },
+                Some(Err(e)) => panic!("Operation {} failed: {:?}", i, e),
+                None => panic!("Operation {} returned None", i),
+            }
+            
+            // Verify engine counter
+            assert_eq!(actor.engine_counter, *expected as u64, 
+                      "Engine counter should be {} after operation {}", expected, i);
+        }
+        
+        // Clean up raw pointer
+        unsafe {
+            let _ = Box::from_raw(engine_ptr.as_ptr());
+        }
+    }
+}
