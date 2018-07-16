@@ -2,7 +2,7 @@ use std::any::Any;
 use uuid::Uuid;
 use actix::Message as ActixMessage;
 use parrot_api::message::{MessageEnvelope, Message, MessageOptions};
-use parrot_api::types::BoxedMessage;
+use parrot_api::types::{BoxedMessage, ActorResult};
 use parrot_api::errors::ActorError;
 
 /// Wrapper for MessageEnvelope to implement actix::Message
@@ -17,7 +17,7 @@ pub struct ActixMessageWrapper {
 }
 
 impl ActixMessage for ActixMessageWrapper {
-    type Result = Result<BoxedMessage, ActorError>;
+    type Result = Option<ActorResult<BoxedMessage>>;
 }
 
 /// Helper traits and functions for message handling
