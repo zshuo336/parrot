@@ -1,14 +1,17 @@
 use std::time::Duration;
-use parrot::actix::{ActixActorSystem, ActorBase, IntoActorBase};
+use parrot::actix::{ActixActorSystem, ActixActor, ActixContext};
 use parrot::system::ParrotActorSystem;
 use parrot_api::{
-    actor::Actor,
+    actor::{ActorState, EmptyConfig},
     message::Message,
     errors::ActorError,
-    types::{BoxedMessage, ActorResult, BoxedFuture},
-    system::ActorSystemConfig,
+    types::{BoxedMessage, ActorResult},
+    system::{ActorSystemConfig, ActorSystem},
+    address::ActorRefExt,
 };
 use parrot_api_derive::{Message, ParrotActor};
+use std::any::Any;
+use std::ptr::NonNull;
 
 // Engine selection constants
 pub const ACTIX: &str = "actix";
@@ -27,66 +30,87 @@ struct Pong(u32);
 #[ParrotActor(engine = "actix")]
 struct PingActor {
     count: u32,
+    state: ActorState,
 }
 
 #[derive(Debug, Clone, ParrotActor)]
 #[ParrotActor(engine = ACTIX)]
 struct PongActor {
     count: u32,
+    state: ActorState,
 }
 
 impl PingActor {
-    async fn handle_message<M: Message>(&mut self, msg: M, ctx: &mut parrot::actix::ActixContext<Self>) 
-        -> ActorResult<M::Result> {
-        
+    pub fn new() -> Self {
+        Self {
+            count: 0,
+            state: ActorState::Starting,
+        }
+    }
+
+    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
         if let Some(ping) = msg.downcast_ref::<Ping>() {
-                println!("PingActor received Ping({})", ping.0);
+            println!("PingActor received Ping({})", ping.0);
             self.count += 1;
-            return Ok(Box::new(self.count) as Box<dyn std::any::Any + Send>);
+            return Some(Ok(Box::new(self.count) as BoxedMessage));
         }
         
         if let Some(pong) = msg.downcast_ref::<Pong>() {
-            return Ok(Box::new(format!("PingActor got Pong({})", pong.0)) as Box<dyn std::any::Any + Send>);
+            let response = format!("PingActor got Pong({})", pong.0);
+            return Some(Ok(Box::new(response) as BoxedMessage));
         }
         
-        Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
+        Some(Err(ActorError::MessageHandlingError("Unknown message type".to_string())))
     }
 }
 
 impl PongActor {
-    async fn handle_message<M: Message>(&mut self, msg: M, ctx: &mut parrot::actix::ActixContext<Self>) 
-        -> ActorResult<M::Result> {
-        
+    pub fn new() -> Self {
+        Self {
+            count: 0,
+            state: ActorState::Starting,
+        }
+    }
+
+    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
         if let Some(ping) = msg.downcast_ref::<Ping>() {
             println!("PongActor received Ping({})", ping.0);
             self.count += 1;
-            return Ok(Box::new(self.count) as Box<dyn std::any::Any + Send>);
+            return Some(Ok(Box::new(self.count) as BoxedMessage));
         }
         
         if let Some(pong) = msg.downcast_ref::<Pong>() {
-            return Ok(Box::new(format!("PongActor got Pong({})", pong.0)) as Box<dyn std::any::Any + Send>);
+            let response = format!("PongActor got Pong({})", pong.0);
+            return Some(Ok(Box::new(response) as BoxedMessage));
         }
         
-        Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
+        Some(Err(ActorError::MessageHandlingError("Unknown message type".to_string())))
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // use actix::System to wrap our application
+    actix::System::new().block_on(async {
+        run_example().await
+    })
+}
+
+async fn run_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create global actor system
-    let system = ParrotActorSystem::start(ActorSystemConfig::default()).await?;
+    let config = ActorSystemConfig::default();
+    let system = ParrotActorSystem::new(config).await?;
 
     // Create and register ActixActorSystem
     let actix_system = ActixActorSystem::new().await?;
     system.register_actix_system("actix".to_string(), actix_system, true).await?;
 
     // Create actors
-    let ping_actor = PingActor { count: 0 };
-    let pong_actor = PongActor { count: 0 };
+    let ping_actor = PingActor::new();
+    let pong_actor = PongActor::new();
 
     // Spawn actors using global system
-    let ping_ref = system.spawn_root_typed(ping_actor, ()).await?;
-    let pong_ref = system.spawn_root_typed(pong_actor, ()).await?;
+    let ping_ref = system.spawn_root_actix(ping_actor, EmptyConfig::default()).await?;
+    let pong_ref = system.spawn_root_actix(pong_actor, EmptyConfig::default()).await?;
 
     // Send messages
     for i in 0..5 {
@@ -101,9 +125,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for messages to be processed
     tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Shutdown system
-    system.shutdown().await?;
+    
+    println!("Before system shutdown");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    
+    // Shutdown system (use ActorSystem trait method)
+    println!("Calling system shutdown");
+    ActorSystem::shutdown(system).await?;
+    
+    println!("After system shutdown");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    println!("Exiting");
 
     Ok(())
 }

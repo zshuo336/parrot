@@ -10,6 +10,7 @@ use parrot_api::message::Message;
 use parrot_api::types::{BoxedActorRef, ActorResult};
 use crate::actix::actor::ActixActor;
 use crate::actix::reference::ActixActorRef;
+use crate::actix::context::ActixContext;
 use std::time::Duration;
 
 /// ActixActorSystem implements the actor system for Actix
@@ -32,9 +33,26 @@ pub struct ActixActorSystem {
     /// Underlying Actix system
     system: Arc<ActixSystem>,
     /// Registry of active actors by path
-    actors: RwLock<HashMap<String, BoxedActorRef>>,
+    actors: Arc<RwLock<HashMap<String, BoxedActorRef>>>,
     /// System configuration
     config: ActorSystemConfig,
+    /// Registry of active actors by path
+    registry: Arc<RwLock<HashMap<String, BoxedActorRef>>>,
+    /// Default dispatcher
+    default_dispatcher: Arc<RwLock<Option<String>>>,
+}
+
+// 手动实现Clone，共享某些锁内数据
+impl Clone for ActixActorSystem {
+    fn clone(&self) -> Self {
+        Self {
+            system: self.system.clone(),
+            actors: Arc::new(RwLock::new(HashMap::new())), // 新的空actors集合
+            config: self.config.clone(),
+            registry: self.registry.clone(),              // 共享registry数据
+            default_dispatcher: self.default_dispatcher.clone(), // 共享dispatcher设置
+        }
+    }
 }
 
 impl ActixActorSystem {
@@ -46,13 +64,14 @@ impl ActixActorSystem {
     /// # Returns
     /// A new ActixActorSystem instance or error
     pub async fn new() -> Result<Self, SystemError> {
-        // Create a new Actix system with default settings
-        let _ = actix::System::new();
-        
+        // 不在这里创建新的Actix系统，而是使用当前运行时
         Ok(Self {
+            // 使用Tokio运行时的spawn方法而不是创建新系统
             system: Arc::new(ActixSystem::current()),
-            actors: RwLock::new(HashMap::new()),
+            actors: Arc::new(RwLock::new(HashMap::new())),
             config: ActorSystemConfig::default(),
+            registry: Arc::new(RwLock::new(HashMap::new())),
+            default_dispatcher: Arc::new(RwLock::new(None)),
         })
     }
     
@@ -67,19 +86,19 @@ impl ActixActorSystem {
     /// 
     /// # Returns
     /// Reference to the created actor or error
-    pub async fn spawn_root_typed<A: ParrotActor + 'static>(
-        &self,
-        actor: A,
-        _config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError> {
+    pub async fn spawn_root_typed<A>(&self, actor: A, _config: A::Config) -> Result<Box<dyn ActorRef>, SystemError> 
+    where
+        A: ParrotActor<Context = ActixContext<ActixActor<A>>> + Unpin + 'static 
+    {
         // Create ActixActor wrapper
         let actor_base = ActixActor::new(actor);
         
-        // Start the actor in Actix
-        let addr = actor_base.start();
+        // Start the actor in the current Actix system instead of creating a new one
+        // Use the system handle we already have
+        let addr = actix::Actor::start(actor_base);
         
         // Generate actor path
-        let path = format!("actix://{}", addr.clone());
+        let path = format!("actix://{:?}", addr.clone());
         
         // Create actor reference
         let actor_ref = Box::new(ActixActorRef::new(addr, path.clone())) as Box<dyn ActorRef>;
@@ -147,12 +166,16 @@ impl ActixActorSystem {
     /// # Returns
     /// Success or error
     pub async fn shutdown(self) -> Result<(), SystemError> {
+        println!("ActixActorSystem: Starting shutdown sequence");
+        
         // Stop all actors
         {
             let actors = match self.actors.read() {
                 Ok(actors) => actors,
                 Err(_) => return Err(SystemError::Other(anyhow!("Failed to acquire read lock"))),
             };
+            
+            println!("ActixActorSystem: Stopping {} actors", actors.len());
             
             for actor_ref in actors.values() {
                 // Spawn a task to stop the actor
@@ -164,10 +187,14 @@ impl ActixActorSystem {
         }
         
         // Wait for actors to stop (could add a timeout here)
+        println!("ActixActorSystem: Waiting for actors to stop");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         
         // Stop the Actix system
+        println!("ActixActorSystem: Stopping the Actix system");
         actix::System::current().stop();
+        println!("ActixActorSystem: System shutdown initiated");
+        tracing::info!("ActixActorSystem: System shutdown initiated");
         
         Ok(())
     }
@@ -179,9 +206,11 @@ impl ActixActorSystem {
     pub fn status(&self) -> SystemStatus {
         SystemStatus {
             state: SystemState::Running,
-            active_actors: self.actors.read().map(|a| a.len()).unwrap_or(0),
-            uptime: Duration::from_secs(0), // 实际应用中应该计算真实运行时间
+            active_actors: self.actors.read().map(|actors| actors.len()).unwrap_or(0),
+            // TODO: calculate actual uptime based on system start timestamp
+            uptime: Duration::from_secs(0),
             resources: SystemResources {
+                // Placeholder resource metrics; integrate real data as needed
                 cpu_usage: 0.0,
                 memory_usage: 0,
                 thread_count: 1,

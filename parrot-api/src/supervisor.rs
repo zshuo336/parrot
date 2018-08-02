@@ -166,9 +166,10 @@ pub trait SupervisorStrategy: Send + Sync + Debug + Clone + 'static {
 ///
 /// These strategies provide basic error handling behaviors without
 /// the need for custom configuration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum DefaultStrategy {
     /// Always terminates the failed actor
+    #[default]
     StopOnFailure,
     /// Always attempts to restart the failed actor
     RestartOnFailure,
@@ -350,6 +351,12 @@ pub enum SupervisorStrategyType {
     OneForOne(OneForOneStrategy),
     /// Coordinated child handling strategy
     OneForAll(OneForAllStrategy),
+}
+
+impl Default for SupervisorStrategyType {
+    fn default() -> Self {
+        Self::Default(DefaultStrategy::default())
+    }
 }
 
 #[async_trait]

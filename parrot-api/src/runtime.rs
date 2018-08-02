@@ -46,7 +46,7 @@ use crate::errors::ActorError;
 ///
 /// This structure defines the resource allocation and execution
 /// parameters for the entire actor system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RuntimeConfig {
     /// Number of threads for processing actor messages.
     ///
@@ -66,7 +66,7 @@ pub struct RuntimeConfig {
 ///
 /// Defines how tasks are queued, executed, and distributed
 /// across worker threads.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SchedulerConfig {
     /// Maximum number of tasks that can be queued.
     ///
@@ -88,11 +88,12 @@ pub struct SchedulerConfig {
 ///
 /// Different strategies optimize for different workload
 /// patterns and performance characteristics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum LoadBalancingStrategy {
     /// Distribute tasks evenly in circular order.
     ///
     /// Best for uniform workloads with similar task costs.
+    #[default]
     RoundRobin,
     
     /// Distribute tasks randomly across workers.

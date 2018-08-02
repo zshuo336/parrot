@@ -414,4 +414,42 @@ mod tests {
         
         assert!(result.is_ok());
     }
+
+    // Test actor with default configuration
+    #[test]
+    fn test_actor_with_default_config() {
+        let rt = Runtime::new().unwrap();
+        let config = create_system_config();
+        
+        let result = rt.block_on(async {
+            let system = MockActorSystem::start(config).await?;
+            
+            // Create an actor using the default configuration
+            let actor = TestActor::default();
+            
+            // Spawn a root actor with the default configuration
+            let config = TestActorConfig::default();
+            let actor_ref = system.spawn_root_typed(actor, config).await?;
+            
+            // Verify that the actor is alive
+            assert!(actor_ref.is_alive().await);
+            
+            // Check that only one actor is active in the system
+            let status = system.status();
+            assert_eq!(status.active_actors, 1);
+            
+            // Send a test message and await the response
+            let msg = Box::new(TestMessage("DefaultConfigTest".to_string())) as BoxedMessage;
+            let response = actor_ref.send(msg).await?;
+            
+            // Unpack and verify the response
+            let unpacked = response.downcast::<TestMessage>();
+            assert!(unpacked.is_ok());
+            assert_eq!(unpacked.unwrap().0, "DefaultConfigTest");
+            
+            Ok::<_, SystemError>(())
+        });
+        
+        assert!(result.is_ok());
+    }
 } 
