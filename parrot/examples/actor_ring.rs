@@ -1,7 +1,7 @@
-// Actor环形队列实现
-// 功能：创建环形Actor队列，实现消息传递、累加和顺序退出
-// 流程：A→B→C→D→E→F→A形成环形，初始消息从A开始传递，每个Actor将值加1并传递
-//       完成环形传递后，启动顺序退出流程，最终整个系统安全退出
+// Actor Ring Implementation
+// Function: Create a ring of actors, implement message passing, accumulation, and sequential exit
+// Process: A→B→C→D→E→F→A forms a ring, initial message starts from A, each actor adds 1 to the value and passes it
+//          After completing the ring cycle, sequential exit process is initiated, eventually the whole system safely exits
 
 use std::time::Duration;
 use parrot::actix::{ActixActorSystem, ActixActor, ActixContext};
@@ -21,46 +21,46 @@ use std::ptr::NonNull;
 use tokio::signal;
 
 //----------------------------------------------------------------------
-// 消息类型定义
+// Message Type Definitions
 //----------------------------------------------------------------------
 
-// NextActorRef：用于传递下一个Actor的引用，建立环形结构
+// NextActorRef: Used to pass the reference to the next actor, establishing the ring structure
 #[derive(Debug, Message)]
 #[message(result = "()")]
 struct NextActorRef {
     next_ref: BoxedActorRef,
 }
 
-// AddMessage：累加消息，包含当前累加值
-// 每个Actor收到后将值加1并发送给下一个
+// AddMessage: Accumulation message, contains the current accumulated value
+// Each actor receives it, adds 1 to the value and sends it to the next actor
 #[derive(Debug, Clone, Message)]
 #[message(result = "u32")]
 struct AddMessage {
     value: u32,
 }
 
-// ExitMessage：退出消息，用于触发Actor的顺序退出
-// 从A开始发送给B，然后B发送给C，依此类推
+// ExitMessage: Exit message, used to trigger sequential actor exit
+// Starts from A sending to B, then B sends to C, and so on
 #[derive(Debug, Clone, Message)]
 #[message(result = "()")]
 struct ExitMessage;
 
 //----------------------------------------------------------------------
-// Actor实现
+// Actor Implementation
 //----------------------------------------------------------------------
 
-// RingActor：环形队列中的节点Actor
-// 处理三种消息类型：NextActorRef、AddMessage和ExitMessage
+// RingActor: Node actor in the ring
+// Handles three types of messages: NextActorRef, AddMessage and ExitMessage
 #[derive(Debug, ParrotActor)]
 #[ParrotActor(engine = "actix")]
 struct RingActor {
-    name: String,           // Actor名称（A-F）
-    next: Option<BoxedActorRef>,  // 下一个Actor的引用
-    state: ActorState,      // Actor的当前状态
+    name: String,           // Actor name (A-F)
+    next: Option<BoxedActorRef>,  // Reference to the next actor
+    state: ActorState,      // Current state of the actor
 }
 
 impl RingActor {
-    // 创建新的RingActor实例
+    // Create a new RingActor instance
     pub fn new(name: String) -> Self {
         Self {
             name,
@@ -69,42 +69,41 @@ impl RingActor {
         }
     }
 
-    // 消息处理方法：处理三种消息类型
-    // 使用match_message!宏进行消息分发，保证类型安全
+    // Message handling method: processes three types of messages
+    // Uses match_message! macro for message dispatch, ensuring type safety
     fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
         let actix_ctx: Option<&ActixBaseContext<ActixActor<Self>>> = unsafe { engine_ctx.as_ref().downcast_ref::<ActixBaseContext<ActixActor<Self>>>() };
         assert!(actix_ctx.is_some());
-        let actix_ctx = actix_ctx.unwrap();
         match_message!("option", self, msg,
-            // 处理NextActorRef消息：接收下一个Actor的引用，建立环形连接
+            // Handle NextActorRef message: receive reference to the next actor, establish ring connection
             NextActorRef => |actor: &mut Self, next_ref: &NextActorRef| {
                 println!("Actor {} received next actor reference", actor.name);
                 actor.next = Some(next_ref.next_ref.clone_boxed());
                 ()
             },
             
-            // 处理AddMessage消息：累加值并传递给下一个Actor
+            // Handle AddMessage: increment value and pass to the next actor
             AddMessage => |actor: &mut Self, add_msg: &AddMessage| {
                 let new_value = add_msg.value + 1;
                 println!("Actor {} received AddMessage with value {}, sending {} to next", 
                          actor.name, add_msg.value, new_value);
                 
-                // 如果是A(第一个Actor)，且接收到来自F的消息(完成一圈)
+                // If this is A (first actor), and received message from F (completed a cycle)
                 if actor.name == "A" && add_msg.value > 1 {
                     println!("Ring completed! Final value: {}", new_value);
                     
-                    // 向下一个Actor发送退出消息启动退出流程
+                    // Send exit message to the next actor to start exit process
                     if let Some(next) = &actor.next {
                         let next_ref = next.clone_boxed();
-                        actix_ctx.spawn(async move {
+                        tokio::spawn(async move {
                             next_ref.ask(ExitMessage).await.unwrap();
                         });
                     }
                 } else if let Some(next) = &actor.next {
-                    // 向下一个Actor发送累加后的消息
+                    // Send incremented message to the next actor
                     let next_ref = next.clone_boxed();
-                    let next_value = new_value;  // 克隆值而不是引用
-                    actix_ctx.spawn(async move {
+                    let next_value = new_value;  // Clone the value, not the reference
+                    tokio::spawn(async move {
                         next_ref.ask(AddMessage { value: next_value }).await.unwrap();
                     });
                 }
@@ -112,28 +111,28 @@ impl RingActor {
                 new_value
             },
             
-            // 处理ExitMessage消息：触发顺序退出流程
+            // Handle ExitMessage: trigger sequential exit process
             ExitMessage => |actor: &mut Self, _: &ExitMessage| {
                 println!("Actor {} received exit message", actor.name);
                 
-                // 如果是A，整个环已经退出完毕，关闭系统
+                // If this is A, the entire ring has completed exit, shut down the system
                 if actor.name == "A" {
                     println!("Actor A received exit message, full ring shutdown completed");
-                    // 异步关闭系统
-                    actix_ctx.spawn(async {
-                        // 给一点时间输出日志
+                    // Asynchronously shut down the system
+                    tokio::spawn(async {
+                        // Give some time for logs to be output
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        // 正常退出程序
+                        // Normal program exit
                         std::process::exit(0);
                     });
                 } else if let Some(next) = &actor.next {
-                    // 向下一个Actor转发退出消息
+                    // Forward exit message to the next actor
                     let next_ref = next.clone_boxed();
-                    actix_ctx.spawn(async move {
+                    tokio::spawn(async move {
                         next_ref.ask(ExitMessage).await.unwrap();
                     });
                     
-                    // 当前Actor将进入Stopping状态
+                    // Current actor will enter Stopping state
                     actor.state = ActorState::Stopping;
                 }
                 
@@ -142,13 +141,13 @@ impl RingActor {
         )
     }
     
-    // 添加状态方法以便Actor系统使用
+    // Add state method for the actor system to use
     fn state(&self) -> ActorState {
         self.state
     }
 }
 
-// 手动为RingActor实现Clone
+// Manually implement Clone for RingActor
 impl Clone for RingActor {
     fn clone(&self) -> Self {
         RingActor {
@@ -160,37 +159,37 @@ impl Clone for RingActor {
 }
 
 //----------------------------------------------------------------------
-// 主程序入口
+// Main Program Entry
 //----------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 使用actix::System作为应用程序的运行环境
+    // Use actix::System as the application runtime environment
     actix::System::new().block_on(async {
         run_ring_example().await
     })
 }
 
-// 运行环形Actor示例的异步函数
+// Async function to run the ring actor example
 async fn run_ring_example() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Actor Ring example");
     
     //----------------------------------------------------------------------
-    // 系统初始化
+    // System Initialization
     //----------------------------------------------------------------------
     
-    // 创建全局Actor系统
+    // Create global Actor system
     let config = ActorSystemConfig::default();
     let system = ParrotActorSystem::new(config).await?;
 
-    // 创建并注册ActixActorSystem
+    // Create and register ActixActorSystem
     let actix_system = ActixActorSystem::new().await?;
     system.register_actix_system("actix".to_string(), actix_system, true).await?;
 
     //----------------------------------------------------------------------
-    // 创建Actor并添加到系统
+    // Create Actors and Add to System
     //----------------------------------------------------------------------
     
-    // 创建6个Actor: A, B, C, D, E, F
+    // Create 6 actors: A, B, C, D, E, F
     let actor_a = RingActor::new("A".to_string());
     let actor_b = RingActor::new("B".to_string());
     let actor_c = RingActor::new("C".to_string());
@@ -198,7 +197,7 @@ async fn run_ring_example() -> Result<(), Box<dyn std::error::Error>> {
     let actor_e = RingActor::new("E".to_string());
     let actor_f = RingActor::new("F".to_string());
     
-    // 将Actor添加到系统中，获取它们的引用
+    // Add actors to the system, get their references
     let a_ref = system.spawn_root_actix(actor_a, EmptyConfig::default()).await?;
     let b_ref = system.spawn_root_actix(actor_b, EmptyConfig::default()).await?;
     let c_ref = system.spawn_root_actix(actor_c, EmptyConfig::default()).await?;
@@ -209,13 +208,13 @@ async fn run_ring_example() -> Result<(), Box<dyn std::error::Error>> {
     println!("All actors spawned");
     
     //----------------------------------------------------------------------
-    // 建立环形连接
+    // Establish Ring Connection
     //----------------------------------------------------------------------
     
-    // 建立环形连接：A -> B -> C -> D -> E -> F -> A
+    // Establish ring connection: A -> B -> C -> D -> E -> F -> A
     println!("Building the ring: A -> B -> C -> D -> E -> F -> A");
     
-    // 发送"下一个Actor引用"消息，建立环形结构
+    // Send "next actor reference" messages to establish the ring structure
     a_ref.ask(NextActorRef { next_ref: b_ref.clone_boxed() }).await?;
     b_ref.ask(NextActorRef { next_ref: c_ref.clone_boxed() }).await?;
     c_ref.ask(NextActorRef { next_ref: d_ref.clone_boxed() }).await?;
@@ -225,33 +224,33 @@ async fn run_ring_example() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("Ring setup completed");
     
-    // 给系统一点时间处理消息
+    // Give the system some time to process messages
     tokio::time::sleep(Duration::from_millis(500)).await;
     
     //----------------------------------------------------------------------
-    // 启动消息传递
+    // Start Message Passing
     //----------------------------------------------------------------------
     
-    // 向A发送初始累加消息，值为1
-    // 这将启动整个消息传递流程：
-    // 1. 每个Actor收到消息后将值加1并发送给下一个
-    // 2. 当A收到来自F的消息后，会打印最终累加值并启动退出流程
-    // 3. 退出流程：A发送退出消息给B，B发送给C，依此类推
-    // 4. 当A收到F的退出消息后，整个系统安全退出
+    // Send initial accumulation message to A with value 1
+    // This will start the entire message passing process:
+    // 1. Each actor receives the message, adds 1 to the value and sends it to the next
+    // 2. When A receives a message from F, it prints the final value and starts the exit process
+    // 3. Exit process: A sends exit message to B, B sends to C, and so on
+    // 4. When A receives exit message from F, the entire system safely exits
     println!("Starting with AddMessage(1) to Actor A");
     let result = a_ref.ask(AddMessage { value: 1 }).await?;
     println!("Initial response from Actor A: {}", result);
     
-    // 等待系统自然退出
-    // 注意：程序会在Actor A收到退出消息后退出，不需要这里主动关闭系统
+    // Wait for the system to naturally exit
+    // Note: The program will exit after Actor A receives the exit message, no need to actively close the system here
     println!("Waiting for ring to process messages and exit");
     
-    // 等待更长时间让消息有足够时间传递，或者等待用户中断程序
+    // Wait longer to give messages enough time to propagate, or wait for user to interrupt the program
     println!("Press Ctrl+C to exit manually if needed...");
     
-    // 两种方式结束程序：
-    // 1. 等待30秒 - 应该足够让消息完成传递
-    // 2. 等待用户按Ctrl+C主动退出
+    // Two ways to end the program:
+    // 1. Wait for 30 seconds - should be enough for messages to complete
+    // 2. Wait for user to press Ctrl+C to exit actively
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_secs(30)) => {
             println!("Timeout reached, exiting...");
