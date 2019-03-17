@@ -104,7 +104,7 @@ where
         let addr = self.addr.clone();
         
         Box::pin(async move {
-            // 将 StopMessage 包装在 ActixMessageWrapper 中
+            // Wrap StopMessage in an ActixMessageWrapper
             let msg = Box::new(StopMessage) as BoxedMessage;
             let envelope = MessageEnvelope {
                 id: uuid::Uuid::new_v4(),

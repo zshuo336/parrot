@@ -109,7 +109,7 @@ pub(crate) fn derive_actor_impl(input: TokenStream) -> TokenStream {
     let config_type = if let Some(ref config_type) = options.config {
         parse_str::<Type>(config_type).unwrap_or_else(|_| parse_str("parrot_api::actor::EmptyConfig").unwrap())
     } else {
-        // 如果未指定配置类型，使用EmptyConfig而不是()
+        // If configuration type is not specified, use EmptyConfig instead of ()
         parse_str("parrot_api::actor::EmptyConfig").unwrap()
     };
     

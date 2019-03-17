@@ -13,6 +13,7 @@ use parrot_api::{
     types::{BoxedMessage, ActorResult, BoxedActorRef},
     system::{ActorSystemConfig, ActorSystem},
     address::ActorRefExt,
+    errors::ActorError,
 };
 use actix::{AsyncContext, Context as ActixBaseContext, Actor as ActixBaseTrait};
 use parrot_api_derive::{Message, ParrotActor};
@@ -67,6 +68,10 @@ impl RingActor {
             next: None,
             state: ActorState::Starting,
         }
+    }
+
+    fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>) -> ActorResult<BoxedMessage> {
+        Err(ActorError::Other(anyhow::anyhow!("Actor {} received message: {:?}", self.name, msg)))
     }
 
     // Message handling method: processes three types of messages
