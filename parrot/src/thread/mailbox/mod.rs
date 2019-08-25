@@ -7,6 +7,7 @@ use crate::thread::error::MailboxError;
 
 pub mod mpsc;
 pub mod spsc;
+pub mod spsc_ringbuf;
 
 /// Abstract interface for an actor's message queue.
 /// Implementors must guarantee FIFO ordering.
