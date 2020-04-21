@@ -52,6 +52,8 @@ pub enum SpawnError {
     SchedulerError(String),
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error("System is shutting down")]
+    SystemShutdown,
 }
 
 /// Errors related to the Actor System itself.
@@ -71,6 +73,8 @@ pub enum SystemError {
     RegistrationError(String),
     #[error("Configuration error: {0}")]
     ConfigError(String),
+    #[error("Operation timed out: {0}")]
+    Timeout(String),
     #[error("Internal system error: {0}")]
     Other(#[from] anyhow::Error),
 }
