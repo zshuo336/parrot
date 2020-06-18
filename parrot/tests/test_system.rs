@@ -66,6 +66,17 @@ impl ActorRef for TestActorRef {
             path_value: self.path_value.clone(),
         })
     }
+
+    fn send_with_timeout(&self, msg: BoxedMessage, timeout: Duration) -> BoxedFuture<'_, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            Ok(msg)
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    
 }
 
 // Define a simple message for broadcast tests

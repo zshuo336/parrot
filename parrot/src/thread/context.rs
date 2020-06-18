@@ -16,6 +16,7 @@ use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 
 use crate::thread::address::ThreadActorRef;
 use crate::thread::config::{BackpressureStrategy, SupervisorStrategy};
+use crate::logging;
 
 /// Weak reference to the actor system to avoid circular references
 pub type WeakSystemRef = Weak<dyn SystemRef + Send + Sync>;
@@ -109,6 +110,14 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         self.self_ref = Some(actor_ref);
     }
     
+    /// get self reference. 
+    /// 
+    /// # Returns
+    /// The actor's own reference, if it is set. otherwise, it will panic.
+    pub fn get_self_ref(&self) -> BoxedActorRef {
+        self.self_ref.as_ref().expect("Self reference not set").clone_boxed()
+    }
+    
     /// Upgrades the weak system reference to a strong reference if available.
     fn system(&self) -> Option<Arc<dyn SystemRef + Send + Sync>> {
         self.system.upgrade()
@@ -116,15 +125,15 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     
     /// Adds a child actor reference.
     pub fn add_child(&mut self, child_ref: BoxedActorRef) {
-        let path = child_ref.path();
-        self.children_refs.insert(path, child_ref);
+        let path_str = child_ref.path();
+        self.children_refs.insert(path_str, child_ref);
     }
     
     /// Removes a child actor reference.
-    pub fn remove_child(&mut self, path: &str) -> Option<BoxedActorRef> {
-        self.children_refs.remove(path)
+    pub fn remove_child(&mut self, path: &ActorPath) -> Option<BoxedActorRef> {
+        self.children_refs.remove(path.path())
     }
-    
+
     /// Sets the backpressure strategy.
     pub fn set_backpressure_strategy(&mut self, strategy: BackpressureStrategy) {
         self.backpressure_strategy = strategy;
@@ -138,7 +147,7 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
 
 impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
     fn get_self_ref(&self) -> BoxedActorRef {
-        self.self_ref.as_ref().expect("Self reference not set").clone_boxed()
+        self.get_self_ref()
     }
     
     fn stop<'a>(&'a mut self) -> BoxedFuture<'a, ActorResult<()>> {
@@ -148,7 +157,10 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
                 
                 // Stop all children
                 for (_, child) in &self.children_refs {
-                    let _ = child.stop().await;
+                    let result = child.stop().await;
+                    if let Err(e) = result {
+                        logging::error!("Failed to stop child actor-{}: {}", child.path(), e);
+                    }
                 }
                 
                 Ok(())
@@ -191,6 +203,7 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         Box::pin(async move {
             let target_clone = target.clone_boxed();
             
+            // Create a task to send the message after the delay
             runtime.spawn(async move {
                 tokio::time::sleep(delay).await;
                 let _ = target_clone.send(msg).await;
@@ -201,18 +214,28 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
     }
     
     fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'a, ActorResult<()>> {
+        use crate::thread::message::BoxedMessageExt;
         let runtime = self.runtime_handle.clone();
         
         Box::pin(async move {
             let target_clone = target.clone_boxed();
             
+            // Try to create a cloneable version of the message
+            // If the message cannot be cloned, we'll create special "tick" messages instead
+            let cloneable_msg = msg.try_clone();
+            
             runtime.spawn(async move {
                 // Initial delay
                 tokio::time::sleep(initial_delay).await;
                 
-                // First message - this is just a simple message for demonstration
-                let first_msg = Box::new(()) as BoxedMessage;
-                let _ = target_clone.send(first_msg).await;
+                // Send first message
+                if let Some(first_msg) = cloneable_msg.as_ref().map(|m| m.try_clone()).flatten() {
+                    let _ = target_clone.send(first_msg).await;
+                } else {
+                    // If message isn't cloneable, send a placeholder "tick" message
+                    let tick_msg = Box::new("periodic_tick") as BoxedMessage;
+                    let _ = target_clone.send(tick_msg).await;
+                }
                 
                 // Set up periodic interval
                 let mut interval_timer = tokio::time::interval(interval);
@@ -220,9 +243,16 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
                 loop {
                     interval_timer.tick().await;
                     
-                    // Create new message for each send - in real implementation this would be cloned properly
-                    let periodic_msg = Box::new(()) as BoxedMessage;
                     let target_copy = target_clone.clone_boxed();
+                    
+                    // Create message for each send
+                    let periodic_msg = if let Some(cloneable) = cloneable_msg.as_ref().map(|m| m.try_clone()).flatten() {
+                        // Use cloned message if available
+                        cloneable
+                    } else {
+                        // Otherwise use placeholder
+                        Box::new("periodic_tick") as BoxedMessage
+                    };
                     
                     if let Err(_) = target_copy.send(periodic_msg).await {
                         // Target is likely dead, stop sending

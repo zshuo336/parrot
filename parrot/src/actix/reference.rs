@@ -5,13 +5,14 @@ use async_trait::async_trait;
 use anyhow::anyhow;
 use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::actor::Actor as ParrotActor;
-use parrot_api::message::{Message, MessageEnvelope};
+use parrot_api::message::{Message, MessageEnvelope, MessageOptions};
 use parrot_api::errors::ActorError;
 use parrot_api::types::{BoxedMessage, BoxedActorRef, BoxedFuture, ActorResult};
 use crate::actix::actor::ActixActor;
 use crate::actix::message::ActixMessageWrapper;
 use crate::actix::context::ActixContext;
-
+use actix::prelude::SendError;
+use std::time::Duration;
 /// An internal message to stop the actor
 #[derive(Debug)]
 pub struct StopMessage;
@@ -56,6 +57,50 @@ where
             path,
         }
     }
+
+    pub fn get_addr(&self) -> &Addr<ActixActor<A>> {
+        &self.addr
+    }
+
+    pub fn get_path(&self) -> &String {
+        &self.path
+    }
+
+    pub fn create_envelope(&self, msg: BoxedMessage, sender: Option<BoxedActorRef>, options: MessageOptions, message_type: &'static str) -> ActixMessageWrapper {
+        let envelope = MessageEnvelope {
+            id: uuid::Uuid::new_v4(),
+            payload: msg,
+            sender,
+            options,
+            message_type,
+        };
+        
+        // Create ActixMessageWrapper
+        let wrapper = ActixMessageWrapper { envelope };
+        wrapper
+    }
+    
+    /// Sends a message unconditionally, ignoring any potential errors.
+    ///
+    /// The message is always queued, even if the mailbox for the receiver is full. If the mailbox
+    /// is closed, the message is silently dropped.
+    pub fn do_send(&self, msg: BoxedMessage) {
+        let wrapper = self.create_envelope(msg, None, MessageOptions::default(), "unknown");
+        self.addr.do_send(wrapper);
+    }
+
+    /// Tries to send a message.
+    ///
+    /// This method fails if actor's mailbox is full or closed. This
+    /// method registers the current task in the receiver's queue.
+    pub fn try_send(&self, msg: BoxedMessage) -> Result<(), SendError<BoxedMessage>> {
+        let wrapper = self.create_envelope(msg, None, MessageOptions::default(), "unknown");
+        self.addr.try_send(wrapper)
+            .map_err(|e| match e {
+                SendError::Full(wrapper) => SendError::Full(wrapper.envelope.payload),
+                SendError::Closed(wrapper) => SendError::Closed(wrapper.envelope.payload),
+            })
+    }
 }
 
 impl<A> std::fmt::Debug for ActixActorRef<A>
@@ -76,29 +121,37 @@ where
 {
     /// Send a message to the actor and wait for a response
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        self.send_with_timeout(msg, None)
+    }
+    
+    /// Send a message to the actor with a timeout
+    /// 
+    /// # Parameters
+    /// - `msg`: The message to send
+    /// - `timeout`: The timeout duration
+    /// 
+    /// # Returns
+    /// A future that resolves to the actor result
+    /// 
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, timeout: Option<Duration> ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         // Create message envelope
-        let envelope = MessageEnvelope {
-            id: uuid::Uuid::new_v4(),
-            payload: msg,
-            sender: None,
-            options: Default::default(),
-            message_type: "unknown",
-        };
-        
-        // Create ActixMessageWrapper
-        let wrapper = ActixMessageWrapper { envelope };
+        let wrapper = self.create_envelope(msg, None, MessageOptions::default(), "unknown");
         let addr = self.addr.clone();
         
         // Send the message via Actix
         Box::pin(async move {
-            match addr.send(wrapper).await {
+            let mut result_fut = addr.send(wrapper);
+            if let Some(timeout) = timeout {
+                result_fut = result_fut.timeout(timeout);
+            }
+            match result_fut.await {
                 Ok(Some(result)) => result,
                 Ok(None) => Err(ActorError::MessageHandlingError("No response from actor".to_string())),
                 Err(e) => Err(ActorError::Other(anyhow!("Failed to deliver message: {}", e))),
             }
         })
     }
-    
+
     /// Stop the actor
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         let addr = self.addr.clone();
@@ -140,5 +193,9 @@ where
             addr: self.addr.clone(),
             path: self.path.clone(),
         })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

@@ -124,10 +124,7 @@ where
         
         // Create a wrapped actor ref for the address
         let actor_ref = ActixActorRef::new(addr.clone(), path_str.clone());
-        let path = ActorPath {
-            target: Arc::new(actor_ref) as WeakActorTarget,
-            path: path_str,
-        };
+        let path = ActorPath::new(Arc::new(actor_ref) as WeakActorTarget, path_str);
         // Create and store the context wrapper
         self.ctx = Some(ActixContext::new(addr, path));
     }

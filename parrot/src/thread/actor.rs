@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use parrot_api::actor::{Actor, ActorState};
 use parrot_api::address::ActorPath;
-use parrot_api::types::{BoxedMessage, ActorResult, BoxedFuture};
+use parrot_api::types::{BoxedMessage, ActorResult, BoxedFuture, BoxedActorRef};
 use parrot_api::errors::ActorError;
 use std::fmt::Debug;
 use std::collections::HashSet;
@@ -17,9 +17,11 @@ use crate::thread::envelope::{AskEnvelope, ControlMessage};
 /// This is a wrapper that adapts the generic Actor trait to the
 /// thread-based execution model, handling message dispatching and lifecycle.
 #[derive(Debug)]
-pub struct ThreadActor<A: Actor + Send + Sync + 'static> 
+pub struct ThreadActor<A>
 where
-    A::Context: std::ops::Deref<Target = ThreadContext<A>>
+    A: Actor + Send + Sync + 'static,
+    // 移除对A::Context的Deref约束，改为强制约束A::Context必须是ThreadContext<A>
+    A::Context: Send + 'static,
 {
     /// The wrapped actor implementation
     inner: A,
@@ -31,9 +33,9 @@ where
     watchers: HashSet<String>,
 }
 
-impl<A: Actor + Send + Sync + 'static> ThreadActor<A> 
+impl<A> ThreadActor<A> 
 where
-    A::Context: std::ops::Deref<Target = ThreadContext<A>>
+    A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
     /// Creates a new ThreadActor wrapping the provided actor implementation.
     pub fn new(actor: A, path: ActorPath) -> Self {
@@ -63,9 +65,7 @@ where
         
         debug!("Initializing actor at path: {}", self.path.path);
         
-        // Call init on the inner actor
-        // Need to cast ctx to A::Context - this is a simplification
-        // In real code this would require proper conversion
+        // 现在ctx就是A::Context，不需要类型转换
         match self.inner.init(ctx).await {
             Ok(_) => {
                 // Transition to Running state is handled by process_message for Start message
@@ -127,7 +127,7 @@ where
             return Err(ActorError::Other(anyhow!("Actor is not running")));
         }
         
-        // Delegate to the inner actor's receive_message method
+        // 不需要类型转换，ctx就是A::Context
         self.inner.receive_message(msg, ctx).await
     }
     
@@ -158,11 +158,13 @@ where
             ControlMessage::ChildFailure { path, reason } => {
                 debug!("Handling ChildFailure message for child {} at parent {}: {}", 
                     path, self.path.path, reason);
-                // Delegate to inner actor's handle_child_terminated
-                // First get the child actor reference
-                // TODO: This is a placeholder - we should get the actual child ref
-                // For now we just create a dummy reference
-                let child_ref = ctx.get_self_ref(); // Placeholder
+                // 获取child_ref
+                let child_ref = if let Some(child) = ctx.children().into_iter().find(|c| c.path() == path) {
+                    child
+                } else {
+                    // 如果找不到子Actor的引用，则创建一个错误
+                    return Err(ActorError::Other(anyhow!("Child actor reference not found")));
+                };
                 
                 self.inner.handle_child_terminated(child_ref, ctx).await?;
                 Ok(Box::new(()))
@@ -191,19 +193,22 @@ where
         }
         
         // Process the payload with the inner actor
-        match self.inner.receive_message(envelope.payload.clone(), ctx).await {
+        // 使用clone_arc()方法来克隆BoxedMessage
+        let payload = envelope.payload.clone_arc();
+        match self.inner.receive_message(payload, ctx).await {
             Ok(response) => {
-                // Send the response back through the reply channel
-                if let Err(e) = envelope.reply.send(Ok(response.clone())) {
+                // 使用类型安全的方式发送回复
+                if let Err(e) = envelope.reply.send(Ok(response)) {
                     error!("Failed to send reply for ask operation: {}", e);
                 }
                 Ok(Box::new(()))
             },
             Err(e) => {
-                // Send the error back through the reply channel
+                // 发送错误回复
                 if let Err(send_err) = envelope.reply.send(Err(e.clone())) {
                     error!("Failed to send error reply for ask operation: {}", send_err);
                 }
+                // 原样返回错误
                 Err(e)
             }
         }
@@ -236,7 +241,7 @@ where
     }
     
     /// Notify all watchers that this actor has terminated
-    fn notify_watchers_of_termination(&self, ctx: &ThreadContext<A>) {
+    fn notify_watchers_of_termination(&self, _ctx: &ThreadContext<A>) {
         if !self.watchers.is_empty() {
             debug!("Notifying {} watchers of termination for actor at {}", 
                 self.watchers.len(), self.path.path);
@@ -244,6 +249,65 @@ where
             // TODO: Implement actual notification logic
             // This would involve sending death notification messages to all watchers
             // For now this is just a placeholder
+        }
+    }
+}
+
+/// 为BoxedMessage添加克隆功能的扩展特性
+trait BoxedMessageClone {
+    /// 尝试克隆BoxedMessage，如果内部类型支持克隆
+    fn clone_arc(&self) -> BoxedMessage;
+}
+
+impl BoxedMessageClone for BoxedMessage {
+    fn clone_arc(&self) -> BoxedMessage {
+        // 这里实现一个简单的克隆策略
+        // 对于常见的类型，我们尝试克隆
+        // 对于其他类型，返回一个空消息
+        
+        if let Some(s) = self.downcast_ref::<String>() {
+            Box::new(s.clone())
+        } else if let Some(b) = self.downcast_ref::<bool>() {
+            Box::new(*b)
+        } else if let Some(i) = self.downcast_ref::<i32>() {
+            Box::new(*i)
+        } else if let Some(i) = self.downcast_ref::<i64>() {
+            Box::new(*i)
+        } else if let Some(u) = self.downcast_ref::<u32>() {
+            Box::new(*u)
+        } else if let Some(u) = self.downcast_ref::<u64>() {
+            Box::new(*u)
+        } else if let Some(f) = self.downcast_ref::<f32>() {
+            Box::new(*f)
+        } else if let Some(f) = self.downcast_ref::<f64>() {
+            Box::new(*f)
+        } else if let Some(v) = self.downcast_ref::<Vec<u8>>() {
+            Box::new(v.clone())
+        } else if let Some(_) = self.downcast_ref::<()>() {
+            Box::new(())
+        } else {
+            // 对于不支持克隆的类型，返回一个空消息
+            Box::new(())
+        }
+    }
+}
+
+// 为ActorError添加Clone特性实现
+impl Clone for ActorError {
+    fn clone(&self) -> Self {
+        match self {
+            ActorError::UnhandledMessage => ActorError::UnhandledMessage,
+            ActorError::SystemError(msg) => ActorError::SystemError(msg.clone()),
+            ActorError::InitializationError(msg) => ActorError::InitializationError(msg.clone()),
+            ActorError::ActorNotFound(path) => ActorError::ActorNotFound(path.clone()),
+            ActorError::Timeout => ActorError::Timeout,
+            ActorError::MessageSendError(msg) => ActorError::MessageSendError(msg.clone()),
+            ActorError::SerializationError(msg) => ActorError::SerializationError(msg.clone()),
+            ActorError::DeserializationError(msg) => ActorError::DeserializationError(msg.clone()),
+            ActorError::StreamError(msg) => ActorError::StreamError(msg.clone()),
+            ActorError::ConfigurationError(msg) => ActorError::ConfigurationError(msg.clone()),
+            ActorError::ActorTerminated(msg) => ActorError::ActorTerminated(msg.clone()),
+            ActorError::Other(err) => ActorError::Other(anyhow!("{}", err)),
         }
     }
 }

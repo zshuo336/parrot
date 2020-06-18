@@ -140,6 +140,13 @@ impl ActorRef for MockActorRef {
         })
     }
 
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            let result = self.send(msg).await;
+            result
+        })
+    }
+
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         let is_alive = self.is_alive.clone();
         Box::pin(async move {
@@ -166,6 +173,10 @@ impl ActorRef for MockActorRef {
             path: self.path.clone(),
             is_alive: self.is_alive.clone(),
         })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

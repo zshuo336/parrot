@@ -34,6 +34,10 @@ where
     addr: Arc<Addr<A>>,
     /// Actor path in the system
     path: ActorPath,
+    /// The actor's parent reference
+    parent: Option<Arc<BoxedActorRef>>,
+    /// The actor's child references
+    children: Option<Arc<Vec<BoxedActorRef>>>,
 }
 
 impl<A> ActixContext<A> 
@@ -49,10 +53,28 @@ where
     /// # Returns
     /// A new ActixContext instance
     pub fn new(addr: Addr<A>, path: ActorPath) -> Self {
-        Self {
+        let ctx = Self {
             addr: Arc::new(addr),
             path,
-        }
+            parent: None,
+            children: None,
+        };
+        ctx
+    }
+
+    /// Create a new ActixContext with a parent reference
+    /// 
+    /// # Parameters
+    /// - `addr`: The Actix address to wrap
+    /// - `path`: Actor path in the system
+    /// - `parent`: The parent actor reference
+    /// 
+    /// # Returns
+    /// A new ActixContext instance
+    pub fn new_with_parent(addr: Addr<A>, path: ActorPath, parent: BoxedActorRef) -> Self {
+        let mut ctx = Self::new(addr, path);
+        ctx.parent = Some(Arc::new(parent));
+        ctx
     }
     
     /// Get the inner Actix address
@@ -67,8 +89,7 @@ where
 {
     /// Get the actor's self reference
     fn get_self_ref(&self) -> BoxedActorRef {
-        // This will be implemented by the actor system when creating the actor
-        unimplemented!("get_self_ref is implemented by the actor system")
+        self.path.target.clone_boxed()
     }
     
     /// Stop the actor execution
@@ -87,27 +108,60 @@ where
     }
     
     /// Send a message to another actor without waiting for a response
-    fn send<'a>(&'a self, _target: BoxedActorRef, _msg: parrot_api::types::BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        // Implementation will be provided by the actor system
-        Box::pin(async { Err(ActorError::Other(anyhow!("send not implemented in context"))) })
+    fn send<'a>(&'a self, target: BoxedActorRef, msg: parrot_api::types::BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            target.send(msg).await.map_err(|e| ActorError::Other(anyhow!("Failed to send message: {}", e)))?;
+            Ok(())
+        })
     }
     
     /// Send a message to another actor and wait for a response
-    fn ask<'a>(&'a self, _target: BoxedActorRef, _msg: parrot_api::types::BoxedMessage) -> BoxedFuture<'a, ActorResult<parrot_api::types::BoxedMessage>> {
-        // Implementation will be provided by the actor system
-        Box::pin(async { Err(ActorError::Other(anyhow!("ask not implemented in context"))) })
+    fn ask<'a>(&'a self, target: BoxedActorRef, msg: parrot_api::types::BoxedMessage) -> BoxedFuture<'a, ActorResult<parrot_api::types::BoxedMessage>> {
+        Box::pin(async move {
+            let result = target.send(msg).await.map_err(|e| ActorError::Other(anyhow!("Failed to send message: {}", e)))?;
+            Ok(result)
+        })
     }
     
     /// Schedule a one-time delayed message
-    fn schedule_once<'a>(&'a self, _target: BoxedActorRef, _msg: parrot_api::types::BoxedMessage, _delay: std::time::Duration) -> BoxedFuture<'a, ActorResult<()>> {
-        // Implementation will be provided by the actor system
-        Box::pin(async { Err(ActorError::Other(anyhow!("schedule_once not implemented in context"))) })
+    fn schedule_once<'a>(&'a self, target: BoxedActorRef, msg: parrot_api::types::BoxedMessage, delay: std::time::Duration) -> BoxedFuture<'a, ActorResult<()>> {
+        // Use a local reference to the inner context
+        let addr = self.addr.clone();
+        
+        Box::pin(async move {
+            // Create a delayed task using actix runtime
+            actix::spawn(async move {
+                // Wait for the specified delay
+                actix::clock::sleep(delay).await;
+                
+                // Send the message after delay
+                target.send(msg).await.ok(); // Ignore send errors for scheduled messages
+            });
+            
+            Ok(())
+        })
     }
     
     /// Schedule a recurring message
-    fn schedule_periodic<'a>(&'a self, _target: BoxedActorRef, _msg: parrot_api::types::BoxedMessage, _initial_delay: std::time::Duration, _interval: std::time::Duration) -> BoxedFuture<'a, ActorResult<()>> {
-        // Implementation will be provided by the actor system
-        Box::pin(async { Err(ActorError::Other(anyhow!("schedule_periodic not implemented in context"))) })
+    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: parrot_api::types::BoxedMessage, initial_delay: std::time::Duration, interval: std::time::Duration) -> BoxedFuture<'a, ActorResult<()>> {
+        // Use a local reference to the inner context
+        let addr = self.addr.clone();
+        
+        Box::pin(async move {
+            // Wait for the initial delay
+            actix::clock::sleep(initial_delay).await;
+            // Send the message after initial delay
+            target.send(msg).await.ok();
+
+            // Create a periodic task
+            loop {
+                // Wait for the interval
+                actix::clock::sleep(interval).await;
+        
+                // Send the message after interval
+                target.send(msg).await.ok();
+            }            
+        })
     }
     
     /// Watch another actor for termination
@@ -118,8 +172,7 @@ where
     /// When the watched actor terminates, this actor will
     /// receive a Terminated message.
     fn watch<'a>(&'a mut self, _target: BoxedActorRef) -> BoxedFuture<'a, ActorResult<()>> {
-        // Implementation will be provided by the actor system
-        Box::pin(async { Err(ActorError::Other(anyhow!("watch not implemented in context"))) })
+        Box::pin(async { Err(ActorError::Other(anyhow!("unwatch not implemented in context"))) })
     }
     
     /// Remove watch for actor termination
@@ -128,16 +181,19 @@ where
         Box::pin(async { Err(ActorError::Other(anyhow!("unwatch not implemented in context"))) })
     }
     
+    /// Set the parent actor reference
+    fn set_parent(&mut self, parent: BoxedActorRef) {
+        self.parent = Some(Arc::new(parent));
+    }
+
     /// Get parent actor reference
     fn parent(&self) -> Option<BoxedActorRef> {
-        // Will be set by the actor system when creating the actor
-        None
+        self.parent.as_ref().map(|p| p.as_ref().clone_boxed())
     }
     
     /// Get references to all child actors
-    fn children(&self) -> Vec<BoxedActorRef> {
-        // Will be managed by the actor system
-        vec![]
+    fn children(&self) -> Option<Arc<Vec<BoxedActorRef>>> {
+        self.children.clone()
     }
     
     /// Set timeout for receiving messages

@@ -2,12 +2,13 @@ use crate::thread::reply::ReplyChannel;
 use parrot_api::types::BoxedMessage;
 use std::fmt::Debug;
 use std::fmt;
+use parrot_api::errors::ActorError;
 
-/// Wrapper for messages sent via 'ask' to carry a reply channel.
-#[derive(Debug)]
+/// Envelope for ask operations, containing the message payload and reply channel.
 pub struct AskEnvelope {
+    /// The actual message being sent
     pub payload: BoxedMessage,
-    /// The channel to send the reply back on.
+    /// Channel to send the reply back to the requester
     pub reply: Box<dyn ReplyChannel>,
 }
 
@@ -20,28 +21,37 @@ impl fmt::Debug for AskEnvelope {
     }
 }
 
-/// 内部控制消息，用于Actor生命周期管理和系统通信
+/// Control messages used internally within the actor system.
 #[derive(Debug)]
 pub enum ControlMessage {
-    /// 启动Actor
+    /// Start processing messages (transition from Starting to Running state)
     Start,
-    
-    /// 停止Actor
+    /// Stop the actor (graceful shutdown)
     Stop,
-    
-    /// 子Actor失败通知
+    /// Notify of a child actor failure
     ChildFailure {
-        /// 失败的子Actor路径
+        /// Path of the failed child actor
         path: String,
-        /// 失败原因
+        /// Reason for failure
         reason: String,
     },
-    
-    /// 系统正在关闭通知
+    /// System is shutting down, stop gracefully
     SystemShutdown,
-    
-    /// 检查Actor健康状态
+    /// Check if actor is healthy (for supervision)
     HealthCheck,
 }
 
 // Note: BoxedMessage already implements Debug, and Box<dyn ReplyChannel> will require ReplyChannel: Debug 
+
+// 实现AskEnvelope的方法，用于发送回复
+impl AskEnvelope {
+    /// 发送成功回复
+    pub async fn reply_success(self, response: BoxedMessage) {
+        self.reply.send_reply(Ok(response)).await;
+    }
+
+    /// 发送错误回复
+    pub async fn reply_error(self, error: ActorError) {
+        self.reply.send_reply(Err(error)).await;
+    }
+} 

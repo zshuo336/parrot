@@ -87,7 +87,6 @@ impl AsyncActor {
                 println!("Received SpawnAsyncTask message: {}", task.name);
                 let task_name = task.name.clone();
                 let duration = task.duration_ms;
-                
                 // Clone address before async closure, instead of directly using context
                 let addr = actix_ctx.address().clone();
                 

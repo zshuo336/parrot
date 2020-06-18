@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::any::Any;
 use std::future::Future;
 use async_trait::async_trait;
-
+use std::time::Duration;
 // Test message types
 #[derive(Debug, Clone)]
 struct TestMessage(u32);
@@ -67,6 +67,13 @@ impl ActorRef for TestActorRef {
             }
         })
     }
+
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            let result = self.send(msg).await;
+            result
+        })
+    }
     
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         let alive = self.alive.clone();
@@ -95,6 +102,10 @@ impl ActorRef for TestActorRef {
             alive: self.alive.clone(),
         })
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // Mock weak actor target for ActorPath testing
@@ -108,6 +119,13 @@ impl ActorRef for MockWeakTarget {
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             Ok(msg)
+        })
+    }
+
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            let result = self.send(msg).await;
+            result
         })
     }
     
@@ -131,6 +149,10 @@ impl ActorRef for MockWeakTarget {
         Box::new(Self {
             path_value: self.path_value.clone(),
         })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
