@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::cell::RefCell;
-use actix::{Context as ActixCtx, ActorContext as ActixActorContext, Actor as ActixActor, Addr, AsyncContext};
-use parrot_api::context::ActorContext;
+use actix::{Actor as ActixActor, ActorContext as ActixActorContext, Addr, AsyncContext, Context as ActixCtx, Message};
+use parrot_api::context::{ActorContext, ReadOnlyChildrenVec};
 use parrot_api::address::ActorPath;
+use parrot_api::message::{BoxedMessageClone, CloneableMessage};
 use parrot_api::types::{BoxedActorRef, BoxedFuture, ActorResult};
 use parrot_api::errors::ActorError;
 use anyhow::anyhow;
+use std::sync::RwLock;
 
 /// ActixContext is a wrapper around actix::Context
 /// 
@@ -37,7 +39,7 @@ where
     /// The actor's parent reference
     parent: Option<Arc<BoxedActorRef>>,
     /// The actor's child references
-    children: Option<Arc<Vec<BoxedActorRef>>>,
+    children: Option<Arc<RwLock<Vec<BoxedActorRef>>>>,
 }
 
 impl<A> ActixContext<A> 
@@ -143,7 +145,7 @@ where
     }
     
     /// Schedule a recurring message
-    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: parrot_api::types::BoxedMessage, initial_delay: std::time::Duration, interval: std::time::Duration) -> BoxedFuture<'a, ActorResult<()>> {
+    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: CloneableMessage, initial_delay: std::time::Duration, interval: std::time::Duration) -> BoxedFuture<'a, ActorResult<()>> {
         // Use a local reference to the inner context
         let addr = self.addr.clone();
         
@@ -151,7 +153,7 @@ where
             // Wait for the initial delay
             actix::clock::sleep(initial_delay).await;
             // Send the message after initial delay
-            target.send(msg).await.ok();
+            target.send(msg.clone().into_boxed()).await.ok();
 
             // Create a periodic task
             loop {
@@ -159,7 +161,7 @@ where
                 actix::clock::sleep(interval).await;
         
                 // Send the message after interval
-                target.send(msg).await.ok();
+                target.send(msg.clone().into_boxed()).await.ok();
             }            
         })
     }
@@ -191,9 +193,29 @@ where
         self.parent.as_ref().map(|p| p.as_ref().clone_boxed())
     }
     
+    /// Add a child actor to the context
+    fn add_child(&mut self, child: BoxedActorRef) {
+        if let Some(children) = &mut self.children {
+            children.write().unwrap().push(child);
+        } else {
+            self.children = Some(Arc::new(RwLock::new(vec![child])));
+        }
+    }
+
+    /// Remove a child actor from the context
+    fn remove_child(&mut self, child: BoxedActorRef) {
+        if let Some(children) = &mut self.children {
+            let mut children = children.write().unwrap();
+            children
+                .iter()
+                .position(|c| c.as_ref().eq(&*child))
+                .map(|index| children.remove(index));
+        }
+    }
+
     /// Get references to all child actors
-    fn children(&self) -> Option<Arc<Vec<BoxedActorRef>>> {
-        self.children.clone()
+    fn children(&self) -> Option<ReadOnlyChildrenVec> {
+        self.children.as_ref().map(|children| ReadOnlyChildrenVec::new(children.clone()))
     }
     
     /// Set timeout for receiving messages

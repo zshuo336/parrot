@@ -1,8 +1,8 @@
-use parrot_api::context::{ActorContext, ActorContextMessage, LifecycleEvent, ScheduledTask, ActorSpawner, ActorSpawnerExt};
+use parrot_api::context::{ActorContext, ActorContextMessage, LifecycleEvent, ScheduledTask, ActorSpawner, ActorSpawnerExt, ReadOnlyChildrenVec};
 use parrot_api::address::{ActorRef, ActorPath};
 use parrot_api::types::{BoxedMessage, ActorResult, BoxedFuture, BoxedActorRef, WeakActorTarget};
 use parrot_api::errors::ActorError;
-use parrot_api::message::Message;
+use parrot_api::message::{Message, CloneableMessage};
 use parrot_api::stream::StreamRegistry;
 use parrot_api::supervisor::{SupervisorStrategyType, OneForOneStrategy, BasicDecisionFn, SupervisionDecision};
 use parrot_api::actor::{Actor, ActorState, ActorConfig};
@@ -291,8 +291,12 @@ impl MockActorContext {
         self
     }
     
-    fn add_child(&mut self, child: MockActorRef) {
-        self.children.write().unwrap().push(child);
+    fn add_child(&mut self, child: BoxedActorRef) {
+        if let Some(mock_ref) = child.as_any().downcast_ref::<MockActorRef>() {
+            self.children.write().unwrap().push(mock_ref.clone());
+        } else {
+            panic!("Expected a MockActorRef");
+        }
     }
 }
 
@@ -329,10 +333,17 @@ impl ActorContext for MockActorContext {
         })
     }
     
-    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage, _initial_delay: Duration, _interval: Duration) -> BoxedFuture<'a, ActorResult<()>> {
-        // For testing, just send once
+    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: CloneableMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'a, ActorResult<()>> {
+        // For testing, just send two messages
         Box::pin(async move {
-            let _ = target.send(msg).await?;
+            // sleep for initial delay
+            tokio::time::sleep(initial_delay).await;
+            // send the message
+            let _ = target.send(msg.clone().into_boxed()).await?;
+            // sleep for interval
+            tokio::time::sleep(interval).await;
+            // send again after interval
+            let _ = target.send(msg.clone().into_boxed()).await?;
             Ok(())
         })
     }
@@ -358,12 +369,23 @@ impl ActorContext for MockActorContext {
     fn parent(&self) -> Option<BoxedActorRef> {
         self.parent.as_ref().map(|p| Box::new(p.clone()) as BoxedActorRef)
     }
-    fn children(&self) -> Option<Arc<Vec<BoxedActorRef>>> {
-        let lock = self.children.read().unwrap();
-        let boxed_refs: Vec<BoxedActorRef> = lock.iter()
-            .map(|r| Box::new(r.clone()) as BoxedActorRef)
-            .collect();
-        Some(Arc::new(boxed_refs))
+
+    fn add_child(&mut self, child: BoxedActorRef) {
+        self.add_child(child);
+    }
+
+    fn remove_child(&mut self, child: BoxedActorRef) {
+        let index = self.children.write().unwrap().iter().position(|c| c.eq(&*child)).unwrap();
+        self.children.write().unwrap().remove(index);
+    }
+
+    fn children(&self) -> Option<ReadOnlyChildrenVec> {
+        let boxed_children = Arc::new(RwLock::new(
+            self.children.read().unwrap().iter()
+                .map(|child| Box::new(child.clone()) as BoxedActorRef)
+                .collect()
+        ));
+        Some(ReadOnlyChildrenVec::new(boxed_children))
     }
     
     fn set_receive_timeout(&mut self, timeout: Option<Duration>) {
@@ -430,13 +452,26 @@ mod tests {
         let child1 = MockActorRef::new("child1");
         let child2 = MockActorRef::new("child2");
         
-        ctx.add_child(child1.clone());
-        ctx.add_child(child2.clone());
+        ctx.add_child(Box::new(child1.clone()) as BoxedActorRef);
+        ctx.add_child(Box::new(child2.clone()) as BoxedActorRef);
         
         let children = ctx.children().unwrap();
         assert_eq!(children.len(), 2);
-        assert_eq!(children[0].path(), "test://actor/child1");
-        assert_eq!(children[1].path(), "test://actor/child2");
+        assert_eq!(children.get(0).unwrap().path(), "test://actor/child1");
+        assert_eq!(children.get(1).unwrap().path(), "test://actor/child2");
+
+        // Test read all
+        let children = ctx.children().unwrap();
+        for child in children.read_all().iter() {
+            assert!(child.path() == "test://actor/child1" || child.path() == "test://actor/child2");
+        }
+
+        // Test child removal
+        ctx.remove_child(Box::new(child1.clone()) as BoxedActorRef);
+        
+        let children = ctx.children().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children.get(0).unwrap().path(), "test://actor/child2");
     }
     
     // Test ActorContext message passing
@@ -483,7 +518,7 @@ mod tests {
             let msg2 = TestMessage { data: 20 };
             let result = ctx.schedule_periodic(
                 target.clone_boxed(),
-                Box::new(msg2),
+                CloneableMessage::from_message(msg2),
                 Duration::from_millis(50),
                 Duration::from_millis(200)
             ).await;
