@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
+use crate::thread::processor::ActorProcessor;
+use std::any::Any;
+use std::sync::Mutex as StdMutex;
 
 /// A single-producer, single-consumer mailbox implementation using tokio channels.
 /// 
@@ -32,6 +35,8 @@ pub struct SpscMailbox {
     message_count: Arc<AtomicUsize>,
     /// Flag indicating if this mailbox has been closed
     is_closed: Arc<AtomicBool>,
+    /// Associated processor
+    processor: Arc<StdMutex<Option<Arc<dyn Any + Send + Sync>>>>
 }
 
 impl SpscMailbox {
@@ -39,6 +44,7 @@ impl SpscMailbox {
     pub fn new(capacity: usize, path: ActorPath) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         let notify = Arc::new(Notify::new());
+        let processor = Arc::new(StdMutex::new(None));
         
         Self {
             sender,
@@ -48,6 +54,7 @@ impl SpscMailbox {
             notify,
             message_count: Arc::new(AtomicUsize::new(0)),
             is_closed: Arc::new(AtomicBool::new(false)),
+            processor,
         }
     }
 
@@ -252,6 +259,25 @@ impl Mailbox for SpscMailbox {
         // Notify anyone waiting on this mailbox that it's now closed
         self.notify.notify_waiters();
     }
+
+    /// associate a processor with this mailbox
+    fn set_processor(&self, processor: Arc<dyn Any + Send + Sync>) {
+        let mut processor_guard = self.processor.lock().unwrap();
+        *processor_guard = Some(processor);
+    }
+    
+    /// get the associated processor
+    fn get_processor(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        let processor_guard = self.processor.lock().unwrap();
+        processor_guard.as_ref().map(|p| p.clone())
+    }
+
+    /// check if there is a processor associated with this mailbox
+    fn has_processor(&self) -> bool {
+        let processor_guard = self.processor.lock().unwrap();
+        processor_guard.is_some()
+    }
+    
 }
 
 #[cfg(test)]

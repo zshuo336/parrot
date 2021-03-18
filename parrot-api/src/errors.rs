@@ -102,6 +102,12 @@ pub enum ActorError {
     #[error("Reply channel error: {0}")]
     ReplyChannelError(String),
 
+    /// Panic error.
+    ///
+    /// This error occurs when a panic occurs in an actor.
+    #[error("Panic: {0}")]
+    Panic(String),
+
     /// Catch-all for other errors.
     ///
     /// This variant wraps any other error types that may occur

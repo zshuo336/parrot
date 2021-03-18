@@ -47,9 +47,8 @@ use crate::thread::error::{SystemError, SpawnError};
 use crate::thread::mailbox::Mailbox;
 use crate::thread::mailbox::mpsc::MpscMailbox;
 use crate::thread::mailbox::spsc_ringbuf::SpscRingbufMailbox;
-use crate::thread::scheduler::{ThreadScheduler, SystemRef as SchedulerSystemRef};
-use crate::thread::scheduler::shared::SharedThreadPool;
-use crate::thread::scheduler::dedicated::DedicatedThreadPool;
+use crate::thread::scheduler::ThreadScheduler;
+use crate::thread::scheduler::ThreadSchedulerFactory;
 
 /// Entry in the actor registry
 struct ActorRegistryEntry {
@@ -123,25 +122,6 @@ impl ContextSystemRef for ThreadActorSystem {
     }
 }
 
-/// Implementation of the SchedulerSystemRef trait for ThreadActorSystem
-impl SchedulerSystemRef for ThreadActorSystem {
-    fn lookup(&self, path: &str) -> Option<Arc<dyn Mailbox>> {
-        let registry = self.registry.read().unwrap();
-        registry.get(path).map(|entry| entry.mailbox.clone())
-    }
-    
-    fn handle_panic(&self, path: &str, error: String) {
-        // TODO: Implement supervision strategy based on actor configuration
-        error!("Actor at path '{}' panicked: {}", path, error);
-        
-        // For now, just log the error and potentially stop the actor
-        // In the future, implement different supervision strategies
-        if let Err(e) = self.stop_by_path(path) {
-            error!("Failed to stop panicked actor '{}': {}", path, e);
-        }
-    }
-}
-
 impl ThreadActorSystem {
     /// Create a new ThreadActorSystem with the given configuration and runtime handle
     pub fn new(config: ThreadActorSystemConfig, runtime_handle: Handle) -> Self {
@@ -150,22 +130,17 @@ impl ThreadActorSystem {
         let shutdown_signal = Arc::new(Notify::new());
         let is_shutting_down = Arc::new(AtomicBool::new(false));
         
-        // Create system reference
-        let system_ref: Weak<dyn SchedulerSystemRef + Send + Sync> = Weak::new();
-        
         // 先创建系统实例
         let system = Self {
             config: config.clone(),
             registry: registry.clone(),
-            shared_scheduler: Arc::new(SharedThreadPool::new(
+            shared_scheduler: Arc::new(ThreadSchedulerFactory::create_shared_scheduler(
                 config.shared_pool_size,
                 runtime_handle.clone(),
                 config.shared_queue_capacity,
-                Some(system_ref.clone())
             )),
-            dedicated_scheduler: Arc::new(DedicatedThreadPool::new(
+            dedicated_scheduler: Arc::new(ThreadSchedulerFactory::create_dedicated_scheduler(
                 runtime_handle.clone(),
-                Some(system_ref),
                 config.max_dedicated_threads
             )),
             runtime_handle,

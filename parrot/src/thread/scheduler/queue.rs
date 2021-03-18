@@ -71,7 +71,7 @@ impl SchedulingQueue {
     /// * `Some(mailbox)` - A mailbox that has messages ready to process
     /// * `None` - The queue is empty
     pub fn try_pop(&self) -> Option<Arc<dyn Mailbox + Send + Sync>> {
-        self.queue.pop().ok()
+        self.queue.pop()
     }
     
     /// Asynchronously waits for a mailbox to become available.
@@ -112,12 +112,7 @@ impl SchedulingQueue {
     /// # Returns
     /// Current queue length
     pub fn len(&self) -> usize {
-        // This is only an approximation, as SegQueue doesn't provide a direct len() method
-        let mut count = 0;
-        for _ in self.queue.iter() {
-            count += 1;
-        }
-        count
+        self.queue.len()
     }
     
     /// Checks if the queue is empty.
