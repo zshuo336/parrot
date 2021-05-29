@@ -10,11 +10,13 @@ use parrot_api::actor::Actor;
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::processor::ActorProcessor;
+use crate::thread::processor::ProcessorInterface;
 use crate::thread::context::ThreadContext;
 
 pub mod mpsc;
 pub mod spsc;
 pub mod spsc_ringbuf;
+
 
 /// Abstract interface for an actor's message queue.
 /// Implementors must guarantee FIFO ordering.
@@ -62,10 +64,10 @@ pub trait Mailbox: Send + Sync + std::fmt::Debug {
     async fn close(&self);
     
     /// Set the processor for this mailbox
-    fn set_processor(&self, processor: Arc<dyn Any + Send + Sync>);
+    fn set_processor(&mut self, processor: Arc<Mutex<dyn ProcessorInterface>>);
     
     /// Get the processor for this mailbox
-    fn get_processor(&self) -> Option<Arc<dyn Any + Send + Sync>>;
+    fn get_processor(&self) -> Option<Arc<Mutex<dyn ProcessorInterface>>>;
     
     /// Check if this mailbox has a processor
     fn has_processor(&self) -> bool;

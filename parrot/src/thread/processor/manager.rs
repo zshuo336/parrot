@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::runtime::Handle;
 use tracing::{info, error, debug};
+use std::any::Any;
 
 use crate::thread::actor::ThreadActor;
 use crate::thread::context::ThreadContext;
@@ -34,17 +35,7 @@ use parrot_api::actor::Actor;
 #[derive(Debug)]
 pub struct ActorProcessorManager {
     /// Registry of created processors
-    processors: Arc<Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>>,
-}
-
-trait BoxClone {
-    fn clone_box(&self) -> Box<dyn std::any::Any + Send + Sync>;
-}
-
-impl<T: 'static + Clone + Send + Sync> BoxClone for T {
-    fn clone_box(&self) -> Box<dyn std::any::Any + Send + Sync> {
-        Box::new(self.clone())
-    }
+    processors: Arc<Mutex<HashMap<String, Arc<Mutex<dyn std::any::Any + Send + Sync>>>>>,
 }
 
 impl ActorProcessorManager {
@@ -70,26 +61,27 @@ impl ActorProcessorManager {
         &self,
         actor: ThreadActor<A>,
         context: ThreadContext<A>,
-        mailbox: Arc<dyn Mailbox>,
+        mailbox: Arc<Mutex<dyn Mailbox>>,
         path: String,
         config: ThreadActorConfig,
-    ) -> Arc<ActorProcessor<A>>
+    ) -> Arc<Mutex<ActorProcessor<A>>>
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
         // Create actor processor
-        let processor = Arc::new(ActorProcessor::new(
+        let processor = Arc::new(Mutex::new(ActorProcessor::new(
             actor,
             context,
             mailbox.clone(),
             path.clone(),
             config,
-        ));
+        )));
         
         debug!("Created processor for actor at {}", path);
         
         // Register the processor with the mailbox
-        mailbox.set_processor(processor.clone());
+        let mut mailbox_guard = mailbox.lock().unwrap();
+        mailbox_guard.set_processor(processor.clone());
         
         processor
     }
@@ -109,10 +101,10 @@ impl ActorProcessorManager {
         &self,
         actor: ThreadActor<A>,
         context: ThreadContext<A>,
-        mailbox: Arc<dyn Mailbox>,
+        mailbox: Arc<Mutex<dyn Mailbox>>,
         path: String,
         config: ThreadActorConfig,
-    ) -> Arc<ActorProcessor<A>>
+    ) -> Arc<Mutex<ActorProcessor<A>>>
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
@@ -126,26 +118,32 @@ impl ActorProcessorManager {
     }
     
     /// Find processor by path
-    pub fn get_processor_by_path(&self, path: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+    pub fn get_processor_by_path(&self, path: &str) -> Option<Arc<Mutex<dyn std::any::Any + Send + Sync>>> {
         let processors = self.processors.lock().unwrap();
         processors.get(path).map(|p| p.clone())
     }
     
     /// Find processor by path and downcast to specific type
-    pub fn get_processor_by_path_as<A>(&self, path: &str) -> Option<Arc<ActorProcessor<A>>> 
+    pub fn get_processor_by_path_as<A>(&self, path: &str) -> Option<Arc<Mutex<ActorProcessor<A>>>> 
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
         let processor_any = self.get_processor_by_path(path)?;
         
-        // Try to downcast to the specific processor type
-        match processor_any.downcast::<ActorProcessor<A>>() {
-            Ok(processor) => Some(processor.clone()),
-            Err(_) => {
-                debug!("Failed to downcast processor for actor at {}", path);
-                None
-            }
+        // check type
+        let guard = processor_any.lock().unwrap();
+        if !guard.is::<ActorProcessor<A>>() {
+            debug!("Failed to downcast processor for actor at {}: type mismatch", path);
+            return None;
         }
+        drop(guard);
+        
+        // clone the original Arc to keep the reference count
+        let cloned = processor_any.clone();
+        // then convert to the desired type
+        let ptr = Arc::into_raw(cloned);
+        let typed_ptr = ptr as *const Mutex<ActorProcessor<A>>;
+        Some(unsafe { Arc::from_raw(typed_ptr) })
     }
     
     /// Check if processor exists
@@ -160,13 +158,13 @@ impl ActorProcessorManager {
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
         let mut processors = self.processors.lock().unwrap();
-        let processor_arc = Arc::new(processor);
+        let processor_arc = Arc::new(Mutex::new(processor));
         processors.insert(path.clone(), processor_arc);
         debug!("Registered processor for actor at {}", path);
     }
     
     /// Register processor with Arc
-    pub fn register_processor_arc<A>(&self, path: String, processor: Arc<ActorProcessor<A>>) 
+    pub fn register_processor_arc<A>(&self, path: String, processor: Arc<Mutex<ActorProcessor<A>>>) 
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
@@ -199,7 +197,7 @@ impl ActorProcessorManager {
     }
     
     /// Get processor registry reference
-    pub fn processors_ref(&self) -> Arc<Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>> {
+    pub fn processors_ref(&self) -> Arc<Mutex<HashMap<String, Arc<Mutex<dyn std::any::Any + Send + Sync>>>>> {
         self.processors.clone()
     }
     
@@ -240,7 +238,7 @@ impl ActorProcessorManager {
 }
 
 /// Helper function to extract processor status from any processor type
-fn extract_processor_status(processor_any: &Arc<dyn std::any::Any + Send + Sync>) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+fn extract_processor_status(processor_any: &Arc<Mutex<dyn std::any::Any + Send + Sync>>) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
     // Try different possible processor types
     // In reality, you would use a trait or other mechanism to abstract this
     

@@ -59,6 +59,8 @@ pub enum SpawnError {
 /// Errors related to the Actor System itself.
 #[derive(Error, Debug)]
 pub enum SystemError {
+    #[error("Thread setup error: {0}")]
+    ThreadSetupError(String),
     #[error("Actor system is not running")]
     NotRunning,
     #[error("Actor system is already shutting down")]
@@ -75,6 +77,8 @@ pub enum SystemError {
     ConfigError(String),
     #[error("Operation timed out: {0}")]
     Timeout(String),
+    #[error("Worker state error: {0}")]
+    WorkerStateError(String),
     #[error("Internal system error: {0}")]
     Other(#[from] anyhow::Error),
 }

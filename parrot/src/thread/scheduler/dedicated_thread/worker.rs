@@ -18,12 +18,10 @@ use std::time::Duration;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::collections::HashMap;
-use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::thread;
 
-use tokio::runtime::Handle;
 use tokio::sync::{oneshot, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -33,8 +31,13 @@ use tracing::{debug, error, info, warn};
 use crate::thread::mailbox::Mailbox;
 use crate::thread::error::SystemError;
 use crate::thread::config::ThreadActorConfig;
+use crate::thread::context::ThreadContext;
 use crate::thread::system::ThreadActorSystem;
+use crate::thread::processor::{ActorProcessor, ProcessorStats, ProcessorStatsTrait};
 use parrot_api::types::BoxedMessage;
+use parrot_api::actor::Actor;
+
+use std::any::Any;
 
 // Constants for configuration
 const DEFAULT_BATCH_SIZE: usize = 10;
@@ -65,15 +68,18 @@ pub enum WorkerState {
     
     /// Worker is idle, waiting for work
     Idle = 1,
+
+    /// Worker is paused, waiting for resume
+    Paused = 2,
     
     /// Worker is processing a message
-    Processing = 2,
+    Processing = 3,
     
     /// Worker is shutting down
-    ShuttingDown = 3,
+    ShuttingDown = 4,
     
     /// Worker has encountered an error
-    Error = 4,
+    Error = 5,
 }
 
 /// Dedicated worker implementation for compute-intensive actors
@@ -93,9 +99,6 @@ pub struct Worker {
     /// Worker state
     state: Arc<AtomicUsize>,
     
-    /// Stats collection
-    stats: Mutex<WorkerStats>,
-    
     /// Worker thread join handle
     join_handle: Mutex<Option<JoinHandle<()>>>,
     
@@ -109,7 +112,8 @@ pub struct Worker {
     command_rx: Mutex<Option<mpsc::Receiver<WorkerCommand>>>,
 }
 
-impl fmt::Debug for Worker {
+impl fmt::Debug for Worker
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Worker")
             .field("path", &self.path)
@@ -131,7 +135,6 @@ impl Clone for Worker {
             config: self.config.clone(),
             shutdown_flag: self.shutdown_flag.clone(),
             state: self.state.clone(),
-            stats: Mutex::new(self.get_stats()),
             join_handle: Mutex::new(None),
             batch_size: self.batch_size,
             command_tx,
@@ -150,7 +153,6 @@ impl Worker {
     ) -> Self {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let state = Arc::new(AtomicUsize::new(WorkerState::Initializing as usize));
-        let stats = Mutex::new(WorkerStats::default());
         
         // Create command channel
         let (command_tx, command_rx) = mpsc::channel(32);
@@ -161,7 +163,6 @@ impl Worker {
             config,
             shutdown_flag,
             state,
-            stats,
             join_handle: Mutex::new(None),
             batch_size,
             command_tx,
@@ -169,8 +170,28 @@ impl Worker {
         }
     }
     
+    /// Get processor by mailbox
+    fn run_processor<A, F>(&self, f: F) -> Result<(), SystemError>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+        F: FnOnce(&ActorProcessor<A>) -> Result<(), SystemError>,
+    {
+        match self.mailbox.get_processor() {
+            Some(processor) => {
+                let processor_ref = processor.lock().unwrap();
+                processor_ref.as_any_ref().downcast_ref::<ActorProcessor<A>>()
+                    .map(|actor_processor| f(actor_processor))
+                    .unwrap_or_else(|| Err(SystemError::Other(anyhow::anyhow!("Processor is not an ActorProcessor"))))
+            },
+            None => Err(SystemError::Other(anyhow::anyhow!("No processor found")))
+        }
+    }
+
     /// Start this worker
-    pub fn start(&self) -> Result<(), SystemError> {
+    pub fn start<A>(&self) -> Result<(), SystemError>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
         debug!("Starting dedicated worker for actor {}", self.path);
         
         // Get command receiver
@@ -182,7 +203,6 @@ impl Worker {
         };
         
         // Create clones for the new thread
-        let shutdown_flag = self.shutdown_flag.clone();
         let state = self.state.clone();
         let path = self.path.clone();
         let worker_self = self.clone();
@@ -212,7 +232,7 @@ impl Worker {
             // Run the worker's run method inside this dedicated runtime
             match rt.block_on(async {
                 // Run the worker's main loop
-                worker_self.run(command_rx).await;
+                worker_self.run::<A>(command_rx).await
             }) {
                 Ok(_) => debug!("Worker {} completed successfully", path),
                 Err(e) => error!("Worker {} failed with error: {:?}", path, e)
@@ -242,7 +262,7 @@ impl Worker {
         
         // Send shutdown command
         if let Err(e) = self.command_tx.send(WorkerCommand::Shutdown).await {
-            return Err(SystemError::ThreadShutdownError(
+            return Err(SystemError::ShutdownError(
                 format!("Failed to send shutdown command to worker {}: {}", self.path, e)
             ));
         }
@@ -256,7 +276,7 @@ impl Worker {
             // Since we're now using tokio's JoinHandle that wraps std::thread::JoinHandle,
             // we can await it directly
             if let Err(e) = handle.await {
-                return Err(SystemError::ThreadShutdownError(
+                return Err(SystemError::ShutdownError(
                     format!("Error waiting for worker {} to stop: {:?}", self.path, e)
                 ));
             }
@@ -269,7 +289,7 @@ impl Worker {
     pub async fn pause(&self) -> Result<(), SystemError> {
         if let Err(e) = self.command_tx.send(WorkerCommand::Pause).await {
             return Err(SystemError::Other(
-                format!("Failed to send pause command to worker {}: {}", self.path, e)
+                anyhow::anyhow!("Failed to send pause command to worker {}: {}", self.path, e)
             ));
         }
         
@@ -280,7 +300,7 @@ impl Worker {
     pub async fn resume(&self) -> Result<(), SystemError> {
         if let Err(e) = self.command_tx.send(WorkerCommand::Resume).await {
             return Err(SystemError::Other(
-                format!("Failed to send resume command to worker {}: {}", self.path, e)
+                anyhow::anyhow!("Failed to send resume command to worker {}: {}", self.path, e)
             ));
         }
         
@@ -298,9 +318,13 @@ impl Worker {
         }
     }
     
-    /// Get worker stats
-    pub fn get_stats(&self) -> WorkerStats {
-        self.stats.lock().unwrap().clone()
+    /// Get processor stats
+    fn get_stats(&self) -> Arc<ProcessorStats> {
+        self.mailbox.get_processor()
+            .and_then(|processor| {
+                processor.lock().unwrap().get_statistics()
+            })
+            .unwrap_or_default()
     }
     
     /// Get worker state atomic reference
@@ -309,7 +333,10 @@ impl Worker {
     }
     
     /// Main worker thread loop
-    async fn run(&self, mut command_rx: mpsc::Receiver<WorkerCommand>) {
+    async fn run<A>(&self, mut command_rx: mpsc::Receiver<WorkerCommand>) -> Result<(), SystemError>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
         debug!("Starting dedicated worker for actor {}", self.path);
         
         // Update worker state to idle
@@ -330,6 +357,7 @@ impl Worker {
                 }
                 Ok(WorkerCommand::Pause) => {
                     debug!("Received pause command for worker {}", self.path);
+                    self.state.store(WorkerState::Paused as usize, Ordering::Relaxed);
                     // Pause the processing - we'll implement this by not processing messages 
                     // and just waiting for the next command
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -354,7 +382,7 @@ impl Worker {
             
             // Process messages with panic recovery
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                self.process_messages(self.batch_size)
+                self.process_messages::<A>(self.batch_size)
             }));
             
             match result {
@@ -376,6 +404,7 @@ impl Worker {
                     
                     // Mark worker as having encountered an error
                     self.state.store(WorkerState::Error as usize, Ordering::Relaxed);
+                    return Err(SystemError::WorkerStateError(error_msg));
                 }
             }
             
@@ -386,10 +415,14 @@ impl Worker {
         // Worker is shutting down
         self.state.store(WorkerState::ShuttingDown as usize, Ordering::Relaxed);
         debug!("Dedicated worker for actor {} shutting down", self.path);
+        Ok(())
     }
     
     /// Process messages using processor
-    async fn process_messages(&self, max_messages: usize) -> anyhow::Result<()> {
+    async fn process_messages<A>(&self, max_messages: usize) -> anyhow::Result<()> 
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
         // Get yield flag from config or use default (false)
         let yield_after_each_message = self.config.yield_after_each_message
             .unwrap_or(false);
@@ -402,115 +435,28 @@ impl Worker {
         }
         
         // get processor reference
-        let processor_ref_any = self.mailbox.get_processor_ref().ok_or_else(|| {
-            anyhow!("Failed to get processor for actor {}", self.path)
-        })?;
-        
-        let mut processed = 0;
-        
-        // process batch_size messages
-        for _ in 0..max_messages {
-            // get next message
-            match self.mailbox.pop().await {
-                Some(message) => {
-                    // directly use processor to process message, not put back to mailbox
-                    let process_result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        self.process_message_with_processor_ref(processor_ref_any, message)
-                    }));
-                    
-                    match process_result {
-                        Ok(future) => {
-                            // execute the future to process message
-                            match future.await {
-                                Ok(_) => {
-                                    // message processed successfully
-                                    processed += 1;
-                                    
-                                    // update stats
-                                    {
-                                        let mut stats = self.stats.lock().unwrap();
-                                        stats.messages_processed += 1;
-                                    }
-                                    
-                                    // if yield after each message is configured, yield now
-                                    if yield_after_each_message {
-                                        tokio::task::yield_now().await;
-                                    }
-                                },
-                                Err(e) => {
-                                    // message processing error
-                                    error!("Error processing message for actor {}: {}", self.path, e);
-                                    
-                                    // update stats
-                                    {
-                                        let mut stats = self.stats.lock().unwrap();
-                                        stats.errors_encountered += 1;
-                                    }
+        match self.mailbox.get_processor() {
+            Some(p) => {
+                let processor_ref = p.lock().unwrap();
+                match processor_ref.as_any_ref().downcast_ref::<ActorProcessor<A>>() {
+                    Some(actor_processor) => {
+                        match actor_processor.process_batch_of_messages(max_messages, yield_after_each_message).await {
+                            Ok((_processed, error_count)) => {
+                                if error_count > 0 {
+                                    error!("Error processing messages for actor {}: {}", self.path, error_count);
                                 }
+                                Ok(())
                             }
-                        },
-                        Err(panic_error) => {
-                            // processor processing message panicked
-                            let error_msg = match panic_error.downcast::<String>() {
-                                Ok(string) => format!("Panic in actor {}: {}", self.path, string),
-                                Err(e) => format!("Panic in actor {}: {:?}", self.path, e),
-                            };
-                            
-                            error!("{}", error_msg);
-                            
-                            // update stats
-                            {
-                                let mut stats = self.stats.lock().unwrap();
-                                stats.errors_encountered += 1;
+                            Err(e) => {
+                                Err(anyhow::Error::msg(format!("Error processing messages for actor {}: {}", self.path, e)))
                             }
-                            
-                            // break the processing loop
-                            break;
                         }
-                    }
-                },
-                None => {
-                    // no more messages
-                    break;
+                    },
+                    None => return Err(anyhow!("Processor type mismatch for actor {}", self.path))
                 }
-            }
+            },
+            None => return Err(anyhow!("Failed to get processor for actor {}", self.path))
         }
-        
-        debug!("Processed {} messages for actor {}", processed, self.path);
-        Ok(())
     }
     
-    /// use processor to process message
-    /// note: this method returns a Future, which is responsible for execution by the caller
-    fn process_message_with_processor_ref(
-        &self,
-        processor_ref_any: Arc<dyn Any + Send + Sync>,
-        message: BoxedMessage
-    ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send + '_>> {
-        Box::pin(async move {
-            // first try to convert processor to the base type of ActorProcessor
-            // so that we can directly call process_message method
-            
-            // try to convert processor to several possible processor types
-            // note: in actual system, you should know the exact processor type
-            
-            // try to use system reference to process message
-            if let Some(system) = self.system.upgrade() {
-                // system should know how to process message
-                // since ThreadContext has all related information, it can correctly process message
-                // process message and return result
-                return system.handle_message(&self.path, message).await
-                    .map_err(|e| anyhow!("Error processing message via system: {}", e));
-            }
-            
-            // we can try some direct conversions, although it's unlikely to succeed
-            for &type_name in &["ActorProcessor", "ThreadProcessor", "DefaultProcessor"] {
-                info!("Attempting to process message as {}", type_name);
-            }
-            
-            // if we can't process, record warning
-            warn!("Could not find suitable processor for actor {}", self.path);
-            Err(anyhow!("Could not process message for actor {}", self.path))
-        })
-    }
 } 

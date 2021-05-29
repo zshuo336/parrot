@@ -49,7 +49,9 @@ use crate::thread::mailbox::mpsc::MpscMailbox;
 use crate::thread::mailbox::spsc_ringbuf::SpscRingbufMailbox;
 use crate::thread::scheduler::ThreadScheduler;
 use crate::thread::scheduler::ThreadSchedulerFactory;
-
+use crate::thread::scheduler::shared::SharedThreadPoolConfig;
+use crate::thread::scheduler::dedicated_thread::DedicatedThreadConfig;
+use crate::thread::scheduler::SchedulerGroup;
 /// Entry in the actor registry
 struct ActorRegistryEntry {
     /// Reference to the actor for sending messages
@@ -73,11 +75,8 @@ pub struct ThreadActorSystem {
     /// Registry of all active actors
     registry: Arc<RwLock<HashMap<String, ActorRegistryEntry>>>,
     
-    /// Shared thread pool scheduler
-    shared_scheduler: Arc<dyn ThreadScheduler>,
-    
-    /// Dedicated thread pool scheduler
-    dedicated_scheduler: Arc<dyn ThreadScheduler>,
+    /// Scheduler group
+    scheduler_group: Arc<SchedulerGroup>,
     
     /// Runtime handle for spawning async tasks
     runtime_handle: Handle,
@@ -130,19 +129,17 @@ impl ThreadActorSystem {
         let shutdown_signal = Arc::new(Notify::new());
         let is_shutting_down = Arc::new(AtomicBool::new(false));
         
-        // 先创建系统实例
+        let scheduler_factory = ThreadSchedulerFactory::new(runtime_handle.clone());
+        let shared_scheduler_config = SharedThreadPoolConfig::default();
+        let dedicated_scheduler_config = DedicatedThreadConfig::default();
+
+        let scheduler_group = scheduler_factory.create_scheduler_group(Some(shared_scheduler_config), Some(dedicated_scheduler_config));
+
+        // create system
         let system = Self {
             config: config.clone(),
             registry: registry.clone(),
-            shared_scheduler: Arc::new(ThreadSchedulerFactory::create_shared_scheduler(
-                config.shared_pool_size,
-                runtime_handle.clone(),
-                config.shared_queue_capacity,
-            )),
-            dedicated_scheduler: Arc::new(ThreadSchedulerFactory::create_dedicated_scheduler(
-                runtime_handle.clone(),
-                config.max_dedicated_threads
-            )),
+            scheduler_group: Arc::new(scheduler_group),
             runtime_handle,
             shutdown_signal,
             is_shutting_down,
@@ -175,14 +172,10 @@ impl ThreadActorSystem {
     }
     
     /// Spawn a new actor within the system
-    pub fn spawn_internal<A>(&self, 
-                           actor: A,
-                           config: A::Config,
-                           parent_path: Option<&str>,
-                           actor_name: &str) 
-                           -> Result<Arc<dyn ActorRef>, SpawnError>
+    pub fn spawn_internal<A>(&self, actor: A, config: A::Config, parent_path: Option<&str>, actor_name: &str) 
+        -> Result<Arc<dyn ActorRef>, SpawnError>
     where
-        A: Actor + Send + Sync + 'static,
+        A: parrot_api::actor::Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
         if self.is_shutting_down() {
             return Err(SpawnError::SystemShutdown);
@@ -262,11 +255,12 @@ impl ThreadActorSystem {
         );
         
         // Create the actor reference
-        let actor_ref = Arc::new(ThreadActorRef::new(
+        let actor_ref = Arc::new(ThreadActorRef::<A>::new(
             path.clone(),
             weak_mailbox,
             config.backpressure_strategy.clone().unwrap_or(BackpressureStrategy::Block),
             config.ask_timeout.unwrap_or(Duration::from_secs(5)),
+            Some(Arc::downgrade(&self.scheduler_group)),
         ));
         
         // 更新ActorPath中的target
@@ -639,14 +633,14 @@ impl ActorSystem for ThreadActorSystem {
         Ok(system)
     }
     
-    async fn spawn_root_typed<A>(&self, actor: A, config: A::Config) -> Result<Box<dyn ActorRef>, parrot_api::system::SystemError>
+    async fn spawn_root_typed<A>(&self, actor: A, config: A::Config) -> Result<Arc<dyn ActorRef>, parrot_api::system::SystemError>
     where
-        A: Actor + Send + 'static,
+        A: parrot_api::actor::Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
         let actor_name = format!("actor-{}", uuid::Uuid::new_v4());
         
         match self.spawn_internal(actor, config, None, &actor_name) {
-            Ok(actor_ref) => Ok(Box::new(actor_ref) as Box<dyn ActorRef>),
+            Ok(actor_ref) => Ok(actor_ref),
             Err(e) => Err(parrot_api::system::SystemError::ActorCreationError(e.to_string())),
         }
     }
