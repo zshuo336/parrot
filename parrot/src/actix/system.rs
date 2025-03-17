@@ -42,15 +42,15 @@ pub struct ActixActorSystem {
     default_dispatcher: Arc<RwLock<Option<String>>>,
 }
 
-// 手动实现Clone，共享某些锁内数据
+// Manually implement Clone, sharing certain locked data
 impl Clone for ActixActorSystem {
     fn clone(&self) -> Self {
         Self {
             system: self.system.clone(),
-            actors: Arc::new(RwLock::new(HashMap::new())), // 新的空actors集合
+            actors: self.actors.clone(),        // Share actors collection instead of creating a new empty map
             config: self.config.clone(),
-            registry: self.registry.clone(),              // 共享registry数据
-            default_dispatcher: self.default_dispatcher.clone(), // 共享dispatcher设置
+            registry: self.registry.clone(),    // Share registry data
+            default_dispatcher: self.default_dispatcher.clone(), // Share dispatcher settings
         }
     }
 }
@@ -64,9 +64,9 @@ impl ActixActorSystem {
     /// # Returns
     /// A new ActixActorSystem instance or error
     pub async fn new() -> Result<Self, SystemError> {
-        // 不在这里创建新的Actix系统，而是使用当前运行时
+        // Don't create a new Actix system here, use the current runtime instead
         Ok(Self {
-            // 使用Tokio运行时的spawn方法而不是创建新系统
+            // Use Tokio runtime's spawn method instead of creating a new system
             system: Arc::new(ActixSystem::current()),
             actors: Arc::new(RwLock::new(HashMap::new())),
             config: ActorSystemConfig::default(),
@@ -90,15 +90,21 @@ impl ActixActorSystem {
     where
         A: ParrotActor<Context = ActixContext<ActixActor<A>>> + Unpin + 'static 
     {
+        // Get type name as actor name
+        let type_name = std::any::type_name::<A>();
+        let actor_name = match type_name.rsplit("::").next() {
+            Some(name) => name,
+            None => "unknown"
+        };
+        
         // Create ActixActor wrapper
         let actor_base = ActixActor::new(actor);
         
-        // Start the actor in the current Actix system instead of creating a new one
-        // Use the system handle we already have
+        // Start the actor in the current Actix system
         let addr = actix::Actor::start(actor_base);
         
         // Generate actor path
-        let path = format!("actix://{:?}", addr.clone());
+        let path = format!("actix://{}", actor_name);
         
         // Create actor reference
         let actor_ref = Box::new(ActixActorRef::new(addr, path.clone())) as Box<dyn ActorRef>;

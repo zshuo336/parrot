@@ -14,6 +14,7 @@ use parrot_api::{
     types::{BoxedMessage, ActorResult, BoxedActorRef, BoxedFuture},
     system::{ActorSystemConfig, ActorSystem},
     address::ActorRefExt,
+    errors::ActorError,
     match_message,
     message_response_ok,
 };
