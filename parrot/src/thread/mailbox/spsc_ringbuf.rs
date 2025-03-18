@@ -11,7 +11,9 @@ use parrot_api::types::{BoxedMessage, WeakActorTarget, BoxedActorRef, ActorResul
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
-
+use crate::thread::processor::ActorProcessor;
+use std::any::Any;
+use std::sync::Mutex;
 
 /// A single-producer, single-consumer mailbox implementation using ringbuf and tokio::sync::Notify.
 /// 
@@ -45,6 +47,8 @@ pub struct SpscRingbufMailbox {
     is_closed: Arc<AtomicBool>,
     /// Counter for current messages in the mailbox
     message_count: Arc<AtomicUsize>,
+    /// Associated processor
+    processor: Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>
 }
 
 impl std::fmt::Debug for SpscRingbufMailbox {
@@ -65,6 +69,7 @@ impl SpscRingbufMailbox {
         // Create a ringbuffer with the specified capacity
         let rb = HeapRb::<BoxedMessage>::new(capacity);
         let (producer, consumer) = rb.split();
+        let processor = Arc::new(Mutex::new(None));
         
         Self {
             // Wrap producer and consumer in Tokio Mutexes
@@ -76,6 +81,7 @@ impl SpscRingbufMailbox {
             is_ready: Arc::new(AtomicBool::new(false)),
             is_closed: Arc::new(AtomicBool::new(false)),
             message_count: Arc::new(AtomicUsize::new(0)),
+            processor,
         }
     }
     
@@ -314,6 +320,25 @@ impl Mailbox for SpscRingbufMailbox {
         // Notify anyone waiting on this mailbox that it's now closed
         self.notify.notify_waiters();
     }
+
+    /// associate a processor with this mailbox
+    fn set_processor(&self, processor: Arc<dyn Any + Send + Sync>) {
+        let mut processor_guard = self.processor.lock().unwrap();
+        *processor_guard = Some(processor);
+    }
+    
+    /// get the associated processor
+    fn get_processor(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        let processor_guard = self.processor.lock().unwrap();
+        processor_guard.as_ref().map(|p| p.clone())
+    }
+    
+    /// check if there is a processor associated with this mailbox
+    fn has_processor(&self) -> bool {
+        let processor_guard = self.processor.lock().unwrap();
+        processor_guard.is_some()
+    }
+    
 }
 
 #[cfg(test)]

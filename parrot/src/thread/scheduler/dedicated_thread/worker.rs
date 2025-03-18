@@ -13,366 +13,504 @@
 //! - Error handling: Robust panic handling and reporting
 //! - Controlled shutdown: Clean termination of worker threads
 
-use std::sync::{Arc, Weak, Mutex};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Weak, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::time::Duration;
 use std::fmt;
-use std::error::Error;
+use std::panic::{self, AssertUnwindSafe};
+use std::collections::HashMap;
+use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
+use std::thread;
 
 use tokio::runtime::Handle;
 use tokio::sync::{oneshot, mpsc};
-use tokio::time::timeout;
+use tokio::task::JoinHandle;
+use tokio::time;
+use anyhow::anyhow;
+use tracing::{debug, error, info, warn};
 
 use crate::thread::mailbox::Mailbox;
+use crate::thread::error::SystemError;
 use crate::thread::config::ThreadActorConfig;
+use crate::thread::system::ThreadActorSystem;
+use parrot_api::types::BoxedMessage;
 
-use super::SystemRef;
+// Constants for configuration
+const DEFAULT_BATCH_SIZE: usize = 10;
+const DEFAULT_IDLE_SLEEP_DURATION: Duration = Duration::from_millis(10);
+const DEFAULT_THREAD_STACK_SIZE: usize = 3 * 1024 * 1024; // 3MB
 
-/// States a worker can be in
+/// Commands sent to worker threads
+#[derive(Debug)]
+pub enum WorkerCommand {
+    /// Shutdown the worker
+    Shutdown,
+    
+    /// Pause processing
+    Pause,
+    
+    /// Resume processing
+    Resume,
+    
+    /// Stop actor with callback
+    Stop(oneshot::Sender<Result<(), SystemError>>),
+}
+
+/// Worker thread state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
-    /// Worker has been created but not started yet
-    Created,
-    /// Worker is running
-    Running,
-    /// Worker is in the process of stopping
-    Stopping,
-    /// Worker has been stopped
-    Stopped,
+    /// Worker is initializing
+    Initializing = 0,
+    
+    /// Worker is idle, waiting for work
+    Idle = 1,
+    
+    /// Worker is processing a message
+    Processing = 2,
+    
+    /// Worker is shutting down
+    ShuttingDown = 3,
+    
+    /// Worker has encountered an error
+    Error = 4,
 }
 
-/// Worker that runs an actor on a dedicated thread
+/// Dedicated worker implementation for compute-intensive actors
 pub struct Worker {
-    /// Mailbox for the actor
+    /// Actor path
+    path: String,
+    
+    /// Actor mailbox
     mailbox: Arc<dyn Mailbox>,
     
-    /// Configuration for the actor
-    config: Option<ThreadActorConfig>,
+    /// Worker configuration
+    config: ThreadActorConfig,
     
-    /// Current state of the worker
-    state: Mutex<WorkerState>,
+    /// Shutdown flag
+    shutdown_flag: Arc<AtomicBool>,
     
-    /// Handle to the worker thread
-    thread_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Worker state
+    state: Arc<AtomicUsize>,
     
-    /// Sender for stopping the worker thread
-    stop_tx: Mutex<Option<oneshot::Sender<()>>>,
+    /// Stats collection
+    stats: Mutex<WorkerStats>,
     
-    /// Tokio runtime handle
-    runtime_handle: Handle,
+    /// Worker thread join handle
+    join_handle: Mutex<Option<JoinHandle<()>>>,
     
-    /// Reference to the actor system
-    system_ref: Option<Weak<dyn SystemRef + Send + Sync>>,
+    /// Number of messages to process in a batch
+    batch_size: usize,
     
-    /// Called when the thread stops
-    on_stop_command: Command,
+    /// Command channel for worker control
+    command_tx: mpsc::Sender<WorkerCommand>,
+    
+    /// Command receiver
+    command_rx: Mutex<Option<mpsc::Receiver<WorkerCommand>>>,
 }
 
-/// Debug implementation for Worker
 impl fmt::Debug for Worker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Worker")
-            .field("path", &self.mailbox.path())
-            .field("state", &*self.state.lock().unwrap())
-            .field("has_thread", &self.thread_handle.lock().unwrap().is_some())
-            .field("has_stop_channel", &self.stop_tx.lock().unwrap().is_some())
+            .field("path", &self.path)
+            .field("state", &self.get_state())
+            .field("batch_size", &self.batch_size)
+            .field("stats", &self.get_stats())
             .finish()
     }
 }
 
-/// Reference-counted command for worker operations
-type Command = mpsc::Sender<String>;
+impl Clone for Worker {
+    fn clone(&self) -> Self {
+        // Create a new command channel for the clone
+        let (command_tx, command_rx) = mpsc::channel(32);
+        
+        Self {
+            path: self.path.clone(),
+            mailbox: self.mailbox.clone(),
+            config: self.config.clone(),
+            shutdown_flag: self.shutdown_flag.clone(),
+            state: self.state.clone(),
+            stats: Mutex::new(self.get_stats()),
+            join_handle: Mutex::new(None),
+            batch_size: self.batch_size,
+            command_tx,
+            command_rx: Mutex::new(Some(command_rx)),
+        }
+    }
+}
 
 impl Worker {
-    /// Create a new worker for the given mailbox
+    /// Create a new dedicated worker for an actor
     pub fn new(
+        path: String,
         mailbox: Arc<dyn Mailbox>,
-        config: Option<ThreadActorConfig>,
-        runtime_handle: Handle,
-        system_ref: Option<Weak<dyn SystemRef + Send + Sync>>,
-        on_stop_command: Command,
+        config: ThreadActorConfig,
+        batch_size: usize,
     ) -> Self {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(AtomicUsize::new(WorkerState::Initializing as usize));
+        let stats = Mutex::new(WorkerStats::default());
+        
+        // Create command channel
+        let (command_tx, command_rx) = mpsc::channel(32);
+        
         Self {
+            path,
             mailbox,
             config,
-            state: Mutex::new(WorkerState::Created),
-            thread_handle: Mutex::new(None),
-            stop_tx: Mutex::new(None),
-            runtime_handle,
-            system_ref,
-            on_stop_command,
+            shutdown_flag,
+            state,
+            stats,
+            join_handle: Mutex::new(None),
+            batch_size,
+            command_tx,
+            command_rx: Mutex::new(Some(command_rx)),
         }
     }
     
-    /// Start the worker thread
-    pub fn start(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Check and update state
-        {
-            let mut state = self.state.lock().unwrap();
-            match *state {
-                WorkerState::Created => *state = WorkerState::Running,
-                _ => return Err(format!(
-                    "Cannot start worker for {} - worker is in state {:?}",
-                    self.mailbox.path(), *state
-                ).into()),
+    /// Start this worker
+    pub fn start(&self) -> Result<(), SystemError> {
+        debug!("Starting dedicated worker for actor {}", self.path);
+        
+        // Get command receiver
+        let command_rx = match self.command_rx.lock().unwrap().take() {
+            Some(rx) => rx,
+            None => return Err(SystemError::ThreadSetupError(
+                format!("Command receiver already taken for worker {}", self.path)
+            )),
+        };
+        
+        // Create clones for the new thread
+        let shutdown_flag = self.shutdown_flag.clone();
+        let state = self.state.clone();
+        let path = self.path.clone();
+        let worker_self = self.clone();
+        
+        // Get thread stack size from config or use default
+        let thread_stack_size = self.config.thread_stack_size
+            .unwrap_or(DEFAULT_THREAD_STACK_SIZE);
+        
+        // Create OS thread for this worker
+        let builder = std::thread::Builder::new()
+            .name(format!("actor-dedicated-{}", self.path))
+            .stack_size(thread_stack_size);
+        
+        let thread_handle = builder.spawn(move || {
+            // Create a dedicated tokio runtime for this OS thread
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_name(format!("tokio-dedicated-{}", path))
+                .build()
+                .unwrap_or_else(|e| {
+                    panic!("Failed to create tokio runtime for worker {}: {}", path, e);
+                });
+            
+            // Set thread local state
+            state.store(WorkerState::Initializing as usize, Ordering::Relaxed);
+            
+            // Run the worker's run method inside this dedicated runtime
+            match rt.block_on(async {
+                // Run the worker's main loop
+                worker_self.run(command_rx).await;
+            }) {
+                Ok(_) => debug!("Worker {} completed successfully", path),
+                Err(e) => error!("Worker {} failed with error: {:?}", path, e)
             }
-        }
+            
+            debug!("OS thread for worker {} terminated", path);
+        }).map_err(|e| {
+            SystemError::ThreadSetupError(format!("Failed to spawn thread for worker {}: {}", self.path, e))
+        })?;
         
-        // Create stop channel
-        let (stop_tx, stop_rx) = oneshot::channel();
-        *self.stop_tx.lock().unwrap() = Some(stop_tx);
-        
-        // Clone required data for the thread
-        let mailbox = Arc::clone(&self.mailbox);
-        let config = self.config.clone();
-        let system_ref = self.system_ref.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        let on_stop_command = self.on_stop_command.clone();
-        let path = mailbox.path().to_string();
-        
-        // Spawn worker thread
-        let thread_handle = std::thread::Builder::new()
-            .name(format!("dedicated-worker-{}", path))
-            .spawn(move || {
-                Self::worker_thread_main(
-                    mailbox,
-                    config,
-                    stop_rx,
-                    system_ref,
-                    runtime_handle,
-                    on_stop_command,
-                    path,
-                );
-            })
-            .map_err(|e| format!(
-                "Failed to spawn worker thread for {}: {}", 
-                self.mailbox.path(), e
-            ))?;
-        
-        // Store thread handle
-        *self.thread_handle.lock().unwrap() = Some(thread_handle);
+        // Store the OS thread join handle
+        let mut join_handle = self.join_handle.lock().unwrap();
+        // We need to wrap the std::thread::JoinHandle in a compatible structure
+        let tokio_handle = tokio::task::spawn_blocking(move || {
+            if let Err(e) = thread_handle.join() {
+                error!("Error joining worker thread: {:?}", e);
+            }
+        });
+        *join_handle = Some(tokio_handle);
         
         Ok(())
     }
     
-    /// Stop the worker thread
-    pub async fn stop(
-        &self,
-        wait: bool,
-        wait_timeout: Option<u64>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Check and update state
-        {
-            let mut state = self.state.lock().unwrap();
-            match *state {
-                WorkerState::Running => *state = WorkerState::Stopping,
-                WorkerState::Created | WorkerState::Stopped => {
-                    // Already in a stopped state, nothing to do
-                    return Ok(());
-                },
-                WorkerState::Stopping => {
-                    // Already stopping, continue with join if requested
-                },
+    /// Stop this worker
+    pub async fn stop(&self) -> Result<(), SystemError> {
+        debug!("Stopping dedicated worker for actor {}", self.path);
+        
+        // Send shutdown command
+        if let Err(e) = self.command_tx.send(WorkerCommand::Shutdown).await {
+            return Err(SystemError::ThreadShutdownError(
+                format!("Failed to send shutdown command to worker {}: {}", self.path, e)
+            ));
+        }
+        
+        // Set shutdown flag directly in case command processing is blocked
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        
+        // Wait for worker to finish
+        let join_handle = self.join_handle.lock().unwrap().take();
+        if let Some(handle) = join_handle {
+            // Since we're now using tokio's JoinHandle that wraps std::thread::JoinHandle,
+            // we can await it directly
+            if let Err(e) = handle.await {
+                return Err(SystemError::ThreadShutdownError(
+                    format!("Error waiting for worker {} to stop: {:?}", self.path, e)
+                ));
             }
         }
         
-        // Send stop signal
-        if let Some(tx) = self.stop_tx.lock().unwrap().take() {
-            // Send stop signal to thread
-            let _ = tx.send(());
+        Ok(())
+    }
+    
+    /// Pause this worker
+    pub async fn pause(&self) -> Result<(), SystemError> {
+        if let Err(e) = self.command_tx.send(WorkerCommand::Pause).await {
+            return Err(SystemError::Other(
+                format!("Failed to send pause command to worker {}: {}", self.path, e)
+            ));
         }
         
-        // If wait is requested, join the thread with optional timeout
-        if wait {
-            if let Some(thread_handle) = self.thread_handle.lock().unwrap().take() {
-                if let Some(timeout_ms) = wait_timeout {
-                    // Join with timeout
-                    let timeout_duration = Duration::from_millis(timeout_ms);
-                    let join_handle = tokio::task::spawn_blocking(move || {
-                        thread_handle.join()
-                    });
+        Ok(())
+    }
+    
+    /// Resume this worker
+    pub async fn resume(&self) -> Result<(), SystemError> {
+        if let Err(e) = self.command_tx.send(WorkerCommand::Resume).await {
+            return Err(SystemError::Other(
+                format!("Failed to send resume command to worker {}: {}", self.path, e)
+            ));
+        }
+        
+        Ok(())
+    }
+    
+    /// Get current worker state
+    pub fn get_state(&self) -> WorkerState {
+        match self.state.load(Ordering::Relaxed) {
+            0 => WorkerState::Initializing,
+            1 => WorkerState::Idle,
+            2 => WorkerState::Processing,
+            3 => WorkerState::ShuttingDown,
+            _ => WorkerState::Error,
+        }
+    }
+    
+    /// Get worker stats
+    pub fn get_stats(&self) -> WorkerStats {
+        self.stats.lock().unwrap().clone()
+    }
+    
+    /// Get worker state atomic reference
+    pub fn state_ref(&self) -> Arc<AtomicUsize> {
+        self.state.clone()
+    }
+    
+    /// Main worker thread loop
+    async fn run(&self, mut command_rx: mpsc::Receiver<WorkerCommand>) {
+        debug!("Starting dedicated worker for actor {}", self.path);
+        
+        // Update worker state to idle
+        self.state.store(WorkerState::Idle as usize, Ordering::Relaxed);
+        
+        // Get idle sleep duration from config or use default
+        let idle_sleep_duration = self.config.idle_sleep_duration
+            .unwrap_or(DEFAULT_IDLE_SLEEP_DURATION);
+            
+        // Main processing loop
+        while !self.shutdown_flag.load(Ordering::Relaxed) {
+            // Check for commands
+            match command_rx.try_recv() {
+                Ok(WorkerCommand::Shutdown) => {
+                    debug!("Received shutdown command for worker {}", self.path);
+                    self.shutdown_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Ok(WorkerCommand::Pause) => {
+                    debug!("Received pause command for worker {}", self.path);
+                    // Pause the processing - we'll implement this by not processing messages 
+                    // and just waiting for the next command
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Ok(WorkerCommand::Resume) => {
+                    debug!("Received resume command for worker {}", self.path);
+                    // Resume normal processing
+                }
+                _ => { /* No command or other command, continue */ }
+            }
+            
+            // Check if mailbox has messages
+            if self.mailbox.is_empty().await {
+                // No messages, sleep for a bit
+                tokio::time::sleep(idle_sleep_duration).await;
+                continue;
+            }
+            
+            // Mailbox has messages, start processing
+            self.state.store(WorkerState::Processing as usize, Ordering::Relaxed);
+            
+            // Process messages with panic recovery
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                self.process_messages(self.batch_size)
+            }));
+            
+            match result {
+                Ok(future) => {
+                    // Execute the future to process messages
+                    if let Err(e) = future.await {
+                        error!("Error processing messages for actor {}: {}", self.path, e);
+                        self.state.store(WorkerState::Error as usize, Ordering::Relaxed);
+                    }
+                }
+                Err(panic_err) => {
+                    // Worker thread panicked
+                    let error_msg = match panic_err.downcast::<String>() {
+                        Ok(string) => format!("Panic in worker for {}: {}", self.path, string),
+                        Err(e) => format!("Panic in worker for {}: {:?}", self.path, e),
+                    };
                     
-                    match timeout(timeout_duration, join_handle).await {
-                        Ok(Ok(thread_result)) => {
-                            // Thread joined within timeout
-                            match thread_result {
-                                Ok(()) => {
-                                    // Thread terminated successfully
-                                    *self.state.lock().unwrap() = WorkerState::Stopped;
+                    error!("{}", error_msg);
+                    
+                    // Mark worker as having encountered an error
+                    self.state.store(WorkerState::Error as usize, Ordering::Relaxed);
+                }
+            }
+            
+            // Reset state to idle
+            self.state.store(WorkerState::Idle as usize, Ordering::Relaxed);
+        }
+        
+        // Worker is shutting down
+        self.state.store(WorkerState::ShuttingDown as usize, Ordering::Relaxed);
+        debug!("Dedicated worker for actor {} shutting down", self.path);
+    }
+    
+    /// Process messages using processor
+    async fn process_messages(&self, max_messages: usize) -> anyhow::Result<()> {
+        // Get yield flag from config or use default (false)
+        let yield_after_each_message = self.config.yield_after_each_message
+            .unwrap_or(false);
+        
+        // use processor to process messages
+        if !self.mailbox.has_processor() {
+            // if mailbox has no associated processor, record warning and skip processing
+            warn!("Mailbox for actor {} has no associated processor", self.path);
+            return Ok(());
+        }
+        
+        // get processor reference
+        let processor_ref_any = self.mailbox.get_processor_ref().ok_or_else(|| {
+            anyhow!("Failed to get processor for actor {}", self.path)
+        })?;
+        
+        let mut processed = 0;
+        
+        // process batch_size messages
+        for _ in 0..max_messages {
+            // get next message
+            match self.mailbox.pop().await {
+                Some(message) => {
+                    // directly use processor to process message, not put back to mailbox
+                    let process_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        self.process_message_with_processor_ref(processor_ref_any, message)
+                    }));
+                    
+                    match process_result {
+                        Ok(future) => {
+                            // execute the future to process message
+                            match future.await {
+                                Ok(_) => {
+                                    // message processed successfully
+                                    processed += 1;
+                                    
+                                    // update stats
+                                    {
+                                        let mut stats = self.stats.lock().unwrap();
+                                        stats.messages_processed += 1;
+                                    }
+                                    
+                                    // if yield after each message is configured, yield now
+                                    if yield_after_each_message {
+                                        tokio::task::yield_now().await;
+                                    }
                                 },
                                 Err(e) => {
-                                    // Thread panicked
-                                    *self.state.lock().unwrap() = WorkerState::Stopped;
-                                    return Err(format!(
-                                        "Worker thread for {} panicked: {:?}",
-                                        self.mailbox.path(), e
-                                    ).into());
+                                    // message processing error
+                                    error!("Error processing message for actor {}: {}", self.path, e);
+                                    
+                                    // update stats
+                                    {
+                                        let mut stats = self.stats.lock().unwrap();
+                                        stats.errors_encountered += 1;
+                                    }
                                 }
                             }
                         },
-                        Ok(Err(e)) => {
-                            // Join task failed
-                            *self.state.lock().unwrap() = WorkerState::Stopped;
-                            return Err(format!(
-                                "Failed to join worker thread for {}: {}",
-                                self.mailbox.path(), e
-                            ).into());
-                        },
-                        Err(_) => {
-                            // Timeout waiting for thread to join
-                            return Err(format!(
-                                "Timeout waiting for worker thread for {} to terminate",
-                                self.mailbox.path()
-                            ).into());
+                        Err(panic_error) => {
+                            // processor processing message panicked
+                            let error_msg = match panic_error.downcast::<String>() {
+                                Ok(string) => format!("Panic in actor {}: {}", self.path, string),
+                                Err(e) => format!("Panic in actor {}: {:?}", self.path, e),
+                            };
+                            
+                            error!("{}", error_msg);
+                            
+                            // update stats
+                            {
+                                let mut stats = self.stats.lock().unwrap();
+                                stats.errors_encountered += 1;
+                            }
+                            
+                            // break the processing loop
+                            break;
                         }
                     }
-                } else {
-                    // Join without timeout
-                    let join_handle = tokio::task::spawn_blocking(move || {
-                        thread_handle.join()
-                    });
-                    
-                    match join_handle.await {
-                        Ok(Ok(())) => {
-                            // Thread terminated successfully
-                            *self.state.lock().unwrap() = WorkerState::Stopped;
-                        },
-                        Ok(Err(e)) => {
-                            // Thread panicked
-                            *self.state.lock().unwrap() = WorkerState::Stopped;
-                            return Err(format!(
-                                "Worker thread for {} panicked: {:?}",
-                                self.mailbox.path(), e
-                            ).into());
-                        },
-                        Err(e) => {
-                            // Join task failed
-                            *self.state.lock().unwrap() = WorkerState::Stopped;
-                            return Err(format!(
-                                "Failed to join worker thread for {}: {}",
-                                self.mailbox.path(), e
-                            ).into());
-                        }
-                    }
+                },
+                None => {
+                    // no more messages
+                    break;
                 }
             }
-        } else {
-            // Not waiting, but mark as stopping
-            *self.state.lock().unwrap() = WorkerState::Stopping;
         }
         
+        debug!("Processed {} messages for actor {}", processed, self.path);
         Ok(())
     }
     
-    /// Get the current state of the worker
-    pub fn state(&self) -> WorkerState {
-        *self.state.lock().unwrap()
-    }
-    
-    /// Get the path of the mailbox
-    pub fn path(&self) -> &str {
-        self.mailbox.path()
-    }
-    
-    /// Main function for the worker thread
-    fn worker_thread_main(
-        mailbox: Arc<dyn Mailbox>,
-        config: Option<ThreadActorConfig>,
-        mut stop_rx: oneshot::Receiver<()>,
-        system_ref: Option<Weak<dyn SystemRef + Send + Sync>>,
-        runtime_handle: Handle,
-        on_stop_command: Command,
-        path: String,
-    ) {
-        let result = std::panic::catch_unwind(|| {
-            // Enter runtime context
-            let _guard = runtime_handle.enter();
+    /// use processor to process message
+    /// note: this method returns a Future, which is responsible for execution by the caller
+    fn process_message_with_processor_ref(
+        &self,
+        processor_ref_any: Arc<dyn Any + Send + Sync>,
+        message: BoxedMessage
+    ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send + '_>> {
+        Box::pin(async move {
+            // first try to convert processor to the base type of ActorProcessor
+            // so that we can directly call process_message method
             
-            // Get configuration
-            let config = config.unwrap_or_default();
+            // try to convert processor to several possible processor types
+            // note: in actual system, you should know the exact processor type
             
-            // Process messages until stopped
-            let mut should_stop = false;
-            
-            while !should_stop {
-                // Check for stop signal
-                match stop_rx.try_recv() {
-                    Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
-                        // Stop signal received or channel closed
-                        should_stop = true;
-                        break;
-                    },
-                    Err(oneshot::error::TryRecvError::Empty) => {
-                        // No stop signal, continue processing
-                    }
-                }
-                
-                // Process messages until mailbox is empty or stop requested
-                while !should_stop {
-                    // Process a batch of messages
-                    let batch_processed = mailbox.process_batch(config.batch_size);
-                    
-                    // Check for stop signal after batch
-                    match stop_rx.try_recv() {
-                        Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
-                            // Stop signal received or channel closed
-                            should_stop = true;
-                            break;
-                        },
-                        Err(oneshot::error::TryRecvError::Empty) => {
-                            // No stop signal, continue processing
-                        }
-                    }
-                    
-                    // If no messages were processed in this batch, break from inner loop
-                    if batch_processed == 0 {
-                        break;
-                    }
-                }
-                
-                // If stop requested, exit
-                if should_stop {
-                    break;
-                }
-                
-                // Sleep for a bit if no messages were processed
-                std::thread::sleep(Duration::from_millis(config.idle_sleep_ms));
+            // try to use system reference to process message
+            if let Some(system) = self.system.upgrade() {
+                // system should know how to process message
+                // since ThreadContext has all related information, it can correctly process message
+                // process message and return result
+                return system.handle_message(&self.path, message).await
+                    .map_err(|e| anyhow!("Error processing message via system: {}", e));
             }
             
-            // Final cleanup - process any remaining messages if configured
-            if config.drain_on_shutdown {
-                mailbox.process_all();
+            // we can try some direct conversions, although it's unlikely to succeed
+            for &type_name in &["ActorProcessor", "ThreadProcessor", "DefaultProcessor"] {
+                info!("Attempting to process message as {}", type_name);
             }
-        });
-        
-        // Handle panic or normal termination
-        match result {
-            Ok(()) => {
-                // Normal termination
-                eprintln!("Worker thread for {} terminated normally", path);
-            },
-            Err(e) => {
-                // Panic occurred
-                let panic_msg = if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = e.downcast_ref::<&str>() {
-                    s.to_string()
-                } else {
-                    "Unknown panic".to_string()
-                };
-                
-                eprintln!("Worker thread for {} panicked: {}", path, panic_msg);
-                
-                // Report panic to system
-                if let Some(system_ref) = system_ref {
-                    if let Some(system) = system_ref.upgrade() {
-                        system.handle_panic(&path, panic_msg);
-                    }
-                }
-            }
-        }
-        
-        // Notify pool that worker has stopped
-        let _ = on_stop_command.try_send(path);
+            
+            // if we can't process, record warning
+            warn!("Could not find suitable processor for actor {}", self.path);
+            Err(anyhow!("Could not process message for actor {}", self.path))
+        })
     }
 } 

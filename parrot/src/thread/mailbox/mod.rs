@@ -1,9 +1,16 @@
 use async_trait::async_trait;
+use std::sync::Arc;
+use std::any::Any;
+use std::sync::Mutex;
+
 use parrot_api::types::BoxedMessage;
 use parrot_api::address::ActorPath;
+use parrot_api::actor::Actor;
 
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
+use crate::thread::processor::ActorProcessor;
+use crate::thread::context::ThreadContext;
 
 pub mod mpsc;
 pub mod spsc;
@@ -28,6 +35,11 @@ pub trait Mailbox: Send + Sync + std::fmt::Debug {
     /// This method should avoid blocking operations like tokio::runtime::Handle::current().block_on
     /// to prevent deadlocks in nested runtime contexts.
     async fn is_empty(&self) -> bool;
+    
+    /// Checks if the mailbox has more messages (opposite of is_empty).
+    async fn has_more_messages(&self) -> bool {
+        !self.is_empty().await
+    }
 
     /// Signals that this mailbox might have work and should be considered for scheduling.
     /// Primarily used by MPSC mailboxes in the SharedPool scheduler.
@@ -46,7 +58,16 @@ pub trait Mailbox: Send + Sync + std::fmt::Debug {
     /// to prevent deadlocks in nested runtime contexts.
     async fn len(&self) -> usize;
 
-    /// Closes the mailbox, preventing further pushes and cleaning up resources.
-    /// This should be called during actor shutdown to prevent memory leaks.
+    /// Closes this mailbox, preventing further messages from being added.
     async fn close(&self);
+    
+    /// Set the processor for this mailbox
+    fn set_processor(&self, processor: Arc<dyn Any + Send + Sync>);
+    
+    /// Get the processor for this mailbox
+    fn get_processor(&self) -> Option<Arc<dyn Any + Send + Sync>>;
+    
+    /// Check if this mailbox has a processor
+    fn has_processor(&self) -> bool;
 } 
+

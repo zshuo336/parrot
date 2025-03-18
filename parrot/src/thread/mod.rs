@@ -24,7 +24,7 @@ pub use scheduler::queue::SchedulingQueue;
 pub use scheduler::shared::SharedThreadPool;
 pub use system::ThreadActorSystem;
 pub use processor::ActorProcessor;
+pub use processor::ActorProcessorManager;
+pub use actor::ThreadActor;
 
 // TODO: Add the following modules as they are implemented:
-// pub mod system;
-// pub use system::ThreadActorSystem; 

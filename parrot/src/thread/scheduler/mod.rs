@@ -13,18 +13,21 @@
 //! - Efficiency: Minimizing overhead in the scheduling process
 //! - Adaptability: Runtime selection of appropriate scheduler
 
+// Re-exported modules with unified organization
 pub mod shared;
+pub mod dedicated_thread;
 pub mod queue;
-pub mod dedicated;
 
 use std::fmt;
 use std::error::Error;
 use std::sync::{Arc, Weak};
 
 use tokio::runtime::Handle;
+use anyhow::anyhow;
 
 use crate::thread::mailbox::Mailbox;
 use crate::thread::config::ThreadActorConfig;
+use parrot_api::types::{BoxedMessage, ActorResult};
 
 /// Common interface for all thread scheduler implementations
 pub trait ThreadScheduler: fmt::Debug + Send + Sync {
@@ -49,33 +52,24 @@ pub trait ThreadScheduler: fmt::Debug + Send + Sync {
     fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
-/// System reference interface for thread schedulers
-pub trait SystemRef: fmt::Debug {
-    /// Look up an actor by path
-    fn lookup(&self, path: &str) -> Option<Arc<dyn Mailbox>>;
-    
-    /// Handle worker panic
-    fn handle_panic(&self, path: &str, error: String);
-}
+
+
+/// Boxed future type for async actor operations
+pub type BoxedActorFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Factory for creating thread schedulers
 pub struct ThreadSchedulerFactory {
     /// Runtime handle for spawning tasks
     runtime_handle: Handle,
-    
-    /// Reference to the actor system
-    system_ref: Option<Weak<dyn SystemRef + Send + Sync>>,
 }
 
 impl ThreadSchedulerFactory {
     /// Create a new thread scheduler factory
     pub fn new(
         runtime_handle: Handle,
-        system_ref: Option<Weak<dyn SystemRef + Send + Sync>>,
     ) -> Self {
         Self {
             runtime_handle,
-            system_ref,
         }
     }
     
@@ -87,7 +81,6 @@ impl ThreadSchedulerFactory {
         let pool = shared::SharedThreadPool::new(
             config,
             self.runtime_handle.clone(),
-            self.system_ref.clone(),
         );
         
         Arc::new(pool)
@@ -96,73 +89,12 @@ impl ThreadSchedulerFactory {
     /// Create a dedicated thread pool
     pub fn create_dedicated_pool(
         &self,
-        config: Option<dedicated::DedicatedThreadPoolConfig>,
+        config: Option<dedicated_thread::DedicatedThreadConfig>,
     ) -> Arc<dyn ThreadScheduler> {
-        let pool = dedicated::DedicatedThreadPool::new(
+        let scheduler = dedicated_thread::DedicatedThreadScheduler::new(
             config,
-            self.runtime_handle.clone(),
-            self.system_ref.clone(),
         );
         
-        Arc::new(DedicatedThreadScheduler::new(pool))
-    }
-}
-
-/// Adapter to implement ThreadScheduler for DedicatedThreadPool
-pub struct DedicatedThreadScheduler {
-    /// Inner dedicated thread pool
-    pool: dedicated::DedicatedThreadPool,
-}
-
-impl DedicatedThreadScheduler {
-    /// Create a new dedicated thread scheduler
-    pub fn new(pool: dedicated::DedicatedThreadPool) -> Self {
-        Self { pool }
-    }
-}
-
-impl ThreadScheduler for DedicatedThreadScheduler {
-    fn schedule(
-        &self,
-        path: &str,
-        mailbox: Arc<dyn Mailbox>,
-        config: Option<ThreadActorConfig>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.pool.schedule(path, mailbox, config).await
-            })
-        })
-    }
-    
-    fn deschedule(
-        &self,
-        path: &str,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.pool.deschedule(path).await
-            })
-        })
-    }
-    
-    fn is_scheduled(&self, path: &str) -> bool {
-        self.pool.is_scheduled(path)
-    }
-    
-    fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.pool.shutdown().await
-            })
-        })
-    }
-}
-
-impl fmt::Debug for DedicatedThreadScheduler {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DedicatedThreadScheduler")
-            .field("pool", &self.pool)
-            .finish()
+        Arc::new(scheduler)
     }
 } 

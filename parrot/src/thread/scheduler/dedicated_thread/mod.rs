@@ -1,383 +1,265 @@
-//! # Dedicated Thread Pool Module
+//! # Dedicated Thread Module
 //!
-//! This module provides a dedicated thread pool implementation for compute-intensive actors.
-//! Unlike shared thread pools, dedicated pools assign a dedicated thread per actor.
+//! Provides the implementation of dedicated thread schedulers for actor execution.
+//! Each actor gets its own dedicated thread for execution, providing isolation
+//! and predictable performance at the cost of higher resource usage.
 //!
 //! ## Key Concepts
-//! - Dedicated threads: One thread per compute-intensive actor
-//! - Thread limits: Controls on maximum concurrent dedicated threads
-//! - Auto-scaling: Thread management based on system resources
+//! - Thread isolation: Each actor runs on its own dedicated thread
+//! - Predictable performance: No contention with other actors
+//! - Priority management: Support for actor priority levels
 //!
 //! ## Design Principles
-//! - Isolation: Each actor runs on its own thread for predictable performance
-//! - Resource control: Limits on total dedicated threads to prevent system overload
-//! - Simplicity: Straightforward API for scheduling and descheduling actors
+//! - Isolation: Performance and errors are isolated to individual threads
+//! - Determinism: Consistent execution characteristics
+//! - Resource efficiency: Thread lifecycle management to limit overhead
 
 mod worker;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
-use std::fmt;
 use std::error::Error;
+use std::fmt;
+use std::sync::{Arc, Mutex, Weak, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::{oneshot, mpsc};
+use tokio::task::JoinHandle;
 
 use crate::thread::mailbox::Mailbox;
 use crate::thread::config::ThreadActorConfig;
+use crate::thread::error::SystemError;
+use crate::thread::scheduler::ThreadScheduler;
+use worker::Worker;
 
-use self::worker::Worker;
-
-/// Interface for actor system operations
-pub trait SystemRef: fmt::Debug {
-    /// Look up an actor by path
-    fn lookup(&self, path: &str) -> Option<Arc<dyn Mailbox>>;
+/// Status codes for the dedicated thread scheduler
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerStatus {
+    /// Scheduler is initializing
+    Initializing = 0,
     
-    /// Handle worker panic
-    fn handle_panic(&self, path: &str, error: String);
+    /// Scheduler is running normally
+    Running = 1,
+    
+    /// Scheduler is shutting down
+    ShuttingDown = 2,
+    
+    /// Scheduler has completed shutdown
+    Shutdown = 3,
+    
+    /// Scheduler has encountered an error
+    Error = 4,
 }
 
-/// Commands for the pool manager
-enum Command {
-    /// Schedule an actor on a dedicated thread
-    Schedule(String, Arc<dyn Mailbox>, Option<ThreadActorConfig>),
-    
-    /// Deschedule an actor
-    Deschedule(String),
-    
-    /// Shut down the thread pool
-    Shutdown(oneshot::Sender<()>),
-}
-
-/// Internal pool state
-struct PoolState {
-    /// Map of actor paths to worker handles
-    workers: HashMap<String, Worker>,
-    
-    /// Current number of active threads
-    active_threads: usize,
-    
-    /// Maximum number of threads allowed
-    max_threads: usize,
-    
-    /// Tokio runtime handle
-    runtime_handle: Handle,
-    
-    /// Reference to the actor system
-    system_ref: Option<Weak<dyn SystemRef + Send + Sync>>,
-}
-
-/// Configuration for the dedicated thread pool
+/// Configuration for dedicated thread scheduler
 #[derive(Debug, Clone)]
-pub struct DedicatedThreadPoolConfig {
-    /// Maximum number of dedicated threads allowed
-    pub max_threads: usize,
+pub struct DedicatedThreadConfig {
+    /// Whether to use a priority queue for message processing
+    pub use_priority_queue: bool,
     
-    /// Command channel capacity
-    pub command_channel_capacity: usize,
+    /// Maximum number of messages to process in one batch
+    pub max_messages_per_batch: usize,
+    
+    /// Duration to sleep when idle before checking for work again
+    pub idle_sleep_duration: Duration,
+    
+    /// Whether to yield to the scheduler after processing each message
+    pub yield_after_each_message: bool,
+    
+    /// Whether to log detailed processing metrics
+    pub enable_detailed_logging: bool,
 }
 
-impl Default for DedicatedThreadPoolConfig {
+impl Default for DedicatedThreadConfig {
     fn default() -> Self {
         Self {
-            max_threads: 32,
-            command_channel_capacity: 1000,
+            use_priority_queue: false,
+            max_messages_per_batch: 10,
+            idle_sleep_duration: Duration::from_millis(10),
+            yield_after_each_message: false,
+            enable_detailed_logging: false,
         }
     }
 }
 
-/// Dedicated thread pool for compute-intensive actors
-#[derive(Clone)]
-pub struct DedicatedThreadPool {
-    /// Shared pool state
-    state: Arc<Mutex<PoolState>>,
+/// Implementation of a dedicated thread scheduler
+///
+/// Each actor is assigned a dedicated thread for its message processing.
+#[derive(Debug)]
+pub struct DedicatedThreadScheduler {
+    /// Map of actor paths to their dedicated worker threads
+    workers: Mutex<HashMap<String, Worker>>,
     
-    /// Command channel sender
-    command_tx: mpsc::Sender<Command>,
+    /// Scheduler configuration
+    config: DedicatedThreadConfig,
+    
+    /// Shutdown flag
+    is_shutting_down: Arc<AtomicBool>,
+    
+    /// Scheduler status
+    status: Arc<AtomicUsize>,
 }
 
-impl DedicatedThreadPool {
-    /// Create a new dedicated thread pool
+impl DedicatedThreadScheduler {
+    /// Create a new dedicated thread scheduler
     pub fn new(
-        config: Option<DedicatedThreadPoolConfig>,
-        runtime_handle: Handle, 
-        system_ref: Option<Weak<dyn SystemRef + Send + Sync>>,
+        config: Option<DedicatedThreadConfig>,
     ) -> Self {
         let config = config.unwrap_or_default();
+        let is_shutting_down = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(AtomicUsize::new(SchedulerStatus::Initializing as usize));
         
-        // Create initial state
-        let state = Arc::new(Mutex::new(PoolState {
-            workers: HashMap::new(),
-            active_threads: 0,
-            max_threads: config.max_threads,
-            runtime_handle: runtime_handle.clone(),
-            system_ref: system_ref.clone(),
-        }));
+        let scheduler = Self {
+            workers: Mutex::new(HashMap::new()),
+            config,
+            is_shutting_down,
+            status,
+        };
         
-        // Create command channel
-        let (command_tx, command_rx) = mpsc::channel(config.command_channel_capacity);
+        // Mark as running
+        scheduler.status.store(SchedulerStatus::Running as usize, Ordering::SeqCst);
         
-        // Start manager task
-        let state_clone = Arc::clone(&state);
-        let manager_tx = command_tx.clone();
-        
-        runtime_handle.spawn(async move {
-            Self::manager_task(state_clone, command_rx, manager_tx).await;
-        });
-        
-        Self { state, command_tx }
+        scheduler
     }
     
     /// Schedule an actor on a dedicated thread
     pub async fn schedule(
         &self,
-        actor_path: &str,
+        path: &str,
         mailbox: Arc<dyn Mailbox>,
         config: Option<ThreadActorConfig>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Check if already scheduled
-        {
-            let state = self.state.lock().unwrap();
-            if state.workers.contains_key(actor_path) {
-                return Err(format!("Actor {} is already scheduled on a dedicated thread", actor_path).into());
-            }
-            
-            // Check thread limit
-            if state.active_threads >= state.max_threads {
-                return Err(format!(
-                    "Cannot schedule actor {} - maximum number of dedicated threads ({}) reached",
-                    actor_path, state.max_threads
-                ).into());
-            }
+    ) -> Result<(), SystemError> {
+        // Check if already shutting down
+        if self.is_shutting_down.load(Ordering::Relaxed) {
+            return Err(SystemError::ShuttingDown);
         }
         
-        // Send schedule command
-        let cmd = Command::Schedule(actor_path.to_string(), mailbox, config);
-        self.command_tx.send(cmd).await
-            .map_err(|_| "Failed to send schedule command - pool may be shutting down".into())
-    }
-    
-    /// Deschedule an actor from its dedicated thread
-    pub async fn deschedule(
-        &self,
-        actor_path: &str,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Check if scheduled
-        {
-            let state = self.state.lock().unwrap();
-            if !state.workers.contains_key(actor_path) {
-                return Err(format!("Actor {} is not scheduled on a dedicated thread", actor_path).into());
-            }
+        let mut workers = self.workers.lock().unwrap();
+        
+        // dedicated thread scheduler is olny one scedule for each actor
+        if workers.contains_key(path) {
+            return Ok(());
         }
         
-        // Send deschedule command
-        let cmd = Command::Deschedule(actor_path.to_string());
-        self.command_tx.send(cmd).await
-            .map_err(|_| "Failed to send deschedule command - pool may be shutting down".into())
-    }
-    
-    /// Shutdown the thread pool, stopping all workers
-    pub async fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Create response channel
-        let (tx, rx) = oneshot::channel();
-        
-        // Send shutdown command
-        let cmd = Command::Shutdown(tx);
-        self.command_tx.send(cmd).await
-            .map_err(|_| "Failed to send shutdown command - pool may already be shutting down".into())?;
-        
-        // Wait for completion
-        rx.await
-            .map_err(|_| "Failed to receive shutdown completion - manager task may have crashed".into())
-    }
-    
-    /// Get the current number of active dedicated threads
-    pub fn active_threads(&self) -> usize {
-        let state = self.state.lock().unwrap();
-        state.active_threads
-    }
-    
-    /// Get the maximum allowed number of dedicated threads
-    pub fn max_threads(&self) -> usize {
-        let state = self.state.lock().unwrap();
-        state.max_threads
-    }
-    
-    /// Check if an actor is scheduled on a dedicated thread
-    pub fn is_scheduled(&self, actor_path: &str) -> bool {
-        let state = self.state.lock().unwrap();
-        state.workers.contains_key(actor_path)
-    }
-    
-    /// Task that processes commands for the thread pool
-    async fn manager_task(
-        state: Arc<Mutex<PoolState>>,
-        mut command_rx: mpsc::Receiver<Command>,
-        command_tx: mpsc::Sender<Command>,
-    ) {
-        while let Some(cmd) = command_rx.recv().await {
-            match cmd {
-                Command::Schedule(path, mailbox, config) => {
-                    if let Err(e) = Self::handle_schedule(&state, path, mailbox, config).await {
-                        eprintln!("Error scheduling actor: {}", e);
-                    }
-                },
-                Command::Deschedule(path) => {
-                    if let Err(e) = Self::handle_deschedule(&state, &path).await {
-                        eprintln!("Error descheduling actor: {}", e);
-                    }
-                },
-                Command::Shutdown(response_tx) => {
-                    match Self::handle_shutdown(&state).await {
-                        Ok(()) => {
-                            let _ = response_tx.send(());
-                        },
-                        Err(e) => {
-                            eprintln!("Error during shutdown: {}", e);
-                            let _ = response_tx.send(());
-                        }
-                    }
-                    
-                    // Exit task after shutdown
-                    break;
-                }
-            }
-        }
-    }
-    
-    /// Handle a schedule command
-    async fn handle_schedule(
-        state: &Arc<Mutex<PoolState>>,
-        path: String,
-        mailbox: Arc<dyn Mailbox>,
-        config: Option<ThreadActorConfig>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Get runtime handle and system reference
-        let (runtime_handle, system_ref, command_tx) = {
-            let state = state.lock().unwrap();
-            
-            // Check if already scheduled
-            if state.workers.contains_key(&path) {
-                return Err(format!("Actor {} is already scheduled", path).into());
-            }
-            
-            // Check thread limit
-            if state.active_threads >= state.max_threads {
-                return Err(format!(
-                    "Maximum number of dedicated threads ({}) reached", 
-                    state.max_threads
-                ).into());
-            }
-            
-            (state.runtime_handle.clone(), state.system_ref.clone(), Command::Deschedule(path.clone()))
-        };
-        
-        // Create and start worker
+        // Create a new worker for this actor
         let worker = Worker::new(
+            path.to_string(),
             mailbox,
-            config,
-            runtime_handle,
-            system_ref,
-            command_tx,
+            ThreadActorConfig {
+                yield_after_each_message: Some(self.config.yield_after_each_message),
+                idle_sleep_duration: Some(self.config.idle_sleep_duration),
+                thread_stack_size: Some(3 * 1024 * 1024), // default 3MB
+                ..Default::default()
+            },
+            self.config.max_messages_per_batch,
         );
         
         // Start the worker
-        worker.start()?;
+        worker.start();
         
-        // Add to active workers
-        let mut state = state.lock().unwrap();
-        state.workers.insert(path, worker);
-        state.active_threads += 1;
+        // Add to workers map
+        workers.insert(path.to_string(), worker);
         
         Ok(())
     }
     
-    /// Handle a deschedule command
-    async fn handle_deschedule(
-        state: &Arc<Mutex<PoolState>>,
-        path: &str,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Get worker
-        let worker = {
-            let mut state = state.lock().unwrap();
-            
-            // Check if scheduled
-            state.workers.remove(path).ok_or_else(|| {
-                format!("Actor {} is not scheduled", path).into()
-            })
-        }?;
+    /// Deschedule an actor from its dedicated thread
+    pub async fn deschedule(&self, path: &str) -> Result<(), SystemError> {
+        let mut workers = self.workers.lock().unwrap();
+        
+        // Get the worker for this actor
+        let worker = workers.remove(path).ok_or_else(|| {
+            SystemError::ActorNotFound(path.to_string())
+        })?;
         
         // Stop the worker
-        worker.stop(true, None).await?;
-        
-        // Update active thread count
-        let mut state = state.lock().unwrap();
-        state.active_threads = state.active_threads.saturating_sub(1);
+        worker.stop().await?;
         
         Ok(())
     }
     
-    /// Handle a shutdown command
-    async fn handle_shutdown(
-        state: &Arc<Mutex<PoolState>>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Get all workers
+    /// Check if an actor is scheduled
+    pub fn is_scheduled(&self, path: &str) -> bool {
+        let workers = self.workers.lock().unwrap();
+        workers.contains_key(path)
+    }
+    
+    /// Shutdown the scheduler and all dedicated threads
+    pub async fn shutdown(&self) -> Result<(), SystemError> {
+        // Set the shutting down flag
+        self.status.store(SchedulerStatus::ShuttingDown as usize, Ordering::SeqCst);
+        self.is_shutting_down.store(true, Ordering::SeqCst);
+        
+        // Stop all workers
         let workers = {
-            let mut state = state.lock().unwrap();
-            std::mem::take(&mut state.workers)
+            let mut workers_guard = self.workers.lock().unwrap();
+            std::mem::take(&mut *workers_guard)
         };
         
-        // Stop all workers in parallel
-        let mut tasks = Vec::new();
-        
-        for (path, worker) in workers {
-            let stop_task = tokio::spawn(async move {
-                let result = worker.stop(true, None).await;
-                (path, result)
-            });
-            
-            tasks.push(stop_task);
+        // Stop each worker
+        for (_, worker) in workers {
+            let _ = worker.stop().await;
         }
         
-        // Collect results
-        let mut errors = Vec::new();
+        // Mark as fully shutdown
+        self.status.store(SchedulerStatus::Shutdown as usize, Ordering::SeqCst);
         
-        for task in tasks {
-            match task.await {
-                Ok((path, Ok(()))) => {
-                    // Worker stopped successfully
-                },
-                Ok((path, Err(e))) => {
-                    errors.push(format!("Error stopping worker for {}: {}", path, e));
-                },
-                Err(e) => {
-                    errors.push(format!("Task for stopping worker failed: {}", e));
-                }
-            }
+        Ok(())
+    }
+    
+    /// Get the current status of the scheduler
+    pub fn status(&self) -> SchedulerStatus {
+        match self.status.load(Ordering::Relaxed) {
+            0 => SchedulerStatus::Initializing,
+            1 => SchedulerStatus::Running,
+            2 => SchedulerStatus::ShuttingDown,
+            3 => SchedulerStatus::Shutdown,
+            4 => SchedulerStatus::Error,
+            _ => SchedulerStatus::Error, // Default to error for unknown status
         }
-        
-        // Update state
-        let mut state = state.lock().unwrap();
-        state.active_threads = 0;
-        
-        // Return errors if any
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("\n").into())
-        }
+    }
+    
+    /// Get the number of dedicated workers
+    pub fn worker_count(&self) -> usize {
+        let workers = self.workers.lock().unwrap();
+        workers.len()
     }
 }
 
-// Implement Debug for DedicatedThreadPool
-impl fmt::Debug for DedicatedThreadPool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state.lock().unwrap();
-        
-        f.debug_struct("DedicatedThreadPool")
-            .field("active_threads", &state.active_threads)
-            .field("max_threads", &state.max_threads)
-            .field("worker_count", &state.workers.len())
-            .finish()
+// Implement the ThreadScheduler trait
+impl ThreadScheduler for DedicatedThreadScheduler {
+    fn schedule(
+        &self,
+        path: &str,
+        mailbox: Arc<dyn Mailbox>,
+        config: Option<ThreadActorConfig>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.schedule(path, mailbox, config).await
+            })
+        }).map_err(|e| e.into())
+    }
+    
+    fn deschedule(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.deschedule(path).await
+            })
+        }).map_err(|e| e.into())
+    }
+    
+    fn is_scheduled(&self, path: &str) -> bool {
+        self.is_scheduled(path)
+    }
+    
+    fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.shutdown().await
+            })
+        }).map_err(|e| e.into())
     }
 } 

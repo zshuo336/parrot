@@ -5,11 +5,14 @@ use parrot_api::types::{BoxedMessage, WeakActorTarget, ActorResult, BoxedFuture,
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::any::Any;
 use tokio::sync::Notify;
 
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
+use crate::thread::processor::ActorProcessor;
 
 
 /// A multi-producer, single-consumer mailbox implementation using flume.
@@ -32,6 +35,8 @@ pub struct MpscMailbox {
     notify: Arc<Notify>,
     /// Flag indicating if this mailbox has been closed
     is_closed: Arc<AtomicBool>,
+    /// Associated processor
+    processor: Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>
 }
 
 impl MpscMailbox {
@@ -41,6 +46,7 @@ impl MpscMailbox {
         let is_ready = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(Notify::new());
         let is_closed = Arc::new(AtomicBool::new(false));
+        let processor = Arc::new(Mutex::new(None));
         
         Self {
             sender,
@@ -50,6 +56,7 @@ impl MpscMailbox {
             is_ready,
             notify,
             is_closed,
+            processor,
         }
     }
 
@@ -212,6 +219,27 @@ impl Mailbox for MpscMailbox {
         
         // Notify anyone waiting on this mailbox that it's now closed
         self.notify.notify_waiters();
+    }
+
+    /// associate a processor with this mailbox
+    fn set_processor(&self, processor: Arc<dyn Any + Send + Sync>) {
+        let mut processor_guard = self.processor.lock().unwrap();
+        *processor_guard = Some(processor);
+    }
+    
+    /// get the associated processor
+    fn get_processor(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        let processor_guard = self.processor.lock().unwrap();
+        match &*processor_guard {
+            Some(p) => Some(p.clone()),
+            None => None,
+        }
+    }
+    
+    /// check if there is a processor associated with this mailbox
+    fn has_processor(&self) -> bool {
+        let processor_guard = self.processor.lock().unwrap();
+        processor_guard.is_some()
     }
 }
 

@@ -107,6 +107,9 @@ impl ThreadActorSystemConfig {
             supervisor_strategy: actor_config.supervisor_strategy.clone().or_else(|| Some(self.default_supervisor_strategy.clone())),
             ask_timeout: actor_config.ask_timeout.or(Some(self.default_ask_timeout)),
             backpressure_strategy: actor_config.backpressure_strategy.clone().or_else(|| Some(self.default_backpressure_strategy.clone())),
+            thread_stack_size: actor_config.thread_stack_size,
+            yield_after_each_message: actor_config.yield_after_each_message,
+            idle_sleep_duration: actor_config.idle_sleep_duration,
         }
     }
 }
@@ -130,6 +133,15 @@ pub struct ThreadActorConfig {
     
     /// The backpressure strategy for this actor's mailbox.
     pub backpressure_strategy: Option<BackpressureStrategy>,
+    
+    /// The size of the stack for dedicated OS threads (used when scheduling_mode is DedicatedThread)
+    pub thread_stack_size: Option<usize>,
+    
+    /// Whether to yield after processing each message
+    pub yield_after_each_message: Option<bool>,
+    
+    /// Duration to sleep when idle (no messages in mailbox)
+    pub idle_sleep_duration: Option<Duration>,
     
     // pub core_affinity: Option<usize>,
     // pub dispatcher: Option<String>,
