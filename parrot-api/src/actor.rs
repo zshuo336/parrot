@@ -37,6 +37,28 @@ pub trait Actor: Send + 'static {
     /// Handle incoming message
     async fn receive_message(&mut self, msg: Box<dyn Any + Send>, ctx: &mut dyn ActorContext) -> Result<Box<dyn Any + Send>, ActorError>;
 
+    /// Handle stream item
+    async fn handle_stream(&mut self, item: Box<dyn Any + Send>, ctx: &mut dyn ActorContext) -> Result<(), ActorError> {
+        // default implementation, just pass the item to the receive_message method
+        self.receive_message(item, ctx).await?;
+        Ok(())
+    }
+
+    /// Called when stream is started
+    async fn stream_started(&mut self, _ctx: &mut dyn ActorContext) -> Result<(), ActorError> {
+        Ok(())
+    }
+
+    /// Called when stream is finished
+    async fn stream_finished(&mut self, _ctx: &mut dyn ActorContext) -> Result<(), ActorError> {
+        Ok(())
+    }
+
+    /// Called when stream has error
+    async fn stream_error(&mut self, err: ActorError, _ctx: &mut dyn ActorContext) -> Result<(), ActorError> {
+        Err(err)
+    }
+
     /// Cleanup work before Actor stops
     async fn before_stop(&mut self, _ctx: &mut dyn ActorContext) -> Result<(), ActorError> {
         Ok(())

@@ -1,6 +1,7 @@
+use thiserror::Error;
 
 /// Actor error types
-#[derive(thiserror::Error, Debug)]
+#[derive(Error, Debug)]
 pub enum ActorError {
     #[error("Actor initialization failed: {0}")]
     InitializationError(String),

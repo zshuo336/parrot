@@ -1,12 +1,12 @@
 use std::time::Duration;
 use std::any::Any;
 use async_trait::async_trait;
-use crate::actor::{Actor};
+use crate::actor::Actor;
 use crate::errors::ActorError;
 use crate::address::{ActorPath, ActorRef};
 use crate::runtime::RuntimeConfig;
 use crate::message::Message;
-use crate::supervisor::{SupervisorStrategy, SupervisorStrategyType};
+use crate::supervisor::SupervisorStrategyType;
 
 /// System error type
 #[derive(thiserror::Error, Debug)]
