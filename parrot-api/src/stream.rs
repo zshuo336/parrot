@@ -7,21 +7,21 @@ use crate::context::ActorContext;
 
 /// Stream handler trait for handling stream items
 #[async_trait]
-pub trait StreamHandler<S: Stream>: Send 
+pub trait StreamHandler<S: Stream, C: ?Sized + Send>: Send 
 where
     S::Item: Send + 'static,
 {
     /// Called when stream item received
-    async fn handle(&mut self, item: S::Item, ctx: &mut dyn ActorContext);
+    async fn handle(&mut self, item: S::Item, ctx: &mut C);
 
     /// Called when stream is started
-    async fn started(&mut self, ctx: &mut dyn ActorContext) {}
+    async fn started(&mut self, _ctx: &mut C) {}
 
     /// Called when stream is finished
-    async fn finished(&mut self, ctx: &mut dyn ActorContext) {}
+    async fn finished(&mut self, _ctx: &mut C) {}
 
     /// Called when stream has error
-    async fn handle_error(&mut self, err: ActorError, ctx: &mut dyn ActorContext) {}
+    async fn handle_error(&mut self, _err: ActorError, _ctx: &mut C) {}
 }
 
 /// Stream registry for managing streams
@@ -53,11 +53,12 @@ pub trait StreamRegistryExt: StreamRegistry {
     }
 
     /// Add stream with custom handler and type safety
-    fn add_stream_with_handler<S, H>(&mut self, stream: S, handler: H) -> Result<(), ActorError>
+    fn add_stream_with_handler<S, H, C>(&mut self, stream: S, handler: H) -> Result<(), ActorError>
     where
         S: Stream + Send + 'static,
         S::Item: Send + 'static,
-        H: StreamHandler<S> + 'static,
+        H: StreamHandler<S, C> + 'static,
+        C: ?Sized + Send + 'static,
     {
         let stream = Box::new(stream.map(|item| Box::new(item) as Box<dyn Any + Send>));
         self.add_stream_with_handler_erased(stream, Box::new(handler))
@@ -90,26 +91,26 @@ impl<A: Actor> ActorStreamHandler<A> {
 }
 
 #[async_trait]
-impl<A: Actor, S: Stream> StreamHandler<S> for ActorStreamHandler<A>
+impl<A: Actor, S: Stream> StreamHandler<S, A::Context> for ActorStreamHandler<A>
 where
     S::Item: Send + 'static,
 {
-    async fn handle(&mut self, item: S::Item, ctx: &mut dyn ActorContext) {
+    async fn handle(&mut self, item: S::Item, ctx: &mut A::Context) {
         let item = Box::new(item) as Box<dyn Any + Send>;
         if let Err(err) = self.actor.handle_stream(item, ctx).await {
             self.actor.stream_error(err, ctx).await.ok();
         }
     }
 
-    async fn started(&mut self, ctx: &mut dyn ActorContext) {
+    async fn started(&mut self, ctx: &mut A::Context) {
         self.actor.stream_started(ctx).await.ok();
     }
 
-    async fn finished(&mut self, ctx: &mut dyn ActorContext) {
+    async fn finished(&mut self, ctx: &mut A::Context) {
         self.actor.stream_finished(ctx).await.ok();
     }
 
-    async fn handle_error(&mut self, err: ActorError, ctx: &mut dyn ActorContext) {
+    async fn handle_error(&mut self, err: ActorError, ctx: &mut A::Context) {
         self.actor.stream_error(err, ctx).await.ok();
     }
 } 
