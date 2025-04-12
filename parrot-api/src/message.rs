@@ -99,8 +99,34 @@ pub trait Message: Send + 'static {
             .downcast::<Self::Result>()
             .map(|b| *b)
             .map_err(|_| crate::errors::ActorError::MessageHandlingError(
-                "Failed to downcast message result".to_string()
+                format!("Failed to downcast message result for {}", std::any::type_name::<Self>())
             ))
+    }
+
+    /// Validates the message content.
+    ///
+    /// This method should check if the message content is valid
+    /// according to business rules.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Message is valid
+    /// * `Err(ActorError)` - Message is invalid
+    fn validate(&self) -> Result<(), crate::errors::ActorError> {
+        Ok(())
+    }
+
+    /// Returns the message type name.
+    ///
+    /// This is typically the struct name of the message type.
+    fn message_type(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
+    /// Returns the message priority level.
+    ///
+    /// Default implementation returns Normal priority.
+    fn priority(&self) -> MessagePriority {
+        MessagePriority::Normal
     }
 }
 
@@ -129,6 +155,9 @@ pub struct MessageEnvelope {
     
     /// Delivery and processing options
     pub options: MessageOptions,
+
+    /// The type name of the message
+    pub message_type: &'static str,
 }
 
 impl std::fmt::Debug for MessageEnvelope {
@@ -138,6 +167,7 @@ impl std::fmt::Debug for MessageEnvelope {
             .field("payload", &"<dyn Any>")
             .field("sender", &self.sender.as_ref().map(|_| "<dyn ActorRef>"))
             .field("options", &self.options)
+            .field("message_type", &self.message_type)
             .finish()
     }
 }
@@ -248,6 +278,7 @@ impl MessageEnvelope {
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
+            message_type: payload.message_type(),
             payload: Box::new(payload),
             sender,
             options: options.unwrap_or_default(),
@@ -276,5 +307,50 @@ impl MessageEnvelope {
     /// * `None`: If the payload is not of type M
     pub fn payload_mut<M: Message>(&mut self) -> Option<&mut M> {
         self.payload.downcast_mut()
+    }
+
+    /// Returns the type name of the contained message.
+    ///
+    /// This method attempts to downcast the payload to access its message type.
+    /// If the downcast fails, it returns an empty string.
+    ///
+    /// # Returns
+    /// * `&'static str`: The type name of the message or empty string if type information is unavailable
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let envelope = MessageEnvelope::new(MyMessage { data: "test" }, None, None);
+    /// assert_eq!(envelope.message_type(), "my_crate::MyMessage");
+    /// ```
+    pub fn message_type(&self) -> &'static str {
+        self.message_type
+    }
+
+
+    /// Returns a reference to the message payload as a trait object.
+    /// alias for payload::<M: Message>()
+    /// 
+    /// # Type Parameters
+    /// * `M`: Expected message type
+    ///
+    /// # Returns
+    /// * `&M`: Reference to the payload if type matches
+    /// * `expect`: If the payload is not of type M 
+    pub fn message<M: Message>(&self) -> &M {
+        self.payload::<M>().expect("Failed to downcast message payload")
+    }
+
+    /// Returns a mutable reference to the message payload as a trait object.
+    /// alias for payload_mut::<M: Message>()
+    /// 
+    /// # Type Parameters
+    /// * `M`: Expected message type
+    ///
+    /// # Returns
+    /// * `&mut M`: Mutable reference to the payload if type matches
+    /// * `expect`: If the payload is not of type M
+    pub fn message_mut<M: Message>(&mut self) -> &mut M {
+        self.payload_mut::<M>().expect("Failed to downcast message payload")
     }
 } 
