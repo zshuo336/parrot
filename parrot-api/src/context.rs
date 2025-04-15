@@ -1,51 +1,24 @@
-//! # Actor Context and Lifecycle Management
+//! # Actor Context Module
 //! 
-//! This module defines the execution context and lifecycle management facilities
-//! for actors in the Parrot framework. The context provides actors with access
-//! to system services and their runtime environment.
+//! ## Key Concepts
+//! - ActorContext: Primary interface for system interaction
+//! - ActorSpawner: Actor creation and supervision
+//! - ActorFactory: Actor instantiation patterns
+//! - LifecycleEvent: Actor lifecycle management
 //!
-//! ## Design Philosophy
-//!
-//! The context system is designed with these principles:
-//! - Encapsulation: Actors interact with the system only through their context
-//! - Type Safety: Generic interfaces for type-safe message passing
-//! - Lifecycle Management: Comprehensive control over actor lifecycle
+//! ## Design Principles
+//! - Encapsulation: Actors interact with system only through context
+//! - Type Safety: Generic interfaces for type-safe operations
 //! - Resource Control: Managed access to system resources
+//! - Lifecycle Management: Comprehensive actor lifecycle control
 //!
-//! ## Core Components
+//! ## Thread Safety
+//! All components are designed to be thread-safe and support concurrent access
 //!
-//! - `ActorContext`: Primary interface for actor system interaction
-//! - `ActorSpawner`: Actor creation and supervision
-//! - `ActorFactory`: Actor instantiation patterns
-//! - `LifecycleEvent`: Actor lifecycle notifications
-//!
-//! ## Usage Example
-//!
-//! ```rust
-//! use parrot_api::context::{ActorContext, ActorContextMessage};
-//! use parrot_api::message::Message;
-//! use std::time::Duration;
-//!
-//! struct MyActor {
-//!     context: Box<dyn ActorContext>,
-//! }
-//!
-//! impl MyActor {
-//!     async fn handle_message(&mut self, msg: MyMessage) {
-//!         // Send message to another actor
-//!         let other_actor = self.context.get_actor("other").await?;
-//!         self.context.ask(other_actor, msg).await?;
-//!
-//!         // Schedule periodic task
-//!         self.context.schedule_periodic(
-//!             self.context.get_self_ref(),
-//!             TickMessage,
-//!             Duration::from_secs(0),
-//!             Duration::from_secs(60)
-//!         ).await?;
-//!     }
-//! }
-//! ```
+//! ## Performance Considerations
+//! - Uses async/await for non-blocking operations
+//! - Minimizes allocations where possible
+//! - Employs type erasure for interface flexibility
 
 use std::time::Duration;
 use std::any::Any;
@@ -61,31 +34,51 @@ use crate::supervisor::SupervisorStrategyType;
 use crate::stream::StreamRegistry;
 use crate::supervisor::SupervisorStrategy;
 
-/// Interface for creating new actors in the system.
+/// # Actor Spawner
 ///
-/// This trait provides the core functionality for spawning actors
-/// and managing their supervision relationships.
+/// ## Overview
+/// Interface for creating and managing new actors in the system
+///
+/// ## Key Responsibilities
+/// - Actor creation
+/// - Supervision setup
+/// - Configuration management
+///
+/// ## Thread Safety
+/// All methods are thread-safe and can be called concurrently
+#[async_trait]
 pub trait ActorSpawner: Send + Sync {
-    /// Creates a new actor instance in the system.
+    /// Creates new actor instance
     ///
-    /// # Parameters
-    /// * `actor` - Type-erased actor instance
-    /// * `config` - Type-erased actor configuration
+    /// ## Parameters
+    /// - `actor`: Type-erased actor instance
+    /// - `config`: Actor configuration
     ///
-    /// # Returns
-    /// Future resolving to the actor reference or error
+    /// ## Returns
+    /// - `Ok(ActorRef)`: Successfully created actor
+    /// - `Err(Error)`: Creation failed
+    ///
+    /// ## Performance
+    /// - Allocates actor on heap
+    /// - Performs async initialization
     fn spawn<'a>(&'a self, actor: BoxedMessage, config: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>;
     
-    /// Creates a new actor with specified supervision strategy.
+    /// Creates supervised actor
     ///
-    /// # Parameters
-    /// * `actor` - Type-erased actor instance
-    /// * `config` - Type-erased actor configuration
-    /// * `strategy` - Supervision strategy for the actor
+    /// ## Parameters
+    /// - `actor`: Type-erased actor instance
+    /// - `config`: Actor configuration
+    /// - `strategy`: Supervision strategy
     ///
-    /// # Returns
-    /// Future resolving to the actor reference or error
-    fn spawn_with_strategy<'a>(&'a self, actor: BoxedMessage, config: BoxedMessage, strategy: SupervisorStrategyType) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>;
+    /// ## Implementation Details
+    /// 1. Creates actor instance
+    /// 2. Sets up supervision
+    /// 3. Initializes actor
+    fn spawn_with_strategy<'a>(&'a self, 
+        actor: BoxedMessage, 
+        config: BoxedMessage, 
+        strategy: SupervisorStrategyType
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>;
 }
 
 /// Type-safe extension methods for actor spawning.
@@ -143,41 +136,59 @@ pub trait ActorFactory: Send + 'static {
     async fn create_actor(&self) -> ActorResult<(Self::ActorType, <Self::ActorType as Actor>::Config)>;
 }
 
-/// Core interface for actor system interaction.
+/// # Actor Context
 ///
-/// This trait provides actors with access to:
-/// - Message passing facilities
+/// ## Overview
+/// Core interface for actor system interaction
+///
+/// ## Key Responsibilities
+/// - Message passing
 /// - Lifecycle management
 /// - Child actor supervision
-/// - System services
+/// - System service access
+///
+/// ## Thread Safety
+/// - All methods are thread-safe
+/// - Internal state is protected
+///
+/// ## Performance
+/// - Async operations
+/// - Minimized blocking
 pub trait ActorContext: Send + Sync {
-    /// Returns a reference to this actor.
+    /// Returns self reference
+    ///
+    /// ## Thread Safety
+    /// Safe to call from any thread
     fn get_self_ref(&self) -> BoxedActorRef;
 
-    /// Initiates actor shutdown.
+    /// Initiates actor shutdown
     ///
-    /// # Returns
-    /// Future completing when the actor has stopped
+    /// ## Implementation Details
+    /// 1. Stops child actors
+    /// 2. Cancels pending messages
+    /// 3. Runs cleanup
     fn stop<'a>(&'a mut self) -> BoxedFuture<'a, ActorResult<()>>;
 
-    /// Sends a message to another actor without waiting for response.
+    /// Sends message without response
     ///
-    /// # Parameters
-    /// * `target` - Recipient actor reference
-    /// * `msg` - Message to send
+    /// ## Parameters
+    /// - `target`: Recipient actor
+    /// - `msg`: Message to send
     ///
-    /// # Returns
-    /// Future completing when message is sent
+    /// ## Performance
+    /// - Non-blocking operation
+    /// - May allocate on heap
     fn send<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>>;
 
-    /// Sends a message and waits for response.
+    /// Sends message and awaits response
     ///
-    /// # Parameters
-    /// * `target` - Recipient actor reference
-    /// * `msg` - Message to send
+    /// ## Parameters
+    /// - `target`: Recipient actor
+    /// - `msg`: Message to send
     ///
-    /// # Returns
-    /// Future resolving to the response message
+    /// ## Returns
+    /// - `Ok(response)`: Successful response
+    /// - `Err(error)`: Communication failed
     fn ask<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
     /// Schedules a one-time delayed message.
@@ -268,10 +279,9 @@ pub trait ActorContextMessage: ActorContext {
     /// # Returns
     /// Result indicating success or failure
     fn send_self<M: Message>(&self, msg: M) -> ActorResult<()> {
-        let envelope = MessageEnvelope::new(msg, None, None);
         let self_ref = self.get_self_ref();
         tokio::spawn(async move {
-            let _ = self_ref.send(envelope).await;
+            let _ = self_ref.send(Box::new(msg) as BoxedMessage).await;
         });
         Ok(())
     }
@@ -287,8 +297,7 @@ pub trait ActorContextMessage: ActorContext {
     /// # Returns
     /// Future resolving to the response
     async fn ask_self<M: Message>(&self, msg: M) -> ActorResult<M::Result> {
-        let envelope = MessageEnvelope::new(msg, None, None);
-        let result = self.get_self_ref().send(envelope).await?;
+        let result = self.get_self_ref().send(Box::new(msg) as BoxedMessage).await?;
         M::extract_result(result)
     }
 }
@@ -326,19 +335,34 @@ pub trait ActorContextScheduler: ActorContext {
     fn cancel_schedule(&self, task: ScheduledTask);
 }
 
-/// Represents a scheduled message task.
+/// # Scheduled Task
 ///
-/// Contains information about a scheduled message including
-/// its target and timing.
+/// ## Overview
+/// Represents a scheduled message delivery
+///
+/// ## Key Responsibilities
+/// - Unique task identification
+/// - Target actor reference
+/// - Execution timing
+///
+/// ## Thread Safety
+/// - Implements Send + Sync
+/// - Safe for concurrent access
 #[derive(Debug, Clone)]
 pub struct ScheduledTask {
-    /// Unique identifier for the task
+    /// Unique task identifier
+    /// - **Uniqueness**: Guaranteed unique within system
+    /// - **Persistence**: Stable across restarts
     pub id: uuid::Uuid,
     
-    /// Actor that will receive the message
+    /// Target actor reference
+    /// - **Thread Safety**: Arc ensures safe sharing
+    /// - **Lifecycle**: Strong reference to prevent cleanup
     pub target: Arc<dyn ActorRef>,
     
-    /// When the task is scheduled to execute
+    /// Scheduled execution time
+    /// - **Precision**: System time precision
+    /// - **Timezone**: UTC based
     pub schedule_time: std::time::SystemTime,
 }
 
@@ -359,24 +383,36 @@ impl Hash for ScheduledTask {
     }
 }
 
-/// Events representing changes in actor lifecycle.
+/// # Lifecycle Events
 ///
-/// These events are used to notify actors of important
-/// lifecycle transitions and system events.
+/// ## Overview
+/// Events representing actor lifecycle transitions
+///
+/// ## Key Events
+/// - Started: Initialization complete
+/// - Stopped: Termination complete
+/// - ChildTerminated: Child actor stopped
+/// - Terminated: Watched actor stopped
+/// - ReceiveTimeout: Message timeout
+///
+/// ## Usage
+/// Used for monitoring and reacting to actor state changes
 #[derive(Debug)]
 pub enum LifecycleEvent {
-    /// Actor has completed initialization
+    /// Actor started successfully
     Started,
     
-    /// Actor has terminated
+    /// Actor stopped completely
     Stopped,
     
-    /// A child actor has terminated
+    /// Child actor terminated
+    /// - **Parameter**: Reference to terminated child
     ChildTerminated(BoxedActorRef),
     
-    /// A watched actor has terminated
+    /// Watched actor terminated
+    /// - **Parameter**: Reference to terminated actor
     Terminated(BoxedActorRef),
     
-    /// No message received within timeout period
+    /// Message receive timeout occurred
     ReceiveTimeout,
 } 

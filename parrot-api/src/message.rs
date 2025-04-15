@@ -50,37 +50,129 @@ use std::any::Any;
 use std::sync::Arc;
 use uuid::Uuid;
 use crate::address::ActorRef;
-
-/// Unique identifier for messages in the system.
-/// 
-/// Uses UUID v4 to ensure uniqueness across distributed systems.
+use crate::types::BoxedMessage;
+/// Message ID type
 pub type MessageId = Uuid;
 
-/// Core trait for defining actor messages.
+/// # Message Priority
 ///
-/// This trait must be implemented by all message types in the system.
-/// It provides type safety and result type mapping for message handling.
+/// ## Overview
+/// Represents message processing priority in the actor system
 ///
-/// # Type Parameters
+/// ## Key Characteristics
+/// - Range: 0-100 (inclusive)
+/// - Higher value means higher priority
+/// - Default is 50 (normal priority)
 ///
-/// * `Result`: The type returned when this message is processed
+/// ## Priority Ranges
+/// - 0-19: Background tasks (lowest priority)
+/// - 20-39: Low priority tasks
+/// - 40-59: Normal priority tasks
+/// - 60-79: High priority tasks
+/// - 80-100: Critical tasks (highest priority)
 ///
-/// # Examples
-///
-/// ```rust
-/// use parrot_api::message::Message;
-///
-/// #[derive(Message)]
-/// struct GetUserProfile {
-///     user_id: String,
-/// }
-///
-/// impl Message for GetUserProfile {
-///     type Result = Option<UserProfile>;
-/// }
-/// ```
+/// ## Thread Safety
+/// - Implements Send + Sync
+/// - Copy semantic for efficient passing
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MessagePriority(u8);
+
+impl MessagePriority {
+    /// Creates a new MessagePriority with the specified value
+    ///
+    /// ## Parameters
+    /// - `priority`: Priority value between 0 and 100
+    ///
+    /// ## Returns
+    /// - `Some(MessagePriority)`: If value is in valid range
+    /// - `None`: If value is greater than 100
+    pub fn new(priority: u8) -> Option<Self> {
+        if priority <= 100 {
+            Some(MessagePriority(priority))
+        } else {
+            None
+        }
+    }
+
+    /// Creates a new MessagePriority without checking the range
+    ///
+    /// ## Safety
+    /// - Caller must ensure value is <= 100
+    /// - Panics in debug mode if value > 100
+    pub fn new_unchecked(priority: u8) -> Self {
+        debug_assert!(priority <= 100, "Priority must be <= 100");
+        MessagePriority(priority)
+    }
+
+    /// Returns the priority value
+    pub fn value(&self) -> u8 {
+        self.0
+    }
+
+    /// Predefined priority: Background (10)
+    pub const BACKGROUND: MessagePriority = MessagePriority(10);
+    
+    /// Predefined priority: Low (30)
+    pub const LOW: MessagePriority = MessagePriority(30);
+    
+    /// Predefined priority: Normal (50)
+    pub const NORMAL: MessagePriority = MessagePriority(50);
+    
+    /// Predefined priority: High (70)
+    pub const HIGH: MessagePriority = MessagePriority(70);
+    
+    /// Predefined priority: Critical (90)
+    pub const CRITICAL: MessagePriority = MessagePriority(90);
+
+    /// Checks if priority is in background range (0-19)
+    pub fn is_background(&self) -> bool {
+        self.0 <= 19
+    }
+
+    /// Checks if priority is in low range (20-39)
+    pub fn is_low(&self) -> bool {
+        (20..=39).contains(&self.0)
+    }
+
+    /// Checks if priority is in normal range (40-59)
+    pub fn is_normal(&self) -> bool {
+        (40..=59).contains(&self.0)
+    }
+
+    /// Checks if priority is in high range (60-79)
+    pub fn is_high(&self) -> bool {
+        (60..=79).contains(&self.0)
+    }
+
+    /// Checks if priority is in critical range (80-100)
+    pub fn is_critical(&self) -> bool {
+        self.0 >= 80
+    }
+}
+
+impl Default for MessagePriority {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
+
+impl std::fmt::Display for MessagePriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Priority({})", self.0)
+    }
+}
+
+impl TryFrom<u8> for MessagePriority {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or("Priority must be between 0 and 100")
+    }
+}
+
+/// Message trait for type-safe message passing
 pub trait Message: Send + 'static {
-    /// The type returned when this message is processed by an actor
+    /// Message response type
     type Result: Send + 'static;
 
     /// Extracts the typed result from a type-erased response.
@@ -118,6 +210,20 @@ pub trait Message: Send + 'static {
     /// Returns the message type name.
     ///
     /// This is typically the struct name of the message type.
+    /// 
+    /// # Returns
+    /// * `&'static str` - The type name of the message as a static string
+    ///
+    /// # Example
+    /// ```
+    /// struct MyMessage {}
+    /// impl Message for MyMessage {
+    ///     type Result = ();
+    /// }
+    /// 
+    /// let msg = MyMessage {};
+    /// assert_eq!(msg.message_type(), "MyMessage");
+    /// ```
     fn message_type(&self) -> &'static str {
         std::any::type_name::<Self>()
     }
@@ -125,66 +231,69 @@ pub trait Message: Send + 'static {
     /// Returns the message priority level.
     ///
     /// Default implementation returns Normal priority.
+    /// 
+    /// # Returns
+    /// * `MessagePriority` - The priority level for this message
+    ///
+    /// # Example
+    /// ```
+    /// struct MyMessage {}
+    /// impl Message for MyMessage {
+    ///     type Result = ();
+    /// }
+    /// 
+    /// let msg = MyMessage {};
+    /// assert_eq!(msg.priority(), MessagePriority::NORMAL);
+    /// ```
     fn priority(&self) -> MessagePriority {
-        MessagePriority::Normal
+        MessagePriority::NORMAL
     }
-}
 
-/// Container for messages with metadata and delivery options.
-///
-/// `MessageEnvelope` wraps a message with:
-/// - Unique identifier
-/// - Type-erased payload
-/// - Sender information
-/// - Delivery options
-///
-/// This structure enables the actor system to:
-/// - Track message flow
-/// - Implement delivery guarantees
-/// - Handle message priorities
-/// - Manage timeouts and retries
-pub struct MessageEnvelope {
-    /// Unique identifier for this message instance
-    pub id: MessageId,
-    
-    /// Type-erased message content
-    pub payload: Box<dyn Any + Send>,
-    
-    /// Optional reference to the sending actor
-    pub sender: Option<Arc<dyn ActorRef>>,
-    
-    /// Delivery and processing options
-    pub options: MessageOptions,
-
-    /// The type name of the message
-    pub message_type: &'static str,
-}
-
-impl std::fmt::Debug for MessageEnvelope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MessageEnvelope")
-            .field("id", &self.id)
-            .field("payload", &"<dyn Any>")
-            .field("sender", &self.sender.as_ref().map(|_| "<dyn ActorRef>"))
-            .field("options", &self.options)
-            .field("message_type", &self.message_type)
-            .finish()
+    /// Returns the message options for this message.
+    ///
+    /// Default implementation returns default message options.
+    /// 
+    /// # Returns
+    /// * `MessageOptions` - The options for this message
+    fn message_options(&self) -> Option<MessageOptions> {
+        None
     }
+
+
+    /// Converts message into a boxed message
+    ///
+    /// Boxes the message for type erasure in the actor system.
+    /// 
+    /// # Parameters
+    /// * `msg` - The message to box
+    ///
+    /// # Returns
+    /// * `BoxedMessage` - Type-erased boxed message
+    ///
+    /// # Example
+    /// ```
+    /// struct MyMessage {}
+    /// impl Message for MyMessage {
+    ///     type Result = ();
+    /// }
+    /// 
+    /// let msg = MyMessage {};
+    /// let boxed = Message::into_boxed(msg);
+    /// ```
+    fn into_boxed(msg: Self) -> BoxedMessage where Self: Sized {
+        Box::new(msg)
+    }
+
 }
 
-/// Configuration options for message delivery and processing.
-///
-/// These options control how the message is handled by the actor system,
-/// including timing, retries, and priority.
-#[derive(Clone, Debug)]
+/// Message options for controlling delivery and processing
+#[derive(Debug)]
 pub struct MessageOptions {
-    /// Maximum time allowed for message processing
+    /// Message processing timeout
     pub timeout: Option<Duration>,
-    
-    /// Policy for handling message delivery failures
+    /// Retry policy for failed processing
     pub retry_policy: Option<RetryPolicy>,
-    
-    /// Relative importance of the message
+    /// Message priority level
     pub priority: MessagePriority,
 }
 
@@ -193,32 +302,86 @@ impl Default for MessageOptions {
         Self {
             timeout: None,
             retry_policy: None,
-            priority: MessagePriority::Normal,
+            priority: MessagePriority::NORMAL,
         }
     }
 }
 
-/// Priority levels for message processing.
-///
-/// Messages with higher priority are processed before
-/// lower priority messages in the actor's mailbox.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MessagePriority {
-    /// Background or bulk processing tasks
-    Low,
-    /// Standard message priority
-    Normal,
-    /// Time-sensitive operations
-    High,
-    /// System or emergency messages
-    Critical,
+/// Message envelope for type-erased message passing
+#[derive(Debug)]
+pub struct MessageEnvelope {
+    /// Unique message identifier
+    pub id: MessageId,
+    /// Message payload
+    pub payload: Box<dyn Any + Send>,
+    /// Message sender reference
+    pub sender: Option<Box<dyn ActorRef>>,
+    /// Message processing options
+    pub options: MessageOptions,
+    /// The type name of the message
+    pub message_type: &'static str,
+}
+
+impl MessageEnvelope {
+    /// Creates a new message envelope
+    pub fn new<M: Message>(
+        payload: M,
+        sender: Option<Box<dyn ActorRef>>,
+        options: Option<MessageOptions>,
+    ) -> Self {
+        // if options are provided, use them, otherwise use the message options
+        let options = options.unwrap_or_else(
+            || payload.message_options().unwrap_or_default()
+        );
+        Self {
+            id: Uuid::new_v4(),
+            payload: Box::new(payload),
+            sender,
+            options,
+            message_type: std::any::type_name::<M>(),
+        }
+    }
+
+    /// Extracts message payload
+    pub fn payload<M: Message>(&self) -> Option<&M> {
+        self.payload.downcast_ref()
+    }
+
+    /// Extracts mutable message payload
+    pub fn payload_mut<M: Message>(&mut self) -> Option<&mut M> {
+        self.payload.downcast_mut()
+    }
+
+    pub fn message<M: Message>(&self) -> Option<&M> {
+        self.payload.downcast_ref()
+    }
+
+    pub fn message_mut<M: Message>(&mut self) -> Option<&mut M> {
+        self.payload.downcast_mut()
+    }
+
+    /// Creates a new message envelope from a boxed message
+    pub fn from_boxed(
+        boxed_msg: BoxedMessage,
+        sender: Option<Box<dyn ActorRef>>,
+        options: MessageOptions,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            message_type: std::any::type_name_of_val(&*boxed_msg),
+            payload: boxed_msg,
+            sender,
+            options
+        }
+    }
+
 }
 
 /// Configuration for message retry behavior.
 ///
 /// Defines how the system should handle message delivery
 /// or processing failures through retries.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RetryPolicy {
     /// Maximum number of retry attempts
     pub max_attempts: u32,
@@ -234,7 +397,7 @@ pub struct RetryPolicy {
 ///
 /// Different backoff strategies can be used to handle various
 /// types of failures and network conditions.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum BackoffStrategy {
     /// Constant interval between retries
     Fixed,
@@ -251,106 +414,36 @@ pub enum BackoffStrategy {
     },
 }
 
-impl MessageEnvelope {
-    /// Creates a new message envelope with the given payload and options.
-    ///
-    /// # Type Parameters
-    /// * `M`: Message type implementing the `Message` trait
-    ///
-    /// # Parameters
-    /// * `payload`: The message content
-    /// * `sender`: Optional reference to the sending actor
-    /// * `options`: Optional delivery configuration
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// let msg = MessageEnvelope::new(
-    ///     MyMessage { data: "hello" },
-    ///     None,
-    ///     Some(MessageOptions::default())
-    /// );
-    /// ```
-    pub fn new<M: Message>(
-        payload: M,
-        sender: Option<Arc<dyn ActorRef>>,
-        options: Option<MessageOptions>,
-    ) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            message_type: payload.message_type(),
-            payload: Box::new(payload),
-            sender,
-            options: options.unwrap_or_default(),
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_priority_ranges() {
+        assert!(MessagePriority::new(0).unwrap().is_background());
+        assert!(MessagePriority::new(15).unwrap().is_background());
+        assert!(MessagePriority::new(30).unwrap().is_low());
+        assert!(MessagePriority::new(50).unwrap().is_normal());
+        assert!(MessagePriority::new(70).unwrap().is_high());
+        assert!(MessagePriority::new(90).unwrap().is_critical());
     }
 
-    /// Attempts to access the message payload as a specific type.
-    ///
-    /// # Type Parameters
-    /// * `M`: Expected message type
-    ///
-    /// # Returns
-    /// * `Some(&M)`: Reference to the payload if type matches
-    /// * `None`: If the payload is not of type M
-    pub fn payload<M: Message>(&self) -> Option<&M> {
-        self.payload.downcast_ref()
+    #[test]
+    fn test_priority_ordering() {
+        assert!(MessagePriority::CRITICAL > MessagePriority::HIGH);
+        assert!(MessagePriority::HIGH > MessagePriority::NORMAL);
+        assert!(MessagePriority::NORMAL > MessagePriority::LOW);
+        assert!(MessagePriority::LOW > MessagePriority::BACKGROUND);
     }
 
-    /// Attempts to access the message payload as a specific type mutably.
-    ///
-    /// # Type Parameters
-    /// * `M`: Expected message type
-    ///
-    /// # Returns
-    /// * `Some(&mut M)`: Mutable reference to the payload if type matches
-    /// * `None`: If the payload is not of type M
-    pub fn payload_mut<M: Message>(&mut self) -> Option<&mut M> {
-        self.payload.downcast_mut()
+    #[test]
+    fn test_invalid_priority() {
+        assert!(MessagePriority::new(101).is_none());
+        assert!(MessagePriority::new(255).is_none());
     }
 
-    /// Returns the type name of the contained message.
-    ///
-    /// This method attempts to downcast the payload to access its message type.
-    /// If the downcast fails, it returns an empty string.
-    ///
-    /// # Returns
-    /// * `&'static str`: The type name of the message or empty string if type information is unavailable
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// let envelope = MessageEnvelope::new(MyMessage { data: "test" }, None, None);
-    /// assert_eq!(envelope.message_type(), "my_crate::MyMessage");
-    /// ```
-    pub fn message_type(&self) -> &'static str {
-        self.message_type
-    }
-
-
-    /// Returns a reference to the message payload as a trait object.
-    /// alias for payload::<M: Message>()
-    /// 
-    /// # Type Parameters
-    /// * `M`: Expected message type
-    ///
-    /// # Returns
-    /// * `&M`: Reference to the payload if type matches
-    /// * `expect`: If the payload is not of type M 
-    pub fn message<M: Message>(&self) -> &M {
-        self.payload::<M>().expect("Failed to downcast message payload")
-    }
-
-    /// Returns a mutable reference to the message payload as a trait object.
-    /// alias for payload_mut::<M: Message>()
-    /// 
-    /// # Type Parameters
-    /// * `M`: Expected message type
-    ///
-    /// # Returns
-    /// * `&mut M`: Mutable reference to the payload if type matches
-    /// * `expect`: If the payload is not of type M
-    pub fn message_mut<M: Message>(&mut self) -> &mut M {
-        self.payload_mut::<M>().expect("Failed to downcast message payload")
+    #[test]
+    fn test_default_priority() {
+        assert_eq!(MessagePriority::default(), MessagePriority::NORMAL);
     }
 } 

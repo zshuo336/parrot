@@ -10,15 +10,70 @@ struct MessageOptions {
     /// Custom result type for the message
     #[darling(default)]
     result: Option<String>,
-    /// Enable serde serialization
-    #[darling(default)]
-    serde: bool,
     /// Validation expression
     #[darling(default)]
     validate: Option<String>,
-    /// Message priority
+    /// Message priority - either a number (0-100) or a named priority
     #[darling(default)]
-    priority: Option<String>,
+    priority: Option<PriorityValue>,
+    /// Message timeout in seconds
+    #[darling(default)]
+    timeout: Option<u64>,
+    /// Retry policy
+    #[darling(default)]
+    retry_max_attempts: Option<u32>,
+    #[darling(default)]
+    retry_interval: Option<u64>,
+    #[darling(default)]
+    retry_strategy: Option<String>,
+}
+
+/// Represents a priority value that can be either a number, a named priority, or an identifier
+#[derive(Debug)]
+enum PriorityValue {
+    /// Numeric priority value (0-100)
+    Numeric(u8),
+    /// Named priority (BACKGROUND, LOW, NORMAL, HIGH, CRITICAL)
+    Named(String),
+    /// Identifier reference to a constant
+    Ident(String),
+}
+
+impl Default for PriorityValue {
+    fn default() -> Self {
+        PriorityValue::Named("NORMAL".to_string())
+    }
+}
+
+impl FromMeta for PriorityValue {
+    fn from_value(value: &syn::Lit) -> darling::Result<Self> {
+        match value {
+            syn::Lit::Int(lit_int) => {
+                let value = lit_int.base10_parse::<u8>()?;
+                Ok(PriorityValue::Numeric(value))
+            },
+            syn::Lit::Str(lit_str) => {
+                let value = lit_str.value();
+                Ok(PriorityValue::Named(value))
+            },
+            _ => Err(darling::Error::unexpected_lit_type(value)),
+        }
+    }
+
+    fn from_expr(expr: &syn::Expr) -> darling::Result<Self> {
+        match expr {
+            // Handle path expressions like priority = HIGH
+            syn::Expr::Path(path) => {
+                if let Some(ident) = path.path.get_ident() {
+                    return Ok(PriorityValue::Ident(ident.to_string()));
+                }
+                Err(darling::Error::custom("Expected a simple identifier"))
+            },
+            // Pass to from_value for literals
+            syn::Expr::Lit(expr_lit) => Self::from_value(&expr_lit.lit),
+            _ => Err(darling::Error::unexpected_expr_type(expr)),
+        }
+    }
 }
 
 #[derive(Debug, FromAttributes)]
@@ -40,7 +95,6 @@ fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// 
 /// This macro automatically implements the Message trait and provides additional features:
 /// - Custom result type specification
-/// - Serialization/deserialization support
 /// - Validation rules
 /// - Message priority handling
 /// - Helper methods for message processing
@@ -57,18 +111,7 @@ fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// }
 /// ```
 /// 
-/// ## 2. Serialization Support
-/// ```rust
-/// # use parrot_api::Message;
-/// #[derive(Message)]
-/// #[message(serde)]  // Enables serde::Serialize and serde::Deserialize
-/// struct UserEvent {
-///     event_type: String,
-///     data: Vec<u8>,
-/// }
-/// ```
-/// 
-/// ## 3. Validation Rules
+/// ## 2. Validation Rules
 /// ```rust
 /// # use parrot_api::Message;
 /// #[derive(Message)]
@@ -83,26 +126,43 @@ fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// }
 /// ```
 /// 
-/// ## 4. Message Priority
+/// ## 3. Message Priority
 /// ```rust
 /// # use parrot_api::Message;
+/// // Using a named priority
 /// #[derive(Message)]
-/// #[message(priority = "High")]  // Sets message processing priority
+/// #[message(priority = "HIGH")]  // Sets message processing priority to HIGH (70)
 /// struct EmergencyAlert {
+///     alert_type: String,
+///     message: String,
+/// }
+/// 
+/// // Using a numeric priority (0-100)
+/// #[derive(Message)]
+/// #[message(priority = 75)]  // Sets custom priority level
+/// struct CustomPriorityAlert {
 ///     alert_type: String,
 ///     message: String,
 /// }
 /// ```
 /// 
-/// ## 5. Complete Example
+/// Supported priority names:
+/// - "BACKGROUND" (value 10)
+/// - "LOW" (value 30)
+/// - "NORMAL" (value 50)
+/// - "HIGH" (value 70)
+/// - "CRITICAL" (value 90)
+/// 
+/// Or numeric values from 0 to 100.
+/// 
+/// ## 4. Complete Example
 /// ```rust
 /// # use parrot_api::Message;
 /// #[derive(Message)]
 /// #[message(
 ///     result = "Vec<Order>",           // Custom return type
-///     serde,                          // Enable serialization
 ///     validate = "amount > 0.0",      // Add validation
-///     priority = "High"               // Set priority
+///     priority = "HIGH"               // Set priority
 /// )]
 /// struct CreateOrder {
 ///     user_id: String,
@@ -124,9 +184,8 @@ fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// // Get message type
 /// assert_eq!(order.message_type(), "CreateOrder");
 /// 
-/// // Convert to envelope and send
+/// // Convert to envelope
 /// let envelope = order.into_envelope();
-/// // actor.send(envelope).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -140,6 +199,7 @@ fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// - `into_envelope(self) -> MessageEnvelope`: Converts the message into an envelope
 /// - `validate(&self) -> Result<(), ActorError>`: Validates the message (if validation rules are specified)
 /// - `priority(&self) -> MessagePriority`: Returns the message priority
+/// - `extract_result(result: Box<dyn Any + Send>) -> Result<Self::Result, ActorError>`: Extracts the result from a boxed Any type
 #[proc_macro_derive(Message, attributes(message))]
 pub fn derive_message(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -158,7 +218,8 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
     }
     
     let name = &input.ident;
-    let options = parse_message_attrs(&input.attrs);
+    // Parse the message attributes into a MessageOptions struct
+    let options: MessageOptions = parse_message_attrs(&input.attrs);
     
     // Parse the result type from the attribute or use () as default
     let result_type = if let Some(ref result_type) = options.result {
@@ -168,11 +229,41 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
     };
 
     // Parse priority or use Normal as default
-    let priority = if let Some(priority) = options.priority {
-        let priority_ident = Ident::new(&priority, Span::call_site());
-        quote! { parrot_api::MessagePriority::#priority_ident }
+    let priority = if let Some(priority_value) = &options.priority {
+        match priority_value {
+            PriorityValue::Numeric(value) => {
+                quote! { parrot_api::MessagePriority::new_unchecked(#value) }
+            },
+            PriorityValue::Named(name) => {
+                match name.to_uppercase().as_str() {
+                    "BACKGROUND" => quote! { parrot_api::MessagePriority::BACKGROUND },
+                    "LOW" => quote! { parrot_api::MessagePriority::LOW },
+                    "NORMAL" => quote! { parrot_api::MessagePriority::NORMAL },
+                    "HIGH" => quote! { parrot_api::MessagePriority::HIGH },
+                    "CRITICAL" => quote! { parrot_api::MessagePriority::CRITICAL },
+                    _ => {
+                        // Default to NORMAL if an invalid name is provided
+                        quote! { parrot_api::MessagePriority::NORMAL }
+                    }
+                }
+            },
+            PriorityValue::Ident(ident) => {
+                match ident.to_uppercase().as_str() {
+                    "BACKGROUND" => quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::BACKGROUND) },
+                    "LOW" => quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::LOW) },
+                    "NORMAL" => quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::NORMAL) },
+                    "HIGH" => quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::HIGH) },
+                    "CRITICAL" => quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::CRITICAL) },
+                    _ => {
+                        // For other identifiers, assume they are constants
+                        let ident_token = syn::Ident::new(ident, proc_macro2::Span::call_site());
+                        quote! { parrot_api::MessagePriority::new_unchecked(#ident_token) }
+                    }
+                }
+            }
+        }
     } else {
-        quote! { parrot_api::MessagePriority::Normal }
+        quote! { parrot_api::MessagePriority::NORMAL }
     };
 
     // Generate validation code
@@ -189,6 +280,44 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
         }
     } else {
         quote! { Ok(()) }
+    };
+
+    let timeout = options.timeout;
+    let retry_max_attempts = options.retry_max_attempts;
+    let retry_interval = options.retry_interval;
+    let retry_strategy = options.retry_strategy.as_deref();
+
+    // Modify Option<T> handling
+    let timeout_opt = if let Some(timeout) = timeout {
+        quote! { Some(std::time::Duration::from_secs(#timeout)) }
+    } else {
+        quote! { None }
+    };
+    
+    let retry_policy_opt = if let Some(retry_max) = retry_max_attempts {
+        let max_attempts = retry_max;
+        let interval = retry_interval.unwrap_or(1);
+        let strategy = match retry_strategy {
+            Some("Fixed") => quote! { parrot_api::message::BackoffStrategy::Fixed },
+            Some("Linear") => quote! { parrot_api::message::BackoffStrategy::Linear },
+            Some("Exponential") => quote! { 
+                parrot_api::message::BackoffStrategy::Exponential {
+                    base: 2.0,
+                    max_interval: std::time::Duration::from_secs(60),
+                }
+            },
+            _ => quote! { parrot_api::message::BackoffStrategy::Fixed },
+        };
+        
+        quote! {
+            Some(parrot_api::message::RetryPolicy {
+                max_attempts: #max_attempts,
+                retry_interval: std::time::Duration::from_secs(#interval),
+                backoff_strategy: #strategy,
+            })
+        }
+    } else {
+        quote! { None }
     };
 
     // Generate the implementation
@@ -216,6 +345,14 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
             fn validate(&self) -> Result<(), parrot_api::errors::ActorError> {
                 #validate_impl
             }
+
+            fn message_options(&self) -> Option<parrot_api::MessageOptions> {
+                Some(parrot_api::MessageOptions {
+                    timeout: #timeout_opt,
+                    retry_policy: #retry_policy_opt,
+                    priority: self.priority(),
+                })
+            }
         }
 
         impl #name {
@@ -225,10 +362,11 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
             }
 
             pub fn into_envelope(self) -> parrot_api::MessageEnvelope {
-                parrot_api::MessageEnvelope::new(self, None, None)
+                let options = self.message_options();
+                parrot_api::MessageEnvelope::new(self, None, options)
             }
         }
     };
 
     TokenStream::from(expanded)
-} 
+}

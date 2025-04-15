@@ -1,41 +1,19 @@
-//! # Actor Addressing and Reference Management
+//! # Actor Address Module
 //! 
-//! This module provides the addressing and reference management system for the Parrot actor framework.
-//! It defines how actors can be uniquely identified, located, and communicated with in a distributed system.
+//! ## Key Concepts
+//! - ActorPath: Unique identifier and location for actors
+//! - ActorRef: Core message passing interface
+//! - WeakActorRef: Non-owning actor references
+//! 
+//! ## Design Principles
+//! - Type safety: Generic interfaces for type-safe message passing
+//! - Memory safety: Proper handling of actor lifecycles
+//! - Asynchronous: All operations are non-blocking
+//! - Thread safety: All types are Send + Sync
 //!
-//! ## Design Philosophy
-//!
-//! The addressing system follows these principles:
-//! - Location Transparency: Actors can communicate without knowing each other's physical location
-//! - Reference Safety: Strong and weak references prevent memory leaks and dangling references
-//! - Path-based Addressing: Hierarchical naming scheme for actor identification
-//! - Type-safe Communication: Generic traits ensure type safety in message passing
-//!
-//! ## Core Components
-//!
-//! - `ActorPath`: Unique identifier for actors in the system
-//! - `ActorRef`: Interface for sending messages to actors
-//! - `ActorRefExt`: Type-safe message sending extensions
-//! - `WeakActorRef`: Non-owning reference to prevent reference cycles
-//!
-//! ## Usage Example
-//!
-//! ```rust
-//! use parrot_api::address::{ActorRef, ActorRefExt};
-//! use parrot_api::message::Message;
-//!
-//! // Define a message
-//! #[derive(Message)]
-//! struct Ping(String);
-//!
-//! async fn example(actor: impl ActorRef) {
-//!     // Type-safe message sending
-//!     let response = actor.ask(Ping("Hello".to_string())).await;
-//!     
-//!     // Fire-and-forget message
-//!     actor.tell(Ping("Notification".to_string()));
-//! }
-//! ```
+//! ## Architecture
+//! This module provides the addressing and message passing infrastructure
+//! for the actor system, enabling location-transparent communication.
 
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
@@ -46,21 +24,28 @@ use crate::errors::ActorError;
 use crate::types::{BoxedActorRef, BoxedMessage, ActorResult, BoxedFuture, WeakActorTarget};
 use crate::message::{Message, MessageEnvelope};
 use std::sync::Arc;
+use async_trait::async_trait;
 
+/// # Actor Path
+///
+/// ## Overview
 /// Unique identifier and location information for an actor in the system.
 ///
-/// `ActorPath` combines:
-/// - A weak reference to the actual actor target
-/// - A string path representing the actor's location in the hierarchy
+/// ## Key Responsibilities
+/// - Maintains weak reference to actual actor
+/// - Provides hierarchical addressing
+/// - Supports path-based actor lookup
 ///
-/// The path format follows a URI-like structure:
-/// `protocol://system/user/child1/child2`
+/// ## Implementation Details
+/// ### Path Format
+/// Follows URI-like structure: `protocol://system/user/child1/child2`
 ///
-/// # Examples
+/// ### Thread Safety
+/// - Implements Send + Sync
+/// - Clone is lock-free
 ///
+/// ## Examples
 /// ```rust
-/// use parrot_api::address::ActorPath;
-///
 /// let path = ActorPath {
 ///     target: actor_target,
 ///     path: "local://system1/user/worker1".to_string()
@@ -69,9 +54,13 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ActorPath {
     /// Weak reference to the actual actor implementation
+    /// - **Thread Safety**: Safe to share between threads
+    /// - **Lifecycle**: Does not prevent actor termination
     pub target: WeakActorTarget,
     
-    /// String representation of the actor's path in the system
+    /// String representation of the actor's path
+    /// - **Format**: protocol://system/user/child1/child2
+    /// - **Uniqueness**: Must be unique within system
     pub path: String,
 }
 
@@ -95,69 +84,64 @@ impl Display for ActorPath {
     }
 }
 
-/// Core interface for interacting with actors through message passing.
+/// # Actor Reference
 ///
-/// `ActorRef` provides the fundamental operations for:
-/// - Sending messages to actors
-/// - Managing actor lifecycle
-/// - Querying actor status
+/// ## Overview
+/// Core trait for sending messages to actors.
 ///
-/// This trait is the primary way to interact with actors in the system,
-/// providing location transparency and type safety.
+/// ## Key Responsibilities
+/// - Type-erased message passing
+/// - Actor lifecycle management
+/// - Location transparency
 ///
-/// # Thread Safety
+/// ## Thread Safety
+/// - All methods are thread-safe
+/// - Can be shared between threads
 ///
-/// All methods are thread-safe and can be called from multiple threads.
-///
-/// # Implementation Notes
-///
-/// Implementors must ensure that:
-/// - Message sending is asynchronous
-/// - Actor lifecycle operations are atomic
-/// - Path information is immutable
+/// ## Performance
+/// - Message sends are asynchronous
+/// - Uses boxed futures for type erasure
+#[async_trait]
 pub trait ActorRef: Send + Sync + Debug {
-    /// Sends a message to the actor and waits for a response.
+    /// Sends a type-erased message and awaits response
     ///
-    /// This is the core message passing method that:
-    /// - Delivers the message to the actor
-    /// - Waits for processing
-    /// - Returns the response
+    /// ## Parameters
+    /// - `msg`: Type-erased message (must implement Send)
     ///
-    /// # Parameters
-    /// * `msg` - The message envelope containing the message and metadata
+    /// ## Returns
+    /// - `Ok(response)`: Message processed successfully
+    /// - `Err(error)`: Message processing failed
     ///
-    /// # Returns
-    /// A future that resolves to the actor's response or an error
-    fn send<'a>(&'a self, msg: MessageEnvelope) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
+    /// ## Performance
+    /// - Uses dynamic dispatch
+    /// - Allocates future on heap
+    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
-    /// Initiates graceful shutdown of the actor.
+    /// Stops the actor
     ///
-    /// The shutdown process:
-    /// 1. Stops accepting new messages
-    /// 2. Processes remaining messages in the mailbox
-    /// 3. Calls cleanup handlers
-    /// 4. Terminates the actor
-    ///
-    /// # Returns
-    /// A future that completes when the actor has stopped
+    /// ## Implementation Details
+    /// 1. Sends stop signal to actor
+    /// 2. Waits for confirmation
+    /// 3. Cleans up resources
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>>;
 
-    /// Returns the string representation of the actor's path.
+    /// Returns actor's path
     ///
-    /// The path uniquely identifies the actor in the system hierarchy.
+    /// ## Returns
+    /// String representation of actor location
     fn path(&self) -> String;
 
-    /// Checks if the actor is still alive and processing messages.
+    /// Checks actor liveness
     ///
-    /// # Returns
-    /// A future that resolves to:
-    /// - `true` if the actor is alive
-    /// - `false` if the actor has terminated
+    /// ## Returns
+    /// - `true`: Actor is processing messages
+    /// - `false`: Actor has terminated
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool>;
 
-    /// Creates a new boxed reference to this actor.
+    /// Creates boxed clone of reference
     ///
-    /// Used internally for type erasure and dynamic dispatch.
+    /// ## Thread Safety
+    /// Safe to call from any thread
     fn clone_boxed(&self) -> BoxedActorRef;
 }
 
@@ -182,10 +166,9 @@ pub trait ActorRefExt: ActorRef {
     /// # Returns
     /// A future that resolves to the typed response or error
     fn ask<'a, M: Message>(&'a self, msg: M) -> BoxedFuture<'a, ActorResult<M::Result>> {
-        let envelope = MessageEnvelope::new(msg, None, None);
         let this = self.clone_boxed();
         Box::pin(async move {
-            let result = this.send(envelope).await?;
+            let result = this.send(Box::new(msg) as BoxedMessage).await?;
             M::extract_result(result)
         })
     }
@@ -203,10 +186,9 @@ pub trait ActorRefExt: ActorRef {
     /// # Parameters
     /// * `msg` - The message to send
     fn tell<M: Message>(&self, msg: M) {
-        let envelope = MessageEnvelope::new(msg, None, None);
         let actor_ref = self.clone_boxed();
         tokio::spawn(async move {
-            let _ = actor_ref.send(envelope).await;
+            let _ = actor_ref.send(Box::new(msg) as BoxedMessage).await;
         });
     }
 }
@@ -214,18 +196,22 @@ pub trait ActorRefExt: ActorRef {
 // Implement ActorRefExt for all types that implement ActorRef
 impl<T: ActorRef + ?Sized> ActorRefExt for T {}
 
-/// Non-owning reference to an actor that doesn't prevent garbage collection.
+/// # Weak Actor Reference
 ///
-/// `WeakActorRef` is used to:
-/// - Break reference cycles in actor hierarchies
-/// - Create temporary references
-/// - Implement supervision without memory leaks
+/// ## Overview
+/// Non-owning reference that doesn't prevent garbage collection
 ///
-/// # Examples
+/// ## Key Responsibilities
+/// - Break reference cycles
+/// - Temporary references
+/// - Supervision without leaks
 ///
+/// ## Thread Safety
+/// - Implements Send + Sync
+/// - Clone is thread-safe
+///
+/// ## Examples
 /// ```rust
-/// use parrot_api::address::WeakActorRef;
-///
 /// async fn example(weak_ref: WeakActorRef) {
 ///     if let Some(strong_ref) = weak_ref.upgrade().await {
 ///         // Use the strong reference
@@ -234,7 +220,9 @@ impl<T: ActorRef + ?Sized> ActorRefExt for T {}
 /// ```
 #[derive(Clone, Debug)]
 pub struct WeakActorRef {
-    /// The path identifying the referenced actor
+    /// Actor path information
+    /// - **Lifecycle**: Outlives actor instance
+    /// - **Thread Safety**: Safe to share
     pub path: ActorPath,
 }
 
