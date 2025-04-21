@@ -198,7 +198,7 @@ impl Actor for ActixContextSpawner {
             println!("Received request to spawn child actor: {}", spawn_msg.0);
             
             // Try to convert engine_ctx to actix::Context<ActixActor<Self>>
-            let actix_ctx = unsafe { engine_ctx.as_ref().downcast_ref::<actix::Context<ActixActor<Self>>>() };
+            let actix_ctx: Option<&ActixBaseContext<ActixActor<ActixContextSpawner>>> = unsafe { engine_ctx.as_ref().downcast_ref::<actix::Context<ActixActor<Self>>>() };
             
             if let Some(actix_context) = actix_ctx {
                 // Create child actor
