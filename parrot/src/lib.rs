@@ -5,6 +5,7 @@
 
 pub mod actix;
 pub mod system;
+pub mod thread;
 
 // Re-export commonly used types
 pub use actix::*;

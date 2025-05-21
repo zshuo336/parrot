@@ -1,4 +1,6 @@
 Cargo.lock
+docs/
+tasks/
 target/
 gitcmd.sh
 # .DS_Store
