@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
-use crate::thread::processor::ActorProcessor;
+use crate::thread::processor::ProcessorInterface;
 use std::any::Any;
 use std::sync::Mutex as StdMutex;
 
@@ -19,7 +19,6 @@ use std::sync::Mutex as StdMutex;
 /// This mailbox is optimized for the single-producer case, which is the common case
 /// for dedicated actor mailboxes where only the scheduler sends messages.
 /// It provides FIFO ordering guarantees.
-#[derive(Debug)]
 pub struct SpscMailbox {
     /// The sending half of the channel
     sender: Sender<BoxedMessage>,
@@ -36,15 +35,26 @@ pub struct SpscMailbox {
     /// Flag indicating if this mailbox has been closed
     is_closed: Arc<AtomicBool>,
     /// Associated processor
-    processor: Arc<StdMutex<Option<Arc<dyn Any + Send + Sync>>>>
+    processor: Option<Arc<StdMutex<dyn ProcessorInterface>>>
 }
+
+impl Debug for SpscMailbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpscMailbox")
+            .field("path", &self.path)
+            .field("capacity", &self.capacity)
+            .field("processor", &"processor")
+            .finish()
+    }
+}
+
 
 impl SpscMailbox {
     /// Creates a new SpscMailbox with the specified capacity and actor path.
     pub fn new(capacity: usize, path: ActorPath) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         let notify = Arc::new(Notify::new());
-        let processor = Arc::new(StdMutex::new(None));
+        let processor = None;
         
         Self {
             sender,
@@ -261,21 +271,18 @@ impl Mailbox for SpscMailbox {
     }
 
     /// associate a processor with this mailbox
-    fn set_processor(&self, processor: Arc<dyn Any + Send + Sync>) {
-        let mut processor_guard = self.processor.lock().unwrap();
-        *processor_guard = Some(processor);
+    fn set_processor(&mut self, processor: Arc<StdMutex<dyn ProcessorInterface>>) {
+        self.processor = Some(processor);
     }
     
     /// get the associated processor
-    fn get_processor(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        let processor_guard = self.processor.lock().unwrap();
-        processor_guard.as_ref().map(|p| p.clone())
+    fn get_processor(&self) -> Option<Arc<StdMutex<dyn ProcessorInterface>>> {
+        self.processor.clone()
     }
 
     /// check if there is a processor associated with this mailbox
     fn has_processor(&self) -> bool {
-        let processor_guard = self.processor.lock().unwrap();
-        processor_guard.is_some()
+        self.processor.is_some()
     }
     
 }

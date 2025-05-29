@@ -11,7 +11,7 @@ use parrot_api::types::{BoxedMessage, WeakActorTarget, BoxedActorRef, ActorResul
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
-use crate::thread::processor::ActorProcessor;
+use crate::thread::processor::ProcessorInterface;
 use std::any::Any;
 use std::sync::Mutex;
 
@@ -48,7 +48,7 @@ pub struct SpscRingbufMailbox {
     /// Counter for current messages in the mailbox
     message_count: Arc<AtomicUsize>,
     /// Associated processor
-    processor: Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>
+    processor: Option<Arc<Mutex<dyn ProcessorInterface>>>
 }
 
 impl std::fmt::Debug for SpscRingbufMailbox {
@@ -59,6 +59,7 @@ impl std::fmt::Debug for SpscRingbufMailbox {
             .field("is_ready", &self.is_ready)
             .field("is_closed", &self.is_closed)
             .field("message_count", &self.message_count)
+            .field("processor", &"processor")
             .finish()
     }
 }
@@ -69,7 +70,7 @@ impl SpscRingbufMailbox {
         // Create a ringbuffer with the specified capacity
         let rb = HeapRb::<BoxedMessage>::new(capacity);
         let (producer, consumer) = rb.split();
-        let processor = Arc::new(Mutex::new(None));
+        let processor = None;
         
         Self {
             // Wrap producer and consumer in Tokio Mutexes
@@ -322,21 +323,18 @@ impl Mailbox for SpscRingbufMailbox {
     }
 
     /// associate a processor with this mailbox
-    fn set_processor(&self, processor: Arc<dyn Any + Send + Sync>) {
-        let mut processor_guard = self.processor.lock().unwrap();
-        *processor_guard = Some(processor);
+    fn set_processor(&mut self, processor: Arc<Mutex<dyn ProcessorInterface>>) {
+        self.processor = Some(processor);
     }
     
     /// get the associated processor
-    fn get_processor(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        let processor_guard = self.processor.lock().unwrap();
-        processor_guard.as_ref().map(|p| p.clone())
+    fn get_processor(&self) -> Option<Arc<Mutex<dyn ProcessorInterface>>> {
+        self.processor.clone()
     }
     
     /// check if there is a processor associated with this mailbox
     fn has_processor(&self) -> bool {
-        let processor_guard = self.processor.lock().unwrap();
-        processor_guard.is_some()
+        self.processor.is_some()
     }
     
 }

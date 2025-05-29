@@ -25,10 +25,13 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use parrot_api::actor::Actor;
+
 use crate::thread::mailbox::Mailbox;
 use crate::thread::config::ThreadActorConfig;
 use crate::thread::error::SystemError;
-use crate::thread::scheduler::ThreadScheduler;
+use crate::thread::scheduler::{ThreadScheduler, TypedThreadScheduler};
+use crate::thread::context::ThreadContext;
 use worker::Worker;
 
 /// Status codes for the dedicated thread scheduler
@@ -84,10 +87,10 @@ impl Default for DedicatedThreadConfig {
 /// Implementation of a dedicated thread scheduler
 ///
 /// Each actor is assigned a dedicated thread for its message processing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DedicatedThreadScheduler {
     /// Map of actor paths to their dedicated worker threads
-    workers: Mutex<HashMap<String, Worker>>,
+    workers: Arc<Mutex<HashMap<String, Worker>>>,
     
     /// Scheduler configuration
     config: DedicatedThreadConfig,
@@ -109,7 +112,7 @@ impl DedicatedThreadScheduler {
         let status = Arc::new(AtomicUsize::new(SchedulerStatus::Initializing as usize));
         
         let scheduler = Self {
-            workers: Mutex::new(HashMap::new()),
+            workers: Arc::new(Mutex::new(HashMap::new())),
             config,
             is_shutting_down,
             status,
@@ -122,12 +125,15 @@ impl DedicatedThreadScheduler {
     }
     
     /// Schedule an actor on a dedicated thread
-    pub async fn schedule(
+    pub async fn schedule<A>(
         &self,
         path: &str,
         mailbox: Arc<dyn Mailbox>,
         config: Option<ThreadActorConfig>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), SystemError>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
         // Check if already shutting down
         if self.is_shutting_down.load(Ordering::Relaxed) {
             return Err(SystemError::ShuttingDown);
@@ -154,7 +160,7 @@ impl DedicatedThreadScheduler {
         );
         
         // Start the worker
-        worker.start();
+        worker.start::<A>();
         
         // Add to workers map
         workers.insert(path.to_string(), worker);
@@ -233,11 +239,7 @@ impl ThreadScheduler for DedicatedThreadScheduler {
         mailbox: Arc<dyn Mailbox>,
         config: Option<ThreadActorConfig>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.schedule(path, mailbox, config).await
-            })
-        }).map_err(|e| e.into())
+        Err("Cannot schedule without knowing the actor type. Use schedule_typed instead.".into())
     }
     
     fn deschedule(
@@ -259,6 +261,24 @@ impl ThreadScheduler for DedicatedThreadScheduler {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 self.shutdown().await
+            })
+        }).map_err(|e| e.into())
+    }
+}
+
+impl TypedThreadScheduler for DedicatedThreadScheduler {
+    fn schedule_typed<A>(
+        &self,
+        path: &str,
+        mailbox: Arc<dyn Mailbox>,
+        config: Option<ThreadActorConfig>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.schedule::<A>(path, mailbox, config).await
             })
         }).map_err(|e| e.into())
     }

@@ -18,8 +18,8 @@ use crate::thread::config::ThreadActorConfig;
 use std::sync::Mutex;
 use std::panic;
 use std::panic::AssertUnwindSafe;
-
-
+use std::any::Any;
+use std::cell::RefCell;
 /// Processor status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessorStatus {
@@ -43,28 +43,34 @@ pub enum ProcessorStatus {
 }
 
 /// Worker stats collection
-#[derive(Debug, Clone, Default)]
-pub struct WorkerStats {
+#[derive(Debug, Default)]
+pub struct ProcessorStats {
     /// Number of messages processed
-    pub messages_processed: Arc<AtomicUsize>,
+    pub messages_processed: AtomicUsize,
     
     /// Number of errors encountered
-    pub errors_encountered: Arc<AtomicUsize>,
+    pub errors_encountered: AtomicUsize,
     
     /// Time spent processing messages (nanoseconds)
-    pub processing_time_ns: Arc<AtomicUsize>,
+    pub processing_time_ns: AtomicUsize,
 }
 
-impl WorkerStats {
+impl ProcessorStats {
     pub fn new() -> Self {
-        Self {
-            messages_processed: Arc::new(AtomicUsize::new(0)),
-            errors_encountered: Arc::new(AtomicUsize::new(0)),
-            processing_time_ns: Arc::new(AtomicUsize::new(0)),
-        }
+        Self::default()
     }
 }
 
+/// Processor stats trait
+pub trait ProcessorStatsTrait {
+    fn get_statistics(&self) -> Option<Arc<ProcessorStats>>;
+}
+
+pub trait ProcessorInterface: ProcessorStatsTrait + Any + Send + Sync + 'static {
+    fn as_any(self: Arc<Self>) -> Arc<dyn Any>;
+    fn as_any_ref(self: &Self) -> &dyn Any;
+    fn as_any_mut(self: &mut Self) -> &mut dyn Any;
+}
 
 /// Actor processor, responsible for managing Actor's resources and message processing
 /// 
@@ -97,13 +103,13 @@ where
     A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
     /// Actor instance
-    actor: ThreadActor<A>,
+    actor: Mutex<ThreadActor<A>>,
     
     /// Actor context
-    context: ThreadContext<A>,
+    context: Mutex<ThreadContext<A>>,
     
     /// Actor mailbox
-    mailbox: Arc<dyn Mailbox>,
+    mailbox: Arc<Mutex<dyn Mailbox>>,
     
     /// Actor path
     path: String,
@@ -115,7 +121,7 @@ where
     status: Arc<AtomicUsize>,
     
     /// Processor stats
-    stats: Arc<WorkerStats>,
+    stats: Arc<ProcessorStats>,
 }
 
 impl<A> ActorProcessor<A>
@@ -126,25 +132,25 @@ where
     pub fn new(
         actor: ThreadActor<A>,
         context: ThreadContext<A>,
-        mailbox: Arc<dyn Mailbox>,
+        mailbox: Arc<Mutex<dyn Mailbox>>,
         path: String,
         config: ThreadActorConfig,
     ) -> Self {
         Self {
-            actor,
-            context,
+            actor: Mutex::new(actor),
+            context: Mutex::new(context),
             mailbox,
             path,
             config,
             status: Arc::new(AtomicUsize::new(ProcessorStatus::Initializing as usize)),
-            stats: Arc::new(WorkerStats::new()),
+            stats: Arc::new(ProcessorStats::new()),
         }
     }
     
     /// Initialize the actor
     pub async fn initialize_actor(&mut self) -> Result<(), SystemError> {
         debug!("Initializing actor at {}", self.path);
-        if let Err(e) = self.actor.initialize(&mut self.context).await {
+        if let Err(e) = self.actor.lock().unwrap().initialize(&mut self.context.lock().unwrap()).await {
             error!("Failed to initialize actor at {}: {}", self.path, e);
             self.status.store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
             self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
@@ -160,7 +166,7 @@ where
     pub async fn start_actor(&mut self) -> Result<(), SystemError> {
         debug!("Sending Start message to actor at {}", self.path);
         let start_msg = Box::new(ControlMessage::Start);
-        if let Err(e) = self.actor.process_message(start_msg, &mut self.context).await {
+        if let Err(e) = self.actor.lock().unwrap().process_message(start_msg, &mut self.context.lock().unwrap()).await {
             error!("Failed to start actor at {}: {}", self.path, e);
             self.status.store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
             self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
@@ -179,7 +185,7 @@ where
         self.status.store(ProcessorStatus::Stopping as usize, Ordering::SeqCst);
         
         let stop_msg = Box::new(ControlMessage::Stop);
-        if let Err(e) = self.actor.process_message(stop_msg, &mut self.context).await {
+        if let Err(e) = self.actor.lock().unwrap().process_message(stop_msg, &mut self.context.lock().unwrap()).await {
             error!("Failed to stop actor at {}: {}", self.path, e);
             self.status.store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
             self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
@@ -200,7 +206,9 @@ where
     }
     
     /// Process a single message
-    pub async fn process_message(&mut self, msg: BoxedMessage) -> ActorResult<BoxedMessage> {
+    async fn process_message(&self, msg: BoxedMessage) -> ActorResult<()> {
+        let mut actor = self.actor.lock().unwrap();
+        let mut context = self.context.lock().unwrap();
         // Only process messages when in Running state
         if self.get_status() != ProcessorStatus::Running {
             return Err(anyhow::Error::msg(format!("Actor at {} is not running, current status: {:?}", 
@@ -208,15 +216,17 @@ where
         }
 
         let process_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            self.actor.process_message(msg, &mut self.context)
+            actor.process_message(msg, &mut context)
         }));
         
-        let result: ActorResult<BoxedMessage> = match process_result {
+        let result = match process_result {
             Ok(future) => {
                 // execute the future to process message
                 match future.await {
-                    Ok(result) => {
-                        Ok(result)
+                    Ok(_result) => {
+                        // message processed successfully
+                        // TODO: process ask result?
+                        Ok(())
                     },
                     Err(e) => {
                         // message processing error
@@ -259,15 +269,18 @@ where
     /// A tuple containing:
     /// * Number of messages processed
     /// * Whether any errors were encountered
-    pub async fn process_batch(&mut self, max_messages: usize, yield_after_each_message: bool) -> (usize, bool) {
+    pub async fn process_batch_of_messages(&self, max_messages: usize, yield_after_each_message: bool) -> ActorResult<(usize, usize)> {
         // Only process messages when in Running state
         if self.get_status() != ProcessorStatus::Running {
-            return (0, false);
+            return Err(anyhow::Error::msg(format!("Actor at {} is not running, current status: {:?}", 
+                self.path, self.get_status())).into());
         }
         
         let mut processed = 0;
-        let mut had_error = false;
+        let mut error_count = 0;
         
+        let mailbox_guard = self.mailbox.lock().unwrap();
+
         for _ in 0..max_messages {
             // Check if still in running state
             if self.get_status() != ProcessorStatus::Running {
@@ -275,7 +288,7 @@ where
             }
             
             // Get message from mailbox
-            match self.mailbox.pop().await {
+            match mailbox_guard.pop().await {
                 Some(msg) => {
                     // Process message
                     match self.process_message(msg).await {
@@ -291,11 +304,11 @@ where
                         Err(e) => {
                             // Record error but continue processing
                             processed += 1;
-                            had_error = true;
+                            error_count += 1;
                             // if panic, break the processing loop
                             if let ActorError::Panic(_) = e {
                                 debug!("Panic in actor {}: {} break the processing loop", self.path, e);
-                                break;
+                                return Err(e);
                             }
                         }
                     }
@@ -307,7 +320,7 @@ where
             }
         }
         
-        (processed, had_error)
+        Ok((processed, error_count))
     }
     
     /// Pause the processor
@@ -335,13 +348,8 @@ where
         }
     }
     
-    /// Get message statistics
-    pub fn get_statistics(&self) -> Arc<WorkerStats> {
-        self.stats.clone()
-    }
-    
     /// Get mailbox reference
-    pub fn mailbox(&self) -> Arc<dyn Mailbox> {
+    pub fn mailbox(&self) -> Arc<Mutex<dyn Mailbox>> {
         self.mailbox.clone()
     }
     
@@ -352,6 +360,33 @@ where
     
     /// Check if processor has pending messages
     pub async fn has_pending_messages(&self) -> bool {
-        !self.mailbox.is_empty().await
+        let mailbox_guard = self.mailbox.lock().unwrap();
+        !mailbox_guard.is_empty().await
     }
 } 
+
+impl<A> ProcessorStatsTrait for ActorProcessor<A>
+where
+    A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+{
+    fn get_statistics(&self) -> Option<Arc<ProcessorStats>> {
+        Some(self.stats.clone())
+    }
+}
+
+impl<A> ProcessorInterface for ActorProcessor<A>
+where
+    A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+{
+    fn as_any(self: Arc<Self>) -> Arc<dyn Any> {
+        self
+    }
+
+    fn as_any_ref(self: &Self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(self: &mut Self) -> &mut dyn Any {
+        self
+    }
+}
