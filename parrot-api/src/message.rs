@@ -50,7 +50,7 @@ use std::any::Any;
 use std::sync::Arc;
 use uuid::Uuid;
 use crate::address::ActorRef;
-use crate::types::BoxedMessage;
+use crate::types::{BoxedMessage, SharedMessage};
 /// Message ID type
 pub type MessageId = Uuid;
 
@@ -300,6 +300,45 @@ pub trait AnyMessage: Any + Send {
     
     /// Message options
     fn message_options(&self) -> Option<crate::message::MessageOptions>;
+}
+
+enum MessageContainer {
+    Exclusive(BoxedMessage),
+    Shared(SharedMessage)
+}
+
+
+/// Implement From<MessageContainer> for BoxedMessage
+/// 
+/// This implementation allows for conversion between MessageContainer and BoxedMessage.
+/// 
+/// # Parameters
+/// * `container` - The MessageContainer to convert
+/// 
+/// # Returns
+/// exclusive example:
+/// ```
+/// let container = MessageContainer::Exclusive(Box::new(Message1));
+/// let boxed_message = container.into(); // return type is Box<dyn Any + Send>
+/// actor.send(boxed_message);
+/// ```
+/// shared example:
+/// ```
+/// let container = MessageContainer::Shared(Arc::new(Message1));
+/// let boxed_message = container.into(); // return type is Box<Arc<dyn Any + Send + Sync>>
+/// actor.send(boxed_message);
+/// ```
+impl From<MessageContainer> for BoxedMessage {
+    fn from(container: MessageContainer) -> Self {
+        match container {
+            // return type is Box<dyn Any + Send>
+            MessageContainer::Exclusive(boxed) => boxed,
+            // return type is Box<Arc<dyn Any + Send + Sync>
+            MessageContainer::Shared(arc) => {
+                Box::new(arc)
+            }
+        }
+    }
 }
 
 /// Implement AnyMessage for any type that implements Message

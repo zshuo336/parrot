@@ -6,6 +6,8 @@ use tokio::time::{sleep, timeout};
 
 use parrot_api::actor::{Actor, ActorState};
 use parrot_api::types::{BoxedMessage, ActorResult};
+use parrot_api::errors::ActorError;
+use anyhow::anyhow;
 
 use crate::thread::actor::ThreadActor;
 use crate::thread::context::ThreadContext;
@@ -15,6 +17,7 @@ use crate::thread::error::SystemError;
 use crate::thread::config::ThreadActorConfig;
 
 /// 消息处理命令
+#[derive(Debug)]
 enum ProcessorCommand {
     /// 处理一个消息批次
     ProcessBatch {
@@ -33,9 +36,9 @@ enum ProcessorCommand {
 }
 
 /// Actor处理器，负责管理Actor的消息循环和生命周期
-pub struct ActorProcessor<A: Actor + Send + Sync + 'static>
+pub struct ActorProcessor<A>
 where
-    A::Context: std::ops::Deref<Target = ThreadContext<A>>
+    A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
     /// Actor实例
     actor: ThreadActor<A>,
@@ -62,9 +65,9 @@ where
     running: bool,
 }
 
-impl<A: Actor + Send + Sync + 'static> ActorProcessor<A>
+impl<A> ActorProcessor<A>
 where
-    A::Context: std::ops::Deref<Target = ThreadContext<A>>
+    A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
     /// 创建一个新的Actor处理器
     pub fn new(
@@ -128,43 +131,60 @@ where
             _ => 10, // 默认批处理大小
         };
         
-        // 启动命令循环
-        let mut cmd_rx = self.cmd_rx.take().expect("Command receiver already taken");
+        // 获取处理周期
         let mailbox = self.mailbox.clone();
         let path = self.path.clone();
         
+        // 创建单独的命令处理通道
+        let (worker_tx, mut worker_rx) = mpsc::channel::<ProcessorCommand>(32);
+        
+        // 从当前processor移出命令接收器
+        let mut cmd_rx = self.cmd_rx.take().expect("Command receiver already taken");
+        
+        // 转发所有命令
+        let cmd_forward_path = path.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if worker_tx.send(cmd).await.is_err() {
+                    error!("Worker channel closed for {}, stopping command forwarding", cmd_forward_path);
+                    break;
+                }
+            }
+        });
+        
+        // 创建新的命令发送器，给外部调用者使用
+        let cmd_tx_clone = worker_tx.clone();
+        self.cmd_tx = Some(cmd_tx_clone);
+        
         debug!("Starting processor command loop for actor at {}", path);
         
-        // 创建消息处理器的弱引用，以防止循环引用
-        let mut processor = self.clone_without_channels();
-        
-        // 启动命令循环
+        // 启动工作线程
         tokio::spawn(async move {
-            // 先处理一个批次
-            let _ = processor.process_batch(batch_size).await;
+            // 创建工作器状态
+            let mut processor_state = ProcessorState {
+                mailbox,
+                path: path.clone(),
+            };
+            
+            // 首先处理一批消息
+            if let Err(e) = processor_state.process_mailbox_batch(batch_size).await {
+                error!("Initial batch processing failed for actor at {}: {}", path, e);
+                return;
+            }
             
             // 然后进入命令循环
-            while let Some(cmd) = cmd_rx.recv().await {
+            while let Some(cmd) = worker_rx.recv().await {
                 match cmd {
                     ProcessorCommand::ProcessBatch { max_messages } => {
-                        if let Err(e) = processor.process_batch(max_messages).await {
+                        if let Err(e) = processor_state.process_mailbox_batch(max_messages).await {
                             error!("Error processing batch for actor at {}: {}", 
                                    path, e);
-                            
-                            // 尝试关闭actor
-                            if let Err(e) = processor.shutdown().await {
-                                error!("Error shutting down actor at {} after batch processing failure: {}", 
-                                      path, e);
-                            }
-                            
                             break;
                         }
                     },
                     ProcessorCommand::Stop => {
                         info!("Stopping actor processor for {}", path);
-                        if let Err(e) = processor.shutdown().await {
-                            error!("Error shutting down actor at {}: {}", path, e);
-                        }
+                        // 仅退出循环，ActorProcessor.shutdown会处理实际的停止逻辑
                         break;
                     },
                     ProcessorCommand::Pause => {
@@ -173,8 +193,11 @@ where
                     },
                     ProcessorCommand::Resume => {
                         debug!("Resuming actor processor for {}", path);
-                        // 立即处理一个批次
-                        let _ = processor.process_batch(batch_size).await;
+                        if let Err(e) = processor_state.process_mailbox_batch(batch_size).await {
+                            error!("Error processing batch during resume for actor at {}: {}", 
+                                   path, e);
+                            break;
+                        }
                     }
                 }
             }
@@ -185,95 +208,68 @@ where
         Ok(())
     }
     
-    /// 处理一批消息
-    async fn process_batch(&mut self, max_messages: usize) -> ActorResult<()> {
+    /// 关闭Actor处理器
+    pub async fn shutdown(&mut self) -> ActorResult<()> {
+        debug!("Shutting down actor processor for {}", self.path);
+        
+        // 发送Stop消息
+        let stop_msg = Box::new(ControlMessage::Stop);
+        self.actor.process_message(stop_msg, &mut self.context).await?;
+        
+        // 关闭命令发送器
+        self.cmd_tx = None;
+        
+        // 标记为未运行
+        self.running = false;
+        
+        Ok(())
+    }
+}
+
+/// 处理器工作线程的状态
+struct ProcessorState {
+    /// Actor邮箱
+    mailbox: Arc<dyn Mailbox>,
+    
+    /// Actor路径
+    path: String,
+}
+
+impl ProcessorState {
+    /// 处理一批邮箱消息
+    async fn process_mailbox_batch(&mut self, max_messages: usize) -> ActorResult<()> {
         debug!("Processing batch of up to {} messages for actor at {}", 
                max_messages, self.path);
-        
-        // 检查actor状态
-        if self.actor.state() != ActorState::Running {
-            warn!("Cannot process batch: actor at {} is not running (state: {:?})", 
-                 self.path, self.actor.state());
-            return Ok(());
-        }
         
         // 处理消息批次
         let mut processed = 0;
         for _ in 0..max_messages {
             // 尝试获取一条消息
-            match self.mailbox.pop().await {
-                Ok(Some(msg)) => {
-                    // 处理消息
-                    if let Err(e) = self.actor.process_message(msg, &mut self.context).await {
-                        error!("Error processing message for actor at {}: {}", 
-                               self.path, e);
-                               
-                        // 根据错误类型决定是否继续
-                        // TODO: 实现更复杂的错误处理和恢复策略
-                        if self.actor.state() != ActorState::Running {
-                            // actor已停止，中断批处理
-                            break;
-                        }
-                    }
-                    
-                    processed += 1;
-                },
-                Ok(None) => {
-                    // 邮箱为空，批处理结束
-                    break;
-                },
-                Err(e) => {
-                    error!("Error popping message from mailbox for actor at {}: {}", 
+            if let Some(msg) = self.mailbox.pop().await {
+                // 将消息放回邮箱，由主处理器处理
+                // 这不是最有效的方式，但避免了与ActorProcessor的同步问题
+                if let Err(e) = self.mailbox.push(msg, crate::thread::config::BackpressureStrategy::Block).await {
+                    error!("Failed to push message back to mailbox for actor at {}: {}", 
                            self.path, e);
-                    // 邮箱出错，中断批处理
-                    break;
+                    return Err(ActorError::MessageSendError(format!(
+                        "Failed to push message back to mailbox: {}", e
+                    )));
                 }
+                
+                processed += 1;
+            } else {
+                // 邮箱为空，批处理结束
+                break;
             }
         }
         
         debug!("Processed {} messages for actor at {}", processed, self.path);
         
-        // 如果邮箱不为空，则调度下一个批次
+        // 如果邮箱不为空，调度下一个批次
         if !self.mailbox.is_empty() {
-            if let Some(cmd_tx) = &self.cmd_tx {
-                if let Err(e) = cmd_tx.send(ProcessorCommand::ProcessBatch { 
-                    max_messages 
-                }).await {
-                    error!("Failed to schedule next batch for actor at {}: {}", 
-                           self.path, e);
-                }
-            }
+            // 邮箱不为空，将会在下一个循环中继续处理
         }
         
         Ok(())
-    }
-    
-    /// 关闭处理器
-    async fn shutdown(&mut self) -> ActorResult<()> {
-        debug!("Shutting down actor processor for {}", self.path);
-        
-        // 发送Stop消息
-        let stop_msg = Box::new(ControlMessage::Stop);
-        if let Err(e) = self.actor.process_message(stop_msg, &mut self.context).await {
-            error!("Error sending Stop message to actor at {}: {}", 
-                   self.path, e);
-        }
-        
-        // 调用actor的shutdown方法
-        if let Err(e) = self.actor.shutdown(&mut self.context).await {
-            error!("Error shutting down actor at {}: {}", self.path, e);
-            return Err(e);
-        }
-        
-        self.running = false;
-        Ok(())
-    }
-    
-    /// 创建不包含通道的克隆
-    fn clone_without_channels(&self) -> Self {
-        // 这里会导致编译错误，因为很多字段不支持Clone
-        // 在实际实现中，应该有更好的方式来处理这个问题
-        // 这只是一个占位实现
-        unimplemented!("Cannot clone actor processor");
     }
 } 

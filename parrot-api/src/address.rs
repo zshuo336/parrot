@@ -25,6 +25,7 @@ use crate::types::{BoxedActorRef, BoxedMessage, ActorResult, BoxedFuture, WeakAc
 use crate::message::{Message, MessageEnvelope};
 use std::sync::Arc;
 use async_trait::async_trait;
+use std::time::Duration;
 
 /// # Actor Path
 ///
@@ -62,6 +63,20 @@ pub struct ActorPath {
     /// - **Format**: protocol://system/user/child1/child2
     /// - **Uniqueness**: Must be unique within system
     pub path: String,
+}
+
+impl ActorPath {
+    pub fn new(target: WeakActorTarget, path: String) -> Self {
+        Self { target, path }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn target(&self) -> &WeakActorTarget {
+        &self.target
+    }
 }
 
 impl PartialEq for ActorPath {
@@ -117,6 +132,18 @@ pub trait ActorRef: Send + Sync + Debug {
     /// - Allocates future on heap
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
+    /// Sends a type-erased message and awaits response with timeout
+    ///
+    /// ## Parameters
+    /// - `msg`: Type-erased message (must implement Send)
+    /// - `timeout`: Duration for the operation
+    ///
+    /// ## Returns
+    /// - `Ok(response)`: Message processed successfully
+    /// - `Err(error)`: Message processing failed
+    ///
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
+
     /// Stops the actor
     ///
     /// ## Implementation Details
@@ -143,6 +170,9 @@ pub trait ActorRef: Send + Sync + Debug {
     /// ## Thread Safety
     /// Safe to call from any thread
     fn clone_boxed(&self) -> BoxedActorRef;
+
+    /// Returns a reference to the actor as a `dyn Any`
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Extension trait providing type-safe message passing operations.

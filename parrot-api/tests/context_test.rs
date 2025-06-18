@@ -99,6 +99,10 @@ impl MockActorRef {
     fn get_messages(&self) -> Vec<TestMessage> {
         self.messages.read().unwrap().clone()
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait]
@@ -123,6 +127,13 @@ impl ActorRef for MockActorRef {
             }
         })
     }
+
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            let result = self.send(msg).await;
+            result
+        })
+    }
     
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         let alive = self.alive.clone();
@@ -145,6 +156,10 @@ impl ActorRef for MockActorRef {
     
     fn clone_boxed(&self) -> BoxedActorRef {
         Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -332,12 +347,23 @@ impl ActorContext for MockActorContext {
         Box::pin(async { Ok(()) })
     }
     
+    fn set_parent(&mut self, parent: BoxedActorRef) {
+        if let Some(mock_ref) = parent.as_any().downcast_ref::<MockActorRef>() {
+            self.parent = Some(mock_ref.clone());
+        } else {
+            panic!("Expected a MockActorRef");
+        }
+    }
+
     fn parent(&self) -> Option<BoxedActorRef> {
         self.parent.as_ref().map(|p| Box::new(p.clone()) as BoxedActorRef)
     }
-    
-    fn children(&self) -> Vec<BoxedActorRef> {
-        self.children.read().unwrap().iter().map(|c| Box::new(c.clone()) as BoxedActorRef).collect()
+    fn children(&self) -> Option<Arc<Vec<BoxedActorRef>>> {
+        let lock = self.children.read().unwrap();
+        let boxed_refs: Vec<BoxedActorRef> = lock.iter()
+            .map(|r| Box::new(r.clone()) as BoxedActorRef)
+            .collect();
+        Some(Arc::new(boxed_refs))
     }
     
     fn set_receive_timeout(&mut self, timeout: Option<Duration>) {
@@ -387,7 +413,7 @@ mod tests {
         
         // Test parent/children
         assert!(ctx.parent().is_none());
-        assert_eq!(ctx.children().len(), 0);
+        assert_eq!(ctx.children().unwrap().len(), 0);
     }
     
     // Test ActorContext parent/child relationships
@@ -407,7 +433,7 @@ mod tests {
         ctx.add_child(child1.clone());
         ctx.add_child(child2.clone());
         
-        let children = ctx.children();
+        let children = ctx.children().unwrap();
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].path(), "test://actor/child1");
         assert_eq!(children[1].path(), "test://actor/child2");

@@ -155,6 +155,7 @@ pub trait ActorFactory: Send + 'static {
 /// - Async operations
 /// - Minimized blocking
 pub trait ActorContext: Send + Sync {
+
     /// Returns self reference
     ///
     /// ## Thread Safety
@@ -232,11 +233,14 @@ pub trait ActorContext: Send + Sync {
     /// Future completing when watch is removed
     fn unwatch<'a>(&'a mut self, target: BoxedActorRef) -> BoxedFuture<'a, ActorResult<()>>;
 
+    /// Sets the parent actor reference.
+    fn set_parent(&mut self, parent: BoxedActorRef);
+
     /// Returns reference to parent actor if it exists.
     fn parent(&self) -> Option<BoxedActorRef>;
     
     /// Returns references to all child actors.
-    fn children(&self) -> Vec<BoxedActorRef>;
+    fn children(&self) -> Option<Arc<Vec<BoxedActorRef>>>;
     
     /// Sets timeout for receiving messages.
     ///

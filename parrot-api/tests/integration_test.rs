@@ -244,6 +244,10 @@ impl ActorRef for MockActorRef {
         })
     }
 
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        self.send(msg)
+    }
+
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         let state = self.state.clone();
         Box::pin(async move {
@@ -266,6 +270,10 @@ impl ActorRef for MockActorRef {
 
     fn clone_boxed(&self) -> Box<dyn ActorRef> {
         Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

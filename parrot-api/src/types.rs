@@ -61,6 +61,13 @@ pub type WeakActorTarget = Arc<dyn ActorRef>;
 /// while maintaining thread safety.
 pub type BoxedMessage = Box<dyn Any + Send>;
 
+/// Shared message container.
+///
+/// This type represents a reference-counted, thread-safe handle to a message.
+/// Used for sharing messages across multiple owners while ensuring proper cleanup
+/// when all references are dropped.
+pub type SharedMessage = Arc<dyn Any + Send + Sync>;
+
 /// Result type for actor operations.
 ///
 /// This type combines a generic success type with the actor system's error type.q
