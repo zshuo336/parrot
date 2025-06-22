@@ -215,7 +215,7 @@ pub trait ActorSystem: Send + Sync + 'static {
     ///
     /// # Returns
     /// Success or failure of the broadcast operation
-    async fn broadcast<M: Message>(&self, msg: M) -> Result<(), SystemError>;
+    async fn broadcast<M: Message + Clone>(&self, msg: M) -> Result<(), SystemError>;
     
     /// Retrieves current system status.
     ///

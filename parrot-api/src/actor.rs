@@ -70,11 +70,21 @@ pub enum ActorState {
     Stopped,
 }
 
+/// Default empty configuration for actors that don't need any configuration.
+/// 
+/// This type is provided as a convenience to avoid having to create an empty
+/// configuration type for every actor.
+#[derive(Debug, Default, Clone)]
+pub struct EmptyConfig;
+
 /// Configuration trait for actor initialization.
 /// 
 /// Implement this trait to define custom configuration parameters for your actor.
 /// The configuration is passed to the actor during creation through the `ActorFactory`.
 pub trait ActorConfig: Send + Sync + 'static {}
+
+/// Implement ActorConfig for the EmptyConfig type
+impl ActorConfig for EmptyConfig {}
 
 /// Factory trait for creating actor instances.
 /// 
