@@ -16,7 +16,17 @@ pub const TOKIO: &str = "tokio";
 pub mod parrot {
     pub mod actix {
         // Mock ActixContext for testing
-        pub struct ActixContext;
+        pub struct ActixContext<A = ()> {
+            _phantom: std::marker::PhantomData<A>,
+        }
+        
+        impl<A> Default for ActixContext<A> {
+            fn default() -> Self {
+                ActixContext {
+                    _phantom: std::marker::PhantomData,
+                }
+            }
+        }
         
         // Mock ActorBase for testing
         pub struct ActorBase<A> {
@@ -355,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_handling() {
         let mut actor = DefaultActor { counter: 0 };
-        let mut ctx = parrot::actix::ActixContext;
+        let mut ctx = parrot::actix::ActixContext::default();
         
         // Test Increment message
         let result = actor.receive_message(Box::new(Increment(5)), &mut ctx).await;
@@ -418,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_actor_message_handling() {
         let mut actor = SimpleActor::new();
-        let mut ctx = parrot::actix::ActixContext;
+        let mut ctx = parrot::actix::ActixContext::default();
         
         // Test CounterMsg
         let result = actor.receive_message(Box::new(CounterMsg(5)), &mut ctx).await;
@@ -435,7 +445,7 @@ mod tests {
         let mut actor = GenericActor { 
             value: vec![1, 2, 3],
         };
-        let mut ctx = parrot::actix::ActixContext;
+        let mut ctx = parrot::actix::ActixContext::default();
         
         // Test Increment message
         let result = actor.receive_message(Box::new(Increment(5)), &mut ctx).await;
@@ -458,7 +468,7 @@ mod tests {
     async fn test_manual_vs_derived_actor() {
         let mut manual_actor = ManualActor::new();
         let mut derived_actor = DefaultActor { counter: 0 };
-        let mut ctx = parrot::actix::ActixContext;
+        let mut ctx = parrot::actix::ActixContext::default();
         
         // Test whether implementations are consistent
         let manual_result = manual_actor.receive_message(Box::new(Increment(5)), &mut ctx).await;
@@ -480,7 +490,7 @@ mod tests {
     async fn test_simple_vs_manual_actor() {
         let mut manual = ManualActor::new();
         let mut simple = SimpleActor::new();
-        let mut ctx = parrot::actix::ActixContext;
+        let mut ctx = parrot::actix::ActixContext::default();
         
         // Test whether implementations are consistent
         let manual_result = manual.receive_message(Box::new(CounterMsg(10)), &mut ctx).await;
