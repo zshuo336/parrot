@@ -16,7 +16,7 @@ use tokio::runtime::Runtime;
 use async_trait::async_trait;
 use uuid::Uuid;
 use futures::Stream;
-
+use std::ptr::NonNull;
 // Test message types
 #[derive(Debug, Clone, PartialEq)]
 struct TestMessage {
@@ -68,6 +68,10 @@ impl Actor for TestActor {
                 Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
             }
         })
+    }
+
+    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
     }
     
     fn state(&self) -> ActorState {
