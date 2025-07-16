@@ -1,15 +1,16 @@
 use std::sync::Arc;
 use std::any::Any;
-use std::fmt::Debug;
 use actix::Addr;
 use async_trait::async_trait;
 use anyhow::anyhow;
 use parrot_api::address::{ActorRef, ActorRefExt};
+use parrot_api::actor::Actor as ParrotActor;
 use parrot_api::message::{Message, MessageEnvelope};
 use parrot_api::errors::ActorError;
 use parrot_api::types::{BoxedMessage, BoxedActorRef, BoxedFuture, ActorResult};
 use crate::actix::actor::ActixActor;
 use crate::actix::message::ActixMessageWrapper;
+use crate::actix::context::ActixContext;
 
 /// An internal message to stop the actor
 #[derive(Debug)]
@@ -34,10 +35,9 @@ impl actix::Message for StopMessage {
 /// - Wraps an actix::Addr
 /// - Handles message conversion and type safety
 /// - Manages both sync and async message delivery
-#[derive(Debug)]
 pub struct ActixActorRef<A>
 where 
-    A: parrot_api::actor::Actor + std::marker::Unpin + std::fmt::Debug + 'static,
+    A: ParrotActor<Context = ActixContext<ActixActor<A>>> + std::marker::Unpin + 'static,
 {
     /// The underlying Actix address
     addr: Arc<Addr<ActixActor<A>>>,
@@ -47,7 +47,7 @@ where
 
 impl<A> ActixActorRef<A>
 where
-    A: parrot_api::actor::Actor + std::marker::Unpin + std::fmt::Debug + 'static,
+    A: ParrotActor<Context = ActixContext<ActixActor<A>>> + std::marker::Unpin + 'static,
 {
     /// Create a new ActixActorRef from an Actix address
     pub fn new(addr: Addr<ActixActor<A>>, path: String) -> Self {
@@ -58,10 +58,21 @@ where
     }
 }
 
+impl<A> std::fmt::Debug for ActixActorRef<A>
+where
+    A: ParrotActor<Context = ActixContext<ActixActor<A>>> + std::marker::Unpin + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActixActorRef")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 #[async_trait]
 impl<A> ActorRef for ActixActorRef<A>
 where
-    A: parrot_api::actor::Actor + std::marker::Unpin + std::fmt::Debug + 'static,
+    A: ParrotActor<Context = ActixContext<ActixActor<A>>> + std::marker::Unpin + 'static,
 {
     /// Send a message to the actor and wait for a response
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
@@ -81,7 +92,8 @@ where
         // Send the message via Actix
         Box::pin(async move {
             match addr.send(wrapper).await {
-                Ok(result) => result,
+                Ok(Some(result)) => result,
+                Ok(None) => Err(ActorError::MessageHandlingError("No response from actor".to_string())),
                 Err(e) => Err(ActorError::Other(anyhow!("Failed to deliver message: {}", e))),
             }
         })
@@ -92,8 +104,17 @@ where
         let addr = self.addr.clone();
         
         Box::pin(async move {
-            // Use our custom StopMessage
-            addr.do_send(StopMessage);
+            // 将 StopMessage 包装在 ActixMessageWrapper 中
+            let msg = Box::new(StopMessage) as BoxedMessage;
+            let envelope = MessageEnvelope {
+                id: uuid::Uuid::new_v4(),
+                payload: msg,
+                sender: None,
+                options: Default::default(),
+                message_type: "stop",
+            };
+            let wrapper = ActixMessageWrapper { envelope };
+            addr.do_send(wrapper);
             Ok(())
         })
     }
@@ -121,45 +142,3 @@ where
         })
     }
 }
-
-/// Type-erased ActorRef for Actix actors
-/// This type can hold any ActixActor reference
-#[derive(Debug)]
-pub struct DynamicActixActorRef {
-    /// The underlying actor reference (dynamically typed)
-    inner: BoxedActorRef,
-}
-
-impl DynamicActixActorRef {
-    /// Create a new DynamicActixActorRef by wrapping a typed ActixActorRef
-    pub fn new<A: parrot_api::actor::Actor + std::marker::Unpin + std::fmt::Debug + 'static>(actor_ref: ActixActorRef<A>) -> Self {
-        Self {
-            inner: Box::new(actor_ref),
-        }
-    }
-}
-
-#[async_trait]
-impl ActorRef for DynamicActixActorRef {
-    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        self.inner.send(msg)
-    }
-    
-    fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        self.inner.stop()
-    }
-    
-    fn path(&self) -> String {
-        self.inner.path()
-    }
-    
-    fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-        self.inner.is_alive()
-    }
-    
-    fn clone_boxed(&self) -> BoxedActorRef {
-        Box::new(Self {
-            inner: self.inner.clone_boxed(),
-        })
-    }
-} 
