@@ -94,7 +94,7 @@ where
     // not use on actix engine
     fn receive_message<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async { 
-            Err(ActorError::MessageHandlingError("Message requires async processing".to_string()))
+            Err(ActorError::MessageHandlingError("Not use on actix engine".to_string()))
         })
     }
 
@@ -181,4 +181,38 @@ where
         // Use ActorContext trait method to stop
         ctx.stop();
     }
+}
+
+/// ActorBase is a simple wrapper for user actors
+///
+/// # Overview
+/// This wrapper exists to support the ParrotActor derive macro
+///
+/// # Key Responsibilities
+/// - Wrap a user-defined actor
+///
+/// # Implementation Details
+/// - Used by the parrot-api-derive macro
+pub struct ActorBase<A> {
+    /// The wrapped actor
+    pub actor: A,
+}
+
+impl<A> ActorBase<A> {
+    /// Create a new ActorBase
+    pub fn new(actor: A) -> Self {
+        ActorBase { actor }
+    }
+}
+
+/// IntoActorBase trait for conversion to ActorBase
+///
+/// # Overview
+/// This trait is used by the ParrotActor derive macro
+///
+/// # Key Responsibilities
+/// - Convert a user actor to an ActorBase
+pub trait IntoActorBase {
+    /// Convert self to ActorBase
+    fn into_actor_base(self) -> ActorBase<Self> where Self: Sized;
 } 

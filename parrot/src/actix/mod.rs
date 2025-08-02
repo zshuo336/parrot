@@ -10,9 +10,10 @@ pub mod reference;
 pub mod system;
 pub mod types;
 
-pub use actor::*;
-pub use context::*;
+pub use actor::ActixActor;
+pub use actor::{ActorBase, IntoActorBase};
+pub use context::ActixContext;
 pub use message::*;
-pub use reference::*;
-pub use system::*;
+pub use reference::ActixActorRef;
+pub use system::ActixActorSystem;
 pub use types::*; 

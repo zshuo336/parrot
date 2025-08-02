@@ -162,6 +162,31 @@ pub trait Actor: Send + 'static {
     /// `ActorResult<BoxedMessage>` containing the response message or error
     fn receive_message<'a>(&'a mut self, msg: BoxedMessage, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
+    /// Process an incoming message and produce a response.
+    /// 
+    /// This is the core message handling method that defines the actor's behavior.
+    /// Implement this to:
+    /// - Pattern match on message types
+    /// - Update internal state
+    /// 
+    /// # Parameters
+    /// * `msg` - Incoming message to process
+    /// * `ctx` - Mutable reference to actor context
+    /// * `engine_ctx` - Mutable Pointer(`NonNull<dyn Any>`) to engine context like actix context etc.
+    /// 
+    /// # Returns
+    /// `Option<ActorResult<BoxedMessage>>` containing the response message or error
+    /// 
+    /// # Note
+    /// This method is only used on the engine side.
+    /// 
+    /// # Engine Context
+    /// The engine context is a mutable pointer to the actix actor's context type.
+    /// It is used to access the engine's resources and services.
+    /// 
+    /// # Context
+    /// The context is a mutable reference to the parrot actor's context.
+    /// It is used to access the actor's resources and services.
     fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>>;
 
     /// Handle an item from a stream.

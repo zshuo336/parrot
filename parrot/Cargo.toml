@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 parrot-api = { path = "../parrot-api" }
+parrot-api-derive = { path = "../parrot-api-derive" }
 actix = "0.13"
 async-trait = "0.1"
 thiserror = "2.0"

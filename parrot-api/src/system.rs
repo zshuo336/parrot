@@ -88,7 +88,7 @@ pub enum SystemError {
 /// - Runtime parameters
 /// - Supervision policies
 /// - Timing constraints
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ActorSystemConfig {
     /// Unique name for this actor system instance
     pub name: String,
@@ -107,7 +107,7 @@ pub struct ActorSystemConfig {
 ///
 /// The guardian is a special system actor that supervises
 /// all top-level user actors.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GuardianConfig {
     /// Maximum number of restarts allowed for supervised actors
     pub max_restarts: u32,
@@ -123,7 +123,7 @@ pub struct GuardianConfig {
 ///
 /// These timeouts provide safety boundaries for various
 /// system operations to prevent resource leaks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SystemTimeouts {
     /// Maximum time allowed for actor creation
     pub actor_creation: Duration,

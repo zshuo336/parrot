@@ -137,19 +137,28 @@ fn generate_actix_implementation(
 ) -> TokenStream2 {
     quote! {
         impl #impl_generics parrot_api::actor::Actor for #actor_name #ty_generics #where_clause {
-            type Context = parrot::actix::ActixContext;
+            type Context = parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>;
             type Config = #config_type;
             
             fn receive_message<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context) 
                 -> parrot_api::types::BoxedFuture<'a, parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
                 Box::pin(async move {
-                    // Call the user's message handler implementation
-                    // This will be implemented separately by the user
-                    self.handle_message(msg, ctx).await
+                    // on test environment, call the user's handle_message implementation
+                    #[cfg(test)]
+                    {
+                        self.handle_message(msg, ctx).await
+                    }
+                    
+                    #[cfg(not(test))]
+                    {
+                        // on production environment, not call handle_message
+                        Err(parrot_api::errors::ActorError::MessageHandlingError("Not use on actix engine".to_string()))
+                    }
                 })
             }
             
-            fn receive_message_with_engine<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: NonNull<dyn Any>)
+            // Process an incoming message and produce a response. *use on actix engine*
+            fn receive_message_with_engine<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: std::ptr::NonNull<dyn std::any::Any>)
                 -> Option<parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
                     // Call the user's message handler implementation
                     // This will be implemented separately by the user
