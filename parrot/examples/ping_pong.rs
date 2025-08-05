@@ -1,6 +1,7 @@
 use std::time::Duration;
 use parrot::actix::{ActixActorSystem, ActixActor, ActixContext};
 use parrot::system::ParrotActorSystem;
+use parrot_api::match_message;
 use parrot_api::{
     actor::{ActorState, EmptyConfig},
     message::Message,
@@ -12,6 +13,7 @@ use parrot_api::{
 use parrot_api_derive::{Message, ParrotActor};
 use std::any::Any;
 use std::ptr::NonNull;
+use tokio::signal;
 
 // Engine selection constants
 pub const ACTIX: &str = "actix";
@@ -49,18 +51,16 @@ impl PingActor {
     }
 
     fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
-        if let Some(ping) = msg.downcast_ref::<Ping>() {
-            println!("PingActor received Ping({})", ping.0);
-            self.count += 1;
-            return Some(Ok(Box::new(self.count) as BoxedMessage));
-        }
-        
-        if let Some(pong) = msg.downcast_ref::<Pong>() {
-            let response = format!("PingActor got Pong({})", pong.0);
-            return Some(Ok(Box::new(response) as BoxedMessage));
-        }
-        
-        Some(Err(ActorError::MessageHandlingError("Unknown message type".to_string())))
+        match_message!("option", self, msg,
+            Ping => |actor: &mut Self, ping: &Ping| {
+                println!("PingActor received Ping({})", ping.0);
+                actor.count += 1;
+                actor.count
+            },
+            Pong => |_actor: &mut Self, pong: &Pong| {
+                format!("PingActor got Pong({})", pong.0)
+            }
+        )
     }
 }
 
@@ -73,18 +73,16 @@ impl PongActor {
     }
 
     fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
-        if let Some(ping) = msg.downcast_ref::<Ping>() {
-            println!("PongActor received Ping({})", ping.0);
-            self.count += 1;
-            return Some(Ok(Box::new(self.count) as BoxedMessage));
-        }
-        
-        if let Some(pong) = msg.downcast_ref::<Pong>() {
-            let response = format!("PongActor got Pong({})", pong.0);
-            return Some(Ok(Box::new(response) as BoxedMessage));
-        }
-        
-        Some(Err(ActorError::MessageHandlingError("Unknown message type".to_string())))
+        match_message!("option", self, msg,
+            Ping => |actor: &mut Self, ping: &Ping| {
+                println!("PongActor received Ping({})", ping.0);
+                actor.count += 1;
+                actor.count
+            },
+            Pong => |_actor: &mut Self, pong: &Pong| {
+                format!("PongActor got Pong({})", pong.0)
+            }
+        )
     }
 }
 
@@ -117,14 +115,14 @@ async fn run_example() -> Result<(), Box<dyn std::error::Error>> {
         let ping_result = ping_ref.ask(Ping(i)).await?;
         println!("PingActor response: {}", ping_result);
         
-        let pong_result = pong_ref.ask(Ping(i)).await?;
+        let pong_result = pong_ref.ask(Pong(i)).await?;
         println!("PongActor response: {}", pong_result);
         
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Wait for messages to be processed
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    signal::ctrl_c().await?;
+    println!("Ctrl+C received, shutting down...");
     
     println!("Before system shutdown");
     tokio::time::sleep(Duration::from_millis(500)).await;
