@@ -71,6 +71,21 @@ macro_rules! match_message {
             _ => Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
         }
     };
+
+    // async version - return ActorResult<BoxedFuture>  
+    ("async", $self:ident, $msg:ident, $( $type:ty => $handler:expr ),* $(,)?) => {
+        match () {
+            $(
+                _ if $msg.downcast_ref::<$type>().is_some() => {
+                    let handler_fn = $handler;
+                    let result = handler_fn($self, $msg.downcast_ref::<$type>().unwrap()).await;
+                    // return BoxedFuture
+                    Ok(Box::pin(result))
+                }
+            )*
+            _ => Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
+        }
+    };
 }
 
 /// Matches message types and dispatches to corresponding async handler functions
