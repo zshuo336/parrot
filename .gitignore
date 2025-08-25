@@ -2,6 +2,7 @@ Cargo.lock
 docs/
 tasks/
 target/
+temp_code/
 gitcmd.sh
 # .DS_Store
 .d*

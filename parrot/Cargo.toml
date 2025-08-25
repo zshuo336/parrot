@@ -17,6 +17,7 @@ anyhow = "1.0"
 num_cpus = "1.0"
 lazy_static = "1.5.0"
 flume = "0.11.1"
+ringbuf = { version = "0.4.8", features = ["alloc"] } 
 
 [dev-dependencies]
 tokio = { workspace = true }
