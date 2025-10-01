@@ -17,17 +17,14 @@
 //! - Reliability: Robust error handling and supervision
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::fmt;
-use std::error::Error;
-use std::pin::Pin;
 use std::any::Any;
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
-use anyhow::anyhow;
 use tracing::{error, warn, info, debug};
 use async_trait::async_trait;
 
@@ -40,52 +37,93 @@ use parrot_api::errors::ActorError;
 use parrot_api::supervisor::SupervisorStrategyType;
 
 use crate::thread::actor::ThreadActor;
-use crate::thread::address::{ThreadActorRef, WeakMailboxRef};
-use crate::thread::config::{ThreadActorSystemConfig, ThreadActorConfig, BackpressureStrategy, SupervisorStrategy};
-use crate::thread::context::{ThreadContext, SystemRef as ContextSystemRef};
+use crate::thread::address::ThreadActorRef;
+use crate::thread::mailbox::WeakMailboxRef;
+use crate::thread::config::{ThreadActorSystemConfig, ThreadActorConfig, BackpressureStrategy, SupervisorStrategy, SchedulingMode};
+use crate::thread::context::ThreadContext;
 use crate::thread::error::{SystemError, SpawnError};
 use crate::thread::mailbox::Mailbox;
 use crate::thread::mailbox::mpsc::MpscMailbox;
 use crate::thread::mailbox::spsc_ringbuf::SpscRingbufMailbox;
 use crate::thread::scheduler::ThreadScheduler;
+use crate::thread::scheduler::SchedulerGroup;
 use crate::thread::scheduler::ThreadSchedulerFactory;
 use crate::thread::scheduler::shared::SharedThreadPoolConfig;
 use crate::thread::scheduler::dedicated_thread::DedicatedThreadConfig;
-use crate::thread::scheduler::SchedulerGroup;
+use crate::thread::scheduler::dedicated_thread::TypedThreadSchedulerExt;
+use crate::thread::processor::ActorProcessor;
+use parrot_api::message::Message;
+
 /// Entry in the actor registry
-struct ActorRegistryEntry {
+pub(crate) struct ActorRegistryEntry {
     /// Reference to the actor for sending messages
     actor_ref: Arc<dyn ActorRef>,
-    
+
     /// Reference to the actor's mailbox
     mailbox: Arc<dyn Mailbox>,
-    
+
     /// Actor configuration
     config: ThreadActorConfig,
-    
-    /// Optional reference to the actor's supervisor
-    supervisor: Option<Arc<dyn ActorRef>>,
 }
 
-/// Thread-based implementation of the Parrot actor system
+impl fmt::Debug for ActorRegistryEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActorRegistryEntry")
+            .field("path", &self.actor_ref.path())
+            .finish()
+    }
+}
+
+/// Watch request sent through the registry to register interest in termination.
+#[derive(Debug, Clone)]
+pub(crate) struct WatchRequest {
+    pub watcher_path: String,
+}
+
+/// Unwatch request removing a previously registered watcher.
+#[derive(Debug, Clone)]
+pub(crate) struct UnwatchRequest {
+    pub watcher_path: String,
+}
+
+/// Death notification delivered to watchers when an actor terminates.
+#[derive(Debug, Clone)]
+pub(crate) struct Terminated {
+    pub path: String,
+}
+
+/// Thread-based implementation of the Parrot actor system.
+///
+/// The system is always handled through `Arc<ThreadActorSystem>`; a
+/// `Weak<ThreadActorSystem>` is distributed to contexts so actors can spawn
+/// children and register watches without creating reference cycles.
 pub struct ThreadActorSystem {
     /// System configuration
     config: Arc<ThreadActorSystemConfig>,
-    
+
     /// Registry of all active actors
     registry: Arc<RwLock<HashMap<String, ActorRegistryEntry>>>,
-    
-    /// Scheduler group
+
+    /// Scheduler group (shared pool + dedicated threads)
     scheduler_group: Arc<SchedulerGroup>,
-    
+
     /// Runtime handle for spawning async tasks
     runtime_handle: Handle,
-    
+
     /// Signal for system shutdown
     shutdown_signal: Arc<Notify>,
-    
+
     /// Flag indicating if the system is shutting down
     is_shutting_down: Arc<AtomicBool>,
+
+    /// Watch registry: watched path -> watcher paths
+    watch_registry: Arc<Mutex<HashMap<String, Vec<String>>>>,
+
+    /// System start time for uptime reporting
+    started_at: Instant,
+
+    /// Weak self reference used by contexts (set right after construction)
+    self_weak: Mutex<Option<Weak<ThreadActorSystem>>>,
 }
 
 impl fmt::Debug for ThreadActorSystem {
@@ -99,663 +137,972 @@ impl fmt::Debug for ThreadActorSystem {
     }
 }
 
-/// Implementation of the SystemRef trait for the ThreadActorSystem
-/// This allows the system to be referenced by contexts and schedulers
-#[async_trait]
-impl ContextSystemRef for ThreadActorSystem {
-    fn runtime_handle(&self) -> &Handle {
-        &self.runtime_handle
-    }
-    
-    fn default_ask_timeout(&self) -> Duration {
-        self.config.default_ask_timeout
-    }
-    
-    fn default_backpressure_strategy(&self) -> BackpressureStrategy {
-        self.config.default_backpressure_strategy.clone()
-    }
-    
-    async fn spawn_actor(&self, actor: BoxedMessage, config: BoxedMessage, strategy: Option<SupervisorStrategy>) -> ActorResult<BoxedActorRef> {
-        // 这只是一个占位实现，实际应该将 actor 和 config 解析并调用 spawn_internal
-        Err(ActorError::Other(anyhow!("Not implemented yet")))
-    }
-}
-
 impl ThreadActorSystem {
-    /// Create a new ThreadActorSystem with the given configuration and runtime handle
-    pub fn new(config: ThreadActorSystemConfig, runtime_handle: Handle) -> Self {
+    /// Create a new thread actor system.
+    ///
+    /// After construction call [`ThreadActorSystem::init`] once to install
+    /// the weak self reference; spawns go through [`ThreadActorSystem::shared`]
+    /// which returns an `Arc`.
+    pub fn new(config: ThreadActorSystemConfig) -> Self {
+        Self::with_runtime_handle(config, Handle::current())
+    }
+
+    /// Create a new system bound to a specific runtime handle.
+    pub fn with_runtime_handle(config: ThreadActorSystemConfig, runtime_handle: Handle) -> Self {
         let config = Arc::new(config);
-        let registry = Arc::new(RwLock::new(HashMap::new()));
-        let shutdown_signal = Arc::new(Notify::new());
-        let is_shutting_down = Arc::new(AtomicBool::new(false));
-        
-        let scheduler_factory = ThreadSchedulerFactory::new(runtime_handle.clone());
-        let shared_scheduler_config = SharedThreadPoolConfig::default();
-        let dedicated_scheduler_config = DedicatedThreadConfig::default();
 
-        let scheduler_group = scheduler_factory.create_scheduler_group(Some(shared_scheduler_config), Some(dedicated_scheduler_config));
+        let factory = ThreadSchedulerFactory::new(runtime_handle.clone());
+        let scheduler_group = Arc::new(factory.create_scheduler_group(None, None));
 
-        // create system
-        let system = Self {
-            config: config.clone(),
-            registry: registry.clone(),
-            scheduler_group: Arc::new(scheduler_group),
+        Self {
+            config,
+            registry: Arc::new(RwLock::new(HashMap::new())),
+            scheduler_group,
             runtime_handle,
-            shutdown_signal,
-            is_shutting_down,
-        };
-        
-        // TODO: 创建系统之后，需要使用 Arc::downgrade 设置调度器的系统引用
-        // 这需要处理循环引用问题，后续完善
-        
+            shutdown_signal: Arc::new(Notify::new()),
+            is_shutting_down: Arc::new(AtomicBool::new(false)),
+            watch_registry: Arc::new(Mutex::new(HashMap::new())),
+            started_at: Instant::now(),
+            self_weak: Mutex::new(None),
+        }
+    }
+
+    /// Create and initialize a shared (`Arc`) system.
+    pub fn shared(config: ThreadActorSystemConfig) -> Arc<Self> {
+        let system = Arc::new(Self::new(config));
+        system.set_self_weak(Arc::downgrade(&system));
         system
     }
-    
-    /// Get a reference to the system configuration
-    pub fn config(&self) -> &Arc<ThreadActorSystemConfig> {
+
+    /// Create and initialize a shared system bound to a runtime handle.
+    pub fn shared_with_handle(config: ThreadActorSystemConfig, runtime_handle: Handle) -> Arc<Self> {
+        let system = Arc::new(Self::with_runtime_handle(config, runtime_handle));
+        system.set_self_weak(Arc::downgrade(&system));
+        system
+    }
+
+    /// Install the weak self reference. Call once after wrapping in Arc.
+    ///
+    /// `shared()` does this automatically; if you constructed the system via
+    /// `ActorSystem::start`, wrap it in an `Arc` and call
+    /// `set_self_weak(Arc::downgrade(&arc))` yourself.
+    pub fn set_self_weak(&self, weak: Weak<ThreadActorSystem>) {
+        *self.self_weak.lock().unwrap() = Some(weak);
+    }
+
+    /// Get the system configuration.
+    pub fn config(&self) -> &ThreadActorSystemConfig {
         &self.config
     }
-    
-    /// Get a reference to the runtime handle
+
+    /// Get the runtime handle.
     pub fn runtime_handle(&self) -> &Handle {
         &self.runtime_handle
     }
-    
-    /// Check if the system is currently shutting down
+
+    /// Get the weak system reference, if initialized.
+    pub(crate) fn self_weak(&self) -> Option<Weak<ThreadActorSystem>> {
+        self.self_weak.lock().unwrap().clone()
+    }
+
+    /// Upgrade the weak self reference.
+    pub(crate) fn self_arc(&self) -> Option<Arc<ThreadActorSystem>> {
+        self.self_weak().and_then(|w| w.upgrade())
+    }
+
+    /// Get the scheduler group.
+    pub fn scheduler_group(&self) -> &Arc<SchedulerGroup> {
+        &self.scheduler_group
+    }
+
+    /// Whether the system is shutting down.
     pub fn is_shutting_down(&self) -> bool {
         self.is_shutting_down.load(Ordering::Relaxed)
     }
-    
-    /// Get the shutdown signal for the system
-    pub fn shutdown_signal(&self) -> Arc<Notify> {
-        self.shutdown_signal.clone()
+
+    /// Register a watch: `watcher_path` wants notifications about `watched_path`.
+    pub async fn watch(&self, watcher_path: String, watched_path: String) -> Result<(), ActorError> {
+        let mut registry = self.watch_registry.lock().unwrap();
+        registry.entry(watched_path).or_default().push(watcher_path);
+        Ok(())
     }
-    
-    /// Spawn a new actor within the system
-    pub fn spawn_internal<A>(&self, actor: A, config: A::Config, parent_path: Option<&str>, actor_name: &str) 
-        -> Result<Arc<dyn ActorRef>, SpawnError>
+
+    /// Remove a previously registered watch.
+    pub async fn unwatch(&self, watcher_path: String, watched_path: String) -> Result<(), ActorError> {
+        let mut registry = self.watch_registry.lock().unwrap();
+        if let Some(watchers) = registry.get_mut(&watched_path) {
+            watchers.retain(|w| w != &watcher_path);
+            if watchers.is_empty() {
+                registry.remove(&watched_path);
+            }
+        }
+        Ok(())
+    }
+
+    /// Notify all watchers of an actor's termination and clean up the entry.
+    async fn notify_termination(&self, path: &str) {
+        let watchers = {
+            let mut registry = self.watch_registry.lock().unwrap();
+            registry.remove(path).unwrap_or_default()
+        };
+
+        if watchers.is_empty() {
+            return;
+        }
+
+        // Collect mailboxes first: std RwLock guards are not Send, so they
+        // must not be held across the await below.
+        let mailboxes: Vec<Arc<dyn Mailbox>> = {
+            let registry = self.registry.read().unwrap();
+            watchers
+                .iter()
+                .filter_map(|watcher_path| registry.get(watcher_path).map(|e| e.mailbox.clone()))
+                .collect()
+        };
+
+        for mailbox in mailboxes {
+            let notification = Box::new(Terminated { path: path.to_string() }) as BoxedMessage;
+            let _ = mailbox.push(notification, BackpressureStrategy::DropNewest).await;
+        }
+    }
+
+    /// Spawn a typed root actor on this system (returns a typed ThreadActorRef).
+    ///
+    /// This is the engine-specific entry point with the required context bound.
+    pub async fn spawn_root_typed_thread<A>(
+        self: &Arc<Self>,
+        actor: A,
+        _config: A::Config,
+    ) -> Result<ThreadActorRef<A>, SpawnError>
     where
-        A: parrot_api::actor::Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
+        let thread_config = ThreadActorConfig::default();
+        self.spawn_at::<A>(actor, &format!("/user/{}", uuid_v4_simple()), None, thread_config)
+            .await
+    }
+
+    /// Spawn a typed root actor with an explicit thread-engine config.
+    pub async fn spawn_typed_with_config<A>(
+        self: &Arc<Self>,
+        actor: A,
+        _config: A::Config,
+        thread_config: ThreadActorConfig,
+    ) -> Result<ThreadActorRef<A>, SpawnError>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
         if self.is_shutting_down() {
-            return Err(SpawnError::SystemShutdown);
+            return Err(SpawnError::SchedulerError("System is shutting down".into()));
         }
-        
-        // Generate the full actor path
-        let path_str = if let Some(parent) = parent_path {
-            format!("{}/{}", parent, actor_name)
-        } else {
-            format!("/{}", actor_name)
-        };
-        
-        // Check if an actor already exists at this path
+
+        let path_str = format!("/user/{}", uuid_v4_simple());
+        self.spawn_at::<A>(actor, &path_str, None, thread_config).await
+    }
+
+    /// Spawn a typed actor at an explicit path with an optional parent.
+    pub async fn spawn_at<A>(
+        self: &Arc<Self>,
+        actor: A,
+        path: &str,
+        parent: Option<BoxedActorRef>,
+        thread_config: ThreadActorConfig,
+    ) -> Result<ThreadActorRef<A>, SpawnError>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
+        if self.is_shutting_down() {
+            return Err(SpawnError::SchedulerError("System is shutting down".into()));
+        }
+
+        // Fast existence check; the authoritative insert happens after the
+        // async scheduling steps (guards must not be held across awaits).
         {
             let registry = self.registry.read().unwrap();
-            if registry.contains_key(&path_str) {
-                return Err(SpawnError::ActorPathAlreadyExists(path_str));
+            if registry.contains_key(path) {
+                return Err(SpawnError::ActorPathAlreadyExists(path.to_string()));
             }
         }
-        
-        // Get the parent actor reference if a parent path was provided
-        let parent_ref = if let Some(parent_path) = parent_path {
-            let registry = self.registry.read().unwrap();
-            registry.get(parent_path)
-                .map(|entry| entry.actor_ref.clone())
-        } else {
-            None
-        };
-        
-        // Extract actor configuration or use defaults
-        let actor_config = ThreadActorConfig::default();
-        
-        // Merge with system defaults
-        let config = self.config.merge_with_actor_config(&actor_config);
-        
-        // Create the appropriate mailbox based on scheduling mode
-        let mailbox: Arc<dyn Mailbox> = match config.scheduling_mode.unwrap() {
-            crate::thread::config::SchedulingMode::SharedPool { .. } => {
-                Arc::new(MpscMailbox::new(
-                    config.mailbox_capacity.unwrap_or(1024),
-                    ActorPath {
-                        path: path_str.clone(),
-                        target: Arc::new(()),  // placeholder
-                    }
-                ))
-            },
-            crate::thread::config::SchedulingMode::DedicatedThread => {
-                Arc::new(SpscRingbufMailbox::new(
-                    config.mailbox_capacity.unwrap_or(1024),
-                    ActorPath {
-                        path: path_str.clone(),
-                        target: Arc::new(()),  // placeholder
-                    }
-                ))
-            },
-        };
-        
-        // Create a weak reference to the mailbox
-        let weak_mailbox = Arc::downgrade(&mailbox);
-        
-        // Create the actor path
-        let path = ActorPath {
-            path: path_str.clone(),
-            target: Arc::new(()),  // placeholder, to be replaced
-        };
-        
-        // Create a weak reference to self for the context
-        let system_ref = Arc::downgrade(&(Arc::new(self.clone()) as Arc<dyn ContextSystemRef + Send + Sync>));
-        
-        // Create the context
-        let mut context = ThreadContext::new(
-            system_ref,
-            self.runtime_handle.clone(),
-            path.clone(),
-            parent_ref.map(|r| Box::new(r) as Box<dyn ActorRef>),
-            config.supervisor_strategy.clone().unwrap_or(SupervisorStrategy::Stop),
-        );
-        
-        // Create the actor reference
+
+        // 1. Create mailbox + typed actor ref first (ref holds only weak mailbox).
         let actor_ref = Arc::new(ThreadActorRef::<A>::new(
-            path.clone(),
-            weak_mailbox,
-            config.backpressure_strategy.clone().unwrap_or(BackpressureStrategy::Block),
-            config.ask_timeout.unwrap_or(Duration::from_secs(5)),
-            Some(Arc::downgrade(&self.scheduler_group)),
+            ActorPath::for_test(path),
+            Weak::<MpscMailbox>::new() as WeakMailboxRef,
+            thread_config
+                .backpressure_strategy
+                .clone()
+                .unwrap_or(self.config.default_backpressure_strategy.clone()),
+            thread_config
+                .ask_timeout
+                .unwrap_or(self.config.default_ask_timeout),
+            None,
         ));
-        
-        // 更新ActorPath中的target
-        let path = ActorPath {
-            path: path_str.clone(),
-            target: actor_ref.clone(),
+
+        let actor_path = ActorPath {
+            target: actor_ref.clone() as parrot_api::types::WeakActorTarget,
+            path: path.to_string(),
         };
-        
-        // Set the self reference in the context
-        context.set_self_ref(Box::new(actor_ref.clone()));
-        
-        // Create the actor wrapper
-        let mut thread_actor = ThreadActor::new(actor, path.clone());
-        
-        // 在单独的异步任务中初始化和启动actor
-        let actor_ref_clone = actor_ref.clone();
-        let runtime = self.runtime_handle.clone();
-        
-        runtime.spawn(async move {
-            // 首先初始化actor
-            match thread_actor.initialize(&mut context).await {
-                Ok(_) => {
-                    // 发送Start消息通知actor已启动
-                    let start_msg = Box::new(crate::thread::envelope::ControlMessage::Start);
-                    if let Err(e) = thread_actor.process_message(start_msg, &mut context).await {
-                        error!("Failed to start actor at {}: {}", path_str, e);
-                        return;
-                    }
-                    
-                    // TODO: 启动消息处理循环
-                    // 这里应该启动一个循环从mailbox获取消息并处理
-                    // 因为这里有很多特定于实现的内容，我们暂时省略细节
-                },
-                Err(e) => {
-                    error!("Failed to initialize actor at {}: {}", path_str, e);
-                    // TODO: 通知父Actor初始化失败
-                }
+
+        // 2. Create the mailbox bound to the typed ref.
+        let capacity = thread_config
+            .mailbox_capacity
+            .unwrap_or(self.config.default_mailbox_capacity);
+        let mailbox: Arc<dyn Mailbox> = match thread_config.scheduling_mode.as_ref() {
+            Some(SchedulingMode::DedicatedThread) => Arc::new(SpscRingbufMailbox::new(capacity, actor_path.clone())),
+            _ => Arc::new(MpscMailbox::new(capacity, actor_path.clone())),
+        };
+
+        // Fix up the actor ref's weak mailbox pointer now that mailbox exists.
+        actor_ref.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
+
+        // 3. Create context + processor.
+        let system_weak = self
+            .self_weak()
+            .ok_or_else(|| SpawnError::SchedulerError("System self reference not initialized".into()))?;
+
+        let mut context = ThreadContext::<A>::new(
+            system_weak.clone(),
+            self.runtime_handle.clone(),
+            actor_path.clone(),
+            parent,
+            thread_config
+                .supervisor_strategy
+                .clone()
+                .unwrap_or_else(SupervisorStrategy::default),
+        );
+
+        let boxed_self: BoxedActorRef = Box::new(ThreadActorRef::<A>::new(
+            actor_path.clone(),
+            Arc::downgrade(&mailbox) as WeakMailboxRef,
+            self.config.default_backpressure_strategy.clone(),
+            self.config.default_ask_timeout,
+            None,
+        ));
+        context.set_self_ref(boxed_self);
+
+        let processor = Arc::new(ActorProcessor::<A>::new(
+            ThreadActor::new(actor, actor_path.clone()),
+            context,
+            path.to_string(),
+            thread_config.clone(),
+        ));
+
+        mailbox.set_processor(processor.clone());
+
+        // 4. Schedule according to the scheduling mode.
+        let mode = thread_config
+            .scheduling_mode
+            .clone()
+            .unwrap_or_else(|| self.config.default_scheduling_mode.clone());
+
+        match &mode {
+            SchedulingMode::DedicatedThread => {
+                self.scheduler_group
+                    .dedicated_scheduler
+                    .schedule_typed_by_processor::<A>(path, mailbox.clone(), processor, thread_config.clone())
+                    .map_err(|e| SpawnError::SchedulerError(e.to_string()))?;
             }
-        });
-        
-        // Register the actor in the registry
+            SchedulingMode::SharedPool { .. } => {
+                self.scheduler_group
+                    .shared_scheduler
+                    .schedule(path, mailbox.clone(), Some(thread_config.clone()))
+                    .await
+                    .map_err(|e| SpawnError::SchedulerError(e.to_string()))?;
+            }        }
+
+        // 5. Register in the registry (authoritative duplicate check).
         {
             let mut registry = self.registry.write().unwrap();
-            let entry = ActorRegistryEntry {
-                actor_ref: actor_ref.clone(),
-                mailbox: mailbox.clone(),
-                config: config.clone(),
-                supervisor: parent_ref,
-            };
-            registry.insert(path_str.clone(), entry);
-        }
-        
-        // Schedule the actor based on its scheduling mode
-        match config.scheduling_mode.unwrap() {
-            crate::thread::config::SchedulingMode::SharedPool { .. } => {
-                if let Err(e) = self.shared_scheduler.schedule(&path_str, mailbox, Some(config)) {
-                    // 如果调度失败，从注册表中移除actor
-                    let mut registry = self.registry.write().unwrap();
-                    registry.remove(&path_str);
-                    return Err(SpawnError::SchedulerError(e.to_string()));
-                }
-            },
-            crate::thread::config::SchedulingMode::DedicatedThread => {
-                if let Err(e) = self.dedicated_scheduler.schedule(&path_str, mailbox, Some(config)) {
-                    // 如果调度失败，从注册表中移除actor
-                    let mut registry = self.registry.write().unwrap();
-                    registry.remove(&path_str);
-                    return Err(SpawnError::SchedulerError(e.to_string()));
-                }
-            },
-        }
-        
-        // Return the actor reference
-        Ok(actor_ref)
-    }
-    
-    /// Stop an actor by its path
-    pub fn stop_by_path(&self, path: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if !self.is_shutting_down() {
-            // First check if the actor exists
-            let (actor_config, actor_ref) = {
-                let registry = self.registry.read().unwrap();
-                match registry.get(path) {
-                    Some(entry) => (entry.config.clone(), entry.actor_ref.clone()),
-                    None => return Err(Box::new(SystemError::ActorNotFound(path.to_string()))),
-                }
-            };
-            
-            // 发送Stop消息
-            let stop_msg = Box::new(crate::thread::envelope::ControlMessage::Stop);
-            self.runtime_handle.block_on(async {
-                let _ = actor_ref.send(stop_msg).await;
-            });
-            
-            // Deschedule the actor from the appropriate scheduler
-            match actor_config.scheduling_mode.unwrap() {
-                crate::thread::config::SchedulingMode::SharedPool { .. } => {
-                    self.shared_scheduler.deschedule(path)?;
+            if registry.contains_key(path) {
+                return Err(SpawnError::ActorPathAlreadyExists(path.to_string()));
+            }
+            registry.insert(
+                path.to_string(),
+                ActorRegistryEntry {
+                    actor_ref: actor_ref.clone() as Arc<dyn ActorRef>,
+                    mailbox: mailbox.clone(),
+                    config: thread_config,
                 },
-                crate::thread::config::SchedulingMode::DedicatedThread => {
-                    self.dedicated_scheduler.deschedule(path)?;
-                },
-            }
-            
-            // Remove the actor from the registry
-            {
-                let mut registry = self.registry.write().unwrap();
-                registry.remove(path);
-            }
+            );
         }
-        
-        Ok(())
-    }
-    
-    /// Stop an actor by its reference
-    pub fn stop_actor(&self, actor_ref: &dyn ActorRef) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.stop_by_path(actor_ref.path().as_str())
-    }
-    
-    /// Get a reference to an actor by its path
-    pub fn get_actor(&self, path: &str) -> Option<Arc<dyn ActorRef>> {
-        let registry = self.registry.read().unwrap();
-        registry.get(path).map(|entry| entry.actor_ref.clone())
-    }
-    
-    /// Watch an actor for termination
-    pub async fn watch(&self, watcher: &dyn ActorRef, target: &dyn ActorRef) -> Result<(), SystemError> {
-        // 查找actor处理器并添加watcher
-        let target_path = target.path();
-        let watcher_path = watcher.path();
-        
-        debug!("Actor at {} watching actor at {} for termination", 
-               watcher_path, target_path);
-        
-        // 检查目标actor是否存在
-        let target_ref = self.get_actor(&target_path)
-            .ok_or_else(|| SystemError::ActorNotFound(target_path.clone()))?;
-        
-        // 检查watcher是否存在
-        let _ = self.get_actor(&watcher_path)
-            .ok_or_else(|| SystemError::ActorNotFound(watcher_path.clone()))?;
-        
-        // 查找目标actor的处理器并添加watcher
-        // 在这个框架中，这需要通过将watcher注册到目标actor的watchers列表中来实现
-        // TODO: 实现真正的watcher注册机制
-        // 考虑到我们没有直接访问ThreadActor实例的方式，这可能需要通过消息传递来实现
-        
-        // 发送watch消息到目标actor
-        let watch_request = Box::new(WatchRequest {
-            watcher_path: watcher_path.clone(),
-        });
-        
-        // 发送消息以注册watcher
-        if let Err(e) = target_ref.send(watch_request).await {
-            return Err(SystemError::Other(anyhow::anyhow!(
-                "Failed to send watch request from {} to {}: {}", 
-                watcher_path, target_path, e
-            )));
-        }
-        
-        Ok(())
-    }
-    
-    /// Stop watching an actor
-    pub async fn unwatch(&self, watcher: &dyn ActorRef, target: &dyn ActorRef) -> Result<(), SystemError> {
-        // 查找actor处理器并移除watcher
-        let target_path = target.path();
-        let watcher_path = watcher.path();
-        
-        debug!("Actor at {} unwatching actor at {}", 
-               watcher_path, target_path);
-        
-        // 检查目标actor是否存在
-        let target_ref = self.get_actor(&target_path)
-            .ok_or_else(|| SystemError::ActorNotFound(target_path.clone()))?;
-        
-        // 检查watcher是否存在
-        let _ = self.get_actor(&watcher_path)
-            .ok_or_else(|| SystemError::ActorNotFound(watcher_path.clone()))?;
-        
-        // 发送unwatch消息到目标actor
-        let unwatch_request = Box::new(UnwatchRequest {
-            watcher_path: watcher_path.clone(),
-        });
-        
-        // 发送消息以取消注册watcher
-        if let Err(e) = target_ref.send(unwatch_request).await {
-            return Err(SystemError::Other(anyhow::anyhow!(
-                "Failed to send unwatch request from {} to {}: {}", 
-                watcher_path, target_path, e
-            )));
-        }
-        
-        Ok(())
-    }
-    
-    /// 检查actor健康状态
-    pub async fn check_health(&self, actor_path: &str) -> Result<ActorState, SystemError> {
-        let actor_ref = self.get_actor(actor_path)
-            .ok_or_else(|| SystemError::ActorNotFound(actor_path.to_string()))?;
-        
-        // 发送健康检查消息
-        let health_check = Box::new(crate::thread::envelope::ControlMessage::HealthCheck);
-        
-        match actor_ref.send(health_check).await {
-            Ok(response) => {
-                // 尝试从响应中提取ActorState
-                if let Some(state) = response.downcast_ref::<ActorState>() {
-                    Ok(*state)
-                } else {
-                    Err(SystemError::Other(anyhow::anyhow!(
-                        "Failed to extract actor state from health check response"
-                    )))
-                }
-            },
-            Err(e) => {
-                Err(SystemError::Other(anyhow::anyhow!(
-                    "Failed to send health check to actor at {}: {}", 
-                    actor_path, e
-                )))
-            }
-        }
-    }
-    
-    /// 处理actor死亡
-    pub fn handle_actor_termination(&self, path: &str, reason: Option<String>) {
-        let parent_path = {
-            // 从路径中提取父路径
-            let parts: Vec<&str> = path.split('/').collect();
-            if parts.len() > 1 {
-                let parent_parts = &parts[0..parts.len()-1];
-                Some(parent_parts.join("/"))
-            } else {
-                None
-            }
-        };
-        
-        // 如果有父actor，通知父actor子actor已终止
-        if let Some(parent_path) = parent_path {
-            if let Some(parent_ref) = self.get_actor(&parent_path) {
-                let failure_msg = Box::new(crate::thread::envelope::ControlMessage::ChildFailure {
-                    path: path.to_string(),
-                    reason: reason.unwrap_or_else(|| "Unknown reason".to_string()),
-                });
-                
-                self.runtime_handle.spawn(async move {
-                    let _ = parent_ref.send(failure_msg).await;
-                });
-            }
-        }
-        
-        // 从注册表中移除actor
-        let mut registry = self.registry.write().unwrap();
-        registry.remove(path);
-    }
-    
-    /// Shutdown the actor system, stopping all actors
-    pub async fn shutdown_internal(&self, timeout: Duration) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Set the shutdown flag
-        self.is_shutting_down.store(true, Ordering::SeqCst);
-        
-        // Notify all waiters
-        self.shutdown_signal.notify_waiters();
-        
-        // 通知所有actor系统正在关闭
-        let shutdown_msg = Box::new(crate::thread::envelope::ControlMessage::SystemShutdown);
-        {
-            let registry = self.registry.read().unwrap();
-            for entry in registry.values() {
-                let actor_ref = entry.actor_ref.clone();
-                let shutdown_clone = shutdown_msg.clone();
-                self.runtime_handle.spawn(async move {
-                    let _ = actor_ref.send(shutdown_clone).await;
-                });
-            }
-        }
-        
-        // 给actor一些时间处理关闭消息
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // Collect all actor paths
-        let paths = {
-            let registry = self.registry.read().unwrap();
-            registry.keys().cloned().collect::<Vec<_>>()
-        };
-        
-        // Stop all actors
-        for path in paths {
-            if let Err(e) = self.stop_by_path(&path) {
-                error!("Error stopping actor '{}' during shutdown: {}", path, e);
-            }
-        }
-        
-        // Shutdown the schedulers
-        let shared_scheduler = self.shared_scheduler.clone();
-        let dedicated_scheduler = self.dedicated_scheduler.clone();
-        
-        let shared_future = tokio::task::spawn(async move {
-            if let Err(e) = shared_scheduler.shutdown() {
-                error!("Error shutting down shared scheduler: {}", e);
-            }
-        });
-        
-        let dedicated_future = tokio::task::spawn(async move {
-            if let Err(e) = dedicated_scheduler.shutdown() {
-                error!("Error shutting down dedicated scheduler: {}", e);
-            }
-        });
-        
-        // Wait for scheduler shutdown with timeout
-        match tokio::time::timeout(timeout, async {
-            let _ = shared_future.await;
-            let _ = dedicated_future.await;
-        }).await {
-            Ok(_) => {
-                info!("Actor system shutdown completed gracefully");
-                Ok(())
-            },
-            Err(_) => {
-                warn!("Actor system shutdown timed out after {:?}", timeout);
-                Err(Box::new(SystemError::Timeout(format!("Actor system shutdown timed out after {:?}", timeout))))
-            }
-        }
-    }
-}
 
-impl Clone for ThreadActorSystem {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            registry: self.registry.clone(),
-            shared_scheduler: self.shared_scheduler.clone(),
-            dedicated_scheduler: self.dedicated_scheduler.clone(),
-            runtime_handle: self.runtime_handle.clone(),
-            shutdown_signal: self.shutdown_signal.clone(),
-            is_shutting_down: self.is_shutting_down.clone(),
-        }
-    }
-}
-
-// Implement the ActorSystem trait
-#[async_trait]
-impl ActorSystem for ThreadActorSystem {
-    async fn start(config: ActorSystemConfig) -> Result<Self, parrot_api::system::SystemError> {
-        // 将通用ActorSystemConfig转换为特定于线程实现的ThreadActorSystemConfig
-        let thread_config = ThreadActorSystemConfig {
-            shared_pool_size: config.runtime_config.thread_pool_size.unwrap_or_else(num_cpus::get),
-            shared_queue_capacity: 10000, // 默认值
-            max_dedicated_threads: 32,    // 默认值
-            default_scheduling_mode: crate::thread::config::SchedulingMode::SharedPool { max_messages_per_run: 10 },
-            default_mailbox_capacity: 1024,
-            default_ask_timeout: config.timeouts.message_handling,
-            default_supervisor_strategy: SupervisorStrategy::Restart { 
-                max_retries: config.guardian_config.max_restarts as usize,
-                within: config.guardian_config.restart_window,
-            },
-            default_backpressure_strategy: BackpressureStrategy::Block,
-            shutdown_timeout: config.timeouts.system_shutdown,
-        };
-        
-        // 获取或创建runtime句柄
-        let runtime_handle = Handle::try_current()
-            .map_err(|e| parrot_api::system::SystemError::InitializationError(
-                format!("Failed to get tokio runtime handle: {}", e)
-            ))?;
-        
-        // 创建线程actor系统
-        let system = Self::new(thread_config, runtime_handle);
-        
-        Ok(system)
-    }
-    
-    async fn spawn_root_typed<A>(&self, actor: A, config: A::Config) -> Result<Arc<dyn ActorRef>, parrot_api::system::SystemError>
-    where
-        A: parrot_api::actor::Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
-    {
-        let actor_name = format!("actor-{}", uuid::Uuid::new_v4());
-        
-        match self.spawn_internal(actor, config, None, &actor_name) {
-            Ok(actor_ref) => Ok(actor_ref),
-            Err(e) => Err(parrot_api::system::SystemError::ActorCreationError(e.to_string())),
-        }
-    }
-    
-    async fn spawn_root_boxed(
-        &self,
-        actor: Box<dyn Actor<Config = Box<dyn Any + Send>, Context = dyn ActorContext>>,
-        config: Box<dyn Any + Send>,
-    ) -> Result<Box<dyn ActorRef>, parrot_api::system::SystemError> {
-        Err(parrot_api::system::SystemError::ActorCreationError(
-            "Thread actor system does not support boxed actors yet".to_string()
+        Ok(ThreadActorRef::<A>::new(
+            actor_path,
+            Arc::downgrade(&mailbox) as WeakMailboxRef,
+            self.config.default_backpressure_strategy.clone(),
+            self.config.default_ask_timeout,
+            None,
         ))
     }
-    
-    async fn get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
-        self.get_actor(&path.path).map(|actor_ref| Box::new(actor_ref) as Box<dyn ActorRef>)
-    }
-    
-    async fn broadcast<M: parrot_api::message::Message + Clone>(&self, msg: M) -> Result<(), parrot_api::system::SystemError> {
-        let registry = self.registry.read().unwrap();
-        for entry in registry.values() {
-            // Clone message for each actor
-            let msg_clone = msg.clone();
-            let actor_ref = entry.actor_ref.clone();
-            
-            // Send in background to avoid blocking
-            self.runtime_handle.spawn(async move {
-                if let Err(e) = actor_ref.send(Box::new(msg_clone) as BoxedMessage).await {
-                    error!("Error broadcasting message: {}", e);
-                }
-            });
+
+    /// Spawn an erased actor from boxed components (used by ThreadContext::spawn).
+    pub async fn spawn_erased_actor(
+        self: &Arc<Self>,
+        actor: BoxedMessage,
+        config: BoxedMessage,
+        strategy: Option<SupervisorStrategy>,
+    ) -> ActorResult<BoxedActorRef> {
+        // The boxed actor payload is an `ErasedSpawnBox` (see
+        // TypedSpawnPayload::into_boxed) erased to BoxedMessage.
+        let payload = actor
+            .downcast::<ErasedSpawnBox>()
+            .map_err(|_| ActorError::InternalError("Spawn payload is not a boxed spawnable actor".into()))?;
+
+        let mut thread_config = ThreadActorConfig::default();
+        if let Some(strategy) = strategy {
+            thread_config.supervisor_strategy = Some(strategy);
         }
-        
+
+        payload.0.spawn_on(self.clone(), config, thread_config).await
+    }
+
+    /// Look up an actor ref by path.
+    pub fn get_actor_ref(&self, path: &str) -> Option<Arc<dyn ActorRef>> {
+        self.registry.read().unwrap().get(path).map(|e| e.actor_ref.clone())
+    }
+
+    /// Look up an actor's mailbox by path.
+    pub fn get_mailbox(&self, path: &str) -> Option<Arc<dyn Mailbox>> {
+        self.registry.read().unwrap().get(path).map(|e| e.mailbox.clone())
+    }
+
+    /// Stop and remove an actor from the system.
+    pub async fn stop_actor(&self, path: &str) -> Result<(), SystemError> {
+        let entry = {
+            let mut registry = self.registry.write().unwrap();
+            registry.remove(path)
+        };
+
+        let entry = match entry {
+            Some(e) => e,
+            None => return Err(SystemError::ActorNotFound(path.to_string())),
+        };
+
+        // Stop the processor gracefully (sends Stop control message).
+        if let Some(processor) = entry.mailbox.get_processor() {
+            let _ = processor.stop_erased().await;
+        }
+
+        // Deschedule.
+        let _ = self.scheduler_group.shared_scheduler.deschedule(path);
+        let _ = self.scheduler_group.dedicated_scheduler.deschedule(path).await;
+
+        // Close the mailbox.
+        entry.mailbox.close().await;
+
+        // Notify watchers.
+        self.notify_termination(path).await;
+
         Ok(())
     }
-    
-    fn status(&self) -> SystemStatus {
-        let registry = self.registry.read().unwrap();
-        
-        // 确定系统当前状态
-        let state = if self.is_shutting_down() {
-            SystemState::ShuttingDown
-        } else {
-            SystemState::Running
-        };
-        
-        // TODO: 实现真实的资源统计
-        SystemStatus {
-            state,
-            active_actors: registry.len(),
-            uptime: Duration::from_secs(0), // 这里应该跟踪实际的运行时间
-            resources: SystemResources {
-                cpu_usage: 0.0,
-                memory_usage: 0,
-                thread_count: 0,
-            },
-        }
+
+    /// Get actor count.
+    pub fn actor_count(&self) -> usize {
+        self.registry.read().unwrap().len()
     }
-    
-    async fn shutdown(self) -> Result<(), parrot_api::system::SystemError> {
-        let timeout = self.config.shutdown_timeout;
-        self.shutdown_internal(timeout).await
-            .map_err(|e| parrot_api::system::SystemError::Other(anyhow!("{}", e)))
+
+    /// Broadcast a message to all registered actors.
+    pub async fn broadcast_message(&self, msg: BoxedMessage) -> Result<(), SystemError> {
+        if self.is_shutting_down() {
+            return Err(SystemError::ShuttingDown);
+        }
+
+        let entries: Vec<Arc<dyn Mailbox>> = {
+            let registry = self.registry.read().unwrap();
+            registry.values().map(|e| e.mailbox.clone()).collect()
+        };
+
+        for mailbox in entries {
+            let _ = mailbox.push(msg_clone(&msg)?, BackpressureStrategy::DropNewest).await;
+        }
+        Ok(())
+    }
+
+    /// Internal shutdown: stop all actors, deschedule, close mailboxes.
+    pub async fn shutdown_internal(&self) -> Result<(), SystemError> {
+        if self.is_shutting_down.swap(true, Ordering::SeqCst) {
+            return Ok(()); // already shutting down
+        }
+
+        info!("ThreadActorSystem shutting down");
+
+        // Remove all entries.
+        let entries: Vec<(String, ActorRegistryEntry)> = {
+            let mut registry = self.registry.write().unwrap();
+            registry.drain().collect()
+        };
+
+        // Stop processors (before_stop lifecycle).
+        for (path, entry) in &entries {
+            if let Some(processor) = entry.mailbox.get_processor() {
+                if let Err(e) = processor.stop_erased().await {
+                    warn!("Failed to stop actor {}: {}", path, e);
+                }
+            }
+        }
+
+        // Shutdown schedulers.
+        // Note: use the inherent async `shutdown` methods, NOT the sync
+        // `ThreadScheduler` trait wrappers which `block_on` internally and
+        // would panic ("Cannot start a runtime from within a runtime").
+        let _ = self
+            .scheduler_group
+            .shared_scheduler
+            .shutdown(5000)
+            .await;
+        let _ = self.scheduler_group.dedicated_scheduler.shutdown().await;
+
+        // Close all mailboxes.
+        for (_, entry) in &entries {
+            entry.mailbox.close().await;
+        }
+
+        // Notify termination watchers.
+        for (path, _) in &entries {
+            self.notify_termination(path).await;
+        }
+
+        self.shutdown_signal.notify_waiters();
+        info!("ThreadActorSystem stopped ({} actors)", entries.len());
+        Ok(())
+    }
+}
+
+/// Clone a boxed message via its Clone impl when available.
+fn msg_clone(msg: &BoxedMessage) -> Result<BoxedMessage, SystemError> {
+    // Box<dyn Any + Send> cannot be cloned generically; broadcast therefore
+    // requires cloneable payloads (see CloneableMessage::try_from_boxed).
+    match parrot_api::message::CloneableMessage::try_from_boxed(msg) {
+        Some(cloneable) => Ok(cloneable.into_boxed()),
+        None => Err(SystemError::Other(anyhow::anyhow!(
+            "Broadcast requires a cloneable message payload"
+        ))),
+    }
+}
+
+/// Erased spawn payload: a boxed closure able to spawn on a system.
+///
+/// The system reference is captured as an `Arc` clone so the returned future
+/// is 'static.
+#[async_trait]
+pub trait ErasedSpawnable: Send + Sync + 'static {
+    async fn spawn_on(
+        self: Box<Self>,
+        system: Arc<ThreadActorSystem>,
+        config: BoxedMessage,
+        thread_config: ThreadActorConfig,
+    ) -> ActorResult<BoxedActorRef>;
+}
+
+/// Wrapper holding an erased spawnable so the outer box stays a concrete
+/// type and can be downcast from `BoxedMessage` reliably.
+///
+/// (Double boxing like `Box<Box<dyn Trait>>` cannot be downcast back: the
+/// unsize coercion to `Box<dyn Any + Send>` erases the inner trait object's
+/// concrete `TypeId`.)
+pub struct ErasedSpawnBox(Box<dyn ErasedSpawnable>);
+
+impl std::fmt::Debug for ErasedSpawnBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErasedSpawnBox").finish()
+    }
+}
+
+/// Erased spawn closure for a typed actor with ThreadContext.
+pub struct TypedSpawnPayload<A> {
+    actor: Option<A>,
+}
+
+#[async_trait]
+impl<A> ErasedSpawnable for TypedSpawnPayload<A>
+where
+    A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+{
+    async fn spawn_on(
+        mut self: Box<Self>,
+        system: Arc<ThreadActorSystem>,
+        _config: BoxedMessage,
+        thread_config: ThreadActorConfig,
+    ) -> ActorResult<BoxedActorRef> {
+        let actor = self
+            .actor
+            .take()
+            .ok_or_else(|| ActorError::InternalError("Spawn payload already consumed".into()))?;
+
+        let actor_ref = system
+            .spawn_at::<A>(actor, &format!("/user/{}", uuid_v4_simple()), None, thread_config)
+            .await
+            .map_err(|e| ActorError::InternalError(e.to_string()))?;
+
+        Ok(Box::new(actor_ref))
+    }
+}
+
+impl<A> TypedSpawnPayload<A>
+where
+    A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+{
+    /// Create an erased spawn payload wrapping a typed actor.
+    pub fn new(actor: A) -> Self {
+        Self { actor: Some(actor) }
+    }
+
+    /// Erase into a BoxedMessage ready for `spawn_erased_actor`.
+    ///
+    /// The concrete `ErasedSpawnBox` wrapper keeps the outer type downcastable.
+    pub fn into_boxed(self) -> BoxedMessage {
+        Box::new(ErasedSpawnBox(Box::new(self) as Box<dyn ErasedSpawnable>))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use tokio::runtime::Builder;
-    
-    #[test]
-    fn test_system_creation() {
-        let runtime = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        
-        let config = ThreadActorSystemConfig::default();
-        let system = ThreadActorSystem::new(config, runtime.handle().clone());
-        
-        assert_eq!(system.is_shutting_down(), false);
-        assert!(system.registry.read().unwrap().is_empty());
+    use crate::thread::tests_support::DummyActor;
+    use parrot_api::actor::EmptyConfig;
+    use parrot_api::types::ActorResult;
+
+    /// Echo actor recording the messages it received.
+    #[derive(Debug, Default)]
+    struct RecvRecorder {
+        received: std::sync::Mutex<Vec<u64>>,
     }
-    
-    #[test]
-    fn test_system_shutdown() {
-        let runtime = Builder::new_current_thread()
-            .enable_all()
-            .build()
+
+    impl Actor for RecvRecorder {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn init<'a>(
+            &'a mut self,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                if let Some(v) = msg.downcast_ref::<u64>() {
+                    self.received.lock().unwrap().push(*v);
+                    return Ok(Box::new(*v) as BoxedMessage);
+                }
+                Ok(msg)
+            })
+        }
+
+        fn receive_message_with_engine<'a>(
+            &'a mut self,
+            _msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+            _engine_ctx: std::ptr::NonNull<dyn Any>,
+        ) -> Option<ActorResult<BoxedMessage>> {
+            None
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+
+    fn shared_system() -> Arc<ThreadActorSystem> {
+        ThreadActorSystem::shared(ThreadActorSystemConfig::default())
+    }
+
+    #[tokio::test]
+    async fn test_shared_installs_self_weak() {
+        let sys = shared_system();
+        assert!(sys.self_weak().is_some());
+        assert!(sys.self_arc().is_some());
+        assert!(!sys.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn test_shared_with_handle_uses_provided_runtime() {
+        let sys = ThreadActorSystem::shared_with_handle(
+            ThreadActorSystemConfig::default(),
+            tokio::runtime::Handle::current(),
+        );
+        assert!(sys.self_weak().is_some());
+        assert!(!sys.is_shutting_down());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_at_registers_actor_and_ref() {
+        let sys = shared_system();
+
+        let actor_ref = sys
+            .spawn_at::<DummyActor>(
+                DummyActor,
+                "/user/test-spawn",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
+            .expect("spawn should succeed");
+
+        assert_eq!(actor_ref.path(), "/user/test-spawn");
+        assert_eq!(sys.actor_count(), 1);
+        assert!(sys.get_actor_ref("/user/test-spawn").is_some());
+        assert!(sys.get_mailbox("/user/test-spawn").is_some());
+
+        sys.shutdown_internal().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_at_duplicate_path_fails() {
+        let sys = shared_system();
+
+        let first = sys
+            .spawn_at::<DummyActor>(
+                DummyActor,
+                "/user/dup",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await;
+        assert!(first.is_ok());
+
+        let second = sys
+            .spawn_at::<DummyActor>(
+                DummyActor,
+                "/user/dup",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await;
+        assert!(matches!(
+            second,
+            Err(SpawnError::ActorPathAlreadyExists(_))
+        ));
+
+        sys.shutdown_internal().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_root_typed_thread_uses_uuid_path() {
+        let sys = shared_system();
+
+        let actor_ref = sys
+            .spawn_root_typed_thread(DummyActor, EmptyConfig)
+            .await
+            .expect("root spawn should succeed");
+
+        assert!(actor_ref.path().starts_with("/user/"));
+        assert_eq!(sys.actor_count(), 1);
+
+        sys.shutdown_internal().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_erased_actor_through_payload() {
+        let sys = shared_system();
+
+        let payload = TypedSpawnPayload::new(DummyActor);
+        let boxed = payload.into_boxed();
+        // The boxed payload must downcast back to the erased spawnable.
+        let inner = boxed
+            .downcast::<ErasedSpawnBox>()
+            .expect("payload boxing round-trip");
+        drop(inner);
+
+        let payload2 = TypedSpawnPayload::new(DummyActor);
+        let boxed_ref = sys
+            .spawn_erased_actor(payload2.into_boxed(), Box::new(EmptyConfig) as BoxedMessage, None)
+            .await
+            .expect("erased spawn should succeed");
+
+        assert!(boxed_ref.path().starts_with("/user/"));
+        assert_eq!(sys.actor_count(), 1);
+
+        sys.shutdown_internal().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_rejects_payload_of_wrong_type() {
+        let sys = shared_system();
+
+        let result = sys
+            .spawn_erased_actor(
+                Box::new("not-a-spawn-payload") as BoxedMessage,
+                Box::new(EmptyConfig) as BoxedMessage,
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+
+        sys.shutdown_internal().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stop_actor_removes_from_registry() {
+        let sys = shared_system();
+
+        sys.spawn_at::<DummyActor>(
+            DummyActor,
+            "/user/stop-me",
+            None,
+            ThreadActorConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sys.actor_count(), 1);
+        sys.stop_actor("/user/stop-me").await.unwrap();
+        assert_eq!(sys.actor_count(), 0);
+        assert!(sys.get_actor_ref("/user/stop-me").is_none());
+
+        // Stopping a non-existent actor errors.
+        let err = sys.stop_actor("/user/ghost").await;
+        assert!(matches!(err, Err(SystemError::ActorNotFound(_))));
+
+        sys.shutdown_internal().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_broadcast_delivers_to_all_mailboxes() {
+        let sys = shared_system();
+
+        for name in ["/user/bcast-1", "/user/bcast-2"] {
+            sys.spawn_at::<RecvRecorder>(
+                RecvRecorder::default(),
+                name,
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
             .unwrap();
-        
-        let config = ThreadActorSystemConfig::default();
-        let system = ThreadActorSystem::new(config, runtime.handle().clone());
-        
-        // 简单测试关闭系统
-        runtime.block_on(async {
-            let result = system.shutdown_internal(Duration::from_millis(100)).await;
-            assert!(result.is_ok(), "System shutdown failed: {:?}", result);
-            assert_eq!(system.is_shutting_down(), true);
-        });
+        }
+
+        sys.broadcast_message(Box::new(42u64) as BoxedMessage)
+            .await
+            .unwrap();
+
+        // Wait until both mailboxes have drained the broadcast.
+        for _ in 0..200 {
+            let empty1 = sys
+                .get_mailbox("/user/bcast-1")
+                .unwrap()
+                .is_empty()
+                .await;
+            let empty2 = sys
+                .get_mailbox("/user/bcast-2")
+                .unwrap()
+                .is_empty()
+                .await;
+            if empty1 && empty2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            sys.get_mailbox("/user/bcast-1").unwrap().is_empty().await,
+            "broadcast should be drained by the shared pool"
+        );
+        assert!(
+            sys.get_mailbox("/user/bcast-2").unwrap().is_empty().await,
+            "broadcast should be drained by the shared pool"
+        );
+
+        sys.shutdown_internal().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_fails_when_system_is_shutting_down() {
+        let sys = shared_system();
+        sys.shutdown_internal().await.unwrap();
+        assert!(sys.is_shutting_down());
+
+        let result = sys
+            .spawn_at::<DummyActor>(
+                DummyActor,
+                "/user/late",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_watch_and_unwatch_registry() {
+        let sys = shared_system();
+
+        sys.spawn_at::<DummyActor>(
+            DummyActor,
+            "/user/watched",
+            None,
+            ThreadActorConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        // Register interest in termination.
+        sys.watch("/user/watcher".to_string(), "/user/watched".to_string())
+            .await
+            .unwrap();
+
+        // Remove interest again.
+        sys.unwatch("/user/watcher".to_string(), "/user/watched".to_string())
+            .await
+            .unwrap();
+
+        sys.shutdown_internal().await.unwrap();
     }
 }
 
-/// 请求对一个actor进行监视
-#[derive(Debug)]
-pub struct WatchRequest {
-    /// 观察者的路径
-    pub watcher_path: ActorPath,
+/// Simple UUID v4-ish generator without external deps.
+fn uuid_v4_simple() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{:x}-{:x}", ms, n)
 }
 
-/// 请求停止监视一个actor
-#[derive(Debug)]
-pub struct UnwatchRequest {
-    /// 观察者的路径
-    pub watcher_path: ActorPath,
-} 
+/// Adapter exposing `Arc<dyn ActorRef>` as `Box<dyn ActorRef>`.
+struct ArcActorRef(Arc<dyn ActorRef>);
+
+impl std::fmt::Debug for ArcActorRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArcActorRef")
+            .field("path", &self.0.path())
+            .finish()
+    }
+}
+
+impl ArcActorRef {
+    fn boxed(inner: Arc<dyn ActorRef>) -> Box<dyn ActorRef> {
+        Box::new(ArcActorRef(inner))
+    }
+}
+
+#[async_trait]
+impl ActorRef for ArcActorRef {
+    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        self.0.send(msg)
+    }
+
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        self.0.send_with_timeout(msg, timeout)
+    }
+
+    fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
+        self.0.stop()
+    }
+
+    fn path(&self) -> String {
+        self.0.path()
+    }
+
+    fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+        self.0.is_alive()
+    }
+
+    fn clone_boxed(&self) -> BoxedActorRef {
+        self.0.clone_boxed()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self.0.as_any()
+    }
+}
+
+#[async_trait]
+impl ActorSystem for ThreadActorSystem {
+    async fn start(config: ActorSystemConfig) -> Result<Self, parrot_api::system::SystemError> {
+        let runtime_handle = Handle::try_current()
+            .map_err(|_| parrot_api::system::SystemError::InitializationError(
+                "ThreadActorSystem::start must be called within a Tokio runtime".to_string(),
+            ))?;
+
+        let thread_config = ThreadActorSystemConfig {
+            name: if config.name.is_empty() { "parrot-thread-system".to_string() } else { config.name },
+            ..Default::default()
+        };
+
+        let system = Self::with_runtime_handle(thread_config, runtime_handle);
+        Ok(system)
+    }
+
+    async fn spawn_root_typed<A>(
+        &self,
+        _actor: A,
+        _config: A::Config,
+    ) -> Result<Box<dyn ActorRef>, parrot_api::system::SystemError>
+    where
+        A: Actor + 'static,
+    {
+        // Generic (context-erased) spawn cannot construct a ThreadContext<A>
+        // without the context bound; use the engine-specific entry point.
+        Err(parrot_api::system::SystemError::ActorCreationError(
+            "Generic actor creation not supported directly. Use spawn_root_typed_thread on the ThreadActorSystem.".to_string(),
+        ))
+    }
+
+    async fn spawn_root_boxed(
+        &self,
+        _actor: Box<dyn Actor<Config = Box<dyn Any + Send>, Context = dyn ActorContext>>,
+        _config: Box<dyn Any + Send>,
+    ) -> Result<Box<dyn ActorRef>, parrot_api::system::SystemError> {
+        Err(parrot_api::system::SystemError::ActorCreationError(
+            "spawn_root_boxed is not supported by the thread engine; use spawn_root_typed".to_string(),
+        ))
+    }
+
+    async fn get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
+        self.get_actor_ref(&path.path).map(ArcActorRef::boxed)
+    }
+
+    async fn broadcast<M: Message + Clone>(&self, msg: M) -> Result<(), parrot_api::system::SystemError> {
+        self.broadcast_message(Box::new(msg)).await
+            .map_err(|e| parrot_api::system::SystemError::Other(anyhow::anyhow!(e.to_string())))
+    }
+
+    fn status(&self) -> SystemStatus {
+        SystemStatus {
+            state: if self.is_shutting_down() {
+                SystemState::ShuttingDown
+            } else {
+                SystemState::Running
+            },
+            active_actors: self.actor_count(),
+            uptime: self.started_at.elapsed(),
+            resources: SystemResources {
+                cpu_usage: 0.0,
+                memory_usage: 0,
+                thread_count: self.scheduler_group.shared_scheduler.metrics_thread_count(),
+            },
+        }
+    }
+
+    async fn shutdown(self) -> Result<(), parrot_api::system::SystemError> {
+        self.shutdown_internal()
+            .await
+            .map_err(|e| parrot_api::system::SystemError::Other(anyhow::anyhow!(e.to_string())))
+    }
+}
+
+/// Free function performing the typed spawn used by `spawn_root_typed`.
+///
+/// Casts the context requirement down to ThreadContext<A> via a helper trait.
+#[async_trait]
+pub trait TypedSpawnHelper<A>: Send + Sync + 'static
+where
+    A: Actor + Send + Sync + 'static,
+{
+    async fn spawn_on_system(
+        &self,
+        system: &Arc<ThreadActorSystem>,
+        actor: A,
+        config: A::Config,
+    ) -> Result<BoxedActorRef, SpawnError>;
+}
+

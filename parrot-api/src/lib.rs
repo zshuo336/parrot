@@ -25,25 +25,42 @@
 //! ## Usage Example
 //! 
 //! ```rust
-//! use parrot_api::{Actor, ActorSystem, Message};
+//! use parrot_api::{actor::{Actor, ActorState, EmptyConfig}, context::ActorContext, message::Message, types::{ActorResult, BoxedFuture, BoxedMessage}};
+//! use std::any::Any;
 //! 
 //! // Define a message
-//! #[derive(Message)]
 //! struct Ping;
+//! impl Message for Ping { type Result = (); }
 //! 
-//! // Define an actor
+//! // Define an actor (illustrative minimal implementation)
 //! struct PingActor;
 //! 
 //! impl Actor for PingActor {
-//!     // Actor implementation
+//!     type Config = EmptyConfig;
+//!     type Context = dyn ActorContext;
+//! 
+//!     fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+//!         Box::pin(async { Ok(()) })
+//!     }
+//! 
+//!     fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+//!         Box::pin(async move { Ok(msg) })
+//!     }
+//! 
+//!     fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: std::ptr::NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+//!         None
+//!     }
+//! 
+//!     fn state(&self) -> ActorState {
+//!         ActorState::Running
+//!     }
 //! }
 //! 
-//! // Create and use the actor system
-//! async fn example() {
-//!     let system = ActorSystem::new();
-//!     let actor = system.spawn_actor(PingActor::new());
-//!     actor.send(Ping).await;
-//! }
+//! # async fn example() {
+//! // Spawn through a concrete actor system implementation; see the
+//! // engine crates (e.g. `parrot::thread::ThreadActorSystem`).
+//! # let _ = PingActor;
+//! # }
 //! ```
 //! 
 //! ## Module Organization
@@ -84,3 +101,8 @@ pub use stream::{StreamHandler, StreamRegistry, StreamRegistryExt, ActorStreamHa
 
 // Re-export priority constants for convenience
 pub use priority::{BACKGROUND, LOW, NORMAL, HIGH, CRITICAL};
+
+// Re-export derive macros for convenience. `Message` is also a trait name, so
+// the macro is exposed under an explicit alias to avoid a name clash.
+pub use parrot_api_derive::Message as MessageDerive;
+pub use parrot_api_derive::ParrotActor;

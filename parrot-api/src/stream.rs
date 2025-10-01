@@ -21,7 +21,7 @@
 //!
 //! ## Usage Example
 //!
-//! ```rust
+//! ```ignore
 //! use parrot_api::stream::{StreamHandler, StreamRegistry};
 //! use futures::stream::Stream;
 //!

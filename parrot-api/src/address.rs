@@ -47,10 +47,12 @@ use std::time::Duration;
 ///
 /// ## Examples
 /// ```rust
-/// let path = ActorPath {
-///     target: actor_target,
-///     path: "local://system1/user/worker1".to_string()
-/// };
+/// use parrot_api::address::ActorPath;
+///
+/// // Placeholder targets are weak refs to dropped refs; typical actors
+/// // construct their real path from a live target.
+/// let path = ActorPath::placeholder("local://system1/user/worker1");
+/// assert_eq!(path.path, "local://system1/user/worker1");
 /// ```
 #[derive(Debug, Clone)]
 pub struct ActorPath {
@@ -68,6 +70,23 @@ pub struct ActorPath {
 impl ActorPath {
     pub fn new(target: WeakActorTarget, path: String) -> Self {
         Self { target, path }
+    }
+
+    /// Creates a path with a dead placeholder target (never upgrades).
+    ///
+    /// Useful for tests and for bootstrap phases where the real target
+    /// reference is created after the path. The placeholder is a weak
+    /// reference to a dropped dead ref, so `upgrade` always yields `None`.
+    pub fn placeholder(path: impl Into<String>) -> Self {
+        Self {
+            target: Arc::new(DeadTargetRef) as WeakActorTarget,
+            path: path.into(),
+        }
+    }
+
+    /// Test-only alias of [`ActorPath::placeholder`].
+    pub fn for_test(path: &str) -> Self {
+        Self::placeholder(path.to_string())
     }
 
     pub fn path(&self) -> &str {
@@ -258,11 +277,13 @@ impl<T: ActorRef + ?Sized> ActorRefExt for T {}
 ///
 /// ## Examples
 /// ```rust
-/// async fn example(weak_ref: WeakActorRef) {
-///     if let Some(strong_ref) = weak_ref.upgrade().await {
-///         // Use the strong reference
-///     }
-/// }
+/// use parrot_api::address::{ActorPath, WeakActorRef};
+///
+/// # async fn example() {
+/// let weak_ref = WeakActorRef::new(ActorPath::placeholder("local://sys/user/a"));
+/// // A weak ref carries the path even after the actor is gone.
+/// assert_eq!(weak_ref.path.path, "local://sys/user/a");
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct WeakActorRef {
@@ -291,3 +312,49 @@ impl WeakActorRef {
         Box::pin(async move { None })
     }
 } 
+/// Dead actor ref used as a placeholder target in [`ActorPath::placeholder`].
+///
+/// Never alive; `send`/`stop` return `NotFound`-style errors.
+#[derive(Debug, Clone)]
+pub(crate) struct DeadTargetRef;
+
+#[async_trait]
+impl ActorRef for DeadTargetRef {
+    fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
+        })
+    }
+
+    fn send_with_timeout<'a>(
+        &'a self,
+        _msg: BoxedMessage,
+        _timeout_duration: Option<std::time::Duration>,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
+        })
+    }
+
+    fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
+        })
+    }
+
+    fn path(&self) -> String {
+        "dead://placeholder".to_string()
+    }
+
+    fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+        Box::pin(async move { false })
+    }
+
+    fn clone_boxed(&self) -> BoxedActorRef {
+        Box::new(Self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}

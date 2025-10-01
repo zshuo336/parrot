@@ -37,10 +37,21 @@ pub enum SupervisorStrategy {
         max_retries: usize,
         within: Duration,
     },
+    /// Resume the child actor (keep it running, message dropped).
+    Resume,
     /// Stop the child actor permanently.
     Stop,
     /// Stop the child actor and escalate the failure by stopping the supervisor itself.
     Escalate,
+}
+
+impl Default for SupervisorStrategy {
+    fn default() -> Self {
+        SupervisorStrategy::Restart {
+            max_retries: 3,
+            within: Duration::from_secs(10),
+        }
+    }
 }
 
 // --- System Configuration ---
@@ -48,6 +59,9 @@ pub enum SupervisorStrategy {
 /// Configuration for the `ThreadActorSystem`.
 #[derive(Clone, Debug)]
 pub struct ThreadActorSystemConfig {
+    /// The name of this actor system.
+    pub name: String,
+
     /// The number of worker threads in the shared thread pool.
     pub shared_pool_size: usize,
     
@@ -82,6 +96,7 @@ pub struct ThreadActorSystemConfig {
 impl Default for ThreadActorSystemConfig {
     fn default() -> Self {
         Self {
+            name: "parrot-thread-system".to_string(),
             shared_pool_size: num_cpus::get(),
             shared_queue_capacity: 10000,
             max_dedicated_threads: 32,

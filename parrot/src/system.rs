@@ -11,6 +11,7 @@ use parrot_api::{
     context::ActorContext,
 };
 use crate::actix::ActixActorSystem;
+use crate::thread::system::ThreadActorSystem;
 use uuid::Uuid;
 use anyhow;
 
@@ -19,6 +20,8 @@ use anyhow;
 pub enum ActorSystemImpl {
     /// Actix implementation
     Actix(ActixActorSystem),
+    /// Thread engine implementation (native shared-pool / dedicated-thread)
+    Thread(Arc<ThreadActorSystem>),
 }
 
 impl ActorSystemImpl {
@@ -33,7 +36,16 @@ impl ActorSystemImpl {
                 Err(SystemError::ActorCreationError(
                     "Generic actor creation not supported directly. Use spawn_root_typed_actix for Actix system.".to_string()
                 ))
-            }
+            },
+            ActorSystemImpl::Thread(sys) => {
+                // The engine-specific typed entry point requires the
+                // `Context = ThreadContext<A>` bound, which cannot be proven
+                // from the fully generic context; return a helpful error.
+                let _ = sys;
+                Err(SystemError::ActorCreationError(
+                    "Generic actor creation not supported directly. Use spawn_root_thread for the thread system.".to_string()
+                ))
+            },
             // Add branches for other system types
         }
     }
@@ -78,7 +90,11 @@ impl ActorSystemImpl {
                 ActorSystemImpl::Actix(sys) => {
                     // ActixActorSystem's get_actor method expects a &String
                     sys.get_actor(&path_copy.path).await
-                }
+                },
+                ActorSystemImpl::Thread(sys) => {
+                    use parrot_api::system::ActorSystem as _;
+                    sys.get_actor(&path_copy).await
+                },
             }
         }
         .await
@@ -96,6 +112,10 @@ impl ActorSystemImpl {
         async move {
             match self_clone {
                 ActorSystemImpl::Actix(sys) => sys.broadcast(msg_copy).await,
+                ActorSystemImpl::Thread(sys) => {
+                    use parrot_api::system::ActorSystem as _;
+                    sys.broadcast(msg_copy).await
+                },
                 // Add branches for other system types
             }
         }
@@ -106,6 +126,10 @@ impl ActorSystemImpl {
     pub async fn shutdown(self) -> Result<(), SystemError> {
         match self {
             ActorSystemImpl::Actix(sys) => sys.shutdown().await,
+            ActorSystemImpl::Thread(sys) => sys
+                .shutdown_internal()
+                .await
+                .map_err(|e| SystemError::Other(anyhow::anyhow!(e.to_string()))),
             // Add branches for other system types
         }
     }
@@ -150,6 +174,28 @@ impl ParrotActorSystem {
             *self.default_system.write().unwrap() = Some(name);
         }
         
+        Ok(())
+    }
+
+    /// Register a thread engine system
+    pub async fn register_thread_system(
+        &self,
+        name: String,
+        system: Arc<ThreadActorSystem>,
+        set_as_default: bool,
+    ) -> Result<(), SystemError> {
+        let mut systems = self.systems.write().map_err(|_| {
+            SystemError::Other(anyhow::anyhow!("Failed to acquire write lock"))
+        })?;
+
+        // Store the system
+        systems.insert(name.clone(), ActorSystemImpl::Thread(system));
+
+        // Set as default if needed
+        if set_as_default || self.default_system.read().unwrap().is_none() {
+            *self.default_system.write().unwrap() = Some(name);
+        }
+
         Ok(())
     }
 
@@ -373,6 +419,81 @@ impl ParrotActorSystem {
             )),
         }
     }
+
+    /// Spawn an actor specific to the thread engine system
+    ///
+    /// This method is a thread-engine-specific version of spawn_root_typed,
+    /// designed for actors whose `Context` is `ThreadContext<A>`.
+    pub async fn spawn_root_thread<A>(
+        &self,
+        actor: A,
+        config: A::Config,
+    ) -> Result<Box<dyn ActorRef>, SystemError>
+    where
+        A: Actor<Context = crate::thread::context::ThreadContext<A>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        // Get the default system name
+        let default_name = self.get_default_system_name()?;
+
+        // Get the system instance
+        let system = self.get_system_impl(&default_name)?;
+
+        // Check if the default system is a thread engine system
+        match system {
+            ActorSystemImpl::Thread(sys) => {
+                let typed_ref = sys
+                    .spawn_root_typed_thread(actor, config)
+                    .await
+                    .map_err(|e| SystemError::ActorCreationError(e.to_string()))?;
+                Ok(Box::new(typed_ref) as Box<dyn ActorRef>)
+            },
+            _ => Err(SystemError::ActorCreationError(
+                "Default system is not a thread engine system".to_string()
+            )),
+        }
+    }
+
+    /// Spawn an actor specific to the thread engine system in a named system
+    pub async fn spawn_root_thread_in_system<A>(
+        &self,
+        system_name: &str,
+        actor: A,
+        config: A::Config,
+    ) -> Result<Box<dyn ActorRef>, SystemError>
+    where
+        A: Actor<Context = crate::thread::context::ThreadContext<A>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let system = self.get_system_impl(system_name)?;
+
+        match system {
+            ActorSystemImpl::Thread(sys) => {
+                let typed_ref = sys
+                    .spawn_root_typed_thread(actor, config)
+                    .await
+                    .map_err(|e| SystemError::ActorCreationError(e.to_string()))?;
+                Ok(Box::new(typed_ref) as Box<dyn ActorRef>)
+            },
+            _ => Err(SystemError::ActorCreationError(
+                format!("System '{}' is not a thread engine system", system_name)
+            )),
+        }
+    }
+
+    /// Get a thread engine system by name
+    pub fn get_thread_system(&self, name: &str) -> Result<Arc<ThreadActorSystem>, SystemError> {
+        match self.get_system_impl(name)? {
+            ActorSystemImpl::Thread(sys) => Ok(sys),
+            _ => Err(SystemError::Other(anyhow::anyhow!(
+                format!("System '{}' is not a thread engine system", name)
+            ))),
+        }
+    }
 }
 
 #[async_trait]
@@ -462,5 +583,191 @@ impl ActorSystem for ParrotActorSystem {
 
     async fn shutdown(self) -> Result<(), SystemError> {
         self.internal_shutdown().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::context::ThreadContext;
+    use parrot_api::actor::{Actor, ActorState, EmptyConfig};
+    use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
+
+    /// Simple echo actor for the thread engine.
+    #[derive(Debug, Default)]
+    struct EchoActor {
+        received: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl Actor for EchoActor {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn init<'a>(
+            &'a mut self,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                if let Some(v) = msg.downcast_ref::<u64>() {
+                    self.received.lock().unwrap().push(*v);
+                }
+                Ok(msg)
+            })
+        }
+
+        fn receive_message_with_engine<'a>(
+            &'a mut self,
+            _msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+            _engine_ctx: std::ptr::NonNull<dyn std::any::Any>,
+        ) -> Option<ActorResult<BoxedMessage>> {
+            None
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parrot_system_with_no_registrations() {
+        let system = ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        assert!(system.list_registered_systems().unwrap().is_empty());
+
+        // No default system: spawn and broadcast must fail cleanly.
+        let spawn = system
+            .spawn_root_thread(EchoActor::default(), EmptyConfig)
+            .await;
+        assert!(spawn.is_err());
+
+        system.internal_shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_register_thread_system_and_spawn() {
+        let parrot = ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let thread_system = crate::thread::system::ThreadActorSystem::shared(
+            crate::thread::config::ThreadActorSystemConfig::default(),
+        );
+
+        parrot
+            .register_thread_system("thread-main".into(), thread_system, true)
+            .await
+            .unwrap();
+
+        // Registered and set as default (first registration wins by default).
+        let names = parrot.list_registered_systems().unwrap();
+        assert_eq!(names, vec!["thread-main".to_string()]);
+
+        // Spawn a thread-engine actor through the Parrot facade.
+        let actor_ref = parrot
+            .spawn_root_thread(EchoActor::default(), EmptyConfig)
+            .await
+            .expect("spawn through ParrotActorSystem");
+        assert!(actor_ref.path().starts_with("/user/"));
+
+        // The actor lives in the thread system registry.
+        let ts = parrot.get_thread_system("thread-main").unwrap();
+        assert_eq!(ts.actor_count(), 1);
+
+        // get_thread_system rejects non-thread systems.
+        assert!(parrot.get_thread_system("missing").is_err());
+
+        parrot.internal_shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_named_system_spawn_and_default_selection() {
+        let parrot = ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let ts = crate::thread::system::ThreadActorSystem::shared(
+            crate::thread::config::ThreadActorSystemConfig::default(),
+        );
+        parrot
+            .register_thread_system("engine-a".into(), ts, false)
+            .await
+            .unwrap();
+
+        // First registration becomes the default even when set_as_default=false.
+        let spawned = parrot
+            .spawn_root_thread(EchoActor::default(), EmptyConfig)
+            .await;
+        assert!(spawned.is_ok());
+
+        // Explicit named spawn works too.
+        let named = parrot
+            .spawn_root_thread_in_system("engine-a", EchoActor::default(), EmptyConfig)
+            .await;
+        assert!(named.is_ok());
+
+        // Unknown system name fails.
+        let missing = parrot
+            .spawn_root_thread_in_system("nope", EchoActor::default(), EmptyConfig)
+            .await;
+        assert!(missing.is_err());
+
+        // set_default_system validates the name.
+        assert!(parrot.set_default_system("engine-a").is_ok());
+        assert!(parrot.set_default_system("missing").is_err());
+
+        parrot.internal_shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_actor_through_facade() {
+        let parrot = ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+
+        let ts = crate::thread::system::ThreadActorSystem::shared(
+            crate::thread::config::ThreadActorSystemConfig::default(),
+        );
+        parrot
+            .register_thread_system("lookup".into(), ts, true)
+            .await
+            .unwrap();
+
+        let actor_ref = parrot
+            .spawn_root_thread(EchoActor::default(), EmptyConfig)
+            .await
+            .unwrap();
+        let path_str = actor_ref.path();
+
+        // Look up by path via the ActorSystem trait method.
+        let found = parrot.get_actor(&ActorPath::placeholder(&path_str)).await;
+        assert!(found.is_some(), "spawned actor must be discoverable");
+
+        let missing = parrot
+            .get_actor(&ActorPath::placeholder("/user/nonexistent"))
+            .await;
+        assert!(missing.is_none());
+
+        parrot.internal_shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_status_reports_running() {
+        let parrot = ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        let status = parrot.status();
+        assert_eq!(status.state, SystemState::Running);
+        parrot.internal_shutdown().await.unwrap();
     }
 }

@@ -304,12 +304,13 @@ pub fn init_with_file(config: LogConfig, log_file: &str) -> Result<(), io::Error
 /// use parrot::logging;
 /// 
 /// // Simple initialization with defaults
-/// logging::init_default();
+/// logging::init_default(false);
 /// 
 /// // Now you can use logging macros
 /// logging::info!("Application started");
 /// ```
 pub fn init_default(use_file: bool) {
+    let _ = use_file; // reserved: file output toggle, not yet wired
     init(LogConfig::default());
 }
 
@@ -703,7 +704,7 @@ macro_rules! log_scheduler {
 /// use std::thread;
 /// 
 /// // Initialize logging
-/// logging::init_default();
+/// logging::init_default(false);
 /// 
 /// // Capture the current dispatcher
 /// let dispatcher = logging::current_subscriber();

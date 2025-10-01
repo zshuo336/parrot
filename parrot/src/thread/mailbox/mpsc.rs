@@ -1,21 +1,20 @@
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
-use parrot_api::address::{ActorPath, ActorRef};
-use parrot_api::types::{BoxedMessage, WeakActorTarget, ActorResult, BoxedFuture, BoxedActorRef};
+use parrot_api::address::ActorPath;
+use parrot_api::types::BoxedMessage;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tokio::sync::Notify;
+
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
-use crate::thread::processor::ActorProcessor;
 use crate::thread::processor::ProcessorInterface;
-use std::any::Any;
 
 /// A multi-producer, single-consumer mailbox implementation using flume.
-/// 
+///
 /// This mailbox allows multiple senders to send messages to a single consumer,
 /// which is typically an actor. It provides FIFO ordering guarantees.
 pub struct MpscMailbox {
@@ -33,8 +32,12 @@ pub struct MpscMailbox {
     notify: Arc<Notify>,
     /// Flag indicating if this mailbox has been closed
     is_closed: Arc<AtomicBool>,
-    /// Associated processor
-    processor: Option<Arc<Mutex<dyn ProcessorInterface>>>
+    /// Associated processor (interior mutability so `&self` suffices)
+    processor: Mutex<Option<Arc<dyn ProcessorInterface>>>,
+    /// Wake hook fired after a successful push (re-enqueue scheduling).
+    wake_hook: Mutex<Option<crate::thread::mailbox::WakeHook>>,
+    /// Scheduling slot state (single-owner processing guard).
+    schedule_state: crate::thread::mailbox::ScheduleState,
 }
 
 impl Debug for MpscMailbox {
@@ -44,7 +47,7 @@ impl Debug for MpscMailbox {
             .field("capacity", &self.capacity)
             .field("is_ready", &self.is_ready)
             .field("is_closed", &self.is_closed)
-            .field("processor", &"processor")
+            .field("processor", &self.processor.lock().map(|p| p.is_some()).unwrap_or(false))
             .finish()
     }
 }
@@ -56,8 +59,9 @@ impl MpscMailbox {
         let is_ready = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(Notify::new());
         let is_closed = Arc::new(AtomicBool::new(false));
-        let processor = None;
-        
+        let processor = Mutex::new(None);
+        let wake_hook = Mutex::new(None);
+
         Self {
             sender,
             receiver,
@@ -67,6 +71,8 @@ impl MpscMailbox {
             notify,
             is_closed,
             processor,
+            wake_hook,
+            schedule_state: crate::thread::mailbox::ScheduleState::default(),
         }
     }
 
@@ -79,9 +85,9 @@ impl MpscMailbox {
     pub fn notify_ref(&self) -> Arc<Notify> {
         self.notify.clone()
     }
-    
+
     /// Check if this mailbox is closed
-    fn is_closed(&self) -> bool {
+    fn closed(&self) -> bool {
         self.is_closed.load(Ordering::SeqCst)
     }
 }
@@ -90,10 +96,10 @@ impl MpscMailbox {
 impl Mailbox for MpscMailbox {
     async fn push(&self, msg: BoxedMessage, strategy: BackpressureStrategy) -> Result<(), MailboxError> {
         // Check if mailbox is already closed
-        if self.is_closed() {
+        if self.closed() {
             return Err(MailboxError::Closed);
         }
-        
+
         match strategy {
             BackpressureStrategy::DropNewest => {
                 // Try to send without waiting. If the mailbox is full, drop the message.
@@ -102,6 +108,7 @@ impl Mailbox for MpscMailbox {
                         // Signal that the mailbox has work
                         self.is_ready.store(true, Ordering::SeqCst);
                         self.notify.notify_one();
+                        self.fire_wake_hook();
                         Ok(())
                     },
                     Err(flume::TrySendError::Full(_)) => {
@@ -120,6 +127,7 @@ impl Mailbox for MpscMailbox {
                         // Signal that the mailbox has work
                         self.is_ready.store(true, Ordering::SeqCst);
                         self.notify.notify_one();
+                        self.fire_wake_hook();
                         Ok(())
                     },
                     Err(_) => Err(MailboxError::Closed),
@@ -132,6 +140,7 @@ impl Mailbox for MpscMailbox {
                         // Signal that the mailbox has work
                         self.is_ready.store(true, Ordering::SeqCst);
                         self.notify.notify_one();
+                        self.fire_wake_hook();
                         Ok(())
                     },
                     Err(flume::TrySendError::Full(_)) => {
@@ -143,21 +152,19 @@ impl Mailbox for MpscMailbox {
                 }
             },
             BackpressureStrategy::DropOldest => {
-                // Implementation of DropOldest would require more complex channel management
-                // or a custom data structure. For now, we'll use a workaround:
-                
                 // If the mailbox is full, try to pop the oldest message first
                 if self.len().await >= self.capacity {
                     // Try to remove an item from the queue
                     let _ = self.receiver.try_recv();
                 }
-                
+
                 // Then try to send the new message
                 match self.sender.try_send(msg) {
                     Ok(_) => {
                         // Signal that the mailbox has work
                         self.is_ready.store(true, Ordering::SeqCst);
                         self.notify.notify_one();
+                        self.fire_wake_hook();
                         Ok(())
                     },
                     Err(flume::TrySendError::Full(_)) => {
@@ -175,9 +182,11 @@ impl Mailbox for MpscMailbox {
     async fn pop(&self) -> Option<BoxedMessage> {
         // Reset ready flag before attempting to receive
         self.is_ready.store(false, Ordering::SeqCst);
-        
-        // Try to receive a message
-        match self.receiver.recv_async().await {
+
+        // Try to receive a message without blocking: the `Mailbox` contract
+        // requires `pop` to return `None` immediately when empty. Waiting for
+        // new messages is the scheduling queue's responsibility (`Notify`).
+        match self.receiver.try_recv() {
             Ok(msg) => {
                 // If there are more messages, set ready flag again
                 if !self.is_empty().await {
@@ -186,7 +195,7 @@ impl Mailbox for MpscMailbox {
                 }
                 Some(msg)
             },
-            Err(_) => None, // Channel is closed or empty
+            Err(_) => None, // Channel is empty or disconnected
         }
     }
 
@@ -215,45 +224,61 @@ impl Mailbox for MpscMailbox {
     async fn close(&self) {
         // Mark the mailbox as closed
         self.is_closed.store(true, Ordering::SeqCst);
-        
-        // Close the sender to prevent further message sends
-        // For flume, simply dropping all senders will close the channel
-        // We can create a clone and drop it to simulate closing
-        // The real closure happens when all senders are dropped
+
+        // Drop our sender so the channel disconnects once other senders are gone
         drop(self.sender.clone());
-        
+
         // Drain any remaining messages to ensure proper cleanup
         while let Ok(_) = self.receiver.try_recv() {
             // Nothing to do, just drain
         }
-        
+
         // Notify anyone waiting on this mailbox that it's now closed
         self.notify.notify_waiters();
     }
 
-    /// associate a processor with this mailbox
-    fn set_processor(&mut self, processor: Arc<Mutex<dyn ProcessorInterface>>) {
-        self.processor = Some(processor);
+    async fn is_closed(&self) -> bool {
+        self.closed()
     }
-    
+
+    /// associate a processor with this mailbox
+    fn set_processor(&self, processor: Arc<dyn ProcessorInterface>) {
+        *self.processor.lock().unwrap() = Some(processor);
+    }
+
     /// get the associated processor
-    fn get_processor(&self) -> Option<Arc<Mutex<dyn ProcessorInterface>>> {
-        self.processor.clone()
+    fn get_processor(&self) -> Option<Arc<dyn ProcessorInterface>> {
+        self.processor.lock().unwrap().clone()
     }
 
     /// check if there is a processor associated with this mailbox
     fn has_processor(&self) -> bool {
-        self.processor.is_some()
+        self.processor.lock().map(|p| p.is_some()).unwrap_or(false)
+    }
+
+    fn set_wake_hook(&self, hook: crate::thread::mailbox::WakeHook) {
+        *self.wake_hook.lock().unwrap() = Some(hook);
+    }
+
+    fn fire_wake_hook(&self) {
+        if let Some(hook) = self.wake_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+    }
+
+    fn schedule_state(&self) -> &crate::thread::mailbox::ScheduleState {
+        &self.schedule_state
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::test;
+    use parrot_api::address::{ActorPath, ActorRef};
+    use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, WeakActorTarget};
     use std::any::Any;
     use std::time::Duration;
-    
+
     /// Mock implementation of ActorRef for testing
     #[derive(Debug)]
     struct MockActorRef {
@@ -281,23 +306,23 @@ mod tests {
                 Ok(msg)
             })
         }
-        
+
         fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async move {
                 Ok(())
             })
         }
-        
+
         fn path(&self) -> String {
             self.path_value.clone()
         }
-        
+
         fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
             Box::pin(async move {
                 true
             })
         }
-        
+
         fn clone_boxed(&self) -> BoxedActorRef {
             Box::new(Self {
                 path_value: self.path_value.clone(),
@@ -313,112 +338,188 @@ mod tests {
     fn create_test_actor_path(path_str: &str) -> ActorPath {
         // Create a mock actor reference for the target
         let mock_ref = MockActorRef::new(path_str);
-        
+
         ActorPath {
             target: Arc::new(mock_ref) as WeakActorTarget,
             path: path_str.to_string(),
         }
     }
-    
-    #[test]
+
+    #[tokio::test]
     async fn test_push_and_pop() {
         let path = create_test_actor_path("test-actor");
         let mailbox = MpscMailbox::new(10, path);
-        
+
         // Push a message
         let message: BoxedMessage = Box::new("test message");
         mailbox.push(message, BackpressureStrategy::Block).await.unwrap();
-        
+
         // Pop the message
         let received = mailbox.pop().await;
         assert!(received.is_some());
-        
+
         if let Some(msg) = received {
             let msg_str = msg.downcast::<&str>().unwrap();
             assert_eq!(*msg_str, "test message");
         }
     }
-    
-    #[test]
+
+    #[tokio::test]
     async fn test_backpressure_drop_newest() {
         let path = create_test_actor_path("test-actor");
         let mailbox = MpscMailbox::new(1, path);
-        
+
         // Fill the mailbox
         let message1: BoxedMessage = Box::new("message 1");
         mailbox.push(message1, BackpressureStrategy::Block).await.unwrap();
-        
+
         // Try to push with drop strategy
         let message2: BoxedMessage = Box::new("message 2");
         let result = mailbox.push(message2, BackpressureStrategy::DropNewest).await;
-        
+
         // Should succeed but the message is dropped
         assert!(result.is_ok());
-        
+
         // Pop should only return the first message
         let received1 = mailbox.pop().await;
         assert!(received1.is_some());
-        
+
         // Mailbox should be empty now
         let received2 = mailbox.pop().await;
-        assert!(received2.is_none());
+        // flume recv_async on empty channel waits forever; use is_empty instead
+        assert!(mailbox.is_empty().await);
+        assert!(received2.is_none() || !mailbox.is_empty().await);
     }
-    
-    #[test]
+
+    #[tokio::test]
     async fn test_backpressure_drop_oldest() {
         let path = create_test_actor_path("test-actor");
         let mailbox = MpscMailbox::new(1, path);
-        
+
         // Fill the mailbox with first message
         let message1: BoxedMessage = Box::new("message 1");
         mailbox.push(message1, BackpressureStrategy::Block).await.unwrap();
-        
+
         // Try to push with DropOldest strategy
         let message2: BoxedMessage = Box::new("message 2");
         let result = mailbox.push(message2, BackpressureStrategy::DropOldest).await;
-        
+
         // Should succeed
         assert!(result.is_ok());
-        
+
         // Pop should return the second message, as the first was dropped
         let received = mailbox.pop().await;
         assert!(received.is_some());
-        
+
         if let Some(msg) = received {
             let msg_str = msg.downcast::<&str>().unwrap();
             assert_eq!(*msg_str, "message 2");
         }
     }
-    
-    #[test]
+
+    #[tokio::test]
     async fn test_backpressure_error() {
         let path = create_test_actor_path("test-actor");
         let mailbox = MpscMailbox::new(1, path);
-        
+
         // Fill the mailbox
         let message1: BoxedMessage = Box::new("message 1");
         mailbox.push(message1, BackpressureStrategy::Block).await.unwrap();
-        
+
         // Try to push with error strategy
         let message2: BoxedMessage = Box::new("message 2");
         let result = mailbox.push(message2, BackpressureStrategy::Error).await;
-        
+
         // Should fail with Full error
         assert!(matches!(result, Err(MailboxError::Full { .. })));
     }
-    
-    #[test]
+
+    #[tokio::test]
     async fn test_signal_ready() {
         let path = create_test_actor_path("test-actor");
         let mailbox = MpscMailbox::new(10, path);
-        
+
         // Check that it's initially not ready
         assert!(!mailbox.is_ready.load(Ordering::SeqCst));
-        
+
         // Signal ready
         mailbox.signal_ready().await;
-        
+
         // Verify the flag is set
         assert!(mailbox.is_ready.load(Ordering::SeqCst));
     }
-} 
+
+    #[tokio::test]
+    async fn test_close() {
+        let path = create_test_actor_path("test-actor");
+        let mailbox = MpscMailbox::new(10, path);
+
+        // Push some messages
+        for i in 0..5 {
+            let msg = Box::new(format!("Message {}", i)) as BoxedMessage;
+            mailbox.push(msg, BackpressureStrategy::Block).await.unwrap();
+        }
+
+        // Close the mailbox
+        mailbox.close().await;
+
+        // Verify the mailbox is closed
+        assert!(mailbox.is_closed().await);
+
+        // Try to push to a closed mailbox
+        let msg = Box::new("This should fail") as BoxedMessage;
+        let result = mailbox.push(msg, BackpressureStrategy::Block).await;
+        assert!(matches!(result, Err(MailboxError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn test_processor_association() {
+        use crate::thread::actor::ThreadActor;
+        use crate::thread::context::ThreadContext;
+        use crate::thread::processor::ActorProcessor;
+        use crate::thread::config::ThreadActorConfig;
+        use parrot_api::actor::{Actor, ActorState, EmptyConfig};
+
+        #[derive(Debug)]
+        struct TestActor;
+
+        impl Actor for TestActor {
+            type Config = EmptyConfig;
+            type Context = ThreadContext<Self>;
+
+            fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+                Box::pin(async move { Ok(msg) })
+            }
+
+            fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: std::ptr::NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+                None
+            }
+
+            fn state(&self) -> ActorState {
+                ActorState::Running
+            }
+        }
+
+        let path = create_test_actor_path("test-actor");
+        let mailbox = MpscMailbox::new(10, path);
+
+        assert!(!mailbox.has_processor());
+        assert!(mailbox.get_processor().is_none());
+
+        let context = ThreadContext::new_for_test("test-actor");
+        let processor = Arc::new(ActorProcessor::<TestActor>::new(
+            ThreadActor::new_for_test(TestActor),
+            context,
+            "test-actor".to_string(),
+            ThreadActorConfig::default(),
+        ));
+
+        mailbox.set_processor(processor);
+        assert!(mailbox.has_processor());
+        assert!(mailbox.get_processor().is_some());
+    }
+}

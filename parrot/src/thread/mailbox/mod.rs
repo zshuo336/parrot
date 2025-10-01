@@ -1,75 +1,239 @@
-use async_trait::async_trait;
-use std::sync::Arc;
-use std::any::Any;
-use std::sync::Mutex;
+//! Mailbox abstraction for the thread-based actor system.
 
-use parrot_api::types::BoxedMessage;
+use std::fmt::Debug;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use async_trait::async_trait;
+
 use parrot_api::address::ActorPath;
-use parrot_api::actor::Actor;
+use parrot_api::types::BoxedMessage;
 
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
-use crate::thread::processor::ActorProcessor;
 use crate::thread::processor::ProcessorInterface;
-use crate::thread::context::ThreadContext;
 
 pub mod mpsc;
 pub mod spsc;
 pub mod spsc_ringbuf;
 
+/// Weak reference to a mailbox.
+pub type WeakMailboxRef = std::sync::Weak<dyn Mailbox + Send + Sync>;
 
-/// Abstract interface for an actor's message queue.
-/// Implementors must guarantee FIFO ordering.
+/// Hook fired after a successful `push` so the scheduling layer can
+/// (re-)enqueue the mailbox for processing.
+///
+/// This closes the lost-wakeup race where a worker drains a mailbox, decides
+/// not to re-queue it (it looked empty), and a subsequent push only fires a
+/// bare `Notify` that no worker associates with this mailbox.
+pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Scheduling-slot state ensuring at most one queue entry (and at most one
+/// owning worker) per mailbox.
+///
+/// The state machine is:
+/// - `queued_or_owned == false`: idle; anyone may acquire the slot and push
+///   the mailbox into the scheduling queue.
+/// - `queued_or_owned == true`: the mailbox is either sitting in the
+///   scheduling queue or is being processed by a worker. Concurrent enqueue
+///   attempts are rejected and recorded in `pending_wake` so the owning
+///   worker takes over the re-queue on release instead of losing the wakeup.
+///
+/// This preserves actor semantics: a single actor's mailbox is processed by
+/// exactly one worker at a time.
+#[derive(Debug, Default)]
+pub struct ScheduleState {
+    queued_or_owned: AtomicBool,
+    pending_wake: AtomicBool,
+}
+
+impl ScheduleState {
+    /// Attempt to acquire the scheduling slot.
+    ///
+    /// Returns `true` when the caller should push the mailbox into the
+    /// scheduling queue (the slot was acquired). Returns `false` when the
+    /// mailbox is already queued or owned; the attempt is recorded in
+    /// `pending_wake` so the current owner re-queues on release.
+    pub fn try_enqueue(&self) -> bool {
+        if !self.queued_or_owned.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        self.pending_wake.store(true, Ordering::Release);
+        false
+    }
+
+    /// Worker-side release after finishing a batch.
+    ///
+    /// Returns `true` when the mailbox must be re-queued (more messages are
+    /// pending, or a push raced with this release). Returns `false` when the
+    /// slot was freed and no re-queue is needed.
+    pub fn release(&self, has_more: bool) -> bool {
+        if has_more {
+            return true; // still owns the slot; caller re-queues directly.
+        }
+        if self.pending_wake.swap(false, Ordering::AcqRel) {
+            return true; // a push raced us; keep the slot and re-queue.
+        }
+        self.queued_or_owned.store(false, Ordering::Release);
+        // A hook may have landed between the pending_wake swap above and the
+        // store: its slot CAS failed (we still owned it) and it set
+        // pending_wake. Take the slot back and re-queue on its behalf.
+        if self.pending_wake.swap(false, Ordering::AcqRel) {
+            self.queued_or_owned.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    /// Drop the slot unconditionally (error paths). Any pending wakeup is
+    /// discarded; the next successful push re-enqueues the mailbox.
+    pub fn force_release(&self) {
+        self.pending_wake.store(false, Ordering::Release);
+        self.queued_or_owned.store(false, Ordering::Release);
+    }
+}
+
+/// Trait defining a mailbox that buffers messages for an actor.
+///
+/// A mailbox is the single delivery point between senders (`ThreadActorRef`)
+/// and the scheduling layer (workers). It also carries the (optional)
+/// type-erased processor association used by workers to execute messages.
 #[async_trait]
-pub trait Mailbox: Send + Sync + std::fmt::Debug {
-    /// Asynchronously pushes a message into the mailbox, applying the specified backpressure strategy.
+pub trait Mailbox: Debug + Send + Sync + 'static {
+    /// Push a message into the mailbox using the given backpressure strategy.
     async fn push(&self, msg: BoxedMessage, strategy: BackpressureStrategy) -> Result<(), MailboxError>;
 
-    /// Asynchronously pops a message from the mailbox.
-    /// Returns `None` if the mailbox is closed or empty after potentially waiting.
-    /// 
-    /// This method must be implemented to be thread-safe through internal synchronization
-    /// mechanisms since it's called with `&self` but conceptually needs mutable access.
+    /// Pop the next message from the mailbox, or `None` when empty.
     async fn pop(&self) -> Option<BoxedMessage>;
 
-    /// Checks if the mailbox is currently empty (snapshot in time).
-    /// 
-    /// This method should avoid blocking operations like tokio::runtime::Handle::current().block_on
-    /// to prevent deadlocks in nested runtime contexts.
+    /// Whether the mailbox currently holds no messages.
     async fn is_empty(&self) -> bool;
-    
-    /// Checks if the mailbox has more messages (opposite of is_empty).
+
+    /// Wake any processor waiting for messages on this mailbox.
+    async fn signal_ready(&self);
+
+    /// The actor path this mailbox belongs to.
+    fn path(&self) -> &ActorPath;
+
+    /// Maximum number of messages the mailbox can hold.
+    fn capacity(&self) -> usize;
+
+    /// Current number of buffered messages.
+    async fn len(&self) -> usize;
+
+    /// Close the mailbox: further pushes fail, buffered messages are drained.
+    async fn close(&self);
+
+    /// Whether the mailbox is closed.
+    async fn is_closed(&self) -> bool {
+        false
+    }
+
+    /// Associate a processor with this mailbox (interior mutability).
+    fn set_processor(&self, processor: Arc<dyn ProcessorInterface>);
+
+    /// Get the associated processor, if any.
+    fn get_processor(&self) -> Option<Arc<dyn ProcessorInterface>>;
+
+    /// Whether a processor is associated with this mailbox.
+    fn has_processor(&self) -> bool;
+
+    /// Install the wake hook fired after each successful push.
+    ///
+    /// Schedulers use this to re-enqueue the mailbox when new messages arrive
+    /// while no worker currently owns it.
+    fn set_wake_hook(&self, hook: WakeHook);
+
+    /// Fire the installed wake hook (no-op when none is installed).
+    fn fire_wake_hook(&self);
+
+    /// The scheduling slot state guarding single-owner processing.
+    fn schedule_state(&self) -> &ScheduleState;
+
+    /// Whether the mailbox has more messages after a pop (scheduling hint).
     async fn has_more_messages(&self) -> bool {
         !self.is_empty().await
     }
+}
 
-    /// Signals that this mailbox might have work and should be considered for scheduling.
-    /// Primarily used by MPSC mailboxes in the SharedPool scheduler.
-    /// SPSC mailbox implementations can be a no-op.
-    async fn signal_ready(&self);
+#[cfg(test)]
+mod schedule_state_tests {
+    use super::*;
 
-    /// Returns the path of the actor this mailbox belongs to.
-    fn path(&self) -> &ActorPath;
+    #[test]
+    fn test_initial_state_allows_enqueue() {
+        let state = ScheduleState::default();
+        assert!(state.try_enqueue(), "first enqueue acquires the slot");
+    }
 
-    /// Returns the configured capacity of the mailbox.
-    fn capacity(&self) -> usize;
+    #[test]
+    fn test_second_enqueue_is_rejected_and_records_wake() {
+        let state = ScheduleState::default();
+        assert!(state.try_enqueue());
+        assert!(!state.try_enqueue(), "slot already held");
+        // The rejected attempt is recorded so the owner re-queues on release.
+        assert!(state.release(false), "pending wake forces re-queue");
+    }
 
-    /// Returns the current number of messages in the mailbox (snapshot in time).
-    /// 
-    /// This method should avoid blocking operations like tokio::runtime::Handle::current().block_on
-    /// to prevent deadlocks in nested runtime contexts.
-    async fn len(&self) -> usize;
+    #[test]
+    fn test_release_with_more_work_requeues_without_freeing() {
+        let state = ScheduleState::default();
+        assert!(state.try_enqueue());
+        // Worker still owns the slot; more messages present.
+        assert!(state.release(true));
+        // Slot was not freed: a concurrent enqueue attempt is still rejected.
+        assert!(!state.try_enqueue());
+    }
 
-    /// Closes this mailbox, preventing further messages from being added.
-    async fn close(&self);
-    
-    /// Set the processor for this mailbox
-    fn set_processor(&mut self, processor: Arc<Mutex<dyn ProcessorInterface>>);
-    
-    /// Get the processor for this mailbox
-    fn get_processor(&self) -> Option<Arc<Mutex<dyn ProcessorInterface>>>;
-    
-    /// Check if this mailbox has a processor
-    fn has_processor(&self) -> bool;
-} 
+    #[test]
+    fn test_release_without_work_frees_slot() {
+        let state = ScheduleState::default();
+        assert!(state.try_enqueue());
+        assert!(!state.release(false), "idle release frees the slot");
+        // Slot free again: the next enqueue succeeds.
+        assert!(state.try_enqueue());
+    }
 
+    #[test]
+    fn test_force_release_discards_everything() {
+        let state = ScheduleState::default();
+        assert!(state.try_enqueue());
+        assert!(!state.try_enqueue()); // record a pending wake
+        state.force_release();
+        assert!(state.try_enqueue(), "slot must be free after force release");
+        assert!(!state.release(false), "pending wake was discarded");
+    }
+
+    #[test]
+    fn test_pending_wake_cleared_after_handover() {
+        let state = ScheduleState::default();
+        assert!(state.try_enqueue());
+        assert!(!state.try_enqueue()); // pending wake recorded
+        assert!(state.release(false)); // handover: re-queue required
+        // The new queue entry keeps the slot held; releasing without work
+        // now frees it cleanly because no further wake was recorded.
+        assert!(!state.release(false));
+    }
+
+    #[test]
+    fn test_concurrent_enqueue_exactly_one_wins() {
+        let state = Arc::new(ScheduleState::default());
+        let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let s = state.clone();
+                let w = winners.clone();
+                std::thread::spawn(move || {
+                    if s.try_enqueue() {
+                        w.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(winners.load(Ordering::SeqCst), 1, "exactly one enqueue wins");
+    }
+}

@@ -25,15 +25,7 @@ mod worker_manager;
 
 // Re-exports
 pub use pool::SharedThreadPool;
-
-// Export types
 pub use pool::SharedThreadPoolConfig;
-
-// Import for SharedSystemRef trait
-use std::sync::Arc;
-use std::fmt;
-use anyhow::anyhow;
-
-use crate::thread::mailbox::Mailbox;
-use crate::thread::scheduler::BoxedActorFuture;
-use parrot_api::types::BoxedMessage;
+pub use pool::{SchedulerStatus, SchedulerMetrics};
+pub use worker::{Worker, WorkerConfig, WorkerStatus};
+pub use worker_manager::WorkerManager;

@@ -35,22 +35,3 @@ path = "examples/actor/simple.rs"
 name = "ping_pong"
 path = "examples/ping_pong.rs"
 
-[[bin]]
-name = "test_actor_basics"
-path = "tests/test_actor_basics.rs" 
-
-[[bin]]
-name = "test_actor_macro"
-path = "tests/test_actor_macro.rs"
-
-[[bin]]
-name = "test_async_message"
-path = "tests/test_async_message.rs"
-
-[[bin]]
-name = "test_sync_message"
-path = "tests/test_sync_message.rs"
-
-[[bin]]
-name = "test_system"
-path = "tests/test_system.rs" 

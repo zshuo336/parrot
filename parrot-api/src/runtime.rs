@@ -34,8 +34,9 @@
 //!         load_balancing: LoadBalancingStrategy::LeastLoaded,
 //!     },
 //! };
-//!
-//! let runtime = ActorRuntime::start(config).await?;
+//! // Pass `config` to your runtime implementation of choice, e.g.
+//! // `ActorRuntime::start(config).await?` inside an async context.
+//! # let _ = config;
 //! ```
 
 use std::time::Duration;

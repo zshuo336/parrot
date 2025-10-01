@@ -6,20 +6,25 @@
 //! # Usage
 //!
 //! ```rust
+//! use parrot_api::MessageDerive;
 //! use parrot_api::Message;
 //! use parrot_api::priority::{HIGH, LOW};
 //!
-//! #[derive(Message)]
+//! #[derive(MessageDerive)]
 //! #[message(priority = 70)] // use HIGH
 //! struct ImportantMessage {
 //!     content: String,
 //! }
 //!
-//! #[derive(Message)]
+//! #[derive(MessageDerive)]
 //! #[message(priority = 30)] // use LOW
 //! struct LowPriorityMessage {
 //!     content: String,
 //! }
+//!
+//! // The Message trait methods are now in scope via the derive.
+//! let m = ImportantMessage { content: "x".into() };
+//! assert!(m.validate().is_ok());
 //! ```
 
 /// Background priority (10)

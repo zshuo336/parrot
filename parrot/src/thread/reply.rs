@@ -29,4 +29,62 @@ impl ReplyChannel for ThreadReplyChannel {
 }
 
 // TODO: Need an ActixReplyChannel implementation if enabling interop,
-// potentially wrapping actix::prelude::Recipient<ReplyMessage> or similar. 
+// potentially wrapping actix::prelude::Recipient<ReplyMessage> or similar.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_send_reply_success() {
+        let (tx, rx) = oneshot::channel();
+        let channel = ThreadReplyChannel(tx);
+
+        Box::new(channel)
+            .send_reply(Ok(Box::new("ok") as BoxedMessage))
+            .await
+            .expect("send must succeed");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("reply arrives")
+            .expect("channel open");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_reply_error_payload() {
+        let (tx, rx) = oneshot::channel();
+        let channel = ThreadReplyChannel(tx);
+
+        Box::new(channel)
+            .send_reply(Err(ActorError::Timeout))
+            .await
+            .expect("send itself must succeed");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("reply arrives")
+            .expect("channel open");
+        assert!(matches!(result, Err(ActorError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn test_send_reply_to_dropped_receiver_errors() {
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        let channel = ThreadReplyChannel(tx);
+
+        let result = Box::new(channel)
+            .send_reply(Ok(Box::new(()) as BoxedMessage))
+            .await;
+        assert!(matches!(result, Err(ActorError::ReplyChannelError(_))));
+    }
+
+    #[test]
+    fn test_debug_formatting() {
+        let (tx, _rx) = oneshot::channel();
+        let repr = format!("{:?}", ThreadReplyChannel(tx));
+        assert!(repr.contains("ThreadReplyChannel"));
+    }
+} 

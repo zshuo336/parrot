@@ -30,8 +30,13 @@ where
     state: ActorState,
     /// Actor path for addressing
     path: ActorPath,
-    /// Set of actor paths that are watching this actor
-    watchers: Option<HashSet<ActorPath>>,
+    /// Set of watcher paths that are watching this actor
+    watchers: Option<HashSet<String>>,
+    /// Whether `Actor::init` has already run successfully. The state machine
+    /// stays in `Starting` until the `Start` control message arrives, so the
+    /// state alone cannot distinguish "not yet initialized" from
+    /// "initialized, awaiting start".
+    initialized: bool,
 }
 
 impl<A> ThreadActor<A> 
@@ -45,7 +50,13 @@ where
             state: ActorState::Starting,
             path,
             watchers: None,
+            initialized: false,
         }
+    }
+
+    /// Creates a ThreadActor for unit tests with a placeholder path.
+    pub fn new_for_test(actor: A) -> Self {
+        Self::new(actor, ActorPath::placeholder("test://actor"))
     }
     
     /// Gets the current state of the actor.
@@ -60,7 +71,7 @@ where
     
     /// Initialize the actor.
     pub async fn initialize<'a>(&'a mut self, ctx: &'a mut ThreadContext<A>) -> ActorResult<()> {
-        if self.state != ActorState::Starting {
+        if self.initialized || self.state != ActorState::Starting {
             return Err(ActorError::Other(anyhow!("Actor is already initialized")));
         }
 
@@ -69,7 +80,9 @@ where
         // current ctx is ThreadContext<A>, not type cast
         match self.inner.init(ctx).await {
             Ok(_) => {
-                // Transition to Running state is handled by process_message for Start message
+                // Mark initialized; the transition to Running is handled by
+                // process_message for the Start control message.
+                self.initialized = true;
                 Ok(())
             },
             Err(e) => {
@@ -81,7 +94,7 @@ where
     }
 
     /// Add an actor to the watchers list
-    pub fn add_watcher(&mut self, watcher_path: ActorPath) {
+    pub fn add_watcher(&mut self, watcher_path: String) {
         if self.watchers.is_none() {
             self.watchers = Some(HashSet::new());
         }
@@ -89,15 +102,16 @@ where
     }
 
     /// Remove an actor from the watchers list
-    pub fn remove_watcher(&mut self, watcher_path: &ActorPath) {
+    pub fn remove_watcher(&mut self, watcher_path: &str) {
         if let Some(watchers) = self.watchers.as_mut() {
             watchers.remove(watcher_path);
         }
     }
 
-    /// Get the watchers list
-    pub fn watchers(&self) -> &HashSet<ActorPath> {
-        self.watchers.as_ref().unwrap()
+    /// Get the watchers list (empty if none registered)
+    pub fn watchers(&self) -> &HashSet<String> {
+        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+        self.watchers.as_ref().unwrap_or_else(|| EMPTY.get_or_init(HashSet::new))
     }
     
     /// Process a message.
@@ -264,4 +278,304 @@ where
 }
 
 // Note: This is a stub implementation that will be expanded in future PRs
-// to include more actor lifecycle management, supervision, etc. 
+// to include more actor lifecycle management, supervision, etc.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::context::ThreadContext;
+    use parrot_api::actor::EmptyConfig;
+
+    /// Actor that records lifecycle callbacks.
+    #[derive(Debug, Default)]
+    struct LifecycleActor {
+        inits: u32,
+        messages: Vec<String>,
+        before_stop_called: bool,
+    }
+
+    impl Actor for LifecycleActor {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn init<'a>(
+            &'a mut self,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move {
+                self.inits += 1;
+                Ok(())
+            })
+        }
+
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                if let Some(s) = msg.downcast_ref::<String>() {
+                    self.messages.push(s.clone());
+                }
+                Ok(msg)
+            })
+        }
+
+        fn receive_message_with_engine<'a>(
+            &'a mut self,
+            _msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+            _engine_ctx: std::ptr::NonNull<dyn std::any::Any>,
+        ) -> Option<ActorResult<BoxedMessage>> {
+            None
+        }
+
+        fn before_stop<'a>(
+            &'a mut self,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move {
+                self.before_stop_called = true;
+                Ok(())
+            })
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+
+    fn make_actor() -> (ThreadActor<LifecycleActor>, ThreadContext<LifecycleActor>) {
+        (
+            ThreadActor::new_for_test(LifecycleActor::default()),
+            ThreadContext::new_for_test("test/thread-actor"),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_initialize_transitions_and_allows_start() {
+        let (mut actor, mut ctx) = make_actor();
+        assert_eq!(actor.state(), ActorState::Starting);
+
+        actor.initialize(&mut ctx).await.expect("init ok");
+        // Still Starting until the Start control message arrives.
+        assert_eq!(actor.state(), ActorState::Starting);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_twice_errors() {
+        let (mut actor, mut ctx) = make_actor();
+        actor.initialize(&mut ctx).await.unwrap();
+
+        let second = actor.initialize(&mut ctx).await;
+        assert!(second.is_err(), "double init must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_start_control_message_transitions_to_running() {
+        let (mut actor, mut ctx) = make_actor();
+        actor.initialize(&mut ctx).await.unwrap();
+
+        actor
+            .process_message(Box::new(ControlMessage::Start), &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(actor.state(), ActorState::Running);
+    }
+
+    #[tokio::test]
+    async fn test_regular_message_rejected_before_running() {
+        let (mut actor, mut ctx) = make_actor();
+        // Not started yet: regular messages must be rejected.
+        let result = actor
+            .process_message(Box::new(String::from("hi")), &mut ctx)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_regular_message_processed_when_running() {
+        let (mut actor, mut ctx) = make_actor();
+        actor.initialize(&mut ctx).await.unwrap();
+        actor
+            .process_message(Box::new(ControlMessage::Start), &mut ctx)
+            .await
+            .unwrap();
+
+        let reply = actor
+            .process_message(Box::new(String::from("hello")), &mut ctx)
+            .await
+            .unwrap();
+        let echoed = reply.downcast::<String>().expect("echo is String");
+        assert_eq!(*echoed, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_stop_control_message_shuts_down_and_calls_before_stop() {
+        let (mut actor, mut ctx) = make_actor();
+        actor.initialize(&mut ctx).await.unwrap();
+        actor
+            .process_message(Box::new(ControlMessage::Start), &mut ctx)
+            .await
+            .unwrap();
+
+        actor
+            .process_message(Box::new(ControlMessage::Stop), &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(actor.state(), ActorState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_is_idempotent() {
+        let (mut actor, mut ctx) = make_actor();
+        actor.shutdown(&mut ctx).await.unwrap();
+        // Second shutdown is a no-op.
+        actor.shutdown(&mut ctx).await.unwrap();
+        assert_eq!(actor.state(), ActorState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_returns_state() {
+        let (mut actor, mut ctx) = make_actor();
+        actor.initialize(&mut ctx).await.unwrap();
+        actor
+            .process_message(Box::new(ControlMessage::Start), &mut ctx)
+            .await
+            .unwrap();
+
+        let reply = actor
+            .process_message(Box::new(ControlMessage::HealthCheck), &mut ctx)
+            .await
+            .unwrap();
+        let state = reply.downcast::<ActorState>().expect("state payload");
+        assert_eq!(*state, ActorState::Running);
+    }
+
+    #[tokio::test]
+    async fn test_watch_request_registers_watcher() {
+        let (mut actor, mut ctx) = make_actor();
+        actor.initialize(&mut ctx).await.unwrap();
+        actor
+            .process_message(Box::new(ControlMessage::Start), &mut ctx)
+            .await
+            .unwrap();
+
+        actor
+            .process_message(
+                Box::new(crate::thread::system::WatchRequest {
+                    watcher_path: "/user/watcher".into(),
+                }),
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(actor.watchers().contains("/user/watcher"));
+
+        // Unwatch removes it again.
+        actor
+            .process_message(
+                Box::new(crate::thread::system::UnwatchRequest {
+                    watcher_path: "/user/watcher".into(),
+                }),
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!actor.watchers().contains("/user/watcher"));
+    }
+
+    #[tokio::test]
+    async fn test_watchers_empty_by_default() {
+        let (actor, _ctx) = make_actor();
+        assert!(actor.watchers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ask_envelope_replies_through_channel() {
+        let (mut actor, mut ctx) = make_actor();
+        actor.initialize(&mut ctx).await.unwrap();
+        actor
+            .process_message(Box::new(ControlMessage::Start), &mut ctx)
+            .await
+            .unwrap();
+
+        let (envelope, rx) = AskEnvelope::new(Box::new(String::from("ping")));
+        let reply = actor
+            .process_message(Box::new(envelope), &mut ctx)
+            .await
+            .unwrap();
+
+        // The actor consumes the envelope and returns unit; the actual reply
+        // arrives on the oneshot channel.
+        let _ = reply.downcast::<()>().expect("unit ack");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("ask reply arrives")
+            .expect("channel open");
+        let payload = response.expect("Ok reply");
+        assert_eq!(*payload.downcast::<String>().unwrap(), "ping");
+    }
+
+    #[tokio::test]
+    async fn test_ask_envelope_rejected_when_not_running() {
+        let (mut actor, mut ctx) = make_actor();
+        let (envelope, rx) = AskEnvelope::new(Box::new(String::from("ping")));
+
+        let result = actor
+            .process_message(Box::new(envelope), &mut ctx)
+            .await;
+        assert!(result.is_err(), "ask before running must fail");
+
+        // Dropping rx here must not panic.
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn test_failed_init_marks_actor_stopped() {
+        #[derive(Debug, Default)]
+        struct FailingActor;
+
+        impl Actor for FailingActor {
+            type Config = EmptyConfig;
+            type Context = ThreadContext<Self>;
+
+            fn init<'a>(
+                &'a mut self,
+                _ctx: &'a mut Self::Context,
+            ) -> BoxedFuture<'a, ActorResult<()>> {
+                Box::pin(async { Err(ActorError::MessageHandlingError("init boom".into())) })
+            }
+
+            fn receive_message<'a>(
+                &'a mut self,
+                msg: BoxedMessage,
+                _ctx: &'a mut Self::Context,
+            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+                Box::pin(async move { Ok(msg) })
+            }
+
+            fn receive_message_with_engine<'a>(
+                &'a mut self,
+                _msg: BoxedMessage,
+                _ctx: &'a mut Self::Context,
+                _engine_ctx: std::ptr::NonNull<dyn std::any::Any>,
+            ) -> Option<ActorResult<BoxedMessage>> {
+                None
+            }
+
+            fn state(&self) -> ActorState {
+                ActorState::Running
+            }
+        }
+
+        let (mut actor, mut ctx) = (
+            ThreadActor::new_for_test(FailingActor),
+            ThreadContext::new_for_test("test/failing"),
+        );
+        let result = actor.initialize(&mut ctx).await;
+        assert!(result.is_err());
+        assert_eq!(actor.state(), ActorState::Stopped);
+    }
+} 

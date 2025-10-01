@@ -21,26 +21,34 @@
 //! 4. Implement message handling logic
 //!
 //! ```rust
-//! use parrot_api::actor::{Actor, ActorState};
-//! use parrot_api::context::ActorContext;
+//! use parrot_api::actor::{Actor, ActorState, EmptyConfig};
+//! use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
+//! use std::any::Any;
 //!
 //! struct MyActor {
-//!     state: ActorState,
 //!     counter: u64,
 //! }
 //!
 //! impl Actor for MyActor {
-//!     type Config = ();
-//!     type Context = ActorContext;
+//!     type Config = EmptyConfig;
+//!     type Context = dyn parrot_api::context::ActorContext;
 //!
-//!     async fn receive_message(&mut self, msg: BoxedMessage, ctx: &mut Self::Context) 
-//!         -> ActorResult<BoxedMessage> {
+//!     fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+//!         Box::pin(async { Ok(()) })
+//!     }
+//!
+//!     fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context)
+//!         -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
 //!         // Handle messages here
-//!         Ok(msg)
+//!         Box::pin(async move { Ok(msg) })
+//!     }
+//!
+//!     fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: std::ptr::NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+//!         None
 //!     }
 //!
 //!     fn state(&self) -> ActorState {
-//!         self.state
+//!         ActorState::Running
 //!     }
 //! }
 //! ```

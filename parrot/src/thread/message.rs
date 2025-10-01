@@ -28,3 +28,46 @@ pub fn make_cloneable<T: 'static + Clone + Send>(value: T) -> BoxedMessage {
     Box::new(value)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clone_box_clones_cloneable_payload() {
+        let msg = make_cloneable(String::from("hello"));
+        let cloned = msg.downcast_ref::<String>().unwrap().clone_box();
+        let inner = cloned.downcast::<String>().expect("cloned is String");
+        assert_eq!(*inner, "hello");
+    }
+
+    #[test]
+    fn test_clone_box_works_for_custom_types() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Payload {
+            id: u64,
+            items: Vec<u32>,
+        }
+
+        let payload = Payload {
+            id: 7,
+            items: vec![1, 2, 3],
+        };
+        let msg = make_cloneable(payload);
+        let cloned = msg.downcast_ref::<Payload>().unwrap().clone_box();
+        let inner = cloned.downcast::<Payload>().expect("cloned is Payload");
+        assert_eq!(*inner, Payload {
+            id: 7,
+            items: vec![1, 2, 3],
+        });
+    }
+
+    #[test]
+    fn test_non_cloneable_dispatch() {
+        // A non-Clone payload simply has no CloneableMessage impl; using
+        // make_cloneable requires Clone at compile time, so this test checks
+        // that plain boxed messages of Clone types still downcast correctly.
+        let msg: BoxedMessage = Box::new(42u64);
+        assert_eq!(*msg.downcast_ref::<u64>().unwrap(), 42u64);
+    }
+}
+

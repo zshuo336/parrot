@@ -22,19 +22,19 @@
 //! ## Usage Example
 //!
 //! ```rust
-//! use parrot_api::message::{Message, MessageEnvelope, MessageOptions};
+//! use parrot_api::message::{Message, MessageEnvelope, MessageOptions, MessagePriority};
 //! use std::time::Duration;
 //!
 //! // Define a message type
-//! #[derive(Message)]
 //! struct GreetingMsg {
 //!     name: String,
 //! }
+//! impl Message for GreetingMsg { type Result = (); }
 //!
 //! // Create a message with options
 //! let options = MessageOptions {
 //!     timeout: Some(Duration::from_secs(5)),
-//!     priority: MessagePriority::High,
+//!     priority: MessagePriority::new(70).expect("valid priority"),
 //!     ..Default::default()
 //! };
 //!
@@ -217,13 +217,16 @@ pub trait Message: Send + 'static {
     ///
     /// # Example
     /// ```
+    /// use parrot_api::message::Message;
     /// struct MyMessage {}
     /// impl Message for MyMessage {
     ///     type Result = ();
     /// }
     /// 
     /// let msg = MyMessage {};
-    /// assert_eq!(msg.message_type(), "MyMessage");
+    /// // Note: message_type returns std::any::type_name, which includes the
+    /// // defining module path (e.g. "rust_out::MyMessage" in doctests).
+    /// assert!(msg.message_type().ends_with("MyMessage"));
     /// ```
     fn message_type(&self) -> &'static str {
         std::any::type_name::<Self>()
@@ -238,6 +241,7 @@ pub trait Message: Send + 'static {
     ///
     /// # Example
     /// ```
+    /// use parrot_api::message::{Message, MessagePriority};
     /// struct MyMessage {}
     /// impl Message for MyMessage {
     ///     type Result = ();
@@ -273,6 +277,7 @@ pub trait Message: Send + 'static {
     ///
     /// # Example
     /// ```
+    /// use parrot_api::message::Message;
     /// struct MyMessage {}
     /// impl Message for MyMessage {
     ///     type Result = ();
@@ -441,13 +446,13 @@ enum MessageContainer {
 /// 
 /// # Returns
 /// exclusive example:
-/// ```
+/// ```ignore
 /// let container = MessageContainer::Exclusive(Box::new(Message1));
 /// let boxed_message = container.into(); // return type is Box<dyn Any + Send>
 /// actor.send(boxed_message);
 /// ```
 /// shared example:
-/// ```
+/// ```ignore
 /// let container = MessageContainer::Shared(Arc::new(Message1));
 /// let boxed_message = container.into(); // return type is Box<Arc<dyn Any + Send + Sync>>
 /// actor.send(boxed_message);

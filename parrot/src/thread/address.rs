@@ -1,298 +1,240 @@
-use std::sync::{Arc, Weak};
+//! Typed actor reference for the thread-based actor system.
+
+use std::any::Any;
+use std::marker::PhantomData;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+
 use async_trait::async_trait;
-use tokio::sync::oneshot;
-use tokio::time::timeout;
-use anyhow::Error as AnyhowError;
 
 use parrot_api::address::{ActorPath, ActorRef};
 use parrot_api::errors::ActorError;
-use parrot_api::types::{BoxedActorRef, BoxedMessage, ActorResult, BoxedFuture};
-use crate::thread::error::MailboxError;
-use crate::thread::mailbox::Mailbox;
-use crate::thread::reply::ThreadReplyChannel;
-use crate::thread::envelope::AskEnvelope;
-use crate::thread::config::BackpressureStrategy;
-use crate::thread::scheduler::WeakSchedulerRef;
-use std::any::Any;
-use crate::thread::scheduler::ThreadScheduler;
-use parrot_api::actor::Actor;
-use crate::thread::context::ThreadContext;
-use std::marker::PhantomData;
-/// Type alias for weak reference to a Mailbox
-pub type WeakMailboxRef = Weak<dyn Mailbox + Send + Sync>;
-/// Type alias for strong reference to a Mailbox
-pub type StrongMailboxRef = Arc<dyn Mailbox + Send + Sync>;
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 
-/// Actor reference implementation for the thread-based actor system.
-/// 
-/// Provides methods to send messages to and interact with actors. Uses weak references
-/// to mailboxes to prevent circular dependencies and support lifetime management.
-#[derive(Debug)]
+use crate::thread::config::BackpressureStrategy;
+use crate::thread::envelope::AskEnvelope;
+use crate::thread::mailbox::{Mailbox, WeakMailboxRef};
+use crate::thread::scheduler::ThreadScheduler;
+
+/// A typed reference to an actor running on the thread engine.
+///
+/// Holds only a *weak* reference to the actor's mailbox so the reference
+/// never keeps a stopped actor's mailbox alive. The weak pointer sits in an
+/// `Arc<Mutex<..>>` so it can be installed after construction (the mailbox
+/// is created after the ref during spawn) while the ref itself is shared
+/// through `Arc`.
+///
+/// `send` performs a tell (fire-and-forget) while `ask` performs a
+/// request-response round trip using an oneshot channel embedded in an
+/// [`AskEnvelope`].
 pub struct ThreadActorRef<A>
-    where A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
- {
-    /// The path that uniquely identifies this actor
-    path: ActorPath,
-    /// Weak reference to the actor's mailbox to avoid circular references
-    mailbox: WeakMailboxRef,
-    /// Default backpressure strategy to use when sending messages
+where
+    A: parrot_api::actor::Actor<Context = crate::thread::context::ThreadContext<A>>
+        + Send
+        + Sync
+        + 'static,
+{
+    /// Actor path (string copy; mailbox holds the full ActorPath)
+    path: String,
+
+    /// Weak reference to the actor's mailbox (interior mutability for late install)
+    mailbox: Arc<Mutex<WeakMailboxRef>>,
+
+    /// Default backpressure strategy for sends
     default_strategy: BackpressureStrategy,
-    /// Default timeout for ask operations
+
+    /// Default timeout for asks
     default_timeout: Duration,
-    scheduler: WeakSchedulerRef,
-    _marker: PhantomData<A>,
+
+    /// Optional typed scheduler handle (kept for engine-specific operations)
+    scheduler: Option<Arc<dyn ThreadScheduler>>,
+
+    /// Marker for the actor type
+    _marker: PhantomData<fn() -> A>,
 }
 
 impl<A> ThreadActorRef<A>
-    where A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
- {
-    /// Creates a new ThreadActorRef.
-    ///
-    /// # Parameters
-    /// * `path` - The actor path
-    /// * `mailbox` - Weak reference to the actor's mailbox
-    /// * `default_strategy` - Default backpressure strategy to use
-    /// * `default_timeout` - Default timeout for ask operations
+where
+    A: parrot_api::actor::Actor<Context = crate::thread::context::ThreadContext<A>>
+        + Send
+        + Sync
+        + 'static,
+{
+    /// Create a new typed actor reference.
     pub fn new(
         path: ActorPath,
         mailbox: WeakMailboxRef,
         default_strategy: BackpressureStrategy,
         default_timeout: Duration,
-        scheduler: Option<WeakSchedulerRef>,
+        scheduler: Option<Arc<dyn ThreadScheduler>>,
     ) -> Self {
         Self {
-            path,
-            mailbox,
+            path: path.path,
+            mailbox: Arc::new(Mutex::new(mailbox)),
             default_strategy,
             default_timeout,
-            scheduler: scheduler.unwrap_or_else(|| Weak::new()),
+            scheduler,
             _marker: PhantomData,
         }
     }
 
-    /// Tries to upgrade the weak mailbox reference to a strong reference.
+    /// Get the actor path string.
+    pub fn actor_path(&self) -> &str {
+        &self.path
+    }
+
+    /// Get the default ask timeout.
+    pub fn default_timeout(&self) -> Duration {
+        self.default_timeout
+    }
+
+    /// Get the default backpressure strategy.
+    pub fn default_strategy(&self) -> &BackpressureStrategy {
+        &self.default_strategy
+    }
+
+    /// Set (or fix up) the weak mailbox reference.
     ///
-    /// Returns an error if the mailbox no longer exists (actor is dead).
-    fn mailbox(&self) -> Result<StrongMailboxRef, ActorError> {
-        self.mailbox.upgrade()
-            .ok_or_else(|| {
-                let err: ActorError = AnyhowError::msg(format!(
-                    "Actor reference is dead (target: {:?})",
-                    self.path
-                )).into();
-                err
-            })
+    /// Used during spawn: the ref is created before the mailbox, then the
+    /// mailbox pointer is installed once the mailbox exists.
+    pub fn set_mailbox(&self, mailbox: WeakMailboxRef) {
+        *self.mailbox.lock().unwrap() = mailbox;
     }
 
-    #[inline]
-    async fn push_to_mailbox(&self, msg: BoxedMessage, strategy: BackpressureStrategy) -> Result<(), ActorError> {
-        let mailbox = self.mailbox()?;
-        mailbox.push(msg, strategy).await.map_err(|e| {
-            let err: ActorError = AnyhowError::msg(format!(
-                "Mailbox error for actor {:?}: {}",
-                self.path, e
-            )).into();
-            err
-        })
+    /// Read the current weak mailbox reference.
+    fn weak_mailbox(&self) -> WeakMailboxRef {
+        self.mailbox.lock().unwrap().clone()
     }
 
-    #[inline]
-    async fn schedule_actor(&self) -> Result<(), ActorError> {
-        let mailbox = self.mailbox()?;
-        let scheduler = self.scheduler.upgrade();
-        if let Some(scheduler) = scheduler {
-            scheduler.dedicated_scheduler.schedule::<A>(&self.path.path, mailbox, None).await.unwrap();
-        }
-        Ok(())
+    /// Upgrade the weak mailbox reference, mapping failure to an ActorError.
+    fn mailbox(&self) -> ActorResult<Arc<dyn Mailbox + Send + Sync>> {
+        self.weak_mailbox()
+            .upgrade()
+            .ok_or_else(|| ActorError::InternalError(format!("Actor at {} is stopped (mailbox dropped)", self.path)))
     }
 
-    #[inline]
-    async fn push_and_schedule(&self, msg: BoxedMessage, strategy: BackpressureStrategy) -> Result<(), ActorError> {
-        self.push_to_mailbox(msg, strategy).await?;
-        self.schedule_actor().await?;
-        Ok(())
-    }
-
-    /// Sends a message to the actor using the specified backpressure strategy.
-    ///
-    /// # Parameters
-    /// * `msg` - The message to send
-    /// * `strategy` - The backpressure strategy to use
-    ///
-    /// # Returns
-    /// * `Ok(())` - The message was successfully sent
-    /// * `Err(...)` - An error occurred (mailbox full, closed, etc.)
+    /// Send a message with an explicit backpressure strategy (tell semantics).
     pub async fn send_with_strategy(
         &self,
         msg: BoxedMessage,
         strategy: BackpressureStrategy,
-    ) -> ActorResult<BoxedMessage> {
-        self.push_and_schedule(msg, strategy).await?;
-        Ok(Box::new(()))
+    ) -> ActorResult<()> {
+        let mailbox = self.mailbox()?;
+        mailbox
+            .push(msg, strategy)
+            .await
+            .map_err(|e| ActorError::InternalError(format!("Failed to enqueue message for {}: {:?}", self.path, e)))
     }
 
-    pub async fn send_with_timeout(
-        &self,
-        msg: BoxedMessage,
-        timeout_duration: Duration,
-    ) -> ActorResult<BoxedMessage> {        
-        // Use timeout to wrap the mailbox push operation
-        match timeout(timeout_duration, async {
-            self.push_and_schedule(msg, self.default_strategy.clone()).await?;
-            Ok::<(), ActorError>(())
-        }).await {
-            Ok(result) => {
-                result?;
-                Ok(Box::new(()))
-            },
-            Err(_) => {
-                let err: ActorError = AnyhowError::msg(format!(
-                    "Send timed out after {:?} for actor {}",
-                    timeout_duration, self.path
-                )).into();
-                Err(err)
-            }
-        }
+    /// Send a message with the default backpressure strategy (tell semantics).
+    pub async fn send_msg(&self, msg: BoxedMessage) -> ActorResult<()> {
+        self.send_with_strategy(msg, self.default_strategy.clone()).await
     }
 
-    /// Sends a message to the actor and expects a reply, with custom strategy and timeout.
+    /// Ask with explicit strategy and timeout (request-response semantics).
     ///
-    /// # Parameters
-    /// * `msg` - The message to send
-    /// * `strategy` - The backpressure strategy to use
-    /// * `timeout_duration` - How long to wait for a reply
-    ///
-    /// # Returns
-    /// * `Ok(reply)` - The reply from the actor
-    /// * `Err(...)` - An error occurred (timeout, mailbox error, etc.)
+    /// Wraps the message in an [`AskEnvelope`] carrying a oneshot reply
+    /// channel. The actor processor completes the channel with the actor's
+    /// response; the ask future resolves with it, or times out.
     pub async fn ask_with_strategy_and_timeout(
         &self,
         msg: BoxedMessage,
         strategy: BackpressureStrategy,
         timeout_duration: Duration,
     ) -> ActorResult<BoxedMessage> {
-        // Create oneshot channel for reply
-        let (tx, rx) = oneshot::channel();
-        
-        // Create reply channel and envelope
-        let reply_channel = Box::new(ThreadReplyChannel(tx));
-        let envelope = AskEnvelope {
-            payload: msg,
-            reply: reply_channel,
-        };
-        
-        // Send the envelope as a message
         let mailbox = self.mailbox()?;
-        mailbox.push(Box::new(envelope), strategy).await.map_err(|e| {
-            let err: ActorError = AnyhowError::msg(format!(
-                "Mailbox error for actor {:?}: {}",
-                self.path, e
-            )).into();
-            err
-        })?;
-        
-        // Wait for reply with timeout
-        match timeout(timeout_duration, rx).await {
-            Ok(reply_result) => {
-                match reply_result {
-                    Ok(reply) => reply,
-                    Err(_) => {
-                        let err: ActorError = AnyhowError::msg(format!(
-                            "Reply channel closed for ask to {:?}",
-                            self.path
-                        )).into();
-                        Err(err)
-                    },
-                }
-            },
-            Err(_) => {
-                let err: ActorError = AnyhowError::msg(format!(
-                    "Request to actor {:?} timed out after {}ms",
-                    self.path, timeout_duration.as_millis()
-                )).into();
-                Err(err)
-            },
+
+        let (envelope, reply_rx) = AskEnvelope::new(msg);
+        let envelope = Box::new(envelope) as BoxedMessage;
+
+        mailbox
+            .push(envelope, strategy)
+            .await
+            .map_err(|e| ActorError::InternalError(format!("Failed to enqueue ask for {}: {:?}", self.path, e)))?;
+
+        match tokio::time::timeout(timeout_duration, reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ActorError::ReplyChannelError(format!(
+                "Reply channel closed for ask to {}",
+                self.path
+            ))),
+            Err(_) => Err(ActorError::TimeoutDetail(format!(
+                "Request to actor {} timed out after {}ms",
+                self.path,
+                timeout_duration.as_millis()
+            ))),
         }
     }
 
-    /// Sends a request to the actor and expects a reply, using default strategy and timeout.
+    /// Ask with default strategy and timeout.
     pub async fn ask(&self, msg: BoxedMessage) -> ActorResult<BoxedMessage> {
-        self.ask_with_strategy_and_timeout(
-            msg,
-            self.default_strategy.clone(),
-            self.default_timeout,
-        ).await
+        self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), self.default_timeout)
+            .await
     }
 
-    /// Sends a request to the actor with a custom timeout, using default strategy.
+    /// Ask with custom timeout (default strategy).
     pub async fn ask_with_timeout(
         &self,
         msg: BoxedMessage,
         timeout_duration: Duration,
     ) -> ActorResult<BoxedMessage> {
-        self.ask_with_strategy_and_timeout(
-            msg,
-            self.default_strategy.clone(),
-            timeout_duration,
-        ).await
+        self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), timeout_duration)
+            .await
     }
 }
 
 #[async_trait]
 impl<A> ActorRef for ThreadActorRef<A>
-    where A: Actor<Context = ThreadContext<A>> + Send + Sync + std::fmt::Debug + 'static,
- {
+where
+    A: parrot_api::actor::Actor<Context = crate::thread::context::ThreadContext<A>>
+        + Send
+        + Sync
+        + 'static,
+{
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            self.send_with_strategy(msg, self.default_strategy.clone()).await
+            self.send_with_strategy(msg, self.default_strategy.clone()).await?;
+            Ok(Box::new(()) as BoxedMessage)
         })
     }
-    
-    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        if let Some(duration) = timeout_duration {
-            Box::pin(async move {
-                self.send_with_timeout(msg, duration).await
-            })
-        } else {
-            Box::pin(async move {
-                self.send_with_strategy(msg, self.default_strategy.clone()).await
-            })
-        }
+
+    fn send_with_timeout<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        timeout_duration: Option<Duration>,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            match timeout_duration {
+                Some(duration) => {
+                    self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), duration)
+                        .await
+                }
+                None => {
+                    self.send_with_strategy(msg, self.default_strategy.clone()).await?;
+                    Ok(Box::new(()) as BoxedMessage)
+                }
+            }
+        })
     }
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
-            // Get mailbox reference
             let mailbox = self.mailbox()?;
-            
-            // Close the mailbox
             mailbox.close().await;
-            
-            // Return success
-            Ok::<(), ActorError>(())
+            Ok(())
         })
     }
-    
+
     fn path(&self) -> String {
-        self.path.path.clone()
+        self.path.clone()
     }
-    
+
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-        Box::pin(async move {
-            self.mailbox.upgrade().is_some()
-        })
+        Box::pin(async move { self.weak_mailbox().upgrade().is_some() })
     }
-    
+
     fn clone_boxed(&self) -> BoxedActorRef {
-        Box::new(Self {
-            path: self.path.clone(),
-            mailbox: self.mailbox.clone(),
-            default_strategy: self.default_strategy.clone(),
-            default_timeout: self.default_timeout,
-            scheduler: self.scheduler.clone(),
-            _marker: PhantomData,
-        })
+        Box::new(self.clone())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -301,8 +243,12 @@ impl<A> ActorRef for ThreadActorRef<A>
 }
 
 impl<A> Clone for ThreadActorRef<A>
-    where A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
- {
+where
+    A: parrot_api::actor::Actor<Context = crate::thread::context::ThreadContext<A>>
+        + Send
+        + Sync
+        + 'static,
+{
     fn clone(&self) -> Self {
         Self {
             path: self.path.clone(),
@@ -315,27 +261,38 @@ impl<A> Clone for ThreadActorRef<A>
     }
 }
 
+impl<A> std::fmt::Debug for ThreadActorRef<A>
+where
+    A: parrot_api::actor::Actor<Context = crate::thread::context::ThreadContext<A>>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadActorRef")
+            .field("path", &self.path)
+            .field("alive", &self.weak_mailbox().upgrade().is_some())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::thread::mailbox::mpsc::MpscMailbox;
-    use parrot_api::address::ActorPath;
-    use std::time::Duration;
-    use crate::thread::scheduler::ThreadScheduler;
     use parrot_api::actor::EmptyConfig;
-    
-    // Helper function to create a test mailbox
-    fn create_test_mailbox() -> (Arc<dyn Mailbox + Send + Sync>, ActorPath) {
-        // create a mock actor ref to replace ()
+    use crate::thread::context::ThreadContext;
+
+    fn create_test_mailbox() -> (Arc<MpscMailbox>, ActorPath) {
         #[derive(Debug)]
         struct MockActorRef;
-        
+
         #[async_trait]
         impl ActorRef for MockActorRef {
             fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
             }
-            
+
             fn send_with_timeout<'a>(&'a self, _msg: BoxedMessage, _timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
             }
@@ -343,15 +300,15 @@ mod tests {
             fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
                 Box::pin(async { Ok(()) })
             }
-            
+
             fn path(&self) -> String {
                 "mock-actor".to_string()
             }
-            
+
             fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
                 Box::pin(async { true })
             }
-            
+
             fn clone_boxed(&self) -> BoxedActorRef {
                 Box::new(Self)
             }
@@ -360,40 +317,39 @@ mod tests {
                 self
             }
         }
-        
+
         let path = ActorPath {
             path: "test-actor".to_string(),
-            target: Arc::new(MockActorRef) as Arc<dyn ActorRef + 'static>,
+            target: Arc::new(MockActorRef) as parrot_api::types::WeakActorTarget,
         };
         let mailbox = Arc::new(MpscMailbox::new(10, path.clone()));
         (mailbox, path)
     }
 
-    // 添加此结构体作为测试用的Actor
     #[derive(Debug)]
     struct TestActor;
-    
-    impl Actor for TestActor {
+
+    impl parrot_api::actor::Actor for TestActor {
         type Config = EmptyConfig;
         type Context = ThreadContext<Self>;
-        
+
         fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async { Ok(()) })
         }
-        
+
         fn receive_message<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async { Ok(Box::new(()) as Box<dyn Any + Send>) })
         }
-        
+
         fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: std::ptr::NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
             None
         }
-        
+
         fn state(&self) -> parrot_api::actor::ActorState {
             parrot_api::actor::ActorState::Running
         }
     }
-    
+
     #[tokio::test]
     async fn test_send_message() {
         let (mailbox, path) = create_test_mailbox();
@@ -405,17 +361,12 @@ mod tests {
             None,
         );
 
-        // Send a simple message
         let message = Box::new("Hello, actor!") as BoxedMessage;
         let result = actor_ref.send(message).await;
         assert!(result.is_ok());
 
-        // Verify message was received
         let received = mailbox.pop().await;
         assert!(received.is_some());
-
-        // Note: In a real test, you'd check the message content
-        // but that requires downcast which we'll simplify here
     }
 
     #[tokio::test]
@@ -429,16 +380,92 @@ mod tests {
             None,
         );
 
-        // Drop the mailbox to simulate a dead actor
         drop(mailbox);
 
-        // Try to send a message
         let message = Box::new("This should fail") as BoxedMessage;
         let result = actor_ref.send(message).await;
-        
-        // Verify it failed with error
         assert!(result.is_err());
     }
 
-    // Additional tests for ask, timeout, etc. would be added here
-} 
+    #[tokio::test]
+    async fn test_ask_times_out_when_no_processor() {
+        let (mailbox, path) = create_test_mailbox();
+        let actor_ref = ThreadActorRef::<TestActor>::new(
+            path,
+            Arc::downgrade(&mailbox) as WeakMailboxRef,
+            BackpressureStrategy::Block,
+            Duration::from_millis(50),
+            None,
+        );
+
+        // No processor is attached, so the ask envelope is never answered.
+        let message = Box::new("ping") as BoxedMessage;
+        let result = actor_ref.ask(message).await;
+        assert!(matches!(result, Err(ActorError::TimeoutDetail(_))));
+    }
+
+    #[tokio::test]
+    async fn test_ask_receives_reply_from_envelope() {
+        use crate::thread::envelope::AskEnvelope;
+
+        let (mailbox, path) = create_test_mailbox();
+        let actor_ref = ThreadActorRef::<TestActor>::new(
+            path,
+            Arc::downgrade(&mailbox) as WeakMailboxRef,
+            BackpressureStrategy::Block,
+            Duration::from_secs(1),
+            None,
+        );
+
+        // Simulate a processor answering the envelope.
+        let answerer = tokio::spawn(async move {
+            let env = mailbox.pop().await.expect("envelope queued");
+            let envelope = *env.downcast::<AskEnvelope>().expect("is AskEnvelope");
+            envelope.reply_success(Box::new("pong") as BoxedMessage).await;
+        });
+
+        let message = Box::new("ping") as BoxedMessage;
+        let result = actor_ref.ask(message).await;
+        assert!(result.is_ok());
+        let payload = result.unwrap();
+        assert_eq!(*payload.downcast::<&str>().unwrap(), "pong");
+
+        answerer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stop_closes_mailbox() {
+        let (mailbox, path) = create_test_mailbox();
+        let actor_ref = ThreadActorRef::<TestActor>::new(
+            path,
+            Arc::downgrade(&mailbox) as WeakMailboxRef,
+            BackpressureStrategy::Block,
+            Duration::from_secs(1),
+            None,
+        );
+
+        actor_ref.stop().await.unwrap();
+        assert!(mailbox.is_closed().await);
+    }
+
+    #[tokio::test]
+    async fn test_set_mailbox_late_install() {
+        let (mailbox, path) = create_test_mailbox();
+        let actor_ref = ThreadActorRef::<TestActor>::new(
+            path,
+            Weak::<MpscMailbox>::new() as WeakMailboxRef,
+            BackpressureStrategy::Block,
+            Duration::from_secs(1),
+            None,
+        );
+
+        // Initially dead
+        assert!(!actor_ref.is_alive().await);
+        assert!(actor_ref.send(Box::new("x") as BoxedMessage).await.is_err());
+
+        // Install the mailbox afterwards
+        actor_ref.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
+        assert!(actor_ref.is_alive().await);
+        assert!(actor_ref.send(Box::new("x") as BoxedMessage).await.is_ok());
+    }
+}
