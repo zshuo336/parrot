@@ -102,20 +102,21 @@ pub fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// 
 /// ## 1. Custom Return Type
 /// ```rust
-/// # use parrot_api::Message;
-/// #[derive(Message)]
+/// # use parrot_api::{Message, MessageDerive};
+/// #[derive(MessageDerive)]
 /// #[message(result = "Option<UserProfile>")]
 /// struct GetUserProfile {
 ///     user_id: String,
 /// }
+/// # struct UserProfile;
 /// ```
 /// 
 /// ## 2. Validation Rules
 /// ```rust
-/// # use parrot_api::Message;
-/// #[derive(Message)]
+/// # use parrot_api::{Message, MessageDerive};
+/// #[derive(MessageDerive)]
 /// #[message(
-///     validate = "amount > 0.0 && items.len() > 0",
+///     validate = "self.amount > 0.0 && self.items.len() > 0",
 ///     result = "OrderResult"
 /// )]
 /// struct CreateOrder {
@@ -123,13 +124,14 @@ pub fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 ///     amount: f64,
 ///     items: Vec<String>,
 /// }
+/// # struct OrderResult;
 /// ```
 /// 
 /// ## 3. Message Priority
 /// ```rust
-/// # use parrot_api::Message;
+/// # use parrot_api::{Message, MessageDerive};
 /// // Using a named priority
-/// #[derive(Message)]
+/// #[derive(MessageDerive)]
 /// #[message(priority = "HIGH")]  // Sets message processing priority to HIGH (70)
 /// struct EmergencyAlert {
 ///     alert_type: String,
@@ -137,7 +139,7 @@ pub fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// }
 /// 
 /// // Using a numeric priority (0-100)
-/// #[derive(Message)]
+/// #[derive(MessageDerive)]
 /// #[message(priority = 75)]  // Sets custom priority level
 /// struct CustomPriorityAlert {
 ///     alert_type: String,
@@ -156,11 +158,11 @@ pub fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// 
 /// ## 4. Complete Example
 /// ```rust
-/// # use parrot_api::Message;
-/// #[derive(Message)]
+/// # use parrot_api::{Message, MessageDerive};
+/// #[derive(MessageDerive)]
 /// #[message(
 ///     result = "Vec<Order>",           // Custom return type
-///     validate = "amount > 0.0",      // Add validation
+///     validate = "self.amount > 0.0",      // Add validation
 ///     priority = "HIGH"               // Set priority
 /// )]
 /// struct CreateOrder {
@@ -168,6 +170,7 @@ pub fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 ///     amount: f64,
 ///     items: Vec<String>,
 /// }
+/// # #[derive(Clone)] struct Order;
 /// 
 /// // Usage example:
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -181,10 +184,10 @@ pub fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// let order = CreateOrder::new(order)?;
 /// 
 /// // Get message type
-/// assert_eq!(order.message_type(), "CreateOrder");
+/// assert!(order.message_type().ends_with("CreateOrder"));
 /// 
 /// // Convert to envelope
-/// let envelope = order.into_envelope();
+/// let _envelope = order.into_envelope();
 /// # Ok(())
 /// # }
 /// ```
@@ -265,14 +268,17 @@ pub fn derive_message_impl(input: TokenStream) -> TokenStream {
     };
 
     // Generate validation code
+    // NOTE: the validation expression is evaluated inside `fn validate(&self)`,
+    // so field accesses must be qualified with `self.` (e.g. `self.amount > 0.0`).
     let validate_impl = if let Some(validate_expr) = options.validate {
-        let expr = parse_str::<syn::Expr>(&validate_expr).unwrap();
+        let expr_str = validate_expr;
+        let expr = parse_str::<syn::Expr>(&expr_str).unwrap();
         quote! {
             if #expr {
                 Ok(())
             } else {
                 Err(parrot_api::errors::ActorError::MessageHandlingError(
-                    format!("Validation failed for {}: {}", std::any::type_name::<Self>(), #validate_expr)
+                    format!("Validation failed for {}: {}", std::any::type_name::<Self>(), #expr_str)
                 ))
             }
         }

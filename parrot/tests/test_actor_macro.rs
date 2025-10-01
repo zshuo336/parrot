@@ -103,103 +103,93 @@ impl MacroTestActor {
     }
 }
 
-// Run all tests
-fn main() {
-    actix::System::new().block_on(async {
-        // Run all tests and report results
-        let results = run_all_tests().await;
+
+
+#[test]
+fn test_macro_actor_creation() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create actor using the macro-generated implementation
+            let actor = MacroTestActor::new("MacroTest".to_string());
+            let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
         
-        match results {
-            Ok(_) => println!("All macro tests passed!"),
-            Err(e) => {
-                eprintln!("Test failure: {}", e);
-                std::process::exit(1);
-            }
-        }
-    });
+            // Verify that we have a valid actor reference
+            let path = actor_ref.path();
+            assert!(!path.is_empty(), "Should have a valid actor path");
+        
+            Ok(((), system))
+        }).await
+    })
 }
 
-async fn run_all_tests() -> Result<()> {
-    test_macro_actor_creation().await?;
-    test_macro_message_handling().await?;
-    test_macro_state_tracking().await?;
-    
-    Ok(())
+#[test]
+fn test_macro_message_handling() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create and spawn the actor
+            let actor = MacroTestActor::new("MacroTest".to_string());
+            let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
+        
+            // Test greeting message
+            let response = actor_ref.ask(GreetMessage {
+                name: "MacroTest".to_string(),
+            }).await?;
+        
+            assert_eq!(response, "Hello, MacroTest!", "Should get correct greeting response");
+        
+            // Test counter message
+            let counter_value = actor_ref.ask(CounterMessage {
+                increment_by: 10,
+            }).await?;
+        
+            assert_eq!(counter_value, 10, "Counter should be incremented to 10");
+        
+            // Increment again
+            let counter_value = actor_ref.ask(CounterMessage {
+                increment_by: 5,
+            }).await?;
+        
+            assert_eq!(counter_value, 15, "Counter should be incremented to 15");
+        
+            Ok(((), system))
+        }).await
+    })
 }
 
-async fn test_macro_actor_creation() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create actor using the macro-generated implementation
-        let actor = MacroTestActor::new("MacroTest".to_string());
-        let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
+#[test]
+fn test_macro_state_tracking() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create and spawn the actor
+            let actor = MacroTestActor::new("MacroTest".to_string());
+            let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
         
-        // Verify that we have a valid actor reference
-        let path = actor_ref.path();
-        assert!(!path.is_empty(), "Should have a valid actor path");
+            // Send multiple messages to accumulate state
+            actor_ref.ask(GreetMessage {
+                name: "User1".to_string(),
+            }).await?;
         
-        Ok(((), system))
-    }).await
+            actor_ref.ask(GreetMessage {
+                name: "User2".to_string(),
+            }).await?;
+        
+            actor_ref.ask(GreetMessage {
+                name: "User3".to_string(),
+            }).await?;
+        
+            // Get the accumulated state
+            let messages = actor_ref.ask(GetStateMessage).await?;
+        
+            // Verify we have the expected messages
+            assert_eq!(messages.len(), 3, "Should have 3 messages in state");
+            assert!(messages.contains(&"Hello, User1!".to_string()), "Should contain greeting for User1");
+            assert!(messages.contains(&"Hello, User2!".to_string()), "Should contain greeting for User2");
+            assert!(messages.contains(&"Hello, User3!".to_string()), "Should contain greeting for User3");
+        
+            Ok(((), system))
+        }).await
+    })
 }
-
-async fn test_macro_message_handling() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create and spawn the actor
-        let actor = MacroTestActor::new("MacroTest".to_string());
-        let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
-        
-        // Test greeting message
-        let response = actor_ref.ask(GreetMessage {
-            name: "MacroTest".to_string(),
-        }).await?;
-        
-        assert_eq!(response, "Hello, MacroTest!", "Should get correct greeting response");
-        
-        // Test counter message
-        let counter_value = actor_ref.ask(CounterMessage {
-            increment_by: 10,
-        }).await?;
-        
-        assert_eq!(counter_value, 10, "Counter should be incremented to 10");
-        
-        // Increment again
-        let counter_value = actor_ref.ask(CounterMessage {
-            increment_by: 5,
-        }).await?;
-        
-        assert_eq!(counter_value, 15, "Counter should be incremented to 15");
-        
-        Ok(((), system))
-    }).await
-}
-
-async fn test_macro_state_tracking() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create and spawn the actor
-        let actor = MacroTestActor::new("MacroTest".to_string());
-        let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
-        
-        // Send multiple messages to accumulate state
-        actor_ref.ask(GreetMessage {
-            name: "User1".to_string(),
-        }).await?;
-        
-        actor_ref.ask(GreetMessage {
-            name: "User2".to_string(),
-        }).await?;
-        
-        actor_ref.ask(GreetMessage {
-            name: "User3".to_string(),
-        }).await?;
-        
-        // Get the accumulated state
-        let messages = actor_ref.ask(GetStateMessage).await?;
-        
-        // Verify we have the expected messages
-        assert_eq!(messages.len(), 3, "Should have 3 messages in state");
-        assert!(messages.contains(&"Hello, User1!".to_string()), "Should contain greeting for User1");
-        assert!(messages.contains(&"Hello, User2!".to_string()), "Should contain greeting for User2");
-        assert!(messages.contains(&"Hello, User3!".to_string()), "Should contain greeting for User3");
-        
-        Ok(((), system))
-    }).await
-} 

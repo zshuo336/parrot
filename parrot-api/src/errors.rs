@@ -89,6 +89,18 @@ pub enum ActorError {
     /// processing, actor creation, or system operations.
     #[error("Timeout")]
     Timeout,
+
+    /// Operation timeout with a detailed message.
+    #[error("Timeout: {0}")]
+    TimeoutDetail(String),
+
+    /// Actor not found at the given path.
+    #[error("Actor not found: {0}")]
+    ActorNotFound(String),
+
+    /// Internal system error.
+    #[error("Internal error: {0}")]
+    InternalError(String),
     
     /// Process message error.
     ///

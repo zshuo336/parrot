@@ -35,7 +35,11 @@ pub struct SpscMailbox {
     /// Flag indicating if this mailbox has been closed
     is_closed: Arc<AtomicBool>,
     /// Associated processor
-    processor: Option<Arc<StdMutex<dyn ProcessorInterface>>>
+    processor: StdMutex<Option<Arc<dyn ProcessorInterface>>>,
+    /// Wake hook fired after a successful push (re-enqueue scheduling).
+    wake_hook: StdMutex<Option<crate::thread::mailbox::WakeHook>>,
+    /// Scheduling slot state (single-owner processing guard).
+    schedule_state: crate::thread::mailbox::ScheduleState,
 }
 
 impl Debug for SpscMailbox {
@@ -54,8 +58,9 @@ impl SpscMailbox {
     pub fn new(capacity: usize, path: ActorPath) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         let notify = Arc::new(Notify::new());
-        let processor = None;
-        
+        let processor = StdMutex::new(None);
+        let wake_hook = StdMutex::new(None);
+
         Self {
             sender,
             receiver: Arc::new(Mutex::new(receiver)),
@@ -65,6 +70,8 @@ impl SpscMailbox {
             message_count: Arc::new(AtomicUsize::new(0)),
             is_closed: Arc::new(AtomicBool::new(false)),
             processor,
+            wake_hook,
+            schedule_state: crate::thread::mailbox::ScheduleState::default(),
         }
     }
 
@@ -89,7 +96,7 @@ impl SpscMailbox {
     }
     
     /// Check if this mailbox is closed
-    fn is_closed(&self) -> bool {
+    fn closed(&self) -> bool {
         self.is_closed.load(Ordering::SeqCst)
     }
 }
@@ -98,7 +105,7 @@ impl SpscMailbox {
 impl Mailbox for SpscMailbox {
     async fn push(&self, msg: BoxedMessage, strategy: BackpressureStrategy) -> Result<(), MailboxError> {
         // Check if mailbox is already closed
-        if self.is_closed() {
+        if self.closed() {
             return Err(MailboxError::Closed);
         }
         
@@ -109,6 +116,7 @@ impl Mailbox for SpscMailbox {
                     Ok(_) => {
                         self.increment_count();
                         self.notify.notify_one();
+                        self.fire_wake_hook();
                         Ok(())
                     },
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -126,6 +134,7 @@ impl Mailbox for SpscMailbox {
                     Ok(_) => {
                         self.increment_count();
                         self.notify.notify_one();
+                        self.fire_wake_hook();
                         Ok(())
                     },
                     Err(_) => Err(MailboxError::Closed),
@@ -137,6 +146,7 @@ impl Mailbox for SpscMailbox {
                     Ok(_) => {
                         self.increment_count();
                         self.notify.notify_one();
+                        self.fire_wake_hook();
                         Ok(())
                     },
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -157,6 +167,7 @@ impl Mailbox for SpscMailbox {
                     Ok(_) => {
                         self.increment_count();
                         self.notify.notify_one();
+                        self.fire_wake_hook();
                         Ok(())
                     },
                     Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
@@ -194,6 +205,7 @@ impl Mailbox for SpscMailbox {
                             Ok(_) => {
                                 self.increment_count();
                                 self.notify.notify_one();
+                                self.fire_wake_hook();
                                 Ok(())
                             },
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -216,15 +228,14 @@ impl Mailbox for SpscMailbox {
     async fn pop(&self) -> Option<BoxedMessage> {
         // Get exclusive access to the receiver
         let mut receiver = self.receiver.lock().await;
-        
-        // Try to receive a message
-        match receiver.recv().await {
-            Some(msg) => {
-                self.decrement_count();
-                Some(msg)
-            },
-            None => None, // Channel is closed or empty
-        }
+
+        // Try to receive a message without blocking: the `Mailbox` contract
+        // requires `pop` to return `None` immediately when empty. Waiting for
+        // new messages is the scheduling queue's responsibility (`Notify`).
+        receiver.try_recv().ok().map(|msg| {
+            self.decrement_count();
+            msg
+        })
     }
 
     async fn is_empty(&self) -> bool {
@@ -271,20 +282,38 @@ impl Mailbox for SpscMailbox {
     }
 
     /// associate a processor with this mailbox
-    fn set_processor(&mut self, processor: Arc<StdMutex<dyn ProcessorInterface>>) {
-        self.processor = Some(processor);
+    fn set_processor(&self, processor: Arc<dyn ProcessorInterface>) {
+        *self.processor.lock().unwrap() = Some(processor);
     }
-    
+
     /// get the associated processor
-    fn get_processor(&self) -> Option<Arc<StdMutex<dyn ProcessorInterface>>> {
-        self.processor.clone()
+    fn get_processor(&self) -> Option<Arc<dyn ProcessorInterface>> {
+        self.processor.lock().unwrap().clone()
     }
 
     /// check if there is a processor associated with this mailbox
     fn has_processor(&self) -> bool {
-        self.processor.is_some()
+        self.processor.lock().map(|p| p.is_some()).unwrap_or(false)
     }
-    
+
+    fn set_wake_hook(&self, hook: crate::thread::mailbox::WakeHook) {
+        *self.wake_hook.lock().unwrap() = Some(hook);
+    }
+
+    fn fire_wake_hook(&self) {
+        if let Some(hook) = self.wake_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+    }
+
+    fn schedule_state(&self) -> &crate::thread::mailbox::ScheduleState {
+        &self.schedule_state
+    }
+
+    async fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::SeqCst)
+    }
+
 }
 
 #[cfg(test)]

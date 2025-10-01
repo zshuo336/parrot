@@ -125,126 +125,113 @@ impl AsyncTestActor {
     }
 }
 
-// Run async tests
-fn main() {
-    actix::System::new().block_on(async {
-        // Run all tests
-        let results = run_all_tests().await;
+
+
+#[test]
+fn test_async_message_handling() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create async test actor
+            let actor = AsyncTestActor::new();
+            let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
         
-        match results {
-            Ok(_) => println!("All async tests passed!"),
-            Err(e) => {
-                eprintln!("Test failure: {}", e);
-                std::process::exit(1);
-            }
-        }
-    });
+            // Start an async task that takes some time
+            let response = actor_ref.ask(AsyncTaskMessage {
+                name: "Test Task".to_string(),
+                delay_ms: 100,
+            }).await?;
+        
+            // Verify immediate response
+            assert_eq!(response, "Started task: Test Task", "Should get immediate start confirmation");
+        
+            // Wait for task to complete
+            wait_for(200).await;
+        
+            // Check task completion
+            let tasks = actor_ref.ask(GetTasksMessage).await?;
+        
+            // Should have 2 entries - one in started and one in completed
+            assert_eq!(tasks.len(), 2, "Should have 2 task entries (start + completion)");
+            assert!(tasks.contains(&"Test Task".to_string()), "Tasks should contain the test task");
+        
+            Ok(((), system))
+        }).await
+    })
 }
 
-async fn run_all_tests() -> Result<()> {
-    test_async_message_handling().await?;
-    test_multiple_async_tasks().await?;
-    
-    Ok(())
+#[test]
+fn test_multiple_async_tasks() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create async test actor
+            let actor = AsyncTestActor::new();
+            let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
+        
+            // Start multiple async tasks with different delays
+            actor_ref.ask(AsyncTaskMessage {
+                name: "Fast Task".to_string(),
+                delay_ms: 50,
+            }).await?;
+        
+            actor_ref.ask(AsyncTaskMessage {
+                name: "Medium Task".to_string(),
+                delay_ms: 100,
+            }).await?;
+        
+            actor_ref.ask(AsyncTaskMessage {
+                name: "Slow Task".to_string(),
+                delay_ms: 150,
+            }).await?;
+        
+            // Wait for shortest task to complete, but not all
+            wait_for(75).await;
+        
+            // At this point, only the fast task should be complete
+            let tasks_partial = actor_ref.ask(GetTasksMessage).await?;
+            let started_count = 3; // All tasks should be started
+            let completed_count = tasks_partial.len() - started_count; // 计算完成的任务数
+        
+            // 验证任务起始数量是否正确
+            assert_eq!(
+                tasks_partial.len() >= started_count,
+                true,
+                "Should have started at least all tasks"
+            );
+        
+            // 验证完成的任务中包含快速任务
+            assert!(
+                tasks_partial.contains(&"Fast Task".to_string()),
+                "Fast task should be in the list of tasks"
+            );
+        
+            // Wait for all tasks to complete
+            wait_for(150).await;
+        
+            // All tasks should now be complete
+            let tasks_final = actor_ref.ask(GetTasksMessage).await?;
+        
+            // 验证所有任务都已开始
+            assert!(
+                tasks_final.contains(&"Fast Task".to_string()) &&
+                tasks_final.contains(&"Medium Task".to_string()) &&
+                tasks_final.contains(&"Slow Task".to_string()),
+                "All tasks should be present in the list"
+            );
+        
+            // 检查任务数量，应该至少包含所有已开始的任务
+            assert!(
+                tasks_final.len() >= started_count, 
+                "Task list should contain at least all started tasks"
+            );
+        
+            // Check that specific tasks are in the list
+            assert!(tasks_final.contains(&"Fast Task".to_string()), "Fast task should be recorded");
+            assert!(tasks_final.contains(&"Medium Task".to_string()), "Medium task should be recorded");
+            assert!(tasks_final.contains(&"Slow Task".to_string()), "Slow task should be recorded");
+        
+            Ok(((), system))
+        }).await
+    })
 }
-
-async fn test_async_message_handling() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create async test actor
-        let actor = AsyncTestActor::new();
-        let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
-        
-        // Start an async task that takes some time
-        let response = actor_ref.ask(AsyncTaskMessage {
-            name: "Test Task".to_string(),
-            delay_ms: 100,
-        }).await?;
-        
-        // Verify immediate response
-        assert_eq!(response, "Started task: Test Task", "Should get immediate start confirmation");
-        
-        // Wait for task to complete
-        wait_for(200).await;
-        
-        // Check task completion
-        let tasks = actor_ref.ask(GetTasksMessage).await?;
-        
-        // Should have 2 entries - one in started and one in completed
-        assert_eq!(tasks.len(), 2, "Should have 2 task entries (start + completion)");
-        assert!(tasks.contains(&"Test Task".to_string()), "Tasks should contain the test task");
-        
-        Ok(((), system))
-    }).await
-}
-
-async fn test_multiple_async_tasks() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create async test actor
-        let actor = AsyncTestActor::new();
-        let actor_ref = system.spawn_root_actix(actor, EmptyConfig::default()).await?;
-        
-        // Start multiple async tasks with different delays
-        actor_ref.ask(AsyncTaskMessage {
-            name: "Fast Task".to_string(),
-            delay_ms: 50,
-        }).await?;
-        
-        actor_ref.ask(AsyncTaskMessage {
-            name: "Medium Task".to_string(),
-            delay_ms: 100,
-        }).await?;
-        
-        actor_ref.ask(AsyncTaskMessage {
-            name: "Slow Task".to_string(),
-            delay_ms: 150,
-        }).await?;
-        
-        // Wait for shortest task to complete, but not all
-        wait_for(75).await;
-        
-        // At this point, only the fast task should be complete
-        let tasks_partial = actor_ref.ask(GetTasksMessage).await?;
-        let started_count = 3; // All tasks should be started
-        let completed_count = tasks_partial.len() - started_count; // 计算完成的任务数
-        
-        // 验证任务起始数量是否正确
-        assert_eq!(
-            tasks_partial.len() >= started_count,
-            true,
-            "Should have started at least all tasks"
-        );
-        
-        // 验证完成的任务中包含快速任务
-        assert!(
-            tasks_partial.contains(&"Fast Task".to_string()),
-            "Fast task should be in the list of tasks"
-        );
-        
-        // Wait for all tasks to complete
-        wait_for(150).await;
-        
-        // All tasks should now be complete
-        let tasks_final = actor_ref.ask(GetTasksMessage).await?;
-        
-        // 验证所有任务都已开始
-        assert!(
-            tasks_final.contains(&"Fast Task".to_string()) &&
-            tasks_final.contains(&"Medium Task".to_string()) &&
-            tasks_final.contains(&"Slow Task".to_string()),
-            "All tasks should be present in the list"
-        );
-        
-        // 检查任务数量，应该至少包含所有已开始的任务
-        assert!(
-            tasks_final.len() >= started_count, 
-            "Task list should contain at least all started tasks"
-        );
-        
-        // Check that specific tasks are in the list
-        assert!(tasks_final.contains(&"Fast Task".to_string()), "Fast task should be recorded");
-        assert!(tasks_final.contains(&"Medium Task".to_string()), "Medium task should be recorded");
-        assert!(tasks_final.contains(&"Slow Task".to_string()), "Slow task should be recorded");
-        
-        Ok(((), system))
-    }).await
-} 
