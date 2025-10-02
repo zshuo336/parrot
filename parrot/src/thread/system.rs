@@ -425,6 +425,12 @@ impl ThreadActorSystem {
                     .schedule_typed_by_processor::<A>(path, mailbox.clone(), processor, thread_config.clone())
                     .map_err(|e| SpawnError::SchedulerError(e.to_string()))?;
             }
+            SchedulingMode::Sharded { affinity_key } => {
+                let shards = self.scheduler_group.sharded();
+                shards
+                    .schedule_affinity(path, mailbox.clone(), affinity_key)
+                    .map_err(SpawnError::SchedulerError)?;
+            }
             SchedulingMode::SharedPool { .. } => {
                 self.scheduler_group
                     .shared_scheduler

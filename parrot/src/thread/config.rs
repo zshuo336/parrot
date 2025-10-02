@@ -14,6 +14,13 @@ pub enum SchedulingMode {
     },
     /// Actor runs exclusively on its own dedicated system thread.
     DedicatedThread,
+    /// Actor is pinned to a fixed **shard thread** chosen by an affinity key
+    /// (ADR-14). All messages to this actor are processed by that one thread;
+    /// no global scheduling queue is involved on the hot path.
+    Sharded {
+        /// Affinity key: actors with equal keys share a shard (hash-routed).
+        affinity_key: String,
+    },
 }
 
 /// Defines the behavior when `mailbox.push()` is called on a full mailbox.
