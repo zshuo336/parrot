@@ -221,9 +221,16 @@ impl ThreadActorSystem {
     }
 
     /// Register a watch: `watcher_path` wants notifications about `watched_path`.
+    ///
+    /// Idempotent (matching Akka's `context.watch` semantics): registering
+    /// the same (watcher, watched) pair twice does not duplicate the
+    /// termination notification.
     pub async fn watch(&self, watcher_path: String, watched_path: String) -> Result<(), ActorError> {
         let mut registry = self.watch_registry.lock().unwrap();
-        registry.entry(watched_path).or_default().push(watcher_path);
+        let watchers = registry.entry(watched_path).or_default();
+        if !watchers.contains(&watcher_path) {
+            watchers.push(watcher_path);
+        }
         Ok(())
     }
 
@@ -697,7 +704,7 @@ mod tests {
             &'a mut self,
             _msg: BoxedMessage,
             _ctx: &'a mut Self::Context,
-            _engine_ctx: std::ptr::NonNull<dyn Any>,
+            _engine_ctx: parrot_api::actor::EngineContextHandle,
         ) -> Option<ActorResult<BoxedMessage>> {
             None
         }

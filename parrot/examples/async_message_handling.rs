@@ -59,6 +59,11 @@ struct AsyncActor {
 }
 
 impl AsyncActor {
+    async fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>) -> ActorResult<BoxedMessage> {
+        // Fallback for message types not handled by the engine fast path.
+        Err(ActorError::MessageHandlingError(format!("AsyncActor received unhandled message: {:?}", msg)))
+    }
+
     pub fn new() -> Self {
         Self {
             processed_tasks: Vec::new(),
@@ -76,8 +81,8 @@ impl AsyncActor {
     }
 
     // Engine-specific message handling method
-    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
-        let actix_ctx = unsafe { engine_ctx.as_ref().downcast_ref::<ActixBaseContext<ActixActor<Self>>>() };
+    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
+        let actix_ctx = engine_ctx.downcast_ref::<ActixBaseContext<ActixActor<Self>>>();
         assert!(actix_ctx.is_some());
         let actix_ctx = actix_ctx.unwrap();
 

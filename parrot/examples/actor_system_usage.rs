@@ -50,7 +50,7 @@ impl Actor for SimpleActor {
         &'a mut self,
         msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
-        _engine_ctx: NonNull<dyn Any>
+        _engine_ctx: parrot_api::actor::EngineContextHandle
     ) -> Option<ActorResult<BoxedMessage>> {
         // Add processing logic to avoid returning None
         println!("SimpleActor '{}' processing message via engine", self.name);
@@ -106,7 +106,7 @@ impl Actor for ActixCompatibleActor {
         &'a mut self,
         msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
-        _engine_ctx: NonNull<dyn Any>
+        _engine_ctx: parrot_api::actor::EngineContextHandle
     ) -> Option<ActorResult<BoxedMessage>> {
         // Properly handle messages and return results
         println!("ActixCompatibleActor '{}' received message via engine", self.name);
@@ -189,7 +189,7 @@ impl Actor for ActixContextSpawner {
         &'a mut self,
         msg: BoxedMessage,
         ctx: &'a mut Self::Context,
-        engine_ctx: NonNull<dyn Any>
+        engine_ctx: parrot_api::actor::EngineContextHandle
     ) -> Option<ActorResult<BoxedMessage>> {
         println!("ActixContextSpawner '{}' received message via engine", self.name);
         
@@ -198,7 +198,7 @@ impl Actor for ActixContextSpawner {
             println!("Received request to spawn child actor: {}", spawn_msg.0);
             
             // Try to convert engine_ctx to actix::Context<ActixActor<Self>>
-            let actix_ctx: Option<&ActixBaseContext<ActixActor<ActixContextSpawner>>> = unsafe { engine_ctx.as_ref().downcast_ref::<actix::Context<ActixActor<Self>>>() };
+            let actix_ctx: Option<&ActixBaseContext<ActixActor<ActixContextSpawner>>> = engine_ctx.downcast_ref::<actix::Context<ActixActor<Self>>>();
             
             if let Some(actix_context) = actix_ctx {
                 // Create child actor
@@ -229,7 +229,7 @@ impl Actor for ActixContextSpawner {
             println!("Received request to create another type of child: {}", another_child_msg.0);
             
             // Try again to convert to actix::Context
-            let actix_ctx = unsafe { engine_ctx.as_ref().downcast_ref::<actix::Context<ActixActor<Self>>>() };
+            let actix_ctx = engine_ctx.downcast_ref::<actix::Context<ActixActor<Self>>>();
             
             if let Some(actix_context) = actix_ctx {
                 // Get current actor address - verify context is usable

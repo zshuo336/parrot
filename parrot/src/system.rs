@@ -627,7 +627,7 @@ mod tests {
             &'a mut self,
             _msg: BoxedMessage,
             _ctx: &'a mut Self::Context,
-            _engine_ctx: std::ptr::NonNull<dyn std::any::Any>,
+            _engine_ctx: parrot_api::actor::EngineContextHandle,
         ) -> Option<ActorResult<BoxedMessage>> {
             None
         }

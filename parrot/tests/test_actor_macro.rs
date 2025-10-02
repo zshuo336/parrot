@@ -59,7 +59,7 @@ impl MacroTestActor {
     }
 
     // Define the engine-specific message handler required by the macro
-    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         match_message!("option", self, msg,
             GreetMessage => |actor: &mut Self, greet: &GreetMessage| {
                 // Record the greeting and return a response

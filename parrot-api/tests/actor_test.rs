@@ -69,7 +69,7 @@ impl Actor for TestActor {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
 
@@ -126,7 +126,7 @@ impl Actor for StreamTestActor {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
 
@@ -200,10 +200,9 @@ impl Actor for EngineContextActor {
         })
     }
     
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         // Try to get the custom engine context
-        let engine_ctx_ref = unsafe { engine_ctx.as_ref() };
-        if let Some(ctx) = engine_ctx_ref.downcast_ref::<TestEngineContext>() {
+                if let Some(ctx) = engine_ctx.downcast_ref::<TestEngineContext>() {
             if let Some(increment) = msg.downcast_ref::<Increment>() {
                 // Use the multiplier from the engine context
                 let inc_amount = increment.0 * ctx.multiplier;
@@ -243,7 +242,7 @@ impl Actor for EngineErrorActor {
         })
     }
     
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         if msg.downcast_ref::<Panic>().is_some() {
             // Return an error for Panic messages
             return Some(Err(ActorError::MessageHandlingError("Engine context error".to_string())));
@@ -319,11 +318,10 @@ impl Actor for EnhancedEngineActor {
         })
     }
     
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         // Try to get the engine context
-        let engine_ctx_ref = unsafe { engine_ctx.as_ref() };
-        
-        if let Some(ctx) = engine_ctx_ref.downcast_ref::<EnhancedEngineContext>() {
+                
+        if let Some(ctx) = engine_ctx.downcast_ref::<EnhancedEngineContext>() {
             // Check operation mode first
             match ctx.operation_mode {
                 OperationMode::ErrorProne => {
@@ -488,7 +486,8 @@ mod tests {
         rt.block_on(async {
             // Engine context handling should be None in the test actor
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
             assert!(result.is_none());
         });
         
@@ -563,7 +562,8 @@ mod tests {
         rt.block_on(async {
             // Test message with engine context
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
             
             // Should have a result because we implemented custom handling
             assert!(result.is_some());
@@ -606,7 +606,8 @@ mod tests {
         rt.block_on(async {
             // Test error case with Panic message
             let panic_msg = Box::new(Panic) as BoxedMessage;
-            let result = actor.receive_message_with_engine(panic_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(panic_msg, &mut ctx, engine_handle);
             
             // Should have Some(Err(...)) result
             assert!(result.is_some(), "Expected Some result");
@@ -621,7 +622,8 @@ mod tests {
             
             // Test fallback case with Increment message
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
             
             // Should return None to indicate fallback to regular message handling
             assert!(result.is_none(), "Expected None result for fallback");
@@ -655,7 +657,8 @@ mod tests {
         rt.block_on(async {
             // Test increment message
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
             
             assert!(result.is_some());
             if let Some(Ok(boxed)) = result {
@@ -669,7 +672,8 @@ mod tests {
             
             // Test multiply message
             let multiply_msg = Box::new(Multiply(3)) as BoxedMessage;
-            let result = actor.receive_message_with_engine(multiply_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(multiply_msg, &mut ctx, engine_handle);
             
             assert!(result.is_some());
             if let Some(Ok(boxed)) = result {
@@ -683,7 +687,8 @@ mod tests {
             
             // Test get counter message
             let get_counter_msg = Box::new(GetEngineCounter) as BoxedMessage;
-            let result = actor.receive_message_with_engine(get_counter_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(get_counter_msg, &mut ctx, engine_handle);
             
             assert!(result.is_some());
             if let Some(Ok(boxed)) = result {
@@ -695,7 +700,8 @@ mod tests {
             
             // Test reset message
             let reset_msg = Box::new(Reset) as BoxedMessage;
-            let result = actor.receive_message_with_engine(reset_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(reset_msg, &mut ctx, engine_handle);
             
             assert!(result.is_some());
             if let Some(Ok(_)) = result {
@@ -707,7 +713,8 @@ mod tests {
             
             // Test invalid operation
             let invalid_msg = Box::new(InvalidOperation) as BoxedMessage;
-            let result = actor.receive_message_with_engine(invalid_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(invalid_msg, &mut ctx, engine_handle);
             
             assert!(result.is_some());
             if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
@@ -743,7 +750,8 @@ mod tests {
         rt.block_on(async {
             // Test read operation should succeed
             let get_counter_msg = Box::new(GetEngineCounter) as BoxedMessage;
-            let result = actor.receive_message_with_engine(get_counter_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(get_counter_msg, &mut ctx, engine_handle);
             
             assert!(result.is_some());
             if let Some(Ok(boxed)) = result {
@@ -755,7 +763,8 @@ mod tests {
             
             // Test write operation should fail
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
             
             assert!(result.is_some());
             if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
@@ -795,7 +804,8 @@ mod tests {
             ];
             
             for op in operations {
-                let result = actor.receive_message_with_engine(op, &mut ctx, engine_ctx);
+                let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+                let result = actor.receive_message_with_engine(op, &mut ctx, engine_handle);
                 
                 assert!(result.is_some());
                 if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
@@ -826,7 +836,8 @@ mod tests {
         rt.block_on(async {
             // Should fall back to regular message handling
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_ctx);
+            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
             
             // Should be None to indicate fallback
             assert!(result.is_none());
@@ -882,7 +893,8 @@ mod tests {
                     _ => unreachable!(),
                 };
                 
-                let result = actor.receive_message_with_engine(message, &mut ctx, engine_ctx);
+                let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+                let result = actor.receive_message_with_engine(message, &mut ctx, engine_handle);
                 
                 assert!(result.is_some(), "Operation {} should return Some result", i);
                 

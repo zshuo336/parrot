@@ -69,7 +69,7 @@ impl Actor for TestActor {
         &'a mut self,
         _msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
-        _engine_ctx: NonNull<dyn Any>,
+        _engine_ctx: parrot_api::actor::EngineContextHandle,
     ) -> Option<ActorResult<BoxedMessage>> {
         None
     }
@@ -163,7 +163,7 @@ impl Actor for EmptyConfigActor {
         &'a mut self,
         _msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
-        _engine_ctx: NonNull<dyn Any>,
+        _engine_ctx: parrot_api::actor::EngineContextHandle,
     ) -> Option<ActorResult<BoxedMessage>> {
         None
     }

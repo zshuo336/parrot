@@ -15,5 +15,5 @@ pub use actor::{ActorBase, IntoActorBase};
 pub use context::ActixContext;
 pub use message::*;
 pub use reference::ActixActorRef;
-pub use system::ActixActorSystem;
-pub use types::*; 
+pub use system::{ActixActorSystem, ArbiterPool};
+pub use types::*;

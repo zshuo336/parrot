@@ -70,9 +70,9 @@ impl AsyncTestActor {
     }
     
     // 添加engine版本的处理函数
-    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         // 获取Actix上下文，需要使用ActorContext trait来访问address方法
-        let actix_ctx = unsafe { engine_ctx.as_ref().downcast_ref::<actix::Context<ActixActor<Self>>>() };
+        let actix_ctx = engine_ctx.downcast_ref::<actix::Context<ActixActor<Self>>>();
         
         match_message!("option", self, msg,
             AsyncTaskMessage => |actor: &mut Self, task: &AsyncTaskMessage| {

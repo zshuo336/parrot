@@ -192,9 +192,13 @@ where
         + 'static,
 {
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        // Align with the Actix engine: `send` performs an ask round trip so
+        // callers of the generic ActorRefExt::ask receive the actual reply.
+        // (Previously this returned unit after a bare tell, which made
+        // engine-agnostic `ask` unusable on the thread engine.)
         Box::pin(async move {
-            self.send_with_strategy(msg, self.default_strategy.clone()).await?;
-            Ok(Box::new(()) as BoxedMessage)
+            self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), self.default_timeout)
+                .await
         })
     }
 
@@ -341,7 +345,7 @@ mod tests {
             Box::pin(async { Ok(Box::new(()) as Box<dyn Any + Send>) })
         }
 
-        fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: std::ptr::NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
             None
         }
 
@@ -357,16 +361,18 @@ mod tests {
             path,
             Arc::downgrade(&mailbox) as WeakMailboxRef,
             BackpressureStrategy::Block,
-            Duration::from_secs(1),
+            // No consumer answers the ask: send must time out, but the
+            // envelope must still be observable in the mailbox.
+            Duration::from_millis(100),
             None,
         );
 
         let message = Box::new("Hello, actor!") as BoxedMessage;
         let result = actor_ref.send(message).await;
-        assert!(result.is_ok());
+        assert!(result.is_err(), "unanswered ask must time out");
 
         let received = mailbox.pop().await;
-        assert!(received.is_some());
+        assert!(received.is_some(), "envelope must be enqueued");
     }
 
     #[tokio::test]
@@ -455,7 +461,8 @@ mod tests {
             path,
             Weak::<MpscMailbox>::new() as WeakMailboxRef,
             BackpressureStrategy::Block,
-            Duration::from_secs(1),
+            // Short ask timeout: no consumer replies in this unit test.
+            Duration::from_millis(50),
             None,
         );
 
@@ -466,6 +473,8 @@ mod tests {
         // Install the mailbox afterwards
         actor_ref.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
         assert!(actor_ref.is_alive().await);
-        assert!(actor_ref.send(Box::new("x") as BoxedMessage).await.is_ok());
+        // Envelope is enqueued but unanswered: ask semantics time out.
+        assert!(actor_ref.send(Box::new("x") as BoxedMessage).await.is_err());
+        assert!(mailbox.pop().await.is_some());
     }
 }

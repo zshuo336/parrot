@@ -70,14 +70,14 @@ impl RingActor {
         }
     }
 
-    fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>) -> ActorResult<BoxedMessage> {
+    async fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>) -> ActorResult<BoxedMessage> {
         Err(ActorError::Other(anyhow::anyhow!("Actor {} received message: {:?}", self.name, msg)))
     }
 
     // Message handling method: processes three types of messages
     // Uses match_message! macro for message dispatch, ensuring type safety
-    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
-        let actix_ctx: Option<&ActixBaseContext<ActixActor<Self>>> = unsafe { engine_ctx.as_ref().downcast_ref::<ActixBaseContext<ActixActor<Self>>>() };
+    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
+        let actix_ctx: Option<&ActixBaseContext<ActixActor<Self>>> = engine_ctx.downcast_ref::<ActixBaseContext<ActixActor<Self>>>();
         assert!(actix_ctx.is_some());
         match_message!("option", self, msg,
             // Handle NextActorRef message: receive reference to the next actor, establish ring connection

@@ -50,7 +50,12 @@ impl PingActor {
         }
     }
 
-    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    async fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>) -> ActorResult<BoxedMessage> {
+        // Fallback for message types not handled by the engine fast path.
+        Err(ActorError::MessageHandlingError(format!("PingActor received unhandled message: {:?}", msg)))
+    }
+
+    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         match_message!("option", self, msg,
             Ping => |actor: &mut Self, ping: &Ping| {
                 println!("PingActor received Ping({})", ping.0);
@@ -72,7 +77,12 @@ impl PongActor {
         }
     }
 
-    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    async fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>) -> ActorResult<BoxedMessage> {
+        // Fallback for message types not handled by the engine fast path.
+        Err(ActorError::MessageHandlingError(format!("PongActor received unhandled message: {:?}", msg)))
+    }
+
+    fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut ActixContext<ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         match_message!("option", self, msg,
             Ping => |actor: &mut Self, ping: &Ping| {
                 println!("PongActor received Ping({})", ping.0);

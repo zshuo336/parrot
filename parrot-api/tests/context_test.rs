@@ -70,7 +70,7 @@ impl Actor for TestActor {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
     
