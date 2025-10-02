@@ -32,6 +32,22 @@ pub struct SharedThreadPoolConfig {
 
     /// Whether to log detailed processing metrics
     pub enable_detailed_logging: bool,
+
+    /// Elastic-scaling: maximum number of *temporary* burst workers.
+    ///
+    /// Burst workers are spawned when the scheduling queue stays backlogged
+    /// while all core workers are busy (e.g. every core worker is stuck in a
+    /// minute-level CPU task) and exit after `burst_idle_timeout` of
+    /// continuous idleness. The global thread count is bounded by
+    /// `pool_size + burst_workers_max`, preventing thread explosions.
+    pub burst_workers_max: usize,
+
+    /// Elastic-scaling: how long the queue must stay backlogged (with no
+    /// idle core worker) before a burst worker is spawned.
+    pub burst_backlog_threshold: Duration,
+
+    /// Elastic-scaling: how long a burst worker idles before exiting.
+    pub burst_idle_timeout: Duration,
 }
 
 impl Default for SharedThreadPoolConfig {
@@ -43,6 +59,12 @@ impl Default for SharedThreadPoolConfig {
             idle_sleep_duration: Duration::from_millis(10),
             yield_after_each_message: false,
             enable_detailed_logging: false,
+            // Elastic defaults: up to `num_cpus` extra threads, requiring
+            // the queue to stay backlogged ≥100ms before scaling out, and
+            // reaping burst workers after 5s of idleness.
+            burst_workers_max: num_cpus::get(),
+            burst_backlog_threshold: Duration::from_millis(100),
+            burst_idle_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -84,6 +106,9 @@ pub struct SchedulerMetrics {
     /// Number of worker threads in the pool
     pub pool_size: usize,
 
+    /// Number of currently-alive elastic burst workers
+    pub burst_workers_alive: usize,
+
     /// Current length of the scheduling queue
     pub queue_length: usize,
 
@@ -95,6 +120,153 @@ pub struct SchedulerMetrics {
 
     /// Number of active processors
     pub active_processors: usize,
+}
+
+/// Elastic burst-worker controller.
+///
+/// `probe()` is called from mailbox wake hooks (i.e. on message arrival).
+/// It decides whether to spawn a temporary burst worker using the
+/// algorithm documented on [`SharedThreadPool`].
+pub struct ElasticController {
+    /// Weak ref to the scheduling queue (probe reads its length)
+    queue: std::sync::Weak<SchedulingQueue>,
+
+    /// Weak ref to the worker manager (idle-count source)
+    worker_manager: std::sync::Weak<WorkerManager>,
+
+    /// Shared shutdown flag
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Alive burst worker count (shared with pool)
+    burst_alive: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// First-backlog timestamp in micros (shared with pool)
+    backlog_since_us: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Pool creation instant (time base for backlog_since_us)
+    pool_started: std::time::Instant,
+
+    /// Spawn decision serializer
+    spawn_gate: Arc<std::sync::Mutex<()>>,
+
+    /// Pool config (burst parameters)
+    config: SharedThreadPoolConfig,
+
+    /// Runtime handle for spawning burst workers
+    runtime: Handle,
+}
+
+impl ElasticController {
+    /// Probe scheduler pressure; maybe spawn one burst worker.
+    pub fn probe(&self) {
+        use std::sync::atomic::Ordering as O;
+
+        if self.shutting_down.load(O::Relaxed) {
+            return;
+        }
+        // Static budget disabled → feature off entirely.
+        if self.config.burst_workers_max == 0 {
+            return;
+        }
+
+        let Some(queue) = self.queue.upgrade() else { return };
+        let Some(wm) = self.worker_manager.upgrade() else { return };
+
+        // No pressure if the queue drained or a core worker is idle.
+        if queue.len() == 0 || wm.idle_worker_count() > 0 {
+            self.backlog_since_us.store(0, O::Relaxed);
+            return;
+        }
+
+        // Record (or read) the first-backlog instant.
+        //
+        // compare_exchange semantics: only the *first* observer of a new
+        // backlog period stores its timestamp; later probes must NOT
+        // overwrite it (a plain swap would restart the window on every
+        // probe and the threshold would never be reached).
+        let now_us = self.pool_started.elapsed().as_micros() as u64;
+        let first_us = match self.backlog_since_us.compare_exchange(
+            0,
+            now_us,
+            O::AcqRel,
+            O::Relaxed,
+        ) {
+            Ok(_) => now_us,           // we are the first observer
+            Err(prev) => prev,         // keep the original timestamp
+        };
+        if now_us.saturating_sub(first_us) < self.config.burst_backlog_threshold.as_micros() as u64 {
+            // Backlog not persistent enough yet; wait for more probes.
+            return;
+        }
+
+        // Backlog persisted: spawn at most one burst worker per probe,
+        // bounded by the global budget.
+        let alive = self.burst_alive.load(O::Relaxed);
+        if alive >= self.config.burst_workers_max {
+            return;
+        }
+
+        // Reset the timer so the next burst worker requires another full
+        // threshold interval (prevents thundering spawns).
+        self.backlog_since_us.store(0, O::Relaxed);
+
+        // Serialize spawn decisions (cheap: only on the spawn path).
+        let _gate = self.spawn_gate.lock().unwrap();
+        let alive = self.burst_alive.load(O::Relaxed);
+        if alive >= self.config.burst_workers_max {
+            return;
+        }
+        self.burst_alive.fetch_add(1, O::Relaxed);
+
+        let queue = queue as Arc<SchedulingQueue>;
+        let burst_alive = self.burst_alive.clone();
+        let idle_timeout = self.config.burst_idle_timeout;
+        let batch_size = self.config.max_messages_per_batch;
+        let idle_sleep = self.config.idle_sleep_duration;
+
+        // Burst worker = Worker with a *dedicated* shutdown flag the reaper
+        // controls. Setting it makes the worker exit at the next loop check
+        // (after finishing its current batch) — no mid-batch abort.
+        let worker_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = crate::thread::scheduler::shared::worker::Worker::new(
+            usize::MAX, // marker id: burst worker
+            self.runtime.clone(),
+            queue.clone(),
+            worker_shutdown.clone(),
+            crate::thread::scheduler::shared::worker::WorkerConfig {
+                batch_size,
+                idle_sleep_duration: idle_sleep,
+                yield_after_each_message: false,
+                enable_detailed_logging: false,
+            },
+        );
+        let status = worker.status();
+        let handle = worker.spawn();
+
+        // Reaper: set the dedicated flag after idle_timeout of continuous
+        // idleness, then await the worker's natural exit.
+        self.runtime.spawn(async move {
+            let mut idle_since: Option<tokio::time::Instant> = None;
+            loop {
+                let is_processing =
+                    status.load(std::sync::atomic::Ordering::Relaxed) == 1;
+                if is_processing {
+                    idle_since = None;
+                } else {
+                    let started = *idle_since.get_or_insert_with(tokio::time::Instant::now);
+                    if started.elapsed() >= idle_timeout {
+                        break; // reap
+                    }
+                }
+                tokio::time::sleep((idle_timeout / 10).max(Duration::from_millis(10))).await;
+            }
+            // Graceful: worker finishes its current batch, then observes the
+            // flag at the top of the loop and exits.
+            worker_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = handle.await;
+            burst_alive.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
 }
 
 impl fmt::Debug for SharedThreadPool {
@@ -146,6 +318,20 @@ pub struct SharedThreadPool {
 
     /// Scheduled actor paths (registered by path, executed via queue)
     scheduled_paths: std::sync::Mutex<std::collections::HashSet<String>>,
+
+    // ----- Elastic burst-worker state -----
+    /// Currently alive burst workers (bounded by burst_workers_max)
+    burst_workers_alive: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// Monotonic micros when the queue was first observed backlogged with
+    /// zero idle core workers (0 = not currently backlogged).
+    backlog_since_us: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Instant source for backlog tracking (captured at pool creation).
+    pool_started: std::time::Instant,
+
+    /// Serialize burst-worker spawn decisions
+    burst_spawn_gate: Arc<std::sync::Mutex<()>>,
 }
 
 impl SharedThreadPool {
@@ -177,13 +363,39 @@ impl SharedThreadPool {
             worker_manager,
             status,
             scheduled_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
+            burst_workers_alive: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            backlog_since_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pool_started: std::time::Instant::now(),
+            burst_spawn_gate: Arc::new(std::sync::Mutex::new(())),
         };
 
         pool.start_workers();
+        pool.start_elastic_patrol();
 
         pool.status.store(SchedulerStatus::Running as usize, Ordering::SeqCst);
 
         pool
+    }
+
+    /// Periodic elastic patrol: probes scheduler pressure on a fixed tick
+    /// so burst spawning does not depend on fresh message arrivals.
+    ///
+    /// This is essential when callers *await* their send (a saturated pool
+    /// would otherwise never see another wake hook until a burst worker
+    /// exists — a chicken-and-egg stall the stress suite exposed).
+    fn start_elastic_patrol(&self) {
+        if self.config.burst_workers_max == 0 {
+            return;
+        }
+        let controller = self.elastic_controller();
+        let shutting_down = self.is_shutting_down.clone();
+        let tick = self.config.burst_backlog_threshold / 2;
+        self.runtime_handle.spawn(async move {
+            while !shutting_down.load(Ordering::Relaxed) {
+                tokio::time::sleep(tick).await;
+                controller.probe();
+            }
+        });
     }
 
     /// Start worker tasks
@@ -248,6 +460,9 @@ impl SharedThreadPool {
             let queue = self.scheduling_queue.clone();
             let weak_mailbox = Arc::downgrade(&mailbox);
             let shutting_down = self.is_shutting_down.clone();
+            // Elastic-scaling probe: every wake (message arrival under load)
+            // feeds the burst-worker controller.
+            let elastic = self.elastic_controller();
             mailbox.set_wake_hook(Arc::new(move || {
                 if shutting_down.load(Ordering::Relaxed) {
                     return;
@@ -255,6 +470,7 @@ impl SharedThreadPool {
                 if let Some(strong) = weak_mailbox.upgrade() {
                     if strong.schedule_state().try_enqueue() {
                         queue.push(strong);
+                        elastic.probe();
                     }
                 }
             }));
@@ -320,6 +536,43 @@ impl SharedThreadPool {
         self.pool_size
     }
 
+    // ------------------------------------------------------------------
+    // Elastic burst workers (2026-10-02, per stress report M1 finding)
+    // ------------------------------------------------------------------
+    //
+    // Motivation: when every core worker is stuck inside a long CPU-bound
+    // handler (e.g. minute-level tasks occupying all 8 workers), short
+    // tasks queued behind them starve for the entire duration. The elastic
+    // controller spawns *temporary* burst workers to drain the backlog and
+    // reaps them after `burst_idle_timeout` of continuous idleness.
+    //
+    // Global thread bound: pool_size + burst_workers_max — no explosion.
+    //
+    // Controller algorithm (probe() runs on every queue push under load):
+    //   1. If a core worker is idle OR no burst budget remains → reset.
+    //   2. If queue is empty → reset.
+    //   3. Otherwise record the first-backlog instant (CAS once); once the
+    //      backlog has persisted ≥ burst_backlog_threshold, spawn one
+    //      burst worker and reset the timer (one worker per interval).
+
+    /// Build a controller handle for injection into wake hooks.
+    ///
+    /// The controller holds only weak references to the queue so a parked
+    /// spawn path can never keep the pool alive.
+    fn elastic_controller(&self) -> Arc<ElasticController> {
+        Arc::new(ElasticController {
+            queue: Arc::downgrade(&self.scheduling_queue),
+            worker_manager: Arc::downgrade(&self.worker_manager),
+            shutting_down: self.is_shutting_down.clone(),
+            burst_alive: self.burst_workers_alive.clone(),
+            backlog_since_us: self.backlog_since_us.clone(),
+            pool_started: self.pool_started,
+            spawn_gate: self.burst_spawn_gate.clone(),
+            config: self.config.clone(),
+            runtime: self.runtime_handle.clone(),
+        })
+    }
+
     /// Get the current scheduler status
     pub fn status(&self) -> SchedulerStatus {
         SchedulerStatus::from_usize(self.status.load(Ordering::Relaxed))
@@ -329,6 +582,7 @@ impl SharedThreadPool {
     pub fn metrics(&self) -> SchedulerMetrics {
         SchedulerMetrics {
             pool_size: self.pool_size,
+            burst_workers_alive: self.burst_workers_alive.load(Ordering::Relaxed),
             queue_length: self.scheduling_queue.len(),
             is_shutting_down: self.is_shutting_down.load(Ordering::Relaxed),
             status: self.status(),

@@ -149,19 +149,44 @@ pub trait ActorRef: Send + Sync + Debug {
     /// ## Performance
     /// - Uses dynamic dispatch
     /// - Allocates future on heap
-    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
-
-    /// Sends a type-erased message and awaits response with timeout
+    /// Sends a type-erased message and awaits the actor's response.
+    ///
+    /// **Unified semantics (2026-10-02, per stress report §9)**: `send` is an
+    /// *unbounded ask* — the future resolves when the actor processes the
+    /// message and produces a result. It never applies an implicit engine
+    /// default timeout; use [`ActorRef::send_with_timeout`] to bound the
+    /// wait. Fire-and-forget delivery is [`ActorRef::deliver`].
     ///
     /// ## Parameters
     /// - `msg`: Type-erased message (must implement Send)
-    /// - `timeout`: Duration for the operation
     ///
     /// ## Returns
     /// - `Ok(response)`: Message processed successfully
     /// - `Err(error)`: Message processing failed
     ///
+    /// ## Performance
+    /// - Uses dynamic dispatch
+    /// - Allocates future on heap
+    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
+
+    /// Sends a type-erased message and awaits response, with an optional
+    /// timeout.
+    ///
+    /// **Unified semantics**: `timeout == None` behaves exactly like
+    /// [`ActorRef::send`] (unbounded ask). `Some(d)` bounds the wait; on
+    /// expiry the *caller* gives up — the message stays enqueued and the
+    /// actor may still process it later.
     fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
+
+    /// Fire-and-forget delivery: enqueues the message and returns
+    /// immediately after the mailbox accepts it.
+    ///
+    /// **Unified semantics**: `deliver` never waits for the actor to process
+    /// the message. It resolves as soon as the mailbox push completes
+    /// (subject to the engine's backpressure strategy), returning a unit
+    /// receipt. This is the explicit tell path; [`ActorRefExt::tell`] is
+    /// built on it.
+    fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>>;
 
     /// Stops the actor
     ///
@@ -253,7 +278,7 @@ pub trait ActorRefExt: ActorRef {
     fn tell<M: Message>(&self, msg: M) {
         let actor_ref = self.clone_boxed();
         tokio::spawn(async move {
-            let _ = actor_ref.send(Box::new(msg) as BoxedMessage).await;
+            let _ = actor_ref.deliver(Box::new(msg) as BoxedMessage).await;
         });
     }
 }
@@ -331,6 +356,12 @@ impl ActorRef for DeadTargetRef {
         _msg: BoxedMessage,
         _timeout_duration: Option<std::time::Duration>,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
+        })
+    }
+
+    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
         })

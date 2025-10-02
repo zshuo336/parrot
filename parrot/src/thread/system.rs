@@ -152,7 +152,18 @@ impl ThreadActorSystem {
         let config = Arc::new(config);
 
         let factory = ThreadSchedulerFactory::new(runtime_handle.clone());
-        let scheduler_group = Arc::new(factory.create_scheduler_group(None, None));
+        let pool_config = crate::thread::scheduler::shared::SharedThreadPoolConfig {
+            pool_size: config.shared_pool_size,
+            burst_workers_max: config.shared_burst_workers_max,
+            burst_backlog_threshold: std::time::Duration::from_millis(
+                config.shared_burst_backlog_threshold_ms,
+            ),
+            burst_idle_timeout: std::time::Duration::from_millis(
+                config.shared_burst_idle_timeout_ms,
+            ),
+            ..Default::default()
+        };
+        let scheduler_group = Arc::new(factory.create_scheduler_group(Some(pool_config), None));
 
         Self {
             config,
@@ -381,8 +392,13 @@ impl ThreadActorSystem {
         let boxed_self: BoxedActorRef = Box::new(ThreadActorRef::<A>::new(
             actor_path.clone(),
             Arc::downgrade(&mailbox) as WeakMailboxRef,
-            self.config.default_backpressure_strategy.clone(),
-            self.config.default_ask_timeout,
+            thread_config
+                .backpressure_strategy
+                .clone()
+                .unwrap_or_else(|| self.config.default_backpressure_strategy.clone()),
+            thread_config
+                .ask_timeout
+                .unwrap_or(self.config.default_ask_timeout),
             None,
         ));
         context.set_self_ref(boxed_self);
@@ -428,7 +444,7 @@ impl ThreadActorSystem {
                 ActorRegistryEntry {
                     actor_ref: actor_ref.clone() as Arc<dyn ActorRef>,
                     mailbox: mailbox.clone(),
-                    config: thread_config,
+                    config: thread_config.clone(),
                 },
             );
         }
@@ -436,8 +452,13 @@ impl ThreadActorSystem {
         Ok(ThreadActorRef::<A>::new(
             actor_path,
             Arc::downgrade(&mailbox) as WeakMailboxRef,
-            self.config.default_backpressure_strategy.clone(),
-            self.config.default_ask_timeout,
+            thread_config
+                .backpressure_strategy
+                .clone()
+                .unwrap_or_else(|| self.config.default_backpressure_strategy.clone()),
+            thread_config
+                .ask_timeout
+                .unwrap_or(self.config.default_ask_timeout),
             None,
         ))
     }
@@ -526,6 +547,17 @@ impl ThreadActorSystem {
     }
 
     /// Internal shutdown: stop all actors, deschedule, close mailboxes.
+    /// Snapshot of shared-pool scheduler metrics (incl. elastic burst
+    /// workers). Returns `None` if the shared scheduler does not expose
+    /// detailed metrics.
+    pub fn scheduler_metrics(
+        &self,
+    ) -> Option<crate::thread::scheduler::shared::SchedulerMetrics> {
+        // SharedThreadPool::metrics is on the concrete type; downcast via
+        // as_any-free path: the scheduler group stores Arc<SharedThreadPool>.
+        Some(self.scheduler_group.shared_scheduler.metrics())
+    }
+
     pub async fn shutdown_internal(&self) -> Result<(), SystemError> {
         if self.is_shutting_down.swap(true, Ordering::SeqCst) {
             return Ok(()); // already shutting down
@@ -999,6 +1031,10 @@ impl ActorRef for ArcActorRef {
 
     fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         self.0.send_with_timeout(msg, timeout)
+    }
+
+    fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        self.0.deliver(msg)
     }
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {

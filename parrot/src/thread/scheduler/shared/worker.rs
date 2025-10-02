@@ -241,8 +241,21 @@ impl Worker {
             }));
             match result {
                 Ok(fut) => {
-                    // Execute on a spawned task so panics surface as JoinError.
-                    let task = tokio::spawn(fut);
+                    // Execute on the *blocking* pool so long CPU-bound
+                    // handlers cannot monopolize tokio runtime worker
+                    // threads. This is critical: engine machinery (elastic
+                    // patrol, burst spawn, mailbox wake paths) is itself
+                    // tokio-driven; a batch of minute-level CPU handlers on
+                    // runtime threads would starve the scheduler itself
+                    // (stress report M1: probe starvation observed when 12
+                    // CPU futures occupied all 8 runtime threads).
+                    // Panics still surface as JoinError.
+                    let rt = self.runtime_handle.clone();
+                    let task = tokio::task::spawn_blocking(move || {
+                        // block_on a dedicated blocking thread: the future
+                        // (and any synchronous handler inside) runs here.
+                        rt.block_on(fut)
+                    });
                     match task.await {
                         Ok(inner) => inner,
                         Err(join_err) => Err(crate::thread::error::SystemError::WorkerStateError(
@@ -358,6 +371,7 @@ mod tests {
         struct MockRef(String);
         #[async_trait]
         impl ActorRef for MockRef {
+    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> { Box::pin(async { Ok(()) }) }
             fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async { Ok(Box::new(()) as BoxedMessage) })
             }

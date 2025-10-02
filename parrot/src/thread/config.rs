@@ -64,6 +64,21 @@ pub struct ThreadActorSystemConfig {
 
     /// The number of worker threads in the shared thread pool.
     pub shared_pool_size: usize,
+
+    /// Elastic scaling: max temporary burst workers for the shared pool.
+    ///
+    /// Burst workers are spawned when the scheduling queue stays backlogged
+    /// while all core workers are busy with long CPU tasks, and are reaped
+    /// after sustained idleness. Global thread bound:
+    /// `shared_pool_size + shared_burst_workers_max`.
+    pub shared_burst_workers_max: usize,
+
+    /// How long the queue must stay backlogged (no idle core worker)
+    /// before one burst worker is spawned.
+    pub shared_burst_backlog_threshold_ms: u64,
+
+    /// How long a burst worker may idle before being reaped.
+    pub shared_burst_idle_timeout_ms: u64,
     
     /// The capacity of the shared scheduling queue.
     pub shared_queue_capacity: usize,
@@ -98,6 +113,9 @@ impl Default for ThreadActorSystemConfig {
         Self {
             name: "parrot-thread-system".to_string(),
             shared_pool_size: num_cpus::get(),
+            shared_burst_workers_max: num_cpus::get(),
+            shared_burst_backlog_threshold_ms: 100,
+            shared_burst_idle_timeout_ms: 5000,
             shared_queue_capacity: 10000,
             max_dedicated_threads: 32,
             default_scheduling_mode: SchedulingMode::SharedPool { max_messages_per_run: 10 },
