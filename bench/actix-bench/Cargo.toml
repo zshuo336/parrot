@@ -1,0 +1,14 @@
+# 纯 Actix 基准（独立 workspace，与 akka-bench 平级，不进根 workspace）
+[workspace]
+
+[package]
+name = "actix-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix = "0.13"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+# 与根 workspace release 默认一致（opt-level 3, 无 LTO），保证口径可比
