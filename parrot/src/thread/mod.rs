@@ -6,6 +6,7 @@ pub mod common;
 pub mod config;
 pub mod context;
 pub mod envelope;
+pub mod message_pool;
 pub mod error;
 pub mod mailbox;
 pub mod message;

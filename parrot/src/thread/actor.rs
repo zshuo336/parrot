@@ -213,27 +213,18 @@ where
         }
         
         // Process the message with the inner actor
-        match self.inner.receive_message(envelope.payload, ctx).await {
+        let (payload, reply) = envelope.into_parts();
+        match self.inner.receive_message(payload, ctx).await {
             Ok(response) => {
-                // Send the reply and return an empty response
-                match envelope.reply.send_reply(Ok(response)).await {
-                    Ok(_) => Ok(Box::new(())),
-                    Err(e) => {
-                        error!("Failed to send reply for ask operation: {}", e);
-                        Err(e)
-                    }
-                }
+                // Send the reply and return an empty response.
+                // A dropped receiver (asker timed out) is not an error here.
+                let _ = reply.send(Ok(response));
+                Ok(Box::new(()))
             },
             Err(e) => {
                 // Send error reply
-                let err_clone = ActorError::Other(anyhow!(e.to_string()));
-                match envelope.reply.send_reply(Err(e)).await {
-                    Ok(_) => Ok(Box::new(())),
-                    Err(send_err) => {
-                        error!("Failed to send error reply for ask operation: {}", send_err);
-                        Err(err_clone)
-                    }
-                }
+                let _ = reply.send(Err(e));
+                Ok(Box::new(()))
             }
         }
     }

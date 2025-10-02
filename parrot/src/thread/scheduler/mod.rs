@@ -16,17 +16,20 @@
 // Re-exported modules with unified organization
 pub mod shared;
 pub mod dedicated_thread;
+pub mod sharded;
+pub mod steal;
 pub mod queue;
 
 use std::fmt;
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 
 use crate::thread::mailbox::Mailbox;
 use crate::thread::config::ThreadActorConfig;
 use crate::thread::scheduler::dedicated_thread::DedicatedThreadScheduler;
+use crate::thread::scheduler::sharded::ShardedScheduler;
 use crate::thread::scheduler::shared::SharedThreadPool;
 
 /// Common interface for all thread scheduler implementations
@@ -64,6 +67,23 @@ pub trait ThreadScheduler: fmt::Debug + Send + Sync {
 pub struct SchedulerGroup {
     pub shared_scheduler: Arc<SharedThreadPool>,
     pub dedicated_scheduler: Arc<DedicatedThreadScheduler>,
+    /// Lazily-started shard pool (ADR-14). Shard count defaults to CPU count;
+    /// started on first `Sharded` actor spawn.
+    pub sharded_scheduler: Mutex<Option<Arc<ShardedScheduler>>>,
+    sharded_default_size: usize,
+}
+
+impl SchedulerGroup {
+    /// Get (or start) the sharded scheduler with the default shard count.
+    pub fn sharded(&self) -> Arc<ShardedScheduler> {
+        let mut guard = self.sharded_scheduler.lock().unwrap();
+        if let Some(s) = guard.as_ref() {
+            return s.clone();
+        }
+        let s = ShardedScheduler::start(self.sharded_default_size, 32);
+        *guard = Some(s.clone());
+        s
+    }
 }
 
 impl fmt::Debug for SchedulerGroup {
@@ -71,6 +91,7 @@ impl fmt::Debug for SchedulerGroup {
         f.debug_struct("SchedulerGroup")
             .field("shared_scheduler", &self.shared_scheduler)
             .field("dedicated_scheduler", &self.dedicated_scheduler)
+            .field("sharded_scheduler", &self.sharded_scheduler.lock().unwrap().is_some())
             .finish()
     }
 }
@@ -100,6 +121,10 @@ impl ThreadSchedulerFactory {
         SchedulerGroup {
             shared_scheduler: self.create_shared_pool(config),
             dedicated_scheduler: self.create_dedicated_pool(dedicated_config),
+            sharded_scheduler: Mutex::new(None),
+            sharded_default_size: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8),
         }
     }
 
