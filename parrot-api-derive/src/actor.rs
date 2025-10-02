@@ -22,6 +22,16 @@ pub struct ActorOptions {
     /// Dispatcher type (for future use)
     #[darling(default)]
     dispatcher: Option<String>,
+
+    /// Opt this actor into the async dispatch path (`use_async_handler`).
+    ///
+    /// When `true`, the generated impl overrides `use_async_handler()` to
+    /// return `true`, which makes the Actix engine route every message
+    /// through the async `receive_message` (i.e. the user's
+    /// `handle_message`) instead of probing the sync
+    /// `handle_message_engine` fast path first.
+    #[darling(default)]
+    async_handler: Option<bool>,
 }
 
 /// Represents an engine value that can be a string or an identifier
@@ -112,10 +122,13 @@ pub(crate) fn derive_actor_impl(input: TokenStream) -> TokenStream {
         // If configuration type is not specified, use EmptyConfig instead of ()
         parse_str("parrot_api::actor::EmptyConfig").unwrap()
     };
+
+    // Whether the generated impl opts into the async dispatch path.
+    let async_handler = options.async_handler.unwrap_or(false);
     
     // Generate implementation based on the engine
     let implementation = match engine.as_str() {
-        "actix" => generate_actix_implementation(actor_name, &impl_generics, &ty_generics, where_clause, &config_type),
+        "actix" => generate_actix_implementation(actor_name, &impl_generics, &ty_generics, where_clause, &config_type, async_handler),
         _ => {
             let error_message = format!("Unsupported engine: {}", engine);
             return syn::Error::new(Span::call_site(), error_message)
@@ -128,13 +141,39 @@ pub(crate) fn derive_actor_impl(input: TokenStream) -> TokenStream {
 }
 
 /// Generate implementation for actix engine
+///
+/// Message dispatch contract (ADR-3 resolution):
+///
+/// - `receive_message` now *always* forwards to the user's `handle_message`
+///   (async). This is the primary path of the thread engine, and of the
+///   Actix engine when `async_handler = true`. The historical
+///   `#[cfg(not(test))]` error branch made derive-based actors completely
+///   unusable on the thread engine in production and blocked the async
+///   Actix path; test/prod semantics are now identical.
+/// - `receive_message_with_engine` still forwards to the user's
+///   `handle_message_engine` (sync, Actix-only fast path). Returning `None`
+///   there means "not handled" and the adapter falls back to
+///   `handle_message` instead of dropping the message.
 fn generate_actix_implementation(
     actor_name: &Ident,
     impl_generics: &syn::ImplGenerics,
     ty_generics: &syn::TypeGenerics,
     where_clause: Option<&syn::WhereClause>,
     config_type: &Type,
+    async_handler: bool,
 ) -> TokenStream2 {
+    // Only emit the `use_async_handler` override when opted in; otherwise
+    // the trait default (`false`) applies and manual overrides still win.
+    let use_async_handler_override = if async_handler {
+        quote! {
+            fn use_async_handler(&self) -> bool {
+                true
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         impl #impl_generics parrot_api::actor::Actor for #actor_name #ty_generics #where_clause {
             type Context = parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>;
@@ -143,27 +182,19 @@ fn generate_actix_implementation(
             fn receive_message<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context) 
                 -> parrot_api::types::BoxedFuture<'a, parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
                 Box::pin(async move {
-                    // on test environment, call the user's handle_message implementation
-                    #[cfg(test)]
-                    {
-                        self.handle_message(msg, ctx).await
-                    }
-                    
-                    #[cfg(not(test))]
-                    {
-                        // on production environment, not call handle_message
-                        Err(parrot_api::errors::ActorError::MessageHandlingError("Not use on actix engine".to_string()))
-                    }
+                    self.handle_message(msg, ctx).await
                 })
             }
             
             // Process an incoming message and produce a response. *use on actix engine*
-            fn receive_message_with_engine<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: std::ptr::NonNull<dyn std::any::Any>)
+            fn receive_message_with_engine<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: parrot_api::actor::EngineContextHandle)
                 -> Option<parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
                     // Call the user's message handler implementation
                     // This will be implemented separately by the user
                     self.handle_message_engine(msg, ctx, engine_ctx)
             }
+
+            #use_async_handler_override
 
             fn state(&self) -> parrot_api::actor::ActorState {
                 // Default implementation returns Running

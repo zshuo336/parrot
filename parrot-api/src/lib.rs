@@ -25,8 +25,7 @@
 //! ## Usage Example
 //! 
 //! ```rust
-//! use parrot_api::{actor::{Actor, ActorState, EmptyConfig}, context::ActorContext, message::Message, types::{ActorResult, BoxedFuture, BoxedMessage}};
-//! use std::any::Any;
+//! use parrot_api::{actor::{Actor, ActorState, EmptyConfig, EngineContextHandle}, context::ActorContext, message::Message, types::{ActorResult, BoxedFuture, BoxedMessage}};
 //! 
 //! // Define a message
 //! struct Ping;
@@ -47,7 +46,7 @@
 //!         Box::pin(async move { Ok(msg) })
 //!     }
 //! 
-//!     fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: std::ptr::NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+//!     fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
 //!         None
 //!     }
 //! 
@@ -91,7 +90,7 @@ pub mod priority;
 pub mod macros;
 
 
-pub use actor::{Actor, ActorConfig, ActorFactory, ActorState};
+pub use actor::{Actor, ActorConfig, ActorFactory, ActorState, EngineContextHandle};
 pub use address::{ActorPath, ActorRef};
 pub use context::ActorContext;
 pub use message::{Message, MessageEnvelope, MessageOptions, MessagePriority};

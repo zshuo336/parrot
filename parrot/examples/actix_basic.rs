@@ -72,7 +72,7 @@ impl Actor for GreeterActor {
         &'a mut self,
         msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
-        _engine_ctx: NonNull<dyn Any>
+        _engine_ctx: parrot_api::actor::EngineContextHandle
     ) -> Option<ActorResult<BoxedMessage>> {
         if let Some(greeting) = msg.downcast_ref::<Greeting>() {
             // Create personalized response

@@ -343,7 +343,7 @@ mod tests {
             Box::pin(async move { Ok(msg) })
         }
 
-        fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: std::ptr::NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
             None
         }
 
@@ -444,5 +444,119 @@ mod tests {
         worker.process_mailbox(mailbox.clone(), 4).await.unwrap();
         // Message remains (no processor)
         assert!(!mailbox.is_empty().await);
+    }
+
+    /// ADR-4 feasibility probe: does `batch_size` (default 10) amplify
+    /// head-of-line latency for a single actor?
+    ///
+    /// Setup: one mailbox pre-loaded with a backlog of ~20µs messages plus
+    /// one late probe; drain with batch sizes 1 / 10 / 50 and compare
+    /// total drain time. Within one actor, messages are serialized
+    /// regardless of batching, so the expectation is near-identical drain
+    /// times — documenting that ADR-4's cost is code complexity, not
+    /// single-actor HOL amplification. (Cross-actor fairness is the real
+    /// lever of the knob; see the shared-pool stress scenarios.)
+    #[derive(Debug, Default)]
+    struct SpinActor {
+        sink: u64,
+    }
+
+    impl Actor for SpinActor {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                let spin = std::time::Instant::now();
+                while spin.elapsed().as_micros() < 20 {}
+                if msg.downcast_ref::<u64>().is_some() {
+                    self.sink += 1;
+                }
+                Ok(msg)
+            })
+        }
+
+        fn receive_message_with_engine<'a>(
+            &'a mut self,
+            _msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+            _engine_ctx: parrot_api::actor::EngineContextHandle,
+        ) -> Option<ActorResult<BoxedMessage>> {
+            None
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+
+    async fn drain_with_batch(batch: usize, backlog: usize) -> std::time::Duration {
+        let worker = Worker::new(
+            0,
+            Handle::current(),
+            Arc::new(SchedulingQueue::new(1000)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            WorkerConfig {
+                batch_size: batch,
+                ..Default::default()
+            },
+        );
+        let path = mock_actor_path(&format!("bench/b{}", batch));
+        let mailbox = Arc::new(MpscMailbox::new(8192, path));
+        let context = ThreadContext::new_for_test("bench");
+        let processor = Arc::new(ActorProcessor::<SpinActor>::new(
+            ThreadActor::new_for_test(SpinActor::default()),
+            context,
+            "bench".to_string(),
+            ThreadActorConfig::default(),
+        ));
+        mailbox.set_processor(processor as Arc<dyn crate::thread::processor::ProcessorInterface>);
+
+        for i in 0..backlog {
+            mailbox
+                .push(Box::new(i as u64) as BoxedMessage, crate::thread::config::BackpressureStrategy::Block)
+                .await
+                .unwrap();
+        }
+        mailbox
+            .push(Box::new(u64::MAX) as BoxedMessage, crate::thread::config::BackpressureStrategy::Block)
+            .await
+            .unwrap();
+
+        let t0 = std::time::Instant::now();
+        while !mailbox.is_empty().await {
+            worker.process_mailbox(mailbox.clone(), batch).await.unwrap();
+        }
+        t0.elapsed()
+    }
+
+    #[tokio::test]
+    async fn batch_size_hol_experiment() {
+        let backlog = 200usize;
+        let d1 = drain_with_batch(1, backlog).await;
+        let d10 = drain_with_batch(10, backlog).await;
+        let d50 = drain_with_batch(50, backlog).await;
+
+        println!("\n==== ADR-4 batch_size HOL experiment (backlog={}, ~20µs/msg) ====", backlog);
+        println!("batch_size= 1  drain={:?}", d1);
+        println!("batch_size=10  drain={:?}", d10);
+        println!("batch_size=50  drain={:?}", d50);
+        let (a, b, c) = (d1.as_secs_f64(), d10.as_secs_f64(), d50.as_secs_f64());
+        println!("ratios: b10/b1={:.2} b50/b1={:.2}", b / a, c / a);
+
+        // Expect near-invariance for a single serialized actor.
+        assert!(
+            c / a < 3.0 && a / c < 3.0,
+            "unexpected batch-size sensitivity: d1={:?} d10={:?} d50={:?}",
+            d1, d10, d50
+        );
     }
 }

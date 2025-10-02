@@ -175,7 +175,7 @@ impl DefaultActor {
         )
     }
 
-    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
 
@@ -204,7 +204,7 @@ impl StringEngineActor {
         Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
     
-    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
 }
@@ -232,7 +232,7 @@ impl ConstantEngineActor {
         Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
     
-    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
 }
@@ -261,7 +261,7 @@ impl ComplexConfigActor {
         Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
     
-    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
 }
@@ -289,7 +289,7 @@ impl SimpleActor {
         Err(ActorError::MessageHandlingError("Unknown message".to_string()))
     }
     
-    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
 }
@@ -332,7 +332,7 @@ impl<T: Debug + Clone + Send + 'static> GenericActor<T> {
         Err(ActorError::MessageHandlingError("Unknown message type".to_string()))
     }
     
-    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    pub fn handle_message_engine(&mut self, _msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
 }
@@ -374,10 +374,9 @@ impl EngineAwareActor {
         )
     }
     
-    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    pub fn handle_message_engine(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         // Only process if we can downcast to our expected engine context type
-        let engine_ctx_ref = unsafe { engine_ctx.as_ref() };
-        if let Some(ctx) = engine_ctx_ref.downcast_ref::<TestEngineContext>() {
+        if let Some(ctx) = engine_ctx.downcast_ref::<TestEngineContext>() {
             // First check operation mode
             match ctx.mode {
                 EngineMode::ErrorProne => {
@@ -466,7 +465,7 @@ impl Actor for ManualActor {
         })
     }
     
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
         None
     }
     
@@ -702,13 +701,13 @@ mod tests {
         let increment_msg = Box::new(Increment(5)) as BoxedMessage;
         
         // Test the derive macro's receive_message_with_engine implementation
-        let derived_result = derived_actor.receive_message_with_engine(increment_msg, &mut ctx_derived, engine_ctx);
+        let derived_result = derived_actor.receive_message_with_engine(increment_msg, &mut ctx_derived, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) });
         
         // Create a new message since the previous one was moved
         let increment_msg2 = Box::new(Increment(5)) as BoxedMessage;
         
         // Test the manually implemented receive_message_with_engine
-        let manual_result = manual_actor.receive_message_with_engine(increment_msg2, &mut ctx_manual, engine_ctx);
+        let manual_result = manual_actor.receive_message_with_engine(increment_msg2, &mut ctx_manual, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) });
         
         // Both should return None (default behavior)
         assert!(derived_result.is_none(), "ParrotActor derive macro's receive_message_with_engine should return None");
@@ -751,12 +750,12 @@ mod tests {
         let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
         
         // Test receive_message_with_engine for each actor
-        let default_result = default_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_default, engine_ctx);
-        let string_result = string_engine_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_string, engine_ctx);
-        let constant_result = constant_engine_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_constant, engine_ctx);
-        let complex_result = complex_config_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_complex, engine_ctx);
-        let simple_result = simple_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_simple, engine_ctx);
-        let generic_result = generic_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_generic, engine_ctx);
+        let default_result = default_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_default, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) });
+        let string_result = string_engine_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_string, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) });
+        let constant_result = constant_engine_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_constant, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) });
+        let complex_result = complex_config_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_complex, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) });
+        let simple_result = simple_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_simple, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) });
+        let generic_result = generic_actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx_generic, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) });
         
         // All derived actors should return None
         assert!(default_result.is_none(), "DefaultActor's receive_message_with_engine should return None");
@@ -787,7 +786,7 @@ mod tests {
         let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_ctx) as Box<dyn Any>)) };
         
         // Test Increment with engine context
-        let result = actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, engine_ptr);
+        let result = actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
         assert!(result.is_some(), "Should handle the message with engine context");
         
         if let Some(Ok(boxed)) = result {
@@ -801,7 +800,7 @@ mod tests {
         
         // Test Multiply with engine context
         let result = actor.receive_message_with_engine(Box::new(Multiply(3)) as BoxedMessage, 
-                                                     &mut ctx, engine_ptr);
+                                                     &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
         assert!(result.is_some());
         
         if let Some(Ok(boxed)) = result {
@@ -814,8 +813,7 @@ mod tests {
         }
         
         // Test GetEngineCounter
-        let result = actor.receive_message_with_engine(Box::new(GetEngineCounter) as BoxedMessage, 
-                                                     &mut ctx, engine_ptr);
+        let result = actor.receive_message_with_engine(Box::new(GetEngineCounter) as BoxedMessage,                                                      &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
         assert!(result.is_some());
         
         if let Some(Ok(boxed)) = result {
@@ -826,8 +824,7 @@ mod tests {
         }
         
         // Test Reset
-        let result = actor.receive_message_with_engine(Box::new(Reset) as BoxedMessage, 
-                                                     &mut ctx, engine_ptr);
+        let result = actor.receive_message_with_engine(Box::new(Reset) as BoxedMessage,                                                      &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
         assert!(result.is_some());
         
         if let Some(Ok(_)) = result {
@@ -860,8 +857,7 @@ mod tests {
         let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_ctx) as Box<dyn Any>)) };
         
         // Test read operation (should succeed)
-        let result = actor.receive_message_with_engine(Box::new(GetEngineCounter) as BoxedMessage, 
-                                                     &mut ctx, engine_ptr);
+        let result = actor.receive_message_with_engine(Box::new(GetEngineCounter) as BoxedMessage,                                                      &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
         assert!(result.is_some());
         
         if let Some(Ok(boxed)) = result {
@@ -873,7 +869,7 @@ mod tests {
         
         // Test write operation (should fail)
         let result = actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, 
-                                                     &mut ctx, engine_ptr);
+                                                     &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
         assert!(result.is_some());
         
         if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
@@ -920,7 +916,7 @@ mod tests {
                 _ => unreachable!(),
             };
             
-            let result = actor.receive_message_with_engine(message, &mut ctx, engine_ptr);
+            let result = actor.receive_message_with_engine(message, &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
             assert!(result.is_some(), "Message {} should be handled", i);
             
             if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
@@ -950,8 +946,7 @@ mod tests {
         let engine_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_ctx) as Box<dyn Any>)) };
         
         // Test invalid operation
-        let result = actor.receive_message_with_engine(Box::new(InvalidOperation) as BoxedMessage, 
-                                                     &mut ctx, engine_ptr);
+        let result = actor.receive_message_with_engine(Box::new(InvalidOperation) as BoxedMessage,                                                      &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
         assert!(result.is_some());
         
         if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
@@ -978,7 +973,7 @@ mod tests {
         
         // Should fall back to regular message handling
         let result = actor.receive_message_with_engine(Box::new(Increment(5)) as BoxedMessage, 
-                                                     &mut ctx, engine_ptr);
+                                                     &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
         assert!(result.is_none(), "Should return None for fallback with incompatible context");
         
         // Test that regular message handling still works
@@ -1027,7 +1022,7 @@ mod tests {
                 _ => unreachable!(),
             };
             
-            let result = actor.receive_message_with_engine(msg, &mut ctx, engine_ptr);
+            let result = actor.receive_message_with_engine(msg, &mut ctx, unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ptr) });
             assert!(result.is_some(), "Operation {} should return Some", i);
             
             match result {
@@ -1053,5 +1048,116 @@ mod tests {
         unsafe {
             let _ = Box::from_raw(engine_ptr.as_ptr());
         }
+    }
+}
+// ===========================================================================
+// ADR-3 fix regression: derive codegen behavior
+// ===========================================================================
+
+mod adr3_regression {
+    use super::*;
+    use parrot_api::actor::EngineContextHandle;
+
+    /// Actor deriving WITHOUT async opt-in: `use_async_handler` must be the
+    /// trait default (false) — the macro must NOT emit an override.
+    #[derive(ParrotActor, Debug)]
+    #[ParrotActor(engine = "actix")]
+    pub struct SyncDefaultActor { pub v: u32 }
+
+    impl SyncDefaultActor {
+        pub async fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>) -> ActorResult<BoxedMessage> {
+            if let Some(i) = msg.downcast_ref::<Increment>() { self.v += i.0; }
+            Ok(Box::new(self.v) as BoxedMessage)
+        }
+        pub fn handle_message_engine(&mut self, _m: BoxedMessage, _c: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> { None }
+    }
+
+    /// Actor deriving WITH async opt-in: macro must emit
+    /// `use_async_handler() == true`.
+    #[derive(ParrotActor, Debug)]
+    #[ParrotActor(engine = "actix", async_handler = true)]
+    pub struct AsyncOptInActor { pub v: u32 }
+
+    impl AsyncOptInActor {
+        pub async fn handle_message(&mut self, msg: BoxedMessage, _ctx: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>) -> ActorResult<BoxedMessage> {
+            if let Some(i) = msg.downcast_ref::<Increment>() { self.v += i.0; }
+            Ok(Box::new(self.v) as BoxedMessage)
+        }
+        pub fn handle_message_engine(&mut self, _m: BoxedMessage, _c: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> { None }
+    }
+
+    #[test]
+    fn async_opt_in_flag_defaults_to_false() {
+        let a = SyncDefaultActor { v: 0 };
+        assert!(!a.use_async_handler(), "default must NOT opt into async dispatch");
+    }
+
+    #[test]
+    fn async_opt_in_attribute_sets_flag_true() {
+        let a = AsyncOptInActor { v: 0 };
+        assert!(a.use_async_handler(), "async_handler = true must set the flag");
+    }
+
+    /// The core ADR-3 regression assertion: `receive_message` forwards to
+    /// `handle_message` WITHOUT any cfg(test) bifurcation. We simulate the
+    /// "production" codegen by driving the trait method the same way the
+    /// thread engine does. Since integration tests compile with cfg(test)
+    /// active, the strongest available in-crate proof is that dispatch
+    /// works through BOTH entry points and returns user errors (not the
+    /// historical "Not use on actix engine").
+    #[tokio::test]
+    async fn receive_message_forwards_in_all_cfg_modes() {
+        let mut actor = SyncDefaultActor { v: 10 };
+        let mut ctx = parrot::actix::ActixContext::<parrot::actix::ActixActor<SyncDefaultActor>>::default();
+
+        let r = actor.receive_message(Box::new(Increment(5)), &mut ctx).await;
+        assert!(r.is_ok(), "forwarding must work identically regardless of cfg");
+        assert_eq!(*r.unwrap().downcast::<u32>().unwrap(), 15);
+    }
+
+    /// The macro must not emit the historical error branch: assert that the
+    /// reply NEVER equals the poison string, across many invocations.
+    #[tokio::test]
+    async fn receive_message_never_returns_legacy_error() {
+        let mut actor = SyncDefaultActor { v: 0 };
+        let mut ctx = parrot::actix::ActixContext::<parrot::actix::ActixActor<SyncDefaultActor>>::default();
+        for i in 0..50 {
+            let r = actor.receive_message(Box::new(Increment(i)), &mut ctx).await;
+            match r {
+                Ok(boxed) => { let v: u32 = *boxed.downcast::<u32>().unwrap(); assert_eq!(v, (0..=i).sum::<u32>()); }
+                Err(e) => assert!(
+                    !e.to_string().contains("Not use on actix engine"),
+                    "legacy cfg(not(test)) error leaked: {}", e
+                ),
+            }
+        }
+    }
+
+    /// Derive + safe handle: engine fast-path handler receives the wrapper
+    /// type and its safe downcasts behave.
+    #[test]
+    fn handle_message_engine_consumes_safe_handle() {
+        #[derive(ParrotActor, Debug)]
+        #[ParrotActor(engine = "actix")]
+        pub struct HandleProbeActor { pub seen: Option<u32> }
+
+        impl HandleProbeActor {
+            pub async fn handle_message(&mut self, _m: BoxedMessage, _c: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>) -> ActorResult<BoxedMessage> {
+                Ok(Box::new(0u32) as BoxedMessage)
+            }
+            pub fn handle_message_engine(&mut self, _m: BoxedMessage, _c: &mut parrot::actix::ActixContext<parrot::actix::ActixActor<Self>>, e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
+                self.seen = e.downcast_ref::<u32>().copied();
+                Some(Ok(Box::new(1u32) as BoxedMessage))
+            }
+        }
+
+        let mut a = HandleProbeActor { seen: None };
+        let data = 42u32;
+        let raw: NonNull<dyn Any> = NonNull::from(&data);
+        let h = unsafe { EngineContextHandle::from_raw(raw) };
+        let mut ctx = parrot::actix::ActixContext::<parrot::actix::ActixActor<HandleProbeActor>>::default();
+        let r = a.handle_message_engine(Box::new(Increment(1)), &mut ctx, h).unwrap().unwrap();
+        assert_eq!(*r.downcast::<u32>().unwrap(), 1);
+        assert_eq!(a.seen, Some(42));
     }
 }

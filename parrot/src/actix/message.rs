@@ -6,7 +6,7 @@ use parrot_api::types::{BoxedMessage, ActorResult};
 use parrot_api::errors::ActorError;
 
 /// Wrapper for MessageEnvelope to implement actix::Message
-/// 
+///
 /// # Overview
 /// This is necessary since we can't directly implement external traits
 /// for external types (orphan rule).
@@ -45,11 +45,15 @@ impl MessageDowncast for BoxedMessage {
     }
     
     fn downcast_ref<M: 'static>(&self) -> Option<&M> {
-        <dyn Any>::downcast_ref::<M>(self)
+        // Deref through the Box first: `self` is `&Box<dyn Any>`, and the
+        // pointee (`dyn Any`) is what carries the concrete type. Calling
+        // `downcast_ref` on `&Box<dyn Any>` directly would test whether the
+        // reference itself is an `M` — always None.
+        (**self).downcast_ref::<M>()
     }
     
     fn downcast_mut<M: 'static>(&mut self) -> Option<&mut M> {
-        <dyn Any>::downcast_mut::<M>(self)
+        (**self).downcast_mut::<M>()
     }
 }
 

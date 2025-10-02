@@ -161,7 +161,7 @@ impl Actor for BasicTestActor {
         &'a mut self,
         msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
-        _engine_ctx: NonNull<dyn Any>
+        _engine_ctx: parrot_api::actor::EngineContextHandle
     ) -> Option<ActorResult<BoxedMessage>> {
         if let Some(test_msg) = msg.downcast_ref::<TestMessage>() {
             // Echo back with actor name
