@@ -473,6 +473,7 @@ mod tests {
     }
 
     impl parrot_api::address::ActorRef for FakeRef {
+    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> { Box::pin(async { Ok(()) }) }
         fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async { Err(ActorError::ActorNotFound("fake".into())) })
         }

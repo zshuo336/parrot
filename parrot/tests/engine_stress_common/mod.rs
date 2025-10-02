@@ -35,6 +35,36 @@ pub struct Echo {
     pub value: u64,
 }
 
+/// 分钟级 CPU 密集任务（约 N 秒的纯计算）。
+pub struct MinuteCpuTask {
+    pub iterations: u64,
+    pub salt: u64,
+}
+
+/// 中等时长 CPU 任务（秒级），用于"新长任务持续加入"。
+pub struct MediumCpuTask {
+    pub iterations: u64,
+    pub salt: u64,
+}
+
+/// 混合负载里的短小任务（微秒级）。
+pub struct TinyTask {
+    pub salt: u64,
+}
+
+/// 分片长任务：分 N 片执行，每片之间向系统让出（协作式）。
+pub struct ChunkedLongTask {
+    pub total_iterations: u64,
+    pub chunk_iterations: u64,
+    pub salt: u64,
+}
+
+/// 批量 echo（一次消息做 N 个小工作，降低测量噪声）。
+pub struct BatchEcho {
+    pub value: u64,
+    pub batch: u64,
+}
+
 /// 读取计数。
 pub struct GetCount;
 
@@ -84,6 +114,9 @@ pub struct BenchResult {
     pub latencies: LatencyStats,
     pub correctness: bool,
     pub note: String,
+    /// 场景的标称 CPU 工作量（秒）。用于计算 worker 利用率 =
+    /// 标称总量 / (墙钟 × 可用核数)。None = 不适用。
+    pub cpu_work_secs: Option<f64>,
 }
 
 impl BenchResult {
@@ -96,8 +129,12 @@ impl BenchResult {
     }
 
     pub fn print(&self) {
+        let util = self
+            .cpu_work_secs
+            .map(|w| format!(" | util={:.0}%", self.utilization() * 100.0))
+            .unwrap_or_default();
         println!(
-            "[{}] {} | msgs={} | wall={:.3}s | tput={:.0}/s | lat p50={:.1}ms p90={:.1}ms p99={:.1}ms max={:.1}ms | correct={}",
+            "[{}] {} | msgs={} | wall={:.3}s | tput={:.0}/s | lat p50={:.1}ms p90={:.1}ms p99={:.1}ms max={:.1}ms{} | correct={}",
             self.engine,
             self.name,
             self.total_messages,
@@ -107,11 +144,22 @@ impl BenchResult {
             self.latencies.p90_us as f64 / 1000.0,
             self.latencies.p99_us as f64 / 1000.0,
             self.latencies.max_us as f64 / 1000.0,
+            util,
             self.correctness,
         );
         if !self.note.is_empty() {
             println!("        note: {}", self.note);
         }
+    }
+
+    /// 有效 CPU 利用率 = 标称工作量 / (墙钟 × 核数)。
+    pub fn utilization(&self) -> f64 {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8) as f64;
+        self.cpu_work_secs
+            .map(|w| w / (self.elapsed.as_secs_f64().max(f64::EPSILON) * cores))
+            .unwrap_or(0.0)
     }
 }
 
@@ -129,6 +177,13 @@ impl Sink {
         self.0.load(Ordering::Relaxed)
     }
 }
+
+/// 实测 burn_cpu 速率（iters/sec）。
+///
+/// 标定环境：**release test profile**（`cargo test --release`），
+/// Apple Silicon。2G iters 实测 ~2.27s → ~0.88 G/s。
+/// （debug profile 约 0.194 G/s，若用 debug 跑请自行换算：场景时长 ×4.5。）
+pub const BURN_RATE: f64 = 880_000_000.0;
 
 /// CPU 工作负载：不可被优化器折叠的迭代混合运算。
 #[inline]
@@ -167,12 +222,16 @@ impl Report {
 
     /// 输出对比小结（markdown 表格行）。
     pub fn dump_markdown(&self) -> String {
-        let mut out = String::from("| 场景 | 引擎 | 消息数 | 耗时(s) | 吞吐(/s) | p50(ms) | p90(ms) | p99(ms) | max(ms) | 正确 |\n|---|---|---|---|---|---|---|---|---|---|\n");
+        let mut out = String::from("| 场景 | 引擎 | 消息数 | 耗时(s) | 吞吐(/s) | p50(ms) | p90(ms) | p99(ms) | max(ms) | util | 正确 |\n|---|---|---|---|---|---|---|---|---|---|---|\n");
         let mut rows = self.results.lock().unwrap().clone();
         rows.sort_by(|a, b| (&a.name, a.engine).cmp(&(&b.name, b.engine)));
         for r in rows {
+            let util = r
+                .cpu_work_secs
+                .map(|w| format!("{:.0}%", r.utilization() * 100.0))
+                .unwrap_or_else(|| "-".into());
             out.push_str(&format!(
-                "| {} | {} | {} | {:.3} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
+                "| {} | {} | {} | {:.3} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} |\n",
                 r.name,
                 r.engine,
                 r.total_messages,
@@ -182,6 +241,7 @@ impl Report {
                 r.latencies.p90_us as f64 / 1000.0,
                 r.latencies.p99_us as f64 / 1000.0,
                 r.latencies.max_us as f64 / 1000.0,
+                util,
                 r.correctness,
             ));
         }

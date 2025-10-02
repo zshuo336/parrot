@@ -48,6 +48,10 @@ impl ActorRef for MockActorRef {
         })
     }
 
+    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             Ok(())

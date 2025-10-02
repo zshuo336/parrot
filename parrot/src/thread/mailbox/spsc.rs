@@ -339,6 +339,7 @@ mod tests {
 
     #[async_trait]
     impl ActorRef for MockActorRef {
+    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> { Box::pin(async { Ok(()) }) }
         fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async move {
                 Ok(msg)

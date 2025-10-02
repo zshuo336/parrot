@@ -66,6 +66,23 @@ where
         &self.path
     }
 
+    /// Build an envelope with default options (associated helper for
+    /// static contexts like `deliver`).
+    pub fn create_envelope_for(msg: BoxedMessage) -> ActixMessageWrapper {
+        Self::create_envelope_static(msg, None, MessageOptions::default(), "unknown")
+    }
+
+    fn create_envelope_static(msg: BoxedMessage, sender: Option<BoxedActorRef>, options: MessageOptions, message_type: &'static str) -> ActixMessageWrapper {
+        let envelope = MessageEnvelope {
+            id: uuid::Uuid::new_v4(),
+            payload: msg,
+            sender,
+            options,
+            message_type,
+        };
+        ActixMessageWrapper { envelope }
+    }
+
     pub fn create_envelope(&self, msg: BoxedMessage, sender: Option<BoxedActorRef>, options: MessageOptions, message_type: &'static str) -> ActixMessageWrapper {
         let envelope = MessageEnvelope {
             id: uuid::Uuid::new_v4(),
@@ -122,6 +139,24 @@ where
     /// Send a message to the actor and wait for a response
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         self.send_with_timeout(msg, None)
+    }
+
+    /// Fire-and-forget delivery: enqueue and return immediately.
+    fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        let addr = self.addr.clone();
+        Box::pin(async move {
+            // do_send never blocks: actix mailboxes are unbounded; closed
+            // mailboxes silently drop (documented actix semantics). We
+            // surface closure via connected() for observability.
+            if !addr.connected() {
+                return Err(ActorError::InternalError(
+                    "Actor mailbox closed (actor stopped)".to_string(),
+                ));
+            }
+            let wrapper = Self::create_envelope_static(msg, None, MessageOptions::default(), "tell");
+            addr.do_send(wrapper);
+            Ok(())
+        })
     }
     
     /// Send a message to the actor with a timeout

@@ -172,6 +172,35 @@ where
             .await
     }
 
+    /// Unbounded ask: enqueue the AskEnvelope and await the reply channel
+    /// with no timeout wrapper. The future resolves only when the actor
+    /// processes the message (or its mailbox drops).
+    ///
+    /// This backs the unified `ActorRef::send` semantics.
+    pub async fn ask_unbounded(
+        &self,
+        msg: BoxedMessage,
+        strategy: BackpressureStrategy,
+    ) -> ActorResult<BoxedMessage> {
+        let mailbox = self.mailbox()?;
+
+        let (envelope, reply_rx) = AskEnvelope::new(msg);
+        let envelope = Box::new(envelope) as BoxedMessage;
+
+        mailbox
+            .push(envelope, strategy)
+            .await
+            .map_err(|e| ActorError::InternalError(format!("Failed to enqueue ask for {}: {:?}", self.path, e)))?;
+
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(ActorError::ReplyChannelError(format!(
+                "Reply channel closed for ask to {}",
+                self.path
+            ))),
+        }
+    }
+
     /// Ask with custom timeout (default strategy).
     pub async fn ask_with_timeout(
         &self,
@@ -192,13 +221,12 @@ where
         + 'static,
 {
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        // Align with the Actix engine: `send` performs an ask round trip so
-        // callers of the generic ActorRefExt::ask receive the actual reply.
-        // (Previously this returned unit after a bare tell, which made
-        // engine-agnostic `ask` unusable on the thread engine.)
+        // Unified semantics (stress report §9): `send` is an *unbounded*
+        // ask. No implicit engine default timeout — callers who need a
+        // bound use send_with_timeout(Some(d)); fire-and-forget uses
+        // `deliver`.
         Box::pin(async move {
-            self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), self.default_timeout)
-                .await
+            self.ask_unbounded(msg, self.default_strategy.clone()).await
         })
     }
 
@@ -214,10 +242,17 @@ where
                         .await
                 }
                 None => {
-                    self.send_with_strategy(msg, self.default_strategy.clone()).await?;
-                    Ok(Box::new(()) as BoxedMessage)
+                    // Aligned with `send`: unbounded ask.
+                    self.ask_unbounded(msg, self.default_strategy.clone()).await
                 }
             }
+        })
+    }
+
+    fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            self.send_with_strategy(msg, self.default_strategy.clone())
+                .await
         })
     }
 
@@ -301,6 +336,10 @@ mod tests {
                 Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
             }
 
+            fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
             fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
                 Box::pin(async { Ok(()) })
             }
@@ -361,18 +400,46 @@ mod tests {
             path,
             Arc::downgrade(&mailbox) as WeakMailboxRef,
             BackpressureStrategy::Block,
-            // No consumer answers the ask: send must time out, but the
-            // envelope must still be observable in the mailbox.
             Duration::from_millis(100),
             None,
         );
 
+        // Unified semantics (ADR-10): bare `send` is an *unbounded* ask —
+        // with no consumer answering, it would hang forever. Tests must
+        // bound it explicitly via send_with_timeout(Some(d)).
         let message = Box::new("Hello, actor!") as BoxedMessage;
-        let result = actor_ref.send(message).await;
-        assert!(result.is_err(), "unanswered ask must time out");
+        let result = actor_ref
+            .send_with_timeout(message, Some(Duration::from_millis(100)))
+            .await;
+        assert!(result.is_err(), "unanswered bounded ask must time out");
 
         let received = mailbox.pop().await;
         assert!(received.is_some(), "envelope must be enqueued");
+    }
+
+    #[tokio::test]
+    async fn test_send_unbounded_receives_reply_when_answered() {
+        use crate::thread::envelope::AskEnvelope;
+
+        let (mailbox, path) = create_test_mailbox();
+        let actor_ref = ThreadActorRef::<TestActor>::new(
+            path,
+            Arc::downgrade(&mailbox) as WeakMailboxRef,
+            BackpressureStrategy::Block,
+            Duration::from_secs(5),
+            None,
+        );
+
+        // A consumer answers the envelope: the unbounded send resolves.
+        let answerer = tokio::spawn(async move {
+            let env = mailbox.pop().await.expect("envelope queued");
+            let envelope = *env.downcast::<AskEnvelope>().expect("is AskEnvelope");
+            envelope.reply_success(Box::new("ack") as BoxedMessage).await;
+        });
+
+        let result = actor_ref.send(Box::new("hi") as BoxedMessage).await;
+        assert!(result.is_ok(), "answered unbounded send must resolve");
+        answerer.await.unwrap();
     }
 
     #[tokio::test]
@@ -473,8 +540,11 @@ mod tests {
         // Install the mailbox afterwards
         actor_ref.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
         assert!(actor_ref.is_alive().await);
-        // Envelope is enqueued but unanswered: ask semantics time out.
-        assert!(actor_ref.send(Box::new("x") as BoxedMessage).await.is_err());
+        // Envelope is enqueued but unanswered: bounded ask times out.
+        assert!(actor_ref
+            .send_with_timeout(Box::new("x") as BoxedMessage, Some(Duration::from_millis(50)))
+            .await
+            .is_err());
         assert!(mailbox.pop().await.is_some());
     }
 }

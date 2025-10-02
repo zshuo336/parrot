@@ -147,6 +147,10 @@ impl ActorRef for MockActorRef {
         })
     }
 
+
+    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         let is_alive = self.is_alive.clone();
         Box::pin(async move {

@@ -75,6 +75,22 @@ impl ActorRef for TestActorRef {
         })
     }
     
+
+    fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        // Mirror the send() side effects (counter update) so tell()-based
+        // tests observe the same behavior as send().
+        Box::pin(async move {
+            if !*self.alive.read().unwrap() {
+                return Err(ActorError::Stopped);
+            }
+            if let Some(test_msg) = msg.downcast_ref::<TestMessage>() {
+                let val = test_msg.0;
+                let mut counter = self.counter.write().unwrap();
+                *counter += val;
+            }
+            Ok(())
+        })
+    }
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         let alive = self.alive.clone();
         Box::pin(async move {
@@ -128,7 +144,13 @@ impl ActorRef for MockWeakTarget {
             result
         })
     }
-    
+
+    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            Ok(())
+        })
+    }
+
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             Ok(())
