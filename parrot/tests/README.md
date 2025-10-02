@@ -11,6 +11,23 @@ This directory contains tests for the Parrot Actor Framework. The tests are desi
 - **test_system.rs**: Tests actor system operations, including multiple systems, broadcasting, and system management.
 - **test_helpers.rs**: Common utilities used across test files.
 - **integration_test.rs**: A single test that runs all the individual tests.
+- **engine_stress_thread.rs / engine_stress_actix.rs**: 双引擎压测套件（20 场景逐字节对齐；`--ignored --nocapture` 运行，分钟级场景约 3.5 分钟）。
+- **test_correctness_suite.rs**: C1–C8 引擎语义不变量（恰好一次/FIFO/回复路由/背压精确拒绝/停止与超时语义）。
+- **test_business_logic.rs**: B1–B7 业务逻辑正确性（银行守恒/统计精确/状态机/Saga 补偿零泄漏/错误契约/审计序）——模型对照 + 守恒不变量方法。
+- **test_thread_advantages.rs**: A1–A5 thread 引擎结构优势专项（独占线程并行/背压四策略/内存防护/宿主嵌入/海量 spawn）。
+- **test_sharded_scheduler.rs**: ADR-14 亲和性分片调度器（S1 吞吐 1.76×、S2 尾延迟硬隔离）。
+- **test_message_pool.rs**: ADR-15 消息池化微基准（并发 2.83×；含池上限/脏槽复用断言）。
+- **test_steal_bench.rs**: ADR-16 work-stealing 评估（StealDeque/StealRing 正确性 + 与中央队列对比，结论：粗粒度下中央队列最优）。
+- **test_elastic_scaling.rs**: ADR-11 弹性扩缩容（饱和保护/收缩后复救/线程上限）。
+- **test_adr_stress_suite.rs / test_akka_parity_suite.rs**: ADR 回归聚合与 Akka 对等性检查。
+- **test_dispatch_matrix.rs / test_derive_dispatch_paths.rs**: 派发路径与宏生成代码覆盖矩阵。
+- **test_usage_scenario_catalog.rs / test_thread_engine_scenarios.rs**: 使用场景目录与 thread 引擎场景演练。
+- **test_actix_adapter_coverage.rs**: actix 适配层覆盖（含 raw context 直用）。
+
+外部基准（跨语言/跨框架，不在 cargo test 内）：
+- `bench/akka-bench/`（Akka Typed 2.6.20 对等实现，`./run.sh`）
+- `bench/actix-bench/`（纯 actix 零 parrot 依赖，量化 parrot 包装税，`./run.sh`）
+
 
 ## Running Tests
 
