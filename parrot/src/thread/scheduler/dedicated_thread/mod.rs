@@ -2,16 +2,18 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
 use tracing::{debug, error};
 
 use parrot_api::actor::Actor;
-use parrot_api::types::BoxedMessage;
 
-use crate::thread::config::{ThreadActorConfig, SchedulingMode};
+use crate::thread::config::ThreadActorConfig;
 use crate::thread::context::ThreadContext;
 use crate::thread::error::SystemError;
 use crate::thread::mailbox::Mailbox;
@@ -101,7 +103,7 @@ impl DedicatedThreadScheduler {
     /// Create a new dedicated thread scheduler.
     pub fn new(config: Option<DedicatedThreadConfig>) -> Self {
         let config = config.unwrap_or_default();
-        let mut scheduler = Self {
+        let scheduler = Self {
             workers: Mutex::new(HashMap::new()),
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             status: Arc::new(AtomicUsize::new(0)),
@@ -152,7 +154,10 @@ impl DedicatedThreadScheduler {
         ));
 
         worker.start().map_err(|e| {
-            SystemError::ThreadSetupError(format!("Failed to start dedicated thread for {}: {}", path, e))
+            SystemError::ThreadSetupError(format!(
+                "Failed to start dedicated thread for {}: {}",
+                path, e
+            ))
         })?;
 
         workers.insert(path.to_string(), worker);
@@ -220,12 +225,12 @@ impl ThreadScheduler for DedicatedThreadScheduler {
         config: Option<ThreadActorConfig>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // The processor must already be attached to the mailbox.
-        let processor = mailbox
-            .get_processor()
-            .ok_or_else(|| Box::new(SystemError::Other(anyhow::anyhow!(
+        let processor = mailbox.get_processor().ok_or_else(|| {
+            Box::new(SystemError::Other(anyhow::anyhow!(
                 "Mailbox for actor {} has no processor attached",
                 path
-            ))) as Box<dyn Error + Send + Sync>)?;
+            ))) as Box<dyn Error + Send + Sync>
+        })?;
 
         let config = config.unwrap_or_default();
         self.schedule_with_processor(path, mailbox, processor, config)
@@ -321,7 +326,10 @@ impl std::fmt::Debug for DedicatedWorker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DedicatedWorker")
             .field("path", &self.path)
-            .field("state", &WorkerState::from_usize(self.state.load(Ordering::Relaxed)))
+            .field(
+                "state",
+                &WorkerState::from_usize(self.state.load(Ordering::Relaxed)),
+            )
             .finish()
     }
 }
@@ -359,10 +367,7 @@ impl DedicatedWorker {
             .idle_sleep_duration
             .unwrap_or(Duration::from_millis(10));
         let yield_each = self.config.yield_after_each_message.unwrap_or(false);
-        let stack_size = self
-            .config
-            .thread_stack_size
-            .unwrap_or(3 * 1024 * 1024);
+        let stack_size = self.config.thread_stack_size.unwrap_or(3 * 1024 * 1024);
 
         let builder = std::thread::Builder::new()
             .name(format!("parrot-dedicated-{}", path))
@@ -375,7 +380,10 @@ impl DedicatedWorker {
                     .enable_all()
                     .build()
                     .unwrap_or_else(|e| {
-                        error!("Failed to create runtime for dedicated worker {}: {}", path, e);
+                        error!(
+                            "Failed to create runtime for dedicated worker {}: {}",
+                            path, e
+                        );
                         std::process::exit(1);
                     });
 
@@ -462,14 +470,14 @@ impl DedicatedWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread::actor::ThreadActor;
+    use crate::thread::config::SchedulingMode;
+    use crate::thread::context::ThreadContext;
     use crate::thread::mailbox::mpsc::MpscMailbox;
     use crate::thread::processor::ActorProcessor;
-    use crate::thread::actor::ThreadActor;
-    use crate::thread::context::ThreadContext;
     use parrot_api::actor::{Actor, ActorState, EmptyConfig};
     use parrot_api::address::ActorPath;
-    use parrot_api::types::{ActorResult, BoxedFuture};
-    use std::any::Any;
+    use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 
     #[derive(Debug)]
     struct CounterActor {
@@ -484,7 +492,11 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async move {
                 if msg.downcast_ref::<u64>().is_some() {
                     self.count += 1;
@@ -492,10 +504,6 @@ mod tests {
                 }
                 Ok(msg)
             })
-        }
-
-        fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-            None
         }
 
         fn state(&self) -> ActorState {
@@ -545,7 +553,10 @@ mod tests {
         // Send messages; the dedicated thread should process them.
         for i in 0..5u64 {
             mailbox
-                .push(Box::new(i) as BoxedMessage, crate::thread::config::BackpressureStrategy::Block)
+                .push(
+                    Box::new(i) as BoxedMessage,
+                    crate::thread::config::BackpressureStrategy::Block,
+                )
                 .await
                 .unwrap();
         }
@@ -557,9 +568,15 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(mailbox.is_empty().await, "dedicated thread should drain the mailbox");
+        assert!(
+            mailbox.is_empty().await,
+            "dedicated thread should drain the mailbox"
+        );
 
-        scheduler.deschedule("test/dedicated/counter").await.unwrap();
+        scheduler
+            .deschedule("test/dedicated/counter")
+            .await
+            .unwrap();
         assert_eq!(scheduler.worker_count(), 0);
     }
 
@@ -574,7 +591,12 @@ mod tests {
         let (m2, _) = build_actor_stack("test/lim/b");
 
         scheduler
-            .schedule_with_processor("test/lim/a", m1.clone(), m1.get_processor().unwrap(), ThreadActorConfig::default())
+            .schedule_with_processor(
+                "test/lim/a",
+                m1.clone(),
+                m1.get_processor().unwrap(),
+                ThreadActorConfig::default(),
+            )
             .unwrap();
 
         let result = scheduler.schedule_with_processor(

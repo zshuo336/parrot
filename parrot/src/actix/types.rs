@@ -1,12 +1,11 @@
+use actix::Message as ActixMessage;
 /// # Parrot-Actix Common Types
-/// 
+///
 /// This module contains common type definitions used across the Parrot-Actix adapter.
 /// Keeping these types in a separate module helps avoid circular dependencies.
-
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use actix::Message as ActixMessage;
 
 /// Type alias for a boxed trait object that can be sent across threads.
 pub type BoxedMessage = Box<dyn Any + Send>;
@@ -70,4 +69,4 @@ impl ActixMessage for StopMessage {
 
 /// Type alias for context generic parameter
 /// This is used to avoid circular references between modules
-pub struct ActorContextData; 
+pub struct ActorContextData;

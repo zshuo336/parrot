@@ -1,24 +1,20 @@
-use std::time::Duration;
-use std::ptr::NonNull;
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
-use actix;
 use anyhow::Result;
 use async_trait::async_trait;
-use parrot::actix::{ActixActorSystem, ActixActor, ActixContext};
-use parrot::system::ParrotActorSystem;
+use parrot::actix::{ActixActor, ActixContext};
 use parrot_api::{
     actor::{Actor, ActorState, EmptyConfig},
-    message::Message,
-    types::{BoxedMessage, ActorResult, BoxedActorRef, BoxedFuture, WeakActorTarget},
-    system::{ActorSystemConfig, ActorSystem},
-    address::{ActorRefExt, ActorPath, ActorRef},
+    address::{ActorPath, ActorRef, ActorRefExt},
     errors::ActorError,
+    message::Message,
+    types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage, WeakActorTarget},
 };
 
 mod test_helpers;
-use test_helpers::{setup_test_system, wait_for, with_test_system, DEFAULT_WAIT_TIME};
+use test_helpers::with_test_system;
 
 // Define a mock actor reference for testing
 #[derive(Debug)]
@@ -37,15 +33,15 @@ impl MockActorRef {
 #[async_trait]
 impl ActorRef for MockActorRef {
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async move {
-            Ok(msg)
-        })
+        Box::pin(async move { Ok(msg) })
     }
 
-    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async move {
-            Ok(msg)
-        })
+    fn send_with_timeout<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        _timeout: Option<Duration>,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move { Ok(msg) })
     }
 
     fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
@@ -53,9 +49,7 @@ impl ActorRef for MockActorRef {
     }
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
-            Ok(())
-        })
+        Box::pin(async move { Ok(()) })
     }
 
     fn path(&self) -> String {
@@ -63,9 +57,7 @@ impl ActorRef for MockActorRef {
     }
 
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-        Box::pin(async move {
-            true
-        })
+        Box::pin(async move { true })
     }
 
     fn clone_boxed(&self) -> BoxedActorRef {
@@ -85,7 +77,7 @@ struct TestMessage(String);
 
 impl Message for TestMessage {
     type Result = String;
-    
+
     fn extract_result(result: BoxedMessage) -> ActorResult<Self::Result> {
         if let Ok(string) = result.downcast::<String>() {
             Ok(*string)
@@ -103,7 +95,7 @@ struct IncrementCounter(u32);
 
 impl Message for IncrementCounter {
     type Result = u32;
-    
+
     fn extract_result(result: BoxedMessage) -> ActorResult<Self::Result> {
         if let Ok(value) = result.downcast::<u32>() {
             Ok(*value)
@@ -135,12 +127,12 @@ impl BasicTestActor {
 impl Actor for BasicTestActor {
     type Config = EmptyConfig;
     type Context = ActixContext<ActixActor<Self>>;
-    
+
     // Implement the required receive_message method
     fn receive_message<'a>(
         &'a mut self,
         msg: BoxedMessage,
-        ctx: &'a mut Self::Context
+        _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             // Default implementation for async message handling
@@ -155,17 +147,24 @@ impl Actor for BasicTestActor {
             } else {
                 // Unknown message type
                 Err(ActorError::MessageHandlingError(
-                    "Unknown message type".to_string()
+                    "Unknown message type".to_string(),
                 ))
             }
         })
     }
-    
+
+    fn state(&self) -> ActorState {
+        self.state
+    }
+}
+
+// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
+impl parrot_api::actor::ActixEngineExt for BasicTestActor {
     fn receive_message_with_engine<'a>(
         &'a mut self,
         msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
-        _engine_ctx: parrot_api::actor::EngineContextHandle
+        _engine_ctx: parrot_api::actor::EngineContextHandle,
     ) -> Option<ActorResult<BoxedMessage>> {
         if let Some(test_msg) = msg.downcast_ref::<TestMessage>() {
             // Echo back with actor name
@@ -178,17 +177,11 @@ impl Actor for BasicTestActor {
         } else {
             // Unknown message type
             Some(Err(ActorError::MessageHandlingError(
-                "Unknown message type".to_string()
+                "Unknown message type".to_string(),
             )))
         }
     }
-    
-    fn state(&self) -> ActorState {
-        self.state
-    }
 }
-
-
 
 // Using fn instead of #[test] because async functions can't be used directly as tests
 #[test]
@@ -198,14 +191,18 @@ fn test_basic_actor_creation() -> Result<()> {
         with_test_system(|system| async move {
             // Create a basic test actor
             let test_actor = BasicTestActor::new("TestActor1".to_string());
-            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
-        
+            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig).await?;
+
             // Check that we can get a valid reference - test that the actor has a path
             let actor_path = actor_ref.path();
-            assert!(!actor_path.is_empty(), "Actor reference should have a valid path");
-        
+            assert!(
+                !actor_path.is_empty(),
+                "Actor reference should have a valid path"
+            );
+
             Ok(((), system))
-        }).await
+        })
+        .await
     })
 }
 
@@ -216,21 +213,21 @@ fn test_actor_message_handling() -> Result<()> {
         with_test_system(|system| async move {
             // Create a basic test actor
             let test_actor = BasicTestActor::new("MessageHandler".to_string());
-            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
-        
+            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig).await?;
+
             // Send a test message
             let msg = TestMessage("Hello Actor!".to_string());
             let response = actor_ref.ask(msg).await?;
-        
+
             // Verify response
             assert_eq!(
-                response, 
-                "MessageHandler received: Hello Actor!",
+                response, "MessageHandler received: Hello Actor!",
                 "Actor should process messages and return correct responses"
             );
-        
+
             Ok(((), system))
-        }).await
+        })
+        .await
     })
 }
 
@@ -241,21 +238,22 @@ fn test_actor_counter() -> Result<()> {
         with_test_system(|system| async move {
             // Create a counter test actor
             let test_actor = BasicTestActor::new("Counter".to_string());
-            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
-        
+            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig).await?;
+
             // Test initial counter value
             let initial = actor_ref.ask(IncrementCounter(0)).await?;
             assert_eq!(initial, 0, "Initial counter should be 0");
-        
+
             // Increment counter multiple times
             let val1 = actor_ref.ask(IncrementCounter(5)).await?;
             assert_eq!(val1, 5, "Counter should be 5 after incrementing by 5");
-        
+
             let val2 = actor_ref.ask(IncrementCounter(10)).await?;
             assert_eq!(val2, 15, "Counter should be 15 after incrementing by 10");
-        
+
             Ok(((), system))
-        }).await
+        })
+        .await
     })
 }
 
@@ -266,31 +264,36 @@ fn test_actor_get_by_path() -> Result<()> {
         with_test_system(|system| async move {
             // Create a test actor
             let test_actor = BasicTestActor::new("PathTest".to_string());
-            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
-        
+            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig).await?;
+
             // Get actor path
             let actor_path_str = actor_ref.path();
-        
+
             // Create a mock actor reference for the target
             let mock_ref = MockActorRef::new(&actor_path_str);
-        
+
             // Try to get actor by path - use ActorPath struct
-            if let Some(retrieved_ref) = system.internal_get_actor(&ActorPath {
-                path: actor_path_str.clone(),
-                target: Arc::new(mock_ref) as WeakActorTarget,
-            }).await {
+            if let Some(retrieved_ref) = system
+                .internal_get_actor(&ActorPath {
+                    path: actor_path_str.clone(),
+                    target: Arc::new(mock_ref) as WeakActorTarget,
+                })
+                .await
+            {
                 // Send message to verify it's the same actor
-                let response = retrieved_ref.ask(TestMessage("Via Path".to_string())).await?;
+                let response = retrieved_ref
+                    .ask(TestMessage("Via Path".to_string()))
+                    .await?;
                 assert_eq!(
-                    response,
-                    "PathTest received: Via Path", 
+                    response, "PathTest received: Via Path",
                     "Should get the same actor through path reference"
                 );
             } else {
                 anyhow::bail!("Failed to retrieve actor by path");
             }
-        
+
             Ok(((), system))
-        }).await
+        })
+        .await
     })
 }

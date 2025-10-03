@@ -1,54 +1,46 @@
-use std::marker::PhantomData;
-use std::any::Any;
-use std::pin::Pin;
-use std::fmt::Debug;
-use actix::{Actor as ActixActorTrait, Handler, Context as ActixContextType, Running, AsyncContext, ActorContext as ActixActorContextTrait, Addr};
-use parrot_api::actor::{Actor as ParrotActor, ActorState, EmptyConfig, EngineContextHandle};
-use parrot_api::message::MessageEnvelope;
-use parrot_api::types::{BoxedMessage, ActorResult, BoxedFuture, WeakActorTarget, BoxedActorRef};
-use parrot_api::errors::ActorError;
-use parrot_api::address::ActorPath;
-use parrot_api::context::ActorContext;
-use parrot_api::supervisor::SupervisorStrategyType;
 use crate::actix::context::ActixContext;
 use crate::actix::message::ActixMessageWrapper;
-use crate::actix::reference::{StopMessage, ActixActorRef};
-use async_trait::async_trait;
-use std::sync::Arc;
-use std::cell::RefCell;
-use std::rc::Rc;
-use anyhow::{anyhow, Context};
-use std::time::Duration;
-use std::sync::Mutex;
-use std::ptr::NonNull;
+use crate::actix::reference::{ActixActorRef, StopMessage};
 use actix::fut::{ActorFuture, WrapFuture};
 use actix::prelude::AtomicResponse;
-use futures::FutureExt;
-
-
+use actix::{
+    Actor as ActixActorTrait, ActorContext as ActixActorContextTrait, AsyncContext,
+    Context as ActixContextType, Handler, Running,
+};
+use async_trait::async_trait;
+use parrot_api::actor::{Actor as ParrotActor, ActorState, EmptyConfig, EngineContextHandle};
+use parrot_api::address::ActorPath;
+use parrot_api::errors::ActorError;
+use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage, WeakActorTarget};
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 /// ActixActor wraps a user-defined actor for the Actix engine
-/// 
+///
 /// # Overview
 /// This is the main adapter between user-defined actors and
 /// the Actix engine implementation
-/// 
+///
 /// # Key Responsibilities
 /// - Implement actix::Actor for any Parrot Actor
 /// - Delegate message handling to user code
 /// - Manage actor lifecycle with context
-/// 
+///
 /// # Implementation Details
 /// - Uses type erasure for message routing
 /// - Preserves context between calls
 /// - Passes messages to user-defined handle_message method
-/// 
+///
 /// # Type Parameters
 /// - `A`: The user-defined actor type
-
 pub struct ActixActor<A>
 where
-    A: ParrotActor<Context = ActixContext<Self>> + Unpin + 'static,
+    A: ParrotActor<Context = ActixContext<Self>>
+        + parrot_api::actor::ActixEngineExt<Context = ActixContext<Self>>
+        + Unpin
+        + 'static,
 {
     /// The user-defined actor instance
     inner: A,
@@ -60,7 +52,10 @@ where
 
 impl<A> ActixActor<A>
 where
-    A:  ParrotActor<Context = ActixContext<Self>> + Unpin + 'static,
+    A: ParrotActor<Context = ActixContext<Self>>
+        + parrot_api::actor::ActixEngineExt<Context = ActixContext<Self>>
+        + Unpin
+        + 'static,
 {
     /// Create a new ActixActor wrapping a user-defined actor
     pub fn new(inner: A) -> Self {
@@ -70,19 +65,26 @@ where
             state: ActorState::Starting,
         }
     }
-    
+
     /// Get the actor's state
     pub fn state(&self) -> ActorState {
         self.state
     }
-}
 
+    /// M6: 访问被包装的用户 actor（同步快路径扩展 trait调用用）。
+    pub fn inner_mut(&mut self) -> &mut A {
+        &mut self.inner
+    }
+}
 
 // Implement ParrotActor for ActixActor to allow nesting
 #[async_trait]
 impl<A> ParrotActor for ActixActor<A>
 where
-    A: ParrotActor<Context = ActixContext<Self>> + Unpin + 'static,
+    A: ParrotActor<Context = ActixContext<Self>>
+        + parrot_api::actor::ActixEngineExt<Context = ActixContext<Self>>
+        + Unpin
+        + 'static,
 {
     // Use EmptyConfig since we don't need additional configuration
     type Config = EmptyConfig;
@@ -90,19 +92,21 @@ where
     type Context = ActixContext<Self>;
 
     // Initialize the actor
-    fn init<'a>(&'a mut self, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
     // not use on actix engine
-    fn receive_message<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async { 
-            Err(ActorError::MessageHandlingError("Not use on actix engine".to_string()))
+    fn receive_message<'a>(
+        &'a mut self,
+        _msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async {
+            Err(ActorError::MessageHandlingError(
+                "Not use on actix engine".to_string(),
+            ))
         })
-    }
-
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        self.inner.receive_message_with_engine(msg, ctx, engine_ctx)
     }
 
     // Return the current actor state
@@ -113,31 +117,34 @@ where
 
 impl<A> ActixActorTrait for ActixActor<A>
 where
-    A: ParrotActor<Context = ActixContext<Self>> + Unpin + 'static,
+    A: ParrotActor<Context = ActixContext<Self>>
+        + parrot_api::actor::ActixEngineExt<Context = ActixContext<Self>>
+        + Unpin
+        + 'static,
 {
     type Context = ActixContextType<Self>;
-    
+
     fn started(&mut self, ctx: &mut Self::Context) {
         self.state = ActorState::Running;
-        
+
         // Create a path for the actor
         let addr = ctx.address();
         // Create a path string from the address
         let path_str = format!("actix://{:?}", addr);
-        
+
         // Create a wrapped actor ref for the address
         let actor_ref = ActixActorRef::new(addr.clone(), path_str.clone());
         let path = ActorPath::new(Arc::new(actor_ref) as WeakActorTarget, path_str);
         // Create and store the context wrapper
         self.ctx = Some(ActixContext::new(addr, path));
     }
-    
+
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
         // Handle actor stopping event
         self.state = ActorState::Stopping;
         Running::Stop
     }
-    
+
     fn stopped(&mut self, _: &mut Self::Context) {
         // Handle actor stopped event
         self.state = ActorState::Stopped;
@@ -166,7 +173,10 @@ where
 /// timeouts keep working unchanged.
 impl<A> Handler<ActixMessageWrapper> for ActixActor<A>
 where
-    A: ParrotActor<Context = ActixContext<Self>> + Unpin + 'static,
+    A: ParrotActor<Context = ActixContext<Self>>
+        + parrot_api::actor::ActixEngineExt<Context = ActixContext<Self>>
+        + Unpin
+        + 'static,
 {
     type Result = AtomicResponse<Self, Option<ActorResult<BoxedMessage>>>;
 
@@ -182,9 +192,7 @@ where
             self.state = ActorState::Stopping;
             ctx.stop();
             let ready = Some(Ok(Box::new(()) as BoxedMessage));
-            return AtomicResponse::new(Box::pin(
-                futures::future::ready(ready).into_actor(self),
-            ));
+            return AtomicResponse::new(Box::pin(futures::future::ready(ready).into_actor(self)));
         }
 
         // Get the context or return error if not initialized
@@ -192,9 +200,7 @@ where
             let err = Some(Err(ActorError::MessageHandlingError(
                 "ActixActor context not initialized".to_string(),
             )));
-            return AtomicResponse::new(Box::pin(
-                futures::future::ready(err).into_actor(self),
-            ));
+            return AtomicResponse::new(Box::pin(futures::future::ready(err).into_actor(self)));
         };
 
         // Mint the safe engine-context handle (ADR-2). This is the single
@@ -208,8 +214,15 @@ where
 
         // ---- Sync fast path ----
         // Only when the actor did not opt into the async dispatch path.
+        // M6: 经 actix 扩展 trait（`ActixEngineExt`）调用；未写
+        // `handle_message_engine` 的 actor 走 blanket 默认 `None`。
         if !self.inner.use_async_handler() {
-            if let Some(result) = self.inner.receive_message_with_engine(payload, actor_ctx, engine_handle) {
+            #[allow(unused_imports)]
+            use parrot_api::actor::ActixEngineExt as _;
+            if let Some(result) =
+                self.inner
+                    .receive_message_with_engine(payload, actor_ctx, engine_handle)
+            {
                 return AtomicResponse::new(Box::pin(
                     futures::future::ready(Some(result)).into_actor(self),
                 ));
@@ -227,9 +240,7 @@ where
                  / use_async_handler() == true."
                     .to_string(),
             )));
-            return AtomicResponse::new(Box::pin(
-                futures::future::ready(err).into_actor(self),
-            ));
+            return AtomicResponse::new(Box::pin(futures::future::ready(err).into_actor(self)));
         }
 
         // ---- Async dispatch path ----
@@ -281,7 +292,10 @@ where
 ///   oneshot by `AtomicResponse`, preserving ask/tell/timeout semantics.
 struct AsyncDispatchFuture<A>
 where
-    A: ParrotActor<Context = ActixContext<ActixActor<A>>> + Unpin + 'static,
+    A: ParrotActor<Context = ActixContext<ActixActor<A>>>
+        + parrot_api::actor::ActixEngineExt<Context = ActixContext<ActixActor<A>>>
+        + Unpin
+        + 'static,
 {
     /// The handler future (created in `Handler::handle`, lifetime extended).
     fut: Option<BoxedFuture<'static, ActorResult<BoxedMessage>>>,
@@ -290,7 +304,10 @@ where
 
 impl<A> ActorFuture<ActixActor<A>> for AsyncDispatchFuture<A>
 where
-    A: ParrotActor<Context = ActixContext<ActixActor<A>>> + Unpin + 'static,
+    A: ParrotActor<Context = ActixContext<ActixActor<A>>>
+        + parrot_api::actor::ActixEngineExt<Context = ActixContext<ActixActor<A>>>
+        + Unpin
+        + 'static,
 {
     type Output = Option<ActorResult<BoxedMessage>>;
 
@@ -322,10 +339,13 @@ where
 /// Handler for stop messages
 impl<A> Handler<StopMessage> for ActixActor<A>
 where
-    A: ParrotActor<Context = ActixContext<Self>> + Unpin + 'static,
+    A: ParrotActor<Context = ActixContext<Self>>
+        + parrot_api::actor::ActixEngineExt<Context = ActixContext<Self>>
+        + Unpin
+        + 'static,
 {
     type Result = ();
-    
+
     fn handle(&mut self, _: StopMessage, ctx: &mut Self::Context) -> Self::Result {
         self.state = ActorState::Stopping;
         // Use ActorContext trait method to stop
@@ -364,5 +384,7 @@ impl<A> ActorBase<A> {
 /// - Convert a user actor to an ActorBase
 pub trait IntoActorBase {
     /// Convert self to ActorBase
-    fn into_actor_base(self) -> ActorBase<Self> where Self: Sized;
-} 
+    fn into_actor_base(self) -> ActorBase<Self>
+    where
+        Self: Sized;
+}

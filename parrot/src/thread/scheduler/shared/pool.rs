@@ -1,16 +1,19 @@
 use std::fmt;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::thread::mailbox::Mailbox;
-use crate::thread::scheduler::queue::SchedulingQueue;
-use crate::thread::config::ThreadActorConfig;
-use crate::thread::error::SystemError;
-use crate::thread::scheduler::ThreadScheduler;
 use super::worker::{Worker, WorkerConfig};
 use super::worker_manager::WorkerManager;
+use crate::thread::config::ThreadActorConfig;
+use crate::thread::error::SystemError;
+use crate::thread::mailbox::Mailbox;
+use crate::thread::scheduler::ThreadScheduler;
+use crate::thread::scheduler::queue::SchedulingQueue;
 
 /// Configuration for the shared thread pool
 #[derive(Debug, Clone)]
@@ -169,11 +172,15 @@ impl ElasticController {
             return;
         }
 
-        let Some(queue) = self.queue.upgrade() else { return };
-        let Some(wm) = self.worker_manager.upgrade() else { return };
+        let Some(queue) = self.queue.upgrade() else {
+            return;
+        };
+        let Some(wm) = self.worker_manager.upgrade() else {
+            return;
+        };
 
         // No pressure if the queue drained or a core worker is idle.
-        if queue.len() == 0 || wm.idle_worker_count() > 0 {
+        if queue.is_empty() || wm.idle_worker_count() > 0 {
             self.backlog_since_us.store(0, O::Relaxed);
             return;
         }
@@ -185,16 +192,16 @@ impl ElasticController {
         // overwrite it (a plain swap would restart the window on every
         // probe and the threshold would never be reached).
         let now_us = self.pool_started.elapsed().as_micros() as u64;
-        let first_us = match self.backlog_since_us.compare_exchange(
-            0,
-            now_us,
-            O::AcqRel,
-            O::Relaxed,
-        ) {
-            Ok(_) => now_us,           // we are the first observer
-            Err(prev) => prev,         // keep the original timestamp
-        };
-        if now_us.saturating_sub(first_us) < self.config.burst_backlog_threshold.as_micros() as u64 {
+        let first_us =
+            match self
+                .backlog_since_us
+                .compare_exchange(0, now_us, O::AcqRel, O::Relaxed)
+            {
+                Ok(_) => now_us,   // we are the first observer
+                Err(prev) => prev, // keep the original timestamp
+            };
+        if now_us.saturating_sub(first_us) < self.config.burst_backlog_threshold.as_micros() as u64
+        {
             // Backlog not persistent enough yet; wait for more probes.
             return;
         }
@@ -248,8 +255,7 @@ impl ElasticController {
         self.runtime.spawn(async move {
             let mut idle_since: Option<tokio::time::Instant> = None;
             loop {
-                let is_processing =
-                    status.load(std::sync::atomic::Ordering::Relaxed) == 1;
+                let is_processing = status.load(std::sync::atomic::Ordering::Relaxed) == 1;
                 if is_processing {
                     idle_since = None;
                 } else {
@@ -273,9 +279,15 @@ impl fmt::Debug for SharedThreadPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SharedThreadPool")
             .field("pool_size", &self.pool_size)
-            .field("workers", &self.workers.lock().map(|w| w.len()).unwrap_or(0))
+            .field(
+                "workers",
+                &self.workers.lock().map(|w| w.len()).unwrap_or(0),
+            )
             .field("status", &self.status())
-            .field("is_shutting_down", &self.is_shutting_down.load(Ordering::Relaxed))
+            .field(
+                "is_shutting_down",
+                &self.is_shutting_down.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -340,18 +352,13 @@ impl SharedThreadPool {
     /// # Arguments
     /// * `config` - Optional configuration for the thread pool
     /// * `runtime_handle` - Tokio runtime handle
-    pub fn new(
-        config: Option<SharedThreadPoolConfig>,
-        runtime_handle: Handle,
-    ) -> Self {
+    pub fn new(config: Option<SharedThreadPoolConfig>, runtime_handle: Handle) -> Self {
         let config = config.unwrap_or_default();
         let scheduling_queue = Arc::new(SchedulingQueue::new(config.max_queue_capacity));
         let is_shutting_down = Arc::new(AtomicBool::new(false));
         let status = Arc::new(AtomicUsize::new(SchedulerStatus::Initializing as usize));
 
-        let worker_manager = Arc::new(WorkerManager::new(
-            scheduling_queue.clone(),
-        ));
+        let worker_manager = Arc::new(WorkerManager::new(scheduling_queue.clone()));
 
         let mut pool = Self {
             pool_size: config.pool_size,
@@ -372,7 +379,8 @@ impl SharedThreadPool {
         pool.start_workers();
         pool.start_elastic_patrol();
 
-        pool.status.store(SchedulerStatus::Running as usize, Ordering::SeqCst);
+        pool.status
+            .store(SchedulerStatus::Running as usize, Ordering::SeqCst);
 
         pool
     }
@@ -467,11 +475,17 @@ impl SharedThreadPool {
                 if shutting_down.load(Ordering::Relaxed) {
                     return;
                 }
-                if let Some(strong) = weak_mailbox.upgrade() {
-                    if strong.schedule_state().try_enqueue() {
-                        queue.push(strong);
-                        elastic.probe();
-                    }
+                if let Some(strong) = weak_mailbox.upgrade()
+                    && strong.schedule_state().try_enqueue()
+                {
+                    // M2: wake path also honors the priority lane.
+                    let lane = if strong.has_high_priority_messages() {
+                        crate::thread::scheduler::queue::Lane::High
+                    } else {
+                        crate::thread::scheduler::queue::Lane::Normal
+                    };
+                    queue.push_with_lane(strong, lane);
+                    elastic.probe();
                 }
             }));
         }
@@ -506,7 +520,8 @@ impl SharedThreadPool {
     /// # Arguments
     /// * `timeout_ms` - Timeout in milliseconds to wait for graceful shutdown
     pub async fn shutdown(&self, timeout_ms: u64) -> Result<(), SystemError> {
-        self.status.store(SchedulerStatus::ShuttingDown as usize, Ordering::SeqCst);
+        self.status
+            .store(SchedulerStatus::ShuttingDown as usize, Ordering::SeqCst);
         self.is_shutting_down.store(true, Ordering::SeqCst);
 
         // Wake all idle workers so they observe the shutdown flag.
@@ -527,7 +542,8 @@ impl SharedThreadPool {
             }
             let _ = tokio::time::timeout(remaining, handle).await;
         }
-        self.status.store(SchedulerStatus::Shutdown as usize, Ordering::SeqCst);
+        self.status
+            .store(SchedulerStatus::Shutdown as usize, Ordering::SeqCst);
         Ok(())
     }
 
@@ -607,10 +623,7 @@ impl ThreadScheduler for SharedThreadPool {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    fn deschedule(
-        &self,
-        path: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn deschedule(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.runtime_handle
             .block_on(async { self.deschedule(path).await })
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -638,7 +651,6 @@ mod tests {
     use parrot_api::actor::{Actor, ActorState, EmptyConfig};
     use parrot_api::address::ActorPath;
     use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
-    use std::any::Any;
     use std::sync::Arc;
 
     /// Counting actor that records processed values.
@@ -651,10 +663,7 @@ mod tests {
         type Config = EmptyConfig;
         type Context = ThreadContext<Self>;
 
-        fn init<'a>(
-            &'a mut self,
-            _ctx: &'a mut Self::Context,
-        ) -> BoxedFuture<'a, ActorResult<()>> {
+        fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -669,15 +678,6 @@ mod tests {
                 }
                 Ok(msg)
             })
-        }
-
-        fn receive_message_with_engine<'a>(
-            &'a mut self,
-            _msg: BoxedMessage,
-            _ctx: &'a mut Self::Context,
-            _engine_ctx: parrot_api::actor::EngineContextHandle,
-        ) -> Option<ActorResult<BoxedMessage>> {
-            None
         }
 
         fn state(&self) -> ActorState {
@@ -761,10 +761,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_schedule_rejects_mailbox_without_processor() {
         let pool = make_pool(1);
-        let mailbox: Arc<dyn Mailbox> = Arc::new(MpscMailbox::new(
-            8,
-            ActorPath::placeholder("pool/no-proc"),
-        ));
+        let mailbox: Arc<dyn Mailbox> =
+            Arc::new(MpscMailbox::new(8, ActorPath::placeholder("pool/no-proc")));
 
         let result = pool.schedule("pool/no-proc", mailbox, None).await;
         assert!(result.is_err());
@@ -786,7 +784,9 @@ mod tests {
         let pool = make_pool(1);
         let mailbox = build_mailbox("pool/desched/a");
 
-        pool.schedule("pool/desched/a", mailbox, None).await.unwrap();
+        pool.schedule("pool/desched/a", mailbox, None)
+            .await
+            .unwrap();
         assert!(pool.is_scheduled("pool/desched/a"));
 
         pool.deschedule("pool/desched/a").await.unwrap();
@@ -815,16 +815,26 @@ mod tests {
         let m1 = build_mailbox("pool/multi/a");
         let m2 = build_mailbox("pool/multi/b");
 
-        pool.schedule("pool/multi/a", m1.clone(), None).await.unwrap();
-        pool.schedule("pool/multi/b", m2.clone(), None).await.unwrap();
+        pool.schedule("pool/multi/a", m1.clone(), None)
+            .await
+            .unwrap();
+        pool.schedule("pool/multi/b", m2.clone(), None)
+            .await
+            .unwrap();
 
         for i in 0..5u64 {
-            m1.push(Box::new(i), crate::thread::config::BackpressureStrategy::Block)
-                .await
-                .unwrap();
-            m2.push(Box::new(i * 10), crate::thread::config::BackpressureStrategy::Block)
-                .await
-                .unwrap();
+            m1.push(
+                Box::new(i),
+                crate::thread::config::BackpressureStrategy::Block,
+            )
+            .await
+            .unwrap();
+            m2.push(
+                Box::new(i * 10),
+                crate::thread::config::BackpressureStrategy::Block,
+            )
+            .await
+            .unwrap();
         }
 
         // Both mailboxes must be drained by the pool workers.
@@ -896,9 +906,15 @@ mod tests {
 
     #[test]
     fn test_scheduler_status_from_usize() {
-        assert_eq!(SchedulerStatus::from_usize(0), SchedulerStatus::Initializing);
+        assert_eq!(
+            SchedulerStatus::from_usize(0),
+            SchedulerStatus::Initializing
+        );
         assert_eq!(SchedulerStatus::from_usize(1), SchedulerStatus::Running);
-        assert_eq!(SchedulerStatus::from_usize(2), SchedulerStatus::ShuttingDown);
+        assert_eq!(
+            SchedulerStatus::from_usize(2),
+            SchedulerStatus::ShuttingDown
+        );
         assert_eq!(SchedulerStatus::from_usize(3), SchedulerStatus::Shutdown);
         assert_eq!(SchedulerStatus::from_usize(99), SchedulerStatus::Error);
     }

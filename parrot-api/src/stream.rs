@@ -1,5 +1,5 @@
 //! # Actor Stream Processing
-//! 
+//!
 //! This module provides stream processing capabilities for the Parrot actor system.
 //! It enables actors to handle continuous streams of data with backpressure and
 //! error handling.
@@ -48,12 +48,11 @@
 //! )?;
 //! ```
 
-use std::any::Any;
-use futures::{Stream, StreamExt};
-use async_trait::async_trait;
-use crate::errors::ActorError;
 use crate::actor::Actor;
-use crate::context::ActorContext;
+use crate::errors::ActorError;
+use async_trait::async_trait;
+use futures::{Stream, StreamExt};
+use std::any::Any;
 
 /// Core trait for processing items from a stream.
 ///
@@ -74,7 +73,7 @@ use crate::context::ActorContext;
 /// - Resource cleanup in lifecycle methods
 /// - Error recovery in error handler
 #[async_trait]
-pub trait StreamHandler<S: Stream, C: ?Sized + Send>: Send 
+pub trait StreamHandler<S: Stream, C: ?Sized + Send>: Send
 where
     S::Item: Send + 'static,
 {
@@ -214,6 +213,7 @@ impl<T: StreamRegistry + ?Sized> StreamRegistryExt for T {}
 /// Used to communicate stream events between the stream
 /// processor and the actor system.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) enum StreamMessage<I> {
     /// New item received from stream
     Item(I),
@@ -265,4 +265,4 @@ where
     async fn handle_error(&mut self, err: ActorError, ctx: &mut A::Context) {
         self.actor.stream_error(err, ctx).await.ok();
     }
-} 
+}

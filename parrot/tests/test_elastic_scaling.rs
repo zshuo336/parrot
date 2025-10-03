@@ -7,16 +7,14 @@
 //! 3. **全局上限**：burst 数量 ≤ burst_workers_max，总线程 ≤
 //!    pool_size + burst_workers_max（不爆炸）。
 
-use parrot::system::ParrotActorSystem;
 use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::address::{ActorRef, ActorRefExt};
-use parrot_api::system::ActorSystemConfig;
+use parrot_api::address::ActorRef;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -32,7 +30,10 @@ pub struct BenchActor {
 fn burn_cpu(iterations: u64, salt: u64) -> u64 {
     let mut x: u64 = salt | 1;
     for i in 0..iterations {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) ^ i;
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+            ^ i;
         if x == 42 {
             return x;
         }
@@ -62,15 +63,6 @@ impl Actor for BenchActor {
         Box::pin(async move { res })
     }
 
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        Some(dispatch(self, msg))
-    }
-
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -86,24 +78,26 @@ fn dispatch(actor: &mut BenchActor, msg: BoxedMessage) -> ActorResult<BoxedMessa
         actor.ops.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(1u64) as BoxedMessage)
     } else {
-        Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into()))
+        Err(parrot_api::errors::ActorError::MessageHandlingError(
+            "unknown".into(),
+        ))
     }
 }
 
 impl parrot_api::message::Message for LongTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| {
-            parrot_api::errors::ActorError::MessageHandlingError("type".into())
-        })
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| parrot_api::errors::ActorError::MessageHandlingError("type".into()))
     }
 }
 impl parrot_api::message::Message for TinyTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| {
-            parrot_api::errors::ActorError::MessageHandlingError("type".into())
-        })
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| parrot_api::errors::ActorError::MessageHandlingError("type".into()))
     }
 }
 
@@ -168,7 +162,9 @@ fn elastic_burst_rescues_starved_short_tasks() {
             let r = l1.clone_boxed();
             tokio::spawn(async move {
                 r.send_with_timeout(
-                    Box::new(LongTask { iterations: 2_000_000_000 }),
+                    Box::new(LongTask {
+                        iterations: 2_000_000_000,
+                    }),
                     Some(Duration::from_secs(60)),
                 )
                 .await
@@ -178,7 +174,9 @@ fn elastic_burst_rescues_starved_short_tasks() {
             let r = l2.clone_boxed();
             tokio::spawn(async move {
                 r.send_with_timeout(
-                    Box::new(LongTask { iterations: 2_000_000_000 }),
+                    Box::new(LongTask {
+                        iterations: 2_000_000_000,
+                    }),
                     Some(Duration::from_secs(60)),
                 )
                 .await
@@ -264,7 +262,9 @@ fn elastic_burst_reaps_after_idle() {
                 tokio::spawn(async move {
                     let _ = r
                         .send_with_timeout(
-                            Box::new(LongTask { iterations: 1_500_000_000 }),
+                            Box::new(LongTask {
+                                iterations: 1_500_000_000,
+                            }),
                             Some(Duration::from_secs(60)),
                         )
                         .await;
@@ -320,7 +320,9 @@ fn elastic_burst_reaps_after_idle() {
             tokio::spawn(async move {
                 let _ = r
                     .send_with_timeout(
-                        Box::new(LongTask { iterations: 1_200_000_000 }),
+                        Box::new(LongTask {
+                            iterations: 1_200_000_000,
+                        }),
                         Some(Duration::from_secs(60)),
                     )
                     .await;
@@ -331,7 +333,9 @@ fn elastic_burst_reaps_after_idle() {
             tokio::spawn(async move {
                 let _ = r
                     .send_with_timeout(
-                        Box::new(LongTask { iterations: 1_200_000_000 }),
+                        Box::new(LongTask {
+                            iterations: 1_200_000_000,
+                        }),
                         Some(Duration::from_secs(60)),
                     )
                     .await;
@@ -391,7 +395,9 @@ fn elastic_thread_count_bounded() {
                 tokio::spawn(async move {
                     let _ = r
                         .send_with_timeout(
-                            Box::new(LongTask { iterations: 300_000_000 }),
+                            Box::new(LongTask {
+                                iterations: 300_000_000,
+                            }),
                             Some(Duration::from_secs(120)),
                         )
                         .await;

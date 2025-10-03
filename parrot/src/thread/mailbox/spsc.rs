@@ -1,21 +1,22 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, Notify};
+#[allow(unused_imports)] // 测试模块需要 ActorRef/BoxedActorRef/WeakActorTarget
 use parrot_api::address::{ActorPath, ActorRef};
-use parrot_api::types::{BoxedMessage, WeakActorTarget, ActorResult, BoxedFuture, BoxedActorRef};
+#[allow(unused_imports)] // 测试模块需要全部类型形状
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage, WeakActorTarget};
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{Mutex, Notify};
 
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
 use crate::thread::processor::ProcessorInterface;
-use std::any::Any;
 use std::sync::Mutex as StdMutex;
 
 /// A single-producer, single-consumer mailbox implementation using tokio channels.
-/// 
+///
 /// This mailbox is optimized for the single-producer case, which is the common case
 /// for dedicated actor mailboxes where only the scheduler sends messages.
 /// It provides FIFO ordering guarantees.
@@ -52,7 +53,6 @@ impl Debug for SpscMailbox {
     }
 }
 
-
 impl SpscMailbox {
     /// Creates a new SpscMailbox with the specified capacity and actor path.
     pub fn new(capacity: usize, path: ActorPath) -> Self {
@@ -79,22 +79,22 @@ impl SpscMailbox {
     pub fn sender(&self) -> Sender<BoxedMessage> {
         self.sender.clone()
     }
-    
+
     /// Returns a reference to the notify mechanism
     pub fn notify_ref(&self) -> Arc<Notify> {
         self.notify.clone()
     }
-    
+
     /// Increment the message count
     fn increment_count(&self) {
         self.message_count.fetch_add(1, Ordering::SeqCst);
     }
-    
+
     /// Decrement the message count
     fn decrement_count(&self) {
         self.message_count.fetch_sub(1, Ordering::SeqCst);
     }
-    
+
     /// Check if this mailbox is closed
     fn closed(&self) -> bool {
         self.is_closed.load(Ordering::SeqCst)
@@ -103,12 +103,16 @@ impl SpscMailbox {
 
 #[async_trait]
 impl Mailbox for SpscMailbox {
-    async fn push(&self, msg: BoxedMessage, strategy: BackpressureStrategy) -> Result<(), MailboxError> {
+    async fn push(
+        &self,
+        msg: BoxedMessage,
+        strategy: BackpressureStrategy,
+    ) -> Result<(), MailboxError> {
         // Check if mailbox is already closed
         if self.closed() {
             return Err(MailboxError::Closed);
         }
-        
+
         match strategy {
             BackpressureStrategy::DropNewest => {
                 // Try to send without waiting. If the mailbox is full, drop the message.
@@ -118,16 +122,16 @@ impl Mailbox for SpscMailbox {
                         self.notify.notify_one();
                         self.fire_wake_hook();
                         Ok(())
-                    },
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         // Mailbox is full, drop the message as per strategy
                         Ok(())
-                    },
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         Err(MailboxError::Closed)
                     }
                 }
-            },
+            }
             BackpressureStrategy::Block => {
                 // Block until the message can be sent
                 match self.sender.send(msg).await {
@@ -136,10 +140,10 @@ impl Mailbox for SpscMailbox {
                         self.notify.notify_one();
                         self.fire_wake_hook();
                         Ok(())
-                    },
+                    }
                     Err(_) => Err(MailboxError::Closed),
                 }
-            },
+            }
             BackpressureStrategy::Error => {
                 // Try to send without waiting. If the mailbox is full, return an error.
                 match self.sender.try_send(msg) {
@@ -148,20 +152,22 @@ impl Mailbox for SpscMailbox {
                         self.notify.notify_one();
                         self.fire_wake_hook();
                         Ok(())
-                    },
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        Err(MailboxError::Full { capacity: self.capacity })
-                    },
+                        Err(MailboxError::Full {
+                            capacity: self.capacity,
+                        })
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         Err(MailboxError::Closed)
                     }
                 }
-            },
+            }
             BackpressureStrategy::DropOldest => {
                 // Tokio's mpsc doesn't directly support dropping oldest messages
                 // For a real implementation, we would need a custom data structure
                 // This implementation handles the drop oldest pattern more carefully:
-                
+
                 // Try to send first, in case there's room
                 match self.sender.try_send(msg) {
                     Ok(_) => {
@@ -169,7 +175,7 @@ impl Mailbox for SpscMailbox {
                         self.notify.notify_one();
                         self.fire_wake_hook();
                         Ok(())
-                    },
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
                         // Mailbox is full, get exclusive access to the receiver
                         let mut receiver_guard = match self.receiver.try_lock() {
@@ -178,28 +184,28 @@ impl Mailbox for SpscMailbox {
                                 // Another thread has the lock, we can't safely drop the oldest message
                                 // Consider this case as if the mailbox is full and return error
                                 return Err(MailboxError::PushError(
-                                    "Cannot acquire lock to drop oldest message".to_string()
+                                    "Cannot acquire lock to drop oldest message".to_string(),
                                 ));
                             }
                         };
-                        
+
                         // Discard one message
                         match receiver_guard.try_recv() {
                             Ok(_) => {
                                 // Successfully removed one message, decrement count
                                 self.decrement_count();
-                            },
+                            }
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                                 // Mailbox is empty (race condition), no need to drop
-                            },
+                            }
                             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                                 return Err(MailboxError::Closed);
                             }
                         }
-                        
+
                         // Drop the guard to release the mutex
                         drop(receiver_guard);
-                        
+
                         // Now try to send again
                         match self.sender.try_send(msg) {
                             Ok(_) => {
@@ -207,21 +213,23 @@ impl Mailbox for SpscMailbox {
                                 self.notify.notify_one();
                                 self.fire_wake_hook();
                                 Ok(())
-                            },
+                            }
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                 // Still full, this is unusual but possible with concurrent access
-                                Err(MailboxError::PushError("Failed to push after dropping oldest message".to_string()))
-                            },
+                                Err(MailboxError::PushError(
+                                    "Failed to push after dropping oldest message".to_string(),
+                                ))
+                            }
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                 Err(MailboxError::Closed)
                             }
                         }
-                    },
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         Err(MailboxError::Closed)
                     }
                 }
-            },
+            }
         }
     }
 
@@ -232,9 +240,8 @@ impl Mailbox for SpscMailbox {
         // Try to receive a message without blocking: the `Mailbox` contract
         // requires `pop` to return `None` immediately when empty. Waiting for
         // new messages is the scheduling queue's responsibility (`Notify`).
-        receiver.try_recv().ok().map(|msg| {
+        receiver.try_recv().ok().inspect(|_msg| {
             self.decrement_count();
-            msg
         })
     }
 
@@ -260,23 +267,23 @@ impl Mailbox for SpscMailbox {
         // Use atomic counter for thread-safe length check without blocking
         self.message_count.load(Ordering::SeqCst)
     }
-    
+
     async fn close(&self) {
         // Mark the mailbox as closed
         self.is_closed.store(true, Ordering::SeqCst);
-        
+
         // Close the sender to prevent further message sends
         // This will cause any future attempts to send to fail
         // The original sender is dropped here
         drop(self.sender.clone());
-        
+
         // Drain any remaining messages to ensure proper cleanup
         if let Ok(mut receiver) = self.receiver.try_lock() {
-            while let Ok(_) = receiver.try_recv() {
+            while receiver.try_recv().is_ok() {
                 self.decrement_count();
             }
         }
-        
+
         // Notify anyone waiting on this mailbox that it's now closed
         self.notify.notify_waiters();
     }
@@ -313,15 +320,14 @@ impl Mailbox for SpscMailbox {
     async fn is_closed(&self) -> bool {
         self.is_closed.load(Ordering::SeqCst)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::test;
     use std::any::Any;
     use std::time::Duration;
+    use tokio::test;
 
     /// Mock implementation of ActorRef for testing
     #[derive(Debug)]
@@ -339,35 +345,33 @@ mod tests {
 
     #[async_trait]
     impl ActorRef for MockActorRef {
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> { Box::pin(async { Ok(()) }) }
+        fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
         fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-            Box::pin(async move {
-                Ok(msg)
-            })
+            Box::pin(async move { Ok(msg) })
         }
 
-        fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-            Box::pin(async move {
-                Ok(msg)
-            })
+        fn send_with_timeout<'a>(
+            &'a self,
+            msg: BoxedMessage,
+            _timeout_duration: Option<Duration>,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move { Ok(msg) })
         }
-        
+
         fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async move { Ok(()) })
         }
-        
+
         fn path(&self) -> String {
             self.path_value.clone()
         }
-        
+
         fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-            Box::pin(async move {
-                true
-            })
+            Box::pin(async move { true })
         }
-        
+
         fn clone_boxed(&self) -> BoxedActorRef {
             Box::new(Self {
                 path_value: self.path_value.clone(),
@@ -378,100 +382,112 @@ mod tests {
             self
         }
     }
-    
+
     // Helper to create a test ActorPath
     fn create_test_actor_path(path_str: &str) -> ActorPath {
         // Create a mock actor reference for the target
         let mock_ref = MockActorRef::new(path_str);
-        
+
         ActorPath {
             target: Arc::new(mock_ref) as WeakActorTarget,
             path: path_str.to_string(),
         }
     }
-    
+
     #[test]
     async fn test_push_and_pop() {
         let path = create_test_actor_path("test-actor");
         let mailbox = SpscMailbox::new(10, path);
-        
+
         // Test basic push and pop functionality
         let msg = Box::new("Hello, World!") as BoxedMessage;
-        mailbox.push(msg, BackpressureStrategy::Block).await.unwrap();
-        
+        mailbox
+            .push(msg, BackpressureStrategy::Block)
+            .await
+            .unwrap();
+
         // Verify message count
         assert_eq!(mailbox.len().await, 1);
-        
+
         // Pop the message
         let received = mailbox.pop().await;
         assert!(received.is_some());
-        
+
         let str_msg = received.unwrap().downcast::<&str>().unwrap();
         assert_eq!(*str_msg, "Hello, World!");
-        
+
         // Verify mailbox is now empty
         assert!(mailbox.is_empty().await);
         assert_eq!(mailbox.len().await, 0);
     }
-    
+
     #[test]
     async fn test_backpressure_drop_newest() {
         let path = create_test_actor_path("test-actor");
         let mailbox = SpscMailbox::new(1, path);
-        
+
         // Fill the mailbox
         let msg1 = Box::new("First message") as BoxedMessage;
-        mailbox.push(msg1, BackpressureStrategy::Block).await.unwrap();
-        
+        mailbox
+            .push(msg1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
+
         // Try to push when mailbox is full with DropNewest strategy
         let msg2 = Box::new("Second message") as BoxedMessage;
         let result = mailbox.push(msg2, BackpressureStrategy::DropNewest).await;
-        
+
         // The push should succeed (message was dropped)
         assert!(result.is_ok());
-        
+
         // Verify only one message is in the mailbox
         assert_eq!(mailbox.len().await, 1);
-        
+
         // Pop the message and verify it's the first one
         let received = mailbox.pop().await.unwrap();
         let str_msg = received.downcast::<&str>().unwrap();
         assert_eq!(*str_msg, "First message");
     }
-    
+
     #[test]
     async fn test_backpressure_error() {
         let path = create_test_actor_path("test-actor");
         let mailbox = SpscMailbox::new(1, path);
-        
+
         // Fill the mailbox
         let msg1 = Box::new("First message") as BoxedMessage;
-        mailbox.push(msg1, BackpressureStrategy::Block).await.unwrap();
-        
+        mailbox
+            .push(msg1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
+
         // Try to push when mailbox is full with Error strategy
         let msg2 = Box::new("Second message") as BoxedMessage;
         let result = mailbox.push(msg2, BackpressureStrategy::Error).await;
-        
+
         // The push should fail with Full error
         assert!(matches!(result, Err(MailboxError::Full { .. })));
     }
-    
+
     #[test]
     async fn test_backpressure_drop_oldest() {
         let path = create_test_actor_path("test-actor");
         let mailbox = SpscMailbox::new(1, path);
-        
+
         // Fill the mailbox
         let msg1 = Box::new("First message") as BoxedMessage;
-        mailbox.push(msg1, BackpressureStrategy::Block).await.unwrap();
-        
+        mailbox
+            .push(msg1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
+
         // Try to push when mailbox is full with DropOldest strategy
         let msg2 = Box::new("Second message") as BoxedMessage;
         let result = mailbox.push(msg2, BackpressureStrategy::DropOldest).await;
-        
+
         // The push should succeed
         assert!(result.is_ok());
-        
+
         // Pop the message and verify it's the second one
         let received = mailbox.pop().await.unwrap();
         let str_msg = received.downcast::<&str>().unwrap();
@@ -481,4 +497,4 @@ mod tests {
 
 // Note: This implementation has the following limitation:
 // The DropOldest strategy has potential race conditions when multiple producers attempt
-// to concurrently send messages to the same mailbox, despite this being a SPSC mailbox. 
+// to concurrently send messages to the same mailbox, despite this being a SPSC mailbox.

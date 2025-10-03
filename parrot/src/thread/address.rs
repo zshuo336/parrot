@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::marker::PhantomData;
+#[allow(unused_imports)] // 测试模块需要 Weak
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -108,9 +109,12 @@ where
 
     /// Upgrade the weak mailbox reference, mapping failure to an ActorError.
     fn mailbox(&self) -> ActorResult<Arc<dyn Mailbox + Send + Sync>> {
-        self.weak_mailbox()
-            .upgrade()
-            .ok_or_else(|| ActorError::InternalError(format!("Actor at {} is stopped (mailbox dropped)", self.path)))
+        self.weak_mailbox().upgrade().ok_or_else(|| {
+            ActorError::InternalError(format!(
+                "Actor at {} is stopped (mailbox dropped)",
+                self.path
+            ))
+        })
     }
 
     /// Send a message with an explicit backpressure strategy (tell semantics).
@@ -120,15 +124,44 @@ where
         strategy: BackpressureStrategy,
     ) -> ActorResult<()> {
         let mailbox = self.mailbox()?;
+        mailbox.push(msg, strategy).await.map_err(|e| {
+            ActorError::InternalError(format!(
+                "Failed to enqueue message for {}: {:?}",
+                self.path, e
+            ))
+        })
+    }
+
+    /// M2: Send with an explicit priority lane.
+    ///
+    /// `high_priority = true` routes the message into the mailbox's high
+    /// lane (drained before normal messages) AND (when the mailbox needs
+    /// re-scheduling) into the scheduler's High lane, giving O(1) jumps
+    /// over backlogs. Use for user messages whose `MessagePriority >= 70`;
+    /// system/death messages are routed here automatically by the engine.
+    pub async fn send_with_priority(
+        &self,
+        msg: BoxedMessage,
+        strategy: BackpressureStrategy,
+        high_priority: bool,
+    ) -> ActorResult<()> {
+        let mailbox = self.mailbox()?;
         mailbox
-            .push(msg, strategy)
+            .push_with_priority(msg, strategy, high_priority)
             .await
-            .map_err(|e| ActorError::InternalError(format!("Failed to enqueue message for {}: {:?}", self.path, e)))
+            .map_err(|e| {
+                ActorError::InternalError(format!(
+                    "Failed to enqueue message for {}: {:?}",
+                    self.path, e
+                ))
+            })?;
+        Ok(())
     }
 
     /// Send a message with the default backpressure strategy (tell semantics).
     pub async fn send_msg(&self, msg: BoxedMessage) -> ActorResult<()> {
-        self.send_with_strategy(msg, self.default_strategy.clone()).await
+        self.send_with_strategy(msg, self.default_strategy.clone())
+            .await
     }
 
     /// Ask with explicit strategy and timeout (request-response semantics).
@@ -136,6 +169,10 @@ where
     /// Wraps the message in an [`AskEnvelope`] carrying a oneshot reply
     /// channel. The actor processor completes the channel with the actor's
     /// response; the ask future resolves with it, or times out.
+    ///
+    /// M5: the envelope is pushed **by value** into the mailbox
+    /// (`push_ask`) — no envelope boxing. Small payloads (`new_inline`)
+    /// are additionally zero-payload-alloc.
     pub async fn ask_with_strategy_and_timeout(
         &self,
         msg: BoxedMessage,
@@ -144,13 +181,49 @@ where
     ) -> ActorResult<BoxedMessage> {
         let mailbox = self.mailbox()?;
 
-        let (envelope, reply_rx) = AskEnvelope::new(msg);
-        let envelope = Box::new(envelope) as BoxedMessage;
+        let (envelope, reply_rx) = AskEnvelope::with_boxed(msg);
+
+        mailbox.push_ask(envelope, strategy).await.map_err(|e| {
+            ActorError::InternalError(format!("Failed to enqueue ask for {}: {:?}", self.path, e))
+        })?;
+
+        match tokio::time::timeout(timeout_duration, reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ActorError::ReplyChannelError(format!(
+                "Reply channel closed for ask to {}",
+                self.path
+            ))),
+            Err(_) => Err(ActorError::TimeoutDetail(format!(
+                "Request to actor {} timed out after {}ms",
+                self.path,
+                timeout_duration.as_millis()
+            ))),
+        }
+    }
+
+    /// M5: inline-payload ask (SSO lane, ≤16B messages).    ///
+    /// Ask with a small message that implements `InlineMsg`: the payload
+    /// lives inline in the envelope (zero payload allocations), the
+    /// envelope flows by value (zero envelope allocation). Total asker-side
+    /// allocations: exactly one (the oneshot cell).
+    pub async fn ask_inline<P: crate::thread::envelope::InlineMsg>(
+        &self,
+        msg: P,
+        timeout_duration: Duration,
+    ) -> ActorResult<BoxedMessage> {
+        let mailbox = self.mailbox()?;
+
+        let (envelope, reply_rx) = AskEnvelope::new_inline(msg);
 
         mailbox
-            .push(envelope, strategy)
+            .push_ask(envelope, self.default_strategy.clone())
             .await
-            .map_err(|e| ActorError::InternalError(format!("Failed to enqueue ask for {}: {:?}", self.path, e)))?;
+            .map_err(|e| {
+                ActorError::InternalError(format!(
+                    "Failed to enqueue ask for {}: {:?}",
+                    self.path, e
+                ))
+            })?;
 
         match tokio::time::timeout(timeout_duration, reply_rx).await {
             Ok(Ok(result)) => result,
@@ -184,13 +257,11 @@ where
     ) -> ActorResult<BoxedMessage> {
         let mailbox = self.mailbox()?;
 
-        let (envelope, reply_rx) = AskEnvelope::new(msg);
-        let envelope = Box::new(envelope) as BoxedMessage;
+        let (envelope, reply_rx) = AskEnvelope::with_boxed(msg);
 
-        mailbox
-            .push(envelope, strategy)
-            .await
-            .map_err(|e| ActorError::InternalError(format!("Failed to enqueue ask for {}: {:?}", self.path, e)))?;
+        mailbox.push_ask(envelope, strategy).await.map_err(|e| {
+            ActorError::InternalError(format!("Failed to enqueue ask for {}: {:?}", self.path, e))
+        })?;
 
         match reply_rx.await {
             Ok(result) => result,
@@ -225,9 +296,7 @@ where
         // ask. No implicit engine default timeout — callers who need a
         // bound use send_with_timeout(Some(d)); fire-and-forget uses
         // `deliver`.
-        Box::pin(async move {
-            self.ask_unbounded(msg, self.default_strategy.clone()).await
-        })
+        Box::pin(async move { self.ask_unbounded(msg, self.default_strategy.clone()).await })
     }
 
     fn send_with_timeout<'a>(
@@ -318,9 +387,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread::context::ThreadContext;
     use crate::thread::mailbox::mpsc::MpscMailbox;
     use parrot_api::actor::EmptyConfig;
-    use crate::thread::context::ThreadContext;
 
     fn create_test_mailbox() -> (Arc<MpscMailbox>, ActorPath) {
         #[derive(Debug)]
@@ -328,11 +397,18 @@ mod tests {
 
         #[async_trait]
         impl ActorRef for MockActorRef {
-            fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            fn send<'a>(
+                &'a self,
+                _msg: BoxedMessage,
+            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
             }
 
-            fn send_with_timeout<'a>(&'a self, _msg: BoxedMessage, _timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            fn send_with_timeout<'a>(
+                &'a self,
+                _msg: BoxedMessage,
+                _timeout_duration: Option<Duration>,
+            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
             }
 
@@ -380,12 +456,12 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn receive_message<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn receive_message<'a>(
+            &'a mut self,
+            _msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async { Ok(Box::new(()) as Box<dyn Any + Send>) })
-        }
-
-        fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-            None
         }
 
         fn state(&self) -> parrot_api::actor::ActorState {
@@ -434,7 +510,9 @@ mod tests {
         let answerer = tokio::spawn(async move {
             let env = mailbox.pop().await.expect("envelope queued");
             let envelope = *env.downcast::<AskEnvelope>().expect("is AskEnvelope");
-            envelope.reply_success(Box::new("ack") as BoxedMessage).await;
+            envelope
+                .reply_success(Box::new("ack") as BoxedMessage)
+                .await;
         });
 
         let result = actor_ref.send(Box::new("hi") as BoxedMessage).await;
@@ -494,7 +572,9 @@ mod tests {
         let answerer = tokio::spawn(async move {
             let env = mailbox.pop().await.expect("envelope queued");
             let envelope = *env.downcast::<AskEnvelope>().expect("is AskEnvelope");
-            envelope.reply_success(Box::new("pong") as BoxedMessage).await;
+            envelope
+                .reply_success(Box::new("pong") as BoxedMessage)
+                .await;
         });
 
         let message = Box::new("ping") as BoxedMessage;
@@ -541,10 +621,15 @@ mod tests {
         actor_ref.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
         assert!(actor_ref.is_alive().await);
         // Envelope is enqueued but unanswered: bounded ask times out.
-        assert!(actor_ref
-            .send_with_timeout(Box::new("x") as BoxedMessage, Some(Duration::from_millis(50)))
-            .await
-            .is_err());
+        assert!(
+            actor_ref
+                .send_with_timeout(
+                    Box::new("x") as BoxedMessage,
+                    Some(Duration::from_millis(50))
+                )
+                .await
+                .is_err()
+        );
         assert!(mailbox.pop().await.is_some());
     }
 }

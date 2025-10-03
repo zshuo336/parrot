@@ -1,17 +1,18 @@
-use std::sync::{Arc, RwLock};
-use std::collections::HashMap;
+use crate::actix::actor::ActixActor;
+use crate::actix::context::ActixContext;
+use crate::actix::reference::ActixActorRef;
 use actix::System as ActixSystem;
 use actix::prelude::ArbiterHandle;
-use async_trait::async_trait;
 use anyhow::anyhow;
-use parrot_api::system::{ActorSystemConfig, SystemError, SystemStatus, SystemState, SystemResources};
 use parrot_api::actor::Actor as ParrotActor;
 use parrot_api::address::ActorRef;
 use parrot_api::message::Message;
-use parrot_api::types::{BoxedActorRef, ActorResult};
-use crate::actix::actor::ActixActor;
-use crate::actix::reference::ActixActorRef;
-use crate::actix::context::ActixContext;
+use parrot_api::system::{
+    ActorSystemConfig, SystemError, SystemResources, SystemState, SystemStatus,
+};
+use parrot_api::types::BoxedActorRef;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -62,11 +63,8 @@ impl ArbiterPool {
     }
 
     /// Pick the next arbiter (round-robin).
-    fn next_arbiter(&self) -> ArbiterHandle {
-        let idx = self
-            .next
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.workers.len();
+    pub(crate) fn next_arbiter(&self) -> ArbiterHandle {
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.workers.len();
         self.workers[idx].clone()
     }
 }
@@ -80,16 +78,16 @@ impl std::fmt::Debug for ArbiterPool {
 }
 
 /// ActixActorSystem implements the actor system for Actix
-/// 
+///
 /// # Overview
 /// Core system for managing actors in the Actix backend
-/// 
+///
 /// # Key Responsibilities
 /// - Create and manage actors
 /// - Track actor references
 /// - Handle system-wide operations
 /// - Mediate broadcast messages
-/// 
+///
 /// # Implementation Details
 /// - Wraps an actix::System instance
 /// - Manages actor address mappings
@@ -118,11 +116,11 @@ impl Clone for ActixActorSystem {
     fn clone(&self) -> Self {
         Self {
             system: self.system.clone(),
-            actors: self.actors.clone(),        // Share actors collection instead of creating a new empty map
+            actors: self.actors.clone(), // Share actors collection instead of creating a new empty map
             config: self.config.clone(),
-            registry: self.registry.clone(),    // Share registry data
+            registry: self.registry.clone(), // Share registry data
             default_dispatcher: self.default_dispatcher.clone(), // Share dispatcher settings
-            arbiters: self.arbiters.clone(),    // Share the arbiter pool
+            arbiters: self.arbiters.clone(), // Share the arbiter pool
             arbiter_count: self.arbiter_count,
         }
     }
@@ -130,10 +128,10 @@ impl Clone for ActixActorSystem {
 
 impl ActixActorSystem {
     /// Create a new ActixActorSystem
-    /// 
+    ///
     /// # Parameters
     /// - `config`: System configuration parameters
-    /// 
+    ///
     /// # Returns
     /// A new ActixActorSystem instance or error
     pub async fn new() -> Result<Self, SystemError> {
@@ -164,7 +162,7 @@ impl ActixActorSystem {
     }
 
     /// Get (lazily constructing) the shared arbiter pool.
-    fn arbiter_pool(&self) -> Result<ArbiterPool, SystemError> {
+    pub(crate) fn arbiter_pool(&self) -> Result<ArbiterPool, SystemError> {
         // Fast path: read without constructing.
         if let Some(pool) = self.arbiters.read().ok().and_then(|g| g.clone()) {
             return Ok(pool);
@@ -180,38 +178,42 @@ impl ActixActorSystem {
         *guard = Some(pool.clone());
         Ok(pool)
     }
-    
+
     /// Spawn a root-level actor
-    /// 
+    ///
     /// # Type Parameters
     /// - `A`: Actor type implementing ParrotActor
-    /// 
+    ///
     /// # Parameters
     /// - `actor`: Actor instance to spawn
     /// - `config`: Actor configuration
-    /// 
+    ///
     /// # Returns
     /// Reference to the created actor or error
-    pub async fn spawn_root_typed<A>(&self, actor: A, _config: A::Config) -> Result<Box<dyn ActorRef>, SystemError> 
+    pub async fn spawn_root_typed<A>(
+        &self,
+        actor: A,
+        _config: A::Config,
+    ) -> Result<Box<dyn ActorRef>, SystemError>
     where
-        A: ParrotActor<Context = ActixContext<ActixActor<A>>> + Unpin + 'static 
+        A: ParrotActor<Context = ActixContext<ActixActor<A>>>
+            + parrot_api::actor::ActixEngineExt<Context = ActixContext<ActixActor<A>>>
+            + Unpin
+            + 'static,
     {
         // Get type name as actor name
         let type_name = std::any::type_name::<A>();
-        let actor_name = match type_name.rsplit("::").next() {
-            Some(name) => name,
-            None => "unknown"
-        };
-        
+        let actor_name = type_name.rsplit("::").next().unwrap_or("unknown");
+
         // Unique path per actor instance: spawning the same actor type twice
         // used to overwrite the registry entry (both stress suites noted this
         // limitation). A short uuid suffix keeps paths collision-free while
         // staying readable.
         let path = format!("actix://{}/{}", actor_name, Uuid::new_v4().simple());
-        
+
         // Create ActixActor wrapper
         let actor_base = ActixActor::new(actor);
-        
+
         // Start the actor on a pooled worker arbiter (round-robin). This is
         // the multi-arbiter support: actors land on different OS threads and
         // execute in parallel; a blocking handler on one arbiter no longer
@@ -221,25 +223,26 @@ impl ActixActorSystem {
             Ok(pool) => actix::Actor::start_in_arbiter(&pool.next_arbiter(), |_ctx| actor_base),
             Err(_) => actix::Actor::start(actor_base),
         };
-        
+
         // Create actor reference
         let actor_ref = Box::new(ActixActorRef::new(addr, path.clone())) as Box<dyn ActorRef>;
-        
+
         // Register actor
-        let mut actors = self.actors.write().map_err(|_| {
-            SystemError::Other(anyhow!("Failed to acquire write lock"))
-        })?;
-        
+        let mut actors = self
+            .actors
+            .write()
+            .map_err(|_| SystemError::Other(anyhow!("Failed to acquire write lock")))?;
+
         actors.insert(path, actor_ref.clone_boxed());
-        
+
         Ok(actor_ref)
     }
-    
+
     /// Get an actor by its path
-    /// 
+    ///
     /// # Parameters
     /// - `path`: The actor's path
-    /// 
+    ///
     /// # Returns
     /// Reference to the actor if found
     pub async fn get_actor(&self, path: &String) -> Option<BoxedActorRef> {
@@ -247,18 +250,18 @@ impl ActixActorSystem {
             Ok(actors) => actors,
             Err(_) => return None,
         };
-        
+
         actors.get(path).map(|actor_ref| actor_ref.clone_boxed())
     }
-    
+
     /// Broadcast a message to all actors
-    /// 
+    ///
     /// # Type Parameters
     /// - `M`: Message type implementing Message
-    /// 
+    ///
     /// # Parameters
     /// - `msg`: Message to broadcast
-    /// 
+    ///
     /// # Returns
     /// Success or error
     pub async fn broadcast<M: Message + Clone + 'static>(&self, msg: M) -> Result<(), SystemError> {
@@ -266,39 +269,39 @@ impl ActixActorSystem {
             Ok(actors) => actors,
             Err(_) => return Err(SystemError::Other(anyhow!("Failed to acquire read lock"))),
         };
-        
+
         for actor_ref in actors.values() {
             // Use the ActorRefExt::tell method to send the message without waiting for a response
             // Clone the message for each actor
             let actor_ref_clone = actor_ref.clone_boxed();
             let msg_clone = msg.clone();
-            
+
             // Spawn a task to send the message
             tokio::spawn(async move {
                 let boxed_msg = Box::new(msg_clone) as Box<dyn std::any::Any + Send>;
                 let _ = actor_ref_clone.send(boxed_msg).await;
             });
         }
-        
+
         Ok(())
     }
-    
+
     /// Shutdown the actor system
-    /// 
+    ///
     /// # Returns
     /// Success or error
     pub async fn shutdown(self) -> Result<(), SystemError> {
         println!("ActixActorSystem: Starting shutdown sequence");
-        
+
         // Stop all actors
         {
             let actors = match self.actors.read() {
                 Ok(actors) => actors,
                 Err(_) => return Err(SystemError::Other(anyhow!("Failed to acquire read lock"))),
             };
-            
+
             println!("ActixActorSystem: Stopping {} actors", actors.len());
-            
+
             for actor_ref in actors.values() {
                 // Spawn a task to stop the actor
                 let actor_ref_clone = actor_ref.clone_boxed();
@@ -307,22 +310,22 @@ impl ActixActorSystem {
                 });
             }
         }
-        
+
         // Wait for actors to stop (could add a timeout here)
         println!("ActixActorSystem: Waiting for actors to stop");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        
+
         // Stop the Actix system
         println!("ActixActorSystem: Stopping the Actix system");
         actix::System::current().stop();
         println!("ActixActorSystem: System shutdown initiated");
         tracing::info!("ActixActorSystem: System shutdown initiated");
-        
+
         Ok(())
     }
-    
+
     /// Get status of the actor system
-    /// 
+    ///
     /// # Returns
     /// Current system status
     pub fn status(&self) -> SystemStatus {
@@ -339,4 +342,4 @@ impl ActixActorSystem {
             },
         }
     }
-} 
+}

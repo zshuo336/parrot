@@ -1,8 +1,8 @@
-use parrot_api::{Message, MessagePriority};
-use parrot_api::{HIGH, LOW, NORMAL, CRITICAL, BACKGROUND};
 use parrot_api::message::BackoffStrategy;
-use serde::{Serialize, Deserialize};
+use parrot_api::HIGH;
+use parrot_api::{Message, MessagePriority};
 use parrot_api_derive::Message;
+use serde::{Deserialize, Serialize};
 
 // Test basic message without any attributes
 #[derive(Message, Debug, PartialEq, Clone)]
@@ -18,8 +18,7 @@ struct CustomResultMessage {
 }
 
 // Test message with serde support
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-#[derive(Message)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Message)]
 struct SerdeMessage {
     data: Vec<u8>,
 }
@@ -39,8 +38,7 @@ struct PriorityMessage {
 }
 
 // Test message with all features
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-#[derive(Message)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Message)]
 #[message(
     result = "Vec<String>",
     validate = "self.items.len() > 0",
@@ -59,21 +57,13 @@ struct TimeoutMessage {
 
 // Add new message type for testing retry strategy
 #[derive(Message, Debug, PartialEq, Clone)]
-#[message(
-    retry_max_attempts = 3,
-    retry_interval = 2,
-    retry_strategy = "Fixed"
-)]
+#[message(retry_max_attempts = 3, retry_interval = 2, retry_strategy = "Fixed")]
 struct RetryFixedMessage {
     job_id: String,
 }
 
 #[derive(Message, Debug, PartialEq, Clone)]
-#[message(
-    retry_max_attempts = 3,
-    retry_interval = 2,
-    retry_strategy = "Linear"
-)]
+#[message(retry_max_attempts = 3, retry_interval = 2, retry_strategy = "Linear")]
 struct RetryLinearMessage {
     job_id: String,
 }
@@ -121,6 +111,7 @@ struct StringPriorityMessage {
 #[derive(Message, Debug, Clone)]
 #[message(priority = HIGH)]
 struct ConstantPriorityMessage {
+    #[allow(dead_code)]
     data: String,
 }
 
@@ -134,7 +125,7 @@ mod tests {
         let msg = BasicMessage {
             content: "test".to_string(),
         };
-        
+
         let msg = BasicMessage::new(msg).unwrap();
         assert_eq!(msg.message_type(), "message_tests::BasicMessage");
         assert_eq!(msg.priority(), MessagePriority::NORMAL);
@@ -147,13 +138,19 @@ mod tests {
         let msg = CustomResultMessage {
             query: "search".to_string(),
         };
-        
+
         let msg = CustomResultMessage::new(msg).unwrap();
         let envelope = msg.into_envelope();
         let _msg_ref = envelope.message::<CustomResultMessage>().unwrap();
         // Assert that _msg_ref is of type CustomResultMessage
-        assert!(std::any::TypeId::of::<CustomResultMessage>() == std::any::TypeId::of::<CustomResultMessage>());
-        assert_eq!(_msg_ref.message_type(), "message_tests::CustomResultMessage");
+        assert!(
+            std::any::TypeId::of::<CustomResultMessage>()
+                == std::any::TypeId::of::<CustomResultMessage>()
+        );
+        assert_eq!(
+            _msg_ref.message_type(),
+            "message_tests::CustomResultMessage"
+        );
         assert_eq!(_msg_ref.query, "search".to_string());
     }
 
@@ -162,7 +159,7 @@ mod tests {
         let msg = SerdeMessage {
             data: vec![1, 2, 3],
         };
-        
+
         // Test serialization
         let serialized = serde_json::to_string(&msg).unwrap();
         let deserialized: SerdeMessage = serde_json::from_str(&serialized).unwrap();
@@ -195,9 +192,11 @@ mod tests {
         let msg = PriorityMessage::new(msg).unwrap();
         let envelope = msg.into_envelope();
         let _msg_ref = envelope.message::<PriorityMessage>().unwrap();
-        assert!(std::any::TypeId::of::<PriorityMessage>() == std::any::TypeId::of::<PriorityMessage>());
+        assert!(
+            std::any::TypeId::of::<PriorityMessage>() == std::any::TypeId::of::<PriorityMessage>()
+        );
         assert_eq!(_msg_ref.message_type(), "message_tests::PriorityMessage");
-        assert_eq!(_msg_ref.urgent, true);
+        assert!(_msg_ref.urgent);
     }
 
     #[test]
@@ -210,9 +209,7 @@ mod tests {
         assert_eq!(msg.priority(), MessagePriority::HIGH);
 
         // Test invalid case
-        let invalid_msg = CompleteMessage {
-            items: vec![],
-        };
+        let invalid_msg = CompleteMessage { items: vec![] };
         assert!(CompleteMessage::new(invalid_msg).is_err());
 
         // Test serialization
@@ -236,20 +233,18 @@ mod tests {
         assert_eq!(_msg_ref.message_type(), "message_tests::BasicMessage");
 
         // Test full featured message envelope conversion
-        let msg = FullFeaturedMessage {
-            amount: 100.0,
-        };
+        let msg = FullFeaturedMessage { amount: 100.0 };
         let envelope = msg.into_envelope();
-        
+
         // Verify message content after conversion
         let msg_ref = envelope.message::<FullFeaturedMessage>().unwrap();
         assert_eq!(msg_ref.amount, 100.0);
-        
+
         // Verify message options
         let options = envelope.options;
         assert_eq!(options.priority, MessagePriority::CRITICAL);
         assert_eq!(options.timeout, Some(Duration::from_secs(10)));
-        
+
         // Verify retry policy
         let retry_policy = options.retry_policy.unwrap();
         assert_eq!(retry_policy.max_attempts, 5);
@@ -300,7 +295,7 @@ mod tests {
         };
         let msg = RetryFixedMessage::new(msg).unwrap();
         let options = msg.message_options().unwrap();
-        
+
         if let Some(retry_policy) = options.retry_policy {
             assert_eq!(retry_policy.max_attempts, 3);
             assert_eq!(retry_policy.retry_interval, Duration::from_secs(2));
@@ -317,7 +312,7 @@ mod tests {
         };
         let msg = RetryLinearMessage::new(msg).unwrap();
         let options = msg.message_options().unwrap();
-        
+
         if let Some(retry_policy) = options.retry_policy {
             matches!(retry_policy.backoff_strategy, BackoffStrategy::Linear);
         } else {
@@ -332,9 +327,12 @@ mod tests {
         };
         let msg = RetryExponentialMessage::new(msg).unwrap();
         let options = msg.message_options().unwrap();
-        
+
         if let Some(retry_policy) = options.retry_policy {
-            matches!(retry_policy.backoff_strategy, BackoffStrategy::Exponential { .. });
+            matches!(
+                retry_policy.backoff_strategy,
+                BackoffStrategy::Exponential { .. }
+            );
         } else {
             panic!("Expected retry policy to be Some");
         }
@@ -354,15 +352,18 @@ mod tests {
         // Test valid case
         let msg = FullFeaturedMessage { amount: 100.0 };
         let msg = FullFeaturedMessage::new(msg).unwrap();
-        
+
         let options = msg.message_options().unwrap();
         assert_eq!(options.timeout, Some(Duration::from_secs(10)));
         assert_eq!(msg.priority().value(), 90);
-        
+
         if let Some(retry_policy) = options.retry_policy {
             assert_eq!(retry_policy.max_attempts, 5);
             assert_eq!(retry_policy.retry_interval, Duration::from_secs(3));
-            matches!(retry_policy.backoff_strategy, BackoffStrategy::Exponential { .. });
+            matches!(
+                retry_policy.backoff_strategy,
+                BackoffStrategy::Exponential { .. }
+            );
         } else {
             panic!("Expected retry policy to be Some");
         }
@@ -379,7 +380,7 @@ mod tests {
         };
         let msg = BasicMessage::new(msg).unwrap();
         let options = msg.message_options().unwrap();
-        
+
         assert_eq!(options.timeout, None);
         // Use is_none() check instead of direct comparison
         assert!(options.retry_policy.is_none());
@@ -390,14 +391,17 @@ mod tests {
     fn test_envelope_options_propagation() {
         let msg = FullFeaturedMessage { amount: 100.0 };
         let envelope = msg.into_envelope();
-        
+
         assert_eq!(envelope.options.timeout, Some(Duration::from_secs(10)));
         assert_eq!(envelope.options.priority.value(), 90);
-        
+
         if let Some(retry_policy) = envelope.options.retry_policy {
             assert_eq!(retry_policy.max_attempts, 5);
             assert_eq!(retry_policy.retry_interval, Duration::from_secs(3));
-            matches!(retry_policy.backoff_strategy, BackoffStrategy::Exponential { .. });
+            matches!(
+                retry_policy.backoff_strategy,
+                BackoffStrategy::Exponential { .. }
+            );
         } else {
             panic!("Expected retry policy to be Some");
         }

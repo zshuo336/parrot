@@ -4,8 +4,8 @@
 // cannot be cloned directly due to the boxed trait object. We implement a zero-cost abstraction
 // that allows proper cloning of messages.
 
-use std::any::Any;
 use parrot_api::types::BoxedMessage;
+use std::any::Any;
 
 /// CloneableMessage is a trait that extends Any and Send with the ability to clone itself.
 /// This allows us to implement cloning for BoxedMessage types that contain cloneable data.
@@ -20,8 +20,6 @@ impl<T: 'static + Clone + Send> CloneableMessage for T {
         Box::new(self.clone())
     }
 }
-
-
 
 /// Helper function to create a BoxedMessage that can be safely cloned
 pub fn make_cloneable<T: 'static + Clone + Send>(value: T) -> BoxedMessage {
@@ -55,10 +53,13 @@ mod tests {
         let msg = make_cloneable(payload);
         let cloned = msg.downcast_ref::<Payload>().unwrap().clone_box();
         let inner = cloned.downcast::<Payload>().expect("cloned is Payload");
-        assert_eq!(*inner, Payload {
-            id: 7,
-            items: vec![1, 2, 3],
-        });
+        assert_eq!(
+            *inner,
+            Payload {
+                id: 7,
+                items: vec![1, 2, 3],
+            }
+        );
     }
 
     #[test]
@@ -70,4 +71,3 @@ mod tests {
         assert_eq!(*msg.downcast_ref::<u64>().unwrap(), 42u64);
     }
 }
-

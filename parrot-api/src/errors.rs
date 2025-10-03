@@ -1,5 +1,5 @@
 //! # Actor System Error Types
-//! 
+//!
 //! This module defines the error types used throughout the Parrot actor system.
 //! It provides a comprehensive error handling infrastructure that enables proper
 //! error propagation and handling across the actor hierarchy.
@@ -63,7 +63,7 @@ pub enum ActorError {
     /// * String - Detailed error message explaining the initialization failure
     #[error("Actor initialization failed: {0}")]
     InitializationError(String),
-    
+
     /// Error during message processing.
     ///
     /// This error occurs when an actor fails to process a message,
@@ -73,7 +73,7 @@ pub enum ActorError {
     /// * String - Detailed error message explaining the handling failure
     #[error("Message handling failed: {0}")]
     MessageHandlingError(String),
-    
+
     /// Actor has been stopped.
     ///
     /// This error indicates that an operation was attempted on a
@@ -81,7 +81,7 @@ pub enum ActorError {
     /// management.
     #[error("Actor stopped")]
     Stopped,
-    
+
     /// Operation timeout.
     ///
     /// This error occurs when an operation fails to complete within
@@ -101,7 +101,7 @@ pub enum ActorError {
     /// Internal system error.
     #[error("Internal error: {0}")]
     InternalError(String),
-    
+
     /// Process message error.
     ///
     /// This error occurs when a message is processed with an error.
@@ -128,4 +128,3 @@ pub enum ActorError {
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
-

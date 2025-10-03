@@ -3,6 +3,11 @@ name = "parrot"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# M5 工程审慎逃生阀：ask 路径回退历史双装箱（payload Box + envelope Box）。
+# 首个稳定版移除（计划 M5 节"工程审慎"）。
+parrot_envelope_legacy = []
+
 [dependencies]
 parrot-api = { path = "../parrot-api" }
 parrot-api-derive = { path = "../parrot-api-derive" }

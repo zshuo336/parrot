@@ -1,5 +1,5 @@
 //! # Actor Supervision System
-//! 
+//!
 //! This module provides the supervision infrastructure for the Parrot actor system,
 //! implementing fault tolerance through hierarchical error handling and recovery strategies.
 //!
@@ -37,12 +37,42 @@
 //! Note: registering the strategy with an actor system is
 //! implementation-specific; refer to the concrete system's builder API.
 
-use std::time::Duration;
+use crate::address::ActorRef;
+use crate::errors::ActorError;
+use async_trait::async_trait;
 use std::fmt::Debug;
 use std::sync::Arc;
-use async_trait::async_trait;
-use crate::errors::ActorError;
-use crate::address::ActorRef;
+use std::time::Duration;
+
+/// Why an actor terminated (M3 supervision: public death reason).
+///
+/// Carried by engine `Terminated` notifications so DeathWatch consumers
+/// can distinguish graceful stops from panics and escalations — parity
+/// with Akka's public `Terminated`/`DeathPact` distinction and Erlang's
+/// process exit reasons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeathReason {
+    /// Normal termination (`stop` / system shutdown / mailbox closed).
+    Normal,
+    /// The actor panicked; the payload message is the formatted panic.
+    Panic(String),
+    /// The actor was killed by the system (forced removal).
+    Killed,
+    /// The actor was stopped as part of an escalation cascade; the payload
+    /// message explains the originating failure.
+    Escalated(String),
+}
+
+impl std::fmt::Display for DeathReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeathReason::Normal => write!(f, "normal"),
+            DeathReason::Panic(m) => write!(f, "panic: {m}"),
+            DeathReason::Killed => write!(f, "killed"),
+            DeathReason::Escalated(m) => write!(f, "escalated: {m}"),
+        }
+    }
+}
 
 /// Decisions available to supervisors when handling actor failures.
 ///
@@ -54,17 +84,17 @@ pub enum SupervisionDecision {
     ///
     /// Use when the error is transient and doesn't affect actor state.
     Resume,
-    
+
     /// Recreate the actor, resetting its state to initial values.
     ///
     /// Use when the actor's state may be corrupted.
     Restart,
-    
+
     /// Terminate the actor permanently.
     ///
     /// Use when the error is unrecoverable or the actor is no longer needed.
     Stop,
-    
+
     /// Forward the error to the parent supervisor.
     ///
     /// Use when the error needs to be handled at a higher level.
@@ -203,10 +233,10 @@ impl SupervisorStrategy for DefaultStrategy {
 pub struct OneForOneStrategy {
     /// Maximum number of restarts allowed within the time window
     pub max_restarts: u32,
-    
+
     /// Time window for counting restarts
     pub within: Duration,
-    
+
     /// Function for making supervision decisions
     pub decider: BasicDecisionFn,
 }
@@ -246,10 +276,10 @@ impl SupervisorStrategy for OneForOneStrategy {
 pub struct OneForAllStrategy {
     /// Maximum number of restarts allowed within the time window
     pub max_restarts: u32,
-    
+
     /// Time window for counting restarts
     pub within: Duration,
-    
+
     /// Function for making supervision decisions
     pub decider: BasicDecisionFn,
 }
@@ -377,4 +407,4 @@ impl SupervisorStrategy for SupervisorStrategyType {
             Self::OneForAll(s) => s.handle_failure(failed_actor, error, failure_count).await,
         }
     }
-} 
+}

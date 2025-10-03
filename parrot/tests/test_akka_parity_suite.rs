@@ -19,21 +19,18 @@
 
 mod common;
 
-
 use common::*;
 use parrot::thread::config::{
     BackpressureStrategy, SchedulingMode, SupervisorStrategy, ThreadActorConfig,
-    ThreadActorSystemConfig,
 };
 use parrot::thread::context::ThreadContext;
-use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 use parrot_api::address::ActorRefExt;
 use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::Message;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -86,16 +83,10 @@ impl Actor for LifecycleProbe {
         })
     }
 
-    fn receive_message_with_engine<'a>(
+    fn before_stop<'a>(
         &'a mut self,
-        _msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
-    fn before_stop<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         // Akka postStop: runs after the last message, before removal.
         self.mark("before_stop");
         Box::pin(async { Ok(()) })
@@ -124,22 +115,33 @@ async fn akka_parity_lifecycle_ordering() {
             self.0.lock().unwrap().push("init".into());
             Box::pin(async { Ok(()) })
         }
-        fn receive_message<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn receive_message<'a>(
+            &'a mut self,
+            _m: BoxedMessage,
+            _c: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             self.0.lock().unwrap().push("message".into());
             Box::pin(async { Ok(Box::new("alive".to_string()) as BoxedMessage) })
         }
-        fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-            None
-        }
-        fn before_stop<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        fn before_stop<'a>(
+            &'a mut self,
+            _c: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
             self.0.lock().unwrap().push("before_stop".into());
             Box::pin(async { Ok(()) })
         }
-        fn state(&self) -> ActorState { ActorState::Running }
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
     }
 
     let aref = ts
-        .spawn_at::<Probe>(Probe(shared.clone()), "/akka/lifecycle", None, ThreadActorConfig::default())
+        .spawn_at::<Probe>(
+            Probe(shared.clone()),
+            "/akka/lifecycle",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .expect("spawn");
 
@@ -160,7 +162,11 @@ async fn akka_parity_lifecycle_ordering() {
     // Stop drives before_stop (Akka postStop), then removal.
     ts.stop_actor("/akka/lifecycle").await.expect("stop");
     let ev = shared.lock().unwrap().clone();
-    assert_eq!(ev, vec!["init", "message", "before_stop"], "Akka lifecycle ordering: preStart → receive → postStop");
+    assert_eq!(
+        ev,
+        vec!["init", "message", "before_stop"],
+        "Akka lifecycle ordering: preStart → receive → postStop"
+    );
 
     // After stop, the path is gone from the registry (actorFor → dead).
     assert!(ts.get_actor_ref("/akka/lifecycle").is_none());
@@ -215,15 +221,6 @@ impl Actor for DeathWatcher {
         })
     }
 
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -234,17 +231,31 @@ async fn akka_parity_deathwatch_watch_and_terminate() {
     let ts = mk_system();
 
     let watcher = ts
-        .spawn_at::<DeathWatcher>(DeathWatcher::default(), "/akka/watcher", None, ThreadActorConfig::default())
+        .spawn_at::<DeathWatcher>(
+            DeathWatcher::default(),
+            "/akka/watcher",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
-    let watched = ts
-        .spawn_at::<SimpleWatched>(SimpleWatched::default(), "/akka/watched", None, ThreadActorConfig::default())
+    let _watched = ts
+        .spawn_at::<SimpleWatched>(
+            SimpleWatched::default(),
+            "/akka/watched",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
 
     // Akka: context.watch(target) — idempotent registration.
-    ts.watch("/akka/watcher".into(), "/akka/watched".into()).await.unwrap();
-    ts.watch("/akka/watcher".into(), "/akka/watched".into()).await.unwrap();
+    ts.watch("/akka/watcher".into(), "/akka/watched".into())
+        .await
+        .unwrap();
+    ts.watch("/akka/watcher".into(), "/akka/watched".into())
+        .await
+        .unwrap();
 
     // Stop the watched actor → watcher must receive the termination notice.
     ts.stop_actor("/akka/watched").await.unwrap();
@@ -258,15 +269,25 @@ async fn akka_parity_deathwatch_watch_and_terminate() {
 
     // Unwatched target stopping does NOT notify (registration removed).
     let stranger = ts
-        .spawn_at::<SimpleWatched>(SimpleWatched::default(), "/akka/stranger", None, ThreadActorConfig::default())
+        .spawn_at::<SimpleWatched>(
+            SimpleWatched::default(),
+            "/akka/stranger",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     let _ = stranger;
-    ts.unwatch("/akka/watcher".into(), "/akka/watched".into()).await.unwrap();
+    ts.unwatch("/akka/watcher".into(), "/akka/watched".into())
+        .await
+        .unwrap();
     ts.stop_actor("/akka/stranger").await.unwrap();
     tokio::time::sleep(Duration::from_millis(120)).await;
     let n: usize = ask(&watcher, WatcherQuery).await.unwrap();
-    assert_eq!(n, 1, "unwatch/unregistered stops must not notify — Akka unwatch semantics");
+    assert_eq!(
+        n, 1,
+        "unwatch/unregistered stops must not notify — Akka unwatch semantics"
+    );
 }
 
 // ===========================================================================
@@ -316,15 +337,6 @@ impl Actor for PanickyWorker {
         })
     }
 
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -335,20 +347,32 @@ async fn akka_parity_supervision_panic_isolation() {
     let ts = mk_system();
 
     let victim = ts
-        .spawn_at::<PanickyWorker>(PanickyWorker::default(), "/akka/panic-victim", None, ThreadActorConfig::default())
+        .spawn_at::<PanickyWorker>(
+            PanickyWorker::default(),
+            "/akka/panic-victim",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     let neighbor = ts
-        .spawn_at::<PanickyWorker>(PanickyWorker::default(), "/akka/panic-neighbor", None, ThreadActorConfig::default())
+        .spawn_at::<PanickyWorker>(
+            PanickyWorker::default(),
+            "/akka/panic-neighbor",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
 
     // Akka guarantee 1: a failing child does not take down siblings.
-    let _ = victim.tell(SupervisedBoom(1)); // panics inside the victim
+    victim.tell(SupervisedBoom(1)); // panics inside the victim
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Neighbor unaffected — processes normally.
-    let c: u64 = ask(&neighbor, SupervisedCount).await.expect("neighbor alive");
+    let c: u64 = ask(&neighbor, SupervisedCount)
+        .await
+        .expect("neighbor alive");
     assert!(c >= 1, "Akka: sibling isolation under child failure");
 
     // Akka guarantee 2: the system process/test itself survives the panic
@@ -360,7 +384,10 @@ async fn akka_parity_supervision_panic_isolation() {
 #[tokio::test]
 async fn akka_parity_supervision_strategy_shapes() {
     // The strategy vocabulary matches Akka's Supervisor directives.
-    let restart = SupervisorStrategy::Restart { max_retries: 3, within: Duration::from_secs(10) };
+    let restart = SupervisorStrategy::Restart {
+        max_retries: 3,
+        within: Duration::from_secs(10),
+    };
     let resume = SupervisorStrategy::Resume;
     let stop = SupervisorStrategy::Stop;
     let escalate = SupervisorStrategy::Escalate;
@@ -375,7 +402,10 @@ async fn akka_parity_supervision_strategy_shapes() {
     // Strategies are attachable per-actor via config (the Akka
     // `supervisorStrategy` override point).
     let cfg = ThreadActorConfig {
-        supervisor_strategy: Some(SupervisorStrategy::Restart { max_retries: 10, within: Duration::from_secs(60) }),
+        supervisor_strategy: Some(SupervisorStrategy::Restart {
+            max_retries: 10,
+            within: Duration::from_secs(60),
+        }),
         ..Default::default()
     };
     let ts = mk_system();
@@ -395,10 +425,10 @@ async fn akka_parity_supervision_strategy_shapes() {
 #[tokio::test]
 async fn akka_parity_mailbox_overflow_policies() {
     // Policy vocabulary parity with Akka's mailbox overflow directives.
-    let _block = BackpressureStrategy::Block;      // Akka: block the sender
-    let _error = BackpressureStrategy::Error;      // Akka: fail the send
-    let _dn = BackpressureStrategy::DropNewest;    // Akka: discard new
-    let _do = BackpressureStrategy::DropOldest;    // Akka: discard head
+    let _block = BackpressureStrategy::Block; // Akka: block the sender
+    let _error = BackpressureStrategy::Error; // Akka: fail the send
+    let _dn = BackpressureStrategy::DropNewest; // Akka: discard new
+    let _do = BackpressureStrategy::DropOldest; // Akka: discard head
 
     // A bounded mailbox actor must accept at least its capacity without
     // loss, regardless of policy.
@@ -417,7 +447,11 @@ async fn akka_parity_mailbox_overflow_policies() {
         assert!(r.is_ok(), "within-capacity message {} must not be lost", i);
     }
     let total: u64 = ask(&w, GetTotal).await.unwrap();
-    assert_eq!(total, (1..=64).sum::<u64>(), "no loss within capacity (Akka bounded mailbox)");
+    assert_eq!(
+        total,
+        (1..=64).sum::<u64>(),
+        "no loss within capacity (Akka bounded mailbox)"
+    );
 }
 
 // ===========================================================================
@@ -437,7 +471,11 @@ async fn akka_parity_scheduler_once_and_periodic() {
     impl Actor for Timer {
         type Config = EmptyConfig;
         type Context = ThreadContext<Self>;
-        fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _c: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             let fired = self.fired.clone();
             Box::pin(async move {
                 if msg.downcast_ref::<Tick>().is_some() {
@@ -447,14 +485,18 @@ async fn akka_parity_scheduler_once_and_periodic() {
                 Err(ActorError::MessageHandlingError("unknown".into()))
             })
         }
-        fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-            None
+        fn state(&self) -> ActorState {
+            ActorState::Running
         }
-        fn state(&self) -> ActorState { ActorState::Running }
     }
 
     let timer = ts
-        .spawn_at::<Timer>(Timer { fired: t2 }, "/akka/timer", None, ThreadActorConfig::default())
+        .spawn_at::<Timer>(
+            Timer { fired: t2 },
+            "/akka/timer",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
 
@@ -467,7 +509,10 @@ async fn akka_parity_scheduler_once_and_periodic() {
         let _ = target.send(Box::new(Tick) as BoxedMessage).await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(ticks.load(Ordering::SeqCst) >= 1, "scheduleOnce-equivalent delivery fired");
+    assert!(
+        ticks.load(Ordering::SeqCst) >= 1,
+        "scheduleOnce-equivalent delivery fired"
+    );
 
     // Fixed-rate: repeated delivery with a stable cadence (Akka
     // scheduleAtFixedRate). Drive externally, assert ≥3 ticks in window.
@@ -478,7 +523,10 @@ async fn akka_parity_scheduler_once_and_periodic() {
         i += 1;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(ticks.load(Ordering::SeqCst) >= 3, "periodic cadence delivered");
+    assert!(
+        ticks.load(Ordering::SeqCst) >= 3,
+        "periodic cadence delivered"
+    );
     let _ = i;
 }
 
@@ -500,7 +548,11 @@ impl Actor for ThreadReporter {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if msg.downcast_ref::<Tid>().is_some() {
                 self.threads.push(std::thread::current().id());
@@ -515,11 +567,9 @@ impl Actor for ThreadReporter {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[derive(Clone, Debug, Message)]
@@ -547,7 +597,12 @@ async fn akka_parity_pinned_dispatcher_dedicated_thread() {
     // (thread identity may vary — the Akka property is *only* that the
     // pinned actor stays exclusive, which we assert via its own count).
     let shared = ts
-        .spawn_at::<ThreadReporter>(ThreadReporter::default(), "/akka/shared", None, ThreadActorConfig::default())
+        .spawn_at::<ThreadReporter>(
+            ThreadReporter::default(),
+            "/akka/shared",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     for _ in 0..5 {
@@ -570,7 +625,7 @@ async fn akka_parity_ask_pattern_with_timeout() {
     // a Timeout error to the caller, not a hang.
     let ts = mk_system();
     let slow = ts
-        .spawn_at::<Slowpoke>(Slowpoke::default(), "/akka/slow", None, ThreadActorConfig::default())
+        .spawn_at::<Slowpoke>(Slowpoke, "/akka/slow", None, ThreadActorConfig::default())
         .await
         .unwrap();
 
@@ -592,7 +647,12 @@ async fn akka_parity_pipe_to_and_forward() {
     // idiom: spawn a task that resolves and tells the target.
     let ts = mk_system();
     let target = ts
-        .spawn_at::<Counter>(Counter::default(), "/akka/pipeto", None, ThreadActorConfig::default())
+        .spawn_at::<Counter>(
+            Counter::default(),
+            "/akka/pipeto",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
 
@@ -632,12 +692,22 @@ impl Actor for HotSwapActor {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(op) = msg.downcast_ref::<BecomeOp>() {
                 match (self.mode, op.0.as_str()) {
-                    (0, "become-fancy") => { self.mode = 1; return Ok(Box::new("became".to_string()) as BoxedMessage); }
-                    (1, "unbecome") => { self.mode = 0; return Ok(Box::new("unbecame".to_string()) as BoxedMessage); }
+                    (0, "become-fancy") => {
+                        self.mode = 1;
+                        return Ok(Box::new("became".to_string()) as BoxedMessage);
+                    }
+                    (1, "unbecome") => {
+                        self.mode = 0;
+                        return Ok(Box::new("unbecame".to_string()) as BoxedMessage);
+                    }
 
                     (1, "unstash-all") => {
                         let n = self.stash.len();
@@ -645,48 +715,86 @@ impl Actor for HotSwapActor {
                         self.stash.clear();
                         return Ok(Box::new(format!("unstashed-{}", n)) as BoxedMessage);
                     }
-                    (m, "peek") => return Ok(Box::new(format!("mode-{}-stash-{}", m, self.stash.len())) as BoxedMessage),
-                    (_, "stash") => { self.stash.push(BecomeOp(op.0.clone())); return Ok(Box::new("stashed".to_string()) as BoxedMessage); }
-                    _ => return Err(ActorError::MessageHandlingError("state-dependent reject".into())),
+                    (m, "peek") => {
+                        return Ok(Box::new(format!("mode-{}-stash-{}", m, self.stash.len()))
+                            as BoxedMessage);
+                    }
+                    (_, "stash") => {
+                        self.stash.push(BecomeOp(op.0.clone()));
+                        return Ok(Box::new("stashed".to_string()) as BoxedMessage);
+                    }
+                    _ => {
+                        return Err(ActorError::MessageHandlingError(
+                            "state-dependent reject".into(),
+                        ));
+                    }
                 }
             }
             Err(ActorError::MessageHandlingError("unknown".into()))
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
 async fn akka_parity_become_unbecome_stash() {
     let ts = mk_system();
     let a = ts
-        .spawn_at::<HotSwapActor>(HotSwapActor { mode: 0, stash: vec![], processed_unstash: 0 }, "/akka/hotswap", None, ThreadActorConfig::default())
+        .spawn_at::<HotSwapActor>(
+            HotSwapActor {
+                mode: 0,
+                stash: vec![],
+                processed_unstash: 0,
+            },
+            "/akka/hotswap",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
 
     // Initial behavior.
-    assert_eq!(ask(&a, BecomeOp("peek".into())).await.unwrap(), "mode-0-stash-0");
+    assert_eq!(
+        ask(&a, BecomeOp("peek".into())).await.unwrap(),
+        "mode-0-stash-0"
+    );
 
     // become: behavior swap (Akka context.become).
-    assert_eq!(ask(&a, BecomeOp("become-fancy".into())).await.unwrap(), "became");
-    assert_eq!(ask(&a, BecomeOp("peek".into())).await.unwrap(), "mode-1-stash-0");
+    assert_eq!(
+        ask(&a, BecomeOp("become-fancy".into())).await.unwrap(),
+        "became"
+    );
+    assert_eq!(
+        ask(&a, BecomeOp("peek".into())).await.unwrap(),
+        "mode-1-stash-0"
+    );
 
     // stash accumulates while in the alternate behavior.
     assert_eq!(ask(&a, BecomeOp("stash".into())).await.unwrap(), "stashed");
     assert_eq!(ask(&a, BecomeOp("stash".into())).await.unwrap(), "stashed");
-    assert_eq!(ask(&a, BecomeOp("peek".into())).await.unwrap(), "mode-1-stash-2");
+    assert_eq!(
+        ask(&a, BecomeOp("peek".into())).await.unwrap(),
+        "mode-1-stash-2"
+    );
 
     // unstashAll: the Akka stash drain point.
-    assert_eq!(ask(&a, BecomeOp("unstash-all".into())).await.unwrap(), "unstashed-2");
+    assert_eq!(
+        ask(&a, BecomeOp("unstash-all".into())).await.unwrap(),
+        "unstashed-2"
+    );
 
     // unbecome: back to initial behavior.
-    assert_eq!(ask(&a, BecomeOp("unbecome".into())).await.unwrap(), "unbecame");
-    assert_eq!(ask(&a, BecomeOp("peek".into())).await.unwrap(), "mode-0-stash-0");
+    assert_eq!(
+        ask(&a, BecomeOp("unbecome".into())).await.unwrap(),
+        "unbecame"
+    );
+    assert_eq!(
+        ask(&a, BecomeOp("peek".into())).await.unwrap(),
+        "mode-0-stash-0"
+    );
 }
 
 // ===========================================================================
@@ -698,14 +806,23 @@ async fn akka_parity_become_unbecome_stash() {
 async fn akka_parity_actor_selection_by_path() {
     let ts = mk_system();
     let a = ts
-        .spawn_at::<Counter>(Counter::default(), "/akka/select/me", None, ThreadActorConfig::default())
+        .spawn_at::<Counter>(
+            Counter::default(),
+            "/akka/select/me",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     let _: u64 = ask(&a, IncN(5)).await.unwrap();
 
     // Resolve by path (actorSelection analog) — returns a working ref.
-    let resolved = ts.get_actor_ref("/akka/select/me").expect("selection resolves");
-    let total: u64 = parrot_api::address::ActorRefExt::ask(&*resolved, GetTotal).await.unwrap();
+    let resolved = ts
+        .get_actor_ref("/akka/select/me")
+        .expect("selection resolves");
+    let total: u64 = parrot_api::address::ActorRefExt::ask(&*resolved, GetTotal)
+        .await
+        .unwrap();
     assert_eq!(total, 5, "selected actor shares identity & state");
 
     // Dead-letter: unknown path resolves to None (Akka dead letters).
@@ -727,15 +844,30 @@ async fn akka_parity_graceful_stop_and_shutdown() {
 
     // Watcher observes shutdown notifications (CoordinatedShutdown analog).
     let watcher = ts
-        .spawn_at::<DeathWatcher>(DeathWatcher::default(), "/akka/shutdown/watcher", None, ThreadActorConfig::default())
+        .spawn_at::<DeathWatcher>(
+            DeathWatcher::default(),
+            "/akka/shutdown/watcher",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     let victim = ts
-        .spawn_at::<SimpleWatched>(SimpleWatched::default(), "/akka/shutdown/victim", None, ThreadActorConfig::default())
+        .spawn_at::<SimpleWatched>(
+            SimpleWatched::default(),
+            "/akka/shutdown/victim",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     let _ = victim;
-    ts.watch("/akka/shutdown/watcher".into(), "/akka/shutdown/victim".into()).await.unwrap();
+    ts.watch(
+        "/akka/shutdown/watcher".into(),
+        "/akka/shutdown/victim".into(),
+    )
+    .await
+    .unwrap();
 
     // Graceful single-actor stop (gracefulStop analog): in-flight work
     // finishes, before_stop runs, watchers notified, path removed.
@@ -750,18 +882,32 @@ async fn akka_parity_graceful_stop_and_shutdown() {
     // System-wide coordinated shutdown: every actor stopped & registry empty.
     for i in 0..5 {
         let _ = ts
-            .spawn_at::<Counter>(Counter::default(), &format!("/akka/shutdown/c{}", i), None, ThreadActorConfig::default())
+            .spawn_at::<Counter>(
+                Counter::default(),
+                &format!("/akka/shutdown/c{}", i),
+                None,
+                ThreadActorConfig::default(),
+            )
             .await
             .unwrap();
     }
     assert!(ts.actor_count() >= 5);
     ts.shutdown_internal().await.expect("coordinated shutdown");
-    assert_eq!(ts.actor_count(), 0, "CoordinatedShutdown drains the registry");
+    assert_eq!(
+        ts.actor_count(),
+        0,
+        "CoordinatedShutdown drains the registry"
+    );
     assert!(ts.is_shutting_down());
 
     // Post-shutdown: spawns are refused (system gate).
     let r = ts
-        .spawn_at::<Counter>(Counter::default(), "/akka/shutdown/late", None, ThreadActorConfig::default())
+        .spawn_at::<Counter>(
+            Counter::default(),
+            "/akka/shutdown/late",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await;
     assert!(r.is_err(), "spawn after shutdown must fail fast");
 }
@@ -776,16 +922,46 @@ async fn akka_parity_graceful_stop_and_shutdown() {
 #[test]
 fn akka_gap_manifest_is_current() {
     let gaps: &[(&str, &str)] = &[
-        ("GAP-1", "Terminated is crate-private; Akka exposes it publicly with actor identity"),
-        ("GAP-2", "No automatic restart-on-panic; Akka one-for-one Restart respawns in place (panics isolate but never respawn)"),
-        ("GAP-3", "No persisted eventsourcing/snapshot (akka-persistence)"),
-        ("GAP-4", "No priority mailbox ordering (only metadata class; Akka PriorityMailbox reorders queue)"),
-        ("GAP-5", "become/stash are idioms, not engine primitives (no context.become/stash())"),
-        ("GAP-6", "No backoff supervision (exponential restart backoff) wired to strategy"),
-        ("GAP-7", "No per-actor receive-timeout signal to self (timeout surfaces to caller only)"),
-        ("GAP-8", "No ActorDSL/typed receive builder; dispatch is manual downcast chains"),
-        ("GAP-9", "No scheduler cancellation handle exposed (schedule_periodic task cannot be cancelled)"),
-        ("GAP-10", "No mailbox deadlock detection (Akka custom mailbox with NonBlocking + failed sends diagnostics)"),
+        (
+            "GAP-1",
+            "Terminated is crate-private; Akka exposes it publicly with actor identity",
+        ),
+        (
+            "GAP-2",
+            "No automatic restart-on-panic; Akka one-for-one Restart respawns in place (panics isolate but never respawn)",
+        ),
+        (
+            "GAP-3",
+            "No persisted eventsourcing/snapshot (akka-persistence)",
+        ),
+        (
+            "GAP-4",
+            "No priority mailbox ordering (only metadata class; Akka PriorityMailbox reorders queue)",
+        ),
+        (
+            "GAP-5",
+            "become/stash are idioms, not engine primitives (no context.become/stash())",
+        ),
+        (
+            "GAP-6",
+            "No backoff supervision (exponential restart backoff) wired to strategy",
+        ),
+        (
+            "GAP-7",
+            "No per-actor receive-timeout signal to self (timeout surfaces to caller only)",
+        ),
+        (
+            "GAP-8",
+            "No ActorDSL/typed receive builder; dispatch is manual downcast chains",
+        ),
+        (
+            "GAP-9",
+            "No scheduler cancellation handle exposed (schedule_periodic task cannot be cancelled)",
+        ),
+        (
+            "GAP-10",
+            "No mailbox deadlock detection (Akka custom mailbox with NonBlocking + failed sends diagnostics)",
+        ),
     ];
     for (id, desc) in gaps {
         assert!(!id.is_empty() && !desc.is_empty());
@@ -805,7 +981,12 @@ async fn akka_parity_round_robin_pool() {
     let mut routees = Vec::new();
     for i in 0..N {
         let r = ts
-            .spawn_at::<Counter>(Counter::default(), &format!("/akka/rr/r{}", i), None, ThreadActorConfig::default())
+            .spawn_at::<Counter>(
+                Counter::default(),
+                &format!("/akka/rr/r{}", i),
+                None,
+                ThreadActorConfig::default(),
+            )
             .await
             .unwrap();
         routees.push(r);
@@ -829,9 +1010,14 @@ async fn akka_parity_broadcast_pool() {
     let mut routees = Vec::new();
     for i in 0..N {
         routees.push(
-            ts.spawn_at::<Counter>(Counter::default(), &format!("/akka/bc/r{}", i), None, ThreadActorConfig::default())
-                .await
-                .unwrap(),
+            ts.spawn_at::<Counter>(
+                Counter::default(),
+                &format!("/akka/bc/r{}", i),
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
+            .unwrap(),
         );
     }
     for r in &routees {
@@ -849,7 +1035,11 @@ async fn akka_parity_broadcast_pool() {
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
-struct DeliverAttempt { seq: u64, duplicate: bool }
+struct DeliverAttempt {
+    seq: u64,
+    #[allow(dead_code)]
+    duplicate: bool,
+}
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "u64")]
@@ -870,7 +1060,11 @@ impl Actor for IdempotentSink {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(d) = msg.downcast_ref::<DeliverAttempt>() {
                 if self.seen.insert(d.seq) {
@@ -888,31 +1082,53 @@ impl Actor for IdempotentSink {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
 async fn akka_parity_at_least_once_delivery() {
     let ts = mk_system();
     let sink = ts
-        .spawn_at::<IdempotentSink>(IdempotentSink::default(), "/akka/alod/sink", None, ThreadActorConfig::default())
+        .spawn_at::<IdempotentSink>(
+            IdempotentSink::default(),
+            "/akka/alod/sink",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
 
     // Upstream retries: seq 1-5 delivered, with duplicates for 2 and 4.
     for seq in 1..=5u64 {
-        ask(&sink, DeliverAttempt { seq, duplicate: false }).await.unwrap();
+        ask(
+            &sink,
+            DeliverAttempt {
+                seq,
+                duplicate: false,
+            },
+        )
+        .await
+        .unwrap();
         if seq == 2 || seq == 4 {
-            ask(&sink, DeliverAttempt { seq, duplicate: true }).await.unwrap();
+            ask(
+                &sink,
+                DeliverAttempt {
+                    seq,
+                    duplicate: true,
+                },
+            )
+            .await
+            .unwrap();
         }
     }
 
     let count: u64 = ask(&sink, DeliveredCount).await.unwrap();
-    assert_eq!(count, 5, "exactly-once effect despite at-least-once delivery");
+    assert_eq!(
+        count, 5,
+        "exactly-once effect despite at-least-once delivery"
+    );
     let order: Vec<u64> = ask(&sink, DeliveredSeqs).await.unwrap();
     assert_eq!(order, vec![1, 2, 3, 4, 5], "first-delivery order preserved");
 }
@@ -928,14 +1144,17 @@ async fn akka_parity_receive_timeout_idle_signal() {
     // CALLER (documented divergence — engine-level idle signal absent).
     let ts = mk_system();
     let idle = ts
-        .spawn_at::<Slowpoke>(Slowpoke::default(), "/akka/idle", None, ThreadActorConfig::default())
+        .spawn_at::<Slowpoke>(Slowpoke, "/akka/idle", None, ThreadActorConfig::default())
         .await
         .unwrap();
 
     let started = std::time::Instant::now();
     let r = tokio::time::timeout(Duration::from_millis(25), ask(&idle, SlowEchoU64(300))).await;
     assert!(r.is_err(), "caller-side receive timeout fires");
-    assert!(started.elapsed() < Duration::from_secs(1), "bounded, no hang");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "bounded, no hang"
+    );
 }
 
 // ===========================================================================
@@ -957,13 +1176,20 @@ impl Actor for MachineFsm {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             let Some(i) = msg.downcast_ref::<FsmInput>() else {
                 return Err(ActorError::MessageHandlingError("unknown".into()));
             };
             match (self.state, i.0.as_str()) {
-                ("idle", "start") => { self.state = "running"; self.transitions.push("idle→running".into()); }
+                ("idle", "start") => {
+                    self.state = "running";
+                    self.transitions.push("idle→running".into());
+                }
                 ("running", "finish") => {
                     self.state = "done";
                     self.stop_reason = Some("Normal");
@@ -974,14 +1200,14 @@ impl Actor for MachineFsm {
                     self.stop_reason = Some("Failure");
                     self.transitions.push("running→failed".into());
                 }
-                _ => return Err(ActorError::MessageHandlingError("invalid transition".into())),
+                _ => {
+                    return Err(ActorError::MessageHandlingError(
+                        "invalid transition".into(),
+                    ));
+                }
             }
             Ok(Box::new(format!("{}|{:?}", self.state, self.stop_reason)) as BoxedMessage)
         })
-    }
-
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -997,27 +1223,67 @@ async fn akka_parity_fsm_stop_reasons() {
     let ts = mk_system();
     // Normal completion.
     let m = ts
-        .spawn_at::<MachineFsm>(MachineFsm { state: "idle", transitions: vec![], stop_reason: None }, "/akka/fsm/normal", None, ThreadActorConfig::default())
+        .spawn_at::<MachineFsm>(
+            MachineFsm {
+                state: "idle",
+                transitions: vec![],
+                stop_reason: None,
+            },
+            "/akka/fsm/normal",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
-    assert!(ask(&m, FsmInput("start".into())).await.unwrap().starts_with("running|"));
+    assert!(
+        ask(&m, FsmInput("start".into()))
+            .await
+            .unwrap()
+            .starts_with("running|")
+    );
     let fin = ask(&m, FsmInput("finish".into())).await.unwrap();
     assert!(fin.starts_with("done|"), "{}", fin);
-    assert!(fin.contains("Normal"), "FSM stop reason Normal recorded: {}", fin);
+    assert!(
+        fin.contains("Normal"),
+        "FSM stop reason Normal recorded: {}",
+        fin
+    );
 
     // Failure path.
     let f = ts
-        .spawn_at::<MachineFsm>(MachineFsm { state: "idle", transitions: vec![], stop_reason: None }, "/akka/fsm/failure", None, ThreadActorConfig::default())
+        .spawn_at::<MachineFsm>(
+            MachineFsm {
+                state: "idle",
+                transitions: vec![],
+                stop_reason: None,
+            },
+            "/akka/fsm/failure",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     ask(&f, FsmInput("start".into())).await.unwrap();
     let err = ask(&f, FsmInput("error".into())).await.unwrap();
     assert!(err.starts_with("failed|"));
-    assert!(err.contains("Failure"), "FSM stop reason Failure recorded: {}", err);
+    assert!(
+        err.contains("Failure"),
+        "FSM stop reason Failure recorded: {}",
+        err
+    );
 
     // Invalid transitions are rejected (FSM error semantics).
     let bad = ts
-        .spawn_at::<MachineFsm>(MachineFsm { state: "idle", transitions: vec![], stop_reason: None }, "/akka/fsm/invalid", None, ThreadActorConfig::default())
+        .spawn_at::<MachineFsm>(
+            MachineFsm {
+                state: "idle",
+                transitions: vec![],
+                stop_reason: None,
+            },
+            "/akka/fsm/invalid",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     assert!(ask(&f, FsmInput("start".into())).await.is_ok() || true);

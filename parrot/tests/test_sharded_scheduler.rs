@@ -13,7 +13,6 @@ use parrot::thread::config::{SchedulingMode, ThreadActorConfig, ThreadActorSyste
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::address::ActorRefExt;
 use parrot_api::message::Message;
 use parrot_api::system::ActorSystemConfig;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
@@ -31,14 +30,17 @@ impl Actor for BenchActor {
     fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         let r = dispatch(self, m);
         Box::pin(async move { r })
     }
-    fn receive_message_with_engine<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        Some(dispatch(self, m))
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 fn dispatch(a: &mut BenchActor, m: BoxedMessage) -> ActorResult<BoxedMessage> {
@@ -49,7 +51,9 @@ fn dispatch(a: &mut BenchActor, m: BoxedMessage) -> ActorResult<BoxedMessage> {
         let r = burn_cpu(t.iterations, t.salt);
         Ok(Box::new(r) as BoxedMessage)
     } else {
-        Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into()))
+        Err(parrot_api::errors::ActorError::MessageHandlingError(
+            "unknown".into(),
+        ))
     }
 }
 
@@ -59,31 +63,45 @@ use parrot_api::errors::ActorError;
 impl Message for Echo {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for CpuTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 
 async fn ask_echo(r: &parrot::thread::address::ThreadActorRef<BenchActor>, v: u64) -> u64 {
-    let rep = r.ask(Box::new(Echo { value: v }) as BoxedMessage).await.unwrap();
+    let rep = r
+        .ask(Box::new(Echo { value: v }) as BoxedMessage)
+        .await
+        .unwrap();
     *rep.downcast::<u64>().unwrap()
 }
 
 async fn setup() -> (ParrotActorSystem, Arc<ThreadActorSystem>) {
-    let parrot = ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap();
+    let parrot = ParrotActorSystem::new(ActorSystemConfig::default())
+        .await
+        .unwrap();
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
-    parrot.register_thread_system("shardbench".into(), ts.clone(), true).await.unwrap();
+    parrot
+        .register_thread_system("shardbench".into(), ts.clone(), true)
+        .await
+        .unwrap();
     (parrot, ts)
 }
 
 fn cfg_sharded(key: &str) -> ThreadActorConfig {
     ThreadActorConfig {
-        scheduling_mode: Some(SchedulingMode::Sharded { affinity_key: key.into() }),
+        scheduling_mode: Some(SchedulingMode::Sharded {
+            affinity_key: key.into(),
+        }),
         ..Default::default()
     }
 }
@@ -95,7 +113,11 @@ fn cfg_sharded(key: &str) -> ThreadActorConfig {
 #[test]
 #[ignore]
 fn s1_sharded_vs_shared_ask_throughput() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup().await;
         const N_ACTORS: usize = 8;
@@ -164,7 +186,11 @@ fn s1_sharded_vs_shared_ask_throughput() {
 #[test]
 #[ignore]
 fn s2_shard_isolation_under_overload() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup().await;
 
@@ -220,7 +246,11 @@ fn s2_shard_isolation_under_overload() {
 #[test]
 #[ignore]
 fn s4_alloc_optimized_seq_ask() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup().await;
         let a = ts.spawn_at::<BenchActor>(BenchActor { ops: Arc::new(std::sync::atomic::AtomicU64::new(0)) },

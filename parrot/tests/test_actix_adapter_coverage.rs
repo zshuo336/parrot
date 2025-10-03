@@ -10,17 +10,17 @@
 //!
 //! These are exercised against a real arbiter inside an actix System.
 
-use actix::{Actor as ActixActorTrait, ActorContext as _, Addr};
+use actix::{Actor as ActixActorTrait, Addr};
+use parrot::actix as __parrot_engine;
 use parrot::actix::{ActixActor, ActixActorSystem, ActixContext, ActorBase, IntoActorBase};
 use parrot_api::actor::{Actor as ParrotActor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::ActorRefExt;
-use parrot_api::types::BoxedActorRef;
 use parrot_api::message::Message;
-use parrot_api::system::{ActorSystem, ActorSystemConfig};
+use parrot_api::types::BoxedActorRef;
 use parrot_api::types::{ActorResult, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
-use std::ptr::NonNull;
 use std::any::Any;
+use std::ptr::NonNull;
 use std::time::Duration;
 
 #[derive(Clone, Debug, Message)]
@@ -34,6 +34,15 @@ struct Inner {
     v: u64,
 }
 
+// M1 derive-decouple: the macro no longer generates `IntoActorBase`
+// (engine-specific glue, previously dead code). Engines users who need it
+// implement it explicitly — it is a one-liner.
+impl parrot::actix::IntoActorBase for Inner {
+    fn into_actor_base(self) -> parrot::actix::ActorBase<Self> {
+        parrot::actix::ActorBase::new(self)
+    }
+}
+
 impl Inner {
     async fn handle_message(
         &mut self,
@@ -44,7 +53,9 @@ impl Inner {
             self.v += m.0;
             return Ok(Box::new(self.v) as BoxedMessage);
         }
-        Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into()))
+        Err(parrot_api::errors::ActorError::MessageHandlingError(
+            "unknown".into(),
+        ))
     }
 
     fn handle_message_engine(
@@ -78,7 +89,6 @@ fn actix_actor_state_accessor_lifecycle() {
 
         // stop() drives Stopping/Stopped through the native StopMessage
         // handler (Handler<StopMessage> → ctx.stop()).
-        use parrot_api::address::ActorRef;
         aref.stop().await.expect("stop ok");
 
         // Give the arbiter a beat to run the stop handler.
@@ -89,7 +99,7 @@ fn actix_actor_state_accessor_lifecycle() {
         match r {
             Err(_) => panic!("post-stop ask hung"),
             Ok(Err(_)) => {} // expected
-            Ok(Ok(_)) => {} // mailbox drained one last time; tolerated
+            Ok(Ok(_)) => {}  // mailbox drained one last time; tolerated
         }
     });
 }
@@ -135,7 +145,14 @@ fn actix_actor_nested_parrot_impl() {
             let data = 0u32;
             let raw: NonNull<dyn Any> = NonNull::from(&data);
             let h = unsafe { EngineContextHandle::from_raw(raw) };
-            let r = ParrotActor::receive_message_with_engine(&mut outer, Box::new(Add(1)), &mut pctx, h);
+            // M6: 同步快路径经扩展 trait；适配层转发到 inner（Inner 实现了
+            // ActixEngineExt），默认 None 时走 async 错误臂。
+            let r = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                outer.inner_mut(),
+                Box::new(Add(1)),
+                &mut pctx,
+                h,
+            );
             let v = r.expect("inner handled Add").unwrap();
             assert_eq!(*v.downcast::<u64>().unwrap(), 101);
         }
@@ -154,7 +171,8 @@ fn actix_actor_nested_parrot_impl() {
 #[test]
 fn actor_base_roundtrip() {
     let base: ActorBase<Inner> = Inner { v: 5 }.into_actor_base();
-    // The derive macro also generates IntoActorBase for its actors.
+    // M1: derive no longer generates IntoActorBase; the explicit impl above
+    // covers the same call shape.
     let base2 = Inner { v: 6 }.into_actor_base();
     assert_eq!(base.actor.v, 5);
     assert_eq!(base2.actor.v, 6);
@@ -167,8 +185,6 @@ fn actor_base_roundtrip() {
 // ---------------------------------------------------------------------------
 
 use parrot::actix::reference::StopMessage;
-use parrot_api::address::ActorRef;
-use parrot_api::types::BoxedFuture;
 
 /// Direct construction of ActixActorRef and its accessors (get_addr /
 /// get_path / Debug).
@@ -210,11 +226,12 @@ fn native_stop_message_handler() {
         // Deliver StopMessage wrapped in the standard envelope (the path
         // the adapter's dispatch interception recognizes).
         let payload: BoxedMessage = Box::new(StopMessage);
-        let r = parrot::actix::reference::ActixActorRef::new(addr.clone(), "t://native-stop".into());
+        let r =
+            parrot::actix::reference::ActixActorRef::new(addr.clone(), "t://native-stop".into());
         r.do_send(payload);
         tokio::time::sleep(Duration::from_millis(50)).await;
         // Mailbox closed after stop → send errors.
-        let mut envelope = parrot::actix::message::create_envelope(Add(1));
+        let envelope = parrot::actix::message::create_envelope(Add(1));
         let wrapper = parrot::actix::message::ActixMessageWrapper { envelope };
         let r2 = addr.send(wrapper).await;
         assert!(r2.is_err(), "actor must be stopped after StopMessage");
@@ -285,7 +302,7 @@ fn native_stop_message_direct_handler() {
         addr.do_send(StopMessage);
         tokio::time::sleep(Duration::from_millis(50)).await;
         // After stop the mailbox is closed: further sends fail.
-        let mut envelope = parrot::actix::message::create_envelope(Add(1));
+        let envelope = parrot::actix::message::create_envelope(Add(1));
         let wrapper = parrot::actix::message::ActixMessageWrapper { envelope };
         let r = addr.try_send(wrapper);
         assert!(r.is_err(), "mailbox must be closed after native stop");
@@ -297,7 +314,7 @@ fn native_stop_message_direct_handler() {
 /// with the explicit diagnostic error (never panic, never hang).
 #[test]
 fn dispatch_before_started_reports_diagnostic() {
-    use actix::dev::{Context as ActixRawContext, MessageResponse};
+    use actix::dev::Context as ActixRawContext;
     use parrot::actix::message::ActixMessageWrapper;
     use parrot_api::message::MessageOptions;
 
@@ -319,15 +336,17 @@ fn dispatch_before_started_reports_diagnostic() {
         let wrapper = ActixMessageWrapper { envelope };
 
         use actix::Handler as ActixHandler;
-        let resp = ActixHandler::<ActixMessageWrapper>::handle(&mut unstarted, wrapper, &mut raw_ctx);
+        let resp =
+            ActixHandler::<ActixMessageWrapper>::handle(&mut unstarted, wrapper, &mut raw_ctx);
         // AtomicResponse must resolve to the diagnostic error.
         // Drive the AtomicResponse through MessageResponse::handle with a
         // oneshot sender; the ready future resolves on ctx.wait inside
         // raw_ctx.run.
-        use actix::dev::MessageResponse as _;
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<ActorResult<BoxedMessage>>>();
         actix::dev::MessageResponse::<ActixActor<Inner>, ActixMessageWrapper>::handle(
-            resp, &mut raw_ctx, Some(tx),
+            resp,
+            &mut raw_ctx,
+            Some(tx),
         );
         let addr = raw_ctx.run(unstarted);
         let _ = &addr; // run() returns the actor's Addr; drive it implicitly
@@ -335,7 +354,11 @@ fn dispatch_before_started_reports_diagnostic() {
         match rx.await {
             Ok(v) => {
                 let err = v.expect("Some(_)").expect_err("diagnostic error");
-                assert!(err.to_string().contains("context not initialized"), "{}", err);
+                assert!(
+                    err.to_string().contains("context not initialized"),
+                    "{}",
+                    err
+                );
             }
             Err(_) => {
                 // Channel dropped when the actor context finishes without
@@ -354,13 +377,15 @@ fn dispatch_before_started_reports_diagnostic() {
 #[test]
 fn actix_context_full_surface() {
     use parrot::actix::context::ActixContext;
-    use parrot_api::address::ActorRef as _;
     use parrot_api::context::ActorContext as _;
     use parrot_api::supervisor::SupervisorStrategyType;
 
     actix::System::new().block_on(async {
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
-        let mut pctx = ActixContext::new(addr.clone(), parrot_api::address::ActorPath::placeholder("surf"));
+        let mut pctx = ActixContext::new(
+            addr.clone(),
+            parrot_api::address::ActorPath::placeholder("surf"),
+        );
 
         // accessors
         assert!(!pctx.path().path.is_empty());
@@ -372,9 +397,10 @@ fn actix_context_full_surface() {
 
         // parent / children management
         let other: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 1 }).start();
-        let parent_ref: BoxedActorRef = Box::new(
-            parrot::actix::reference::ActixActorRef::new(other.clone(), "test://parent".into()),
-        );
+        let parent_ref: BoxedActorRef = Box::new(parrot::actix::reference::ActixActorRef::new(
+            other.clone(),
+            "test://parent".into(),
+        ));
         pctx.set_parent(parent_ref.clone_boxed());
         assert!(pctx.parent().is_some());
         pctx.add_child(parent_ref.clone_boxed());
@@ -402,14 +428,20 @@ fn actix_context_full_surface() {
         assert!(pctx.stop().await.is_ok());
 
         // send/ask through the context to a live target.
-        let target: BoxedActorRef = Box::new(
-            parrot::actix::reference::ActixActorRef::new(addr.clone(), "test://target".into()),
-        );
+        let target: BoxedActorRef = Box::new(parrot::actix::reference::ActixActorRef::new(
+            addr.clone(),
+            "test://target".into(),
+        ));
         // schedule_once fires the delayed delivery.
-        assert!(pctx
-            .schedule_once(target.clone_boxed(), Box::new(Add(5)), Duration::from_millis(10))
+        assert!(
+            pctx.schedule_once(
+                target.clone_boxed(),
+                Box::new(Add(5)),
+                Duration::from_millis(10)
+            )
             .await
-            .is_ok());
+            .is_ok()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         // The target received Add(5) — observable via its state.
         let r: u64 = target.ask(Add(0)).await.unwrap();
@@ -426,10 +458,14 @@ fn actix_context_schedule_periodic_one_tick() {
 
     actix::System::new().block_on(async {
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
-        let pctx = ActixContext::new(addr.clone(), parrot_api::address::ActorPath::placeholder("per"));
-        let target: BoxedActorRef = Box::new(
-            parrot::actix::reference::ActixActorRef::new(addr.clone(), "test://per".into()),
+        let pctx = ActixContext::new(
+            addr.clone(),
+            parrot_api::address::ActorPath::placeholder("per"),
         );
+        let target: BoxedActorRef = Box::new(parrot::actix::reference::ActixActorRef::new(
+            addr.clone(),
+            "test://per".into(),
+        ));
         let target_for_task = target.clone_boxed();
         // Cloneable Add ticks: each delivery increments the actor's value.
         let cm = parrot_api::message::CloneableMessage::from_message(Add(1));
@@ -466,7 +502,10 @@ fn actix_types_surface() {
     assert_eq!(id.name(), "worker-1");
     assert_eq!(format!("{}", id), "worker-1");
 
-    let env = TypeEnvelope { message: Box::new(1u8), message_type: "u8" };
+    let env = TypeEnvelope {
+        message: Box::new(1u8),
+        message_type: "u8",
+    };
     let s = format!("{:?}", env);
     assert!(s.contains("MessageEnvelope") && s.contains("u8"));
 }
@@ -492,9 +531,10 @@ fn actix_ref_ask_timeout_and_send_errors() {
         // create_envelope with sender + custom message_type/options.
         let addr2: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
         let r2 = ActixActorRef::new(addr2, "t://env".into());
-        let sender: BoxedActorRef = Box::new(
-            ActixActorRef::new(ActixActor::new(Inner { v: 9 }).start(), "t://sender".into()),
-        );
+        let sender: BoxedActorRef = Box::new(ActixActorRef::new(
+            ActixActor::new(Inner { v: 9 }).start(),
+            "t://sender".into(),
+        ));
         let wrapper = r2.create_envelope(
             Box::new(Add(3)),
             Some(sender),
@@ -518,18 +558,29 @@ fn actix_context_send_ask_and_child_branches() {
 
     actix::System::new().block_on(async {
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
-        let mut pctx = ActixContext::new(addr.clone(), parrot_api::address::ActorPath::placeholder("sa"));
+        let mut pctx = ActixContext::new(
+            addr.clone(),
+            parrot_api::address::ActorPath::placeholder("sa"),
+        );
 
         // Live target for context send/ask.
         let taddr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 100 }).start();
-        let target: BoxedActorRef = Box::new(
-            parrot::actix::reference::ActixActorRef::new(taddr, "t://sa".into()),
-        );
+        let target: BoxedActorRef = Box::new(parrot::actix::reference::ActixActorRef::new(
+            taddr,
+            "t://sa".into(),
+        ));
 
         // send (fire-and-forget through context).
-        assert!(pctx.send(target.clone_boxed(), Box::new(Add(1))).await.is_ok());
+        assert!(
+            pctx.send(target.clone_boxed(), Box::new(Add(1)))
+                .await
+                .is_ok()
+        );
         // ask (request-response through context).
-        let r = pctx.ask(target.clone_boxed(), Box::new(Add(0))).await.unwrap();
+        let r = pctx
+            .ask(target.clone_boxed(), Box::new(Add(0)))
+            .await
+            .unwrap();
         let v = *r.downcast::<u64>().expect("u64 reply");
         assert!(v >= 101, "context send+ask composed: {}", v);
 
@@ -538,14 +589,16 @@ fn actix_context_send_ask_and_child_branches() {
         pctx.add_child(target.clone_boxed());
         assert_eq!(pctx.children().expect("children").len(), 2);
         // remove_child with a non-member ref takes the no-match branch.
-        let stranger: BoxedActorRef = Box::new(
-            parrot::actix::reference::ActixActorRef::new(
-                ActixActor::new(Inner { v: 0 }).start(),
-                "t://stranger".into(),
-            ),
-        );
+        let stranger: BoxedActorRef = Box::new(parrot::actix::reference::ActixActorRef::new(
+            ActixActor::new(Inner { v: 0 }).start(),
+            "t://stranger".into(),
+        ));
         pctx.remove_child(stranger);
-        assert_eq!(pctx.children().expect("children").len(), 2, "no-match remove is a no-op");
+        assert_eq!(
+            pctx.children().expect("children").len(),
+            2,
+            "no-match remove is a no-op"
+        );
     });
 }
 
@@ -605,7 +658,9 @@ fn actix_ref_send_error_paths_and_as_any() {
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("Failed to deliver") || msg.contains("No response") || msg.contains("closed"),
+                    msg.contains("Failed to deliver")
+                        || msg.contains("No response")
+                        || msg.contains("closed"),
                     "unexpected error text: {}",
                     msg
                 );
@@ -633,7 +688,9 @@ fn actix_system_inspection_surface() {
         assert!(dbg.contains("ArbiterPool"));
 
         // Shared-pool caching path: new() returns the cached instance.
-        let sys2 = ActixActorSystem::new().await.expect("second system shares pool");
+        let sys2 = ActixActorSystem::new()
+            .await
+            .expect("second system shares pool");
         assert!(sys2.arbiter_size() >= 1);
         assert!(sys.arbiter_size() >= 1);
 
@@ -651,9 +708,6 @@ fn actix_system_inspection_surface() {
         assert!(st.active_actors >= 1);
 
         // get_actor with a bogus path → None (read-lock path).
-        assert!(sys
-            .get_actor(&"nope/missing".to_string())
-            .await
-            .is_none());
+        assert!(sys.get_actor(&"nope/missing".to_string()).await.is_none());
     });
 }

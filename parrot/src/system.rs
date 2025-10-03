@@ -1,22 +1,22 @@
-use std::sync::{Arc, RwLock};
-use std::collections::HashMap;
-use actix::{System as ActixSystem, Actor as ActixActor, Context as ActixContext};
-use async_trait::async_trait;
-use parrot_api::{
-    system::{ActorSystem, ActorSystemConfig, SystemError, SystemStatus, SystemState, SystemResources},
-    actor::Actor,
-    address::{ActorPath, ActorRef},
-    types::{BoxedActorRef, ActorResult},
-    message::Message,
-    context::ActorContext,
-};
 use crate::actix::ActixActorSystem;
 use crate::thread::system::ThreadActorSystem;
-use uuid::Uuid;
 use anyhow;
+use async_trait::async_trait;
+use parrot_api::{
+    actor::Actor,
+    address::{ActorPath, ActorRef},
+    context::ActorContext,
+    message::Message,
+    system::{
+        ActorSystem, ActorSystemConfig, SystemError, SystemResources, SystemState, SystemStatus,
+    },
+};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// Supported ActorSystem implementation types
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)] // 克隆热路径优先：避免 Box 间接层
 pub enum ActorSystemImpl {
     /// Actix implementation
     Actix(ActixActorSystem),
@@ -28,8 +28,8 @@ impl ActorSystemImpl {
     /// Forward spawn_root_typed method; generic version returns an error
     pub async fn spawn_root_typed<A: Actor + 'static>(
         &self,
-        actor: A,
-        config: A::Config,
+        _actor: A,
+        _config: A::Config,
     ) -> Result<Box<dyn ActorRef>, SystemError> {
         match self {
             ActorSystemImpl::Actix(_) => {
@@ -49,7 +49,7 @@ impl ActorSystemImpl {
             // Add branches for other system types
         }
     }
-    
+
     /// Actix-specific spawn method with necessary type constraints
     pub async fn spawn_root_typed_actix<A>(
         &self,
@@ -57,25 +57,29 @@ impl ActorSystemImpl {
         config: A::Config,
     ) -> Result<Box<dyn ActorRef>, SystemError>
     where
-        A: Actor<Context = crate::actix::context::ActixContext<
-                crate::actix::actor::ActixActor<A>,
-            >> + std::marker::Unpin + 'static
+        A: Actor<Context = crate::actix::context::ActixContext<crate::actix::actor::ActixActor<A>>>
+            + parrot_api::actor::ActixEngineExt<
+                Context = crate::actix::context::ActixContext<crate::actix::actor::ActixActor<A>>,
+            > + std::marker::Unpin
+            + 'static,
     {
         // Move actor and config into a local tuple to avoid capturing external variables in the async block
         let actor_data = (actor, config);
         let self_clone = self.clone();
-        
+
         async move {
             match self_clone {
                 ActorSystemImpl::Actix(sys) => {
                     sys.spawn_root_typed(actor_data.0, actor_data.1).await
-                },
-                _ => Err(SystemError::ActorCreationError("Not an Actix system".to_string())),
+                }
+                _ => Err(SystemError::ActorCreationError(
+                    "Not an Actix system".to_string(),
+                )),
             }
         }
         .await
     }
-    
+
     /// Forward get_actor method
     pub async fn get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
         // Clone path to avoid borrowing the original in the async block
@@ -84,44 +88,40 @@ impl ActorSystemImpl {
             target: path.target.clone(),
         };
         let self_clone = self.clone();
-        
+
         async move {
             match self_clone {
                 ActorSystemImpl::Actix(sys) => {
                     // ActixActorSystem's get_actor method expects a &String
                     sys.get_actor(&path_copy.path).await
-                },
+                }
                 ActorSystemImpl::Thread(sys) => {
                     use parrot_api::system::ActorSystem as _;
                     sys.get_actor(&path_copy).await
-                },
+                }
             }
         }
         .await
     }
-    
+
     /// Forward broadcast method
-    pub async fn broadcast<M: Message + Clone + 'static>(
-        &self,
-        msg: M,
-    ) -> Result<(), SystemError> {
+    pub async fn broadcast<M: Message + Clone + 'static>(&self, msg: M) -> Result<(), SystemError> {
         // Clone the message to avoid borrowing the original in the async block
         let msg_copy = msg.clone();
         let self_clone = self.clone();
-        
+
         async move {
             match self_clone {
                 ActorSystemImpl::Actix(sys) => sys.broadcast(msg_copy).await,
                 ActorSystemImpl::Thread(sys) => {
                     use parrot_api::system::ActorSystem as _;
                     sys.broadcast(msg_copy).await
-                },
-                // Add branches for other system types
+                } // Add branches for other system types
             }
         }
         .await
     }
-    
+
     /// Forward shutdown method
     pub async fn shutdown(self) -> Result<(), SystemError> {
         match self {
@@ -138,6 +138,7 @@ impl ActorSystemImpl {
 /// ParrotActorSystem manages multiple ActorSystem implementations
 pub struct ParrotActorSystem {
     // Main system configuration
+    #[allow(dead_code)] // 配置快照保留（远程网关读取）
     config: ActorSystemConfig,
     // Store registered ActorSystem implementations, using name as key
     systems: RwLock<HashMap<String, ActorSystemImpl>>,
@@ -162,18 +163,19 @@ impl ParrotActorSystem {
         system: ActixActorSystem,
         set_as_default: bool,
     ) -> Result<(), SystemError> {
-        let mut systems = self.systems.write().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire write lock"))
-        })?;
-        
+        let mut systems = self
+            .systems
+            .write()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
+
         // Store the system
         systems.insert(name.clone(), ActorSystemImpl::Actix(system));
-        
+
         // Set as default if needed
         if set_as_default || self.default_system.read().unwrap().is_none() {
             *self.default_system.write().unwrap() = Some(name);
         }
-        
+
         Ok(())
     }
 
@@ -184,9 +186,10 @@ impl ParrotActorSystem {
         system: Arc<ThreadActorSystem>,
         set_as_default: bool,
     ) -> Result<(), SystemError> {
-        let mut systems = self.systems.write().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire write lock"))
-        })?;
+        let mut systems = self
+            .systems
+            .write()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
 
         // Store the system
         systems.insert(name.clone(), ActorSystemImpl::Thread(system));
@@ -202,58 +205,65 @@ impl ParrotActorSystem {
     /// Set default system
     pub fn set_default_system(&self, name: &str) -> Result<(), SystemError> {
         // Verify system exists
-        let systems = self.systems.read().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire read lock"))
-        })?;
-        
+        let systems = self
+            .systems
+            .read()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire read lock")))?;
+
         if !systems.contains_key(name) {
-            return Err(SystemError::Other(anyhow::anyhow!(
-                format!("System not found: {}", name)
-            )));
+            return Err(SystemError::Other(anyhow::anyhow!(format!(
+                "System not found: {}",
+                name
+            ))));
         }
-        
+
         // Set as default
         *self.default_system.write().unwrap() = Some(name.to_string());
         Ok(())
     }
 
     /// Get default system
+    #[allow(dead_code)] // 公共 API 委托入口保留
     fn get_default_system_impl(&self) -> Result<ActorSystemImpl, SystemError> {
-        let guard = self.default_system.read().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire read lock"))
-        })?;
-        
-        let default_name = guard.as_ref().ok_or_else(|| {
-            SystemError::Other(anyhow::anyhow!("No default system registered"))
-        })?;
-            
+        let guard = self
+            .default_system
+            .read()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire read lock")))?;
+
+        let default_name = guard
+            .as_ref()
+            .ok_or_else(|| SystemError::Other(anyhow::anyhow!("No default system registered")))?;
+
         self.get_system_impl(default_name)
     }
-    
+
     /// Get system by name
     fn get_system_impl(&self, name: &str) -> Result<ActorSystemImpl, SystemError> {
-        let systems = self.systems.read().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire read lock"))
-        })?;
-        
+        let systems = self
+            .systems
+            .read()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire read lock")))?;
+
         // Clone the system instance to release the read lock
         match systems.get(name) {
             Some(system) => Ok(system.clone()),
-            None => Err(SystemError::Other(anyhow::anyhow!(
-                format!("System not found: {}", name)
-            ))),
+            None => Err(SystemError::Other(anyhow::anyhow!(format!(
+                "System not found: {}",
+                name
+            )))),
         }
     }
-    
+
     /// List all registered system names
     pub fn list_registered_systems(&self) -> Result<Vec<String>, SystemError> {
-        let systems = self.systems.read().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire read lock"))
-        })?;
-        
+        let systems = self
+            .systems
+            .read()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire read lock")))?;
+
         Ok(systems.keys().cloned().collect())
     }
-    
+
     /// Create actor in default system
     pub async fn internal_spawn_actor<A: Actor + 'static>(
         &self,
@@ -262,15 +272,15 @@ impl ParrotActorSystem {
     ) -> Result<Box<dyn ActorRef>, SystemError> {
         // First, retrieve the default system name and release the lock immediately
         let default_name = self.get_default_system_name()?;
-        
+
         // Then clone the system to avoid holding the lock across an await
         let system = self.get_system_impl(&default_name)?;
-        
+
         // Perform the actual spawn operation in a new async block
         // No locks are held at this point, so the future can safely be sent across threads
         system.spawn_root_typed(actor, config).await
     }
-    
+
     /// Create actor in specified system
     pub async fn spawn_actor_in_system<A: Actor + 'static>(
         &self,
@@ -280,10 +290,10 @@ impl ParrotActorSystem {
     ) -> Result<Box<dyn ActorRef>, SystemError> {
         // Use get_system_impl to get a cloned system instance
         let system = self.get_system_impl(system_name)?;
-            
+
         system.spawn_root_typed(actor, config).await
     }
-    
+
     /// Query actor by path
     pub async fn internal_get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
         // Try to get the actor from the default system
@@ -291,16 +301,16 @@ impl ParrotActorSystem {
             Ok(name) => name,
             Err(_) => "".to_string(), // Use an empty string to indicate no default system
         };
-        
+
         if !default_system.is_empty() {
             // Clone the default system instance
-            if let Ok(system) = self.get_system_impl(&default_system) {
-                if let Some(actor) = system.get_actor(path).await {
-                    return Some(actor);
-                }
+            if let Ok(system) = self.get_system_impl(&default_system)
+                && let Some(actor) = system.get_actor(path).await
+            {
+                return Some(actor);
             }
         }
-        
+
         // If not found in the default system, try all registered systems
         if let Ok(system_names) = self.list_registered_systems() {
             for name in system_names {
@@ -308,29 +318,30 @@ impl ParrotActorSystem {
                 if name == default_system {
                     continue;
                 }
-                
-                if let Ok(system) = self.get_system_impl(&name) {
-                    if let Some(actor) = system.get_actor(path).await {
-                        return Some(actor);
-                    }
+
+                if let Ok(system) = self.get_system_impl(&name)
+                    && let Some(actor) = system.get_actor(path).await
+                {
+                    return Some(actor);
                 }
             }
         }
-        
+
         None
     }
-    
+
     /// Get the default system name
     fn get_default_system_name(&self) -> Result<String, SystemError> {
-        let guard = self.default_system.read().map_err(|_| {
-            SystemError::Other(anyhow::anyhow!("Failed to acquire read lock"))
-        })?;
-        
-        guard.clone().ok_or_else(|| {
-            SystemError::Other(anyhow::anyhow!("No default system registered"))
-        })
+        let guard = self
+            .default_system
+            .read()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire read lock")))?;
+
+        guard
+            .clone()
+            .ok_or_else(|| SystemError::Other(anyhow::anyhow!("No default system registered")))
     }
-    
+
     /// Broadcast message to all systems
     pub async fn internal_broadcast<M: Message + Clone + 'static>(
         &self,
@@ -338,35 +349,38 @@ impl ParrotActorSystem {
     ) -> Result<(), SystemError> {
         // Get all registered system names
         let system_names = self.list_registered_systems()?;
-        
+
         for name in system_names {
             // Clone each system instance
             if let Ok(system) = self.get_system_impl(&name) {
                 system.broadcast(msg.clone()).await?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Shutdown all systems
     pub async fn internal_shutdown(self) -> Result<(), SystemError> {
         println!("ParrotActorSystem: Starting shutdown sequence");
-        
+
         let systems = match self.systems.into_inner() {
             Ok(systems) => systems,
             Err(_) => {
                 println!("ParrotActorSystem: Failed to unwrap systems");
                 return Err(SystemError::Other(anyhow::anyhow!(
                     "Failed to unwrap systems"
-                )))
+                )));
             }
         };
-        
-        println!("ParrotActorSystem: Shutting down {} registered systems", systems.len());
-        
+
+        println!(
+            "ParrotActorSystem: Shutting down {} registered systems",
+            systems.len()
+        );
+
         let mut errors = Vec::new();
-        
+
         for (name, system) in systems {
             println!("ParrotActorSystem: Shutting down system '{}'", name);
             if let Err(e) = system.shutdown().await {
@@ -377,13 +391,16 @@ impl ParrotActorSystem {
                 println!("ParrotActorSystem: System '{}' shutdown completed", name);
             }
         }
-        
+
         if errors.is_empty() {
             println!("ParrotActorSystem: All systems shutdown successfully");
             Ok(())
         } else {
             let error_msg = errors.join("; ");
-            println!("ParrotActorSystem: Shutdown completed with errors: {}", error_msg);
+            println!(
+                "ParrotActorSystem: Shutdown completed with errors: {}",
+                error_msg
+            );
             Err(SystemError::Other(anyhow::anyhow!(error_msg)))
         }
     }
@@ -398,24 +415,26 @@ impl ParrotActorSystem {
         config: A::Config,
     ) -> Result<Box<dyn ActorRef>, SystemError>
     where
-        A: Actor<Context = crate::actix::context::ActixContext<
-                crate::actix::actor::ActixActor<A>,
-            >> + std::marker::Unpin + 'static
+        A: Actor<Context = crate::actix::context::ActixContext<crate::actix::actor::ActixActor<A>>>
+            + parrot_api::actor::ActixEngineExt<
+                Context = crate::actix::context::ActixContext<crate::actix::actor::ActixActor<A>>,
+            > + std::marker::Unpin
+            + 'static,
     {
         // Get the default system name
         let default_name = self.get_default_system_name()?;
-        
+
         // Get the system instance
         let system = self.get_system_impl(&default_name)?;
-        
+
         // Check if the default system is an Actix system
         match system {
             ActorSystemImpl::Actix(_) => {
                 // Use the Actix-specific spawn method
                 system.spawn_root_typed_actix(actor, config).await
-            },
+            }
             _ => Err(SystemError::ActorCreationError(
-                "Default system is not an Actix system".to_string()
+                "Default system is not an Actix system".to_string(),
             )),
         }
     }
@@ -430,10 +449,7 @@ impl ParrotActorSystem {
         config: A::Config,
     ) -> Result<Box<dyn ActorRef>, SystemError>
     where
-        A: Actor<Context = crate::thread::context::ThreadContext<A>>
-            + Send
-            + Sync
-            + 'static,
+        A: Actor<Context = crate::thread::context::ThreadContext<A>> + Send + Sync + 'static,
     {
         // Get the default system name
         let default_name = self.get_default_system_name()?;
@@ -449,9 +465,9 @@ impl ParrotActorSystem {
                     .await
                     .map_err(|e| SystemError::ActorCreationError(e.to_string()))?;
                 Ok(Box::new(typed_ref) as Box<dyn ActorRef>)
-            },
+            }
             _ => Err(SystemError::ActorCreationError(
-                "Default system is not a thread engine system".to_string()
+                "Default system is not a thread engine system".to_string(),
             )),
         }
     }
@@ -464,10 +480,7 @@ impl ParrotActorSystem {
         config: A::Config,
     ) -> Result<Box<dyn ActorRef>, SystemError>
     where
-        A: Actor<Context = crate::thread::context::ThreadContext<A>>
-            + Send
-            + Sync
-            + 'static,
+        A: Actor<Context = crate::thread::context::ThreadContext<A>> + Send + Sync + 'static,
     {
         let system = self.get_system_impl(system_name)?;
 
@@ -478,10 +491,11 @@ impl ParrotActorSystem {
                     .await
                     .map_err(|e| SystemError::ActorCreationError(e.to_string()))?;
                 Ok(Box::new(typed_ref) as Box<dyn ActorRef>)
-            },
-            _ => Err(SystemError::ActorCreationError(
-                format!("System '{}' is not a thread engine system", system_name)
-            )),
+            }
+            _ => Err(SystemError::ActorCreationError(format!(
+                "System '{}' is not a thread engine system",
+                system_name
+            ))),
         }
     }
 
@@ -489,9 +503,10 @@ impl ParrotActorSystem {
     pub fn get_thread_system(&self, name: &str) -> Result<Arc<ThreadActorSystem>, SystemError> {
         match self.get_system_impl(name)? {
             ActorSystemImpl::Thread(sys) => Ok(sys),
-            _ => Err(SystemError::Other(anyhow::anyhow!(
-                format!("System '{}' is not a thread engine system", name)
-            ))),
+            _ => Err(SystemError::Other(anyhow::anyhow!(format!(
+                "System '{}' is not a thread engine system",
+                name
+            )))),
         }
     }
 }
@@ -513,21 +528,18 @@ impl ActorSystem for ParrotActorSystem {
     ) -> Result<Box<dyn ActorRef>, SystemError> {
         // Move actor and config into a local variable to avoid holding locks across await points
         let actor_data = (actor, config);
-        
+
         // Use the generic implementation; for Actix-compatible actors, use spawn_root_actix
-        async move {
-            self.internal_spawn_actor(actor_data.0, actor_data.1).await
-        }
-        .await
+        async move { self.internal_spawn_actor(actor_data.0, actor_data.1).await }.await
     }
 
     async fn spawn_root_boxed(
         &self,
-        actor: Box<dyn Actor<Config = Box<dyn std::any::Any + Send>, Context = dyn ActorContext>>,
-        config: Box<dyn std::any::Any + Send>,
+        _actor: Box<dyn Actor<Config = Box<dyn std::any::Any + Send>, Context = dyn ActorContext>>,
+        _config: Box<dyn std::any::Any + Send>,
     ) -> Result<Box<dyn ActorRef>, SystemError> {
         Err(SystemError::ActorCreationError(
-            "Type-erased actor creation not implemented".to_string()
+            "Type-erased actor creation not implemented".to_string(),
         ))
     }
 
@@ -537,11 +549,8 @@ impl ActorSystem for ParrotActorSystem {
             path: path.path.clone(),
             target: path.target.clone(),
         };
-        
-        async move {
-            self.internal_get_actor(&path_copy).await
-        }
-        .await
+
+        async move { self.internal_get_actor(&path_copy).await }.await
     }
 
     /// Sends a message to all actors in the system.
@@ -560,11 +569,8 @@ impl ActorSystem for ParrotActorSystem {
     async fn broadcast<M: Message + Clone + 'static>(&self, msg: M) -> Result<(), SystemError> {
         // Clone the message to avoid capturing the original in the new async block
         let msg_copy = msg.clone();
-        
-        async move {
-            self.internal_broadcast(msg_copy).await
-        }
-        .await
+
+        async move { self.internal_broadcast(msg_copy).await }.await
     }
 
     fn status(&self) -> SystemStatus {
@@ -603,10 +609,7 @@ mod tests {
         type Config = EmptyConfig;
         type Context = ThreadContext<Self>;
 
-        fn init<'a>(
-            &'a mut self,
-            _ctx: &'a mut Self::Context,
-        ) -> BoxedFuture<'a, ActorResult<()>> {
+        fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -621,15 +624,6 @@ mod tests {
                 }
                 Ok(msg)
             })
-        }
-
-        fn receive_message_with_engine<'a>(
-            &'a mut self,
-            _msg: BoxedMessage,
-            _ctx: &'a mut Self::Context,
-            _engine_ctx: parrot_api::actor::EngineContextHandle,
-        ) -> Option<ActorResult<BoxedMessage>> {
-            None
         }
 
         fn state(&self) -> ActorState {
