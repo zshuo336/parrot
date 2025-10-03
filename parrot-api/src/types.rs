@@ -1,5 +1,5 @@
 //! # Common Type Definitions
-//! 
+//!
 //! This module provides common type definitions and aliases used throughout the Parrot actor system.
 //! These types form the foundation for actor references, message passing, and asynchronous operations.
 //!

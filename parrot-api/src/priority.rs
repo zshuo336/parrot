@@ -1,6 +1,6 @@
 //! Priority constants for use in message attributes
 //!
-//! This module provides constants that can be used when specifying 
+//! This module provides constants that can be used when specifying
 //! message priorities in the Message derive macro.
 //!
 //! # Usage
@@ -55,4 +55,4 @@ mod tests {
         assert_eq!(MessagePriority::HIGH.value(), HIGH);
         assert_eq!(MessagePriority::CRITICAL.value(), CRITICAL);
     }
-} 
+}

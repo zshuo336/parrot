@@ -1,5 +1,5 @@
 //! # Actor Context Module
-//! 
+//!
 //! ## Key Concepts
 //! - ActorContext: Primary interface for system interaction
 //! - ActorSpawner: Actor creation and supervision
@@ -20,21 +20,18 @@
 //! - Minimizes allocations where possible
 //! - Employs type erasure for interface flexibility
 
-use std::time::Duration;
-use std::any::Any;
-use std::sync::Arc;
-use std::hash::Hash;
-use async_trait::async_trait;
 use crate::actor::Actor;
-use crate::errors::ActorError;
 use crate::address::{ActorPath, ActorRef};
-use crate::types::{BoxedActorRef, BoxedMessage, ActorResult, BoxedFuture};
-use crate::message::{Message, MessageEnvelope, CloneableMessage};
-use crate::supervisor::SupervisorStrategyType;
+use crate::message::{CloneableMessage, Message};
 use crate::stream::StreamRegistry;
-use crate::supervisor::SupervisorStrategy;
-use std::sync::{RwLock, RwLockReadGuard};
+use crate::supervisor::SupervisorStrategyType;
+use crate::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
+use async_trait::async_trait;
+use std::hash::Hash;
 use std::ops::Deref;
+use std::sync::Arc;
+use std::sync::{RwLock, RwLockReadGuard};
+use std::time::Duration;
 
 /// # Actor Spawner
 ///
@@ -63,8 +60,12 @@ pub trait ActorSpawner: Send + Sync {
     /// ## Performance
     /// - Allocates actor on heap
     /// - Performs async initialization
-    fn spawn<'a>(&'a self, actor: BoxedMessage, config: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>;
-    
+    fn spawn<'a>(
+        &'a self,
+        actor: BoxedMessage,
+        config: BoxedMessage,
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>;
+
     /// Creates supervised actor
     ///
     /// ## Parameters
@@ -76,10 +77,11 @@ pub trait ActorSpawner: Send + Sync {
     /// 1. Creates actor instance
     /// 2. Sets up supervision
     /// 3. Initializes actor
-    fn spawn_with_strategy<'a>(&'a self, 
-        actor: BoxedMessage, 
-        config: BoxedMessage, 
-        strategy: SupervisorStrategyType
+    fn spawn_with_strategy<'a>(
+        &'a self,
+        actor: BoxedMessage,
+        config: BoxedMessage,
+        strategy: SupervisorStrategyType,
     ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>;
 }
 
@@ -99,10 +101,14 @@ pub trait ActorSpawnerExt: ActorSpawner {
     ///
     /// # Returns
     /// Future resolving to the actor reference or error
-    fn spawn_typed<'a, A: Actor>(&'a self, actor: A, config: A::Config) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
+    fn spawn_typed<'a, A: Actor>(
+        &'a self,
+        actor: A,
+        config: A::Config,
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
         self.spawn(Box::new(actor), Box::new(config))
     }
-    
+
     /// Spawns a supervised actor with preserved type information.
     ///
     /// # Type Parameters
@@ -115,7 +121,12 @@ pub trait ActorSpawnerExt: ActorSpawner {
     ///
     /// # Returns
     /// Future resolving to the actor reference or error
-    fn spawn_supervised<'a, A: Actor>(&'a self, actor: A, config: A::Config, strategy: SupervisorStrategyType) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
+    fn spawn_supervised<'a, A: Actor>(
+        &'a self,
+        actor: A,
+        config: A::Config,
+        strategy: SupervisorStrategyType,
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
         self.spawn_with_strategy(Box::new(actor), Box::new(config), strategy)
     }
 }
@@ -130,12 +141,14 @@ impl<T: ActorSpawner + ?Sized> ActorSpawnerExt for T {}
 pub trait ActorFactory: Send + 'static {
     /// The type of actor this factory creates
     type ActorType: Actor;
-    
+
     /// Creates a new instance of the actor.
     ///
     /// # Returns
     /// Future resolving to the actor instance and its configuration
-    async fn create_actor(&self) -> ActorResult<(Self::ActorType, <Self::ActorType as Actor>::Config)>;
+    async fn create_actor(
+        &self,
+    ) -> ActorResult<(Self::ActorType, <Self::ActorType as Actor>::Config)>;
 }
 
 // A wrapper type that holds a read lock
@@ -143,7 +156,7 @@ pub struct ChildrenGuard<'a>(RwLockReadGuard<'a, Vec<BoxedActorRef>>);
 
 impl<'a> Deref for ChildrenGuard<'a> {
     type Target = [BoxedActorRef];
-    
+
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -165,12 +178,20 @@ impl ReadOnlyChildrenVec {
         ChildrenGuard(self.0.read().unwrap())
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.read().unwrap().is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.0.read().unwrap().len()
     }
 
     pub fn get(&self, index: usize) -> Option<BoxedActorRef> {
-        self.0.read().unwrap().get(index).map(|actor_ref| actor_ref.clone_boxed())
+        self.0
+            .read()
+            .unwrap()
+            .get(index)
+            .map(|actor_ref| actor_ref.clone_boxed())
     }
 }
 
@@ -193,7 +214,6 @@ impl ReadOnlyChildrenVec {
 /// - Async operations
 /// - Minimized blocking
 pub trait ActorContext: Send + Sync {
-
     /// Returns self reference
     ///
     /// ## Thread Safety
@@ -217,7 +237,11 @@ pub trait ActorContext: Send + Sync {
     /// ## Performance
     /// - Non-blocking operation
     /// - May allocate on heap
-    fn send<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>>;
+    fn send<'a>(
+        &'a self,
+        target: BoxedActorRef,
+        msg: BoxedMessage,
+    ) -> BoxedFuture<'a, ActorResult<()>>;
 
     /// Sends message and awaits response
     ///
@@ -228,7 +252,11 @@ pub trait ActorContext: Send + Sync {
     /// ## Returns
     /// - `Ok(response)`: Successful response
     /// - `Err(error)`: Communication failed
-    fn ask<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
+    fn ask<'a>(
+        &'a self,
+        target: BoxedActorRef,
+        msg: BoxedMessage,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
     /// Schedules a one-time delayed message.
     ///
@@ -239,7 +267,12 @@ pub trait ActorContext: Send + Sync {
     ///
     /// # Returns
     /// Future completing when message is scheduled
-    fn schedule_once<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage, delay: Duration) -> BoxedFuture<'a, ActorResult<()>>;
+    fn schedule_once<'a>(
+        &'a self,
+        target: BoxedActorRef,
+        msg: BoxedMessage,
+        delay: Duration,
+    ) -> BoxedFuture<'a, ActorResult<()>>;
 
     /// Schedules a recurring message.
     ///
@@ -251,7 +284,13 @@ pub trait ActorContext: Send + Sync {
     ///
     /// # Returns
     /// Future completing when schedule is set
-    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: CloneableMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'a, ActorResult<()>>;
+    fn schedule_periodic<'a>(
+        &'a self,
+        target: BoxedActorRef,
+        msg: CloneableMessage,
+        initial_delay: Duration,
+        interval: Duration,
+    ) -> BoxedFuture<'a, ActorResult<()>>;
 
     /// Registers for termination notification of another actor.
     ///
@@ -275,7 +314,7 @@ pub trait ActorContext: Send + Sync {
     fn set_parent(&mut self, parent: BoxedActorRef);
 
     /// Returns reference to parent actor if it exists.
-    fn parent(&self) -> Option<BoxedActorRef>;    
+    fn parent(&self) -> Option<BoxedActorRef>;
 
     /// Adds a child actor to the context.
     fn add_child(&mut self, child: BoxedActorRef);
@@ -285,22 +324,22 @@ pub trait ActorContext: Send + Sync {
 
     /// Returns references to all child actors.
     fn children(&self) -> Option<ReadOnlyChildrenVec>;
-    
+
     /// Sets timeout for receiving messages.
     ///
     /// # Parameters
     /// * `timeout` - Duration after which timeout occurs, or None to disable
     fn set_receive_timeout(&mut self, timeout: Option<Duration>);
-    
+
     /// Returns current receive timeout setting.
     fn receive_timeout(&self) -> Option<Duration>;
-    
+
     /// Sets supervision strategy for child actors.
     ///
     /// # Parameters
     /// * `strategy` - Strategy to use for handling child failures
     fn set_supervisor_strategy(&mut self, strategy: SupervisorStrategyType);
-    
+
     /// Returns the actor's unique path in the system.
     fn path(&self) -> &ActorPath;
 
@@ -333,7 +372,7 @@ pub trait ActorContextMessage: ActorContext {
         });
         Ok(())
     }
-    
+
     /// Sends a message to self and waits for response.
     ///
     /// # Type Parameters
@@ -344,8 +383,12 @@ pub trait ActorContextMessage: ActorContext {
     ///
     /// # Returns
     /// Future resolving to the response
+    #[allow(async_fn_in_trait)]
     async fn ask_self<M: Message>(&self, msg: M) -> ActorResult<M::Result> {
-        let result = self.get_self_ref().send(Box::new(msg) as BoxedMessage).await?;
+        let result = self
+            .get_self_ref()
+            .send(Box::new(msg) as BoxedMessage)
+            .await?;
         M::extract_result(result)
     }
 }
@@ -375,7 +418,7 @@ pub trait ActorContextScheduler: ActorContext {
         delay: Duration,
         interval: Option<Duration>,
     ) -> ActorResult<ScheduledTask>;
-    
+
     /// Cancels a scheduled task.
     ///
     /// # Parameters
@@ -402,12 +445,12 @@ pub struct ScheduledTask {
     /// - **Uniqueness**: Guaranteed unique within system
     /// - **Persistence**: Stable across restarts
     pub id: uuid::Uuid,
-    
+
     /// Target actor reference
     /// - **Thread Safety**: Arc ensures safe sharing
     /// - **Lifecycle**: Strong reference to prevent cleanup
     pub target: Arc<dyn ActorRef>,
-    
+
     /// Scheduled execution time
     /// - **Precision**: System time precision
     /// - **Timezone**: UTC based
@@ -416,9 +459,9 @@ pub struct ScheduledTask {
 
 impl PartialEq for ScheduledTask {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && 
-        self.target.path() == other.target.path() && 
-        self.schedule_time == other.schedule_time
+        self.id == other.id
+            && self.target.path() == other.target.path()
+            && self.schedule_time == other.schedule_time
     }
 }
 
@@ -449,18 +492,18 @@ impl Hash for ScheduledTask {
 pub enum LifecycleEvent {
     /// Actor started successfully
     Started,
-    
+
     /// Actor stopped completely
     Stopped,
-    
+
     /// Child actor terminated
     /// - **Parameter**: Reference to terminated child
     ChildTerminated(BoxedActorRef),
-    
+
     /// Watched actor terminated
     /// - **Parameter**: Reference to terminated actor
     Terminated(BoxedActorRef),
-    
+
     /// Message receive timeout occurred
     ReceiveTimeout,
-} 
+}

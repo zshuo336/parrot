@@ -1,10 +1,10 @@
 //! # Actor Address Module
-//! 
+//!
 //! ## Key Concepts
 //! - ActorPath: Unique identifier and location for actors
 //! - ActorRef: Core message passing interface
 //! - WeakActorRef: Non-owning actor references
-//! 
+//!
 //! ## Design Principles
 //! - Type safety: Generic interfaces for type-safe message passing
 //! - Memory safety: Proper handling of actor lifecycles
@@ -15,16 +15,13 @@
 //! This module provides the addressing and message passing infrastructure
 //! for the actor system, enabling location-transparent communication.
 
+use crate::message::Message;
+use crate::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage, WeakActorTarget};
+use async_trait::async_trait;
+use std::any::Any;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
-use std::any::Any;
-use std::future::Future;
-use std::pin::Pin;
-use crate::errors::ActorError;
-use crate::types::{BoxedActorRef, BoxedMessage, ActorResult, BoxedFuture, WeakActorTarget};
-use crate::message::{Message, MessageEnvelope};
 use std::sync::Arc;
-use async_trait::async_trait;
 use std::time::Duration;
 
 /// # Actor Path
@@ -60,7 +57,7 @@ pub struct ActorPath {
     /// - **Thread Safety**: Safe to share between threads
     /// - **Lifecycle**: Does not prevent actor termination
     pub target: WeakActorTarget,
-    
+
     /// String representation of the actor's path
     /// - **Format**: protocol://system/user/child1/child2
     /// - **Uniqueness**: Must be unique within system
@@ -176,7 +173,11 @@ pub trait ActorRef: Send + Sync + Debug {
     /// [`ActorRef::send`] (unbounded ask). `Some(d)` bounds the wait; on
     /// expiry the *caller* gives up — the message stays enqueued and the
     /// actor may still process it later.
-    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
+    fn send_with_timeout<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        timeout: Option<Duration>,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
     /// Fire-and-forget delivery: enqueues the message and returns
     /// immediately after the mailbox accepts it.
@@ -227,12 +228,9 @@ pub trait ActorRef: Send + Sync + Debug {
         self.path() == other.path()
     }
 
-
     fn eq_path(&self, path: &str) -> bool {
         self.path() == path
     }
-
-
 }
 
 /// Extension trait providing type-safe message passing operations.
@@ -262,7 +260,7 @@ pub trait ActorRefExt: ActorRef {
             M::extract_result(result)
         })
     }
-    
+
     /// Sends a message without waiting for a response.
     ///
     /// Use this method for:
@@ -327,16 +325,9 @@ impl WeakActorRef {
         Self { path }
     }
 
-    /// Attempts to convert this weak reference into a strong reference.
-    ///
-    /// # Returns
-    /// A future that resolves to:
-    /// - `Some(ActorRef)` if the actor is still alive
-    /// - `None` if the actor has been terminated
-    fn upgrade<'a>(&'a self) -> BoxedFuture<'a, Option<BoxedActorRef>> {
-        Box::pin(async move { None })
-    }
-} 
+    // M6 清理：`upgrade`（恒返回 None 的占位）从未被调用，删除。
+    // 远程/集群方向的弱引用重建走 ActorPath 解析（TECH_DESIGN_04）。
+}
 /// Dead actor ref used as a placeholder target in [`ActorPath::placeholder`].
 ///
 /// Never alive; `send`/`stop` return `NotFound`-style errors.
@@ -347,7 +338,9 @@ pub(crate) struct DeadTargetRef;
 impl ActorRef for DeadTargetRef {
     fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
+            Err(crate::errors::ActorError::ActorNotFound(
+                "dead://placeholder".to_string(),
+            ))
         })
     }
 
@@ -357,19 +350,25 @@ impl ActorRef for DeadTargetRef {
         _timeout_duration: Option<std::time::Duration>,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
+            Err(crate::errors::ActorError::ActorNotFound(
+                "dead://placeholder".to_string(),
+            ))
         })
     }
 
     fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
-            Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
+            Err(crate::errors::ActorError::ActorNotFound(
+                "dead://placeholder".to_string(),
+            ))
         })
     }
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
-            Err(crate::errors::ActorError::ActorNotFound("dead://placeholder".to_string()))
+            Err(crate::errors::ActorError::ActorNotFound(
+                "dead://placeholder".to_string(),
+            ))
         })
     }
 

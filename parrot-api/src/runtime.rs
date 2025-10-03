@@ -1,5 +1,5 @@
 //! # Actor System Runtime
-//! 
+//!
 //! This module defines the runtime environment and execution configuration
 //! for the Parrot actor system. It provides control over thread allocation,
 //! scheduling, and resource management.
@@ -39,9 +39,9 @@
 //! # let _ = config;
 //! ```
 
-use std::time::Duration;
-use async_trait::async_trait;
 use crate::errors::ActorError;
+use async_trait::async_trait;
+use std::time::Duration;
 
 /// Configuration for the actor system runtime.
 ///
@@ -53,12 +53,12 @@ pub struct RuntimeConfig {
     ///
     /// If None, the system will use the number of available CPU cores.
     pub worker_threads: Option<usize>,
-    
+
     /// Number of threads for handling I/O operations.
     ///
     /// If None, the system will use a default based on workload.
     pub io_threads: Option<usize>,
-    
+
     /// Configuration for the task scheduler.
     pub scheduler_config: SchedulerConfig,
 }
@@ -74,13 +74,13 @@ pub struct SchedulerConfig {
     /// When this limit is reached, task submission will be
     /// backpressured.
     pub task_queue_capacity: usize,
-    
+
     /// Maximum time allowed for task execution.
     ///
     /// Tasks exceeding this timeout will be cancelled and
     /// may trigger supervision.
     pub task_timeout: Duration,
-    
+
     /// Strategy for distributing tasks across workers.
     pub load_balancing: LoadBalancingStrategy,
 }
@@ -96,12 +96,12 @@ pub enum LoadBalancingStrategy {
     /// Best for uniform workloads with similar task costs.
     #[default]
     RoundRobin,
-    
+
     /// Distribute tasks randomly across workers.
     ///
     /// Good for varying workloads to prevent hotspots.
     Random,
-    
+
     /// Assign tasks to workers with least pending work.
     ///
     /// Best for non-uniform workloads with varying task costs.
@@ -124,8 +124,10 @@ pub trait ActorRuntime: Send + Sync + 'static {
     /// # Returns
     /// * `Ok(Self)` - Successfully initialized runtime
     /// * `Err(ActorError)` - Initialization failed
-    async fn start(config: RuntimeConfig) -> Result<Self, ActorError> where Self: Sized;
-    
+    async fn start(config: RuntimeConfig) -> Result<Self, ActorError>
+    where
+        Self: Sized;
+
     /// Performs graceful shutdown of the runtime.
     ///
     /// This process:
@@ -136,7 +138,7 @@ pub trait ActorRuntime: Send + Sync + 'static {
     /// # Returns
     /// Result indicating success or failure of shutdown
     async fn shutdown(self) -> Result<(), ActorError>;
-    
+
     /// Submits a task for execution on the runtime.
     ///
     /// # Type Parameters
@@ -152,7 +154,7 @@ pub trait ActorRuntime: Send + Sync + 'static {
     where
         F: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static;
-        
+
     /// Retrieves current runtime performance metrics.
     ///
     /// Use this method to monitor:
@@ -170,13 +172,13 @@ pub trait ActorRuntime: Send + Sync + 'static {
 pub struct RuntimeMetrics {
     /// Number of actors currently executing.
     pub active_actors: usize,
-    
+
     /// Number of messages waiting to be processed.
     pub pending_messages: usize,
-    
+
     /// Percentage of CPU utilization (0.0 - 100.0).
     pub cpu_usage: f64,
-    
+
     /// Bytes of memory currently in use.
     pub memory_usage: usize,
-} 
+}

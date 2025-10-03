@@ -6,22 +6,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-
-use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::address::ActorPath;
-use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot::thread::actor::ThreadActor;
 use parrot::thread::address::ThreadActorRef;
 use parrot::thread::config::{BackpressureStrategy, SchedulingMode, ThreadActorConfig};
 use parrot::thread::context::ThreadContext;
-use parrot::thread::mailbox::mpsc::MpscMailbox;
 use parrot::thread::mailbox::Mailbox;
+use parrot::thread::mailbox::mpsc::MpscMailbox;
 use parrot::thread::processor::ActorProcessor;
 use parrot::thread::scheduler::dedicated_thread::{
     DedicatedThreadConfig, DedicatedThreadScheduler, TypedThreadSchedulerExt,
 };
-use std::any::Any;
+use parrot_api::actor::{Actor, ActorState, EmptyConfig};
+use parrot_api::address::ActorPath;
+use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 
 /// A compute-heavy actor that folds numbers.
 struct ComputeActor {
@@ -42,7 +39,11 @@ impl Actor for ComputeActor {
         Box::pin(async { Ok(()) })
     }
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(n) = msg.downcast_ref::<u64>() {
                 self.counter = self.counter.wrapping_add(*n);
@@ -50,10 +51,6 @@ impl Actor for ComputeActor {
             }
             Ok(msg)
         })
-    }
-
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -82,7 +79,8 @@ async fn main() {
         path_str.to_string(),
         ThreadActorConfig::default(),
     ));
-    mailbox.set_processor(processor.clone() as Arc<dyn parrot::thread::processor::ProcessorInterface>);
+    mailbox
+        .set_processor(processor.clone() as Arc<dyn parrot::thread::processor::ProcessorInterface>);
 
     // 3. Schedule the actor on a dedicated OS thread.
     scheduler

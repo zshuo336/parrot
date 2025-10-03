@@ -1,17 +1,21 @@
-use parrot_api::system::{ActorSystem, ActorSystemConfig, SystemTimeouts, GuardianConfig, SystemStatus, SystemState, SystemResources, SystemError};
-use parrot_api::runtime::{RuntimeConfig, SchedulerConfig, LoadBalancingStrategy};
-use parrot_api::actor::{Actor, ActorState, ActorConfig};
-use parrot_api::types::{BoxedMessage, ActorResult, BoxedFuture, BoxedActorRef};
-use parrot_api::supervisor::{SupervisorStrategyType, SupervisorStrategy, OneForOneStrategy, SupervisionDecision, BasicDecisionFn};
-use parrot_api::errors::ActorError;
-use parrot_api::message::Message;
+use async_trait::async_trait;
+use parrot_api::actor::{Actor, ActorConfig, ActorState};
 use parrot_api::address::{ActorPath, ActorRef};
 use parrot_api::context::ActorContext;
-use std::time::Duration;
-use std::sync::{Arc, Mutex, RwLock};
+use parrot_api::errors::ActorError;
+use parrot_api::message::Message;
+use parrot_api::runtime::{LoadBalancingStrategy, RuntimeConfig, SchedulerConfig};
+use parrot_api::supervisor::{
+    BasicDecisionFn, OneForOneStrategy, SupervisionDecision, SupervisorStrategyType,
+};
+use parrot_api::system::{
+    ActorSystem, ActorSystemConfig, GuardianConfig, SystemError, SystemResources, SystemState,
+    SystemStatus, SystemTimeouts,
+};
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use std::any::Any;
-use async_trait::async_trait;
-use std::ptr::NonNull;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 // Mock Context for tests
 #[derive(Default)]
@@ -42,7 +46,11 @@ impl Actor for TestActor {
     type Config = TestActorConfig;
     type Context = MockContext;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             self.processed_messages += 1;
             Ok(msg) // Echo back the message
@@ -50,10 +58,6 @@ impl Actor for TestActor {
     }
 
     // This is not used in the test actor
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
     fn state(&self) -> ActorState {
         self.state
     }
@@ -65,12 +69,14 @@ struct TestMessage(String);
 
 impl Message for TestMessage {
     type Result = String;
-    
+
     fn extract_result(result: BoxedMessage) -> ActorResult<Self::Result> {
         if let Ok(response) = result.downcast::<String>() {
             Ok(*response)
         } else {
-            Err(ActorError::MessageHandlingError("Failed to extract result".to_string()))
+            Err(ActorError::MessageHandlingError(
+                "Failed to extract result".to_string(),
+            ))
         }
     }
 }
@@ -92,7 +98,7 @@ impl MockActorSystem {
             uptime: Arc::new(RwLock::new(Duration::from_secs(0))),
         }
     }
-    
+
     // Helper to stop all actors safely without holding RwLock across await points
     async fn stop_all_actors(&self) -> Result<(), SystemError> {
         // First collect all actors into a Vec while holding the lock
@@ -100,12 +106,12 @@ impl MockActorSystem {
             let actors = self.actors.read().unwrap();
             actors.iter().map(|a| a.clone_boxed()).collect()
         };
-        
+
         // Then stop each actor without holding the lock
         for actor in actor_refs {
             let _ = actor.stop().await;
         }
-        
+
         Ok(())
     }
 }
@@ -140,13 +146,16 @@ impl ActorRef for MockActorRef {
         })
     }
 
-    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn send_with_timeout<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        _timeout: Option<Duration>,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             let result = self.send(msg).await;
             result
         })
     }
-
 
     fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
@@ -166,9 +175,7 @@ impl ActorRef for MockActorRef {
 
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
         let is_alive = self.is_alive.clone();
-        Box::pin(async move {
-            *is_alive.read().unwrap()
-        })
+        Box::pin(async move { *is_alive.read().unwrap() })
     }
 
     fn clone_boxed(&self) -> BoxedActorRef {
@@ -186,7 +193,10 @@ impl ActorRef for MockActorRef {
 
 #[async_trait]
 impl ActorSystem for MockActorSystem {
-    async fn start(config: ActorSystemConfig) -> Result<Self, SystemError> where Self: Sized {
+    async fn start(config: ActorSystemConfig) -> Result<Self, SystemError>
+    where
+        Self: Sized,
+    {
         let system = Self::new(config);
         {
             let mut state = system.state.write().unwrap();
@@ -195,8 +205,15 @@ impl ActorSystem for MockActorSystem {
         Ok(system)
     }
 
-    async fn spawn_root_typed<A: Actor>(&self, _actor: A, _config: A::Config) -> Result<Box<dyn ActorRef>, SystemError> {
-        let actor_ref = Box::new(MockActorRef::new("test", &format!("{}/user/test", self.config.name)));
+    async fn spawn_root_typed<A: Actor>(
+        &self,
+        _actor: A,
+        _config: A::Config,
+    ) -> Result<Box<dyn ActorRef>, SystemError> {
+        let actor_ref = Box::new(MockActorRef::new(
+            "test",
+            &format!("{}/user/test", self.config.name),
+        ));
         {
             let mut actors = self.actors.write().unwrap();
             actors.push(actor_ref.clone_boxed());
@@ -209,7 +226,10 @@ impl ActorSystem for MockActorSystem {
         _actor: Box<dyn Actor<Config = Box<dyn Any + Send>, Context = dyn ActorContext>>,
         _config: Box<dyn Any + Send>,
     ) -> Result<Box<dyn ActorRef>, SystemError> {
-        let actor_ref = Box::new(MockActorRef::new("test-boxed", &format!("{}/user/test-boxed", self.config.name)));
+        let actor_ref = Box::new(MockActorRef::new(
+            "test-boxed",
+            &format!("{}/user/test-boxed", self.config.name),
+        ));
         {
             let mut actors = self.actors.write().unwrap();
             actors.push(actor_ref.clone_boxed());
@@ -230,7 +250,9 @@ impl ActorSystem for MockActorSystem {
     async fn broadcast<M: Message>(&self, _msg: M) -> Result<(), SystemError> {
         let actors = self.actors.read().unwrap();
         if actors.is_empty() {
-            return Err(SystemError::ActorCreationError("No actors to broadcast to".to_string()));
+            return Err(SystemError::ActorCreationError(
+                "No actors to broadcast to".to_string(),
+            ));
         }
         Ok(())
     }
@@ -242,7 +264,7 @@ impl ActorSystem for MockActorSystem {
             uptime: *self.uptime.read().unwrap(),
             resources: SystemResources {
                 cpu_usage: 10.0,
-                memory_usage: 1024 * 1024,  // 1MB
+                memory_usage: 1024 * 1024, // 1MB
                 thread_count: 4,
             },
         }
@@ -251,13 +273,13 @@ impl ActorSystem for MockActorSystem {
     async fn shutdown(self) -> Result<(), SystemError> {
         // Stop all actors safely
         self.stop_all_actors().await?;
-        
+
         // Update system state
         {
             let mut state = self.state.write().unwrap();
             *state = SystemState::Stopped;
         }
-        
+
         Ok(())
     }
 }
@@ -270,9 +292,7 @@ mod tests {
     // Helper to create system config
     fn create_system_config() -> ActorSystemConfig {
         // 创建一个基础的决策函数
-        let decider = BasicDecisionFn::new(|error: &ActorError| {
-            SupervisionDecision::Restart
-        });
+        let decider = BasicDecisionFn::new(|_error: &ActorError| SupervisionDecision::Restart);
 
         // 创建一个简单的OneForOneStrategy
         let one_for_one = OneForOneStrategy {
@@ -280,7 +300,7 @@ mod tests {
             within: Duration::from_secs(30),
             decider,
         };
-        
+
         ActorSystemConfig {
             name: "test-system".to_string(),
             runtime_config: RuntimeConfig {
@@ -310,14 +330,12 @@ mod tests {
     fn test_system_creation() {
         let rt = Runtime::new().unwrap();
         let config = create_system_config();
-        
-        let system = rt.block_on(async {
-            MockActorSystem::start(config).await
-        });
-        
+
+        let system = rt.block_on(async { MockActorSystem::start(config).await });
+
         assert!(system.is_ok());
         let system = system.unwrap();
-        
+
         // Verify system is in running state
         let status = system.status();
         assert_eq!(status.state, SystemState::Running);
@@ -329,22 +347,24 @@ mod tests {
     fn test_actor_spawn() {
         let rt = Runtime::new().unwrap();
         let config = create_system_config();
-        
+
         let result = rt.block_on(async {
             let system = MockActorSystem::start(config).await?;
-            
+
             // Spawn an actor
-            let actor = system.spawn_root_typed(TestActor::default(), TestActorConfig::default()).await?;
-            
+            let actor = system
+                .spawn_root_typed(TestActor::default(), TestActorConfig)
+                .await?;
+
             // Verify actor is created
             assert!(actor.is_alive().await);
-            
+
             let status = system.status();
             assert_eq!(status.active_actors, 1);
-            
+
             Ok::<_, SystemError>(actor)
         });
-        
+
         assert!(result.is_ok());
     }
 
@@ -353,25 +373,27 @@ mod tests {
     fn test_actor_messaging() {
         let rt = Runtime::new().unwrap();
         let config = create_system_config();
-        
+
         let result = rt.block_on(async {
             let system = MockActorSystem::start(config).await?;
-            
+
             // Spawn an actor
-            let actor = system.spawn_root_typed(TestActor::default(), TestActorConfig::default()).await?;
-            
+            let actor = system
+                .spawn_root_typed(TestActor::default(), TestActorConfig)
+                .await?;
+
             // Send a message
             let msg = Box::new(TestMessage("Hello".to_string())) as BoxedMessage;
             let response = actor.send(msg).await?;
-            
+
             // Verify response
             let unpacked = response.downcast::<TestMessage>();
             assert!(unpacked.is_ok());
             assert_eq!(unpacked.unwrap().0, "Hello");
-            
+
             Ok::<_, SystemError>(())
         });
-        
+
         assert!(result.is_ok());
     }
 
@@ -380,26 +402,30 @@ mod tests {
     fn test_system_shutdown() {
         let rt = Runtime::new().unwrap();
         let config = create_system_config();
-        
+
         let result = rt.block_on(async {
             let system = MockActorSystem::start(config).await?;
-            
+
             // Spawn some actors
-            let actor1 = system.spawn_root_typed(TestActor::default(), TestActorConfig::default()).await?;
-            let actor2 = system.spawn_root_typed(TestActor::default(), TestActorConfig::default()).await?;
-            
+            let actor1 = system
+                .spawn_root_typed(TestActor::default(), TestActorConfig)
+                .await?;
+            let actor2 = system
+                .spawn_root_typed(TestActor::default(), TestActorConfig)
+                .await?;
+
             // Verify actors are alive
             assert!(actor1.is_alive().await);
             assert!(actor2.is_alive().await);
-            
+
             // Shutdown the system
             system.shutdown().await?;
-            
+
             // Verify actors are stopped (this would need to be checked in a real system)
-            
+
             Ok::<_, SystemError>(())
         });
-        
+
         assert!(result.is_ok());
     }
 
@@ -408,14 +434,18 @@ mod tests {
     fn test_system_status() {
         let rt = Runtime::new().unwrap();
         let config = create_system_config();
-        
+
         let result = rt.block_on(async {
             let system = MockActorSystem::start(config).await?;
-            
+
             // Spawn some actors
-            let _actor1 = system.spawn_root_typed(TestActor::default(), TestActorConfig::default()).await?;
-            let _actor2 = system.spawn_root_typed(TestActor::default(), TestActorConfig::default()).await?;
-            
+            let _actor1 = system
+                .spawn_root_typed(TestActor::default(), TestActorConfig)
+                .await?;
+            let _actor2 = system
+                .spawn_root_typed(TestActor::default(), TestActorConfig)
+                .await?;
+
             // Check status
             let status = system.status();
             assert_eq!(status.state, SystemState::Running);
@@ -423,10 +453,10 @@ mod tests {
             assert!(status.resources.cpu_usage > 0.0);
             assert!(status.resources.memory_usage > 0);
             assert!(status.resources.thread_count > 0);
-            
+
             Ok::<_, SystemError>(())
         });
-        
+
         assert!(result.is_ok());
     }
 
@@ -435,36 +465,36 @@ mod tests {
     fn test_actor_with_default_config() {
         let rt = Runtime::new().unwrap();
         let config = create_system_config();
-        
+
         let result = rt.block_on(async {
             let system = MockActorSystem::start(config).await?;
-            
+
             // Create an actor using the default configuration
             let actor = TestActor::default();
-            
+
             // Spawn a root actor with the default configuration
-            let config = TestActorConfig::default();
+            let config = TestActorConfig;
             let actor_ref = system.spawn_root_typed(actor, config).await?;
-            
+
             // Verify that the actor is alive
             assert!(actor_ref.is_alive().await);
-            
+
             // Check that only one actor is active in the system
             let status = system.status();
             assert_eq!(status.active_actors, 1);
-            
+
             // Send a test message and await the response
             let msg = Box::new(TestMessage("DefaultConfigTest".to_string())) as BoxedMessage;
             let response = actor_ref.send(msg).await?;
-            
+
             // Unpack and verify the response
             let unpacked = response.downcast::<TestMessage>();
             assert!(unpacked.is_ok());
             assert_eq!(unpacked.unwrap().0, "DefaultConfigTest");
-            
+
             Ok::<_, SystemError>(())
         });
-        
+
         assert!(result.is_ok());
     }
-} 
+}

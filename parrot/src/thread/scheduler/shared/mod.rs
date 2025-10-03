@@ -26,6 +26,6 @@ mod worker_manager;
 // Re-exports
 pub use pool::SharedThreadPool;
 pub use pool::SharedThreadPoolConfig;
-pub use pool::{SchedulerStatus, SchedulerMetrics};
+pub use pool::{SchedulerMetrics, SchedulerStatus};
 pub use worker::{Worker, WorkerConfig, WorkerStatus};
 pub use worker_manager::WorkerManager;

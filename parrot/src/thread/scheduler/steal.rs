@@ -8,9 +8,10 @@
 //! 避免 SegQueue 的节点分配）。
 
 use crossbeam_queue::ArrayQueue;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+#[allow(dead_code)] // 预留：关闭哨兵值
 const CLOSED: u64 = u64::MAX;
 
 /// 无锁 chase-lev 变体：环形数组槽位 + top/bottom 索引。
@@ -91,7 +92,9 @@ pub type MailboxRef = Arc<dyn crate::thread::mailbox::Mailbox + Send + Sync>;
 impl StealRing {
     pub fn new(workers: usize, cap: usize) -> Self {
         Self {
-            deques: (0..workers).map(|_| Arc::new(StealDeque::new(cap))).collect(),
+            deques: (0..workers)
+                .map(|_| Arc::new(StealDeque::new(cap)))
+                .collect(),
         }
     }
 

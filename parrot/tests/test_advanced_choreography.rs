@@ -9,8 +9,8 @@
 //!
 //! Every scenario asserts observable end-state, not implementation.
 
+use parrot::actix as __parrot_engine;
 use parrot::system::ParrotActorSystem;
-use parrot_api::system::ActorSystemConfig;
 use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
@@ -18,6 +18,7 @@ use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
+use parrot_api::system::ActorSystemConfig;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
 use std::sync::Arc;
@@ -37,6 +38,7 @@ struct Job(u64);
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "u64")]
+#[allow(dead_code)]
 struct JobDone(u64);
 
 #[derive(Clone, Debug, Message)]
@@ -53,7 +55,12 @@ struct SeenCount;
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
-struct CbCall { fail: bool, id: u64 }
+struct CbCall {
+    #[allow(dead_code)]
+    fail: bool,
+    #[allow(dead_code)]
+    id: u64,
+}
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
@@ -61,12 +68,16 @@ struct CbState;
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
-struct SagaExec { step: u64, ok: bool }
+struct SagaExec {
+    step: u64,
+    ok: bool,
+}
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
 struct SagaReport;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Message)]
 #[message(result = "bool")]
 struct GrabToken(u64);
@@ -85,7 +96,10 @@ struct PermitsUsed;
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "u64")]
-struct RetryTask { attempt_limit: u64, fail_until: u64 }
+struct RetryTask {
+    attempt_limit: u64,
+    fail_until: u64,
+}
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "u64")]
@@ -105,7 +119,9 @@ struct Prepare(u64);
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
-struct CommitOrAbort { commit: bool }
+struct CommitOrAbort {
+    commit: bool,
+}
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
@@ -141,15 +157,25 @@ impl Actor for Turnstile {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             let Some(e) = msg.downcast_ref::<FsmEvent>() else {
                 return Err(ActorError::MessageHandlingError("unknown".into()));
             };
             let out = match (self.locked, e.0.as_str()) {
                 (true, "push") => "rejected",
-                (true, "coin") => { self.locked = false; "unlocked" }
-                (false, "push") => { self.locked = true; "let-through" }
+                (true, "coin") => {
+                    self.locked = false;
+                    "unlocked"
+                }
+                (false, "push") => {
+                    self.locked = true;
+                    "let-through"
+                }
                 (false, "coin") => "already-unlocked",
                 _ => return Err(ActorError::MessageHandlingError("bad event".into())),
             };
@@ -158,17 +184,23 @@ impl Actor for Turnstile {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
 async fn a1_fsm_turnstile() {
     let ts = sys();
-    let t = spawn::<Turnstile>(&ts, "/a1/turnstile", Turnstile { locked: true, events: vec![] }).await;
+    let t = spawn::<Turnstile>(
+        &ts,
+        "/a1/turnstile",
+        Turnstile {
+            locked: true,
+            events: vec![],
+        },
+    )
+    .await;
     assert_eq!(ask_s(&t, FsmEvent("push".into())).await, "rejected");
     assert_eq!(ask_s(&t, FsmEvent("coin".into())).await, "unlocked");
     assert_eq!(ask_s(&t, FsmEvent("coin".into())).await, "already-unlocked");
@@ -181,13 +213,20 @@ async fn a1_fsm_turnstile() {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
-struct PoolWorker { jobs: u64, units: u64 }
+struct PoolWorker {
+    jobs: u64,
+    units: u64,
+}
 
 impl Actor for PoolWorker {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(j) = msg.downcast_ref::<Job>() {
                 self.jobs += 1;
@@ -201,11 +240,9 @@ impl Actor for PoolWorker {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 /// Router fans Jobs out round-robin; keeps no result forwarding (tests
@@ -220,7 +257,11 @@ impl Actor for RoundRobinRouter {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             let Some(j) = msg.downcast_ref::<Job>() else {
                 return Err(ActorError::MessageHandlingError("unknown".into()));
@@ -232,11 +273,9 @@ impl Actor for RoundRobinRouter {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
@@ -245,9 +284,19 @@ async fn a2_round_robin_router() {
     const N: usize = 4;
     let mut workers = Vec::new();
     for i in 0..N {
-        workers.push(Arc::new(spawn::<PoolWorker>(&ts, &format!("/a2/w{}", i), PoolWorker::default()).await));
+        workers.push(Arc::new(
+            spawn::<PoolWorker>(&ts, &format!("/a2/w{}", i), PoolWorker::default()).await,
+        ));
     }
-    let r = spawn::<RoundRobinRouter>(&ts, "/a2/router", RoundRobinRouter { next: 0, workers: workers.clone() }).await;
+    let r = spawn::<RoundRobinRouter>(
+        &ts,
+        "/a2/router",
+        RoundRobinRouter {
+            next: 0,
+            workers: workers.clone(),
+        },
+    )
+    .await;
     let units: Vec<u64> = (1..=8u64).collect();
     for u in &units {
         let done: u64 = r.ask(Job(*u)).await.unwrap();
@@ -262,7 +311,11 @@ async fn a2_round_robin_router() {
     for w in &workers {
         sum += w.ask(Query).await.unwrap() % 1000;
     }
-    assert_eq!(sum, units.into_iter().sum::<u64>(), "no unit lost or duplicated");
+    assert_eq!(
+        sum,
+        units.into_iter().sum::<u64>(),
+        "no unit lost or duplicated"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -270,13 +323,19 @@ async fn a2_round_robin_router() {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
-struct BcastMember { seen: Vec<String> }
+struct BcastMember {
+    seen: Vec<String>,
+}
 
 impl Actor for BcastMember {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(b) = msg.downcast_ref::<Bcast>() {
                 self.seen.push(b.0.clone());
@@ -289,11 +348,9 @@ impl Actor for BcastMember {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
@@ -302,14 +359,19 @@ async fn a3_broadcast_scatter_gather() {
     const N: usize = 5;
     let mut members = Vec::new();
     for i in 0..N {
-        members.push(spawn::<BcastMember>(&ts, &format!("/a3/m{}", i), BcastMember::default()).await);
+        members
+            .push(spawn::<BcastMember>(&ts, &format!("/a3/m{}", i), BcastMember::default()).await);
     }
     // Scatter the same request to everyone, gather all replies.
     let mut futs = Vec::new();
     for m in &members {
         futs.push(m.ask(Bcast("rollout".into())));
     }
-    let replies: Vec<String> = futures::future::join_all(futs).await.into_iter().map(|r| r.unwrap()).collect();
+    let replies: Vec<String> = futures::future::join_all(futs)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
     assert_eq!(replies.len(), N);
     assert!(replies.iter().all(|r| r == "rollout#1"));
     // Second round.
@@ -342,7 +404,11 @@ impl Actor for CircuitBreaker {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(c) = msg.downcast_ref::<CbCall>() {
                 let outcome = if c.fail { "fail" } else { "ok" };
@@ -384,29 +450,50 @@ impl Actor for CircuitBreaker {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
 async fn a4_circuit_breaker() {
     let ts = sys();
-    let cb = spawn::<CircuitBreaker>(&ts, "/a4/cb", CircuitBreaker {
-        state: "closed".into(), consec_fail: 0, threshold: 3, success_seen: 0, log: vec![],
-    }).await;
+    let cb = spawn::<CircuitBreaker>(
+        &ts,
+        "/a4/cb",
+        CircuitBreaker {
+            state: "closed".into(),
+            consec_fail: 0,
+            threshold: 3,
+            success_seen: 0,
+            log: vec![],
+        },
+    )
+    .await;
 
     // Three consecutive failures trip it open.
-    assert_eq!(cb.ask(CbCall { fail: true, id: 1 }).await.unwrap(), "fail@closed");
-    assert_eq!(cb.ask(CbCall { fail: true, id: 2 }).await.unwrap(), "fail@closed");
-    assert_eq!(cb.ask(CbCall { fail: true, id: 3 }).await.unwrap(), "fail@closed");
+    assert_eq!(
+        cb.ask(CbCall { fail: true, id: 1 }).await.unwrap(),
+        "fail@closed"
+    );
+    assert_eq!(
+        cb.ask(CbCall { fail: true, id: 2 }).await.unwrap(),
+        "fail@closed"
+    );
+    assert_eq!(
+        cb.ask(CbCall { fail: true, id: 3 }).await.unwrap(),
+        "fail@closed"
+    );
     assert_eq!(cb.ask(CbState).await.unwrap(), "open");
     // While open, requests are rejected without executing.
-    assert_eq!(cb.ask(CbCall { fail: false, id: 4 }).await.unwrap(), "rejected@open");
+    assert_eq!(
+        cb.ask(CbCall { fail: false, id: 4 }).await.unwrap(),
+        "rejected@open"
+    );
     // Operator forces half-open (simulated recovery probe path).
-    cb.send(Box::new(FsmEvent("half-open".into())) as BoxedMessage).await.ok();
+    cb.send(Box::new(FsmEvent("half-open".into())) as BoxedMessage)
+        .await
+        .ok();
     // FsmEvent is unknown to the breaker — use a real recovery: the actor
     // has no admin message, so emulate via threshold reset by sending
     // success (still rejected while open).
@@ -450,7 +537,11 @@ impl Actor for SagaCoordinator {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(x) = msg.downcast_ref::<SagaExec>() {
                 if !x.ok {
@@ -466,34 +557,57 @@ impl Actor for SagaCoordinator {
                 Ok(Box::new("ok".to_string()) as BoxedMessage)
             } else if msg.downcast_ref::<SagaReport>().is_some() {
                 let f = self.finished.clone().unwrap_or_else(|| "running".into());
-                Ok(Box::new(format!("{}|exec={:?}|comp={:?}", f, self.executed, self.compensated)) as BoxedMessage)
+                Ok(Box::new(format!(
+                    "{}|exec={:?}|comp={:?}",
+                    f, self.executed, self.compensated
+                )) as BoxedMessage)
             } else {
                 Err(ActorError::MessageHandlingError("unknown".into()))
             }
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
 async fn a5_saga_commit_and_compensate() {
     let ts = sys();
     // Happy path: all 4 steps succeed → committed.
-    let s1 = spawn::<SagaCoordinator>(&ts, "/a5/ok", SagaCoordinator { executed: vec![], compensated: vec![], finished: None }).await;
+    let s1 = spawn::<SagaCoordinator>(
+        &ts,
+        "/a5/ok",
+        SagaCoordinator {
+            executed: vec![],
+            compensated: vec![],
+            finished: None,
+        },
+    )
+    .await;
     for step in 1..=4u64 {
         assert_eq!(ask_s(&s1, SagaExec { step, ok: true }).await, "ok");
     }
     let r = ask_s(&s1, SagaReport).await;
-    assert!(r.starts_with("committed|exec=[1, 2, 3, 4]|comp=[]"), "{}", r);
+    assert!(
+        r.starts_with("committed|exec=[1, 2, 3, 4]|comp=[]"),
+        "{}",
+        r
+    );
 
     // Failure path: step 3 fails → compensate 1,2 (and 3 is recorded then
     // compensated; here semantics: executed-so-fur is undone in reverse).
-    let s2 = spawn::<SagaCoordinator>(&ts, "/a5/fail", SagaCoordinator { executed: vec![], compensated: vec![], finished: None }).await;
+    let s2 = spawn::<SagaCoordinator>(
+        &ts,
+        "/a5/fail",
+        SagaCoordinator {
+            executed: vec![],
+            compensated: vec![],
+            finished: None,
+        },
+    )
+    .await;
     ask_s(&s2, SagaExec { step: 1, ok: true }).await;
     ask_s(&s2, SagaExec { step: 2, ok: true }).await;
     assert_eq!(ask_s(&s2, SagaExec { step: 3, ok: false }).await, "aborted");
@@ -516,7 +630,11 @@ impl Actor for RingNode {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(_g) = msg.downcast_ref::<GrabToken>() {
                 self.hops += 1;
@@ -532,11 +650,9 @@ impl Actor for RingNode {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
@@ -557,7 +673,11 @@ async fn a6_token_ring() {
         }
     }
     for n in &nodes {
-        assert_eq!(n.ask(TokenHops).await.unwrap(), 2, "each node hopped exactly twice");
+        assert_eq!(
+            n.ask(TokenHops).await.unwrap(),
+            2,
+            "each node hopped exactly twice"
+        );
     }
 }
 
@@ -577,7 +697,11 @@ impl Actor for RateLimiter {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(t) = msg.downcast_ref::<TryAcquire>() {
                 let now = std::time::Instant::now();
@@ -603,19 +727,25 @@ impl Actor for RateLimiter {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
 async fn a7_rate_limiter() {
     let ts = sys();
-    let rl = spawn::<RateLimiter>(&ts, "/a7/rl", RateLimiter {
-        window: Default::default(), capacity: 3, allowed: 0, rejected: 0,
-    }).await;
+    let rl = spawn::<RateLimiter>(
+        &ts,
+        "/a7/rl",
+        RateLimiter {
+            window: Default::default(),
+            capacity: 3,
+            allowed: 0,
+            rejected: 0,
+        },
+    )
+    .await;
     let mut granted = Vec::new();
     for _ in 0..5u64 {
         granted.push(rl.ask(TryAcquire(50)).await.unwrap());
@@ -643,7 +773,11 @@ impl Actor for RetryWorker {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(t) = msg.downcast_ref::<RetryTask>() {
                 self.calls += 1;
@@ -665,35 +799,62 @@ impl Actor for RetryWorker {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
 async fn a8_retry_backoff() {
     let ts = sys();
     // Succeeds on 3rd attempt (fails until 2).
-    let w = spawn::<RetryWorker>(&ts, "/a8/ok", RetryWorker { attempt: 0, calls: 0, final_state: String::new() }).await;
-    let t = RetryTask { attempt_limit: 5, fail_until: 2 };
+    let w = spawn::<RetryWorker>(
+        &ts,
+        "/a8/ok",
+        RetryWorker {
+            attempt: 0,
+            calls: 0,
+            final_state: String::new(),
+        },
+    )
+    .await;
+    let t = RetryTask {
+        attempt_limit: 5,
+        fail_until: 2,
+    };
     let mut got = None;
     for backoff_ms in [1u64, 2, 4, 8, 16] {
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         match w.ask(t.clone()).await {
-            Ok(v) => { got = Some(v); break; }
+            Ok(v) => {
+                got = Some(v);
+                break;
+            }
             Err(_) => continue,
         }
     }
     let _attempts = got.expect("retry eventually succeeds");
     // Exhaustion: always fail with limit 3.
-    let w2 = spawn::<RetryWorker>(&ts, "/a8/fail", RetryWorker { attempt: 0, calls: 0, final_state: String::new() }).await;
-    let t2 = RetryTask { attempt_limit: 3, fail_until: 99 };
+    let w2 = spawn::<RetryWorker>(
+        &ts,
+        "/a8/fail",
+        RetryWorker {
+            attempt: 0,
+            calls: 0,
+            final_state: String::new(),
+        },
+    )
+    .await;
+    let t2 = RetryTask {
+        attempt_limit: 3,
+        fail_until: 99,
+    };
     let mut err = None;
     for backoff_ms in [1u64, 2, 4] {
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        if let Err(e) = w2.ask(t2.clone()).await { err = Some(e); }
+        if let Err(e) = w2.ask(t2.clone()).await {
+            err = Some(e);
+        }
     }
     let e = err.expect("must end exhausted");
     assert!(e.to_string().contains("exhausted"), "{}", e);
@@ -704,13 +865,19 @@ async fn a8_retry_backoff() {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
-struct HedgeWorker { answered: u64 }
+struct HedgeWorker {
+    answered: u64,
+}
 
 impl Actor for HedgeWorker {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(h) = msg.downcast_ref::<HedgeCall>() {
                 self.answered += 1;
@@ -723,11 +890,9 @@ impl Actor for HedgeWorker {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
@@ -735,12 +900,13 @@ async fn a9_hedging_first_wins() {
     let ts = sys();
     let mut replicas = Vec::new();
     for i in 0..3u64 {
-        replicas.push(spawn::<HedgeWorker>(&ts, &format!("/a9/r{}", i), HedgeWorker::default()).await);
+        replicas
+            .push(spawn::<HedgeWorker>(&ts, &format!("/a9/r{}", i), HedgeWorker::default()).await);
     }
     // Fire 3 hedges concurrently; first result wins the race.
     let mut futs = Vec::new();
-    for i in 0..replicas.len() {
-        futs.push(replicas[i].ask(HedgeCall(i as u64)));
+    for (i, replica) in replicas.iter().enumerate() {
+        futs.push(replica.ask(HedgeCall(i as u64)));
     }
     let results: Vec<u64> = futures::future::join_all(futs)
         .await
@@ -768,13 +934,21 @@ impl Actor for TxParticipant {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(p) = msg.downcast_ref::<Prepare>() {
                 self.vote = Some(p.0 % 2 == 0 || p.0 == self.id); // deterministic votes
                 Ok(Box::new(format!("vote-{}:{}", self.id, self.vote.unwrap())) as BoxedMessage)
             } else if let Some(c) = msg.downcast_ref::<CommitOrAbort>() {
-                self.final_state = if c.commit { "committed".into() } else { "aborted".into() };
+                self.final_state = if c.commit {
+                    "committed".into()
+                } else {
+                    "aborted".into()
+                };
                 Ok(Box::new(self.final_state.clone()) as BoxedMessage)
             } else if msg.downcast_ref::<TxReport>().is_some() {
                 Ok(Box::new(format!("{}|{}", self.id, self.final_state)) as BoxedMessage)
@@ -784,11 +958,9 @@ impl Actor for TxParticipant {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
@@ -796,7 +968,18 @@ async fn a10_two_phase_commit() {
     let ts = sys();
     let mut parts = Vec::new();
     for i in 0..3u64 {
-        parts.push(spawn::<TxParticipant>(&ts, &format!("/a10/p{}", i), TxParticipant { id: i, vote: None, final_state: String::new() }).await);
+        parts.push(
+            spawn::<TxParticipant>(
+                &ts,
+                &format!("/a10/p{}", i),
+                TxParticipant {
+                    id: i,
+                    vote: None,
+                    final_state: String::new(),
+                },
+            )
+            .await,
+        );
     }
 
     // Phase 1: prepare with an even value → all vote yes.
@@ -815,7 +998,18 @@ async fn a10_two_phase_commit() {
     // Phase 2 scenario: prepare odd value → p1/p2 vote no → abort.
     let mut parts2 = Vec::new();
     for i in 0..3u64 {
-        parts2.push(spawn::<TxParticipant>(&ts, &format!("/a10/b{}", i), TxParticipant { id: i, vote: None, final_state: String::new() }).await);
+        parts2.push(
+            spawn::<TxParticipant>(
+                &ts,
+                &format!("/a10/b{}", i),
+                TxParticipant {
+                    id: i,
+                    vote: None,
+                    final_state: String::new(),
+                },
+            )
+            .await,
+        );
     }
     let mut votes = Vec::new();
     for p in &parts2 {
@@ -827,7 +1021,11 @@ async fn a10_two_phase_commit() {
     }
     for p in &parts2 {
         let r = ask_s(p, TxReport).await;
-        assert!(r.ends_with(if any_no { "aborted" } else { "committed" }), "{}", r);
+        assert!(
+            r.ends_with(if any_no { "aborted" } else { "committed" }),
+            "{}",
+            r
+        );
     }
 }
 
@@ -835,6 +1033,7 @@ async fn a10_two_phase_commit() {
 // A11: leader election
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct ElectorNode {
     id: u64,
@@ -846,7 +1045,11 @@ impl Actor for ElectorNode {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(e) = msg.downcast_ref::<Elect>() {
                 self.terms += 1;
@@ -862,11 +1065,9 @@ impl Actor for ElectorNode {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[tokio::test]
@@ -875,11 +1076,26 @@ async fn a11_leader_election() {
     const N: u64 = 5;
     let mut nodes = Vec::new();
     for i in 0..N {
-        nodes.push(spawn::<ElectorNode>(&ts, &format!("/a11/n{}", i), ElectorNode { id: i, leader: 0, terms: 0 }).await);
+        nodes.push(
+            spawn::<ElectorNode>(
+                &ts,
+                &format!("/a11/n{}", i),
+                ElectorNode {
+                    id: i,
+                    leader: 0,
+                    terms: 0,
+                },
+            )
+            .await,
+        );
     }
     // Everyone votes for themselves (max id wins).
     for n in &nodes {
-        assert_eq!(n.ask(Elect(N - 1)).await.unwrap(), N - 1, "highest id elected");
+        assert_eq!(
+            n.ask(Elect(N - 1)).await.unwrap(),
+            N - 1,
+            "highest id elected"
+        );
     }
     // A lower challenge cannot unseat the leader.
     let after: u64 = nodes[0].ask(Elect(1)).await.unwrap();
@@ -928,7 +1144,11 @@ impl Actor for ThreadSide {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(e) = msg.downcast_ref::<CrossEcho>() {
                 self.pings += e.0;
@@ -938,35 +1158,45 @@ impl Actor for ThreadSide {
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[test]
 fn a12_cross_engine_actix_thread() {
     actix::System::new().block_on(async {
-        use parrot_api::system::ActorSystem as _;
-        let agg = ParrotActorSystem::new(ActorSystemConfig::default()).await.expect("agg system");
+        let agg = ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .expect("agg system");
         // Thread side.
         let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
-        agg.register_thread_system("thread-1".into(), ts.clone(), false).await.expect("register thread");
+        agg.register_thread_system("thread-1".into(), ts.clone(), false)
+            .await
+            .expect("register thread");
         // Actix side.
-        let asys = parrot::actix::ActixActorSystem::new().await.expect("actix system");
-        agg.register_actix_system("actix-1".into(), asys.clone(), true).await.expect("register actix");
+        let asys = parrot::actix::ActixActorSystem::new()
+            .await
+            .expect("actix system");
+        agg.register_actix_system("actix-1".into(), asys.clone(), true)
+            .await
+            .expect("register actix");
 
         // Spawn through each engine's native typed API (the aggregated
         // system's generic spawn does not apply to the actix backend).
-        let actix_ref: Box<dyn ActorRef> =
-            asys.spawn_root_typed::<ActixSide>(ActixSide { echo_count: 0 }, EmptyConfig)
-                .await
-                .expect("spawn actix side");
+        let actix_ref: Box<dyn ActorRef> = asys
+            .spawn_root_typed::<ActixSide>(ActixSide { echo_count: 0 }, EmptyConfig)
+            .await
+            .expect("spawn actix side");
         let thread_ref: Box<dyn ActorRef> = Box::new(
-            ts.spawn_at::<ThreadSide>(ThreadSide::default(), "cross/thread", None, ThreadActorConfig::default())
-                .await
-                .expect("spawn thread side"),
+            ts.spawn_at::<ThreadSide>(
+                ThreadSide::default(),
+                "cross/thread",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
+            .expect("spawn thread side"),
         );
 
         // actix → thread: ping the actix side, feed its +1 into the thread side.
@@ -990,17 +1220,18 @@ fn sys() -> Arc<ThreadActorSystem> {
     ThreadActorSystem::shared(ThreadActorSystemConfig::default())
 }
 
-async fn spawn<A>(
-    ts: &Arc<ThreadActorSystem>,
-    path: &str,
-    actor: A,
-) -> Box<dyn ActorRef>
+async fn spawn<A>(ts: &Arc<ThreadActorSystem>, path: &str, actor: A) -> Box<dyn ActorRef>
 where
     A: Actor<Context = ThreadContext<A>, Config = EmptyConfig> + Send + Sync + 'static,
 {
-    Box::new(ts.spawn_at::<A>(actor, path, None, ThreadActorConfig::default()).await.expect("spawn"))
+    Box::new(
+        ts.spawn_at::<A>(actor, path, None, ThreadActorConfig::default())
+            .await
+            .expect("spawn"),
+    )
 }
 
+#[allow(clippy::borrowed_box)] // Box<dyn ActorRef> 未自动 Deref 到 trait
 async fn ask_s(r: &Box<dyn ActorRef>, m: impl Message<Result = String> + 'static) -> String {
     use parrot_api::address::ActorRefExt as _;
     r.ask(m).await.expect("ask")

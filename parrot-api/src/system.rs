@@ -1,5 +1,5 @@
 //! # Actor System Core
-//! 
+//!
 //! This module defines the core Actor System infrastructure for the Parrot framework.
 //! The Actor System is the top-level container that manages actor lifecycle, messaging,
 //! and resource allocation.
@@ -41,16 +41,16 @@
 //! # let _ = config;
 //! ```
 
-use std::time::Duration;
-use std::any::Any;
-use async_trait::async_trait;
 use crate::actor::Actor;
-use crate::errors::ActorError;
 use crate::address::{ActorPath, ActorRef};
-use crate::runtime::RuntimeConfig;
-use crate::message::Message;
-use crate::supervisor::SupervisorStrategyType;
 use crate::context::ActorContext;
+use crate::errors::ActorError;
+use crate::message::Message;
+use crate::runtime::RuntimeConfig;
+use crate::supervisor::SupervisorStrategyType;
+use async_trait::async_trait;
+use std::any::Any;
+use std::time::Duration;
 
 /// Errors that can occur during Actor System operations.
 ///
@@ -61,19 +61,19 @@ pub enum SystemError {
     /// Failed to initialize the actor system
     #[error("System initialization failed: {0}")]
     InitializationError(String),
-    
+
     /// Failed to create a new actor
     #[error("Actor creation failed: {0}")]
     ActorCreationError(String),
-    
+
     /// System is in shutdown process
     #[error("System is shutting down")]
     ShuttingDown,
-    
+
     /// Error from actor execution
     #[error(transparent)]
     ActorError(#[from] ActorError),
-    
+
     /// Other unexpected errors
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -90,13 +90,13 @@ pub enum SystemError {
 pub struct ActorSystemConfig {
     /// Unique name for this actor system instance
     pub name: String,
-    
+
     /// Configuration for the underlying runtime
     pub runtime_config: RuntimeConfig,
-    
+
     /// Configuration for the system's root guardian
     pub guardian_config: GuardianConfig,
-    
+
     /// System-wide timeout settings
     pub timeouts: SystemTimeouts,
 }
@@ -109,10 +109,10 @@ pub struct ActorSystemConfig {
 pub struct GuardianConfig {
     /// Maximum number of restarts allowed for supervised actors
     pub max_restarts: u32,
-    
+
     /// Time window for counting restarts
     pub restart_window: Duration,
-    
+
     /// Strategy for handling supervised actor failures
     pub supervision_strategy: SupervisorStrategyType,
 }
@@ -125,10 +125,10 @@ pub struct GuardianConfig {
 pub struct SystemTimeouts {
     /// Maximum time allowed for actor creation
     pub actor_creation: Duration,
-    
+
     /// Maximum time allowed for message processing
     pub message_handling: Duration,
-    
+
     /// Maximum time allowed for system shutdown
     pub system_shutdown: Duration,
 }
@@ -155,8 +155,10 @@ pub trait ActorSystem: Send + Sync + 'static {
     /// # Returns
     /// * `Ok(Self)` - Successfully initialized system
     /// * `Err(SystemError)` - Initialization failed
-    async fn start(config: ActorSystemConfig) -> Result<Self, SystemError> where Self: Sized;
-    
+    async fn start(config: ActorSystemConfig) -> Result<Self, SystemError>
+    where
+        Self: Sized;
+
     /// Creates a new top-level actor with type information.
     ///
     /// This method is used for creating actors when the concrete
@@ -171,8 +173,12 @@ pub trait ActorSystem: Send + Sync + 'static {
     ///
     /// # Returns
     /// Reference to the created actor or error
-    async fn spawn_root_typed<A: Actor>(&self, actor: A, config: A::Config) -> Result<Box<dyn ActorRef>, SystemError>;
-    
+    async fn spawn_root_typed<A: Actor>(
+        &self,
+        actor: A,
+        config: A::Config,
+    ) -> Result<Box<dyn ActorRef>, SystemError>;
+
     /// Creates a new top-level actor from type-erased components.
     ///
     /// This method is used when actor types are determined at runtime
@@ -189,7 +195,7 @@ pub trait ActorSystem: Send + Sync + 'static {
         actor: Box<dyn Actor<Config = Box<dyn Any + Send>, Context = dyn ActorContext>>,
         config: Box<dyn Any + Send>,
     ) -> Result<Box<dyn ActorRef>, SystemError>;
-    
+
     /// Locates an actor by its path.
     ///
     /// # Parameters
@@ -199,7 +205,7 @@ pub trait ActorSystem: Send + Sync + 'static {
     /// * `Some(ActorRef)` - Actor was found
     /// * `None` - Actor does not exist
     async fn get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>>;
-    
+
     /// Sends a message to all actors in the system.
     ///
     /// This method provides a way to notify all actors of
@@ -214,7 +220,7 @@ pub trait ActorSystem: Send + Sync + 'static {
     /// # Returns
     /// Success or failure of the broadcast operation
     async fn broadcast<M: Message + Clone>(&self, msg: M) -> Result<(), SystemError>;
-    
+
     /// Retrieves current system status.
     ///
     /// Returns information about:
@@ -223,7 +229,7 @@ pub trait ActorSystem: Send + Sync + 'static {
     /// - Resource usage
     /// - Uptime
     fn status(&self) -> SystemStatus;
-    
+
     /// Initiates graceful system shutdown.
     ///
     /// This process:
@@ -245,13 +251,13 @@ pub trait ActorSystem: Send + Sync + 'static {
 pub struct SystemStatus {
     /// Current operational state
     pub state: SystemState,
-    
+
     /// Number of actors currently running
     pub active_actors: usize,
-    
+
     /// Time since system start
     pub uptime: Duration,
-    
+
     /// Current resource utilization
     pub resources: SystemResources,
 }
@@ -280,10 +286,10 @@ pub enum SystemState {
 pub struct SystemResources {
     /// Percentage of CPU utilization
     pub cpu_usage: f64,
-    
+
     /// Bytes of memory in use
     pub memory_usage: usize,
-    
+
     /// Number of active threads
     pub thread_count: usize,
-} 
+}

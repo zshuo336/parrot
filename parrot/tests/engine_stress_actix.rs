@@ -14,9 +14,9 @@ use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
 use parrot_api::system::ActorSystemConfig;
-use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
-use std::sync::atomic::{AtomicU64, Ordering};
+use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -31,7 +31,11 @@ pub struct BenchActor {
 
 impl BenchActor {
     pub fn new(ops: Arc<AtomicU64>, cpu_sink: Arc<AtomicU64>) -> Self {
-        Self { ops, cpu_sink, messages: Arc::new(AtomicU64::new(0)) }
+        Self {
+            ops,
+            cpu_sink,
+            messages: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -51,6 +55,13 @@ impl Actor for BenchActor {
         Box::pin(async { Err(ActorError::MessageHandlingError("use engine path".into())) })
     }
 
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+}
+
+// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
+impl parrot_api::actor::ActixEngineExt for BenchActor {
     fn receive_message_with_engine<'a>(
         &'a mut self,
         msg: BoxedMessage,
@@ -111,23 +122,89 @@ impl Actor for BenchActor {
         self.messages.fetch_add(1, Ordering::Relaxed);
         Some(Ok(out))
     }
-
-    fn state(&self) -> ActorState {
-        ActorState::Running
-    }
 }
 
 // Message impls（与 thread 版相同）
-impl Message for CpuTask { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for IoTask { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for LongRunningTask { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for Echo { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for GetCount { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for MinuteCpuTask { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for MediumCpuTask { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for TinyTask { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for BatchEcho { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
-impl Message for ChunkedLongTask { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into())) } }
+impl Message for CpuTask {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for IoTask {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for LongRunningTask {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for Echo {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for GetCount {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for MinuteCpuTask {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for MediumCpuTask {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for TinyTask {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for BatchEcho {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for ChunkedLongTask {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 环境搭建
@@ -136,11 +213,17 @@ impl Message for ChunkedLongTask { type Result = u64; fn extract_result(r: Boxed
 async fn setup() -> anyhow::Result<(ParrotActorSystem, ActixActorSystem)> {
     let parrot = ParrotActorSystem::new(ActorSystemConfig::default()).await?;
     let actix_sys = ActixActorSystem::new().await?;
-    parrot.register_actix_system("bench-actix".into(), actix_sys.clone(), true).await?;
+    parrot
+        .register_actix_system("bench-actix".into(), actix_sys.clone(), true)
+        .await?;
     Ok((parrot, actix_sys))
 }
 
-fn spawn_actor(sys: &ActixActorSystem, ops: Arc<AtomicU64>, cpu_sink: Arc<AtomicU64>) -> Box<dyn ActorRef> {
+fn spawn_actor(
+    sys: &ActixActorSystem,
+    ops: Arc<AtomicU64>,
+    cpu_sink: Arc<AtomicU64>,
+) -> Box<dyn ActorRef> {
     sys.spawn_root_typed(BenchActor::new(ops, cpu_sink), EmptyConfig)
         .now_or_never()
         .expect("spawn ready")
@@ -158,6 +241,9 @@ use futures::FutureExt;
 pub struct IoAsyncActor {
     pub done: Arc<AtomicU64>,
 }
+
+// M6: async opt-in actor——同步快路径默认 None。
+impl parrot_api::actor::ActixEngineExt for IoAsyncActor {}
 
 impl Actor for IoAsyncActor {
     type Config = EmptyConfig;
@@ -181,15 +267,6 @@ impl Actor for IoAsyncActor {
         })
     }
 
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _engine: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
     /// 关键开关：让 actix 引擎把消息路由到异步 receive_message 路径
     fn use_async_handler(&self) -> bool {
         true
@@ -204,7 +281,12 @@ impl Actor for IoAsyncActor {
 // 基准函数（与 thread 版对齐）
 // ---------------------------------------------------------------------------
 
-async fn bench_sequential_ask(report: &Report, name: &str, actor: &dyn ActorRef, n: u64) -> anyhow::Result<()> {
+async fn bench_sequential_ask(
+    report: &Report,
+    name: &str,
+    actor: &dyn ActorRef,
+    n: u64,
+) -> anyhow::Result<()> {
     let mut samples = Vec::with_capacity(n as usize);
     let start = Instant::now();
     for i in 0..n {
@@ -214,17 +296,24 @@ async fn bench_sequential_ask(report: &Report, name: &str, actor: &dyn ActorRef,
         samples.push(t0.elapsed().as_micros());
     }
     report.push(BenchResult {
-        name: name.into(), engine: "actix", total_messages: n,
-        elapsed: start.elapsed(), latencies: latency_stats(samples),
-        correctness: true, cpu_work_secs: None,
-                note: String::new(),
+        name: name.into(),
+        engine: "actix",
+        total_messages: n,
+        elapsed: start.elapsed(),
+        latencies: latency_stats(samples),
+        correctness: true,
+        cpu_work_secs: None,
+        note: String::new(),
     });
     Ok(())
 }
 
 async fn bench_concurrent_ask(
-    report: &Report, name: &str, actor_ref: Box<dyn ActorRef>,
-    concurrency: usize, per_task: u64,
+    report: &Report,
+    name: &str,
+    actor_ref: Box<dyn ActorRef>,
+    concurrency: usize,
+    per_task: u64,
 ) -> anyhow::Result<()> {
     let mut samples = Vec::with_capacity(concurrency * per_task as usize);
     let start = Instant::now();
@@ -235,7 +324,11 @@ async fn bench_concurrent_ask(
             let mut local = Vec::with_capacity(per_task as usize);
             for i in 0..per_task {
                 let t0 = Instant::now();
-                let r = ar.ask(Echo { value: i + c as u64 }).await?;
+                let r = ar
+                    .ask(Echo {
+                        value: i + c as u64,
+                    })
+                    .await?;
                 assert_eq!(r, i + c as u64);
                 local.push(t0.elapsed().as_micros());
             }
@@ -244,35 +337,57 @@ async fn bench_concurrent_ask(
     }
     let mut correct = true;
     for h in handles {
-        match h.await { Ok(Ok(mut s)) => samples.append(&mut s), _ => correct = false }
+        match h.await {
+            Ok(Ok(mut s)) => samples.append(&mut s),
+            _ => correct = false,
+        }
     }
     report.push(BenchResult {
-        name: name.into(), engine: "actix",
+        name: name.into(),
+        engine: "actix",
         total_messages: (concurrency * per_task as usize) as u64,
-        elapsed: start.elapsed(), latencies: latency_stats(samples),
-        correctness: correct, cpu_work_secs: None,
-                note: format!("concurrency={}", concurrency),
+        elapsed: start.elapsed(),
+        latencies: latency_stats(samples),
+        correctness: correct,
+        cpu_work_secs: None,
+        note: format!("concurrency={}", concurrency),
     });
     Ok(())
 }
 
 async fn bench_tell_throughput(
-    report: &Report, name: &str, sys: &ActixActorSystem,
-    actor: Box<dyn ActorRef>, n: u64, ops: Arc<AtomicU64>,
+    report: &Report,
+    name: &str,
+    sys: &ActixActorSystem,
+    actor: Box<dyn ActorRef>,
+    n: u64,
+    ops: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
     for i in 0..n {
-        actor.send(Box::new(Echo { value: i }) as BoxedMessage).await?;
+        actor
+            .send(Box::new(Echo { value: i }) as BoxedMessage)
+            .await?;
     }
     let ok = wait_until(
         || ops.load(Ordering::Relaxed) >= n,
-        Duration::from_secs(120), Duration::from_millis(5),
-    ).await;
+        Duration::from_secs(120),
+        Duration::from_millis(5),
+    )
+    .await;
     report.push(BenchResult {
-        name: name.into(), engine: "actix", total_messages: n,
-        elapsed: start.elapsed(), latencies: latency_stats(vec![]),
-        correctness: ok, cpu_work_secs: None,
-                note: if ok { String::new() } else { "DRAIN TIMEOUT".into() },
+        name: name.into(),
+        engine: "actix",
+        total_messages: n,
+        elapsed: start.elapsed(),
+        latencies: latency_stats(vec![]),
+        correctness: ok,
+        cpu_work_secs: None,
+        note: if ok {
+            String::new()
+        } else {
+            "DRAIN TIMEOUT".into()
+        },
     });
     let _ = sys;
     Ok(())
@@ -811,7 +926,10 @@ fn actix_engine_full_suite() {
 
             // async handler actor：片间 tokio yield（use_async_handler = true）
             pub struct ChunkAsyncActor;
-            impl Actor for ChunkAsyncActor {
+            // M6: async opt-in actor——同步快路径默认 None。
+impl parrot_api::actor::ActixEngineExt for ChunkAsyncActor {}
+
+impl Actor for ChunkAsyncActor {
                 type Config = EmptyConfig;
                 type Context = ActixContext<ActixActor<Self>>;
                 fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
@@ -835,15 +953,12 @@ fn actix_engine_full_suite() {
                         Ok(Box::new(acc) as BoxedMessage)
                     })
                 }
-                fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-                    None
-                }
                 fn use_async_handler(&self) -> bool { true }
                 fn state(&self) -> ActorState { ActorState::Running }
             }
 
             let chunked = sys.spawn_root_typed(ChunkAsyncActor, EmptyConfig).now_or_never().expect("spawn ready").expect("chunk spawn");
-            let chunked2 = sys.spawn_root_typed(ChunkAsyncActor, EmptyConfig).now_or_never().expect("spawn ready").expect("chunk spawn 2");
+            let _chunked2 = sys.spawn_root_typed(ChunkAsyncActor, EmptyConfig).now_or_never().expect("spawn ready").expect("chunk spawn 2");
             let solid = spawn_actor(&sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
 
             // A) 连续（solid，同步 handler）
@@ -924,7 +1039,7 @@ fn actix_engine_full_suite() {
                 let va = pa.ask(Echo { value: i }).await?;
                 let vb = pb.ask(Echo { value: va }).await?;
                 assert_eq!(vb, i);
-                if i % 10 == 0 { samples.push(t0.elapsed().as_micros()); }
+                if i.is_multiple_of(10) { samples.push(t0.elapsed().as_micros()); }
                 i += 1;
             }
             report.push(BenchResult {
@@ -1021,9 +1136,9 @@ fn actix_engine_full_suite() {
             const PER_WAVE: usize = 1_000;
             let start = Instant::now();
             let mut alive_checks = 0u64;
-            for w in 0..WAVES {
+            for _w in 0..WAVES {
                 let mut refs = Vec::new();
-                for i in 0..PER_WAVE {
+                for _i in 0..PER_WAVE {
                     let r = spawn_actor(&sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
                     refs.push(r);
                 }

@@ -1,10 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
-use std::pin::Pin;
-use std::future::Future;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
@@ -14,9 +12,6 @@ use tracing::{debug, error, warn};
 
 use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::queue::SchedulingQueue;
-use crate::thread::scheduler::shared::worker_manager::WorkerManager;
-use crate::thread::processor::ProcessorInterface;
-use parrot_api::types::BoxedMessage;
 
 /// Worker status codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,14 +154,17 @@ impl Worker {
         while !self.shutdown_flag.load(Ordering::Relaxed) {
             match self.scheduling_queue.try_pop() {
                 Some(mailbox) => {
-                    self.status.store(WorkerStatus::Processing as usize, Ordering::Relaxed);
+                    self.status
+                        .store(WorkerStatus::Processing as usize, Ordering::Relaxed);
                     if let Err(e) = self.process_mailbox(mailbox, self.batch_size).await {
                         error!("[{}] {}", worker_name, e);
                     }
-                    self.status.store(WorkerStatus::Idle as usize, Ordering::Relaxed);
+                    self.status
+                        .store(WorkerStatus::Idle as usize, Ordering::Relaxed);
                 }
                 None => {
-                    self.status.store(WorkerStatus::Idle as usize, Ordering::Relaxed);
+                    self.status
+                        .store(WorkerStatus::Idle as usize, Ordering::Relaxed);
 
                     // Wait for notification or periodic shutdown check.
                     // Enable the notify permit before selecting so a push
@@ -187,7 +185,8 @@ impl Worker {
             }
         }
 
-        self.status.store(WorkerStatus::ShuttingDown as usize, Ordering::Relaxed);
+        self.status
+            .store(WorkerStatus::ShuttingDown as usize, Ordering::Relaxed);
     }
 
     /// Process a batch of messages from a mailbox using its attached processor.
@@ -229,15 +228,24 @@ impl Worker {
             let processor = processor.clone();
             let mailbox_for_panics = mailbox.clone();
             let path_for_panics = actor_path.clone();
+            // M2 fairness yield: truncate this run to a single message when
+            // the actor is over its reduction budget AND other mailboxes
+            // are waiting in the scheduling queue (yielding to an empty
+            // queue — i.e. yielding to yourself — is pure churn). The
+            // budget resets after the yield (POC beam-sched semantics).
+            let max_for_run = if self.scheduling_queue.len() > 1
+                && processor.consecutive_reductions() >= max_messages.saturating_mul(4)
+            {
+                processor.reset_reduction_budget();
+                1.min(max_messages)
+            } else {
+                max_messages
+            };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Only the future *creation* happens here; actual actor code
                 // runs when awaited below. Panics inside the future are caught
                 // by the JoinHandle of the spawned inner task.
-                processor.process_batch_erased(
-                    mailbox_for_panics.clone(),
-                    max_messages,
-                    false,
-                )
+                processor.process_batch_erased(mailbox_for_panics.clone(), max_for_run, false)
             }));
             match result {
                 Ok(fut) => {
@@ -279,9 +287,15 @@ impl Worker {
                 }
             }
             Err(e) => {
-                error!("[{}] Error processing batch for {}: {}", worker_name, actor_path, e);
+                error!(
+                    "[{}] Error processing batch for {}: {}",
+                    worker_name, actor_path, e
+                );
                 // Release the schedule slot so future pushes can re-enqueue.
                 mailbox.schedule_state().force_release();
+                // M3 supervision: notify the system (detached) so the
+                // supervision state machine decides restart/stop/escalate.
+                processor.notify_system_panic(e.to_string());
                 // Do not re-queue a panicking mailbox.
                 self.record_panic(&actor_path);
                 return Ok(());
@@ -290,9 +304,17 @@ impl Worker {
 
         // Re-queue while there is more work, preserving the single-owner
         // invariant through the schedule slot state machine.
+        //
+        // M2: mailboxes that still hold high-priority messages re-enter the
+        // scheduler's High lane, jumping over any normal-lane backlog.
         let has_more = mailbox.has_more_messages().await;
         if mailbox.schedule_state().release(has_more) {
-            self.scheduling_queue.push(mailbox);
+            let lane = if mailbox.has_high_priority_messages() {
+                crate::thread::scheduler::queue::Lane::High
+            } else {
+                crate::thread::scheduler::queue::Lane::Normal
+            };
+            self.scheduling_queue.push_with_lane(mailbox, lane);
         }
 
         Ok(())
@@ -329,16 +351,18 @@ fn panic_message(payload: Box<dyn Any + Send>, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thread::scheduler::queue::SchedulingQueue;
-    use crate::thread::mailbox::mpsc::MpscMailbox;
+    use crate::thread::actor::ThreadActor;
     use crate::thread::config::ThreadActorConfig;
     use crate::thread::context::ThreadContext;
-    use crate::thread::actor::ThreadActor;
+    use crate::thread::mailbox::mpsc::MpscMailbox;
     use crate::thread::processor::ActorProcessor;
+    use crate::thread::scheduler::queue::SchedulingQueue;
+    use async_trait::async_trait;
     use parrot_api::actor::{Actor, ActorState, EmptyConfig};
     use parrot_api::address::{ActorPath, ActorRef};
-    use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, WeakActorTarget};
-    use async_trait::async_trait;
+    use parrot_api::types::{
+        ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage, WeakActorTarget,
+    };
     use std::time::Duration;
 
     #[derive(Debug)]
@@ -352,12 +376,12 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async move { Ok(msg) })
-        }
-
-        fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-            None
         }
 
         fn state(&self) -> ActorState {
@@ -371,11 +395,20 @@ mod tests {
         struct MockRef(String);
         #[async_trait]
         impl ActorRef for MockRef {
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> { Box::pin(async { Ok(()) }) }
-            fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn send<'a>(
+                &'a self,
+                _msg: BoxedMessage,
+            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async { Ok(Box::new(()) as BoxedMessage) })
             }
-            fn send_with_timeout<'a>(&'a self, _msg: BoxedMessage, _t: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            fn send_with_timeout<'a>(
+                &'a self,
+                _msg: BoxedMessage,
+                _t: Option<Duration>,
+            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async { Ok(Box::new(()) as BoxedMessage) })
             }
             fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
@@ -410,7 +443,10 @@ mod tests {
             rt,
             queue.clone(),
             shutdown,
-            WorkerConfig { batch_size: 4, ..Default::default() },
+            WorkerConfig {
+                batch_size: 4,
+                ..Default::default()
+            },
         );
 
         // Build a mailbox with an attached processor
@@ -428,7 +464,10 @@ mod tests {
         // Enqueue messages
         for i in 0..3 {
             mailbox
-                .push(Box::new(format!("m{}", i)) as BoxedMessage, crate::thread::config::BackpressureStrategy::Block)
+                .push(
+                    Box::new(format!("m{}", i)) as BoxedMessage,
+                    crate::thread::config::BackpressureStrategy::Block,
+                )
                 .await
                 .unwrap();
         }
@@ -450,7 +489,10 @@ mod tests {
         let path = mock_actor_path("test/no-proc");
         let mailbox = Arc::new(MpscMailbox::new(16, path));
         mailbox
-            .push(Box::new("x") as BoxedMessage, crate::thread::config::BackpressureStrategy::Block)
+            .push(
+                Box::new("x") as BoxedMessage,
+                crate::thread::config::BackpressureStrategy::Block,
+            )
             .await
             .unwrap();
 
@@ -498,15 +540,6 @@ mod tests {
             })
         }
 
-        fn receive_message_with_engine<'a>(
-            &'a mut self,
-            _msg: BoxedMessage,
-            _ctx: &'a mut Self::Context,
-            _engine_ctx: parrot_api::actor::EngineContextHandle,
-        ) -> Option<ActorResult<BoxedMessage>> {
-            None
-        }
-
         fn state(&self) -> ActorState {
             ActorState::Running
         }
@@ -536,18 +569,27 @@ mod tests {
 
         for i in 0..backlog {
             mailbox
-                .push(Box::new(i as u64) as BoxedMessage, crate::thread::config::BackpressureStrategy::Block)
+                .push(
+                    Box::new(i as u64) as BoxedMessage,
+                    crate::thread::config::BackpressureStrategy::Block,
+                )
                 .await
                 .unwrap();
         }
         mailbox
-            .push(Box::new(u64::MAX) as BoxedMessage, crate::thread::config::BackpressureStrategy::Block)
+            .push(
+                Box::new(u64::MAX) as BoxedMessage,
+                crate::thread::config::BackpressureStrategy::Block,
+            )
             .await
             .unwrap();
 
         let t0 = std::time::Instant::now();
         while !mailbox.is_empty().await {
-            worker.process_mailbox(mailbox.clone(), batch).await.unwrap();
+            worker
+                .process_mailbox(mailbox.clone(), batch)
+                .await
+                .unwrap();
         }
         t0.elapsed()
     }
@@ -559,7 +601,10 @@ mod tests {
         let d10 = drain_with_batch(10, backlog).await;
         let d50 = drain_with_batch(50, backlog).await;
 
-        println!("\n==== ADR-4 batch_size HOL experiment (backlog={}, ~20µs/msg) ====", backlog);
+        println!(
+            "\n==== ADR-4 batch_size HOL experiment (backlog={}, ~20µs/msg) ====",
+            backlog
+        );
         println!("batch_size= 1  drain={:?}", d1);
         println!("batch_size=10  drain={:?}", d10);
         println!("batch_size=50  drain={:?}", d50);
@@ -570,7 +615,9 @@ mod tests {
         assert!(
             c / a < 3.0 && a / c < 3.0,
             "unexpected batch-size sensitivity: d1={:?} d10={:?} d50={:?}",
-            d1, d10, d50
+            d1,
+            d10,
+            d50
         );
     }
 }

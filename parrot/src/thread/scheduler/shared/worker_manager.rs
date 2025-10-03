@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::queue::SchedulingQueue;
@@ -62,7 +62,9 @@ impl WorkerManager {
     pub fn stop_processor(&self, path: &str) -> Result<(), crate::thread::error::SystemError> {
         let mut scheduled = self.scheduled.lock().unwrap();
         if scheduled.remove(path).is_none() {
-            return Err(crate::thread::error::SystemError::ActorNotFound(path.to_string()));
+            return Err(crate::thread::error::SystemError::ActorNotFound(
+                path.to_string(),
+            ));
         }
         Ok(())
     }
