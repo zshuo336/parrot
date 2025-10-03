@@ -25,7 +25,7 @@
 //! ## Usage Example
 //!
 //! ```rust
-//! use parrot_api::{actor::{Actor, ActorState, EmptyConfig, EngineContextHandle}, context::ActorContext, message::Message, types::{ActorResult, BoxedFuture, BoxedMessage}};
+//! use parrot_api::{actor::{Actor, ActorState, EmptyConfig}, context::ActorContext, message::Message, types::{ActorResult, BoxedFuture, BoxedMessage}};
 //!
 //! // Define a message
 //! struct Ping;
@@ -44,10 +44,6 @@
 //!
 //!     fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
 //!         Box::pin(async move { Ok(msg) })
-//!     }
-//!
-//!     fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-//!         None
 //!     }
 //!
 //!     fn state(&self) -> ActorState {
