@@ -21,7 +21,7 @@
 //! 4. Implement message handling logic
 //!
 //! ```rust
-//! use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
+//! use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 //! use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 //!
 //! struct MyActor {
@@ -42,15 +42,12 @@
 //!         Box::pin(async move { Ok(msg) })
 //!     }
 //!
-//!     fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-//!         None
-//!     }
-//!
 //!     fn state(&self) -> ActorState {
 //!         ActorState::Running
 //!     }
 //! }
 //! ```
+//!
 
 use crate::errors::ActorError;
 use crate::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
