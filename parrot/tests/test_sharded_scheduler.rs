@@ -212,7 +212,7 @@ fn s2_shard_isolation_under_overload() {
             let rb = r.clone_boxed();
             hh.push(tokio::spawn(async move {
                 let _ = rb.send_with_timeout(
-                    Box::new(CpuTask { iterations: 8_000_000_000, salt: i as u64 }),
+                    Box::new(CpuTask { iterations: calibrated_iters(8.0), salt: i as u64 }),
                     Some(Duration::from_secs(120))).await;
             }));
         }

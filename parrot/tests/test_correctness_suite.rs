@@ -12,6 +12,7 @@
 mod engine_stress_common;
 
 use engine_stress_common::*;
+
 use parrot::system::ParrotActorSystem;
 use parrot::thread::config::{
     BackpressureStrategy, SchedulingMode, ThreadActorConfig, ThreadActorSystemConfig,
@@ -78,6 +79,9 @@ impl Journal {
 
 struct Recorder {
     journal: Arc<Journal>,
+    /// Tagged 进入 handler 的即时标记（burn 之前置位）：
+    /// 与外部共享（Arc），供测试做确定性门控（区分"已进入"与"已完成"）。
+    started: Arc<AtomicU64>,
 }
 
 impl Actor for Recorder {
@@ -91,6 +95,11 @@ impl Actor for Recorder {
         m: BoxedMessage,
         _c: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        if m.downcast_ref::<Tagged>().is_some() {
+            // 进入即记（burn 之前），让外部 wait_until 能确定性观察到
+            // "gate 已进入 handler"，消除 sleep 时序抖动。
+            self.started.fetch_add(1, Ordering::Relaxed);
+        }
         let r = if let Some(t) = m.downcast_ref::<Tagged>() {
             let v = burn_cpu(t.iters, t.salt);
             self.journal.events.lock().unwrap().push((t.sender, t.seq));
@@ -150,6 +159,7 @@ fn c1_c2_c3_exactly_once_fifo_integrity() {
             .spawn_at::<Recorder>(
                 Recorder {
                     journal: journal.clone(),
+                    started: Arc::new(AtomicU64::new(0)),
                 },
                 "/c1/rec",
                 None,
@@ -252,7 +262,7 @@ fn c4_reply_routing_no_crosstalk() {
         let journal = Journal::new();
         let actor = ts
             .spawn_at::<Recorder>(
-                Recorder { journal },
+                Recorder { journal, started: Arc::new(AtomicU64::new(0)) },
                 "/c4/rec",
                 None,
                 ThreadActorConfig::default(),
@@ -316,7 +326,7 @@ fn c5_mode_equivalence() {
             inputs: &[(u64, u64)],
         ) -> Vec<u64> {
             let journal = Journal::new();
-            let a = ts.spawn_at::<Recorder>(Recorder { journal }, path, None, mode).await.unwrap();
+            let a = ts.spawn_at::<Recorder>(Recorder { journal, started: Arc::new(AtomicU64::new(0)) }, path, None, mode).await.unwrap();
             let mut outs = Vec::new();
             for (iters, salt) in inputs {
                 let rep = a.ask(Box::new(Tagged { sender: 0, seq: *salt, iters: *iters, salt: *salt }) as BoxedMessage).await.unwrap();
@@ -418,7 +428,7 @@ fn c6_backpressure_semantics() {
                     .ask(Box::new(Tagged {
                         sender: 0,
                         seq: 0,
-                        iters: 10_000_000_000,
+                        iters: calibrated_iters(1.2),
                         salt: 1,
                     }) as BoxedMessage)
                     .await;
@@ -458,6 +468,7 @@ fn c6_backpressure_semantics() {
         println!("[C6] Error strategy: exact accept=4 reject=16 (cap=4) with Full error ✓");
 
         // --- DropOldest：容量 4，灌 8 条（值 0..8），应保留最新 4 条（4..8）---
+        let gate_started2 = Arc::new(AtomicU64::new(0));
         let cfg_do = ThreadActorConfig {
             mailbox_capacity: Some(4),
             backpressure_strategy: Some(BackpressureStrategy::DropOldest),
@@ -468,6 +479,7 @@ fn c6_backpressure_semantics() {
             .spawn_at::<Recorder>(
                 Recorder {
                     journal: journal2.clone(),
+                    started: gate_started2.clone(),
                 },
                 "/c6/dropold",
                 None,
@@ -475,7 +487,6 @@ fn c6_backpressure_semantics() {
             )
             .await
             .unwrap();
-        // 堵门（持有 ask 句柄以便等待完成）
         let gate = {
             let ab = a_do.clone();
             tokio::spawn(async move {
@@ -483,17 +494,26 @@ fn c6_backpressure_semantics() {
                     .ask(Box::new(Tagged {
                         sender: 7,
                         seq: 0,
-                        iters: 2_000_000_000,
+                        iters: calibrated_iters(1.0),
                         salt: 1,
                     }) as BoxedMessage)
                     .await;
             })
         };
-        tokio::time::sleep(Duration::from_millis(300)).await; // 让堵门进入 handler
+        let gate_in_handler = wait_until(
+            || gate_started2.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(
+            gate_in_handler,
+            "gate Tagged(7,0) must enter handler before flooding (started flag)"
+        );
         for i in 0..8u64 {
             let _ = a_do.deliver(Box::new(EchoMsg { v: i })).await;
         }
-        // 等堵门任务完成并排空邮箱后才可断言（~2.3s）
+        // 等堵门任务完成并排空邮箱后才可断言
         let _ = gate.await;
         let drained = wait_until(
             || {
@@ -560,6 +580,7 @@ fn c7_stop_semantics() {
             .spawn_at::<Recorder>(
                 Recorder {
                     journal: journal.clone(),
+                    started: Arc::new(AtomicU64::new(0)),
                 },
                 "/c7/a",
                 None,
@@ -609,9 +630,10 @@ fn c8_timeout_semantics() {
     rt.block_on(async move {
         let (_p, ts) = setup("corr8").await;
         let journal = Journal::new();
+        let a_started = Arc::new(AtomicU64::new(0));
         let a = ts
             .spawn_at::<Recorder>(
-                Recorder { journal },
+                Recorder { journal, started: a_started.clone() },
                 "/c8/a",
                 None,
                 ThreadActorConfig::default(),
@@ -630,19 +652,29 @@ fn c8_timeout_semantics() {
             "must not have hit the timeout"
         );
 
-        // 阻塞：前置 ~11s 任务 + 5ms 超时探测 ⇒ 必须超时且及时返回
+        // 阻塞：前置 ~1.2s 校准任务 + 5ms 超时探测 ⇒ 必须超时且及时返回
+        // 确定性门控：等 heavy 真正进入 handler（Recorder.started 置位），
+        // 消除 sleep(300ms) 在插桩/慢机下的时序抖动。
+        let heavy_started = Arc::new(AtomicU64::new(0));
         let ab = a.clone();
         tokio::spawn(async move {
             let _ = ab
                 .ask(Box::new(Tagged {
                     sender: 0,
                     seq: 0,
-                    iters: 10_000_000_000,
+                    iters: calibrated_iters(1.5),
                     salt: 1,
                 }) as BoxedMessage)
                 .await;
         });
-        tokio::time::sleep(Duration::from_millis(300)).await; // 确保 heavy 在 handler 内
+        let started = wait_until(
+            || a_started.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(30),
+            Duration::from_millis(2),
+        )
+        .await;
+        assert!(started, "heavy must enter handler before probing");
+        let _ = heavy_started;
         let t1 = Instant::now();
         let r2 = a
             .send_with_timeout(Box::new(EchoMsg { v: 8 }), Some(Duration::from_millis(5)))

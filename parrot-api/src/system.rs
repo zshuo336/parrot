@@ -293,3 +293,249 @@ pub struct SystemResources {
     /// Number of active threads
     pub thread_count: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::ActorPath;
+    use crate::context::ActorContext;
+
+    use crate::runtime::{LoadBalancingStrategy, RuntimeConfig, SchedulerConfig};
+    use crate::supervisor::{DefaultStrategy, SupervisorStrategyType};
+    use crate::types::{ActorResult, BoxedFuture, BoxedMessage};
+
+    // ---------------- 配置类型 ----------------
+
+    #[test]
+    fn system_config_default_is_empty() {
+        let c = ActorSystemConfig::default();
+        assert!(c.name.is_empty());
+        assert_eq!(c.timeouts.actor_creation, Duration::ZERO);
+        assert_eq!(c.guardian_config.max_restarts, 0);
+        assert!(matches!(
+            c.guardian_config.supervision_strategy,
+            SupervisorStrategyType::Default(DefaultStrategy::StopOnFailure)
+        ));
+    }
+
+    #[test]
+    fn system_config_full_construction_and_clone() {
+        let c = ActorSystemConfig {
+            name: "sys".into(),
+            runtime_config: RuntimeConfig {
+                worker_threads: Some(8),
+                io_threads: None,
+                scheduler_config: SchedulerConfig {
+                    task_queue_capacity: 64,
+                    task_timeout: Duration::from_secs(1),
+                    load_balancing: LoadBalancingStrategy::Random,
+                },
+            },
+            guardian_config: GuardianConfig {
+                max_restarts: 5,
+                restart_window: Duration::from_secs(60),
+                supervision_strategy: SupervisorStrategyType::Default(
+                    DefaultStrategy::RestartOnFailure,
+                ),
+            },
+            timeouts: SystemTimeouts {
+                actor_creation: Duration::from_secs(2),
+                message_handling: Duration::from_secs(3),
+                system_shutdown: Duration::from_secs(4),
+            },
+        };
+        let c2 = c.clone();
+        assert_eq!(c2.name, "sys");
+        assert_eq!(c2.guardian_config.max_restarts, 5);
+        assert_eq!(c2.timeouts.system_shutdown, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn system_timeouts_default_zero() {
+        let t = SystemTimeouts::default();
+        assert_eq!(t.actor_creation, Duration::ZERO);
+        assert_eq!(t.message_handling, Duration::ZERO);
+        assert_eq!(t.system_shutdown, Duration::ZERO);
+    }
+
+    // ---------------- SystemError ----------------
+
+    #[test]
+    fn system_error_display_variants() {
+        assert_eq!(
+            SystemError::InitializationError("x".into()).to_string(),
+            "System initialization failed: x"
+        );
+        assert_eq!(
+            SystemError::ActorCreationError("y".into()).to_string(),
+            "Actor creation failed: y"
+        );
+        assert_eq!(SystemError::ShuttingDown.to_string(), "System is shutting down");
+        assert_eq!(
+            SystemError::ActorError(crate::errors::ActorError::Timeout).to_string(),
+            "Timeout"
+        );
+        assert_eq!(
+            SystemError::Other(anyhow::anyhow!("z")).to_string(),
+            "z"
+        );
+    }
+
+    #[test]
+    fn system_error_from_actor_error() {
+        let e: SystemError = crate::errors::ActorError::Stopped.into();
+        assert!(matches!(e, SystemError::ActorError(_)));
+    }
+
+    // ---------------- SystemState / SystemStatus / SystemResources ----------------
+
+    #[test]
+    fn system_state_variants_distinct() {
+        let states = [
+            SystemState::Starting,
+            SystemState::Running,
+            SystemState::ShuttingDown,
+            SystemState::Stopped,
+        ];
+        for (i, a) in states.iter().enumerate() {
+            for b in states.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+        // Clone/Copy/Debug/Eq
+        let s = SystemState::Running;
+        assert_eq!(s, s.clone());
+    }
+
+    #[test]
+    fn system_status_and_resources_constructible() {
+        let st = SystemStatus {
+            state: SystemState::Running,
+            active_actors: 7,
+            uptime: Duration::from_secs(12),
+            resources: SystemResources {
+                cpu_usage: 33.3,
+                memory_usage: 4096,
+                thread_count: 9,
+            },
+        };
+        let c = st.clone();
+        assert_eq!(c.active_actors, 7);
+        assert_eq!(c.resources.thread_count, 9);
+        assert_eq!(c.uptime, Duration::from_secs(12));
+    }
+
+    // ---------------- ActorSystem trait 对象契约 ----------------
+
+    struct NopSystem {
+        status: SystemStatus,
+    }
+
+    #[derive(Debug)]
+    struct NopActor;
+
+    impl crate::actor::Actor for NopActor {
+        type Config = crate::actor::EmptyConfig;
+        type Context = dyn ActorContext;
+        fn init<'a>(
+            &'a mut self,
+            _c: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _c: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move { Ok(msg) })
+        }
+        fn state(&self) -> crate::actor::ActorState {
+            crate::actor::ActorState::Running
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PingMsg;
+    impl crate::message::Message for PingMsg {
+        type Result = u32;
+        fn extract_result(r: BoxedMessage) -> ActorResult<u32> {
+            r.downcast::<u32>()
+                .map(|b| *b)
+                .map_err(|_| crate::errors::ActorError::MessageHandlingError("t".into()))
+        }
+    }
+
+    #[async_trait]
+    impl ActorSystem for NopSystem {
+        async fn start(_config: ActorSystemConfig) -> Result<Self, SystemError>
+        where
+            Self: Sized,
+        {
+            Ok(NopSystem {
+                status: SystemStatus {
+                    state: SystemState::Starting,
+                    active_actors: 0,
+                    uptime: Duration::ZERO,
+                    resources: SystemResources {
+                        cpu_usage: 0.0,
+                        memory_usage: 0,
+                        thread_count: 0,
+                    },
+                },
+            })
+        }
+        async fn spawn_root_typed<A: crate::actor::Actor>(
+            &self,
+            _actor: A,
+            _config: A::Config,
+        ) -> Result<Box<dyn ActorRef>, SystemError> {
+            Err(SystemError::ActorCreationError("nop".into()))
+        }
+        async fn spawn_root_boxed(
+            &self,
+            _actor: Box<
+                dyn crate::actor::Actor<
+                    Config = Box<dyn std::any::Any + Send>,
+                    Context = dyn ActorContext,
+                >,
+            >,
+            _config: Box<dyn std::any::Any + Send>,
+        ) -> Result<Box<dyn ActorRef>, SystemError> {
+            Err(SystemError::ActorCreationError("nop-boxed".into()))
+        }
+        async fn get_actor(&self, _path: &ActorPath) -> Option<Box<dyn ActorRef>> {
+            None
+        }
+        async fn broadcast<M: crate::message::Message + Clone>(
+            &self,
+            _msg: M,
+        ) -> Result<(), SystemError> {
+            Ok(())
+        }
+        fn status(&self) -> SystemStatus {
+            self.status.clone()
+        }
+        async fn shutdown(self) -> Result<(), SystemError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_system_trait_contract() {
+        let s = NopSystem::start(ActorSystemConfig::default()).await.unwrap();
+        // spawn_typed 错误路径
+        assert!(s
+            .spawn_root_typed(NopActor, crate::actor::EmptyConfig)
+            .await
+            .is_err());
+        // get_actor 找不到
+        assert!(s.get_actor(&ActorPath::placeholder("x://y")).await.is_none());
+        // broadcast 成功
+        s.broadcast(PingMsg).await.unwrap();
+        // status 快照
+        assert_eq!(s.status().active_actors, 0);
+        // shutdown 成功
+        s.shutdown().await.unwrap();
+    }
+}

@@ -197,6 +197,23 @@ impl Sink {
 /// （debug profile 约 0.194 G/s，若用 debug 跑请自行换算：场景时长 ×4.5。）
 pub const BURN_RATE: f64 = 880_000_000.0;
 
+/// 时长校准：按目标秒数求 burn_cpu 迭代数（对 llvm-cov 插桩/慢机鲁棒）。
+///
+/// 标定策略：三轮取最小单次耗时（首轮缓存冷偏慢），乘 0.8 安全系数
+/// （gate 宁可略短也不能超过 ask 默认 5s 超时）。
+pub fn calibrated_iters(secs: f64) -> u64 {
+    let probe = 8_000_000u64;
+    let mut best = f64::MAX;
+    let mut sink = 0u64;
+    for _ in 0..3 {
+        let t0 = Instant::now();
+        sink = sink.wrapping_add(burn_cpu(probe, 1));
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    std::hint::black_box(&sink);
+    (((secs * 0.8) / (best / probe as f64)) as u64).max(1_000)
+}
+
 /// CPU 工作负载：不可被优化器折叠的迭代混合运算。
 #[inline]
 pub fn burn_cpu(iterations: u64, salt: u64) -> u64 {

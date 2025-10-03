@@ -322,3 +322,323 @@ where
         self
     }
 }
+
+// ===========================================================================
+// 单元测试（引擎中立层全路径：通道/ask 超时/tell/断连/桥接/协议切换）
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- 测试用枚举信封 actor（手写 dispatch，覆盖 inject/extract 对偶）----
+
+    #[derive(Debug)]
+    pub enum BenchMsg {
+        Echo(u64),
+        Add(u64, u64),
+        Fail(String),
+        Slow(u64),
+    }
+
+    #[derive(Debug)]
+    #[allow(dead_code)] // Fail 变体保留：枚举信封宏的全形状示例
+    pub enum BenchReply {
+        Echo(u64),
+        Add(u64),
+        Fail(String),
+        Slow(u64),
+    }
+
+    pub struct BenchActor {
+        pub processed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl ParrotTypedDispatch for BenchActor {
+        type Msg = BenchMsg;
+        type Reply = BenchReply;
+
+        fn dispatch<'a>(
+            &'a mut self,
+            msg: Self::Msg,
+        ) -> BoxedFuture<'a, ActorResult<Self::Reply>> {
+            use std::sync::atomic::Ordering;
+            Box::pin(async move {
+                self.processed.fetch_add(1, Ordering::Relaxed);
+                match msg {
+                    BenchMsg::Echo(v) => Ok(BenchReply::Echo(v)),
+                    BenchMsg::Add(a, b) => Ok(BenchReply::Add(a + b)),
+                    BenchMsg::Fail(why) => Err(ActorError::MessageHandlingError(why)),
+                    BenchMsg::Slow(ms) => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        Ok(BenchReply::Slow(ms))
+                    }
+                }
+            })
+        }
+    }
+
+    impl Message for BenchMsg {
+        type Result = BenchReply;
+        fn extract_result(r: BoxedMessage) -> ActorResult<BenchReply> {
+            r.downcast::<BenchReply>()
+                .map(|b| *b)
+                .map_err(|_| ActorError::MessageHandlingError("type".into()))
+        }
+    }
+
+    impl ParrotMsgVariant<BenchActor> for BenchMsg {
+        fn inject(msg: Self) -> BenchMsg {
+            msg
+        }
+        fn extract(reply: BenchReply) -> ActorResult<BenchReply> {
+            Ok(reply)
+        }
+    }
+
+    // ---- 测试辅助：建 actor + 消费循环 ----
+
+    async fn spawn_bench(
+        capacity: usize,
+    ) -> (
+        TypedActorRef<BenchActor, BenchMsg>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let (tx, rx) = typed_channel::<BenchActor>(capacity);
+        let processed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let actor = BenchActor {
+            processed: processed.clone(),
+        };
+        tokio::spawn(async move {
+            let mut actor = actor;
+            while let Ok(env) = rx.recv_async().await {
+                consume_one(&mut actor, env).await;
+            }
+        });
+        (TypedActorRef::new(tx, "/test/bench".into()), processed)
+    }
+
+    // ---- 用例 ----
+
+    #[tokio::test]
+    async fn channel_capacity_zero_clamps_to_one() {
+        // typed_channel(0) 应钳位为 1（max(1) 分支）
+        let (tx, rx) = typed_channel::<BenchActor>(0);
+        tx.send_async(TypedEnvelope {
+            msg: BenchMsg::Echo(1),
+            reply: None,
+        })
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ask_echo_roundtrip() {
+        let (r, _) = spawn_bench(4).await;
+        let v = r.ask(BenchMsg::Echo(42)).await.unwrap();
+        assert!(matches!(v, BenchReply::Echo(42)));
+    }
+
+    #[tokio::test]
+    async fn ask_error_propagates_through_reply_channel() {
+        let (r, _) = spawn_bench(4).await;
+        let e = r
+            .ask(BenchMsg::Fail("boom".into()))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn ask_timeout_returns_timeout_detail() {
+        let (r, _) = spawn_bench(4).await;
+        let e = r
+            .ask_with_timeout(BenchMsg::Slow(300), Duration::from_millis(30))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ActorError::TimeoutDetail(_)));
+    }
+
+    #[tokio::test]
+    async fn ask_unbounded_waits_for_slow_handler() {
+        let (r, _) = spawn_bench(4).await;
+        let t0 = std::time::Instant::now();
+        let v = r.ask_unbounded(BenchMsg::Slow(80)).await.unwrap();
+        assert!(matches!(v, BenchReply::Slow(80)));
+        assert!(t0.elapsed() >= Duration::from_millis(70));
+    }
+
+    #[tokio::test]
+    async fn tell_fire_and_forget_delivers() {
+        let (r, processed) = spawn_bench(8).await;
+        r.tell(BenchMsg::Echo(1)).await.unwrap();
+        // 消费循环异步处理：轮询等待
+        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        while processed.load(std::sync::atomic::Ordering::Relaxed) < 1 {
+            if std::time::Instant::now() > dl {
+                panic!("tell message never processed");
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_after_channel_close_returns_internal_error() {
+        // drop 接收端（消费任务退出）后 ask 必须报 InternalError
+        let (tx, rx) = typed_channel::<BenchActor>(2);
+        let r: TypedActorRef<BenchActor, BenchMsg> =
+            TypedActorRef::new(tx, "/test/closed".into());
+        drop(rx);
+        let e = r.ask(BenchMsg::Echo(1)).await.unwrap_err();
+        assert!(matches!(e, ActorError::InternalError(_)));
+        assert!(!r.is_alive());
+    }
+
+    #[tokio::test]
+    async fn tell_after_channel_close_returns_internal_error() {
+        let (tx, rx) = typed_channel::<BenchActor>(2);
+        let r: TypedActorRef<BenchActor, BenchMsg> =
+            TypedActorRef::new(tx, "/test/closed2".into());
+        drop(rx);
+        let e = r.tell(BenchMsg::Echo(1)).await.unwrap_err();
+        assert!(matches!(e, ActorError::InternalError(_)));
+    }
+
+    #[tokio::test]
+    async fn ref_for_shares_channel_and_path() {
+        let (r, _) = spawn_bench(4).await;
+        let r2 = r.clone();
+        let r3 = r.ref_for::<BenchMsg>();
+        assert_eq!(r.path(), "/test/bench");
+        assert_eq!(r2.path(), r3.path());
+        // 三视图共用同一通道：交替 ask 均可达
+        assert!(matches!(
+            r.ask(BenchMsg::Echo(1)).await.unwrap(),
+            BenchReply::Echo(1)
+        ));
+        assert!(matches!(
+            r2.ask(BenchMsg::Echo(2)).await.unwrap(),
+            BenchReply::Echo(2)
+        ));
+        assert!(matches!(
+            r3.ask(BenchMsg::Echo(3)).await.unwrap(),
+            BenchReply::Echo(3)
+        ));
+    }
+
+    #[tokio::test]
+    async fn into_dyn_bridge_send_roundtrip() {
+        let (r, _) = spawn_bench(4).await;
+        let dynref = r.into_dyn();
+        let resp = dynref
+            .send(Box::new(BenchMsg::Add(1, 2)) as BoxedMessage)
+            .await
+            .unwrap();
+        let v = resp.downcast::<BenchReply>().unwrap();
+        assert!(matches!(*v, BenchReply::Add(3)));
+        assert_eq!(dynref.path(), "/test/bench");
+    }
+
+    #[tokio::test]
+    async fn into_dyn_bridge_type_mismatch_error() {
+        let (r, _) = spawn_bench(4).await;
+        let dynref = r.into_dyn();
+        let e = dynref
+            .send(Box::new(123u64) as BoxedMessage)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ActorError::MessageHandlingError(_)));
+    }
+
+    #[tokio::test]
+    async fn into_dyn_bridge_send_with_timeout_and_deliver() {
+        let (r, processed) = spawn_bench(8).await;
+        let dynref = r.into_dyn();
+        // send_with_timeout(Some)
+        let resp = dynref
+            .send_with_timeout(
+                Box::new(BenchMsg::Echo(9)) as BoxedMessage,
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert!(resp.downcast::<BenchReply>().is_ok());
+        // send_with_timeout 超时路径
+        let e = dynref
+            .send_with_timeout(
+                Box::new(BenchMsg::Slow(200)) as BoxedMessage,
+                Some(Duration::from_millis(20)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ActorError::TimeoutDetail(_)));
+        // deliver（tell 语义）
+        dynref
+            .deliver(Box::new(BenchMsg::Echo(10)) as BoxedMessage)
+            .await
+            .unwrap();
+        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        while processed.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+            if std::time::Instant::now() > dl {
+                panic!("deliver not processed");
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn into_dyn_stop_is_noop_and_alive_reflects_channel() {
+        let (r, _) = spawn_bench(4).await;
+        let dynref = r.into_dyn();
+        assert!(dynref.stop().await.is_ok());
+        assert!(dynref.is_alive().await);
+        // clone_boxed 语义
+        let c = dynref.clone_boxed();
+        assert!(c.send(Box::new(BenchMsg::Echo(5)) as BoxedMessage).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn typed_ask_ref_trait_object_roundtrip() {
+        let (r, _) = spawn_bench(4).await;
+        let tr: &dyn crate::typed::TypedAskRef<BenchMsg> = &r;
+        let v = tr.ask(BenchMsg::Echo(7)).await.unwrap();
+        assert!(matches!(v, BenchReply::Echo(7)));
+        tr.tell(BenchMsg::Echo(8)).await; // 静默
+    }
+
+    #[tokio::test]
+    async fn bounded_channel_backpressure_blocks_until_consumed() {
+        // 容量 1：第二条 tell 阻塞直到消费循环取走第一条
+        let (tx, rx) = typed_channel::<BenchActor>(1);
+        let r: TypedActorRef<BenchActor, BenchMsg> = TypedActorRef::new(tx, "/test/bp".into());
+        r.tell(BenchMsg::Echo(1)).await.unwrap();
+        // 无消费者时第二条必然阻塞 → 用 select 验证未完成
+        let second = r.tell(BenchMsg::Echo(2));
+        tokio::pin!(second);
+        let blocked = tokio::select! {
+            _ = &mut second => false,
+            _ = tokio::time::sleep(Duration::from_millis(80)) => true,
+        };
+        assert!(blocked, "second tell must block on full channel");
+        // 打开消费后解除（flume 唤醒 waiting sender，第二条自动入队）
+        let mut consumed = 0;
+        let mut actor = BenchActor {
+            processed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        while let Ok(env) = rx.try_recv() {
+            consume_one(&mut actor, env).await;
+            consumed += 1;
+        }
+        // flume bounded(1)：try_recv 取走第一条后，被挂起的第二条 send 由
+        // flume 内部唤醒自动入队（不依赖我们再 poll second）——drain 可能
+        // 看到 1 或 2 条（唤醒是异步的）。
+        assert!((1..=2).contains(&consumed), "consumed={consumed}");
+        // 确保 second 最终完成
+        let _ = (&mut second).await;
+        while let Ok(env) = rx.try_recv() {
+            consume_one(&mut actor, env).await;
+            consumed += 1;
+        }
+        assert_eq!(consumed, 2);
+    }
+}

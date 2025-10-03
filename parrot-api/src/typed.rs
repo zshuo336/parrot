@@ -114,3 +114,150 @@ pub fn variant_mismatch_internal() -> ActorError {
         "typed reply variant mismatch (inject/extract not dual)".into(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 最小静态轨栈：Calc { Add, Get } 双协议
+    struct Add(u64);
+    impl Message for Add {
+        type Result = u64;
+    }
+    struct Get;
+    impl Message for Get {
+        type Result = u64;
+    }
+
+    struct Calc {
+        n: u64,
+    }
+
+    impl TypedReceive<Add> for Calc {
+        fn receive_typed<'a>(&'a mut self, msg: Add) -> BoxedFuture<'a, ActorResult<u64>> {
+            Box::pin(async move {
+                self.n += msg.0;
+                Ok(self.n)
+            })
+        }
+    }
+    impl TypedReceive<Get> for Calc {
+        fn receive_typed<'a>(&'a mut self, _msg: Get) -> BoxedFuture<'a, ActorResult<u64>> {
+            Box::pin(async move { Ok(self.n) })
+        }
+    }
+
+    // 手写枚举信封（对等 derive 宏生成物）
+    enum CalcMsg {
+        Add(Add),
+        Get(Get),
+    }
+    enum CalcReply {
+        Add(u64),
+        Get(u64),
+    }
+
+    impl ParrotTypedDispatch for Calc {
+        type Msg = CalcMsg;
+        type Reply = CalcReply;
+        fn dispatch<'a>(
+            &'a mut self,
+            msg: Self::Msg,
+        ) -> BoxedFuture<'a, ActorResult<Self::Reply>> {
+            Box::pin(async move {
+                match msg {
+                    CalcMsg::Add(m) => {
+                        let r = TypedReceive::<Add>::receive_typed(self, m).await?;
+                        Ok(CalcReply::Add(r))
+                    }
+                    CalcMsg::Get(m) => {
+                        let r = TypedReceive::<Get>::receive_typed(self, m).await?;
+                        Ok(CalcReply::Get(r))
+                    }
+                }
+            })
+        }
+    }
+
+    impl ParrotMsgVariant<Calc> for Add {
+        fn inject(msg: Self) -> CalcMsg {
+            CalcMsg::Add(msg)
+        }
+        fn extract(reply: CalcReply) -> ActorResult<u64> {
+            match reply {
+                CalcReply::Add(v) => Ok(v),
+                _ => Err(variant_mismatch_internal()),
+            }
+        }
+    }
+    impl ParrotMsgVariant<Calc> for Get {
+        fn inject(msg: Self) -> CalcMsg {
+            CalcMsg::Get(msg)
+        }
+        fn extract(reply: CalcReply) -> ActorResult<u64> {
+            match reply {
+                CalcReply::Get(v) => Ok(v),
+                _ => Err(variant_mismatch_internal()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_envelope_to_typed_impls() {
+        let mut c = Calc { n: 0 };
+        let r1 = c.dispatch(CalcMsg::Add(Add(41))).await.unwrap();
+        assert!(matches!(r1, CalcReply::Add(41)));
+        let r2 = c.dispatch(CalcMsg::Get(Get)).await.unwrap();
+        assert!(matches!(r2, CalcReply::Get(41)));
+        // 状态跨消息保留
+        let r3 = c.dispatch(CalcMsg::Add(Add(1))).await.unwrap();
+        assert!(matches!(r3, CalcReply::Add(42)));
+    }
+
+    #[tokio::test]
+    async fn inject_extract_roundtrip() {
+        // Add ↔ CalcReply::Add（初始 n=5，+5 → 10）
+        let msg = <Add as ParrotMsgVariant<Calc>>::inject(Add(5));
+        let reply = Calc { n: 5 }.dispatch(msg).await.unwrap();
+        assert_eq!(<Add as ParrotMsgVariant<Calc>>::extract(reply).unwrap(), 10);
+        // Get ↔ CalcReply::Get
+        let msg = <Get as ParrotMsgVariant<Calc>>::inject(Get);
+        let reply = Calc { n: 7 }.dispatch(msg).await.unwrap();
+        assert_eq!(<Get as ParrotMsgVariant<Calc>>::extract(reply).unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn variant_mismatch_yields_internal_error() {
+        // Add 的 extract 收到 Get 的 reply → 内部错误
+        let e = <Add as ParrotMsgVariant<Calc>>::extract(CalcReply::Get(1)).unwrap_err();
+        assert!(e.to_string().contains("variant mismatch"));
+        let e2 = <Get as ParrotMsgVariant<Calc>>::extract(CalcReply::Add(2)).unwrap_err();
+        assert!(e2.to_string().contains("variant mismatch"));
+    }
+
+    #[test]
+    fn variant_mismatch_internal_shape() {
+        let e = variant_mismatch_internal();
+        assert!(matches!(e, ActorError::MessageHandlingError(_)));
+        assert!(e.to_string().contains("inject/extract"));
+    }
+
+    // TypedAskRef 最小实现（验证 trait 对象面可用）
+    struct FakeAskRef;
+
+    impl TypedAskRef<Add> for FakeAskRef {
+        fn ask<'a>(&'a self, msg: Add) -> BoxedFuture<'a, ActorResult<u64>> {
+            Box::pin(async move { Ok(msg.0 * 2) })
+        }
+        fn tell<'a>(&'a self, _msg: Add) -> BoxedFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_ask_ref_contract() {
+        let r = FakeAskRef;
+        assert_eq!(TypedAskRef::<Add>::ask(&r, Add(21)).await.unwrap(), 42);
+        TypedAskRef::<Add>::tell(&r, Add(1)).await;
+    }
+}
