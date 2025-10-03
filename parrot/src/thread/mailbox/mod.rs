@@ -86,6 +86,18 @@ impl ScheduleState {
             return true;
         }
         self.pending_wake.store(true, Ordering::Release);
+        // Close the lost-wakeup window: the owner's `release` may have
+        // completed its final `pending_wake` check *before* the store above
+        // became visible and freed the slot (`queued_or_owned == false`),
+        // in which case nobody re-queues this mailbox. Re-check the slot
+        // with an RMW: if the owner fully released, this caller takes over
+        // the enqueue responsibility itself. If the slot is still held
+        // (owner mid-batch or a concurrent re-queue in flight), the flag
+        // stays set and the owner's release path observes it.
+        if !self.queued_or_owned.swap(true, Ordering::AcqRel) {
+            self.pending_wake.store(false, Ordering::Release);
+            return true;
+        }
         false
     }
 
@@ -338,6 +350,45 @@ mod schedule_state_tests {
             winners.load(Ordering::SeqCst),
             1,
             "exactly one enqueue wins"
+        );
+    }
+
+    /// 修复回归守护：hook 在 owner 完全释放后必须能接管 slot。
+    ///
+    /// 旧实现在 owner `release` 的最终 `pending_wake` 检查与 slot 释放
+    /// 之间设置 pending_wake 会丢失唤醒（hook 的 slot CAS 失败、owner
+    /// 的二次检查也看不到 flag → 无入队者）。新实现在 store 后用 RMW
+    /// 重试 slot，本测试验证该接管路径。
+    #[test]
+    fn test_hook_takes_over_fully_released_slot() {
+        let state = ScheduleState::default();
+        assert!(state.try_enqueue(), "owner acquires");
+        // 模拟 owner 完全释放（无人 pending）
+        assert!(!state.release(false), "slot freed");
+        // hook 到来：必须成功接管（修复点）
+        assert!(
+            state.try_enqueue(),
+            "hook must take over the freed slot after owner release"
+        );
+        // 接管后 pending_wake 被清除，下一次释放干净
+        assert!(!state.release(false), "clean release after takeover");
+    }
+
+    /// 修复回归守护：owner 持有期间 hook 的 RMW 重试不得误抢。
+    ///
+    /// owner 仍在 batch 中（slot held）时，失败的 hook 重试必须继续
+    /// 失败并把 pending_wake 留给 owner 的 release 捕获。
+    #[test]
+    fn test_hook_retry_does_not_steal_held_slot() {
+        let state = ScheduleState::default();
+        assert!(state.try_enqueue(), "owner acquires");
+        // hook 在 owner 持有期间尝试两次（初次 + RMW 重试）都失败
+        assert!(!state.try_enqueue(), "first attempt rejected");
+        assert!(!state.try_enqueue(), "RMW retry must also fail while held");
+        // owner 释放时必须看到 pending_wake（两次尝试留下的）并 re-queue
+        assert!(
+            state.release(false),
+            "owner must observe pending_wake left by failed hook retries"
         );
     }
 }

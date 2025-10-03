@@ -196,7 +196,18 @@ fn m4_actix_static_actors_run_in_parallel() {
         }
 
         const ACTORS: usize = 4;
-        const WORK: u64 = 30_000_000; // ~25ms/actor @debug
+        // 工作量自适应：先探测单 actor 速率，使每 actor ~60ms
+        // （llvm-cov 插桩慢 ~10-30×；固定 30M 迭代在插桩下会放大
+        // 调度抖动，让"并行 vs 串行"相对断言失真）
+        let probe = sys
+            .spawn_typed::<Burner, Burn>(Burner, "/m4a/burn-probe")
+            .await
+            .unwrap();
+        let t = Instant::now();
+        let _ = probe.ask(Burn(2_000_000)).await.unwrap();
+        let per_iter = t.elapsed().as_secs_f64() / 2_000_000.0;
+        let work_per_actor = ((0.06 / per_iter) as u64).max(1_000_000);
+        let WORK: u64 = work_per_actor;
 
         let refs: Vec<_> = {
             let mut v = Vec::new();

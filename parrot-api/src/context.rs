@@ -507,3 +507,228 @@ pub enum LifecycleEvent {
     /// Message receive timeout occurred
     ReceiveTimeout,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::errors::ActorError;
+    use crate::types::BoxedMessage;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // ---------------- ReadOnlyChildrenVec / ChildrenGuard ----------------
+
+    fn child_vec(n: usize) -> Arc<RwLock<Vec<BoxedActorRef>>> {
+        Arc::new(RwLock::new(Vec::new()))
+            .pipe(|arc| {
+                let _ = n; // child 数不真实注入（DeadRef 占位）
+                arc
+            })
+    }
+
+    // pipe 辅助（无外部依赖）
+    trait Pipe: Sized {
+        fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
+            f(self)
+        }
+    }
+    impl<T: Sized> Pipe for T {}
+
+    #[test]
+    fn children_vec_empty_semantics() {
+        let v = ReadOnlyChildrenVec::new(child_vec(0));
+        assert!(v.is_empty());
+        assert_eq!(v.len(), 0);
+        assert!(v.get(0).is_none());
+    }
+
+    #[test]
+    fn children_vec_with_entries() {
+        #[derive(Debug)]
+        struct Ref(&'static str);
+        #[async_trait]
+        impl crate::address::ActorRef for Ref {
+            fn send<'a>(
+                &'a self,
+                _m: BoxedMessage,
+            ) -> BoxedFuture<'a, crate::types::ActorResult<BoxedMessage>> {
+                Box::pin(async { Err(ActorError::Stopped) })
+            }
+            fn send_with_timeout<'a>(
+                &'a self,
+                _m: BoxedMessage,
+                _t: Option<Duration>,
+            ) -> BoxedFuture<'a, crate::types::ActorResult<BoxedMessage>> {
+                Box::pin(async { Err(ActorError::Stopped) })
+            }
+            fn deliver<'a>(
+                &'a self,
+                _m: BoxedMessage,
+            ) -> BoxedFuture<'a, crate::types::ActorResult<()>> {
+                Box::pin(async { Err(ActorError::Stopped) })
+            }
+            fn stop<'a>(&'a self) -> BoxedFuture<'a, crate::types::ActorResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn path(&self) -> String {
+                self.0.into()
+            }
+            fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+                Box::pin(async { true })
+            }
+            fn clone_boxed(&self) -> BoxedActorRef {
+                Box::new(Ref(self.0))
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let inner = Arc::new(RwLock::new(Vec::<BoxedActorRef>::new()));
+        inner.write().unwrap().push(Box::new(Ref("a")) as BoxedActorRef);
+        inner.write().unwrap().push(Box::new(Ref("b")) as BoxedActorRef);
+        let v = ReadOnlyChildrenVec::new(inner);
+        assert!(!v.is_empty());
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.get(0).unwrap().path(), "a");
+        assert_eq!(v.get(1).unwrap().path(), "b");
+        assert!(v.get(2).is_none());
+        // ChildrenGuard deref 到 slice
+        let g = v.read_all();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[1].path(), "b");
+    }
+
+    // ---------------- ScheduledTask ----------------
+
+    #[test]
+    fn scheduled_task_eq_and_hash() {
+        #[derive(Debug)]
+        struct R;
+        #[async_trait]
+        impl crate::address::ActorRef for R {
+            fn send<'a>(
+                &'a self,
+                _m: BoxedMessage,
+            ) -> BoxedFuture<'a, crate::types::ActorResult<BoxedMessage>> {
+                Box::pin(async { Err(ActorError::Stopped) })
+            }
+            fn send_with_timeout<'a>(
+                &'a self,
+                _m: BoxedMessage,
+                _t: Option<Duration>,
+            ) -> BoxedFuture<'a, crate::types::ActorResult<BoxedMessage>> {
+                Box::pin(async { Err(ActorError::Stopped) })
+            }
+            fn deliver<'a>(
+                &'a self,
+                _m: BoxedMessage,
+            ) -> BoxedFuture<'a, crate::types::ActorResult<()>> {
+                Box::pin(async { Err(ActorError::Stopped) })
+            }
+            fn stop<'a>(&'a self) -> BoxedFuture<'a, crate::types::ActorResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn path(&self) -> String {
+                "sched://t".into()
+            }
+            fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+                Box::pin(async { true })
+            }
+            fn clone_boxed(&self) -> BoxedActorRef {
+                Box::new(R)
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let t = std::time::SystemTime::now();
+        let a = ScheduledTask {
+            id: uuid::Uuid::new_v4(),
+            target: Arc::new(R),
+            schedule_time: t,
+        };
+        let b = ScheduledTask {
+            id: a.id,
+            target: Arc::new(R), // 同 path
+            schedule_time: t,
+        };
+        assert_eq!(a, b);
+        // hash 一致（HashMap 可聚合）
+        use std::collections::HashSet;
+        let mut s = HashSet::new();
+        s.insert(a);
+        s.insert(b.clone());
+        assert_eq!(s.len(), 1);
+        // 不同 id 不等
+        let c = ScheduledTask {
+            id: uuid::Uuid::new_v4(),
+            target: Arc::new(R),
+            schedule_time: t,
+        };
+        assert_ne!(b, c);
+    }
+
+    // ---------------- ActorSpawnerExt 默认实现（类型保持） ----------------
+
+    struct NullSpawner;
+
+    #[async_trait]
+    impl ActorSpawner for NullSpawner {
+        fn spawn<'a>(
+            &'a self,
+            _actor: BoxedMessage,
+            _config: BoxedMessage,
+        ) -> BoxedFuture<'a, crate::types::ActorResult<BoxedActorRef>> {
+            Box::pin(async { Err(ActorError::InternalError("null".into())) })
+        }
+        fn spawn_with_strategy<'a>(
+            &'a self,
+            actor: BoxedMessage,
+            config: BoxedMessage,
+            _strategy: SupervisorStrategyType,
+        ) -> BoxedFuture<'a, crate::types::ActorResult<BoxedActorRef>> {
+            self.spawn(actor, config)
+        }
+    }
+
+    #[test]
+    fn spawner_ext_delegates_boxed() {
+        // spawn_typed / spawn_supervised 需要真 Actor；用最小 Actor 验证转发
+        use crate::actor::{Actor, ActorState, EmptyConfig};
+        use crate::types::BoxedFuture;
+
+        struct A;
+        impl Actor for A {
+            type Config = EmptyConfig;
+            type Context = dyn ActorContext;
+            fn init<'a>(
+                &'a mut self,
+                _c: &'a mut Self::Context,
+            ) -> BoxedFuture<'a, crate::types::ActorResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn receive_message<'a>(
+                &'a mut self,
+                msg: BoxedMessage,
+                _c: &'a mut Self::Context,
+            ) -> BoxedFuture<'a, crate::types::ActorResult<BoxedMessage>> {
+                Box::pin(async move { Ok(msg) })
+            }
+            fn state(&self) -> ActorState {
+                ActorState::Running
+            }
+        }
+        let s = NullSpawner;
+        let f1 = s.spawn_typed(A, EmptyConfig);
+        let f2 = s.spawn_supervised(A, EmptyConfig, SupervisorStrategyType::default());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            assert!(f1.await.is_err());
+            assert!(f2.await.is_err());
+        });
+    }
+}

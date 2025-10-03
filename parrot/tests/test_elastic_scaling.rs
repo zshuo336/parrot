@@ -25,6 +25,21 @@ pub struct BenchActor {
     pub ops: Arc<AtomicU64>,
 }
 
+/// 时长校准：按目标秒数求迭代数（对 llvm-cov 插桩/慢机鲁棒；见
+/// test_correctness_suite.rs 同名函数说明）。
+fn calibrated_iters(secs: f64) -> u64 {
+    let probe = 8_000_000u64;
+    let mut best = f64::MAX;
+    let mut sink = 0u64;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        sink = sink.wrapping_add(burn_cpu(probe, 1));
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    std::hint::black_box(&sink);
+    (((secs * 0.8) / (best / probe as f64)) as u64).max(1_000)
+}
+
 /// 不可被优化器折叠的 CPU 燃烧
 #[inline]
 fn burn_cpu(iterations: u64, salt: u64) -> u64 {
@@ -163,7 +178,7 @@ fn elastic_burst_rescues_starved_short_tasks() {
             tokio::spawn(async move {
                 r.send_with_timeout(
                     Box::new(LongTask {
-                        iterations: 2_000_000_000,
+                        iterations: calibrated_iters(2.0),
                     }),
                     Some(Duration::from_secs(60)),
                 )
@@ -175,7 +190,7 @@ fn elastic_burst_rescues_starved_short_tasks() {
             tokio::spawn(async move {
                 r.send_with_timeout(
                     Box::new(LongTask {
-                        iterations: 2_000_000_000,
+                        iterations: calibrated_iters(2.0),
                     }),
                     Some(Duration::from_secs(60)),
                 )
@@ -263,7 +278,7 @@ fn elastic_burst_reaps_after_idle() {
                     let _ = r
                         .send_with_timeout(
                             Box::new(LongTask {
-                                iterations: 1_500_000_000,
+                                iterations: calibrated_iters(1.5),
                             }),
                             Some(Duration::from_secs(60)),
                         )
@@ -321,7 +336,7 @@ fn elastic_burst_reaps_after_idle() {
                 let _ = r
                     .send_with_timeout(
                         Box::new(LongTask {
-                            iterations: 1_200_000_000,
+                            iterations: calibrated_iters(1.2),
                         }),
                         Some(Duration::from_secs(60)),
                     )
@@ -334,7 +349,7 @@ fn elastic_burst_reaps_after_idle() {
                 let _ = r
                     .send_with_timeout(
                         Box::new(LongTask {
-                            iterations: 1_200_000_000,
+                            iterations: calibrated_iters(1.2),
                         }),
                         Some(Duration::from_secs(60)),
                     )
@@ -396,7 +411,7 @@ fn elastic_thread_count_bounded() {
                     let _ = r
                         .send_with_timeout(
                             Box::new(LongTask {
-                                iterations: 300_000_000,
+                                iterations: calibrated_iters(0.35),
                             }),
                             Some(Duration::from_secs(120)),
                         )
