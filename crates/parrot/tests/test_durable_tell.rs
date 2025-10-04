@@ -66,7 +66,9 @@ impl Actor for EdgeSink {
                 }
                 return Ok(Box::new(DTell(*seq)) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
 
@@ -87,14 +89,21 @@ impl LocalLookup for FacadeLookup {
 }
 
 async fn edge_node(id: &str) -> (Arc<RemoteActorSystem>, Arc<ParrotActorSystem>) {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let ts = ThreadActorSystem::shared(Default::default());
     facade
         .register_thread_system("eng".into(), ts.clone(), true)
         .await
         .unwrap();
     ts.spawn_at(
-        EdgeSink { dedup: DedupTable::new(), processed: vec![] },
+        EdgeSink {
+            dedup: DedupTable::new(),
+            processed: vec![],
+        },
         "/user/sink",
         None,
         ThreadActorConfig::default(),
@@ -103,7 +112,9 @@ async fn edge_node(id: &str) -> (Arc<RemoteActorSystem>, Arc<ParrotActorSystem>)
     .unwrap();
     let rs = RemoteActorSystem::new(
         RCfg::mem(id.to_string()),
-        Arc::new(FacadeLookup { facade: facade.clone() }),
+        Arc::new(FacadeLookup {
+            facade: facade.clone(),
+        }),
     )
     .unwrap();
     rs.start().await.unwrap();
@@ -125,7 +136,9 @@ async fn durable_offline_replay() {
             seq,
             path: "parrot://edge-1/user/sink".into(),
             type_key: "bin:durable::DTell#v1".into(),
-            payload: parrot_api::message::serde_remote_serialize(&DTell(seq)).unwrap().into(),
+            payload: parrot_api::message::serde_remote_serialize(&DTell(seq))
+                .unwrap()
+                .into(),
         })
         .unwrap();
     }
@@ -186,7 +199,9 @@ async fn durable_offline_5min_real() {
             seq,
             path: String::new(),
             type_key: "bin:durable::DTell#v1".into(),
-            payload: parrot_api::message::serde_remote_serialize(&DTell(seq)).unwrap().into(),
+            payload: parrot_api::message::serde_remote_serialize(&DTell(seq))
+                .unwrap()
+                .into(),
         })
         .unwrap();
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -219,7 +234,11 @@ async fn tell_ack_not_slow() {
 
     // 预热（页缓存 + 分配器 steady state）
     for i in 0..50u64 {
-        wal.append(WalRecord { seq: 10_000 + i, ..rec.clone() }).unwrap();
+        wal.append(WalRecord {
+            seq: 10_000 + i,
+            ..rec.clone()
+        })
+        .unwrap();
         wal.flush().unwrap();
         wal.ack("e", "s", 10_000 + i).unwrap();
     }
@@ -228,7 +247,11 @@ async fn tell_ack_not_slow() {
     let mut base = Vec::new();
     for i in 0..200u64 {
         let t0 = Instant::now();
-        wal.append(WalRecord { seq: i, ..rec.clone() }).unwrap();
+        wal.append(WalRecord {
+            seq: i,
+            ..rec.clone()
+        })
+        .unwrap();
         wal.flush().unwrap();
         base.push(t0.elapsed().as_nanos() as u64);
     }
@@ -236,7 +259,11 @@ async fn tell_ack_not_slow() {
     let mut with_ack = Vec::new();
     for i in 0..200u64 {
         let t0 = Instant::now();
-        wal.append(WalRecord { seq: 1000 + i, ..rec.clone() }).unwrap();
+        wal.append(WalRecord {
+            seq: 1000 + i,
+            ..rec.clone()
+        })
+        .unwrap();
         wal.flush().unwrap();
         wal.ack("e", "s", 1000 + i).unwrap();
         with_ack.push(t0.elapsed().as_nanos() as u64);

@@ -34,7 +34,9 @@ impl Actor for RegActor {
                 ctx.receptionist_register(key).await?;
                 return Ok(Box::new("ok".to_string()) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
 
@@ -45,11 +47,18 @@ impl Actor for RegActor {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receptionist_context_roundtrip() {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
 
     // gateway 注入（先注入后注册 thread 系统——继承路径）
     let gw = Arc::new(ReceptionistFacade::new("node-a"));
-    facade.register_receptionist_gateway(gw.clone()).await.unwrap();
+    facade
+        .register_receptionist_gateway(gw.clone())
+        .await
+        .unwrap();
 
     let ts = ThreadActorSystem::shared(Default::default());
     facade
@@ -93,12 +102,19 @@ async fn receptionist_context_roundtrip() {
         .register_thread_system("eng2".into(), ts2.clone(), false)
         .await
         .unwrap();
-    assert!(ts2.receptionist_gateway().is_some(), "late thread system inherits gateway");
+    assert!(
+        ts2.receptionist_gateway().is_some(),
+        "late thread system inherits gateway"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receptionist_not_enabled_without_gateway() {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let ts = ThreadActorSystem::shared(Default::default());
     facade
         .register_thread_system("eng".into(), ts.clone(), true)

@@ -102,7 +102,12 @@ impl NodeTable {
     }
 
     pub fn list(&self) -> Vec<NodeAddr> {
-        self.nodes.lock().unwrap().values().map(|(a, _)| a.clone()).collect()
+        self.nodes
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(a, _)| a.clone())
+            .collect()
     }
 
     pub fn len(&self) -> usize {

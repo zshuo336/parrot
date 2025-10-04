@@ -33,10 +33,10 @@ mod engine_stress_common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parrot::actix::ActixTypedActorRef;
 use parrot::actix::actor::ActixActor;
 use parrot::actix::context::ActixContext;
 use parrot::actix::system::ActixActorSystem;
-use parrot::actix::ActixTypedActorRef;
 use parrot::system::ParrotActorSystem;
 use parrot::thread::config::ThreadActorSystemConfig;
 use parrot::thread::context::ThreadContext;
@@ -135,7 +135,10 @@ impl Actor for ThreadDyn {
         Box::pin(async move {
             if let Some(p) = m.downcast_ref::<Ping>() {
                 self.seen.lock().unwrap().push(p.payload);
-                Ok(Box::new(Pong { hop: p.hop, echo: p.payload }) as BoxedMessage)
+                Ok(Box::new(Pong {
+                    hop: p.hop,
+                    echo: p.payload,
+                }) as BoxedMessage)
             } else if let Some(na) = m.downcast_ref::<NestedAsk>() {
                 // V2: handler 内嵌套跨引擎 ask（thread 侧发起）
                 let remote = na.remote.clone_boxed();
@@ -200,7 +203,10 @@ impl parrot_api::actor::ActixEngineExt for ActixDyn {
     ) -> Option<ActorResult<BoxedMessage>> {
         if let Some(p) = m.downcast_ref::<Ping>() {
             self.seen.lock().unwrap().push(p.payload);
-            Some(Ok(Box::new(Pong { hop: p.hop, echo: p.payload }) as BoxedMessage))
+            Some(Ok(Box::new(Pong {
+                hop: p.hop,
+                echo: p.payload,
+            }) as BoxedMessage))
         } else if m.downcast_ref::<NestedAsk>().is_some() {
             // 语义边界：actix 同步快路径内不能 .await，嵌套跨引擎 ask
             // 需在 actix runtime 任务中执行（见 v2_actix_to_thread_nested_ask，
@@ -260,7 +266,11 @@ impl TypedReceive<Get> for Calc {
 
 async fn setup_dual(
     name: &str,
-) -> (Arc<ParrotActorSystem>, Arc<ThreadActorSystem>, Arc<ActixActorSystem>) {
+) -> (
+    Arc<ParrotActorSystem>,
+    Arc<ThreadActorSystem>,
+    Arc<ActixActorSystem>,
+) {
     let parrot = ParrotActorSystem::new(ActorSystemConfig::default())
         .await
         .unwrap();
@@ -284,14 +294,15 @@ async fn setup_dual(
 /// 在 actix 引擎上 spawn 一个 ActixDyn（动态轨），返回 BoxedActorRef。
 async fn spawn_actix_dyn(asys: &ActixActorSystem, seen_seed: Vec<u64>) -> BoxedActorRef {
     use futures::FutureExt;
-    asys
-        .spawn_root_typed(
-            ActixDyn { seen: std::sync::Mutex::new(seen_seed) },
-            EmptyConfig,
-        )
-        .now_or_never()
-        .expect("spawn ready")
-        .expect("spawn ok")
+    asys.spawn_root_typed(
+        ActixDyn {
+            seen: std::sync::Mutex::new(seen_seed),
+        },
+        EmptyConfig,
+    )
+    .now_or_never()
+    .expect("spawn ready")
+    .expect("spawn ok")
 }
 
 /// 关闭门面（Arc 包裹时经 try_unwrap 拿回所有权）。
@@ -315,7 +326,9 @@ fn v1_v2_v5_dual_engine_dyn_track_full_matrix() {
 
         let t_ref = boxed(
             ts.spawn_at::<ThreadDyn>(
-                ThreadDyn { seen: Default::default() },
+                ThreadDyn {
+                    seen: Default::default(),
+                },
                 "/sr/thread-dyn",
                 None,
                 Default::default(),
@@ -327,10 +340,22 @@ fn v1_v2_v5_dual_engine_dyn_track_full_matrix() {
 
         // ---- V2: ask 矩阵 ----
         // thread→thread（同引擎基线）
-        let p: Pong = t_ref.ask(Ping { hop: 1, payload: 11 }).await.unwrap();
+        let p: Pong = t_ref
+            .ask(Ping {
+                hop: 1,
+                payload: 11,
+            })
+            .await
+            .unwrap();
         assert_eq!(p, Pong { hop: 1, echo: 11 });
         // caller→actix（跨引擎）
-        let p: Pong = a_ref.ask(Ping { hop: 2, payload: 22 }).await.unwrap();
+        let p: Pong = a_ref
+            .ask(Ping {
+                hop: 2,
+                payload: 22,
+            })
+            .await
+            .unwrap();
         assert_eq!(p, Pong { hop: 2, echo: 22 });
         // actix→thread：actix actor handler 内 ask thread actor
         // 注意：ActixDyn 同步快路径对 NestedAsk 返回 NestedAskDefer 载荷，
@@ -340,11 +365,18 @@ fn v1_v2_v5_dual_engine_dyn_track_full_matrix() {
         let nested: Pong = t_ref
             .ask(NestedAsk {
                 remote: a_ref.clone_boxed(),
-                ping: Ping { hop: 4, payload: 44 },
+                ping: Ping {
+                    hop: 4,
+                    payload: 44,
+                },
             })
             .await
             .unwrap();
-        assert_eq!(nested, Pong { hop: 4, echo: 44 }, "thread handler 内跨引擎 ask actix");
+        assert_eq!(
+            nested,
+            Pong { hop: 4, echo: 44 },
+            "thread handler 内跨引擎 ask actix"
+        );
 
         // ---- V2: 类型不匹配错误契约（两引擎一致）----
         let bad_t = t_ref.send(Box::new("str") as BoxedMessage).await;
@@ -355,9 +387,19 @@ fn v1_v2_v5_dual_engine_dyn_track_full_matrix() {
         // ---- V5: 跨引擎停止死信 + 对方引擎不受影响 ----
         a_ref.stop().await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let dead = a_ref.send(Box::new(Ping { hop: 9, payload: 99 }) as BoxedMessage).await;
+        let dead = a_ref
+            .send(Box::new(Ping {
+                hop: 9,
+                payload: 99,
+            }) as BoxedMessage)
+            .await;
         assert!(dead.is_err(), "stopped actix actor 必须死信");
-        let alive: Result<Pong, _> = t_ref.ask(Ping { hop: 10, payload: 101 }).await;
+        let alive: Result<Pong, _> = t_ref
+            .ask(Ping {
+                hop: 10,
+                payload: 101,
+            })
+            .await;
         assert!(alive.is_ok(), "thread actor 不因对方引擎 actor 死亡受影响");
 
         // ---- V1: 门面跨系统路径解析（默认 + fallback 遍历）----
@@ -387,7 +429,9 @@ fn v2_actix_to_thread_nested_ask() {
 
         let t_ref = boxed(
             ts.spawn_at::<ThreadDyn>(
-                ThreadDyn { seen: Default::default() },
+                ThreadDyn {
+                    seen: Default::default(),
+                },
                 "/sr/nested-thread",
                 None,
                 Default::default(),
@@ -400,12 +444,19 @@ fn v2_actix_to_thread_nested_ask() {
         // 模拟 actix actor handler 内嵌套 ask 的执行环境。
         let remote = t_ref.clone_boxed();
         let pong: ActorResult<Pong> = actix::spawn(async move {
-            let ping = Ping { hop: 3, payload: 33 };
+            let ping = Ping {
+                hop: 3,
+                payload: 33,
+            };
             remote.ask(ping).await
         })
         .await
         .unwrap();
-        assert_eq!(pong.unwrap(), Pong { hop: 3, echo: 33 }, "actix 任务内 ask thread actor");
+        assert_eq!(
+            pong.unwrap(),
+            Pong { hop: 3, echo: 33 },
+            "actix 任务内 ask thread actor"
+        );
 
         println!("[SR] V2 actix→thread 嵌套 ask 通过 ✓");
         let _ = ts.shutdown_internal().await;
@@ -426,8 +477,10 @@ fn v3_typed_track_cross_engine() {
         let t_calc: ThreadTypedRef<Calc, Add> =
             ts.spawn_typed(Calc { n: 0 }, "/sr/t-calc").await.unwrap();
         // 同一 Calc 类型：actix 引擎 spawn（跑 arbiter 池）
-        let a_calc: ActixTypedActorRef<Calc, Add> =
-            asys.spawn_typed(Calc { n: 100 }, "/sr/a-calc").await.unwrap();
+        let a_calc: ActixTypedActorRef<Calc, Add> = asys
+            .spawn_typed(Calc { n: 100 }, "/sr/a-calc")
+            .await
+            .unwrap();
 
         // 各自引擎内 ask 正常
         assert_eq!(t_calc.ask(Add(1)).await.unwrap(), 1);
@@ -435,21 +488,23 @@ fn v3_typed_track_cross_engine() {
 
         // ---- typed→dyn 桥：thread typed actor 桥到动态轨 ----
         let t_dyn = t_calc.clone().into_dyn();
-        let out = t_dyn
-            .send(Box::new(Add(10)) as BoxedMessage)
-            .await
-            .unwrap();
-        assert_eq!(*out.downcast::<u64>().unwrap(), 11, "thread typed 桥 dyn ask");
+        let out = t_dyn.send(Box::new(Add(10)) as BoxedMessage).await.unwrap();
+        assert_eq!(
+            *out.downcast::<u64>().unwrap(),
+            11,
+            "thread typed 桥 dyn ask"
+        );
         // 桥接后静态轨状态一致
         assert_eq!(t_calc.ref_for::<Get>().ask(Get).await.unwrap(), 11);
 
         // ---- typed→dyn 桥：actix typed actor 桥到动态轨 ----
         let a_dyn = a_calc.clone().into_dyn();
-        let out = a_dyn
-            .send(Box::new(Add(10)) as BoxedMessage)
-            .await
-            .unwrap();
-        assert_eq!(*out.downcast::<u64>().unwrap(), 111, "actix typed 桥 dyn ask");
+        let out = a_dyn.send(Box::new(Add(10)) as BoxedMessage).await.unwrap();
+        assert_eq!(
+            *out.downcast::<u64>().unwrap(),
+            111,
+            "actix typed 桥 dyn ask"
+        );
         assert_eq!(a_calc.ref_for::<Get>().ask(Get).await.unwrap(), 111);
 
         // ---- 跨引擎：动态轨消息路由到另一引擎的 typed actor ----
@@ -457,7 +512,9 @@ fn v3_typed_track_cross_engine() {
         // 并在 handler 内 ask（thread→actix，typed 目标）。
         let carrier = boxed(
             ts.spawn_at::<ThreadDyn>(
-                ThreadDyn { seen: Default::default() },
+                ThreadDyn {
+                    seen: Default::default(),
+                },
                 "/sr/carrier",
                 None,
                 Default::default(),
@@ -468,7 +525,10 @@ fn v3_typed_track_cross_engine() {
         let pong = carrier
             .ask(NestedAsk {
                 remote: a_calc.clone().into_dyn(),
-                ping: Ping { hop: 5, payload: 55 },
+                ping: Ping {
+                    hop: 5,
+                    payload: 55,
+                },
             })
             .await;
         // Calc 的 dyn 桥只接受 Add/Get；Ping 未声明 → 类型化错误（预期语义）
@@ -507,7 +567,9 @@ fn v4_priority_semantics_across_engines() {
         // thread 侧：灌积压 → High 越队（M2 核心语义保持）
         let t_ref = ts
             .spawn_at::<ThreadDyn>(
-                ThreadDyn { seen: Default::default() },
+                ThreadDyn {
+                    seen: Default::default(),
+                },
                 "/sr/prio-thread",
                 None,
                 Default::default(),
@@ -527,7 +589,10 @@ fn v4_priority_semantics_across_engines() {
         let t0 = Instant::now();
         t_ref
             .send_with_priority(
-                Box::new(Ping { hop: 0, payload: u64::MAX }) as BoxedMessage,
+                Box::new(Ping {
+                    hop: 0,
+                    payload: u64::MAX,
+                }) as BoxedMessage,
                 BackpressureStrategy::Block,
                 true,
             )
@@ -551,10 +616,7 @@ fn v4_priority_semantics_across_engines() {
         );
 
         // 顺序验证：seen 里 u64::MAX 必须出现且先于积压主体
-        let seen: Vec<u64> = t_dyn
-            .ask(GetSeen)
-            .await
-            .unwrap();
+        let seen: Vec<u64> = t_dyn.ask(GetSeen).await.unwrap();
         let pos = seen
             .iter()
             .position(|&v| v == u64::MAX)
@@ -568,12 +630,21 @@ fn v4_priority_semantics_across_engines() {
         // 跨引擎方向：actix 引擎侧向 thread actor 的投递保持正确性
         // （actix 无 priority 概念，跨引擎投递退化为 FIFO——既定设计）
         let a_ref = spawn_actix_dyn(&asys, vec![]).await;
-        let pong: Pong = a_ref.ask(Ping { hop: 7, payload: 70 }).await.unwrap();
+        let pong: Pong = a_ref
+            .ask(Ping {
+                hop: 7,
+                payload: 70,
+            })
+            .await
+            .unwrap();
         assert_eq!(pong.echo, 70, "actix→actix 基线");
         // actix 引擎存活状态下 thread 侧 High 语义不回归
         t_ref
             .send_with_priority(
-                Box::new(Ping { hop: 0, payload: u64::MAX - 1 }) as BoxedMessage,
+                Box::new(Ping {
+                    hop: 0,
+                    payload: u64::MAX - 1,
+                }) as BoxedMessage,
                 BackpressureStrategy::Block,
                 true,
             )
@@ -662,13 +733,21 @@ fn v5b_supervision_isolation_across_engines() {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // actix 引擎完全不受影响
-        let pong: Pong = a_ref.ask(Ping { hop: 8, payload: 88 }).await.unwrap();
+        let pong: Pong = a_ref
+            .ask(Ping {
+                hop: 8,
+                payload: 88,
+            })
+            .await
+            .unwrap();
         assert_eq!(pong.echo, 88, "thread 侧 panic 重启期间 actix 引擎不受影响");
 
         // thread 引擎自身也恢复（重启后的新实例仍可服务 + 引擎可继续 spawn）
         let health = ts
             .spawn_at::<ThreadDyn>(
-                ThreadDyn { seen: Default::default() },
+                ThreadDyn {
+                    seen: Default::default(),
+                },
                 "/sr/health",
                 None,
                 Default::default(),
@@ -700,7 +779,9 @@ fn v7_macro_neutrality_on_both_engines() {
         // 动态轨：M1 derive 消息未被 actor 声明 → 类型化错误（一致契约）
         let t_ref = boxed(
             ts.spawn_at::<ThreadDyn>(
-                ThreadDyn { seen: Default::default() },
+                ThreadDyn {
+                    seen: Default::default(),
+                },
                 "/sr/m-thread",
                 None,
                 Default::default(),
@@ -711,9 +792,15 @@ fn v7_macro_neutrality_on_both_engines() {
         let a_ref = spawn_actix_dyn(&asys, vec![]).await;
 
         let bad_t = t_ref.send(Box::new(EchoMsg { v: 1 }) as BoxedMessage).await;
-        assert!(bad_t.is_err(), "thread 侧：M1 derive 消息未声明协议 → 错误而非静默丢弃");
+        assert!(
+            bad_t.is_err(),
+            "thread 侧：M1 derive 消息未声明协议 → 错误而非静默丢弃"
+        );
         let bad_a = a_ref.send(Box::new(EchoMsg { v: 1 }) as BoxedMessage).await;
-        assert!(bad_a.is_err(), "actix 侧：M1 derive 消息未声明协议 → 错误而非静默丢弃");
+        assert!(
+            bad_a.is_err(),
+            "actix 侧：M1 derive 消息未声明协议 → 错误而非静默丢弃"
+        );
 
         println!("[SR] V7 宏中立性通过 ✓");
         let _ = ts.shutdown_internal().await;

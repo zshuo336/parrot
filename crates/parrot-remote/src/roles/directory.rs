@@ -24,7 +24,10 @@ pub struct DirEntry {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DirCmd {
     /// 节点注册/更新（graceful 启动、端点变化）。
-    Upsert { node: String, endpoints: Vec<String> },
+    Upsert {
+        node: String,
+        endpoints: Vec<String>,
+    },
     /// 节点摘除（graceful 离开）。
     Remove { node: String },
     /// border 声明前缀（该 border 代理此前缀的 RESOLVE）。
@@ -108,8 +111,7 @@ impl DirectoryReplica {
 
     /// client 写（leader 才受理）。
     pub fn propose(&mut self, cmd: &DirCmd) -> Result<LogIndex, NotLeader> {
-        let bytes =
-            bincode::serde::encode_to_vec(cmd, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(cmd, bincode::config::standard()).unwrap();
         self.raft.propose(bytes)
     }
 
@@ -170,10 +172,22 @@ mod tests {
     fn directory_sm_apply_all_cmds() {
         let mut sm = DirectorySm::default();
         let cmds = [
-            DirCmd::Upsert { node: "n1".into(), endpoints: vec!["tcp://10.0.0.1:7000".into()] },
-            DirCmd::Upsert { node: "n2".into(), endpoints: vec!["tcp://10.0.0.2:7000".into()] },
-            DirCmd::BorderDeclare { prefix: "parrot://eu-1/".into(), node: "n1".into() },
-            DirCmd::KeyAggregate { key: "media/track/r1".into(), nodes: vec!["n2".into()] },
+            DirCmd::Upsert {
+                node: "n1".into(),
+                endpoints: vec!["tcp://10.0.0.1:7000".into()],
+            },
+            DirCmd::Upsert {
+                node: "n2".into(),
+                endpoints: vec!["tcp://10.0.0.2:7000".into()],
+            },
+            DirCmd::BorderDeclare {
+                prefix: "parrot://eu-1/".into(),
+                node: "n1".into(),
+            },
+            DirCmd::KeyAggregate {
+                key: "media/track/r1".into(),
+                nodes: vec!["n2".into()],
+            },
         ];
         for c in &cmds {
             sm.apply(&bincode::serde::encode_to_vec(c, bincode::config::standard()).unwrap());
@@ -182,16 +196,24 @@ mod tests {
         assert_eq!(sm.nodes["n1"].endpoints, vec!["tcp://10.0.0.1:7000"]);
         assert_eq!(sm.version, 4);
         // Remove 级联清理（border/key_index）
-        sm.apply(&bincode::serde::encode_to_vec(
-            &DirCmd::Remove { node: "n1".into() },
-            bincode::config::standard(),
-        ).unwrap());
+        sm.apply(
+            &bincode::serde::encode_to_vec(
+                &DirCmd::Remove { node: "n1".into() },
+                bincode::config::standard(),
+            )
+            .unwrap(),
+        );
         assert_eq!(sm.nodes.len(), 1);
-        assert!(!sm.borders.contains_key("parrot://eu-1/"), "Remove 级联 border");
+        assert!(
+            !sm.borders.contains_key("parrot://eu-1/"),
+            "Remove 级联 border"
+        );
         // 查询视图（状态直接搬入副本）
         let mut r = DirectoryReplica::new("solo", vec![], Arc::new(ManualClock::new()));
         r.sm = sm.clone();
-        let hit = r.query(&DirQuery::NodesForKey { key: "media/track/r1".into() });
+        let hit = r.query(&DirQuery::NodesForKey {
+            key: "media/track/r1".into(),
+        });
         assert_eq!(hit.unwrap().endpoints, vec!["parrot://n2"]);
     }
 
@@ -205,7 +227,10 @@ mod tests {
         r.raft.tick();
         assert_eq!(r.raft.role, crate::raft::Role::Leader, "单节点立即主");
         let idx = r
-            .propose(&DirCmd::Upsert { node: "n1".into(), endpoints: vec!["tcp://x:1".into()] })
+            .propose(&DirCmd::Upsert {
+                node: "n1".into(),
+                endpoints: vec!["tcp://x:1".into()],
+            })
             .unwrap();
         assert_eq!(idx, 1);
         // 无 peers——advance_commit 需多数派=1（自己）
@@ -351,7 +376,9 @@ mod s3_tests {
         let (shard_id, _) = ds.propose(&cmd).unwrap();
         assert_eq!(ds.apply_committed_all(), 1);
         // 读经同一环 → 命中
-        let hit = ds.query(&DirQuery::Resolve { prefix_or_node: "parrot://n1".into() });
+        let hit = ds.query(&DirQuery::Resolve {
+            prefix_or_node: "parrot://n1".into(),
+        });
         assert!(hit.is_some(), "读写同环必命中");
         assert_eq!(
             ds.route("parrot://n1").unwrap(),
@@ -413,11 +440,7 @@ mod s3_tests {
         ds.propose(&DirCmd::Remove { node: "n1".into() }).unwrap();
         ds.apply_committed_all();
         assert_eq!(ds.total_nodes(), 0);
-        let borders: usize = ds
-            .shards
-            .values()
-            .map(|s| s.sm.borders.len())
-            .sum();
+        let borders: usize = ds.shards.values().map(|s| s.sm.borders.len()).sum();
         assert_eq!(borders, 0, "跨 shard 级联无残留");
     }
 
@@ -458,7 +481,9 @@ mod s3_tests {
         assert_eq!(ds8.total_nodes(), n, "扩容后无丢失");
         // 且仍可命中（8 环读写同环）
         assert!(ds8
-            .query(&DirQuery::Resolve { prefix_or_node: "parrot://n0".into() })
+            .query(&DirQuery::Resolve {
+                prefix_or_node: "parrot://n0".into()
+            })
             .is_some());
         // 一致性哈希性质：扩容仅迁移 ≈ n/2 键（4→8 保留旧节点时理论
         // 最优 1 - 4/8 = 50%，对比全量重哈希 100%）——门禁 55%
@@ -501,7 +526,9 @@ mod s3_tests {
         .unwrap();
         ds.apply_committed_all();
         // 查询必须命中（且只有一份——不因 first 漂移分裂）
-        let hit = ds.query(&DirQuery::NodesForKey { key: "media/track/r1".into() });
+        let hit = ds.query(&DirQuery::NodesForKey {
+            key: "media/track/r1".into(),
+        });
         let entry = hit.expect("同 key 重上报必须可查");
         // 后写覆盖先写（Raft 顺序 apply）——节点集应为第二次的
         assert_eq!(
@@ -539,7 +566,9 @@ mod s3_tests {
         })
         .unwrap();
         ds.apply_committed_all();
-        let hit = ds.query(&DirQuery::BorderFor { prefix: "parrot://eu-1/".into() });
+        let hit = ds.query(&DirQuery::BorderFor {
+            prefix: "parrot://eu-1/".into(),
+        });
         assert_eq!(
             hit.expect("border 可查").endpoints,
             vec!["parrot://n2".to_string()],

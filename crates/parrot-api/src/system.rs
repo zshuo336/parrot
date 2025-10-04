@@ -370,15 +370,15 @@ mod tests {
             SystemError::ActorCreationError("y".into()).to_string(),
             "Actor creation failed: y"
         );
-        assert_eq!(SystemError::ShuttingDown.to_string(), "System is shutting down");
+        assert_eq!(
+            SystemError::ShuttingDown.to_string(),
+            "System is shutting down"
+        );
         assert_eq!(
             SystemError::ActorError(crate::errors::ActorError::Timeout).to_string(),
             "Timeout"
         );
-        assert_eq!(
-            SystemError::Other(anyhow::anyhow!("z")).to_string(),
-            "z"
-        );
+        assert_eq!(SystemError::Other(anyhow::anyhow!("z")).to_string(), "z");
     }
 
     #[test]
@@ -437,10 +437,7 @@ mod tests {
     impl crate::actor::Actor for NopActor {
         type Config = crate::actor::EmptyConfig;
         type Context = dyn ActorContext;
-        fn init<'a>(
-            &'a mut self,
-            _c: &'a mut Self::Context,
-        ) -> BoxedFuture<'a, ActorResult<()>> {
+        fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async { Ok(()) })
         }
         fn receive_message<'a>(
@@ -523,14 +520,19 @@ mod tests {
 
     #[tokio::test]
     async fn actor_system_trait_contract() {
-        let s = NopSystem::start(ActorSystemConfig::default()).await.unwrap();
+        let s = NopSystem::start(ActorSystemConfig::default())
+            .await
+            .unwrap();
         // spawn_typed 错误路径
         assert!(s
             .spawn_root_typed(NopActor, crate::actor::EmptyConfig)
             .await
             .is_err());
         // get_actor 找不到
-        assert!(s.get_actor(&ActorPath::placeholder("x://y")).await.is_none());
+        assert!(s
+            .get_actor(&ActorPath::placeholder("x://y"))
+            .await
+            .is_none());
         // broadcast 成功
         s.broadcast(PingMsg).await.unwrap();
         // status 快照

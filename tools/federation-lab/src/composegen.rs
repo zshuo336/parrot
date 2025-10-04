@@ -139,11 +139,7 @@ impl ComposeGenConfig {
         let _ = writeln!(
             y,
             "# {} clusters × {} nodes (fold {}:{}), realm '{}'",
-            self.clusters,
-            self.nodes_per_cluster,
-            1,
-            self.fold,
-            self.realm
+            self.clusters, self.nodes_per_cluster, 1, self.fold, self.realm
         );
         let _ = writeln!(y, "services:");
         for ct in self.containers() {

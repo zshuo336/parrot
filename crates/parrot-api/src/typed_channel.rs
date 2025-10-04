@@ -357,10 +357,7 @@ mod tests {
         type Msg = BenchMsg;
         type Reply = BenchReply;
 
-        fn dispatch<'a>(
-            &'a mut self,
-            msg: Self::Msg,
-        ) -> BoxedFuture<'a, ActorResult<Self::Reply>> {
+        fn dispatch<'a>(&'a mut self, msg: Self::Msg) -> BoxedFuture<'a, ActorResult<Self::Reply>> {
             use std::sync::atomic::Ordering;
             Box::pin(async move {
                 self.processed.fetch_add(1, Ordering::Relaxed);
@@ -442,10 +439,7 @@ mod tests {
     #[tokio::test]
     async fn ask_error_propagates_through_reply_channel() {
         let (r, _) = spawn_bench(4).await;
-        let e = r
-            .ask(BenchMsg::Fail("boom".into()))
-            .await
-            .unwrap_err();
+        let e = r.ask(BenchMsg::Fail("boom".into())).await.unwrap_err();
         assert!(e.to_string().contains("boom"));
     }
 
@@ -486,8 +480,7 @@ mod tests {
     async fn ask_after_channel_close_returns_internal_error() {
         // drop 接收端（消费任务退出）后 ask 必须报 InternalError
         let (tx, rx) = typed_channel::<BenchActor>(2);
-        let r: TypedActorRef<BenchActor, BenchMsg> =
-            TypedActorRef::new(tx, "/test/closed".into());
+        let r: TypedActorRef<BenchActor, BenchMsg> = TypedActorRef::new(tx, "/test/closed".into());
         drop(rx);
         let e = r.ask(BenchMsg::Echo(1)).await.unwrap_err();
         assert!(matches!(e, ActorError::InternalError(_)));
@@ -497,8 +490,7 @@ mod tests {
     #[tokio::test]
     async fn tell_after_channel_close_returns_internal_error() {
         let (tx, rx) = typed_channel::<BenchActor>(2);
-        let r: TypedActorRef<BenchActor, BenchMsg> =
-            TypedActorRef::new(tx, "/test/closed2".into());
+        let r: TypedActorRef<BenchActor, BenchMsg> = TypedActorRef::new(tx, "/test/closed2".into());
         drop(rx);
         let e = r.tell(BenchMsg::Echo(1)).await.unwrap_err();
         assert!(matches!(e, ActorError::InternalError(_)));
@@ -594,7 +586,10 @@ mod tests {
         assert!(dynref.is_alive().await);
         // clone_boxed 语义
         let c = dynref.clone_boxed();
-        assert!(c.send(Box::new(BenchMsg::Echo(5)) as BoxedMessage).await.is_ok());
+        assert!(c
+            .send(Box::new(BenchMsg::Echo(5)) as BoxedMessage)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

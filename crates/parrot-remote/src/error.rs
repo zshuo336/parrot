@@ -98,14 +98,14 @@ impl ErrCode {
             ActorError::ActorNotFound(s) => (Self::ActorNotFound, s.clone()),
             // enqueue 失败且 detail 标 Closed = 目标 mailbox 已关（stopped）——
             // 远程死信等价映射 Stopped（RC5；引擎在 closed 通道上的权威信号）
-            ActorError::InternalError(s) if s.contains("Closed") => {
-                (Self::Stopped, s.clone())
-            }
+            ActorError::InternalError(s) if s.contains("Closed") => (Self::Stopped, s.clone()),
             ActorError::InternalError(s) => (Self::ConnectionLost, s.clone()),
             ActorError::ProcessMessageError(s) => (Self::CodecError, s.clone()),
             // 引擎 ReplyChannelError（mailbox closed/ask 通道关）在远程语境 =
             // 目标 actor 已停止接收 → Stopped（RC5 跨网等价语义）
-            ActorError::ReplyChannelError(s) => (Self::Stopped, format!("reply channel closed: {s}")),
+            ActorError::ReplyChannelError(s) => {
+                (Self::Stopped, format!("reply channel closed: {s}"))
+            }
             ActorError::Panic(s) => (Self::ProtocolViolation, s.clone()),
             ActorError::Other(e) => (Self::ProtocolViolation, e.to_string()),
         }
@@ -154,7 +154,9 @@ pub enum RemoteError {
 impl RemoteError {
     pub fn to_actor_error(&self) -> ActorError {
         match self {
-            RemoteError::Transport(s) => ActorError::InternalError(format!("remote transport: {s}")),
+            RemoteError::Transport(s) => {
+                ActorError::InternalError(format!("remote transport: {s}"))
+            }
             RemoteError::UnknownNode(n) => {
                 ActorError::ActorNotFound(format!("remote node unknown: {n}"))
             }

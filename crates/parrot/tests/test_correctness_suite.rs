@@ -262,7 +262,10 @@ fn c4_reply_routing_no_crosstalk() {
         let journal = Journal::new();
         let actor = ts
             .spawn_at::<Recorder>(
-                Recorder { journal, started: Arc::new(AtomicU64::new(0)) },
+                Recorder {
+                    journal,
+                    started: Arc::new(AtomicU64::new(0)),
+                },
                 "/c4/rec",
                 None,
                 ThreadActorConfig::default(),
@@ -633,7 +636,10 @@ fn c8_timeout_semantics() {
         let a_started = Arc::new(AtomicU64::new(0));
         let a = ts
             .spawn_at::<Recorder>(
-                Recorder { journal, started: a_started.clone() },
+                Recorder {
+                    journal,
+                    started: a_started.clone(),
+                },
                 "/c8/a",
                 None,
                 ThreadActorConfig::default(),

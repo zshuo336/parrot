@@ -26,7 +26,11 @@ fn member(id: &str, alive: bool) -> Member {
             host: "127.0.0.1".into(),
             port: 0,
         },
-        status: if alive { MemberStatus::Alive } else { MemberStatus::Dead },
+        status: if alive {
+            MemberStatus::Alive
+        } else {
+            MemberStatus::Dead
+        },
         incarnation: 0,
         status_until_ms: 0,
         metadata: parrot_remote::bytes::Bytes::new(),
@@ -56,7 +60,9 @@ async fn swim_convergence_kill9() {
     let (changed, _) = m.tick();
     let elapsed = t0.elapsed();
     assert!(
-        changed.iter().any(|x| x.node_id == "c" && x.status == MemberStatus::Dead),
+        changed
+            .iter()
+            .any(|x| x.node_id == "c" && x.status == MemberStatus::Dead),
         "c must be Dead at 3.5s budget"
     );
     // 多数派视角：alive = {a, b}（c 不在 alive_nodes）
@@ -90,7 +96,10 @@ fn swim_partition_heal() {
     assert_eq!(a.members["a"].status, MemberStatus::Suspect);
     // 对称：B 收到 A 广播的 Suspect(b)（分区双向静默——A 的 probe 也失败）
     let a_suspect_b = member("b", false);
-    let a_suspect_b = Member { status: MemberStatus::Suspect, ..a_suspect_b };
+    let a_suspect_b = Member {
+        status: MemberStatus::Suspect,
+        ..a_suspect_b
+    };
     b.merge_event(&MemberEvent::Upsert(a_suspect_b)); // b 表: b → Suspect(0)
     assert_eq!(b.members["b"].status, MemberStatus::Suspect);
 
@@ -101,8 +110,14 @@ fn swim_partition_heal() {
     assert_eq!(b_refute.status, MemberStatus::Alive);
 
     // 交换 refute 事件：Dead(0) < Alive(1) / Suspect(0) < Alive(1) 偏序覆盖
-    assert!(b.merge_event(&MemberEvent::Upsert(a_refute)), "A Alive(1) heals B Suspect(0)");
-    assert!(a.merge_event(&MemberEvent::Upsert(b_refute)), "B Alive(1) heals A Dead(0)");
+    assert!(
+        b.merge_event(&MemberEvent::Upsert(a_refute)),
+        "A Alive(1) heals B Suspect(0)"
+    );
+    assert!(
+        a.merge_event(&MemberEvent::Upsert(b_refute)),
+        "B Alive(1) heals A Dead(0)"
+    );
     // 两表全部回 Alive，digest 一致
     for m in a.members.values() {
         assert_eq!(m.status, MemberStatus::Alive);

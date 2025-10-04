@@ -98,8 +98,12 @@ impl Decoder for FrameCodec {
 impl From<std::io::Error> for FrameError {
     fn from(e: std::io::Error) -> Self {
         // IO 层错误（对端关闭/复位）——统一映射协议违规类（连接层断连处理）
-        FrameError::MalformedLengths { flen: 0, plen: 0, klen: 0 }
-            .tap_io(e)
+        FrameError::MalformedLengths {
+            flen: 0,
+            plen: 0,
+            klen: 0,
+        }
+        .tap_io(e)
     }
 }
 
@@ -513,4 +517,3 @@ mod tests {
         assert_eq!(a.scheme, "tcp");
     }
 }
-

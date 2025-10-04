@@ -73,7 +73,9 @@ impl Actor for EchoActor {
             if let Some(RPing(v)) = msg.downcast_ref::<RPing>() {
                 return Ok(Box::new(RPong(*v)) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
 
@@ -103,7 +105,9 @@ impl Actor for FifoActor {
             if msg.downcast_ref::<RGetSeen>().is_some() {
                 return Ok(Box::new(RSeq(self.seen.len() as u64)) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
 
@@ -128,7 +132,9 @@ impl Actor for SlowActor {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 return Ok(Box::new(RPong(*v)) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
 
@@ -170,7 +176,11 @@ async fn spawn_thread_actor<A>(
 }
 
 /// 组双节点（真实 thread 引擎 actor + mem 链路）。
-async fn two_nodes_mem() -> (Arc<RemoteActorSystem>, Arc<RemoteActorSystem>, Arc<ParrotActorSystem>) {
+async fn two_nodes_mem() -> (
+    Arc<RemoteActorSystem>,
+    Arc<RemoteActorSystem>,
+    Arc<ParrotActorSystem>,
+) {
     // B 侧：真实引擎 + echo/fifo/slow 三个 actor
     let facade_b = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
@@ -184,16 +194,22 @@ async fn two_nodes_mem() -> (Arc<RemoteActorSystem>, Arc<RemoteActorSystem>, Arc
 
     let rb = RemoteActorSystem::new(
         RCfg::mem("node-b"),
-        Arc::new(FacadeLookup { facade: facade_b.clone() }),
+        Arc::new(FacadeLookup {
+            facade: facade_b.clone(),
+        }),
     )
     .unwrap();
     rb.start().await.unwrap();
 
     // A 侧：无本地 actor（纯客户端语义）
-    let facade_a = ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap();
+    let facade_a = ParrotActorSystem::new(ActorSystemConfig::default())
+        .await
+        .unwrap();
     let ra = RemoteActorSystem::new(
         RCfg::mem("node-a"),
-        Arc::new(FacadeLookup { facade: Arc::new(facade_a) }),
+        Arc::new(FacadeLookup {
+            facade: Arc::new(facade_a),
+        }),
     )
     .unwrap();
     ra.start().await.unwrap();
@@ -208,7 +224,11 @@ async fn two_nodes_mem() -> (Arc<RemoteActorSystem>, Arc<RemoteActorSystem>, Arc
 }
 
 /// TCP 双节点（127.0.0.1 真实网络栈——RC 语义第二遍）。
-async fn two_nodes_tcp() -> (Arc<RemoteActorSystem>, Arc<RemoteActorSystem>, Arc<ParrotActorSystem>) {
+async fn two_nodes_tcp() -> (
+    Arc<RemoteActorSystem>,
+    Arc<RemoteActorSystem>,
+    Arc<ParrotActorSystem>,
+) {
     let facade_b = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
             .await
@@ -225,14 +245,20 @@ async fn two_nodes_tcp() -> (Arc<RemoteActorSystem>, Arc<RemoteActorSystem>, Arc
     };
     let rb = RemoteActorSystem::new(
         RCfg::tcp("node-b", Some(format!("127.0.0.1:{port}").parse().unwrap())),
-        Arc::new(FacadeLookup { facade: facade_b.clone() }),
+        Arc::new(FacadeLookup {
+            facade: facade_b.clone(),
+        }),
     )
     .unwrap();
     rb.start().await.unwrap();
     let ra = RemoteActorSystem::new(
         RCfg::tcp("node-a", None),
         Arc::new(FacadeLookup {
-            facade: Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap()),
+            facade: Arc::new(
+                ParrotActorSystem::new(ActorSystemConfig::default())
+                    .await
+                    .unwrap(),
+            ),
         }),
     )
     .unwrap();
@@ -309,7 +335,10 @@ async fn rc4_timeout_mem() {
     let r = slow
         .send_with_timeout(Box::new(RPing(1)), Some(Duration::from_millis(50)))
         .await;
-    assert!(t0.elapsed() < Duration::from_millis(400), "调用方 50ms 即放弃");
+    assert!(
+        t0.elapsed() < Duration::from_millis(400),
+        "调用方 50ms 即放弃"
+    );
     match r {
         Err(parrot_api::errors::ActorError::TimeoutDetail(_)) => {}
         other => panic!("expect TimeoutDetail, got {other:?}"),
@@ -317,7 +346,10 @@ async fn rc4_timeout_mem() {
     // 对端 500ms 后完成 → 迟到 REPLY 查表 miss → metric+1
     tokio::time::sleep(Duration::from_millis(700)).await;
     let after = parrot_remote::LATE_REPLY_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(after > before, "late_reply_dropped_total +1（RC4）: {before} -> {after}");
+    assert!(
+        after > before,
+        "late_reply_dropped_total +1（RC4）: {before} -> {after}"
+    );
 }
 
 /// RC5 死信：stop 后 send → Stopped 跨网等价。
@@ -343,7 +375,11 @@ async fn rc5_dead_letter_mem() {
         let mut local_err = None;
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(2) {
-            match tokio::time::timeout(Duration::from_secs(1), local_victim.send(Box::new(RPing(99)))).await
+            match tokio::time::timeout(
+                Duration::from_secs(1),
+                local_victim.send(Box::new(RPing(99))),
+            )
+            .await
             {
                 Err(_) => panic!("local send must not hang"),
                 Ok(Err(e)) => {
@@ -354,7 +390,10 @@ async fn rc5_dead_letter_mem() {
                 Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(25)).await, // 传播窗口
             }
         }
-        assert!(local_err.is_some(), "local send must fail within stop-propagation window");
+        assert!(
+            local_err.is_some(),
+            "local send must fail within stop-propagation window"
+        );
     }
     let err = tokio::time::timeout(Duration::from_secs(3), victim.send(Box::new(RPing(2))))
         .await
@@ -408,14 +447,20 @@ async fn rc8_backpressure_mem() {
     .unwrap();
     let rb = RemoteActorSystem::new(
         RCfg::mem("node-b"),
-        Arc::new(FacadeLookup { facade: facade_b.clone() }),
+        Arc::new(FacadeLookup {
+            facade: facade_b.clone(),
+        }),
     )
     .unwrap();
     rb.start().await.unwrap();
-    let facade_a = ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap();
+    let facade_a = ParrotActorSystem::new(ActorSystemConfig::default())
+        .await
+        .unwrap();
     let ra = RemoteActorSystem::new(
         RCfg::mem("node-a"),
-        Arc::new(FacadeLookup { facade: Arc::new(facade_a) }),
+        Arc::new(FacadeLookup {
+            facade: Arc::new(facade_a),
+        }),
     )
     .unwrap();
     ra.start().await.unwrap();
@@ -452,7 +497,6 @@ async fn rc8_backpressure_mem() {
     drop(done);
     tokio::time::sleep(Duration::from_millis(700)).await;
 }
-
 
 // ===========================================================================
 // TCP 双跑（RC 语义第二遍）+ RC7 断连恢复
@@ -499,7 +543,13 @@ async fn rc5_dead_letter_tcp() {
     spawn_thread_actor(&facade_b, &ts, EchoActor, "/user/victim").await;
     let victim = ra.remote_ref("parrot://node-b/user/victim").unwrap();
     assert_eq!(
-        victim.send(Box::new(RPing(1))).await.unwrap().downcast_ref::<RPong>().unwrap().0,
+        victim
+            .send(Box::new(RPing(1)))
+            .await
+            .unwrap()
+            .downcast_ref::<RPong>()
+            .unwrap()
+            .0,
         1
     );
     victim.stop().await.unwrap();
@@ -521,7 +571,13 @@ async fn rc5_dead_letter_tcp() {
 async fn rc7_disconnect_reconnect_tcp() {
     let (ra, rb, facade_b) = two_nodes_tcp().await;
     let echo = ra.remote_ref("parrot://node-b/user/echo").unwrap();
-    let p0 = echo.send(Box::new(RPing(1))).await.unwrap().downcast_ref::<RPong>().unwrap().0;
+    let p0 = echo
+        .send(Box::new(RPing(1)))
+        .await
+        .unwrap()
+        .downcast_ref::<RPong>()
+        .unwrap()
+        .0;
     assert_eq!(p0, 1);
 
     // 断连：B 侧 shutdown（杀连接）
@@ -542,7 +598,9 @@ async fn rc7_disconnect_reconnect_tcp() {
     // 重建 B（旧 rb 已 shutdown；facade_b 的引擎 actor 仍存活）
     let rb2 = RemoteActorSystem::new(
         RCfg::tcp("node-b", Some(format!("127.0.0.1:{port}").parse().unwrap())),
-        Arc::new(FacadeLookup { facade: facade_b.clone() }),
+        Arc::new(FacadeLookup {
+            facade: facade_b.clone(),
+        }),
     )
     .unwrap();
     rb2.start().await.unwrap();
@@ -555,7 +613,13 @@ async fn rc7_disconnect_reconnect_tcp() {
     // remote_ref 重建（旧 ref 持旧链路 sender——links 更新后新 ref 走新链路）
     let echo2 = ra.remote_ref("parrot://node-b/user/echo").unwrap();
     let cid_before = 0; // 内部计数不可达——以行为断言：重连后 ask 成功
-    let p2 = echo2.send(Box::new(RPing(3))).await.unwrap().downcast_ref::<RPong>().unwrap().0;
+    let p2 = echo2
+        .send(Box::new(RPing(3)))
+        .await
+        .unwrap()
+        .downcast_ref::<RPong>()
+        .unwrap()
+        .0;
     assert_eq!(p2, 3);
     let _ = cid_before;
 }

@@ -216,7 +216,12 @@ fn matrix_a_dyn_ask_size_ladder() {
             let out = r.ask(Box::new(i)).await.unwrap();
             assert_eq!(*out.downcast::<u64>().unwrap(), i);
         }
-        row("A2 dyn-ask-boxed-u64", N, t.elapsed(), "2 alloc (Box+oneshot)");
+        row(
+            "A2 dyn-ask-boxed-u64",
+            N,
+            t.elapsed(),
+            "2 alloc (Box+oneshot)",
+        );
 
         // A3 boxed 64B
         let m64 = Msg64([7u8; 64]);
@@ -228,7 +233,12 @@ fn matrix_a_dyn_ask_size_ladder() {
             let out = r.ask(Box::new(m64.clone())).await.unwrap();
             assert_eq!(*out.downcast::<u64>().unwrap(), 7);
         }
-        row("A3 dyn-ask-boxed-64B", N, t.elapsed(), "2 alloc, 64B payload");
+        row(
+            "A3 dyn-ask-boxed-64B",
+            N,
+            t.elapsed(),
+            "2 alloc, 64B payload",
+        );
 
         // A4 boxed 1KB
         let m1k = Msg1K([7u8; 1024]);
@@ -240,7 +250,12 @@ fn matrix_a_dyn_ask_size_ladder() {
             let out = r.ask(Box::new(m1k.clone())).await.unwrap();
             assert_eq!(*out.downcast::<u64>().unwrap(), 7);
         }
-        row("A4 dyn-ask-boxed-1KB", N, t.elapsed(), "2 alloc, 1KB payload");
+        row(
+            "A4 dyn-ask-boxed-1KB",
+            N,
+            t.elapsed(),
+            "2 alloc, 1KB payload",
+        );
 
         // A5 boxed 64KB
         let m64k = Msg64K(Box::new([7u8; 65536]));
@@ -253,7 +268,12 @@ fn matrix_a_dyn_ask_size_ladder() {
             let out = r.ask(Box::new(m64k.clone())).await.unwrap();
             assert_eq!(*out.downcast::<u64>().unwrap(), 7);
         }
-        row("A5 dyn-ask-boxed-64KB", N5, t.elapsed(), "2 alloc, 64KB payload");
+        row(
+            "A5 dyn-ask-boxed-64KB",
+            N5,
+            t.elapsed(),
+            "2 alloc, 64KB payload",
+        );
 
         let _ = ts.shutdown_internal().await;
     });
@@ -314,8 +334,7 @@ fn matrix_c_static_ask_size_ladder() {
         const N: u64 = 10_000;
 
         // C1 static u64（枚举槽 ~24B，0 alloc）
-        let rs: TypedActorRef<EchoS, PingS> =
-            ts.spawn_typed(EchoS, "/mx/echo-s").await.unwrap();
+        let rs: TypedActorRef<EchoS, PingS> = ts.spawn_typed(EchoS, "/mx/echo-s").await.unwrap();
         for _ in 0..500 {
             let _ = rs.ask(PingS(1)).await.unwrap();
         }
@@ -323,11 +342,15 @@ fn matrix_c_static_ask_size_ladder() {
         for i in 0..N {
             assert_eq!(rs.ask(PingS(i)).await.unwrap(), i);
         }
-        row("C1 static-ask-u64", N, t.elapsed(), "0 alloc, enum slot ~24B");
+        row(
+            "C1 static-ask-u64",
+            N,
+            t.elapsed(),
+            "0 alloc, enum slot ~24B",
+        );
 
         // C2 static 64B
-        let rm: TypedActorRef<EchoM, PingM> =
-            ts.spawn_typed(EchoM, "/mx/echo-m").await.unwrap();
+        let rm: TypedActorRef<EchoM, PingM> = ts.spawn_typed(EchoM, "/mx/echo-m").await.unwrap();
         let pm = PingM([7u8; 64]);
         for _ in 0..500 {
             let _ = rm.ask(pm.clone()).await.unwrap();
@@ -336,11 +359,15 @@ fn matrix_c_static_ask_size_ladder() {
         for _ in 0..N {
             assert_eq!(rm.ask(pm.clone()).await.unwrap(), 7);
         }
-        row("C2 static-ask-64B", N, t.elapsed(), "0 alloc, slot ~72B (copy)");
+        row(
+            "C2 static-ask-64B",
+            N,
+            t.elapsed(),
+            "0 alloc, slot ~72B (copy)",
+        );
 
         // C3 static 1KB（枚举槽 1KB+：每条按值 copy 1KB 进 flume 槽）
-        let rl: TypedActorRef<EchoL, PingL> =
-            ts.spawn_typed(EchoL, "/mx/echo-l").await.unwrap();
+        let rl: TypedActorRef<EchoL, PingL> = ts.spawn_typed(EchoL, "/mx/echo-l").await.unwrap();
         let pl = PingL([7u8; 1024]);
         for _ in 0..500 {
             let _ = rl.ask(pl.clone()).await.unwrap();
@@ -349,7 +376,12 @@ fn matrix_c_static_ask_size_ladder() {
         for _ in 0..N {
             assert_eq!(rl.ask(pl.clone()).await.unwrap(), 7);
         }
-        row("C3 static-ask-1KB", N, t.elapsed(), "0 alloc, slot ~1KB (copy)");
+        row(
+            "C3 static-ask-1KB",
+            N,
+            t.elapsed(),
+            "0 alloc, slot ~1KB (copy)",
+        );
 
         let _ = ts.shutdown_internal().await;
     });
@@ -407,7 +439,12 @@ fn matrix_d_concurrent_c8() {
         for h in hs {
             h.await.unwrap();
         }
-        row("D2 dyn-ask-boxed-1KB-c8", TOTAL, t.elapsed(), "8 tasks × 10k × 1KB");
+        row(
+            "D2 dyn-ask-boxed-1KB-c8",
+            TOTAL,
+            t.elapsed(),
+            "8 tasks × 10k × 1KB",
+        );
 
         // D3 static 1KB c8
         let rl = Arc::new(
@@ -433,7 +470,12 @@ fn matrix_d_concurrent_c8() {
         for h in hs {
             h.await.unwrap();
         }
-        row("D3 static-ask-1KB-c8", TOTAL, t.elapsed(), "8 tasks × 10k × 1KB slot");
+        row(
+            "D3 static-ask-1KB-c8",
+            TOTAL,
+            t.elapsed(),
+            "8 tasks × 10k × 1KB slot",
+        );
 
         let _ = ts.shutdown_internal().await;
     });
@@ -466,7 +508,12 @@ fn matrix_e_alloc_counting() {
             let _ = r.ask_inline(7u64, TMO).await.unwrap();
         }
         let d = allocs_delta(b) / N as f64;
-        row("E1 dyn-ask-inline", N as u64, Duration::from_secs(0), &format!("{d:.2} allocs/msg 全链路"));
+        row(
+            "E1 dyn-ask-inline",
+            N as u64,
+            Duration::from_secs(0),
+            &format!("{d:.2} allocs/msg 全链路"),
+        );
 
         // E2 dyn boxed u64 ask（理论：payload Box 1 + oneshot 1 + 回复 Box 1 = 3）
         for _ in 0..300 {
@@ -477,11 +524,15 @@ fn matrix_e_alloc_counting() {
             let _ = r.ask(Box::new(7u64)).await.unwrap();
         }
         let d = allocs_delta(b) / N as f64;
-        row("E2 dyn-ask-boxed-u64", N as u64, Duration::from_secs(0), &format!("{d:.2} allocs/msg 全链路"));
+        row(
+            "E2 dyn-ask-boxed-u64",
+            N as u64,
+            Duration::from_secs(0),
+            &format!("{d:.2} allocs/msg 全链路"),
+        );
 
         // E3 static ask u64（理论：reply channel 构造分配 + 槽位摊销 ≈ 1-2）
-        let rs: TypedActorRef<EchoS, PingS> =
-            ts.spawn_typed(EchoS, "/mx/e-s").await.unwrap();
+        let rs: TypedActorRef<EchoS, PingS> = ts.spawn_typed(EchoS, "/mx/e-s").await.unwrap();
         for _ in 0..300 {
             let _ = rs.ask(PingS(1)).await.unwrap();
         }
@@ -490,7 +541,12 @@ fn matrix_e_alloc_counting() {
             let _ = rs.ask(PingS(7)).await.unwrap();
         }
         let d = allocs_delta(b) / N as f64;
-        row("E3 static-ask-u64", N as u64, Duration::from_secs(0), &format!("{d:.2} allocs/msg 全链路"));
+        row(
+            "E3 static-ask-u64",
+            N as u64,
+            Duration::from_secs(0),
+            &format!("{d:.2} allocs/msg 全链路"),
+        );
 
         // E4 dyn tell（理论：payload Box 1 = 1）
         for _ in 0..300 {
@@ -501,7 +557,12 @@ fn matrix_e_alloc_counting() {
             let _ = r.deliver(Box::new(1u64)).await;
         }
         let d = allocs_delta(b) / N as f64;
-        row("E4 dyn-tell-u64", N as u64, Duration::from_secs(0), &format!("{d:.2} allocs/msg 全链路"));
+        row(
+            "E4 dyn-tell-u64",
+            N as u64,
+            Duration::from_secs(0),
+            &format!("{d:.2} allocs/msg 全链路"),
+        );
 
         // E5 static tell（理论：0 —— flume 槽预分配按值入队）
         for _ in 0..300 {
@@ -512,7 +573,12 @@ fn matrix_e_alloc_counting() {
             rs.tell(PingS(1)).await.unwrap();
         }
         let d = allocs_delta(b) / N as f64;
-        row("E5 static-tell", N as u64, Duration::from_secs(0), &format!("{d:.2} allocs/msg 全链路"));
+        row(
+            "E5 static-tell",
+            N as u64,
+            Duration::from_secs(0),
+            &format!("{d:.2} allocs/msg 全链路"),
+        );
 
         let _ = ts.shutdown_internal().await;
     });
@@ -540,7 +606,12 @@ fn matrix_f_combo() {
         for i in 0..N {
             assert_eq!(rm.ask(PingS(i)).await.unwrap(), i);
         }
-        row("F1 static-ask-SMALL-in-MIXED-enum", N, t.elapsed(), "PingS via {S,L} enum (slot 1KB)");
+        row(
+            "F1 static-ask-SMALL-in-MIXED-enum",
+            N,
+            t.elapsed(),
+            "PingS via {S,L} enum (slot 1KB)",
+        );
 
         // 大消息协议经 ref_for 验证（对照 C3：同槽大小应持平）
         let rl: TypedActorRef<EchoMixed, PingL> = rm.ref_for::<PingL>();
@@ -552,7 +623,12 @@ fn matrix_f_combo() {
         for _ in 0..N {
             assert_eq!(rl.ask(pl.clone()).await.unwrap(), 7);
         }
-        row("F1b static-ask-LARGE-in-MIXED-enum", N, t.elapsed(), "PingL via {S,L} enum (slot 1KB)");
+        row(
+            "F1b static-ask-LARGE-in-MIXED-enum",
+            N,
+            t.elapsed(),
+            "PingL via {S,L} enum (slot 1KB)",
+        );
 
         // F2 动态轨大小混合流：95% u64 + 5% 64KB 洪泛（N=20k deliver）
         let r = ts
@@ -572,7 +648,12 @@ fn matrix_f_combo() {
                 let _ = r.deliver(Box::new(1u64)).await;
             }
         }
-        row("F2 dyn-tell-mixed-95small-5big", N2, t.elapsed(), "95% u64 + 5% 64KB");
+        row(
+            "F2 dyn-tell-mixed-95small-5big",
+            N2,
+            t.elapsed(),
+            "95% u64 + 5% 64KB",
+        );
 
         let _ = ts.shutdown_internal().await;
     });

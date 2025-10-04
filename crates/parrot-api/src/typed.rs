@@ -160,10 +160,7 @@ mod tests {
     impl ParrotTypedDispatch for Calc {
         type Msg = CalcMsg;
         type Reply = CalcReply;
-        fn dispatch<'a>(
-            &'a mut self,
-            msg: Self::Msg,
-        ) -> BoxedFuture<'a, ActorResult<Self::Reply>> {
+        fn dispatch<'a>(&'a mut self, msg: Self::Msg) -> BoxedFuture<'a, ActorResult<Self::Reply>> {
             Box::pin(async move {
                 match msg {
                     CalcMsg::Add(m) => {

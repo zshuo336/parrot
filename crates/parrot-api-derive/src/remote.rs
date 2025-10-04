@@ -46,8 +46,8 @@ pub(crate) fn derive_remote_message_impl(input: TokenStream) -> TokenStream {
     // 宏展开处的 crate 名（运行时经 env!("CARGO_PKG_NAME") 不可得——用模块路径近似：
     // 正式采用 std::module_path! 不可行（宏卫生），此处用 Cargo 包名注入）。
     let crate_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "crate".into());
-    let key = explicit_key(&input.attrs)
-        .unwrap_or_else(|| format!("bin:{}::{}#v1", crate_name, name));
+    let key =
+        explicit_key(&input.attrs).unwrap_or_else(|| format!("bin:{}::{}#v1", crate_name, name));
 
     // bincode 包装函数（类型擦除边界）：encode downcast 后 serde 序列化
     let key_lit = syn::LitStr::new(&key, proc_macro2::Span::call_site());

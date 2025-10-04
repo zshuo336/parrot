@@ -151,12 +151,16 @@ async fn main() {
         .await
         .expect("connect+handshake with pb-only peer");
 
-    let ping = client.remote_ref("parrot://erl-gw-1/erl/user/echo").unwrap();
+    let ping = client
+        .remote_ref("parrot://erl-gw-1/erl/user/echo")
+        .unwrap();
     let r = ping.send(Box::new(UPing(100))).await.unwrap();
     let got = r.downcast_ref::<UPong>().unwrap().0;
     assert_eq!(got, 103, "erlang dialect: Ping(100) -> Pong(103)");
 
-    let add = client.remote_ref("parrot://erl-gw-1/erl/user/calc").unwrap();
+    let add = client
+        .remote_ref("parrot://erl-gw-1/erl/user/calc")
+        .unwrap();
     let r = add.send(Box::new(UAdd(3, 4))).await.unwrap();
     let got = r.downcast_ref::<UAddR>().unwrap().0;
     assert_eq!(got, 10007, "erlang dialect: Add(3,4) -> AddR(10007)");

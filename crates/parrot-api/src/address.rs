@@ -519,10 +519,7 @@ mod tests {
 
     #[async_trait]
     impl ActorRef for PingPong {
-        fn send<'a>(
-            &'a self,
-            msg: BoxedMessage,
-        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async move {
                 if msg.downcast_ref::<PingMsg>().is_some() {
                     Ok(Box::new(7u32) as BoxedMessage)

@@ -163,10 +163,7 @@ mod tests {
         let mut dist: HashMap<String, usize> = HashMap::new();
         for i in 0..1000 {
             let host = ring.node(&format!("entity-{i}")).unwrap().to_string();
-            assert!(
-                nodes.contains(&host),
-                "host must be a member"
-            );
+            assert!(nodes.contains(&host), "host must be a member");
             *dist.entry(host).or_default() += 1;
         }
         let avg = 1000 / nodes.len();

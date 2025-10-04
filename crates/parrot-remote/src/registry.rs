@@ -141,7 +141,10 @@ mod tests {
         r.insert(1, "peer", tx1).unwrap();
         r.insert(2, "peer", tx2).unwrap();
         let (tx3, _rx3) = tokio::sync::oneshot::channel();
-        assert!(matches!(r.insert(3, "peer", tx3), Err(RemoteError::CallbacksFull(2))));
+        assert!(matches!(
+            r.insert(3, "peer", tx3),
+            Err(RemoteError::CallbacksFull(2))
+        ));
     }
 
     #[test]
@@ -155,7 +158,10 @@ mod tests {
         assert_eq!(n, 2);
         for rx in [rx1, rx2] {
             let got = futures::executor::block_on(rx).unwrap();
-            assert!(matches!(got, ReplyPayload::Err(crate::error::ErrCode::ConnectionLost, _)));
+            assert!(matches!(
+                got,
+                ReplyPayload::Err(crate::error::ErrCode::ConnectionLost, _)
+            ));
         }
         assert!(r.is_empty());
     }
@@ -186,9 +192,16 @@ mod tests {
         let before = LATE_REPLY_DROPPED.load(Ordering::Relaxed);
         let r = CallbackRegistry::new(8);
         // 未注册 cid 的 complete → false + metric+1
-        assert!(!r.complete(999, ReplyPayload::Err(crate::error::ErrCode::Stopped, "late".into())));
+        assert!(!r.complete(
+            999,
+            ReplyPayload::Err(crate::error::ErrCode::Stopped, "late".into())
+        ));
         let after = LATE_REPLY_DROPPED.load(Ordering::Relaxed);
-        assert_eq!(after, before + 1, "late_reply_dropped_total must increment (E1.10)");
+        assert_eq!(
+            after,
+            before + 1,
+            "late_reply_dropped_total must increment (E1.10)"
+        );
     }
 
     #[test]

@@ -42,7 +42,12 @@ impl Receptionist {
     }
 
     /// 本节点注册。
-    pub fn register(&mut self, node: &str, key: &ReceptionistKey, remote_path: &str) -> ReceptionistEvent {
+    pub fn register(
+        &mut self,
+        node: &str,
+        key: &ReceptionistKey,
+        remote_path: &str,
+    ) -> ReceptionistEvent {
         let e = ReceptionistEntry {
             key: key.clone(),
             remote_path: remote_path.to_string(),
@@ -95,9 +100,8 @@ impl Receptionist {
     /// 事件广播（本地注册 + 远端同步统一入口）。
     pub fn broadcast(&mut self, ev: &ReceptionistEvent) {
         let key = match ev {
-            ReceptionistEvent::Registered { key, .. } | ReceptionistEvent::Unregistered { key, .. } => {
-                key.as_str().to_string()
-            }
+            ReceptionistEvent::Registered { key, .. }
+            | ReceptionistEvent::Unregistered { key, .. } => key.as_str().to_string(),
         };
         if let Some(subs) = self.subscribers.get_mut(&key) {
             subs.retain(|tx| tx.try_send(ev.clone()).is_ok());
@@ -115,9 +119,7 @@ impl Receptionist {
         // 先移除该节点旧条目（不在新快照中的）
         for (k, list) in self.entries.iter_mut() {
             let before = list.len();
-            list.retain(|e| {
-                e.node != sync.from || nodes_entries.iter().any(|ne| ne == &e)
-            });
+            list.retain(|e| e.node != sync.from || nodes_entries.iter().any(|ne| ne == &e));
             if list.len() != before {
                 for removed in 0..(before - list.len()) {
                     let _ = removed;
@@ -149,8 +151,7 @@ impl Receptionist {
         for k in keys {
             let list = self.entries.get_mut(&k).unwrap();
             let before = list.len();
-            let removed: Vec<ReceptionistEntry> =
-                list.extract_if(.., |e| e.node == node).collect();
+            let removed: Vec<ReceptionistEntry> = list.extract_if(.., |e| e.node == node).collect();
             if list.is_empty() {
                 self.entries.remove(&k);
             }
@@ -176,7 +177,10 @@ impl Receptionist {
     }
 
     pub fn lookup(&self, key: &ReceptionistKey) -> Vec<&ReceptionistEntry> {
-        self.entries.get(key.as_str()).map(|v| v.iter().collect()).unwrap_or_default()
+        self.entries
+            .get(key.as_str())
+            .map(|v| v.iter().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -341,7 +345,9 @@ mod tests {
         r.register("ny", &key("edge/c"), "parrot://ny/user/c");
         let events = r.remove_node("nx");
         assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|e| matches!(e, ReceptionistEvent::Unregistered { .. })));
+        assert!(events
+            .iter()
+            .all(|e| matches!(e, ReceptionistEvent::Unregistered { .. })));
         assert_eq!(r.lookup(&key("edge/a")).len(), 0);
         assert_eq!(r.lookup(&key("edge/c")).len(), 1); // ny 不受影响
     }

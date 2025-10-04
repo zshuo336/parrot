@@ -72,7 +72,9 @@ pub enum FrameError {
     VersionMismatch { expect: u8, got: u8 },
     #[error("未知帧类型 0x{got:02X}（偏移 5）——两端协议版本漂移")]
     UnknownFrameType { got: u8 },
-    #[error("长度不自洽：frame_len={flen} 但 path_len={plen}+key_len={klen}+固定28 超出（偏移 24）")]
+    #[error(
+        "长度不自洽：frame_len={flen} 但 path_len={plen}+key_len={klen}+固定28 超出（偏移 24）"
+    )]
     MalformedLengths { flen: u32, plen: u32, klen: u32 },
     #[error("UTF-8 解码失败（字段 {field}）：{source}")]
     Utf8 {
@@ -143,7 +145,13 @@ impl Frame {
 
     /// ASK：payload 头部带 reply_to 前缀（DEV_01 §3.1 类型键约定：
     /// `[u32 reply_to_len][reply_to_bytes][payload...]`，仅 ASK 帧）。
-    pub fn ask(cid: u64, path: &str, type_key: &str, payload: Bytes, reply_to: Option<&str>) -> Frame {
+    pub fn ask(
+        cid: u64,
+        path: &str,
+        type_key: &str,
+        payload: Bytes,
+        reply_to: Option<&str>,
+    ) -> Frame {
         let mut body = BytesMut::with_capacity(4 + payload.len());
         match reply_to {
             Some(r) => {
@@ -265,9 +273,11 @@ impl Frame {
             None
         } else {
             Some(
-                String::from_utf8(b.copy_to_bytes(rlen).to_vec()).map_err(|e| FrameError::Utf8 {
-                    field: "reply_to",
-                    source: e.utf8_error(),
+                String::from_utf8(b.copy_to_bytes(rlen).to_vec()).map_err(|e| {
+                    FrameError::Utf8 {
+                        field: "reply_to",
+                        source: e.utf8_error(),
+                    }
                 })?,
             )
         };
@@ -278,7 +288,10 @@ impl Frame {
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), FrameError> {
         let path_b = self.path.as_bytes();
         let key_b = self.type_key.as_bytes();
-        let body = BODY_FIXED_OVERHEAD as u64 + path_b.len() as u64 + key_b.len() as u64 + self.payload.len() as u64;
+        let body = BODY_FIXED_OVERHEAD as u64
+            + path_b.len() as u64
+            + key_b.len() as u64
+            + self.payload.len() as u64;
         if body > MAX_FRAME_LEN as u64 {
             return Err(FrameError::TooLarge {
                 len: body as u32,
@@ -368,7 +381,9 @@ impl Frame {
         let _ = reserved;
         let reserved_check: u64 = reserved & RESERVED_MASK;
         if reserved_check != 0 {
-            return Err(FrameError::ReservedNotZero { got: reserved_check });
+            return Err(FrameError::ReservedNotZero {
+                got: reserved_check,
+            });
         }
         let path_len = buf.get_u32_le() as usize;
         let path = String::from_utf8(buf.copy_to_bytes(path_len).to_vec()).map_err(|e| {
@@ -555,73 +570,70 @@ pub struct GoldenVector {
 /// OnceLock 惰性构造（Frame 含 String 非 const-constructible；向量内容仍是冻结字面量）。
 pub fn golden_vectors() -> &'static [GoldenVector] {
     static V: std::sync::OnceLock<Vec<GoldenVector>> = std::sync::OnceLock::new();
-    V.get_or_init(|| vec![
-    GoldenVector {
-        name: "ask-basic",
-        frame: Frame::ask(1, "/x", "bin:t::M", Bytes::from_static(&[0xAB]), None),
-        bytes: &[
-            0x2B, 0x00, 0x00, 0x00, // frame_len = 43
-            0x01, // version
-            0x10, // ASK
-            0x00, 0x00, // flags
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // cid=1
-            0x00, // hop_count
-            0x08, // hop_limit
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved u48
-            0x02, 0x00, 0x00, 0x00, // path_len=2
-            b'/', b'x', // "/x"
-            0x08, 0x00, 0x00, 0x00, // key_len=8
-            b'b', b'i', b'n', b':', b't', b':', b':', b'M', // "bin:t::M"
-            0x00, 0x00, 0x00, 0x00, // reply_to_len=0（ASK payload 头约定）
-            0xAB, // payload
-        ],
-    },
-    GoldenVector {
-        name: "tell-basic",
-        frame: Frame::tell("/y", "bin:t::T", Bytes::from_static(&[0x01, 0x02])),
-        bytes: &[
-            0x28, 0x00, 0x00, 0x00, // frame_len = 40 = 28+2+8+2
-            0x01, 0x13, 0x00, 0x00, // ver/TELL/flags
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // cid=0
-            0x00, 0x08, // hop
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
-            0x02, 0x00, 0x00, 0x00, // path_len
-            b'/', b'y',
-            0x08, 0x00, 0x00, 0x00, // key_len
-            b'b', b'i', b'n', b':', b't', b':', b':', b'T',
-            0x01, 0x02,
-        ],
-    },
-    GoldenVector {
-        name: "reply-err-stopped",
-        frame: Frame::reply_err(7, "", ErrCode::Stopped, "actor stopped"),
-        bytes: &[
-            0x2D, 0x00, 0x00, 0x00, // frame_len = 45 = 28 + 0 + 0 + (4+2+11)
-            0x01, 0x12, 0x00, 0x00,
-            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // cid=7
-            0x00, 0x08,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, // path_len=0
-            0x00, 0x00, 0x00, 0x00, // key_len=0
-            0x03, 0x00, // code=3 Stopped
-            0x00, 0x00, // reserved
-            b'a', b'c', b't', b'o', b'r', b' ', b's', b't', b'o', b'p', b'p', b'e', b'd',
-        ],
-    },
-    GoldenVector {
-        name: "heartbeat",
-        frame: Frame::heartbeat(),
-        bytes: &[
-            0x1C, 0x00, 0x00, 0x00, // frame_len = 28
-            0x01, 0x03, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x08,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, // path_len=0
-            0x00, 0x00, 0x00, 0x00, // key_len=0
-        ],
-    },
-    ])
+    V.get_or_init(|| {
+        vec![
+            GoldenVector {
+                name: "ask-basic",
+                frame: Frame::ask(1, "/x", "bin:t::M", Bytes::from_static(&[0xAB]), None),
+                bytes: &[
+                    0x2B, 0x00, 0x00, 0x00, // frame_len = 43
+                    0x01, // version
+                    0x10, // ASK
+                    0x00, 0x00, // flags
+                    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // cid=1
+                    0x00, // hop_count
+                    0x08, // hop_limit
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved u48
+                    0x02, 0x00, 0x00, 0x00, // path_len=2
+                    b'/', b'x', // "/x"
+                    0x08, 0x00, 0x00, 0x00, // key_len=8
+                    b'b', b'i', b'n', b':', b't', b':', b':', b'M', // "bin:t::M"
+                    0x00, 0x00, 0x00, 0x00, // reply_to_len=0（ASK payload 头约定）
+                    0xAB, // payload
+                ],
+            },
+            GoldenVector {
+                name: "tell-basic",
+                frame: Frame::tell("/y", "bin:t::T", Bytes::from_static(&[0x01, 0x02])),
+                bytes: &[
+                    0x28, 0x00, 0x00, 0x00, // frame_len = 40 = 28+2+8+2
+                    0x01, 0x13, 0x00, 0x00, // ver/TELL/flags
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // cid=0
+                    0x00, 0x08, // hop
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
+                    0x02, 0x00, 0x00, 0x00, // path_len
+                    b'/', b'y', 0x08, 0x00, 0x00, 0x00, // key_len
+                    b'b', b'i', b'n', b':', b't', b':', b':', b'T', 0x01, 0x02,
+                ],
+            },
+            GoldenVector {
+                name: "reply-err-stopped",
+                frame: Frame::reply_err(7, "", ErrCode::Stopped, "actor stopped"),
+                bytes: &[
+                    0x2D, 0x00, 0x00, 0x00, // frame_len = 45 = 28 + 0 + 0 + (4+2+11)
+                    0x01, 0x12, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, // cid=7
+                    0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, // path_len=0
+                    0x00, 0x00, 0x00, 0x00, // key_len=0
+                    0x03, 0x00, // code=3 Stopped
+                    0x00, 0x00, // reserved
+                    b'a', b'c', b't', b'o', b'r', b' ', b's', b't', b'o', b'p', b'p', b'e', b'd',
+                ],
+            },
+            GoldenVector {
+                name: "heartbeat",
+                frame: Frame::heartbeat(),
+                bytes: &[
+                    0x1C, 0x00, 0x00, 0x00, // frame_len = 28
+                    0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, // path_len=0
+                    0x00, 0x00, 0x00, 0x00, // key_len=0
+                ],
+            },
+        ]
+    })
 }
 
 #[cfg(test)]
@@ -632,7 +644,13 @@ mod tests {
     fn frame_roundtrip() {
         // 全 frame_type 编码→解码 == 原
         let frames = vec![
-            Frame::ask(9, "/a/b", "bin:x::Y", Bytes::from_static(b"hello"), Some("parrot://n/_remote/reply")),
+            Frame::ask(
+                9,
+                "/a/b",
+                "bin:x::Y",
+                Bytes::from_static(b"hello"),
+                Some("parrot://n/_remote/reply"),
+            ),
             Frame::tell("/a", "bin:x::T", Bytes::from_static(b"tell")),
             Frame::reply(9, "/a", "bin:x::R", Bytes::from_static(b"ok")),
             Frame::reply_err(9, "/a", ErrCode::Timeout, "slow"),
@@ -645,10 +663,16 @@ mod tests {
             let mut buf = BytesMut::new();
             f.encode(&mut buf).unwrap();
             let mut buf2 = buf.clone();
-            let decoded = Frame::decode(&mut buf2).unwrap().expect("full frame decodes");
+            let decoded = Frame::decode(&mut buf2)
+                .unwrap()
+                .expect("full frame decodes");
             let mut expect = f.clone();
             expect.header.frame_len = decoded.header.frame_len; // encode 前为 0，decode 回填权威值
-            assert_eq!(decoded, expect, "roundtrip mismatch for ft=0x{:02X}", f.header.frame_type);
+            assert_eq!(
+                decoded, expect,
+                "roundtrip mismatch for ft=0x{:02X}",
+                f.header.frame_type
+            );
             assert!(buf2.is_empty(), "buffer fully consumed");
         }
     }
@@ -674,12 +698,21 @@ mod tests {
         for v in golden_vectors() {
             let mut buf = BytesMut::new();
             v.frame.encode(&mut buf).unwrap();
-            assert_eq!(&buf[..], v.bytes, "golden vector {:?} byte mismatch", v.name);
+            assert_eq!(
+                &buf[..],
+                v.bytes,
+                "golden vector {:?} byte mismatch",
+                v.name
+            );
             let mut back = BytesMut::from(v.bytes);
             let decoded = Frame::decode(&mut back).unwrap().expect("golden decodes");
             let mut expect = v.frame.clone();
             expect.header.frame_len = decoded.header.frame_len;
-            assert_eq!(decoded, expect, "golden vector {:?} decode mismatch", v.name);
+            assert_eq!(
+                decoded, expect,
+                "golden vector {:?} decode mismatch",
+                v.name
+            );
         }
     }
 
@@ -729,7 +762,13 @@ mod tests {
 
     #[test]
     fn reply_to_prefix() {
-        let f = Frame::ask(5, "/p", "k", Bytes::from_static(b"data"), Some("parrot://n/_remote/reply"));
+        let f = Frame::ask(
+            5,
+            "/p",
+            "k",
+            Bytes::from_static(b"data"),
+            Some("parrot://n/_remote/reply"),
+        );
         let (rt, payload) = f.split_reply_to().unwrap();
         assert_eq!(rt.as_deref(), Some("parrot://n/_remote/reply"));
         assert_eq!(&payload[..], b"data");
@@ -788,7 +827,13 @@ mod tests {
         // → 批量后带宽降 >60%（vs 单帧，门禁）
         let n = 10_000;
         let frames: Vec<Frame> = (0..n)
-            .map(|i| Frame::tell("/user/telemetry", "bin:t::M", Bytes::from(vec![i as u8; 16])))
+            .map(|i| {
+                Frame::tell(
+                    "/user/telemetry",
+                    "bin:t::M",
+                    Bytes::from(vec![i as u8; 16]),
+                )
+            })
             .collect();
         let per_frame: usize = frames
             .iter()

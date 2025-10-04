@@ -23,8 +23,8 @@
 use crate::actor::Actor;
 use crate::address::{ActorPath, ActorRef};
 use crate::errors::ActorError;
-use crate::receptionist::{ReceptionistKey, ReceptionistStream};
 use crate::message::{CloneableMessage, Message};
+use crate::receptionist::{ReceptionistKey, ReceptionistStream};
 use crate::stream::StreamRegistry;
 use crate::supervisor::SupervisorStrategyType;
 use crate::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
@@ -355,12 +355,18 @@ pub trait ActorContext: Send + Sync {
     // 双引擎 context 各自转发实现（remote 未启用时默认 Unsupported）。
 
     /// 注册到 receptionist（key 命名空间 "{scope}/{name}"）。
-    fn receptionist_register(&mut self, _key: ReceptionistKey) -> BoxedFuture<'static, ActorResult<()>> {
+    fn receptionist_register(
+        &mut self,
+        _key: ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<()>> {
         Box::pin(async { Err(ActorError::InternalError("receptionist not enabled".into())) })
     }
 
     /// 去注册。
-    fn receptionist_deregister(&mut self, _key: &ReceptionistKey) -> BoxedFuture<'static, ActorResult<()>> {
+    fn receptionist_deregister(
+        &mut self,
+        _key: &ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<()>> {
         Box::pin(async { Err(ActorError::InternalError("receptionist not enabled".into())) })
     }
 
@@ -543,11 +549,10 @@ mod tests {
     // ---------------- ReadOnlyChildrenVec / ChildrenGuard ----------------
 
     fn child_vec(n: usize) -> Arc<RwLock<Vec<BoxedActorRef>>> {
-        Arc::new(RwLock::new(Vec::new()))
-            .pipe(|arc| {
-                let _ = n; // child 数不真实注入（DeadRef 占位）
-                arc
-            })
+        Arc::new(RwLock::new(Vec::new())).pipe(|arc| {
+            let _ = n; // child 数不真实注入（DeadRef 占位）
+            arc
+        })
     }
 
     // pipe 辅助（无外部依赖）
@@ -608,8 +613,14 @@ mod tests {
             }
         }
         let inner = Arc::new(RwLock::new(Vec::<BoxedActorRef>::new()));
-        inner.write().unwrap().push(Box::new(Ref("a")) as BoxedActorRef);
-        inner.write().unwrap().push(Box::new(Ref("b")) as BoxedActorRef);
+        inner
+            .write()
+            .unwrap()
+            .push(Box::new(Ref("a")) as BoxedActorRef);
+        inner
+            .write()
+            .unwrap()
+            .push(Box::new(Ref("b")) as BoxedActorRef);
         let v = ReadOnlyChildrenVec::new(inner);
         assert!(!v.is_empty());
         assert_eq!(v.len(), 2);

@@ -63,7 +63,9 @@ impl Actor for EchoActor {
             if let Some(CppEcho(v)) = msg.downcast_ref::<CppEcho>() {
                 return Ok(Box::new(CppEcho(v.clone())) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
     fn state(&self) -> parrot_api::actor::ActorState {
@@ -84,18 +86,23 @@ impl LocalLookup for Lookup {
 
 /// 编译并跑 C++ interop 二进制；返回 (exit_ok, stdout)。
 fn run_cpp_interop(port: u16) -> (bool, String) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../interop/cpp-lite");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interop/cpp-lite");
     let src = dir.join("test_interop.cpp");
-    assert!(src.exists(), "cpp interop source missing: {}", src.display());
+    assert!(
+        src.exists(),
+        "cpp interop source missing: {}",
+        src.display()
+    );
     let bin = std::env::temp_dir().join(format!("pl_interop_{}", std::process::id()));
     let cc = std::env::var("CXX").unwrap_or_else(|_| "clang++".into());
     let build = std::process::Command::new(&cc)
         .args(["-std=c++17", "-Wall", "-Wextra"])
-        .arg("-I").arg(&dir)
+        .arg("-I")
+        .arg(&dir)
         .arg(&src)
         .arg(dir.join("parrot_lite.cpp"))
-        .arg("-o").arg(&bin)
+        .arg("-o")
+        .arg(&bin)
         .output()
         .expect("spawn compiler");
     assert!(
@@ -115,7 +122,11 @@ fn run_cpp_interop(port: u16) -> (bool, String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cpp_interop_ask() {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let ts = ThreadActorSystem::shared(Default::default());
     facade
         .register_thread_system("eng".into(), ts.clone(), true)
@@ -148,9 +159,11 @@ fn cabi_smoke_dlopen() {
     let so = std::env::temp_dir().join(format!("libpl_smoke_{}.dylib", std::process::id()));
     let build = std::process::Command::new(&cc)
         .args(["-std=c++17", "-shared", "-fPIC", "-Wall"])
-        .arg("-I").arg(&dir)
+        .arg("-I")
+        .arg(&dir)
         .arg(dir.join("parrot_lite.cpp"))
-        .arg("-o").arg(&so)
+        .arg("-o")
+        .arg(&so)
         .output()
         .expect("spawn compiler");
     assert!(
@@ -200,7 +213,11 @@ unsafe extern "C" {
 /// 自环回归（不依赖 C++ 工具链——CI 基线锚点）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cpp_echo_selftest() {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let ts = ThreadActorSystem::shared(Default::default());
     facade
         .register_thread_system("eng".into(), ts.clone(), true)
@@ -213,9 +230,12 @@ async fn cpp_echo_selftest() {
         .get_actor(&ActorPath::placeholder("/user/echo"))
         .await
         .unwrap();
-    let r = tokio::time::timeout(Duration::from_secs(3), echo.send(Box::new(CppEcho(vec![9, 8, 7]))))
-        .await
-        .unwrap()
-        .unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        echo.send(Box::new(CppEcho(vec![9, 8, 7]))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(r.downcast_ref::<CppEcho>().unwrap().0, vec![9, 8, 7]);
 }

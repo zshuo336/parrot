@@ -15,7 +15,12 @@ fn main() {
     match cmd {
         "composegen" => {
             let mut cfg = ComposeGenConfig::fifty_clusters();
-            parse_common(&args, &mut cfg.clusters, &mut cfg.nodes_per_cluster, &mut cfg.fold);
+            parse_common(
+                &args,
+                &mut cfg.clusters,
+                &mut cfg.nodes_per_cluster,
+                &mut cfg.fold,
+            );
             if let Some(pos) = args.iter().position(|a| a == "--out") {
                 cfg.output = Output::File(args[pos + 1].clone());
             }

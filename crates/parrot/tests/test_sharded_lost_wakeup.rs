@@ -101,7 +101,10 @@ fn sharded_no_lost_wakeup_under_concurrent_ask_storm() {
             // warmup
             for r in &refs {
                 for _ in 0..200 {
-                    let rep = r.ask(Box::new(Echo { value: 1 }) as BoxedMessage).await.unwrap();
+                    let rep = r
+                        .ask(Box::new(Echo { value: 1 }) as BoxedMessage)
+                        .await
+                        .unwrap();
                     let _ = Echo::extract_result(rep).unwrap();
                 }
             }
@@ -113,7 +116,9 @@ fn sharded_no_lost_wakeup_under_concurrent_ask_storm() {
                     for k in 0..PER {
                         let rep = r
                             .ask_with_timeout(
-                                Box::new(Echo { value: i as u64 * 1000 + k }) as BoxedMessage,
+                                Box::new(Echo {
+                                    value: i as u64 * 1000 + k,
+                                }) as BoxedMessage,
                                 Duration::from_secs(30),
                             )
                             .await
@@ -132,9 +137,12 @@ fn sharded_no_lost_wakeup_under_concurrent_ask_storm() {
             for (i, o) in ops.iter().enumerate() {
                 let n = o.load(std::sync::atomic::Ordering::Relaxed);
                 assert_eq!(
-                    n, PER + 200,
+                    n,
+                    PER + 200,
                     "actor {} processed {} != {} — messages stranded (lost wakeup)",
-                    i, n, PER + 200
+                    i,
+                    n,
+                    PER + 200
                 );
             }
             println!(

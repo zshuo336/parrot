@@ -45,9 +45,18 @@ pub enum AdminCommand {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AdminReply {
-    Spawned { req_id: u64, path: String },
-    Failed { req_id: u64, code: u16, detail: String },
-    Stopped { req_id: u64 },
+    Spawned {
+        req_id: u64,
+        path: String,
+    },
+    Failed {
+        req_id: u64,
+        code: u16,
+        detail: String,
+    },
+    Stopped {
+        req_id: u64,
+    },
 }
 
 impl AdminCommand {
@@ -126,14 +135,14 @@ parrot_api::message::inventory::collect!(PropsFactory);
 
 /// 按名查工厂（目标节点侧）。
 pub fn find_factory(name: &str) -> Option<&'static PropsFactory> {
-    parrot_api::message::inventory::iter::<PropsFactory>()
-        .find(|f| f.name == name)
+    parrot_api::message::inventory::iter::<PropsFactory>().find(|f| f.name == name)
 }
 
 /// admin 回执路由：req_id → oneshot（发起方挂起等待）。
 #[derive(Default)]
 pub struct AdminPending {
-    inner: std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<AdminReply>>>,
+    inner:
+        std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<AdminReply>>>,
 }
 
 impl AdminPending {
@@ -141,7 +150,11 @@ impl AdminPending {
         self.inner.lock().unwrap().insert(req_id, tx);
     }
     pub fn complete(&self, r: AdminReply) -> bool {
-        self.inner.lock().unwrap().remove(&r.req_id()).is_some_and(|tx| tx.send(r).is_ok())
+        self.inner
+            .lock()
+            .unwrap()
+            .remove(&r.req_id())
+            .is_some_and(|tx| tx.send(r).is_ok())
     }
     pub fn fail_all(&self, detail: &str) {
         for (_, tx) in self.inner.lock().unwrap().drain() {
@@ -322,9 +335,7 @@ mod tests {
     }
 
     // PropsFactory inventory 注册与查找
-    fn noop_spawn(
-        _path: &str,
-    ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
+    fn noop_spawn(_path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
         Box::pin(async { Err(parrot_api::errors::ActorError::InternalError("noop".into())) })
     }
 
@@ -347,7 +358,10 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         p.insert(42, tx);
         assert!(p.complete(AdminReply::Stopped { req_id: 42 }));
-        assert!(matches!(rx.blocking_recv(), Ok(AdminReply::Stopped { req_id: 42 })));
+        assert!(matches!(
+            rx.blocking_recv(),
+            Ok(AdminReply::Stopped { req_id: 42 })
+        ));
         // 迟到回执 false
         assert!(!p.complete(AdminReply::Stopped { req_id: 42 }));
     }

@@ -22,9 +22,7 @@ impl Echo {
     }
 }
 
-fn spawn_echo(
-    _path: &str,
-) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
+fn spawn_echo(_path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
     Box::pin(async { Ok(Box::new(EchoRef) as BoxedActorRef) })
 }
 
@@ -84,10 +82,7 @@ impl LocalLookup for TestLookup {
     }
 }
 
-async fn mem_pair(
-    a_id: &str,
-    b_id: &str,
-) -> (Arc<RemoteActorSystem>, Arc<RemoteActorSystem>) {
+async fn mem_pair(a_id: &str, b_id: &str) -> (Arc<RemoteActorSystem>, Arc<RemoteActorSystem>) {
     let ra = RemoteActorSystem::new(RemoteConfig::mem(a_id), Arc::new(TestLookup)).unwrap();
     let rb = RemoteActorSystem::new(RemoteConfig::mem(b_id), Arc::new(TestLookup)).unwrap();
     ra.start().await.unwrap();
@@ -121,7 +116,10 @@ async fn spawn_named_unknown_props() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("not registered"), "got {msg:?}");
-    assert!(msg.contains('4') || msg.contains("NotRemotable"), "code=4 NotRemotable: {msg:?}");
+    assert!(
+        msg.contains('4') || msg.contains("NotRemotable"),
+        "code=4 NotRemotable: {msg:?}"
+    );
 }
 
 /// `admin_stop_with_receipt`：回执到达且目标 actor 已 stop。
@@ -132,7 +130,9 @@ async fn admin_stop_with_receipt() {
     ra.spawn_named("adm-sb", "/user/echo", "test.echo")
         .await
         .unwrap();
-    ra.admin_stop("adm-sb", "/user/echo").await.expect("admin stop receipt");
+    ra.admin_stop("adm-sb", "/user/echo")
+        .await
+        .expect("admin stop receipt");
 }
 
 /// `spawn_path_conflict`：同路径已存在 → Failed(ProtocolViolation, "path exists")。

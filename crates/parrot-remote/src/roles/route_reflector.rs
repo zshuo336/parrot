@@ -41,12 +41,19 @@ impl RouteReflector {
     ///
     /// 返回需要扇出给**其它** client 的增量（(client, entries) 列表——
     /// 宿主逐个发送 RouteGossip）。
-    pub fn reflect_from(&mut self, client: &str, gossip: &RouteGossip, origin: &str) -> Vec<(String, Vec<RouteEntry>)> {
+    pub fn reflect_from(
+        &mut self,
+        client: &str,
+        gossip: &RouteGossip,
+        origin: &str,
+    ) -> Vec<(String, Vec<RouteEntry>)> {
         let mut accepted: Vec<RouteEntry> = Vec::new();
         for e in &gossip.entries {
             // 最优合并（高 version 低 cost——同 F2 RouteTable 语义）先判
             let better = match self.table.get(&e.prefix) {
-                Some(cur) => e.version > cur.version || (e.version == cur.version && e.cost < cur.cost),
+                Some(cur) => {
+                    e.version > cur.version || (e.version == cur.version && e.cost < cur.cost)
+                }
                 None => true,
             };
             if !better {
@@ -59,7 +66,9 @@ impl RouteReflector {
             }
             // 防环：同 origin 同 version 已见过 → 跳过（回灌抑制）
             let origins = self.seen_origins.entry(e.prefix.clone()).or_default();
-            if origins.contains(origin) && self.table.get(&e.prefix).map(|c| c.version) == Some(e.version) {
+            if origins.contains(origin)
+                && self.table.get(&e.prefix).map(|c| c.version) == Some(e.version)
+            {
                 continue;
             }
             origins.insert(origin.to_string());
@@ -143,15 +152,24 @@ mod tests {
     #[test]
     fn reflect_best_version_wins() {
         let mut rr = RouteReflector::new("rr", vec!["b1".into(), "b2".into()]);
-        let g1 = RouteGossip { entries: vec![entry("p/", "b1", 1, 5)], digest: 0 };
+        let g1 = RouteGossip {
+            entries: vec![entry("p/", "b1", 1, 5)],
+            digest: 0,
+        };
         let out1 = rr.reflect_from("b1", &g1, "o1");
         assert_eq!(out1.len(), 1);
         // 旧版本从另一 origin 来 → 拒
-        let g2 = RouteGossip { entries: vec![entry("p/", "b2", 1, 4)], digest: 0 };
+        let g2 = RouteGossip {
+            entries: vec![entry("p/", "b2", 1, 4)],
+            digest: 0,
+        };
         let out2 = rr.reflect_from("b2", &g2, "o2");
         assert!(out2.is_empty(), "stale version not reflected");
         // 新版本 → 纳
-        let g3 = RouteGossip { entries: vec![entry("p/", "b2", 1, 6)], digest: 0 };
+        let g3 = RouteGossip {
+            entries: vec![entry("p/", "b2", 1, 6)],
+            digest: 0,
+        };
         let out3 = rr.reflect_from("b2", &g3, "o2");
         assert_eq!(out3.len(), 1);
         assert_eq!(rr.table["p/"].version, 6);

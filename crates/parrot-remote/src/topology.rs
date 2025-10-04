@@ -141,8 +141,7 @@ impl RouteTable {
         for e in &gossip.entries {
             let accept = match self.entries.get(&e.prefix) {
                 Some(cur) => {
-                    e.version > cur.version
-                        || (e.version == cur.version && e.cost < cur.cost)
+                    e.version > cur.version || (e.version == cur.version && e.cost < cur.cost)
                 }
                 None => true,
             };
@@ -165,7 +164,9 @@ impl RouteTable {
 
     /// 直连端点存在性（hybrid 直连优先判据）。
     pub fn direct_to(&self, node: &str) -> bool {
-        self.entries.values().any(|e| e.next_hop == node && e.cost == 1)
+        self.entries
+            .values()
+            .any(|e| e.next_hop == node && e.cost == 1)
     }
 }
 
@@ -359,7 +360,10 @@ mod tests {
             t.resolve("parrot://eu-1/user/x").unwrap().next_hop,
             "node-eu-1"
         );
-        assert_eq!(t.resolve("parrot://eu-1/system/y").unwrap().next_hop, "hub-eu");
+        assert_eq!(
+            t.resolve("parrot://eu-1/system/y").unwrap().next_hop,
+            "hub-eu"
+        );
         assert!(t.resolve("parrot://us-9/").is_none());
     }
 
@@ -450,18 +454,8 @@ mod tests {
         // 12k 明细：eu-1/user/0..5999（hub-eu）、eu-1/system/0..5999（hub-eu）
         let mut entries = Vec::new();
         for i in 0..6000 {
-            entries.push(entry(
-                &format!("parrot://eu-1/user/{i}/"),
-                "hub-eu",
-                2,
-                1,
-            ));
-            entries.push(entry(
-                &format!("parrot://eu-1/system/{i}/"),
-                "hub-eu",
-                2,
-                1,
-            ));
+            entries.push(entry(&format!("parrot://eu-1/user/{i}/"), "hub-eu", 2, 1));
+            entries.push(entry(&format!("parrot://eu-1/system/{i}/"), "hub-eu", 2, 1));
         }
         let r = agg.compact(&entries);
         assert_eq!(r.before, 12_000);
@@ -585,9 +579,7 @@ mod tests {
         assert_eq!(advertised.len(), 1);
         // 明细不外泄：对外表中无节点级前缀
         assert!(
-            advertised
-                .iter()
-                .all(|e| !e.prefix.contains("user-")),
+            advertised.iter().all(|e| !e.prefix.contains("user-")),
             "集群内明细不外泄"
         );
         // 全联邦路由表 = 集群数级（100 vs 5 万——500 倍压缩）

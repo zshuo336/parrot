@@ -344,7 +344,11 @@ mod tests {
         let arch = twin.architecture(per_addr_ns);
         assert_eq!(arch.total_nodes, 1_000_000);
         // 内存：200B × 1M = 200MB ≤ 预算 200MB（边界含——保守模型）
-        assert!(arch.memory_within_budget, "内存 {}B 超预算", arch.total_memory_bytes);
+        assert!(
+            arch.memory_within_budget,
+            "内存 {}B 超预算",
+            arch.total_memory_bytes
+        );
         // 孪生自身零物化
         assert_eq!(arch.twin_materialized_bytes, 0);
         // 遍历外推 ≤10min（G5 门禁）
@@ -397,23 +401,23 @@ mod tests {
             ..Default::default()
         });
         let bad = [
-            "",                                     // 空
-            "parrot://",                            // 无 realm
-            "parrot://fed",                         // 无集群段
-            "parrot://fed/",                        // 残缺集群段
-            "parrot://fed/c",                       // 无节点段
-            "parrot://fed/c/",                      // 残缺节点段
-            "parrot://fed/cX/n1",                   // 集群非数字
-            "parrot://fed/c1/nX",                   // 节点非数字
-            "parrot://fed/c1/n1/extra",             // 尾部多余段
-            "parrot://fed/c-1/n1",                  // 负数
-            "parrot://fed/c01/n1",                  // 前导零（当前规范不允许——收紧）
-            "PARROT://fed/c1/n1",                   // 大小写
-            "parrot://FED/c1/n1",                   // realm 大小写
-            "parrot://fed/c1/n1 ",                  // 尾随空格
-            " parrot://fed/c1/n1",                  // 前导空格
-            "parrot:///c1/n1",                      // 空 realm
-            "parrot://fed//n1",                     // 空集群段
+            "",                         // 空
+            "parrot://",                // 无 realm
+            "parrot://fed",             // 无集群段
+            "parrot://fed/",            // 残缺集群段
+            "parrot://fed/c",           // 无节点段
+            "parrot://fed/c/",          // 残缺节点段
+            "parrot://fed/cX/n1",       // 集群非数字
+            "parrot://fed/c1/nX",       // 节点非数字
+            "parrot://fed/c1/n1/extra", // 尾部多余段
+            "parrot://fed/c-1/n1",      // 负数
+            "parrot://fed/c01/n1",      // 前导零（当前规范不允许——收紧）
+            "PARROT://fed/c1/n1",       // 大小写
+            "parrot://FED/c1/n1",       // realm 大小写
+            "parrot://fed/c1/n1 ",      // 尾随空格
+            " parrot://fed/c1/n1",      // 前导空格
+            "parrot:///c1/n1",          // 空 realm
+            "parrot://fed//n1",         // 空集群段
         ];
         for addr in bad {
             assert_eq!(
@@ -448,6 +452,8 @@ mod tests {
             assert_eq!(exp.endpoint, format!("tcp://10.{cluster}.{}:7", node % 256));
         }
         // 域外一点
-        assert!(twin.expected_of(&cfg.address_of(cfg.total_nodes())).is_none());
+        assert!(twin
+            .expected_of(&cfg.address_of(cfg.total_nodes()))
+            .is_none());
     }
 }
