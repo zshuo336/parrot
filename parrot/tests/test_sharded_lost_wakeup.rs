@@ -15,7 +15,6 @@ use parrot::thread::config::{SchedulingMode, ThreadActorConfig, ThreadActorSyste
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::address::ActorRef as ActorRefTrait;
 use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};

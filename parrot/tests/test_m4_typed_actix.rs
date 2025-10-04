@@ -207,7 +207,7 @@ fn m4_actix_static_actors_run_in_parallel() {
         let _ = probe.ask(Burn(2_000_000)).await.unwrap();
         let per_iter = t.elapsed().as_secs_f64() / 2_000_000.0;
         let work_per_actor = ((0.06 / per_iter) as u64).max(1_000_000);
-        let WORK: u64 = work_per_actor;
+        let work: u64 = work_per_actor;
 
         let refs: Vec<_> = {
             let mut v = Vec::new();
@@ -223,7 +223,7 @@ fn m4_actix_static_actors_run_in_parallel() {
 
         // 并行发起全部 ask
         let t0 = Instant::now();
-        let futs: Vec<_> = refs.iter().map(|r| r.ask(Burn(WORK))).collect();
+        let futs: Vec<_> = refs.iter().map(|r| r.ask(Burn(work))).collect();
         let results = futures::future::join_all(futs).await;
         let parallel = t0.elapsed();
 
@@ -238,7 +238,7 @@ fn m4_actix_static_actors_run_in_parallel() {
             .await
             .unwrap();
         let t1 = Instant::now();
-        let _ = one.ask(Burn(WORK * ACTORS as u64)).await.unwrap();
+        one.ask(Burn(work * ACTORS as u64)).await.unwrap();
         let serial = t1.elapsed();
 
         // 并行应不慢于串行的 1.2 倍（CI 抖动容忍；理想是 ~4x 加速）。
