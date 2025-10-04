@@ -14,5 +14,11 @@ tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
+actix = "0.13"
+actix-rt = "2"
+futures = "0.3"
+
+[dev-dependencies]
+parrot-api-derive = { path = "../../parrot-api-derive" }
 
 [profile.release]

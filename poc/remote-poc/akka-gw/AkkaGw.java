@@ -64,7 +64,8 @@ public class AkkaGw {
         writer.start();
 
         // 主动 ask rust 侧（双向验证）
-        Executors.newSingleThreadScheduledExecutor().schedule(() -> {
+        ScheduledExecutorService sched = Executors.newSingleThreadScheduledExecutor();
+        sched.schedule(() -> {
             try {
                 long cid = ++cidSeq;
                 pending.put(cid, new CompletableFuture<>());
@@ -78,6 +79,26 @@ public class AkkaGw {
                 System.out.println("[akka-gw] ask rust failed: " + e);
             }
         }, 1, TimeUnit.SECONDS);
+
+        // P4 mesh 中继验证：args[1] = 中继目标路径（如 /erl/user/erlang_service）。
+        // 该 ask 经 parrot hub 前缀路由转发给另一个运行时，验证网关两两互访。
+        if (args.length > 1) {
+            String relayTarget = args[1];
+            sched.schedule(() -> {
+                try {
+                    long cid = ++cidSeq;
+                    pending.put(cid, new CompletableFuture<>());
+                    outQ.add(buildFrame(ASK, cid,
+                            relayTarget.getBytes(StandardCharsets.UTF_8),
+                            "bin:u:Ping".getBytes(StandardCharsets.UTF_8),
+                            writeU64(100)));
+                    byte[] reply = pending.get(cid).get(8, TimeUnit.SECONDS);
+                    System.out.println("[akka-gw] relay ask " + relayTarget + " Ping(100) -> " + readU64(reply, 0));
+                } catch (Exception e) {
+                    System.out.println("[akka-gw] relay ask failed: " + e);
+                }
+            }, 2, TimeUnit.SECONDS);
+        }
 
         // 读循环
         while (true) {
