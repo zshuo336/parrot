@@ -113,7 +113,11 @@ impl RemoteActorSystem {
         // 系统级 shutdown 才 fail_all（shutdown() 方法内）。
         let cb2 = callbacks.clone();
         let dis: OnDisconnect = Arc::new(move |node_id: &str| {
-            cb2.fail_node(node_id, crate::error::ErrCode::ConnectionLost, "connection lost");
+            cb2.fail_node(
+                node_id,
+                crate::error::ErrCode::ConnectionLost,
+                "connection lost",
+            );
         });
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         // K1/S1：成员表挂系统（钩子合并 + 驱动读取同一实例）
@@ -227,7 +231,11 @@ impl RemoteActorSystem {
             let peer_dis: OnDisconnect = {
                 let cb = peer_sys.callbacks.clone();
                 Arc::new(move |down: &str| {
-                    cb.fail_node(down, crate::error::ErrCode::ConnectionLost, "connection lost");
+                    cb.fail_node(
+                        down,
+                        crate::error::ErrCode::ConnectionLost,
+                        "connection lost",
+                    );
                     let _ = neighbor;
                 })
             };
@@ -258,7 +266,11 @@ impl RemoteActorSystem {
         let my_dis: OnDisconnect = {
             let cb = self.callbacks.clone();
             Arc::new(move |down: &str| {
-                cb.fail_node(down, crate::error::ErrCode::ConnectionLost, "connection lost");
+                cb.fail_node(
+                    down,
+                    crate::error::ErrCode::ConnectionLost,
+                    "connection lost",
+                );
             })
         };
         let my_conn = crate::transport::run_connection(
@@ -301,7 +313,10 @@ impl RemoteActorSystem {
         self.nodes.add_seed(NodeAddr {
             node_id: conn.node_id.clone(),
             scheme: conn.info.scheme.to_string(),
-            addr: conn.info.peer.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+            addr: conn
+                .info
+                .peer
+                .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
         });
         let _ = status;
         // 关闭信号 → 移除 link + Disconnected（回调可能早于 NodeTable 填充——容忍）
@@ -318,9 +333,7 @@ impl RemoteActorSystem {
     }
 
     /// 已建链路快照（测试/诊断观测点——node_id + sender + 状态）。
-    pub async fn links_snapshot(
-        &self,
-    ) -> Vec<(String, FrameSender, Arc<NodeStatus>)> {
+    pub async fn links_snapshot(&self) -> Vec<(String, FrameSender, Arc<NodeStatus>)> {
         self.links.lock().await.clone()
     }
 
@@ -336,7 +349,8 @@ impl RemoteActorSystem {
                 .map(|(n, s, st)| (n.clone(), s.clone(), st.clone()))
                 .collect(),
             Err(_) => Vec::new(),
-        };        let inner = Arc::new(RemoteInner {
+        };
+        let inner = Arc::new(RemoteInner {
             nodes,
             callbacks: self.callbacks.clone(),
             self_node: self.config.node_id.clone(),
@@ -392,9 +406,9 @@ impl RemoteActorSystem {
                 let full = format!("parrot://{node}{path}");
                 self.remote_ref(&full)
             }
-            crate::admin::AdminReply::Failed { code, detail, .. } => {
-                Err(RemoteError::Transport(format!("spawn failed: {code} {detail}")))
-            }
+            crate::admin::AdminReply::Failed { code, detail, .. } => Err(RemoteError::Transport(
+                format!("spawn failed: {code} {detail}"),
+            )),
             other => Err(RemoteError::Transport(format!(
                 "unexpected admin reply: {other:?}"
             ))),
@@ -415,9 +429,9 @@ impl RemoteActorSystem {
             .await?;
         match reply {
             crate::admin::AdminReply::Stopped { .. } => Ok(()),
-            crate::admin::AdminReply::Failed { code, detail, .. } => {
-                Err(RemoteError::Transport(format!("admin stop failed: {code} {detail}")))
-            }
+            crate::admin::AdminReply::Failed { code, detail, .. } => Err(RemoteError::Transport(
+                format!("admin stop failed: {code} {detail}"),
+            )),
             other => Err(RemoteError::Transport(format!(
                 "unexpected admin reply: {other:?}"
             ))),
@@ -459,7 +473,9 @@ impl RemoteActorSystem {
             payload,
         };
         if sender.send(frame).await.is_err() {
-            return Err(RemoteError::Transport("admin send failed (link down)".into()));
+            return Err(RemoteError::Transport(
+                "admin send failed (link down)".into(),
+            ));
         }
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(r)) => Ok(r),
@@ -500,12 +516,7 @@ struct AdminHook {
 
 #[async_trait::async_trait]
 impl crate::ingress::SysEventHook for AdminHook {
-    async fn on_event(
-        &self,
-        event: crate::admin::SysEvent,
-        back: &FrameSender,
-        _from: &str,
-    ) {
+    async fn on_event(&self, event: crate::admin::SysEvent, back: &FrameSender, _from: &str) {
         match event {
             crate::admin::SysEvent::AdminCommand(cmd) => {
                 if !crate::admin::admin_allowed(_from) {

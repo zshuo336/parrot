@@ -62,7 +62,9 @@ impl QuicTransport {
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.endpoint.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+        self.endpoint
+            .local_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
     }
 
     /// uni 流扩展点（P3 反压优化：每 ask 一条 uni 流）。
@@ -242,7 +244,10 @@ mod tests {
         let (sd_a, _) = tokio::sync::watch::channel(false);
         let (sd_b, _) = tokio::sync::watch::channel(false);
         let tb = QuicTransport::new(
-            HandshakeBody { node_id: "quic-b".into(), ..Default::default() },
+            HandshakeBody {
+                node_id: "quic-b".into(),
+                ..Default::default()
+            },
             in_b,
             noop.clone(),
             sd_b,
@@ -251,7 +256,10 @@ mod tests {
         )
         .unwrap();
         let ta = QuicTransport::new(
-            HandshakeBody { node_id: "quic-a".into(), ..Default::default() },
+            HandshakeBody {
+                node_id: "quic-a".into(),
+                ..Default::default()
+            },
             in_a,
             noop,
             sd_a,
@@ -268,7 +276,13 @@ mod tests {
 
         conn_a
             .sender
-            .send(Frame::ask(1, "/u/echo", "bin:x::P", bytes::Bytes::from_static(b"P"), None))
+            .send(Frame::ask(
+                1,
+                "/u/echo",
+                "bin:x::P",
+                bytes::Bytes::from_static(b"P"),
+                None,
+            ))
             .await
             .unwrap();
         let (got, _, _) = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())

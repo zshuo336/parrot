@@ -289,10 +289,7 @@ mod tests {
     impl Actor for RecActor {
         type Config = EmptyConfig;
         type Context = dyn ActorContext;
-        fn init<'a>(
-            &'a mut self,
-            _c: &'a mut Self::Context,
-        ) -> BoxedFuture<'a, ActorResult<()>> {
+        fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async { Ok(()) })
         }
         fn receive_message<'a>(
@@ -319,9 +316,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl StreamHandler<futures::stream::Iter<std::vec::IntoIter<u64>>, NullCtx>
-        for CollectHandler
-    {
+    impl StreamHandler<futures::stream::Iter<std::vec::IntoIter<u64>>, NullCtx> for CollectHandler {
         async fn handle(&mut self, item: u64, _ctx: &mut NullCtx) {
             self.items.push(item);
         }
@@ -394,7 +389,8 @@ mod tests {
             err: None,
         };
         let mut ctx = NullCtx;
-        h.handle_error(ActorError::Panic("x".into()), &mut ctx).await;
+        h.handle_error(ActorError::Panic("x".into()), &mut ctx)
+            .await;
         assert_eq!(h.err.as_deref(), Some("Panic: x"));
     }
 
@@ -445,11 +441,8 @@ mod tests {
         assert_eq!(*v, 1);
 
         // add_stream_with_handler：handler 也装箱（具体化 S/C 类型）
-        reg.add_stream_with_handler::<_, _, NullCtx>(
-            stream::iter(vec![9u64]),
-            DefaultHooksHandler,
-        )
-        .unwrap();
+        reg.add_stream_with_handler::<_, _, NullCtx>(stream::iter(vec![9u64]), DefaultHooksHandler)
+            .unwrap();
         assert_eq!(reg.streams.len(), 1);
         assert_eq!(reg.handlers.len(), 1);
     }

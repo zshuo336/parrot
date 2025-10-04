@@ -179,7 +179,10 @@ mod tests {
     fn acquire_and_renew() {
         let mut l = SingletonLease::new(cand("a", 1), LeaseParams::default());
         let t0 = Instant::now();
-        assert_eq!(l.tick(t0, true), Some(SingletonTransition::Acquired(cand("a", 1))));
+        assert_eq!(
+            l.tick(t0, true),
+            Some(SingletonTransition::Acquired(cand("a", 1)))
+        );
         assert_eq!(l.state(), SingletonState::Leader);
         // renew 3s 后仍 Leader（租约延至 t+13s）
         l.tick(t0 + Duration::from_secs(3), true);
@@ -193,8 +196,10 @@ mod tests {
         let mut l = SingletonLease::new(cand("a", 1), LeaseParams::default());
         let t0 = Instant::now();
         l.tick(t0, true);
-        assert_eq!(l.tick(t0 + Duration::from_secs(3), false),
-                   Some(SingletonTransition::SteppedDown(cand("a", 1))));
+        assert_eq!(
+            l.tick(t0 + Duration::from_secs(3), false),
+            Some(SingletonTransition::SteppedDown(cand("a", 1)))
+        );
         assert_eq!(l.state(), SingletonState::Vacant);
     }
 
@@ -212,7 +217,10 @@ mod tests {
         // 过期后（t0+10s）b 可接管——门禁：kill 后 ≤13s
         let t_take = t0 + Duration::from_secs(10);
         let wait = t_take.duration_since(t0);
-        assert!(wait <= Duration::from_secs(13), "takeover wait {wait:?} > 13s gate");
+        assert!(
+            wait <= Duration::from_secs(13),
+            "takeover wait {wait:?} > 13s gate"
+        );
         assert_eq!(
             l.tick(t_take, true),
             Some(SingletonTransition::Acquired(cand("b", 5)))
@@ -245,6 +253,10 @@ mod tests {
         for t in 0..20 {
             assert_eq!(l.tick(t0 + Duration::from_secs(t), false), None);
         }
-        assert_eq!(l.state(), SingletonState::Vacant, "minority side must not lead");
+        assert_eq!(
+            l.state(),
+            SingletonState::Vacant,
+            "minority side must not lead"
+        );
     }
 }

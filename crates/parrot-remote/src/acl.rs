@@ -109,8 +109,8 @@ impl RouteAcl {
             }
             None => {
                 // 无条目：同 realm 直通；跨 realm 按默认策略
-                let same = target_prefix.starts_with(&format!("{src_realm}/"))
-                    || src_realm.is_empty();
+                let same =
+                    target_prefix.starts_with(&format!("{src_realm}/")) || src_realm.is_empty();
                 if same || !self.default_deny_cross_realm {
                     AclDecision::Allow
                 } else {
@@ -193,12 +193,24 @@ mod tests {
     fn cross_realm_denied() {
         let r = route_rules();
         // 未列 realm 访问受保护前缀 → 拒
-        assert_eq!(r.check_route("us-realm", "parrot://eu-1/user/x"), AclDecision::Deny);
+        assert_eq!(
+            r.check_route("us-realm", "parrot://eu-1/user/x"),
+            AclDecision::Deny
+        );
         // 收窄子前缀：admin 只允许 eu
-        assert_eq!(r.check_route("cn-realm", "parrot://eu-1/admin/secret"), AclDecision::Deny);
+        assert_eq!(
+            r.check_route("cn-realm", "parrot://eu-1/admin/secret"),
+            AclDecision::Deny
+        );
         // 授权放行
-        assert_eq!(r.check_route("cn-realm", "parrot://eu-1/user/x"), AclDecision::Allow);
-        assert_eq!(r.check_route("eu-realm", "parrot://eu-1/admin/ops"), AclDecision::Allow);
+        assert_eq!(
+            r.check_route("cn-realm", "parrot://eu-1/user/x"),
+            AclDecision::Allow
+        );
+        assert_eq!(
+            r.check_route("eu-realm", "parrot://eu-1/admin/ops"),
+            AclDecision::Allow
+        );
     }
 
     // 无条目前缀：跨 realm 默认拒；无 realm 单集群直通
@@ -208,13 +220,17 @@ mod tests {
         // 无 realm 标识（单集群/本地域）→ 直通
         assert_eq!(r.check_route("", "parrot://us-1/x"), AclDecision::Allow);
         // 跨 realm 无条目 → 默认拒绝
-        assert_eq!(r.check_route("us-realm", "parrot://ap-1/x"), AclDecision::Deny);
+        assert_eq!(
+            r.check_route("us-realm", "parrot://ap-1/x"),
+            AclDecision::Deny
+        );
         // 显式关闭默认拒绝（可信内网形态）
-        let open = RouteAcl::from_json(
-            r#"{"routes": {}, "default_deny_cross_realm": false}"#,
-        )
-        .unwrap();
-        assert_eq!(open.check_route("us-realm", "parrot://ap-1/x"), AclDecision::Allow);
+        let open =
+            RouteAcl::from_json(r#"{"routes": {}, "default_deny_cross_realm": false}"#).unwrap();
+        assert_eq!(
+            open.check_route("us-realm", "parrot://ap-1/x"),
+            AclDecision::Allow
+        );
         // 通配放行
         let wild = RouteAcl::from_json(
             r#"{"routes": {"parrot://x/": ["*"]}, "default_deny_cross_realm": true}"#,

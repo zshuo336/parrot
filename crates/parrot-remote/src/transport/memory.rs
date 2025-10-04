@@ -47,7 +47,10 @@ impl MemoryTransport {
         let (accept_tx, accept_rx) = mpsc::channel(16);
         let node_id = handshake.node_id.clone();
         // 同 node_id 后注册覆盖（测试进程内重复构造以最后为准）
-        hub().lock().unwrap().insert(node_id.clone(), accept_tx.clone());
+        hub()
+            .lock()
+            .unwrap()
+            .insert(node_id.clone(), accept_tx.clone());
         Self {
             handshake,
             inbound,

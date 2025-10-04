@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parrot_remote::cache::{resolve_decision, CacheState, ResolveAction, ResolveCache};
+use parrot_remote::cache::{CacheState, ResolveAction, ResolveCache, resolve_decision};
 use parrot_remote::raft::{ManualClock, StateMachine, TestNet};
 use parrot_remote::roles::directory::{DirCmd, DirQuery, DirectoryReplica};
 use parrot_remote::roles::hub::RelayHub;
@@ -38,8 +38,18 @@ fn hub_relay_matrix() {
             let mut routes = RouteTable::new();
             routes.merge(&RouteGossip {
                 entries: vec![
-                    RouteEntry { prefix: "parrot://eu-1/".into(), next_hop: "hub".into(), cost: 2, version: 1 },
-                    RouteEntry { prefix: "parrot://us-1/".into(), next_hop: "us-1".into(), cost: 1, version: 1 },
+                    RouteEntry {
+                        prefix: "parrot://eu-1/".into(),
+                        next_hop: "hub".into(),
+                        cost: 2,
+                        version: 1,
+                    },
+                    RouteEntry {
+                        prefix: "parrot://us-1/".into(),
+                        next_hop: "us-1".into(),
+                        cost: 1,
+                        version: 1,
+                    },
                 ],
                 digest: 0,
             });
@@ -65,9 +75,7 @@ fn hub_relay_matrix() {
             assert_eq!(next2, "us-1");
 
             // hop 门禁：链路 8 跳上限
-            assert!(hub
-                .relay_ask(3, "parrot://eu-1/z", b"", "", 7, 8)
-                .is_err());
+            assert!(hub.relay_ask(3, "parrot://eu-1/z", b"", "", 7, 8).is_err());
         }
     }
 }
@@ -97,7 +105,10 @@ fn directory_full_chain() {
 
     // 全员日志一致
     let lens: Vec<usize> = net.nodes.values().map(|n| n.log.len()).collect();
-    assert!(lens.windows(2).all(|w| w[0] == w[1]), "replicated: {lens:?}");
+    assert!(
+        lens.windows(2).all(|w| w[0] == w[1]),
+        "replicated: {lens:?}"
+    );
     assert_eq!(lens[0], 1);
 
     // apply 到状态机（DirectoryReplica 语义）
@@ -107,7 +118,9 @@ fn directory_full_chain() {
             replica.sm.apply(&e.cmd);
         }
     }
-    let hit = replica.query(&DirQuery::Resolve { prefix_or_node: "eu-1".into() });
+    let hit = replica.query(&DirQuery::Resolve {
+        prefix_or_node: "eu-1".into(),
+    });
     assert_eq!(hit.unwrap().endpoints, vec!["tcp://10.1.0.1:7000"]);
 
     // client 缓存链路：put → hit → INVALIDATE → 重 RESOLVE
@@ -119,7 +132,10 @@ fn directory_full_chain() {
         ResolveAction::DirectCache { .. }
     ));
     cache.invalidate("eu-1");
-    assert!(matches!(resolve_decision(&mut cache, "eu-1", t0), ResolveAction::Resolve { .. }));
+    assert!(matches!(
+        resolve_decision(&mut cache, "eu-1", t0),
+        ResolveAction::Resolve { .. }
+    ));
 }
 
 // ── cross_cluster_via_directory（两集群互访模拟） ──────
@@ -161,8 +177,14 @@ fn cross_cluster_via_directory() {
     )
     .unwrap();
     use parrot_remote::acl::AclDecision;
-    assert_eq!(acl.check_route("eu-realm", "parrot://cn-1/x"), AclDecision::Allow);
-    assert_eq!(acl.check_route("us-realm", "parrot://cn-1/x"), AclDecision::Deny);
+    assert_eq!(
+        acl.check_route("eu-realm", "parrot://cn-1/x"),
+        AclDecision::Allow
+    );
+    assert_eq!(
+        acl.check_route("us-realm", "parrot://cn-1/x"),
+        AclDecision::Deny
+    );
 }
 
 // ── raft_3_node_directory_kill（Directory 高可用：leader kill 追平） ──
@@ -180,7 +202,10 @@ fn raft_3_node_directory_kill() {
     // 写 100 条
     for i in 0..100u32 {
         let cmd = bincode::serde::encode_to_vec(
-            &DirCmd::KeyAggregate { key: format!("k{i}"), nodes: vec![format!("n{i}")] },
+            &DirCmd::KeyAggregate {
+                key: format!("k{i}"),
+                nodes: vec![format!("n{i}")],
+            },
             bincode::config::standard(),
         )
         .unwrap();
@@ -205,7 +230,10 @@ fn raft_3_node_directory_kill() {
     let l2 = net.leader().expect("re-elected").clone();
     // 新主继续写
     let cmd = bincode::serde::encode_to_vec(
-        &DirCmd::Upsert { node: "new".into(), endpoints: vec!["tcp://n:1".into()] },
+        &DirCmd::Upsert {
+            node: "new".into(),
+            endpoints: vec!["tcp://n:1".into()],
+        },
         bincode::config::standard(),
     )
     .unwrap();
@@ -228,7 +256,9 @@ fn stale_service_300s() {
     for secs in [100u64, 200, 299] {
         assert_eq!(
             resolve_decision(&mut c, "parrot://svc", t0 + Duration::from_secs(secs)),
-            ResolveAction::TryDirectElseResolve { endpoint: "tcp://1.2.3.4:7".into() },
+            ResolveAction::TryDirectElseResolve {
+                endpoint: "tcp://1.2.3.4:7".into()
+            },
             "stale at {secs}s"
         );
     }
@@ -237,6 +267,8 @@ fn stale_service_300s() {
         resolve_decision(&mut c, "parrot://svc", t0 + Duration::from_secs(301)),
         ResolveAction::Resolve { .. }
     ));
-    let (_, state) = c.get("parrot://svc", t0 + Duration::from_secs(150)).unwrap();
+    let (_, state) = c
+        .get("parrot://svc", t0 + Duration::from_secs(150))
+        .unwrap();
     assert_eq!(state, CacheState::Stale);
 }

@@ -19,7 +19,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -92,9 +96,15 @@ impl Wal {
             let mut off = 0usize;
             let mut good_end = 0usize;
             while off + 8 <= data.len() {
-                let len = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-                    as usize;
-                let crc = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+                let len =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                let crc = u32::from_le_bytes([
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]);
                 if off + 8 + len > data.len() {
                     break; // 尾部不完整 → 截断
                 }
@@ -158,7 +168,9 @@ impl Wal {
         frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32(&body).to_le_bytes());
         frame.extend_from_slice(&body);
-        g.file.write_all(&frame).map_err(|e| format!("wal write: {e}"))?;
+        g.file
+            .write_all(&frame)
+            .map_err(|e| format!("wal write: {e}"))?;
         g.seg_bytes += frame.len() as u64;
         g.pending.push(rec);
         // 段滚动
@@ -176,7 +188,12 @@ impl Wal {
 
     /// 组提交 flush（proxy 定时 10ms 或批量后调）。
     pub fn flush(&self) -> Result<(), String> {
-        self.inner.lock().unwrap().file.flush().map_err(|e| format!("wal flush: {e}"))
+        self.inner
+            .lock()
+            .unwrap()
+            .file
+            .flush()
+            .map_err(|e| format!("wal flush: {e}"))
     }
 
     /// 同步落盘（崩溃安全点）。
@@ -207,14 +224,15 @@ impl Wal {
         frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32(&body).to_le_bytes());
         frame.extend_from_slice(&body);
-        g.file.write_all(&frame).map_err(|e| format!("wal write ack: {e}"))?;
+        g.file
+            .write_all(&frame)
+            .map_err(|e| format!("wal write ack: {e}"))?;
         g.seg_bytes += frame.len() as u64;
 
         // 水位更新 + pending 清理（≤seq 的记录已确认）
         g.acked.insert((endpoint.into(), sender.into()), seq);
-        g.pending.retain(|r| {
-            !(r.endpoint == endpoint && r.sender == sender && r.seq <= seq)
-        });
+        g.pending
+            .retain(|r| !(r.endpoint == endpoint && r.sender == sender && r.seq <= seq));
         // 段清理：pending 为空时删除非当前段（整段删除——无逐条空洞）
         if g.pending.is_empty() {
             let cur = g.seg_id;

@@ -148,7 +148,10 @@ fn decode_common(tlvs: &[(u8, Vec<u8>)]) -> Result<HandshakeBody, HandshakeError
     let capabilities = take_one(tlvs, tlv_tag::CAPABILITIES)?
         .ok_or(HandshakeError::MissingRequired(tlv_tag::CAPABILITIES))?;
     if capabilities.1.len() != 4 {
-        return Err(HandshakeError::BadLen(tlv_tag::CAPABILITIES, capabilities.1.len()));
+        return Err(HandshakeError::BadLen(
+            tlv_tag::CAPABILITIES,
+            capabilities.1.len(),
+        ));
     }
     let capabilities = u32::from_le_bytes([
         capabilities.1[0],
@@ -159,7 +162,10 @@ fn decode_common(tlvs: &[(u8, Vec<u8>)]) -> Result<HandshakeBody, HandshakeError
     let max_frame_len = take_one(tlvs, tlv_tag::MAX_FRAME_LEN)?
         .ok_or(HandshakeError::MissingRequired(tlv_tag::MAX_FRAME_LEN))?;
     if max_frame_len.1.len() != 4 {
-        return Err(HandshakeError::BadLen(tlv_tag::MAX_FRAME_LEN, max_frame_len.1.len()));
+        return Err(HandshakeError::BadLen(
+            tlv_tag::MAX_FRAME_LEN,
+            max_frame_len.1.len(),
+        ));
     }
     let max_frame_len = u32::from_le_bytes([
         max_frame_len.1[0],
@@ -175,11 +181,15 @@ fn decode_common(tlvs: &[(u8, Vec<u8>)]) -> Result<HandshakeBody, HandshakeError
     let topology_role = TopologyRole::from_u8(role.1[0])
         .ok_or(HandshakeError::BadLen(tlv_tag::TOPOLOGY_ROLE, 99))?;
     let realm = match take_one(tlvs, tlv_tag::REALM)? {
-        Some((_, v)) => Some(String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::REALM))?),
+        Some((_, v)) => {
+            Some(String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::REALM))?)
+        }
         None => None,
     };
     let cluster = match take_one(tlvs, tlv_tag::CLUSTER)? {
-        Some((_, v)) => Some(String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::CLUSTER))?),
+        Some((_, v)) => {
+            Some(String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::CLUSTER))?)
+        }
         None => None,
     };
     let hop_limit = match take_one(tlvs, tlv_tag::HOP_LIMIT)? {
@@ -346,11 +356,20 @@ mod tests {
     #[test]
     fn handshake_negotiation() {
         // 正常：公共 bin
-        assert_eq!(negotiate_caps(caps::BIN | caps::PB, caps::BIN), Ok(caps::BIN));
+        assert_eq!(
+            negotiate_caps(caps::BIN | caps::PB, caps::BIN),
+            Ok(caps::BIN)
+        );
         // 无公共栈
-        assert_eq!(negotiate_caps(caps::BIN, caps::PB), Err(ErrCode::NoCommonCodec));
+        assert_eq!(
+            negotiate_caps(caps::BIN, caps::PB),
+            Err(ErrCode::NoCommonCodec)
+        );
         // zstd 不算 codec 栈
-        assert_eq!(negotiate_caps(caps::ZSTD, caps::ZSTD), Err(ErrCode::NoCommonCodec));
+        assert_eq!(
+            negotiate_caps(caps::ZSTD, caps::ZSTD),
+            Err(ErrCode::NoCommonCodec)
+        );
     }
 
     #[test]

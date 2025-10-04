@@ -44,6 +44,9 @@ mod tests {
             Err(ErrCode::UnknownTypeKey)
         );
         assert!(CodecStack::Bin.assert_available().is_ok());
-        assert!(CodecStack::Pb.assert_available().is_ok(), "P2 起 pb 栈放行（K5）");
+        assert!(
+            CodecStack::Pb.assert_available().is_ok(),
+            "P2 起 pb 栈放行（K5）"
+        );
     }
 }

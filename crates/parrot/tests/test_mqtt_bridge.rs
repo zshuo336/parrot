@@ -38,12 +38,7 @@ async fn mqtt_qos0_tell() {
     // QoS0 发布（payload = 模拟 Parrot TELL 帧透传体）
     let frame_like = [0x13u8, 0x00, 0x01]; // ft=TELL 标记 + 序号
     client
-        .publish(
-            "$parrot/edge/sensor-1",
-            QoS::AtMostOnce,
-            false,
-            frame_like,
-        )
+        .publish("$parrot/edge/sensor-1", QoS::AtMostOnce, false, frame_like)
         .await
         .unwrap();
 
@@ -60,7 +55,11 @@ async fn mqtt_qos0_tell() {
     .expect("publish within 5s");
 
     assert_eq!(deadline.topic, "$parrot/edge/sensor-1");
-    assert_eq!(&deadline.payload[..], &frame_like, "payload passthrough intact");
+    assert_eq!(
+        &deadline.payload[..],
+        &frame_like,
+        "payload passthrough intact"
+    );
     assert_eq!(deadline.qos, QoS::AtMostOnce);
 }
 
@@ -118,7 +117,10 @@ async fn mqtt_bridge_stability() {
     let mut opts = MqttOptions::new("parrot-bridge-stab", "127.0.0.1", 18831);
     opts.set_keep_alive(Duration::from_secs(5));
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
-    client.subscribe("$parrot/stab", QoS::AtLeastOnce).await.unwrap();
+    client
+        .subscribe("$parrot/stab", QoS::AtLeastOnce)
+        .await
+        .unwrap();
 
     for i in 0..20u64 {
         client

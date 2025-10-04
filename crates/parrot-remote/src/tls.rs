@@ -25,11 +25,7 @@ pub struct TlsConfig {
 
 impl TlsConfig {
     /// 文件路径加载。
-    pub fn from_paths(
-        cert_path: &str,
-        key_path: &str,
-        ca_path: &str,
-    ) -> Result<Self, RemoteError> {
+    pub fn from_paths(cert_path: &str, key_path: &str, ca_path: &str) -> Result<Self, RemoteError> {
         Ok(Self {
             cert_pem: std::fs::read(cert_path)
                 .map_err(|e| RemoteError::Transport(format!("read {cert_path}: {e}")))?,
@@ -135,12 +131,13 @@ pub fn verify_node_identity(
     claimed_node_id: &str,
 ) -> Result<(), RemoteError> {
     let Some(cert) = peer_certs.first() else {
-        return Err(RemoteError::Transport("mTLS: peer presented no certificate".into()));
+        return Err(RemoteError::Transport(
+            "mTLS: peer presented no certificate".into(),
+        ));
     };
     // 提取 CN（OU 简化解析——x509-parser 不进白名单；CN 在 Subject DN 可打印串）
-    let cn = extract_cn(cert).ok_or_else(|| {
-        RemoteError::Transport("mTLS: certificate has no CN".into())
-    })?;
+    let cn = extract_cn(cert)
+        .ok_or_else(|| RemoteError::Transport("mTLS: certificate has no CN".into()))?;
     if cn != claimed_node_id {
         return Err(RemoteError::Transport(format!(
             "mTLS: node_id mismatch (cert CN={cn:?}, handshake={claimed_node_id:?})"

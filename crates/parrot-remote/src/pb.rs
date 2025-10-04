@@ -56,7 +56,9 @@ mod tests {
     #[test]
     fn pb_entry_registered_and_roundtrip() {
         let reg = CodecRegistry::global();
-        let entry = reg.get(AKKA_ENVELOPE_KEY).expect("pb entry in unified registry");
+        let entry = reg
+            .get(AKKA_ENVELOPE_KEY)
+            .expect("pb entry in unified registry");
         let m = AkkaEnvelope {
             akka_path: "user/echo-1".into(),
             kind: "echo".into(),
@@ -85,11 +87,13 @@ mod tests {
     fn pb_encode_outgoing_via_registry() {
         let reg = CodecRegistry::global();
         let (key, bytes) = reg
-            .encode_outgoing(&(Box::new(AkkaEnvelope {
-                akka_path: "user/cpu".into(),
-                kind: "cpu".into(),
-                payload: 42u64.to_le_bytes().to_vec(),
-            }) as BoxedMessage))
+            .encode_outgoing(
+                &(Box::new(AkkaEnvelope {
+                    akka_path: "user/cpu".into(),
+                    kind: "cpu".into(),
+                    payload: 42u64.to_le_bytes().to_vec(),
+                }) as BoxedMessage),
+            )
             .unwrap();
         assert_eq!(key, AKKA_ENVELOPE_KEY);
         assert!(!bytes.is_empty());

@@ -166,10 +166,7 @@ mod tests {
             ActorError::ReplyChannelError("closed".into()).to_string(),
             "Reply channel error: closed"
         );
-        assert_eq!(
-            ActorError::Panic("boom".into()).to_string(),
-            "Panic: boom"
-        );
+        assert_eq!(ActorError::Panic("boom".into()).to_string(), "Panic: boom");
         let other = ActorError::Other(anyhow::anyhow!("inner"));
         assert_eq!(other.to_string(), "inner");
     }
@@ -219,13 +216,8 @@ mod tests {
     fn debug_names_are_stable() {
         assert!(format!("{:?}", ActorError::Stopped).contains("Stopped"));
         assert!(format!("{:?}", ActorError::Timeout).contains("Timeout"));
-        assert!(
-            format!("{:?}", ActorError::TimeoutDetail("x".into()))
-                .contains("TimeoutDetail")
-        );
-        assert!(
-            format!("{:?}", ActorError::Panic("x".into())).contains("Panic")
-        );
+        assert!(format!("{:?}", ActorError::TimeoutDetail("x".into())).contains("TimeoutDetail"));
+        assert!(format!("{:?}", ActorError::Panic("x".into())).contains("Panic"));
     }
 
     /// 所有变体可跨线程发送（ActorError: Send 断言）。

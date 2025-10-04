@@ -101,13 +101,17 @@ impl ResolveCache {
         CacheStats {
             hits: self.hits,
             misses: self.misses,
-            hit_ratio_permille: self.hits.checked_mul(1000).and_then(|h| {
-                if total == 0 {
-                    None
-                } else {
-                    h.checked_div(total)
-                }
-            }).unwrap_or(0),
+            hit_ratio_permille: self
+                .hits
+                .checked_mul(1000)
+                .and_then(|h| {
+                    if total == 0 {
+                        None
+                    } else {
+                        h.checked_div(total)
+                    }
+                })
+                .unwrap_or(0),
         }
     }
 
@@ -174,7 +178,13 @@ impl ResolveCache {
     }
 
     /// RESOLVE_R 回写（Fetched）。
-    pub fn put(&mut self, key: impl Into<String>, endpoints: Vec<String>, version: u64, now: Instant) {
+    pub fn put(
+        &mut self,
+        key: impl Into<String>,
+        endpoints: Vec<String>,
+        version: u64,
+        now: Instant,
+    ) {
         let lru = self.tick_lru();
         self.entries.insert(
             key.into(),
@@ -238,11 +248,15 @@ pub fn resolve_decision(cache: &mut ResolveCache, key: &str, now: Instant) -> Re
     let got = cache.get(key, now);
     match got {
         Some((endpoints, CacheState::Fresh)) => match endpoints.first() {
-            Some(ep) => ResolveAction::DirectCache { endpoint: ep.clone() },
+            Some(ep) => ResolveAction::DirectCache {
+                endpoint: ep.clone(),
+            },
             None => ResolveAction::RelayFallback { key: key.into() },
         },
         Some((endpoints, CacheState::Stale)) => match endpoints.first() {
-            Some(ep) => ResolveAction::TryDirectElseResolve { endpoint: ep.clone() },
+            Some(ep) => ResolveAction::TryDirectElseResolve {
+                endpoint: ep.clone(),
+            },
             None => ResolveAction::RelayFallback { key: key.into() },
         },
         // Invalid / miss（get 返回 None）
@@ -262,16 +276,22 @@ mod tests {
         c.put("parrot://n1", vec!["tcp://1.1.1.1:7".into()], 1, t0);
         // Fresh：TTL 60s 内
         assert_eq!(
-            c.get("parrot://n1", t0 + Duration::from_secs(30)).unwrap().1,
+            c.get("parrot://n1", t0 + Duration::from_secs(30))
+                .unwrap()
+                .1,
             CacheState::Fresh
         );
         // Stale：60s..300s（可用 + 降级标记）
         assert_eq!(
-            c.get("parrot://n1", t0 + Duration::from_secs(120)).unwrap().1,
+            c.get("parrot://n1", t0 + Duration::from_secs(120))
+                .unwrap()
+                .1,
             CacheState::Stale
         );
         // 超 300s 窗口 → Invalid（须重解析）
-        assert!(c.get("parrot://n1", t0 + Duration::from_secs(301)).is_none());
+        assert!(c
+            .get("parrot://n1", t0 + Duration::from_secs(301))
+            .is_none());
     }
 
     // F7：resolve_cache_hit_zero_rtt（命中零网络开销）
@@ -282,7 +302,9 @@ mod tests {
         c.put("parrot://n1", vec!["tcp://1.1.1.1:7".into()], 1, t0);
         assert_eq!(
             resolve_decision(&mut c, "parrot://n1", t0 + Duration::from_secs(1)),
-            ResolveAction::DirectCache { endpoint: "tcp://1.1.1.1:7".into() }
+            ResolveAction::DirectCache {
+                endpoint: "tcp://1.1.1.1:7".into()
+            }
         );
     }
 
@@ -299,7 +321,9 @@ mod tests {
         c.invalidate("parrot://eu-1/user/svc");
         assert_eq!(
             resolve_decision(&mut c, "parrot://eu-1/user/svc", t0),
-            ResolveAction::Resolve { key: "parrot://eu-1/user/svc".into() }
+            ResolveAction::Resolve {
+                key: "parrot://eu-1/user/svc".into()
+            }
         );
         // 新版本回写恢复 Fresh
         c.put("parrot://eu-1/user/svc", vec!["tcp://y:2".into()], 4, t0);
@@ -319,7 +343,9 @@ mod tests {
         let at = t0 + Duration::from_secs(200);
         assert_eq!(
             resolve_decision(&mut c, "parrot://n1", at),
-            ResolveAction::TryDirectElseResolve { endpoint: "tcp://1.1.1.1:7".into() }
+            ResolveAction::TryDirectElseResolve {
+                endpoint: "tcp://1.1.1.1:7".into()
+            }
         );
     }
 
@@ -350,7 +376,9 @@ mod tests {
         c.put("parrot://dead", vec![], 1, t0);
         assert_eq!(
             resolve_decision(&mut c, "parrot://dead", t0),
-            ResolveAction::RelayFallback { key: "parrot://dead".into() }
+            ResolveAction::RelayFallback {
+                key: "parrot://dead".into()
+            }
         );
     }
 

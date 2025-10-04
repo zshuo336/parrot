@@ -85,7 +85,12 @@ impl RoomSupervisor {
     }
 
     /// 参与者加入（spawn Participant actor 的领域效果）。
-    pub fn join(&mut self, identity: &str, can_subscribe: bool, can_publish: bool) -> Result<(), BridgeError> {
+    pub fn join(
+        &mut self,
+        identity: &str,
+        can_subscribe: bool,
+        can_publish: bool,
+    ) -> Result<(), BridgeError> {
         if self.state != RoomState::Open {
             return Err(BridgeError::RoomClosed(self.room.clone()));
         }
@@ -131,7 +136,9 @@ impl RoomSupervisor {
             .map(|p| p.can_publish)
             .unwrap_or(false)
         {
-            return Err(BridgeError::Forbidden(format!("{publisher} cannot publish")));
+            return Err(BridgeError::Forbidden(format!(
+                "{publisher} cannot publish"
+            )));
         }
         self.tracks.insert(
             sid.into(),
@@ -175,7 +182,9 @@ impl RoomSupervisor {
             .get_mut(track_sid)
             .ok_or_else(|| BridgeError::NotFound(track_sid.into()))?;
         if fps > 10 {
-            return Err(BridgeError::Policy(format!("downsample fps {fps} > 10 hard gate")));
+            return Err(BridgeError::Policy(format!(
+                "downsample fps {fps} > 10 hard gate"
+            )));
         }
         t.downstream_fps = Some(fps);
         Ok(())
@@ -200,11 +209,24 @@ pub enum BridgeError {
 /// LiveKit 信令事件（WebSocket/JSON-RPC 语义的 Rust 投影）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignalEvent {
-    ParticipantJoin { identity: String, can_subscribe: bool, can_publish: bool },
-    ParticipantLeave { identity: String },
-    TrackPublished { publisher: String, sid: String, kind: TrackKind },
+    ParticipantJoin {
+        identity: String,
+        can_subscribe: bool,
+        can_publish: bool,
+    },
+    ParticipantLeave {
+        identity: String,
+    },
+    TrackPublished {
+        publisher: String,
+        sid: String,
+        kind: TrackKind,
+    },
     /// 订阅请求（Policy 判定 + 订阅确认）。
-    Subscribe { subscriber: String, track_sid: String },
+    Subscribe {
+        subscriber: String,
+        track_sid: String,
+    },
 }
 
 /// 信令泵注入面（测试桩实现；生产 livekit-api 适配）。
@@ -292,7 +314,11 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
         };
         for ev in events {
             match ev {
-                SignalEvent::ParticipantJoin { identity, can_subscribe, can_publish } => {
+                SignalEvent::ParticipantJoin {
+                    identity,
+                    can_subscribe,
+                    can_publish,
+                } => {
                     if sup.join(&identity, can_subscribe, can_publish).is_ok() {
                         self.signal.send_downlink(room, &identity, b"joined");
                     }
@@ -302,21 +328,26 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
                         self.signal.send_downlink(room, &identity, b"left");
                     }
                 }
-                SignalEvent::TrackPublished { publisher, sid, kind } => {
+                SignalEvent::TrackPublished {
+                    publisher,
+                    sid,
+                    kind,
+                } => {
                     if let Ok(key) = sup.publish_track(&publisher, &sid, kind) {
                         // Track actor 注册回执（Receptionist key 下发）
                         self.signal.send_downlink(room, &publisher, key.as_bytes());
                     }
                 }
-                SignalEvent::Subscribe { subscriber, track_sid } => {
-                    match sup.can_subscribe(&subscriber, &track_sid) {
-                        Ok(()) => self.signal.send_downlink(room, &subscriber, b"subscribed"),
-                        Err(e) => {
-                            let msg = format!("denied:{e:?}");
-                            self.signal.send_downlink(room, &subscriber, msg.as_bytes());
-                        }
+                SignalEvent::Subscribe {
+                    subscriber,
+                    track_sid,
+                } => match sup.can_subscribe(&subscriber, &track_sid) {
+                    Ok(()) => self.signal.send_downlink(room, &subscriber, b"subscribed"),
+                    Err(e) => {
+                        let msg = format!("denied:{e:?}");
+                        self.signal.send_downlink(room, &subscriber, msg.as_bytes());
                     }
-                }
+                },
             }
         }
         n
@@ -344,28 +375,41 @@ mod tests {
 
         // 未开房间的桥——事件丢弃（无下行）
         let sig_closed = InMemSignal::default();
-        sig_closed.inject("r1", SignalEvent::ParticipantJoin {
-            identity: "bob".into(),
-            can_subscribe: true,
-            can_publish: true,
-        });
+        sig_closed.inject(
+            "r1",
+            SignalEvent::ParticipantJoin {
+                identity: "bob".into(),
+                can_subscribe: true,
+                can_publish: true,
+            },
+        );
         let b2 = ParrotLiveKitBridge::new(std::sync::Arc::new(sig_closed.clone()));
         assert_eq!(b2.pump("r1"), 1);
-        assert!(sig_closed.downlinks().is_empty(), "closed room drops events");
+        assert!(
+            sig_closed.downlinks().is_empty(),
+            "closed room drops events"
+        );
 
         // 已开房间：join 成功 + 下行 joined
         let sig = InMemSignal::default();
-        sig.inject("r1", SignalEvent::ParticipantJoin {
-            identity: "alice".into(),
-            can_subscribe: true,
-            can_publish: true,
-        });
+        sig.inject(
+            "r1",
+            SignalEvent::ParticipantJoin {
+                identity: "alice".into(),
+                can_subscribe: true,
+                can_publish: true,
+            },
+        );
         let b3 = ParrotLiveKitBridge::new(std::sync::Arc::new(sig.clone()));
         b3.open_room("r1");
         b3.pump("r1");
-        assert!(b3.with_room("r1", |r| r.participants.contains_key("alice")).unwrap());
+        assert!(b3
+            .with_room("r1", |r| r.participants.contains_key("alice"))
+            .unwrap());
         assert!(
-            sig.downlinks().iter().any(|(_, to, p)| to == "alice" && p == b"joined"),
+            sig.downlinks()
+                .iter()
+                .any(|(_, to, p)| to == "alice" && p == b"joined"),
             "join downlink"
         );
 
@@ -380,21 +424,30 @@ mod tests {
         let sig = InMemSignal::default();
         let bridge = ParrotLiveKitBridge::new(std::sync::Arc::new(sig.clone()));
         bridge.open_room("r1");
-        sig.inject("r1", SignalEvent::ParticipantJoin {
-            identity: "pub".into(),
-            can_subscribe: true,
-            can_publish: true,
-        });
-        sig.inject("r1", SignalEvent::ParticipantJoin {
-            identity: "viewer".into(),
-            can_subscribe: true,
-            can_publish: false,
-        });
-        sig.inject("r1", SignalEvent::TrackPublished {
-            publisher: "pub".into(),
-            sid: "t1".into(),
-            kind: TrackKind::Video,
-        });
+        sig.inject(
+            "r1",
+            SignalEvent::ParticipantJoin {
+                identity: "pub".into(),
+                can_subscribe: true,
+                can_publish: true,
+            },
+        );
+        sig.inject(
+            "r1",
+            SignalEvent::ParticipantJoin {
+                identity: "viewer".into(),
+                can_subscribe: true,
+                can_publish: false,
+            },
+        );
+        sig.inject(
+            "r1",
+            SignalEvent::TrackPublished {
+                publisher: "pub".into(),
+                sid: "t1".into(),
+                kind: TrackKind::Video,
+            },
+        );
         bridge.pump("r1");
         // 发布回执 = receptionist key
         let dl = sig.downlinks();
@@ -402,17 +455,31 @@ mod tests {
             .iter()
             .any(|(_, to, p)| to == "pub" && p == b"media/track/r1/t1"));
         // 订阅成功
-        sig.inject("r1", SignalEvent::Subscribe { subscriber: "viewer".into(), track_sid: "t1".into() });
+        sig.inject(
+            "r1",
+            SignalEvent::Subscribe {
+                subscriber: "viewer".into(),
+                track_sid: "t1".into(),
+            },
+        );
         bridge.pump("r1");
-        assert!(sig.downlinks().iter().any(|(_, to, p)| to == "viewer" && p == b"subscribed"));
+        assert!(sig
+            .downlinks()
+            .iter()
+            .any(|(_, to, p)| to == "viewer" && p == b"subscribed"));
         // 无发布权者发轨道 → denied
-        sig.inject("r1", SignalEvent::TrackPublished {
-            publisher: "viewer".into(),
-            sid: "t2".into(),
-            kind: TrackKind::Audio,
-        });
+        sig.inject(
+            "r1",
+            SignalEvent::TrackPublished {
+                publisher: "viewer".into(),
+                sid: "t2".into(),
+                kind: TrackKind::Audio,
+            },
+        );
         bridge.pump("r1");
-        assert!(bridge.with_room("r1", |r| !r.tracks.contains_key("t2")).unwrap());
+        assert!(bridge
+            .with_room("r1", |r| !r.tracks.contains_key("t2"))
+            .unwrap());
     }
 
     // F9：AI 降采样 ≤10fps 硬门槛

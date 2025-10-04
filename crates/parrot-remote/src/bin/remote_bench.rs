@@ -131,14 +131,21 @@ async fn main() {
     // 重新用确定端口起 server
     drop(server);
     let server = RemoteActorSystem::new(
-        RemoteConfig::tcp("bench-server", Some(format!("127.0.0.1:{port}").parse().unwrap())),
+        RemoteConfig::tcp(
+            "bench-server",
+            Some(format!("127.0.0.1:{port}").parse().unwrap()),
+        ),
         Arc::new(EchoLookup),
     )
     .unwrap();
     server.start().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let client = RemoteActorSystem::new(RemoteConfig::tcp("bench-client", None), Arc::new(EchoLookup)).unwrap();
+    let client = RemoteActorSystem::new(
+        RemoteConfig::tcp("bench-client", None),
+        Arc::new(EchoLookup),
+    )
+    .unwrap();
     client.start().await.unwrap();
     client
         .connect(&parrot_remote::NodeAddr::tcp(
@@ -148,7 +155,9 @@ async fn main() {
         .await
         .unwrap();
 
-    let echo = client.remote_ref("parrot://bench-server/user/echo").unwrap();
+    let echo = client
+        .remote_ref("parrot://bench-server/user/echo")
+        .unwrap();
 
     // 预热 3s
     let warm_deadline = Instant::now() + Duration::from_secs(3);
@@ -187,14 +196,30 @@ async fn main() {
     let tell_rt = t0.elapsed().as_nanos() as f64 / sent as f64;
 
     println!("== remote-bench（127.0.0.1 TCP 回环）==");
-    println!("seq-ask    : n={} p50={}µs p99={}µs max={}µs thru={:.0}/s", lat.len(), p50 / 1000, p99 / 1000, mx / 1000, ask_thruput);
-    println!("tell       : n={} mean={:.1}µs thru={:.0}/s", sent, tell_rt / 1000.0, 1e9 / tell_rt);
+    println!(
+        "seq-ask    : n={} p50={}µs p99={}µs max={}µs thru={:.0}/s",
+        lat.len(),
+        p50 / 1000,
+        p99 / 1000,
+        mx / 1000,
+        ask_thruput
+    );
+    println!(
+        "tell       : n={} mean={:.1}µs thru={:.0}/s",
+        sent,
+        tell_rt / 1000.0,
+        1e9 / tell_rt
+    );
     println!("remote-tax : p50 - local(~3µs) ≈ {}µs", p50 / 1000 - 3);
 
     if gate {
         let ask_ok = p50 < 150_000;
         let tell_ok = tell_rt < 60_000.0;
-        println!("gate p1    : ask p50<150µs {} | tell<60µs {}", if ask_ok { "PASS" } else { "FAIL" }, if tell_ok { "PASS" } else { "FAIL" });
+        println!(
+            "gate p1    : ask p50<150µs {} | tell<60µs {}",
+            if ask_ok { "PASS" } else { "FAIL" },
+            if tell_ok { "PASS" } else { "FAIL" }
+        );
         if !(ask_ok && tell_ok) {
             eprintln!("E1.9 gate FAILED —— 阻塞发布（超标专项评审）");
             std::process::exit(1);

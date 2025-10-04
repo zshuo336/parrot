@@ -18,7 +18,8 @@ use crate::transport::{
 
 pub struct TcpTransport {
     handshake: HandshakeBody,
-    inbound: tokio::sync::mpsc::Sender<(crate::frame::Frame, crate::transport::FrameSender, String)>,
+    inbound:
+        tokio::sync::mpsc::Sender<(crate::frame::Frame, crate::transport::FrameSender, String)>,
     on_disconnect: OnDisconnect,
     shutdown: tokio::sync::watch::Sender<bool>,
     listener: Mutex<Option<Arc<TcpListener>>>,
@@ -27,7 +28,11 @@ pub struct TcpTransport {
 impl TcpTransport {
     pub fn new(
         handshake: HandshakeBody,
-        inbound: tokio::sync::mpsc::Sender<(crate::frame::Frame, crate::transport::FrameSender, String)>,
+        inbound: tokio::sync::mpsc::Sender<(
+            crate::frame::Frame,
+            crate::transport::FrameSender,
+            String,
+        )>,
         on_disconnect: OnDisconnect,
         shutdown: tokio::sync::watch::Sender<bool>,
     ) -> Self {
@@ -124,8 +129,16 @@ mod tests {
     // 两个 TcpTransport 经真实 TCP 握手并交换一帧（CI 用 127.0.0.1 随机端口）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tcp_connect_handshake_roundtrip() {
-        let (in_a, rx_a) = tokio::sync::mpsc::channel::<(crate::frame::Frame, crate::transport::FrameSender, String)>(64);
-        let (in_b, mut rx_b) = tokio::sync::mpsc::channel::<(crate::frame::Frame, crate::transport::FrameSender, String)>(64);
+        let (in_a, rx_a) = tokio::sync::mpsc::channel::<(
+            crate::frame::Frame,
+            crate::transport::FrameSender,
+            String,
+        )>(64);
+        let (in_b, mut rx_b) = tokio::sync::mpsc::channel::<(
+            crate::frame::Frame,
+            crate::transport::FrameSender,
+            String,
+        )>(64);
         let noop: OnDisconnect = Arc::new(|_| {});
         let (sd_a, _) = tokio::sync::watch::channel(false);
         let (sd_b, _) = tokio::sync::watch::channel(false);
@@ -156,10 +169,7 @@ mod tests {
         let accept_fut = tokio::spawn(async move { tb.accept().await });
         let mut connected = None;
         for _ in 0..50 {
-            if let Ok(c) = ta
-                .connect(&crate::node::NodeAddr::tcp("tcp-b", addr))
-                .await
-            {
+            if let Ok(c) = ta.connect(&crate::node::NodeAddr::tcp("tcp-b", addr)).await {
                 connected = Some(c);
                 break;
             }
@@ -173,7 +183,13 @@ mod tests {
         // a → b ask 帧
         conn_a
             .sender
-            .send(Frame::ask(1, "/u/echo", "bin:x::Ping", bytes::Bytes::from_static(b"P"), None))
+            .send(Frame::ask(
+                1,
+                "/u/echo",
+                "bin:x::Ping",
+                bytes::Bytes::from_static(b"P"),
+                None,
+            ))
             .await
             .unwrap();
         let (got, _, _) = tokio::time::timeout(Duration::from_secs(3), rx_b.recv())

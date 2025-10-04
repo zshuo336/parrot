@@ -173,24 +173,22 @@ impl Membership {
     /// 返回 true = 状态有变（需继续 gossip）。
     pub fn merge_event(&mut self, ev: &MemberEvent) -> bool {
         match ev {
-            MemberEvent::Upsert(m) => {
-                match self.members.get(&m.node_id) {
-                    Some(cur) => {
-                        let cur_key = (cur.incarnation, status_rank(cur.status));
-                        let new_key = (m.incarnation, status_rank(m.status));
-                        if new_key > cur_key {
-                            self.members.insert(m.node_id.clone(), m.clone());
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    None => {
+            MemberEvent::Upsert(m) => match self.members.get(&m.node_id) {
+                Some(cur) => {
+                    let cur_key = (cur.incarnation, status_rank(cur.status));
+                    let new_key = (m.incarnation, status_rank(m.status));
+                    if new_key > cur_key {
                         self.members.insert(m.node_id.clone(), m.clone());
                         true
+                    } else {
+                        false
                     }
                 }
-            }
+                None => {
+                    self.members.insert(m.node_id.clone(), m.clone());
+                    true
+                }
+            },
             MemberEvent::Remove(id) => self.members.remove(id).is_some(),
         }
     }
@@ -401,10 +399,7 @@ pub fn handle_gossip(membership: &mut Membership, g: &MembershipGossip) -> bool 
 }
 
 /// NodeTable 同步：成员表 → 路由表（成员变更 → facade 路由自动生效）。
-pub async fn sync_to_node_table(
-    membership: &tokio::sync::Mutex<Membership>,
-    table: &NodeTable,
-) {
+pub async fn sync_to_node_table(membership: &tokio::sync::Mutex<Membership>, table: &NodeTable) {
     let m = membership.lock().await;
     for (id, member) in &m.members {
         if member.status == MemberStatus::Dead {
@@ -537,7 +532,11 @@ mod tests {
         m.merge_event(&MemberEvent::Upsert(member("self", MemberStatus::Alive, 0)));
         assert_eq!(m.effective_mode(), GossipMode::Full);
         for i in 1..=200 {
-            m.merge_event(&MemberEvent::Upsert(member(&format!("n{i}"), MemberStatus::Alive, 0)));
+            m.merge_event(&MemberEvent::Upsert(member(
+                &format!("n{i}"),
+                MemberStatus::Alive,
+                0,
+            )));
         }
         // 201 个成员（含 self）→ digest
         assert_eq!(m.effective_mode(), GossipMode::Digest);
@@ -619,7 +618,11 @@ mod tests {
         let mut m = Membership::new(0);
         m.merge_event(&MemberEvent::Upsert(member("self", MemberStatus::Alive, 0)));
         for i in 1..500 {
-            m.merge_event(&MemberEvent::Upsert(member(&format!("n{i}"), MemberStatus::Alive, 0)));
+            m.merge_event(&MemberEvent::Upsert(member(
+                &format!("n{i}"),
+                MemberStatus::Alive,
+                0,
+            )));
         }
         assert_eq!(m.effective_mode(), GossipMode::Digest);
         let probe = MembershipGossip {
@@ -681,7 +684,11 @@ mod tests {
         let mut m = Membership::new(0);
         m.merge_event(&MemberEvent::Upsert(member("self", MemberStatus::Alive, 0)));
         for i in 1..500 {
-            m.merge_event(&MemberEvent::Upsert(member(&format!("n{i}"), MemberStatus::Alive, 0)));
+            m.merge_event(&MemberEvent::Upsert(member(
+                &format!("n{i}"),
+                MemberStatus::Alive,
+                0,
+            )));
         }
         let digest_frame = encode_gossip(&MembershipGossip {
             events: vec![],
@@ -710,7 +717,10 @@ mod tests {
         let full_frame = encode_gossip(&full_gossip).len() as u64;
         let full_bps = full_frame * frames_per_sec;
         // 全量档超标（1.0 档门禁 ≤50KB/s 也超）——对比表数据落 SCALE_REPORT
-        assert!(full_bps > 50 * 1024, "全量基线应显著超标（实测 {full_bps}B/s）");
+        assert!(
+            full_bps > 50 * 1024,
+            "全量基线应显著超标（实测 {full_bps}B/s）"
+        );
         // 收益比：digest/全量 ≤ 1/100
         assert!(digest_bps * 100 <= full_bps, "压缩比不足百倍");
     }
@@ -729,8 +739,7 @@ mod tests {
         // 同种子确定性模拟（50 成员、fanout 3、seed 固定）
         let rounds_full = simulate_spread(GossipMode::Full, 50, 3, 42);
         let rounds_digest = simulate_spread(GossipMode::Digest, 50, 3, 42);
-        let parity = (rounds_digest as f64 - rounds_full as f64).abs()
-            / rounds_full.max(1) as f64;
+        let parity = (rounds_digest as f64 - rounds_full as f64).abs() / rounds_full.max(1) as f64;
         assert!(parity <= 0.10, "收敛等价性 {parity:.2} > ±10%");
     }
 
@@ -783,7 +792,11 @@ mod tests {
         }
         // 人为漂移：绕过 gossip 直接给 a 注入 b 不知道的 3 个成员 + 状态翻转
         for i in 50..53 {
-            a.merge_event(&MemberEvent::Upsert(member(&format!("n{i}"), MemberStatus::Alive, 0)));
+            a.merge_event(&MemberEvent::Upsert(member(
+                &format!("n{i}"),
+                MemberStatus::Alive,
+                0,
+            )));
         }
         a.mark_suspect("n10");
         assert_ne!(a.digest(), b.digest(), "漂移已注入");
@@ -872,7 +885,11 @@ mod tests {
         let d0 = base.digest();
         for i in 0..1000 {
             let mut m = Membership::new(0);
-            m.merge_event(&MemberEvent::Upsert(member(&format!("x{i}"), MemberStatus::Alive, 0)));
+            m.merge_event(&MemberEvent::Upsert(member(
+                &format!("x{i}"),
+                MemberStatus::Alive,
+                0,
+            )));
             // 与空表指纹相同即为碰撞（64B 空间抽样验证）
             assert_ne!(m.digest(), d0, "成员 x{i} 与空表指纹碰撞");
         }

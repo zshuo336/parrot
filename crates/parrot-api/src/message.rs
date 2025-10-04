@@ -749,10 +749,7 @@ mod tests {
         // String
         let s: BoxedMessage = Box::new("hello".to_string());
         let c = CloneableMessage::try_from_boxed(&s).unwrap();
-        assert_eq!(
-            c.into_boxed().downcast_ref::<String>().unwrap(),
-            "hello"
-        );
+        assert_eq!(c.into_boxed().downcast_ref::<String>().unwrap(), "hello");
         // 整数族 / 浮点 / bool / unit / char 逐类型断言
         let b: BoxedMessage = Box::new(7i32);
         assert_eq!(
@@ -791,13 +788,11 @@ mod tests {
             &7
         );
         let b: BoxedMessage = Box::new(true);
-        assert!(
-            *CloneableMessage::try_from_boxed(&b)
-                .unwrap()
-                .into_boxed()
-                .downcast_ref::<bool>()
-                .unwrap()
-        );
+        assert!(*CloneableMessage::try_from_boxed(&b)
+            .unwrap()
+            .into_boxed()
+            .downcast_ref::<bool>()
+            .unwrap());
         let b: BoxedMessage = Box::new(());
         assert!(CloneableMessage::try_from_boxed(&b).is_some());
         let b: BoxedMessage = Box::new(1.5f32);
@@ -847,7 +842,9 @@ mod tests {
                 "M"
             }
             fn validate(&self) -> Result<(), crate::errors::ActorError> {
-                Err(crate::errors::ActorError::MessageHandlingError("custom".into()))
+                Err(crate::errors::ActorError::MessageHandlingError(
+                    "custom".into(),
+                ))
             }
             fn priority(&self) -> MessagePriority {
                 MessagePriority::CRITICAL
@@ -989,7 +986,6 @@ mod tests {
         assert!(format!("{:?}", BackoffStrategy::Linear).contains("Linear"));
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Remote messaging contract (DEV_01 §3.4 / TECH_DESIGN_05 §3.1)

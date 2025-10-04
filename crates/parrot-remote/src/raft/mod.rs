@@ -158,7 +158,11 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-    pub fn new(id: impl Into<String>, peers: Vec<NodeId>, clock: std::sync::Arc<dyn Clock>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        peers: Vec<NodeId>,
+        clock: std::sync::Arc<dyn Clock>,
+    ) -> Self {
         let id = id.into();
         let jitter = id_jitter(&id) % 300;
         Self {
@@ -207,18 +211,36 @@ impl RaftNode {
     /// 入站 RPC（宿主收到后调用）。
     pub fn step(&mut self, from: NodeId, rpc: RaftRpc) {
         match rpc {
-            RaftRpc::RequestVote { term, candidate, last_log_index, last_log_term } => {
-                self.step_request_vote(from, term, candidate, last_log_index, last_log_term)
-            }
+            RaftRpc::RequestVote {
+                term,
+                candidate,
+                last_log_index,
+                last_log_term,
+            } => self.step_request_vote(from, term, candidate, last_log_index, last_log_term),
             RaftRpc::RequestVoteResp { term, vote_granted } => {
                 self.step_vote_resp(from, term, vote_granted)
             }
-            RaftRpc::AppendEntries { term, leader, prev_log_index, prev_log_term, entries, leader_commit } => {
-                self.step_append(from, term, leader, prev_log_index, prev_log_term, entries, leader_commit)
-            }
-            RaftRpc::AppendEntriesResp { term, success, match_index } => {
-                self.step_append_resp(from, term, success, match_index)
-            }
+            RaftRpc::AppendEntries {
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => self.step_append(
+                from,
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            ),
+            RaftRpc::AppendEntriesResp {
+                term,
+                success,
+                match_index,
+            } => self.step_append_resp(from, term, success, match_index),
         }
     }
 
@@ -321,7 +343,10 @@ impl RaftNode {
         if term < self.current_term {
             self.outbox.push((
                 from,
-                RaftRpc::RequestVoteResp { term: self.current_term, vote_granted: false },
+                RaftRpc::RequestVoteResp {
+                    term: self.current_term,
+                    vote_granted: false,
+                },
             ));
             return;
         }
@@ -333,9 +358,8 @@ impl RaftNode {
             self.last_heartbeat_ms = self.clock.now_ms();
         }
         // 日志新旧检查（§5.4.1：candidate 日志至少一样新）
-        let up_to_date =
-            (last_log_term > self.last_log_term())
-                || (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index());
+        let up_to_date = (last_log_term > self.last_log_term())
+            || (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index());
         let grant = up_to_date
             && (self.voted_for.is_none() || self.voted_for.as_deref() == Some(candidate.as_str()));
         if grant {
@@ -344,7 +368,10 @@ impl RaftNode {
         }
         self.outbox.push((
             from,
-            RaftRpc::RequestVoteResp { term: self.current_term, vote_granted: grant },
+            RaftRpc::RequestVoteResp {
+                term: self.current_term,
+                vote_granted: grant,
+            },
         ));
     }
 
@@ -379,8 +406,7 @@ impl RaftNode {
                 let e = &self.log[(ni - 2) as usize];
                 (e.index, e.term)
             };
-            let entries: Vec<LogEntry> =
-                self.log[(ni as usize).saturating_sub(1)..].to_vec();
+            let entries: Vec<LogEntry> = self.log[(ni as usize).saturating_sub(1)..].to_vec();
             self.outbox.push((
                 p,
                 RaftRpc::AppendEntries {
@@ -409,7 +435,11 @@ impl RaftNode {
         if term < self.current_term {
             self.outbox.push((
                 from,
-                RaftRpc::AppendEntriesResp { term: self.current_term, success: false, match_index: self.last_log_index() },
+                RaftRpc::AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                },
             ));
             return;
         }
@@ -434,7 +464,11 @@ impl RaftNode {
         if !consistent {
             self.outbox.push((
                 from,
-                RaftRpc::AppendEntriesResp { term: self.current_term, success: false, match_index: self.last_log_index() },
+                RaftRpc::AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                },
             ));
             return;
         }
@@ -457,13 +491,18 @@ impl RaftNode {
             // 本实现 commit_index 单点由 leader 推进，follower 信任 leader_commit
             // 且 leader 已保证其 commit 过当前任期，安全）
             self.commit_index = new_commit;
-            let newly = self.log[(self.last_applied as usize)..(self.commit_index as usize)].to_vec();
+            let newly =
+                self.log[(self.last_applied as usize)..(self.commit_index as usize)].to_vec();
             self.pending_apply.extend(newly);
             self.last_applied = self.commit_index;
         }
         self.outbox.push((
             from,
-            RaftRpc::AppendEntriesResp { term: self.current_term, success: true, match_index: self.last_log_index() },
+            RaftRpc::AppendEntriesResp {
+                term: self.current_term,
+                success: true,
+                match_index: self.last_log_index(),
+            },
         ));
     }
 
@@ -587,7 +626,11 @@ impl TestNet {
         let ids = ["a", "b", "c"];
         let mut nodes = HashMap::new();
         for id in ids {
-            let peers: Vec<NodeId> = ids.iter().filter(|x| **x != id).map(|s| s.to_string()).collect();
+            let peers: Vec<NodeId> = ids
+                .iter()
+                .filter(|x| **x != id)
+                .map(|s| s.to_string())
+                .collect();
             nodes.insert(id.to_string(), RaftNode::new(id, peers, clock.clone()));
         }
         let mut links = HashMap::new();
@@ -639,11 +682,18 @@ impl TestNet {
     }
 
     pub fn leader(&self) -> Option<&NodeId> {
-        self.nodes.iter().find(|(_, n)| n.role == Role::Leader).map(|(id, _)| id)
+        self.nodes
+            .iter()
+            .find(|(_, n)| n.role == Role::Leader)
+            .map(|(id, _)| id)
     }
 
     pub fn term(&self) -> Term {
-        self.nodes.values().map(|n| n.current_term).max().unwrap_or(0)
+        self.nodes
+            .values()
+            .map(|n| n.current_term)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -665,7 +715,10 @@ mod tests {
         let leader = net.leader().expect("leader elected");
         // 唯一 leader
         assert_eq!(
-            net.nodes.values().filter(|n| n.role == Role::Leader).count(),
+            net.nodes
+                .values()
+                .filter(|n| n.role == Role::Leader)
+                .count(),
             1,
             "exactly one leader"
         );
@@ -684,7 +737,11 @@ mod tests {
         let leader = net.leader().unwrap().clone();
         // 并发 1000 提交
         for i in 0..1000u32 {
-            net.nodes.get_mut(&leader).unwrap().propose(i.to_le_bytes().to_vec()).unwrap();
+            net.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose(i.to_le_bytes().to_vec())
+                .unwrap();
         }
         net.round(0, &clock); // 收敛（一次 RTT + resp 级联）
         let ln = net.nodes.get(&leader).unwrap();
@@ -720,10 +777,19 @@ mod tests {
             net.round(100, &clock);
             elapsed_ms += 100;
         }
-        assert!(budget.elapsed() < Duration::from_secs(3), "wall clock sanity");
+        assert!(
+            budget.elapsed() < Duration::from_secs(3),
+            "wall clock sanity"
+        );
         let new_leader = net.leader().expect("re-elected within budget");
         assert_ne!(new_leader, &old);
-        assert_eq!(net.nodes.values().filter(|n| n.role == Role::Leader).count(), 1);
+        assert_eq!(
+            net.nodes
+                .values()
+                .filter(|n| n.role == Role::Leader)
+                .count(),
+            1
+        );
     }
 
     // F4：对称分区 30s——少数派零提交、多数派继续；愈合一致
@@ -771,7 +837,10 @@ mod tests {
         let target = net.nodes.get(&l2).unwrap().log.len();
         let m2 = net.nodes.get(&minority).unwrap();
         assert_eq!(m2.log.len(), target, "healed minority catches up");
-        assert_eq!(m2.log.last().map(|e| e.term), net.nodes.get(&l2).unwrap().log.last().map(|e| e.term));
+        assert_eq!(
+            m2.log.last().map(|e| e.term),
+            net.nodes.get(&l2).unwrap().log.last().map(|e| e.term)
+        );
     }
 
     // F4：确定性——同日志序列两节点 apply 后状态相等
@@ -792,7 +861,11 @@ mod tests {
         let leader = net.leader().unwrap().clone();
         for i in 0..100u8 {
             let k = i % 10;
-            net.nodes.get_mut(&leader).unwrap().propose(vec![k, i]).unwrap();
+            net.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose(vec![k, i])
+                .unwrap();
             if i % 7 == 0 {
                 net.round(0, &clock);
             }
@@ -807,6 +880,9 @@ mod tests {
             }
         }
         let vals: Vec<KV> = sms.into_values().collect();
-        assert!(vals.windows(2).all(|w| w[0] == w[1]), "same log → same state");
+        assert!(
+            vals.windows(2).all(|w| w[0] == w[1]),
+            "same log → same state"
+        );
     }
 }

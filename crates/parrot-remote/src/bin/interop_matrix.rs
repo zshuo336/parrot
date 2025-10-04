@@ -195,9 +195,7 @@ async fn main() {
     let echo = client
         .remote_ref("parrot://jvm-gw-1/jvm/user/echo")
         .unwrap();
-    let cpu = client
-        .remote_ref("parrot://jvm-gw-1/jvm/user/cpu")
-        .unwrap();
+    let cpu = client.remote_ref("parrot://jvm-gw-1/jvm/user/cpu").unwrap();
 
     // —— 语义验证：cpu 41→42（BE u64 往返）——
     let r = cpu.send(Box::new(InteropCpu(41))).await.unwrap();
@@ -226,10 +224,7 @@ async fn main() {
 
     // —— 门禁：RTT p50 <300µs（DEV_02 §6.3）——
     let ok = p50 < 300_000;
-    println!(
-        "gate p2 (RTT<300µs): {}",
-        if ok { "PASS" } else { "FAIL" }
-    );
+    println!("gate p2 (RTT<300µs): {}", if ok { "PASS" } else { "FAIL" });
     let _ = child.kill();
     let _ = child.wait();
     client.shutdown().await.ok();

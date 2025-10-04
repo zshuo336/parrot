@@ -16,8 +16,10 @@ use parrot_api::actor::{Actor, EmptyConfig};
 use parrot_api::address::{ActorPath, ActorRef};
 use parrot_api::system::{ActorSystem, ActorSystemConfig};
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
-use parrot_remote::sharding::{entity_key_of, ShardCoordinator};
-use parrot_remote::singleton::{Candidate, LeaseParams, SingletonLease, SingletonState, SingletonTransition};
+use parrot_remote::sharding::{ShardCoordinator, entity_key_of};
+use parrot_remote::singleton::{
+    Candidate, LeaseParams, SingletonLease, SingletonState, SingletonTransition,
+};
 
 // ── 共享：计数实体 actor ─────────────────────────────────
 
@@ -71,7 +73,9 @@ impl Actor for Counter {
                 self.count += n;
                 return Ok(Box::new(Tick(self.count)) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
     fn state(&self) -> parrot_api::actor::ActorState {
@@ -93,7 +97,9 @@ async fn spawn_entity(
     .await
     .unwrap();
     facade
-        .get_actor(&ActorPath::placeholder(format!("/user/entity-{key}").as_str()))
+        .get_actor(&ActorPath::placeholder(
+            format!("/user/entity-{key}").as_str(),
+        ))
         .await
         .unwrap()
 }
@@ -119,14 +125,14 @@ fn sharding_kill_node() {
     let elapsed = t0.elapsed();
 
     // 门禁 1：5s 内完成重建决策（本地决策路径——网络收敛由 SWIM ≤3.5s 另测）
-    assert!(elapsed < Duration::from_secs(5), "rebalance took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "rebalance took {elapsed:?}"
+    );
 
     // 门禁 2：原 n2 上的实体全部有新宿主
     let entities = coord.entities();
-    let orphaned = entities
-        .values()
-        .filter(|st| st.node.is_empty())
-        .count();
+    let orphaned = entities.values().filter(|st| st.node.is_empty()).count();
     assert_eq!(orphaned, 0, "orphaned entities after kill");
     // n2 宿主不再存在
     assert!(
@@ -137,11 +143,18 @@ fn sharding_kill_node() {
     let on_n2_before: usize = 0; // 初始分布未知——用 moves 非空 + 全部去向 ∈ {n1,n3} 断言
     let _ = on_n2_before;
     for (key, to) in &moves {
-        assert!(to == "n1" || to == "n3", "entity {key} moved to dead/invalid {to}");
+        assert!(
+            to == "n1" || to == "n3",
+            "entity {key} moved to dead/invalid {to}"
+        );
     }
     // 路由一致性：重建后 route(key) == 记录宿主
     for (key, st) in &entities {
-        assert_eq!(&coord.route(key).unwrap(), &st.node, "route drift for {key}");
+        assert_eq!(
+            &coord.route(key).unwrap(),
+            &st.node,
+            "route drift for {key}"
+        );
     }
 }
 
@@ -160,7 +173,11 @@ fn sharding_affinity_l1() {
 /// 迁移 drain：迁移期消息不丢不重（本地 drain 窗口语义断言）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sharding_rebalance_drain() {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let ts = ThreadActorSystem::shared(Default::default());
     facade
         .register_thread_system("eng".into(), ts.clone(), true)
@@ -200,21 +217,36 @@ async fn sharding_rebalance_drain() {
 #[test]
 fn singleton_takeover() {
     let mut follower = SingletonLease::new(
-        Candidate { node: "b".into(), seq: 5 },
+        Candidate {
+            node: "b".into(),
+            seq: 5,
+        },
         LeaseParams::default(),
     );
     let t0 = Instant::now();
     let mut leader = SingletonLease::new(
-        Candidate { node: "a".into(), seq: 3 },
+        Candidate {
+            node: "a".into(),
+            seq: 3,
+        },
         LeaseParams::default(),
     );
     // a 竞选成功
     assert_eq!(
         leader.tick(t0, true),
-        Some(SingletonTransition::Acquired(Candidate { node: "a".into(), seq: 3 }))
+        Some(SingletonTransition::Acquired(Candidate {
+            node: "a".into(),
+            seq: 3
+        }))
     );
     // b 观察 a 持有
-    follower.observe(t0, &Candidate { node: "a".into(), seq: 3 });
+    follower.observe(
+        t0,
+        &Candidate {
+            node: "a".into(),
+            seq: 3,
+        },
+    );
     assert_eq!(follower.state(), SingletonState::Follower);
     // a 死亡（不再续约）。b 每 3s tick：
     let mut took_over_at: Option<Duration> = None;
@@ -240,7 +272,11 @@ fn singleton_takeover() {
 /// `/user/entity-*` 前缀处理器：未显式 spawn 的实体路径命中通配。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn facade_prefix_route() {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let ts = ThreadActorSystem::shared(Default::default());
     facade
         .register_thread_system("eng".into(), ts.clone(), true)
@@ -264,7 +300,9 @@ async fn facade_prefix_route() {
                 if let Some(t) = msg.downcast_ref::<Tick>() {
                     return Ok(Box::new(Tick(t.0)) as BoxedMessage);
                 }
-                Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unhandled".into(),
+                ))
             })
         }
         fn state(&self) -> parrot_api::actor::ActorState {
@@ -273,7 +311,12 @@ async fn facade_prefix_route() {
     }
     let _ = (router_ts, facade_c);
     let router = ts
-        .spawn_at(Router, "/user/shard-router", None, ThreadActorConfig::default())
+        .spawn_at(
+            Router,
+            "/user/shard-router",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
     let router_arc: Arc<dyn ActorRef> = Arc::new(router.clone());
@@ -303,7 +346,11 @@ async fn facade_prefix_route() {
     );
 
     // 非法前缀（无 '-'/'/' 尾锚）拒绝
-    assert!(facade.register_prefix_handler("/user/entity", router_arc.clone()).is_err());
+    assert!(
+        facade
+            .register_prefix_handler("/user/entity", router_arc.clone())
+            .is_err()
+    );
 }
 
 /// entity_key_of：`/user/entity-{key}` → key 提取。

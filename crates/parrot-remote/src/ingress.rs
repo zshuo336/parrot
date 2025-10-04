@@ -96,7 +96,10 @@ impl Ingress {
             }
             // 心跳/握手由 ConnectionTask 处理；集群帧在连接层已断连——防御式吞掉
             _ => {
-                tracing::debug!(ft = frame.header.frame_type, "ingress: frame handled at conn layer");
+                tracing::debug!(
+                    ft = frame.header.frame_type,
+                    "ingress: frame handled at conn layer"
+                );
             }
         }
     }
@@ -153,14 +156,16 @@ impl Ingress {
         let send_fut = local_ref.send(decoded);
         let outcome = std::panic::AssertUnwindSafe(send_fut);
         let outcome = futures::FutureExt::catch_unwind(outcome).await;
-        let outcome: Result<parrot_api::types::BoxedMessage, parrot_api::errors::ActorError> = match outcome {
-            Ok(r) => r,
-            Err(p) => Err(parrot_api::errors::ActorError::Panic(
-                p.downcast_ref::<&str>().map(|s| s.to_string())
-                    .or_else(|| p.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "local actor panicked".into()),
-            )),
-        };
+        let outcome: Result<parrot_api::types::BoxedMessage, parrot_api::errors::ActorError> =
+            match outcome {
+                Ok(r) => r,
+                Err(p) => Err(parrot_api::errors::ActorError::Panic(
+                    p.downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| p.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "local actor panicked".into()),
+                )),
+            };
         match outcome {
             Ok(reply) => {
                 // 回复类型编码（回复也必须 RemoteMessage）
@@ -187,12 +192,7 @@ impl Ingress {
             Err(e) => {
                 let (code, detail) = ErrCode::from_actor_error(&e);
                 let _ = back
-                    .send(Frame::reply_err(
-                        cid,
-                        &frame.path,
-                        code,
-                        &detail,
-                    ))
+                    .send(Frame::reply_err(cid, &frame.path, code, &detail))
                     .await;
             }
         }
@@ -232,7 +232,8 @@ impl Ingress {
             _ => {
                 let (code, detail) = decode_err_payload(&frame.payload)
                     .unwrap_or((ErrCode::ProtocolViolation, "<undecodable>".into()));
-                self.callbacks.complete(cid, ReplyPayload::Err(code, detail));
+                self.callbacks
+                    .complete(cid, ReplyPayload::Err(code, detail));
             }
         }
     }
@@ -385,7 +386,13 @@ mod tests {
             Bytes::from(p)
         };
         ig.dispatch(
-            Frame::ask(1, "/user/ghost", "bin:parrot_remote::TestAsk#v1", ask_payload.clone(), None),
+            Frame::ask(
+                1,
+                "/user/ghost",
+                "bin:parrot_remote::TestAsk#v1",
+                ask_payload.clone(),
+                None,
+            ),
             &back,
             "n1",
         )
@@ -455,12 +462,8 @@ mod tests {
         let (ig, _cb) = ingress();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
         let back = FrameSender { tx };
-        ig.dispatch(
-            Frame::error_frame(ErrCode::Overloaded, "busy"),
-            &back,
-            "n1",
-        )
-        .await;
+        ig.dispatch(Frame::error_frame(ErrCode::Overloaded, "busy"), &back, "n1")
+            .await;
         // 无回帧
         assert!(rx.try_recv().is_err());
     }
@@ -479,7 +482,13 @@ mod tests {
     #[tokio::test]
     async fn ingress_ask_malformed_prefix() {
         // 直接验证 split 失败分支（Frame::ask 总是合法前置——构造裸 payload）
-        let mut f = Frame::ask(3, "/user/echo", "bin:parrot_remote::TestAsk#v1", Bytes::new(), None);
+        let mut f = Frame::ask(
+            3,
+            "/user/echo",
+            "bin:parrot_remote::TestAsk#v1",
+            Bytes::new(),
+            None,
+        );
         f.payload = Bytes::from_static(b"ab"); // < 4B → MalformedLengths
         assert!(f.split_reply_to().is_err());
         // dispatch 走同分支：回 REPLY_ERR(ProtocolViolation)

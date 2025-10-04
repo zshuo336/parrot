@@ -71,7 +71,9 @@ impl Actor for K6Echo {
             if let Some(K6Ping(v)) = msg.downcast_ref::<K6Ping>() {
                 return Ok(Box::new(K6Pong(*v)) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
 
@@ -108,8 +110,16 @@ where
 
 async fn spawn_node(
     id: &str,
-) -> (Arc<RemoteActorSystem>, Arc<ParrotActorSystem>, Arc<ThreadActorSystem>) {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+) -> (
+    Arc<RemoteActorSystem>,
+    Arc<ParrotActorSystem>,
+    Arc<ThreadActorSystem>,
+) {
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let ts = ThreadActorSystem::shared(Default::default());
     facade
         .register_thread_system("eng".into(), ts.clone(), true)
@@ -120,7 +130,9 @@ async fn spawn_node(
         .unwrap();
     let rs = RemoteActorSystem::new(
         RCfg::mem(id.to_string()),
-        Arc::new(FacadeLookup { facade: facade.clone() }),
+        Arc::new(FacadeLookup {
+            facade: facade.clone(),
+        }),
     )
     .unwrap();
     rs.start().await.unwrap();
@@ -180,7 +192,10 @@ async fn k6_rc1_trio_exactly_once() {
     for v in results {
         counts[v as usize] += 1;
     }
-    assert!(counts.iter().all(|c| *c == 2), "each ping answered once per target: {counts:?}");
+    assert!(
+        counts.iter().all(|c| *c == 2),
+        "each ping answered once per target: {counts:?}"
+    );
 
     a.shutdown().await.ok();
     b.shutdown().await.ok();
@@ -249,8 +264,16 @@ async fn k6_quic_smoke() {
 
 async fn spawn_node_quic(
     id: &str,
-) -> (Arc<RemoteActorSystem>, Arc<ParrotActorSystem>, Arc<ThreadActorSystem>) {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+) -> (
+    Arc<RemoteActorSystem>,
+    Arc<ParrotActorSystem>,
+    Arc<ThreadActorSystem>,
+) {
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let ts = ThreadActorSystem::shared(Default::default());
     facade
         .register_thread_system("eng".into(), ts.clone(), true)
@@ -261,7 +284,9 @@ async fn spawn_node_quic(
         .unwrap();
     let rs = RemoteActorSystem::new(
         RCfg::quic(id.to_string(), Some("127.0.0.1:0".parse().unwrap())),
-        Arc::new(FacadeLookup { facade: facade.clone() }),
+        Arc::new(FacadeLookup {
+            facade: facade.clone(),
+        }),
     )
     .unwrap();
     rs.start().await.unwrap();

@@ -46,7 +46,10 @@ impl CodecRegistry {
                     )
                     .is_some()
                 {
-                    panic!("duplicate TYPE_KEY registered: {}（两类型撞键=协议级事故）", reg.type_key);
+                    panic!(
+                        "duplicate TYPE_KEY registered: {}（两类型撞键=协议级事故）",
+                        reg.type_key
+                    );
                 }
                 by_type_id.insert(reg.type_id, reg.type_key);
             }
@@ -71,15 +74,18 @@ impl CodecRegistry {
     pub fn dump(&self) -> Vec<(String, CodecStack)> {
         self.by_key
             .keys()
-            .map(|k| (k.to_string(), CodecStack::of_type_key(k).unwrap_or(CodecStack::Bin)))
+            .map(|k| {
+                (
+                    k.to_string(),
+                    CodecStack::of_type_key(k).unwrap_or(CodecStack::Bin),
+                )
+            })
             .collect()
     }
 
     /// 编码出口：TypeId → TYPE_KEY → encode。未注册 → NotRemotable（RC6：不发帧）。
     pub fn encode_outgoing(&self, msg: &BoxedMessage) -> Result<(String, Vec<u8>), ErrCode> {
-        let key = self
-            .key_of((*msg).type_id())
-            .ok_or(ErrCode::NotRemotable)?;
+        let key = self.key_of((*msg).type_id()).ok_or(ErrCode::NotRemotable)?;
         let entry = self.get(key).expect("key→entry invariant");
         let stack = CodecStack::of_type_key(key)?;
         stack.assert_available()?;
@@ -89,9 +95,7 @@ impl CodecRegistry {
 
     /// 解码入口：type_key → decode。未知键 → UnknownTypeKey（两端不一致）。
     pub fn decode_incoming(&self, type_key: &str, payload: &[u8]) -> Result<BoxedMessage, ErrCode> {
-        let entry = self
-            .get(type_key)
-            .ok_or(ErrCode::UnknownTypeKey)?;
+        let entry = self.get(type_key).ok_or(ErrCode::UnknownTypeKey)?;
         CodecStack::of_type_key(type_key)?.assert_available()?;
         (entry.decode)(payload).map_err(|_| ErrCode::CodecError)
     }
@@ -110,9 +114,7 @@ mod tests {
             type_key: "bin:parrot_remote_test::TestMsg#v1",
             type_id: TypeId::of::<TestMsg>(),
             encode: |msg: &BoxedMessage| {
-                let m = msg
-                    .downcast_ref::<TestMsg>()
-                    .ok_or("downcast")?;
+                let m = msg.downcast_ref::<TestMsg>().ok_or("downcast")?;
                 serde_remote_serialize(&m.0)
             },
             decode: |b: &[u8]| {

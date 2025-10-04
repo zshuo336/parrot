@@ -15,7 +15,7 @@ use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use crate::codec_registry::CodecRegistry;
 use crate::error::ErrCode;
 use crate::frame::Frame;
-use crate::node::{NodeStatus, NodeState};
+use crate::node::{NodeState, NodeStatus};
 use crate::registry::{CallbackRegistry, ReplyPayload};
 use crate::transport::FrameSender;
 
@@ -53,7 +53,11 @@ impl std::fmt::Debug for RemoteActorRef {
 }
 
 impl RemoteActorRef {
-    pub fn new(path: impl Into<String>, node_id: impl Into<String>, inner: Arc<RemoteInner>) -> Self {
+    pub fn new(
+        path: impl Into<String>,
+        node_id: impl Into<String>,
+        inner: Arc<RemoteInner>,
+    ) -> Self {
         Self {
             path: path.into(),
             node_id: node_id.into(),
@@ -128,15 +132,13 @@ impl ActorRef for RemoteActorRef {
             match timeout {
                 None => match rx.await {
                     Ok(p) => self.reply_to_result(p),
-                    Err(_) => Err(
-                        ErrCode::ConnectionLost.to_actor_error("connection lost".into())
-                    ),
+                    Err(_) => Err(ErrCode::ConnectionLost.to_actor_error("connection lost".into())),
                 },
                 Some(d) => match tokio::time::timeout(d, rx).await {
                     Ok(Ok(p)) => self.reply_to_result(p),
-                    Ok(Err(_)) => Err(
-                        ErrCode::ConnectionLost.to_actor_error("connection lost".into())
-                    ),
+                    Ok(Err(_)) => {
+                        Err(ErrCode::ConnectionLost.to_actor_error("connection lost".into()))
+                    }
                     Err(_) => {
                         // 调用方放弃：清回调；迟到 REPLY 查表 miss → metric drop（RC4）
                         self.inner.callbacks.remove(cid);
@@ -153,10 +155,9 @@ impl ActorRef for RemoteActorRef {
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             let (key, payload) = self.encode_outgoing(&msg)?;
-            let sender = self
-                .inner
-                .sender_of(&self.node_id)
-                .ok_or_else(|| ActorError::InternalError(format!("remote link to {} unavailable", self.node_id)))?;
+            let sender = self.inner.sender_of(&self.node_id).ok_or_else(|| {
+                ActorError::InternalError(format!("remote link to {} unavailable", self.node_id))
+            })?;
             sender
                 .send(Frame::tell(&self.path, &key, payload))
                 .await
@@ -167,10 +168,9 @@ impl ActorRef for RemoteActorRef {
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
-            let sender = self
-                .inner
-                .sender_of(&self.node_id)
-                .ok_or_else(|| ActorError::InternalError(format!("remote link to {} unavailable", self.node_id)))?;
+            let sender = self.inner.sender_of(&self.node_id).ok_or_else(|| {
+                ActorError::InternalError(format!("remote link to {} unavailable", self.node_id))
+            })?;
             sender
                 .send(Frame::stop(&self.path))
                 .await
@@ -279,7 +279,9 @@ mod tests {
         let (inner, mut rx) = test_inner_with_sender();
         let r = RemoteActorRef::new("/x", "n1", inner);
         assert!(r.is_alive().await);
-        r.deliver(Box::new(crate::ingress::TestAsk(5))).await.unwrap();
+        r.deliver(Box::new(crate::ingress::TestAsk(5)))
+            .await
+            .unwrap();
         let f = rx.recv().await.unwrap();
         assert_eq!(f.header.frame_type, crate::frame::frame_type::TELL);
         assert_eq!(f.path, "/x");
@@ -294,13 +296,22 @@ mod tests {
         let (inner, mut rx) = test_inner_with_sender();
         let r = RemoteActorRef::new("/x", "n1", inner.clone());
         let err = r
-            .send_with_timeout(Box::new(crate::ingress::TestAsk(1)), Some(Duration::from_millis(50)))
+            .send_with_timeout(
+                Box::new(crate::ingress::TestAsk(1)),
+                Some(Duration::from_millis(50)),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ActorError::TimeoutDetail(_)), "got {err:?}");
-        assert!(inner.callbacks.is_empty(), "callback not cleaned after timeout");
+        assert!(
+            inner.callbacks.is_empty(),
+            "callback not cleaned after timeout"
+        );
         // 帧已发出
-        assert_eq!(rx.recv().await.unwrap().header.frame_type, crate::frame::frame_type::ASK);
+        assert_eq!(
+            rx.recv().await.unwrap().header.frame_type,
+            crate::frame::frame_type::ASK
+        );
     }
 
     // 回调表容量满 → insert 失败 → InternalError（capacity=1 预占满）
@@ -317,7 +328,10 @@ mod tests {
         let (otx, _orx) = tokio::sync::oneshot::channel();
         inner.callbacks.insert(1000, "n1", otx).unwrap();
         let r = RemoteActorRef::new("/x", "n1", inner);
-        let err = r.send(Box::new(crate::ingress::TestAsk(1))).await.unwrap_err();
+        let err = r
+            .send(Box::new(crate::ingress::TestAsk(1)))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ActorError::InternalError(_)), "got {err:?}");
         // 不应有帧发出（insert 失败在 send 帧之前）
         assert!(rx.try_recv().is_err());

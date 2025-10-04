@@ -423,10 +423,7 @@ mod tests {
 
     #[async_trait]
     impl ActorRef for DeadRef {
-        fn send<'a>(
-            &'a self,
-            _msg: BoxedMessage,
-        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async { Err(ActorError::Stopped) })
         }
         fn send_with_timeout<'a>(
@@ -436,10 +433,7 @@ mod tests {
         ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async { Err(ActorError::Stopped) })
         }
-        fn deliver<'a>(
-            &'a self,
-            _msg: BoxedMessage,
-        ) -> BoxedFuture<'a, ActorResult<()>> {
+        fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async { Err(ActorError::Stopped) })
         }
         fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
@@ -472,10 +466,7 @@ mod tests {
     #[test]
     fn death_reason_display_variants() {
         assert_eq!(DeathReason::Normal.to_string(), "normal");
-        assert_eq!(
-            DeathReason::Panic("x".into()).to_string(),
-            "panic: x"
-        );
+        assert_eq!(DeathReason::Panic("x".into()).to_string(), "panic: x");
         assert_eq!(DeathReason::Killed.to_string(), "killed");
         assert_eq!(
             DeathReason::Escalated("cascade".into()).to_string(),
@@ -488,7 +479,10 @@ mod tests {
         let a = DeathReason::Panic("p".into());
         assert_eq!(a.clone(), DeathReason::Panic("p".into()));
         assert_ne!(DeathReason::Normal, DeathReason::Killed);
-        assert_ne!(DeathReason::Panic("a".into()), DeathReason::Panic("b".into()));
+        assert_ne!(
+            DeathReason::Panic("a".into()),
+            DeathReason::Panic("b".into())
+        );
     }
 
     // ---------------- BasicDecisionFn ----------------
@@ -520,9 +514,18 @@ mod tests {
     async fn default_strategy_all_four_decisions() {
         let cases = [
             (DefaultStrategy::StopOnFailure, SupervisionDecision::Stop),
-            (DefaultStrategy::RestartOnFailure, SupervisionDecision::Restart),
-            (DefaultStrategy::ResumeOnFailure, SupervisionDecision::Resume),
-            (DefaultStrategy::EscalateFailure, SupervisionDecision::Escalate),
+            (
+                DefaultStrategy::RestartOnFailure,
+                SupervisionDecision::Restart,
+            ),
+            (
+                DefaultStrategy::ResumeOnFailure,
+                SupervisionDecision::Resume,
+            ),
+            (
+                DefaultStrategy::EscalateFailure,
+                SupervisionDecision::Escalate,
+            ),
         ];
         for (strategy, want) in cases {
             assert_eq!(
@@ -652,24 +655,25 @@ mod tests {
 
     #[tokio::test]
     async fn strategy_type_dispatches_to_inner() {
-        let cases: Vec<(SupervisorStrategyType, SupervisionDecision)> = vec![
-            (
-                SupervisorStrategyType::Default(DefaultStrategy::ResumeOnFailure),
-                SupervisionDecision::Resume,
-            ),
-            (
-                SupervisorStrategyType::OneForOne(
-                    DefaultSupervisorStrategyFactory::one_for_one(0, Duration::from_secs(1)),
+        let cases: Vec<(SupervisorStrategyType, SupervisionDecision)> =
+            vec![
+                (
+                    SupervisorStrategyType::Default(DefaultStrategy::ResumeOnFailure),
+                    SupervisionDecision::Resume,
                 ),
-                SupervisionDecision::Stop, // failure_count=1 > max=0
-            ),
-            (
-                SupervisorStrategyType::OneForAll(
-                    DefaultSupervisorStrategyFactory::one_for_all(9, Duration::from_secs(1)),
+                (
+                    SupervisorStrategyType::OneForOne(
+                        DefaultSupervisorStrategyFactory::one_for_one(0, Duration::from_secs(1)),
+                    ),
+                    SupervisionDecision::Stop, // failure_count=1 > max=0
                 ),
-                SupervisionDecision::Restart, // decider 默认
-            ),
-        ];
+                (
+                    SupervisorStrategyType::OneForAll(
+                        DefaultSupervisorStrategyFactory::one_for_all(9, Duration::from_secs(1)),
+                    ),
+                    SupervisionDecision::Restart, // decider 默认
+                ),
+            ];
         for (ty, want) in cases {
             assert_eq!(ty.handle_failure(dead_ref(), &any_err(), 1).await, want);
         }

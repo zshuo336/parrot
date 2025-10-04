@@ -33,8 +33,14 @@ impl ReceptionistKey {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "remote", derive(Serialize, Deserialize))]
 pub enum ReceptionistEvent {
-    Registered { key: ReceptionistKey, remote_path: String },
-    Unregistered { key: ReceptionistKey, remote_path: String },
+    Registered {
+        key: ReceptionistKey,
+        remote_path: String,
+    },
+    Unregistered {
+        key: ReceptionistKey,
+        remote_path: String,
+    },
 }
 
 /// 订阅流（先回放快照再续流——DEV_02 §3.2）。

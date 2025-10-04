@@ -71,7 +71,9 @@ impl Actor for SlowSink {
             if msg.downcast_ref::<BpGetCount>().is_some() {
                 return Ok(Box::new(BpTell(self.count)) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
 
@@ -85,7 +87,11 @@ async fn mk_facade_with_sink(
     strategy: BackpressureStrategy,
     delay_ms: u64,
 ) -> Arc<ParrotActorSystem> {
-    let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
+    let facade = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
     let cfg = ThreadActorSystemConfig {
         default_mailbox_capacity: mailbox,
         default_backpressure_strategy: strategy.clone(),
@@ -101,9 +107,14 @@ async fn mk_facade_with_sink(
         backpressure_strategy: Some(strategy),
         ..Default::default()
     };
-    ts.spawn_at(SlowSink { count: 0, delay_ms }, "/user/slow", None, actor_cfg)
-        .await
-        .unwrap();
+    ts.spawn_at(
+        SlowSink { count: 0, delay_ms },
+        "/user/slow",
+        None,
+        actor_cfg,
+    )
+    .await
+    .unwrap();
     facade
 }
 
@@ -119,13 +130,18 @@ async fn backpressure_e2e_block_eventual_delivery() {
     // 200 条 tell（每条 1ms 慢消费——邮箱 16 会反复满，Block 挂起等待）
     let t0 = std::time::Instant::now();
     for i in 0..200u64 {
-        sink.send(Box::new(BpTell(i))).await.expect("Block must not drop");
+        sink.send(Box::new(BpTell(i)))
+            .await
+            .expect("Block must not drop");
     }
     // 全部投递完成（最后一条 ask 返回时 count 已含全部）
     let r = sink.send(Box::new(BpGetCount)).await.unwrap();
     let cnt = r.downcast_ref::<BpTell>().unwrap().0;
     assert_eq!(cnt, 200, "all 200 tells delivered after wakeup");
-    assert!(t0.elapsed() > Duration::from_millis(150), "slow consumer actually throttled");
+    assert!(
+        t0.elapsed() > Duration::from_millis(150),
+        "slow consumer actually throttled"
+    );
 }
 
 /// Error 策略：邮箱满 → 编排侧 deliver（tell）收到确定性错误（不悬挂、不静默丢）。
@@ -144,5 +160,8 @@ async fn backpressure_e2e_error_fast_fail() {
             errors += 1;
         }
     }
-    assert!(errors > 0, "Error strategy must surface backpressure to orchestrator");
+    assert!(
+        errors > 0,
+        "Error strategy must surface backpressure to orchestrator"
+    );
 }

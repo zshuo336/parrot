@@ -21,10 +21,10 @@ pub mod mqtt;
 pub mod node;
 pub mod pb;
 pub mod raft;
-pub mod ref_;
-pub mod roles;
 pub mod receptionist;
+pub mod ref_;
 pub mod registry;
+pub mod roles;
 pub mod sharding;
 pub mod singleton;
 pub mod swim;
@@ -48,5 +48,5 @@ pub use ref_::{RemoteActorRef, RemoteInner};
 pub use registry::{CallbackRegistry, ReplyPayload};
 pub use system::{RemoteActorSystem, RemoteConfig, RemoteGatewayImpl};
 pub use transport::{
-    FrameSender, Transport, LATE_REPLY_DROPPED, HEARTBEAT_INTERVAL, HEARTBEAT_MAX_LOSS,
+    FrameSender, Transport, HEARTBEAT_INTERVAL, HEARTBEAT_MAX_LOSS, LATE_REPLY_DROPPED,
 };

@@ -23,7 +23,13 @@ pub struct RemoteEnvelope {
 impl RemoteEnvelope {
     /// ask 语义 → ASK 帧（reply_to 进 payload 头）。
     pub fn to_ask_frame(&self, cid: u64) -> crate::frame::Frame {
-        crate::frame::Frame::ask(cid, &self.path, &self.type_key, self.payload.clone(), self.reply_to.as_deref())
+        crate::frame::Frame::ask(
+            cid,
+            &self.path,
+            &self.type_key,
+            self.payload.clone(),
+            self.reply_to.as_deref(),
+        )
     }
 
     /// tell 语义 → TELL 帧。

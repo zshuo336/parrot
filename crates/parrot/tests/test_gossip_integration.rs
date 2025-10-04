@@ -10,9 +10,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use parrot_remote::frame::{frame_type, Frame, FrameHeader, PROTOCOL_VERSION};
+use parrot_remote::frame::{Frame, FrameHeader, PROTOCOL_VERSION, frame_type};
 use parrot_remote::swim::{
-    encode_gossip, Member, MemberEvent, MemberStatus, MembershipGossip, NodeAddrWire,
+    Member, MemberEvent, MemberStatus, MembershipGossip, NodeAddrWire, encode_gossip,
 };
 use parrot_remote::{LocalLookup, RemoteActorSystem, RemoteConfig};
 
@@ -110,15 +110,15 @@ async fn s1_int_inbound_gossip_merges_into_system_membership() {
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let m = b.membership.lock().await;
-        if m.members.len() == 3
-            && m.members.contains_key("x")
-            && m.members.contains_key("y")
-        {
+        if m.members.len() == 3 && m.members.contains_key("x") && m.members.contains_key("y") {
             merged = true;
             break;
         }
     }
-    assert!(merged, "B 系统 membership 必须合并入站 gossip（接线断点回归）");
+    assert!(
+        merged,
+        "B 系统 membership 必须合并入站 gossip（接线断点回归）"
+    );
 
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();

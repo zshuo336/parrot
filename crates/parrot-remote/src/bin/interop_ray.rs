@@ -155,7 +155,9 @@ async fn main() {
         .await
         .expect("connect+handshake with pb-only peer");
 
-    let ping = client.remote_ref("parrot://ray-gw-1/ray/user/echo").unwrap();
+    let ping = client
+        .remote_ref("parrot://ray-gw-1/ray/user/echo")
+        .unwrap();
 
     // 语义：Ping(100) → Pong(102)（ray 方言 +2）
     let r = ping.send(Box::new(UPing(100))).await.unwrap();
@@ -163,7 +165,9 @@ async fn main() {
     assert_eq!(got, 102, "ray dialect: Ping(100) -> Pong(102)");
 
     // 语义：Add(3,4) → AddR(1007)（ray 方言 +1000）
-    let add = client.remote_ref("parrot://ray-gw-1/ray/user/calc").unwrap();
+    let add = client
+        .remote_ref("parrot://ray-gw-1/ray/user/calc")
+        .unwrap();
     let r = add.send(Box::new(UAdd(3, 4))).await.unwrap();
     let got = r.downcast_ref::<UAddR>().unwrap().0;
     assert_eq!(got, 1007, "ray dialect: Add(3,4) -> AddR(1007)");
