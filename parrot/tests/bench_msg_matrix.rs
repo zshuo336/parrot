@@ -505,11 +505,11 @@ fn matrix_e_alloc_counting() {
 
         // E5 static tell（理论：0 —— flume 槽预分配按值入队）
         for _ in 0..300 {
-            let _ = rs.tell(PingS(1)).await.unwrap();
+            rs.tell(PingS(1)).await.unwrap();
         }
         let b = ALLOCS.load(Ordering::Relaxed);
         for _ in 0..N {
-            let _ = rs.tell(PingS(1)).await.unwrap();
+            rs.tell(PingS(1)).await.unwrap();
         }
         let d = allocs_delta(b) / N as f64;
         row("E5 static-tell", N as u64, Duration::from_secs(0), &format!("{d:.2} allocs/msg 全链路"));
