@@ -1,0 +1,47 @@
+[package]
+name = "parrot-remote"
+version = "0.1.0"
+edition = "2021"
+description = "Parrot remote layer: Wire 1.0 framing, transports, codec registry, remote refs (DEV_01)"
+license = "MIT"
+
+[dependencies]
+parrot-api = { path = "../parrot-api", features = ["remote"] }
+tokio = { version = "1", features = ["net", "time", "sync", "io-util", "rt-multi-thread", "macros"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = { version = "1", features = ["serde"] }
+bincode = "2"
+serde = { version = "1", features = ["derive"] }
+inventory = "0.3"
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+futures = "0.3"
+serde_json = "1"
+quinn = { version = "0.11.12", features = ["rustls", "runtime-tokio"] }
+rustls = { version = "0.23.45", features = ["ring"] }
+rustls-pki-types = "1.15.1"
+tokio-rustls = "0.26.6"
+rustls-pemfile = "2.2.0"
+prost = { version = "0.14.4", features = ["derive"] }
+rcgen = "0.14.10"
+# E7 MQTT 桥（DECISIONS_DEPENDENCIES 2026-10-04 裁定：rumqttc 锁 minor）
+rumqttc = "0.24"
+
+[features]
+default = ["tcp"]
+mem  = []   # MemoryTransport 测试载体（§10.2 回环集成；RC1-RC8 mem+tcp 双跑）
+tcp  = []   # TcpTransport（P1 主载体）
+# quic = [] # P2 增（DEV_02 K3）
+
+[[bin]]
+name = "dump-vectors"
+path = "src/bin/dump_vectors.rs"
+
+[[bin]]
+name = "remote-bench"
+path = "src/bin/remote_bench.rs"
+
+[dev-dependencies]
+prost-build = "0.14.4"
+rcgen = "0.14.10"
