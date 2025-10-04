@@ -1,6 +1,6 @@
 //! Rust ↔ TS(parrot-lite) 握手协商互测（DEV_03 §2.4——CI matrix 形态）。
 //!
-//! #[ignore] 手动门禁：spawn `node packages/lite/tests/interop_with_rust.mjs`
+//! #[ignore] 手动门禁：spawn `node interop/typescript-lite/tests/interop_with_rust.mjs`
 //! 对拉本测试内启动的 TCP echo 节点。
 //!
 //! 跑法：cargo test -p parrot --test test_lite_interop -- --ignored --nocapture
@@ -81,7 +81,7 @@ impl LocalLookup for Lookup {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "manual gate: needs node + packages/lite built (DEV_00 §4.2 P3)"]
+#[ignore = "manual gate: needs node + interop/typescript-lite built (DEV_00 §4.2 P3)"]
 async fn lite_handshake_negotiation_with_rust() {
     let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap());
     let ts = ThreadActorSystem::shared(Default::default());
@@ -105,7 +105,7 @@ async fn lite_handshake_negotiation_with_rust() {
 
     // spawn node 互测脚本（lite build 后 dist 存在）
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../packages/lite/tests/interop_with_rust.mjs");
+        .join("../../interop/typescript-lite/tests/interop_with_rust.mjs");
     assert!(manifest.exists(), "lite interop script missing: {}", manifest.display());
     let out = std::process::Command::new("node")
         .arg(manifest)

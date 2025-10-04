@@ -91,9 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The framework is organized into these primary components:
 
-1. `parrot-api`: Core traits and interfaces
-2. `parrot-api-derive`: Procedural macros for code generation
-3. `parrot`: Implementation of different actor system backends
+1. `crates/parrot-api`: Core traits and interfaces
+2. `crates/parrot-api-derive`: Procedural macros for code generation
+3. `crates/parrot`: Implementation of different actor system backends
+4. `crates/parrot-remote`: Remote / cluster / federation stack (Wire 1.0, SWIM, Raft, sharding)
+5. `interop/`: Cross-language Wire 1.0 implementations and SDKs
+   - `cpp-lite/` (C ABI), `typescript-lite/`, `jvm/` (Scala/Akka), `python/`, `erlang/`
+6. `tools/`: Simulation infra (`federation-lab` — composegen + digital twin)
+7. `docs/`: Design docs, frozen wire vectors, and acceptance reports
 
 ## Contributing
 

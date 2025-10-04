@@ -1,8 +1,8 @@
 %% Wire 1.0 对齐测试（DEV_03 §7：golden vectors eunit 断言）。
 %%
 %% 运行（repo 根）：
-%%   erl -noshell -pa parrot-protocol-erl -eval 'c:c(parrot_gw), test_wire:run(), halt().'
-%%   （或 make：见 parrot-protocol-erl/Makefile）
+%%   erl -noshell -pa interop/erlang -eval 'c:c(parrot_gw), test_wire:run(), halt().'
+%%   （或 make：见 interop/erlang/Makefile）
 -module(test_wire).
 -export([run/0, all/0]).
 

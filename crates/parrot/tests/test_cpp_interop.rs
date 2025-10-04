@@ -85,7 +85,7 @@ impl LocalLookup for Lookup {
 /// 编译并跑 C++ interop 二进制；返回 (exit_ok, stdout)。
 fn run_cpp_interop(port: u16) -> (bool, String) {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../native/cpp-lite");
+        .join("../../interop/cpp-lite");
     let src = dir.join("test_interop.cpp");
     assert!(src.exists(), "cpp interop source missing: {}", src.display());
     let bin = std::env::temp_dir().join(format!("pl_interop_{}", std::process::id()));
@@ -143,7 +143,7 @@ async fn cpp_interop_ask() {
 /// Rust 主控 dlopen C++ 共享库直调（§5.3 cabi_smoke——混合体闭环）。
 #[test]
 fn cabi_smoke_dlopen() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../native/cpp-lite");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interop/cpp-lite");
     let cc = std::env::var("CXX").unwrap_or_else(|_| "clang++".into());
     let so = std::env::temp_dir().join(format!("libpl_smoke_{}.dylib", std::process::id()));
     let build = std::process::Command::new(&cc)

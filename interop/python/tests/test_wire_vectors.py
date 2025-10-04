@@ -19,7 +19,7 @@ from parrot_protocol import (
 )
 
 VECTORS = json.loads(
-    (pathlib.Path(__file__).resolve().parents[2] / "docs" / "vectors" / "wire1.json").read_text()
+    (pathlib.Path(__file__).resolve().parents[3] / "docs" / "vectors" / "wire1.json").read_text()
 )
 
 

@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 
 # 剥离注释行后 grep：宏 crate 源码中任何非注释位置的 parrot::actix / parrot::thread
 # 都意味着生成模板（或属性解析逻辑）硬编码了引擎路径。
-VIOLATIONS=$(grep -rn 'parrot::actix\|parrot::thread' parrot-api-derive/src/ \
+VIOLATIONS=$(grep -rn 'parrot::actix\|parrot::thread' crates/parrot-api-derive/src/ \
   | grep -v '^\s*[^:]*:[0-9]*:\s*///' \
   | grep -v '^\s*[^:]*:[0-9]*:\s*//!' \
   | grep -v '^\s*[^:]*:[0-9]*:\s*//' || true)

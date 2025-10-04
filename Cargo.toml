@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "parrot",
-    "parrot-api",
-    "parrot-api-derive",
-    "parrot-api-derive-tests",
-    "parrot-remote",
+    "crates/parrot",
+    "crates/parrot-api",
+    "crates/parrot-api-derive",
+    "crates/parrot-api-derive-tests",
+    "crates/parrot-remote",
     "tools/federation-lab"
 ]
 
