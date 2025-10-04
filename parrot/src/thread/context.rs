@@ -5,16 +5,16 @@ use std::time::Duration;
 
 use tokio::runtime::Handle;
 
-use parrot_api::actor::Actor;
-use parrot_api::address::{ActorPath, ActorRef};
-use parrot_api::context::{ActorContext, ActorSpawner, ReadOnlyChildrenVec};
-use parrot_api::errors::ActorError;
-use parrot_api::supervisor::SupervisorStrategyType;
-use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
-use parrot_api::message::CloneableMessage;
+use crate::logging;
 use crate::thread::address::ThreadActorRef;
 use crate::thread::config::{BackpressureStrategy, SupervisorStrategy};
-use crate::logging;
+use parrot_api::actor::Actor;
+use parrot_api::address::ActorPath;
+use parrot_api::context::{ActorContext, ActorSpawner, ReadOnlyChildrenVec};
+use parrot_api::errors::ActorError;
+use parrot_api::message::CloneableMessage;
+use parrot_api::supervisor::SupervisorStrategyType;
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use std::sync::RwLock;
 
 /// Weak reference to the actor system to avoid circular references.
@@ -62,6 +62,12 @@ pub struct ThreadContext<A: Actor + Send + Sync + 'static> {
     /// Phantom data to associate with actor type
     _phantom: PhantomData<A>,
 }
+
+/// M1 derive-decouple: thread 引擎的中立 Context 别名。
+///
+/// derive 宏生成代码经 `__parrot_engine::EngineContext<Self>` 引用 context；
+/// 本引擎的具体类型是 `ThreadContext<Self>`。
+pub type EngineContext<A> = ThreadContext<A>;
 
 impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     /// Creates a new ThreadContext.
@@ -124,7 +130,10 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     /// # Returns
     /// The actor's own reference, if it is set. otherwise, it will panic.
     pub fn get_self_ref(&self) -> BoxedActorRef {
-        self.self_ref.as_ref().expect("Self reference not set").clone_boxed()
+        self.self_ref
+            .as_ref()
+            .expect("Self reference not set")
+            .clone_boxed()
     }
 
     /// Whether the self reference has been set.
@@ -146,27 +155,45 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         self.system.upgrade()
     }
 
+    /// Get the weak system reference (M3 supervision hook plumbing).
+    pub fn system_weak_ref(&self) -> WeakSystemRef {
+        self.system.clone()
+    }
+
     /// Adds a child actor reference.
     pub fn add_child(&mut self, child_ref: BoxedActorRef) {
         let path_str = child_ref.path();
         if self.children_refs.is_none() {
             self.children_refs = Some(Arc::new(RwLock::new(HashMap::new())));
         }
-        self.children_refs.as_mut().unwrap().write().unwrap().insert(path_str, child_ref);
+        self.children_refs
+            .as_mut()
+            .unwrap()
+            .write()
+            .unwrap()
+            .insert(path_str, child_ref);
     }
 
     /// Removes a child actor reference by path.
     pub fn remove_child_by_path(&mut self, path: &str) -> Option<BoxedActorRef> {
         self.children_refs.as_mut()?.write().unwrap().remove(path)
-    }    /// Removes a child actor reference.
+    }
+    /// Removes a child actor reference.
     pub fn remove_child_by_ref(&mut self, child: &BoxedActorRef) -> Option<BoxedActorRef> {
-        self.children_refs.as_mut()?.write().unwrap().remove(&child.path())
+        self.children_refs
+            .as_mut()?
+            .write()
+            .unwrap()
+            .remove(&child.path())
     }
 
     /// Returns the children references.
     pub fn children(&self) -> Option<ReadOnlyChildrenVec> {
         self.children_refs.as_ref().map(|children| {
-            let boxed_children = children.read().unwrap().values()
+            let boxed_children = children
+                .read()
+                .unwrap()
+                .values()
                 .map(|r| r.clone_boxed())
                 .collect::<Vec<_>>();
             ReadOnlyChildrenVec::new(Arc::new(RwLock::new(boxed_children)))
@@ -199,11 +226,9 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     {
         // ThreadActorRef<A> is stored boxed as self_ref only when the actor
         // engine created it; downcast through as_any.
-        self.self_ref.as_ref().and_then(|r| {
-            r.as_any()
-                .downcast_ref::<ThreadActorRef<A>>()
-                .cloned()
-        })
+        self.self_ref
+            .as_ref()
+            .and_then(|r| r.as_any().downcast_ref::<ThreadActorRef<A>>().cloned())
     }
 
     /// Actor path string.
@@ -228,7 +253,9 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
 
                 // Stop all children
                 if let Some(children) = &self.children_refs {
-                    let children_to_stop: Vec<_> = children.read().unwrap()
+                    let children_to_stop: Vec<_> = children
+                        .read()
+                        .unwrap()
                         .values()
                         .map(|r| r.clone_boxed())
                         .collect();
@@ -243,12 +270,18 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
 
                 Ok(())
             } else {
-                Err(ActorError::InternalError("Self reference not set".to_string()))
+                Err(ActorError::InternalError(
+                    "Self reference not set".to_string(),
+                ))
             }
         })
     }
 
-    fn send<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+    fn send<'a>(
+        &'a self,
+        target: BoxedActorRef,
+        msg: BoxedMessage,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             target.send(msg).await?;
             Ok(())
@@ -256,7 +289,11 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
     }
 
     /// Ask a target actor for a response using the universal ask envelope.
-    fn ask<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn ask<'a>(
+        &'a self,
+        target: BoxedActorRef,
+        msg: BoxedMessage,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         let timeout_duration = self.receive_timeout.unwrap_or_else(|| {
             self.system()
                 .map(|s| s.config().default_ask_timeout)
@@ -280,7 +317,12 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         })
     }
 
-    fn schedule_once<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage, delay: Duration) -> BoxedFuture<'a, ActorResult<()>> {
+    fn schedule_once<'a>(
+        &'a self,
+        target: BoxedActorRef,
+        msg: BoxedMessage,
+        delay: Duration,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         let runtime = self.runtime_handle.clone();
 
         Box::pin(async move {
@@ -295,7 +337,13 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         })
     }
 
-    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: CloneableMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'a, ActorResult<()>> {
+    fn schedule_periodic<'a>(
+        &'a self,
+        target: BoxedActorRef,
+        msg: CloneableMessage,
+        initial_delay: Duration,
+        interval: Duration,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         let runtime = self.runtime_handle.clone();
 
         Box::pin(async move {
@@ -328,10 +376,10 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         let watcher_path = self.path.path();
 
         Box::pin(async move {
-            if let Some(weak) = system {
-                if let Some(sys) = weak.upgrade() {
-                    sys.watch(watcher_path.to_string(), target.path()).await?;
-                }
+            if let Some(weak) = system
+                && let Some(sys) = weak.upgrade()
+            {
+                sys.watch(watcher_path.to_string(), target.path()).await?;
             }
             Ok(())
         })
@@ -342,10 +390,10 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         let watcher_path = self.path.path();
 
         Box::pin(async move {
-            if let Some(weak) = system {
-                if let Some(sys) = weak.upgrade() {
-                    sys.unwatch(watcher_path.to_string(), target.path()).await?;
-                }
+            if let Some(weak) = system
+                && let Some(sys) = weak.upgrade()
+            {
+                sys.unwatch(watcher_path.to_string(), target.path()).await?;
             }
             Ok(())
         })
@@ -376,27 +424,39 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
     }
 
     fn set_supervisor_strategy(&mut self, strategy: SupervisorStrategyType) {
-        use parrot_api::supervisor::{DefaultStrategy, OneForOneStrategy, OneForAllStrategy};
+        use parrot_api::supervisor::{DefaultStrategy, OneForAllStrategy, OneForOneStrategy};
         self.supervisor_strategy = match strategy {
-            SupervisorStrategyType::Default(DefaultStrategy::StopOnFailure) => SupervisorStrategy::Stop,
-            SupervisorStrategyType::Default(DefaultStrategy::RestartOnFailure) => SupervisorStrategy::Restart {
-                max_retries: 3,
-                within: Duration::from_secs(10),
+            SupervisorStrategyType::Default(DefaultStrategy::StopOnFailure) => {
+                SupervisorStrategy::Stop
+            }
+            SupervisorStrategyType::Default(DefaultStrategy::RestartOnFailure) => {
+                SupervisorStrategy::Restart {
+                    max_retries: 3,
+                    within: Duration::from_secs(10),
+                }
+            }
+            SupervisorStrategyType::Default(DefaultStrategy::ResumeOnFailure) => {
+                SupervisorStrategy::Resume
+            }
+            SupervisorStrategyType::Default(DefaultStrategy::EscalateFailure) => {
+                SupervisorStrategy::Escalate
+            }
+            SupervisorStrategyType::OneForOne(OneForOneStrategy {
+                max_restarts,
+                within,
+                ..
+            }) => SupervisorStrategy::Restart {
+                max_retries: max_restarts as usize,
+                within,
             },
-            SupervisorStrategyType::Default(DefaultStrategy::ResumeOnFailure) => SupervisorStrategy::Resume,
-            SupervisorStrategyType::Default(DefaultStrategy::EscalateFailure) => SupervisorStrategy::Escalate,
-            SupervisorStrategyType::OneForOne(OneForOneStrategy { max_restarts, within, .. }) => {
-                SupervisorStrategy::Restart {
-                    max_retries: max_restarts as usize,
-                    within,
-                }
-            }
-            SupervisorStrategyType::OneForAll(OneForAllStrategy { max_restarts, within, .. }) => {
-                SupervisorStrategy::Restart {
-                    max_retries: max_restarts as usize,
-                    within,
-                }
-            }
+            SupervisorStrategyType::OneForAll(OneForAllStrategy {
+                max_restarts,
+                within,
+                ..
+            }) => SupervisorStrategy::Restart {
+                max_retries: max_restarts as usize,
+                within,
+            },
         };
     }
 
@@ -415,34 +475,63 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
 
 #[async_trait::async_trait]
 impl<A: Actor + Send + Sync + 'static> ActorSpawner for ThreadContext<A> {
-    fn spawn<'a>(&'a self, actor: BoxedMessage, config: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
+    fn spawn<'a>(
+        &'a self,
+        actor: BoxedMessage,
+        config: BoxedMessage,
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
         Box::pin(async move {
             if let Some(system) = self.system() {
                 system
                     .spawn_erased_actor(actor, config, Some(self.supervisor_strategy.clone()))
                     .await
             } else {
-                Err(ActorError::InternalError("Actor system not available".to_string()))
+                Err(ActorError::InternalError(
+                    "Actor system not available".to_string(),
+                ))
             }
         })
     }
 
-    fn spawn_with_strategy<'a>(&'a self, actor: BoxedMessage, config: BoxedMessage, strategy: SupervisorStrategyType) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
-        use parrot_api::supervisor::{DefaultStrategy, OneForOneStrategy, OneForAllStrategy};
+    fn spawn_with_strategy<'a>(
+        &'a self,
+        actor: BoxedMessage,
+        config: BoxedMessage,
+        strategy: SupervisorStrategyType,
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
+        use parrot_api::supervisor::{DefaultStrategy, OneForAllStrategy, OneForOneStrategy};
         let internal = match strategy {
-            SupervisorStrategyType::Default(DefaultStrategy::StopOnFailure) => SupervisorStrategy::Stop,
-            SupervisorStrategyType::Default(DefaultStrategy::RestartOnFailure) => SupervisorStrategy::Restart {
-                max_retries: 3,
-                within: Duration::from_secs(10),
+            SupervisorStrategyType::Default(DefaultStrategy::StopOnFailure) => {
+                SupervisorStrategy::Stop
+            }
+            SupervisorStrategyType::Default(DefaultStrategy::RestartOnFailure) => {
+                SupervisorStrategy::Restart {
+                    max_retries: 3,
+                    within: Duration::from_secs(10),
+                }
+            }
+            SupervisorStrategyType::Default(DefaultStrategy::ResumeOnFailure) => {
+                SupervisorStrategy::Resume
+            }
+            SupervisorStrategyType::Default(DefaultStrategy::EscalateFailure) => {
+                SupervisorStrategy::Escalate
+            }
+            SupervisorStrategyType::OneForOne(OneForOneStrategy {
+                max_restarts,
+                within,
+                ..
+            }) => SupervisorStrategy::Restart {
+                max_retries: max_restarts as usize,
+                within,
             },
-            SupervisorStrategyType::Default(DefaultStrategy::ResumeOnFailure) => SupervisorStrategy::Resume,
-            SupervisorStrategyType::Default(DefaultStrategy::EscalateFailure) => SupervisorStrategy::Escalate,
-            SupervisorStrategyType::OneForOne(OneForOneStrategy { max_restarts, within, .. }) => {
-                SupervisorStrategy::Restart { max_retries: max_restarts as usize, within }
-            }
-            SupervisorStrategyType::OneForAll(OneForAllStrategy { max_restarts, within, .. }) => {
-                SupervisorStrategy::Restart { max_retries: max_restarts as usize, within }
-            }
+            SupervisorStrategyType::OneForAll(OneForAllStrategy {
+                max_restarts,
+                within,
+                ..
+            }) => SupervisorStrategy::Restart {
+                max_retries: max_restarts as usize,
+                within,
+            },
         };
 
         Box::pin(async move {
@@ -451,7 +540,9 @@ impl<A: Actor + Send + Sync + 'static> ActorSpawner for ThreadContext<A> {
                     .spawn_erased_actor(actor, config, Some(internal))
                     .await
             } else {
-                Err(ActorError::InternalError("Actor system not available".to_string()))
+                Err(ActorError::InternalError(
+                    "Actor system not available".to_string(),
+                ))
             }
         })
     }
@@ -473,7 +564,9 @@ mod tests {
     }
 
     impl parrot_api::address::ActorRef for FakeRef {
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> { Box::pin(async { Ok(()) }) }
+        fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
         fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async { Err(ActorError::ActorNotFound("fake".into())) })
         }
@@ -620,17 +713,26 @@ mod tests {
         ctx.set_supervisor_strategy(SupervisorStrategyType::Default(
             DefaultStrategy::StopOnFailure,
         ));
-        assert!(matches!(ctx.supervisor_strategy_internal(), SupervisorStrategy::Stop));
+        assert!(matches!(
+            ctx.supervisor_strategy_internal(),
+            SupervisorStrategy::Stop
+        ));
 
         ctx.set_supervisor_strategy(SupervisorStrategyType::Default(
             DefaultStrategy::ResumeOnFailure,
         ));
-        assert!(matches!(ctx.supervisor_strategy_internal(), SupervisorStrategy::Resume));
+        assert!(matches!(
+            ctx.supervisor_strategy_internal(),
+            SupervisorStrategy::Resume
+        ));
 
         ctx.set_supervisor_strategy(SupervisorStrategyType::Default(
             DefaultStrategy::EscalateFailure,
         ));
-        assert!(matches!(ctx.supervisor_strategy_internal(), SupervisorStrategy::Escalate));
+        assert!(matches!(
+            ctx.supervisor_strategy_internal(),
+            SupervisorStrategy::Escalate
+        ));
 
         ctx.set_supervisor_strategy(SupervisorStrategyType::Default(
             DefaultStrategy::RestartOnFailure,

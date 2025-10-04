@@ -1,27 +1,23 @@
 /// # Actix-based Actor System Example
-/// 
+///
 /// This example demonstrates how to:
 /// - Create an ActixActorSystem without creating a nested Tokio runtime
 /// - Define a custom actor and message
 /// - Spawn the actor using spawn_root_typed
 /// - Send messages and receive responses
 /// - Properly shutdown the system
-/// 
+///
 /// The key difference in this example is the use of `actix::System::new().block_on()`
-/// instead of `#[tokio::main]`, which avoids the "Cannot start a runtime from within 
+/// instead of `#[tokio::main]`, which avoids the "Cannot start a runtime from within
 /// a runtime" error that can occur when a Tokio runtime already exists.
-
-use parrot::actix::{ActixActorSystem, ActixContext, ActixActor};
+use parrot::actix::{ActixActor, ActixActorSystem, ActixContext};
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::message::Message;
-use parrot_api::types::{BoxedMessage, ActorResult, BoxedFuture};
+use parrot_api::address::ActorRefExt;
 use parrot_api::errors::ActorError;
-use parrot_api::address::{ActorRef, ActorRefExt};
-use actix;
+use parrot_api::message::Message;
+use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::fmt::Debug;
 use std::time::Duration;
-use std::any::Any;
-use std::ptr::NonNull;
 
 /// A simple message that carries a string payload
 #[derive(Debug, Clone)]
@@ -29,7 +25,7 @@ struct TestMessage(String);
 
 impl Message for TestMessage {
     type Result = String;
-    
+
     /// Extract the result from a BoxedMessage
     fn extract_result(result: BoxedMessage) -> ActorResult<Self::Result> {
         if let Ok(string) = result.downcast::<String>() {
@@ -64,13 +60,13 @@ impl TestActor {
 impl Actor for TestActor {
     type Config = EmptyConfig;
     type Context = ActixContext<ActixActor<Self>>;
-    
+
     /// Basic message handling interface (required by trait)
     /// This is used for the general async message processing path
     fn receive_message<'a>(
         &'a mut self,
-        msg: BoxedMessage,
-        _ctx: &'a mut Self::Context
+        _msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         let name = self.name.clone();
         Box::pin(async move {
@@ -80,81 +76,88 @@ impl Actor for TestActor {
             Ok(Box::new(response) as BoxedMessage)
         })
     }
-    
+
     /// Engine-specific message handling (for Actix)
     /// This is the primary message handler for Actix-based actors
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _engine_ctx: parrot_api::actor::EngineContextHandle
-    ) -> Option<ActorResult<BoxedMessage>> {
-        // Try to downcast the message to our TestMessage type
-        if let Some(test_msg) = msg.downcast_ref::<TestMessage>() {
-            println!("Actor {} received TestMessage: {}", self.name, test_msg.0);
-            
-            // Create and return response
-            let response = format!("Hello from {}: received {}", self.name, test_msg.0);
-            Some(Ok(Box::new(response) as BoxedMessage))
-        } else {
-            // Unknown message type
-            Some(Err(ActorError::MessageHandlingError(
-                format!("Actor {} received unknown message type", self.name)
-            )))
-        }
-    }
-    
-    /// Return the current actor state
     fn state(&self) -> ActorState {
         self.state
     }
 }
 
+// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
+impl parrot_api::actor::ActixEngineExt for TestActor {
+    fn receive_message_with_engine<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+        _engine_ctx: parrot_api::actor::EngineContextHandle,
+    ) -> Option<ActorResult<BoxedMessage>> {
+        // Try to downcast the message to our TestMessage type
+        if let Some(test_msg) = msg.downcast_ref::<TestMessage>() {
+            println!("Actor {} received TestMessage: {}", self.name, test_msg.0);
+
+            // Create and return response
+            let response = format!("Hello from {}: received {}", self.name, test_msg.0);
+            Some(Ok(Box::new(response) as BoxedMessage))
+        } else {
+            // Unknown message type
+            Some(Err(ActorError::MessageHandlingError(format!(
+                "Actor {} received unknown message type",
+                self.name
+            ))))
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Actix-based actor system example");
-    
+
     // Create an actix system and run within it
     // This approach avoids nested runtime errors
     actix::System::new().block_on(async {
         println!("Initializing ActixActorSystem...");
-        
+
         // Create the actor system
-        let system = ActixActorSystem::new().await.expect("Failed to create actor system");
-        
+        let system = ActixActorSystem::new()
+            .await
+            .expect("Failed to create actor system");
+
         println!("Creating actor...");
-        
+
         // Create actor instances
         let actor = TestActor::new("TestActor1".to_string());
-        
+
         // Spawn actor using spawn_root_typed method
-        let actor_ref = system.spawn_root_typed(actor, EmptyConfig::default())
+        let actor_ref = system
+            .spawn_root_typed(actor, EmptyConfig)
             .await
             .expect("Failed to spawn actor");
-        
+
         println!("Created actor: {}", actor_ref.path());
-        
+
         // Send a message and await response
         println!("Sending message to actor...");
         let message = TestMessage("Hello, Actor World!".to_string());
-        let response = actor_ref.ask(message)
+        let response = actor_ref
+            .ask(message)
             .await
             .expect("Failed to get response");
-        
+
         println!("Got response: {}", response);
-        
+
         // Wait a bit to ensure messages are processed
         println!("Waiting for message processing to complete...");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        
+
         // Shutdown the system
         println!("Shutting down actor system...");
         system.shutdown().await.expect("Failed to shutdown system");
-        
+
         // Stop the actix system
         println!("Stopping Actix system...");
         actix::System::current().stop();
     });
-    
+
     println!("Example completed successfully");
     Ok(())
-} 
+}

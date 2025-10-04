@@ -15,17 +15,18 @@
 //!      (Result/Option/String/Vec/custom)      C19 error taxonomy propagation
 //!  C20 many-small-actors fan-out/fan-in diamond
 
-use parrot::thread::config::{BackpressureStrategy, ThreadActorConfig, ThreadActorSystemConfig};
+use parrot::actix as __parrot_engine;
+use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
-use parrot_api::message::{Message, MessageOptions, MessagePriority};
+use parrot_api::message::{Message, MessagePriority};
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -46,7 +47,10 @@ struct Greet(String);
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "Result<u64, String>")]
-struct TryDiv { num: u64, den: u64 }
+struct TryDiv {
+    num: u64,
+    den: u64,
+}
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "Option<String>")]
@@ -70,9 +74,11 @@ struct Note(String);
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "u64")]
+#[allow(dead_code)]
 struct Job(u64);
 
 #[derive(Clone, Debug, Message)]
+#[allow(dead_code)]
 #[message(result = "u64")]
 struct Aggregated;
 
@@ -82,7 +88,10 @@ struct Stage(u64);
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "u64")]
-struct SessionOp { cmd: String, arg: u64 }
+struct SessionOp {
+    cmd: String,
+    arg: u64,
+}
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "u64")]
@@ -113,8 +122,10 @@ struct Worker {
     value: u64,
     history: Vec<u64>,
     notes: Vec<String>,
+    #[allow(dead_code)]
     mode: u8,
     fail_count: u64,
+    #[allow(dead_code)]
     restart_count: u64,
 }
 
@@ -153,11 +164,11 @@ impl Actor for Worker {
                 return Ok(Box::new(format!("hello {}", g.0)) as BoxedMessage);
             }
             if let Some(d) = msg.downcast_ref::<TryDiv>() {
-                return Ok(Box::new(if d.den == 0 {
-                    Err::<u64, String>("div by zero".into())
-                } else {
-                    Ok::<u64, String>(d.num / d.den)
-                }) as BoxedMessage);
+                return Ok(Box::new(
+                    d.num
+                        .checked_div(d.den)
+                        .ok_or_else::<String, _>(|| "div by zero".into()),
+                ) as BoxedMessage);
             }
             if let Some(f) = msg.downcast_ref::<FindName>() {
                 return Ok(Box::new(if f.0 == 1 {
@@ -187,12 +198,21 @@ impl Actor for Worker {
             }
             if let Some(o) = msg.downcast_ref::<SessionOp>() {
                 match o.cmd.as_str() {
-                    "put" => { self.value += o.arg; Ok(Box::new(self.value) as BoxedMessage) }
+                    "put" => {
+                        self.value += o.arg;
+                        Ok(Box::new(self.value) as BoxedMessage)
+                    }
                     "get" => Ok(Box::new(self.value) as BoxedMessage),
-                    "mul" => { self.value *= o.arg.max(1); Ok(Box::new(self.value) as BoxedMessage) }
-                    _ => Err(ActorError::MessageHandlingError(format!("bad cmd {}", o.cmd))),
+                    "mul" => {
+                        self.value *= o.arg.max(1);
+                        Ok(Box::new(self.value) as BoxedMessage)
+                    }
+                    _ => Err(ActorError::MessageHandlingError(format!(
+                        "bad cmd {}",
+                        o.cmd
+                    ))),
                 }
-            } else if let Some(t) = msg.downcast_ref::<Tick>() {
+            } else if let Some(_t) = msg.downcast_ref::<Tick>() {
                 self.value += 1;
                 Ok(Box::new(self.value) as BoxedMessage)
             } else if let Some(f) = msg.downcast_ref::<FailIf>() {
@@ -214,15 +234,6 @@ impl Actor for Worker {
                 Err(ActorError::MessageHandlingError("unknown".into()))
             }
         })
-    }
-
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _engine_ctx: EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -295,16 +306,24 @@ async fn c3_timeout_bounded_ask() {
     let ts = system().await;
     let w = mk(&ts, "/c3").await;
     // Fast op within budget.
-    let r = timed!(Duration::from_secs(5), w.send_with_timeout(Box::new(Echo(9)), Some(Duration::from_secs(1))));
+    let r = timed!(
+        Duration::from_secs(5),
+        w.send_with_timeout(Box::new(Echo(9)), Some(Duration::from_secs(1)))
+    );
     assert!(r.is_ok());
     // Slow op exceeding budget.
-    let r = timed!(Duration::from_secs(5), w.send_with_timeout(Box::new(SlowEcho(120)), Some(Duration::from_millis(20))));
-    match r {
-        Err(e) => {
-            let s = e.to_string().to_lowercase();
-            assert!(s.contains("timeout") || s.contains("timed out") || s.contains("elapsed"), "want timeout, got {}", e);
-        }
-        Ok(_) => {} // scheduling race tolerated
+    let r = timed!(
+        Duration::from_secs(5),
+        w.send_with_timeout(Box::new(SlowEcho(120)), Some(Duration::from_millis(20)))
+    );
+    // scheduling race tolerated: Ok(_) 无断言
+    if let Err(e) = r {
+        let s = e.to_string().to_lowercase();
+        assert!(
+            s.contains("timeout") || s.contains("timed out") || s.contains("elapsed"),
+            "want timeout, got {}",
+            e
+        );
     }
 }
 
@@ -344,8 +363,13 @@ async fn c5_fan_in_aggregation() {
             }
         }));
     }
-    for h in hs { h.await.unwrap(); }
-    assert_eq!(timed!(Duration::from_secs(5), agg.ask(Get)).unwrap(), N * PER);
+    for h in hs {
+        h.await.unwrap();
+    }
+    assert_eq!(
+        timed!(Duration::from_secs(5), agg.ask(Get)).unwrap(),
+        N * PER
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +393,10 @@ async fn c6_fan_out_distribution() {
     for w in &ws {
         sum += timed!(Duration::from_secs(5), w.ask(Get)).unwrap();
     }
-    assert_eq!(sum, expected_total, "every fanned-out unit delivered exactly once");
+    assert_eq!(
+        sum, expected_total,
+        "every fanned-out unit delivered exactly once"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -389,12 +416,20 @@ async fn c7_pipeline_chain() {
     timed!(Duration::from_secs(5), c.ask(Inc(100))).unwrap();
     // Hand A's state to B: B = 10 + 1 = 11.
     assert_eq!(
-        timed!(Duration::from_secs(5), b.ask(Stage(timed!(Duration::from_secs(5), a.ask(Get)).unwrap()))).unwrap(),
+        timed!(
+            Duration::from_secs(5),
+            b.ask(Stage(timed!(Duration::from_secs(5), a.ask(Get)).unwrap()))
+        )
+        .unwrap(),
         11
     );
     // Hand B's state to C: C = 100 + 11 = 111.
     assert_eq!(
-        timed!(Duration::from_secs(5), c.ask(Stage(timed!(Duration::from_secs(5), b.ask(Get)).unwrap()))).unwrap(),
+        timed!(
+            Duration::from_secs(5),
+            c.ask(Stage(timed!(Duration::from_secs(5), b.ask(Get)).unwrap()))
+        )
+        .unwrap(),
         111
     );
 }
@@ -407,10 +442,46 @@ async fn c7_pipeline_chain() {
 async fn c8_stateful_session() {
     let ts = system().await;
     let s = mk(&ts, "/c8").await;
-    assert_eq!(timed!(Duration::from_secs(5), s.ask(SessionOp { cmd: "put".into(), arg: 5 })).unwrap(), 5);
-    assert_eq!(timed!(Duration::from_secs(5), s.ask(SessionOp { cmd: "mul".into(), arg: 3 })).unwrap(), 15);
-    assert_eq!(timed!(Duration::from_secs(5), s.ask(SessionOp { cmd: "get".into(), arg: 0 })).unwrap(), 15);
-    let bad = timed!(Duration::from_secs(5), s.ask(SessionOp { cmd: "nope".into(), arg: 0 }));
+    assert_eq!(
+        timed!(
+            Duration::from_secs(5),
+            s.ask(SessionOp {
+                cmd: "put".into(),
+                arg: 5
+            })
+        )
+        .unwrap(),
+        5
+    );
+    assert_eq!(
+        timed!(
+            Duration::from_secs(5),
+            s.ask(SessionOp {
+                cmd: "mul".into(),
+                arg: 3
+            })
+        )
+        .unwrap(),
+        15
+    );
+    assert_eq!(
+        timed!(
+            Duration::from_secs(5),
+            s.ask(SessionOp {
+                cmd: "get".into(),
+                arg: 0
+            })
+        )
+        .unwrap(),
+        15
+    );
+    let bad = timed!(
+        Duration::from_secs(5),
+        s.ask(SessionOp {
+            cmd: "nope".into(),
+            arg: 0
+        })
+    );
     assert!(bad.is_err());
 }
 
@@ -422,7 +493,9 @@ async fn c8_stateful_session() {
 async fn c9_metrics_history() {
     let ts = system().await;
     let m = mk(&ts, "/c9").await;
-    for i in 1..=5u64 { timed!(Duration::from_secs(5), m.ask(Inc(i))).unwrap(); }
+    for i in 1..=5u64 {
+        timed!(Duration::from_secs(5), m.ask(Inc(i))).unwrap();
+    }
     let h: Vec<u64> = timed!(Duration::from_secs(5), m.ask(History)).unwrap();
     assert_eq!(h, vec![1, 2, 3, 4, 5]);
     timed!(Duration::from_secs(5), m.ask(Reset)).unwrap();
@@ -440,7 +513,9 @@ async fn c10_broadcast_to_all() {
     let ts = system().await;
     const N: usize = 10;
     let mut ws = Vec::new();
-    for i in 0..N { ws.push(mk(&ts, &format!("/c10/w{}", i)).await); }
+    for i in 0..N {
+        ws.push(mk(&ts, &format!("/c10/w{}", i)).await);
+    }
     for w in &ws {
         timed!(Duration::from_secs(5), w.ask(Note("broadcast".into()))).unwrap();
         timed!(Duration::from_secs(5), w.ask(Inc(7))).unwrap();
@@ -507,16 +582,22 @@ async fn c13_error_taxonomy() {
     let ts = system().await;
     let w = mk(&ts, "/c13").await;
     // Domain error inside Ok(Result).
-    let r: Result<u64, String> = timed!(Duration::from_secs(5), w.ask(TryDiv { num: 5, den: 0 })).unwrap();
+    let r: Result<u64, String> =
+        timed!(Duration::from_secs(5), w.ask(TryDiv { num: 5, den: 0 })).unwrap();
     assert_eq!(r.unwrap_err(), "div by zero");
-    let r: Result<u64, String> = timed!(Duration::from_secs(5), w.ask(TryDiv { num: 6, den: 3 })).unwrap();
+    let r: Result<u64, String> =
+        timed!(Duration::from_secs(5), w.ask(TryDiv { num: 6, den: 3 })).unwrap();
     assert_eq!(r.unwrap(), 2);
     // Transport-level error (actor rejects).
     let e = timed!(Duration::from_secs(5), w.ask(FailIf(7))).unwrap_err();
     assert!(matches!(e, ActorError::MessageHandlingError(_)));
     assert!(e.to_string().contains("fail-7"));
     // Unknown message type.
-    let e = timed!(Duration::from_secs(5), w.send(Box::new(999u32) as BoxedMessage)).unwrap_err();
+    let e = timed!(
+        Duration::from_secs(5),
+        w.send(Box::new(999u32) as BoxedMessage)
+    )
+    .unwrap_err();
     assert!(e.to_string().contains("unknown"));
     // Actor survives all of it.
     assert_eq!(timed!(Duration::from_secs(5), w.ask(Get)).unwrap(), 0);
@@ -563,7 +644,10 @@ async fn c15_priority_metadata() {
     assert!(MessagePriority::new_unchecked(30).is_low());
     assert!(MessagePriority::new_unchecked(50).is_normal());
     assert!(MessagePriority::new_unchecked(70).is_high());
-    assert!(MessagePriority::new(200).is_none(), "out-of-range priority rejected");
+    assert!(
+        MessagePriority::new(200).is_none(),
+        "out-of-range priority rejected"
+    );
     assert!(MessagePriority::new(5).is_some());
     // Metadata flows through envelopes without affecting correctness.
     let ts = system().await;
@@ -599,7 +683,10 @@ async fn c17_stream_ingestion() {
     let mut expect = 0u64;
     for i in 1..=100u64 {
         expect += i;
-        assert_eq!(timed!(Duration::from_secs(5), w.ask(StreamItem(i))).unwrap(), expect);
+        assert_eq!(
+            timed!(Duration::from_secs(5), w.ask(StreamItem(i))).unwrap(),
+            expect
+        );
     }
 }
 
@@ -612,8 +699,14 @@ async fn c18_result_type_variety() {
     let ts = system().await;
     let w = mk(&ts, "/c18").await;
     // u64, String, Result<u64,String>, Option<String>, Vec<u64>, ()
-    assert_eq!(timed!(Duration::from_secs(5), w.ask(Echo(42))).unwrap(), 42u64);
-    assert_eq!(timed!(Duration::from_secs(5), w.ask(Greet("parrot".into()))).unwrap(), "hello parrot");
+    assert_eq!(
+        timed!(Duration::from_secs(5), w.ask(Echo(42))).unwrap(),
+        42u64
+    );
+    assert_eq!(
+        timed!(Duration::from_secs(5), w.ask(Greet("parrot".into()))).unwrap(),
+        "hello parrot"
+    );
     let none: Option<String> = timed!(Duration::from_secs(5), w.ask(FindName(2))).unwrap();
     assert!(none.is_none());
     let some: Option<String> = timed!(Duration::from_secs(5), w.ask(FindName(1))).unwrap();
@@ -649,8 +742,7 @@ impl DeriveWorker {
         if let Some(g) = msg.downcast_ref::<Greet>() {
             return Ok(Box::new(format!("hi {}", g.0)) as BoxedMessage);
         }
-        Err(ActorError::MessageHandlingError("unknown".into())
-        )
+        Err(ActorError::MessageHandlingError("unknown".into()))
     }
 
     fn handle_message_engine(
@@ -666,7 +758,9 @@ impl DeriveWorker {
 #[test]
 fn c19_derive_actor_spot_checks() {
     actix::System::new().block_on(async {
-        let sys = parrot::actix::ActixActorSystem::new().await.expect("system");
+        let sys = parrot::actix::ActixActorSystem::new()
+            .await
+            .expect("system");
         let w = sys
             .spawn_root_typed(DeriveWorker { value: 0 }, EmptyConfig)
             .await
@@ -678,7 +772,13 @@ fn c19_derive_actor_spot_checks() {
         assert_eq!(w.ask(Greet("d".into())).await.unwrap(), "hi d");
         assert_eq!(w.ask(Get).await.unwrap(), 4u64);
         let e = w.ask(FailIf(1)).await.unwrap_err();
-        assert!(e.to_string().contains("Not handled") || e.to_string().contains("not handled") || e.to_string().contains("unknown"), "got: {}", e);
+        assert!(
+            e.to_string().contains("Not handled")
+                || e.to_string().contains("not handled")
+                || e.to_string().contains("unknown"),
+            "got: {}",
+            e
+        );
         assert_eq!(w.ask(Get).await.unwrap(), 4, "alive after error");
     });
 }
@@ -714,8 +814,13 @@ async fn c20_diamond_fan_out_in() {
         }));
     }
     let mut mapper_total = 0u64;
-    for h in hs { mapper_total += h.await.unwrap(); }
+    for h in hs {
+        mapper_total += h.await.unwrap();
+    }
     // Reducer received exactly M*UNITS units.
-    assert_eq!(timed!(Duration::from_secs(5), reducer.ask(Get)).unwrap(), M * UNITS);
+    assert_eq!(
+        timed!(Duration::from_secs(5), reducer.ask(Get)).unwrap(),
+        M * UNITS
+    );
     assert!(mapper_total > 0);
 }

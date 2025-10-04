@@ -83,7 +83,6 @@ pub enum SystemError {
     Other(#[from] anyhow::Error),
 }
 
-
 /// Errors related to Supervision.
 #[derive(Error, Debug, Clone)]
 pub enum SupervisorError {
@@ -93,4 +92,4 @@ pub enum SupervisorError {
     RestartFailed(String, String), // Path, Reason
     #[error("Escalation failed for actor: {0}")]
     EscalationFailed(String), // Path
-} 
+}

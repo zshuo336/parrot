@@ -14,20 +14,20 @@
 //! - Adaptability: Runtime selection of appropriate scheduler
 
 // Re-exported modules with unified organization
-pub mod shared;
 pub mod dedicated_thread;
-pub mod sharded;
-pub mod steal;
 pub mod queue;
+pub mod sharded;
+pub mod shared;
+pub mod steal;
 
-use std::fmt;
 use std::error::Error;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 
-use crate::thread::mailbox::Mailbox;
 use crate::thread::config::ThreadActorConfig;
+use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::dedicated_thread::DedicatedThreadScheduler;
 use crate::thread::scheduler::sharded::ShardedScheduler;
 use crate::thread::scheduler::shared::SharedThreadPool;
@@ -43,10 +43,7 @@ pub trait ThreadScheduler: fmt::Debug + Send + Sync {
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     /// Deschedule an actor from the thread pool
-    fn deschedule(
-        &self,
-        path: &str,
-    ) -> Result<(), Box<dyn Error + Send + Sync>>;
+    fn deschedule(&self, path: &str) -> Result<(), Box<dyn Error + Send + Sync>>;
 
     /// Check if an actor is currently scheduled
     fn is_scheduled(&self, path: &str) -> bool;
@@ -91,7 +88,10 @@ impl fmt::Debug for SchedulerGroup {
         f.debug_struct("SchedulerGroup")
             .field("shared_scheduler", &self.shared_scheduler)
             .field("dedicated_scheduler", &self.dedicated_scheduler)
-            .field("sharded_scheduler", &self.sharded_scheduler.lock().unwrap().is_some())
+            .field(
+                "sharded_scheduler",
+                &self.sharded_scheduler.lock().unwrap().is_some(),
+            )
             .finish()
     }
 }
@@ -104,12 +104,8 @@ pub struct ThreadSchedulerFactory {
 
 impl ThreadSchedulerFactory {
     /// Create a new thread scheduler factory
-    pub fn new(
-        runtime_handle: Handle,
-    ) -> Self {
-        Self {
-            runtime_handle,
-        }
+    pub fn new(runtime_handle: Handle) -> Self {
+        Self { runtime_handle }
     }
 
     /// Create a new scheduler group
@@ -133,10 +129,7 @@ impl ThreadSchedulerFactory {
         &self,
         config: Option<shared::SharedThreadPoolConfig>,
     ) -> Arc<SharedThreadPool> {
-        let pool = SharedThreadPool::new(
-            config,
-            self.runtime_handle.clone(),
-        );
+        let pool = SharedThreadPool::new(config, self.runtime_handle.clone());
 
         Arc::new(pool)
     }
@@ -146,8 +139,8 @@ impl ThreadSchedulerFactory {
         &self,
         config: Option<dedicated_thread::DedicatedThreadConfig>,
     ) -> Arc<DedicatedThreadScheduler> {
-        let scheduler = DedicatedThreadScheduler::new(config)
-            .with_runtime_handle(self.runtime_handle.clone());
+        let scheduler =
+            DedicatedThreadScheduler::new(config).with_runtime_handle(self.runtime_handle.clone());
         Arc::new(scheduler)
     }
 }

@@ -32,7 +32,11 @@ impl ActorProcessorManager {
     ///
     /// Fails (without modifying the registry) if a processor is already
     /// registered for the path.
-    pub fn register(&self, path: &str, processor: Arc<dyn ProcessorInterface>) -> Result<(), SystemError> {
+    pub fn register(
+        &self,
+        path: &str,
+        processor: Arc<dyn ProcessorInterface>,
+    ) -> Result<(), SystemError> {
         let mut map = self.processors.lock().unwrap();
         if map.contains_key(path) {
             return Err(SystemError::RegistrationError(format!(
@@ -85,9 +89,9 @@ impl ActorProcessorManager {
 mod tests {
     use super::*;
     use crate::thread::actor::ThreadActor;
+    use crate::thread::config::ThreadActorConfig;
     use crate::thread::context::ThreadContext;
     use crate::thread::processor::ActorProcessor;
-    use crate::thread::config::ThreadActorConfig;
     use crate::thread::tests_support::DummyActor;
 
     fn make_processor() -> Arc<dyn ProcessorInterface> {

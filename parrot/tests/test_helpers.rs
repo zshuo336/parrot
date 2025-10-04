@@ -1,7 +1,9 @@
-use std::time::Duration;
-use parrot::actix::{ActixActorSystem, ActixContext, ActixActor};
+#![allow(dead_code)] // 共享测试模块：由多个集成测试按需引入（mod test_helpers）
+
+use parrot::actix::ActixActorSystem;
 use parrot::system::ParrotActorSystem;
-use parrot_api::system::{ActorSystemConfig, ActorSystem};
+use parrot_api::system::{ActorSystem, ActorSystemConfig};
+use std::time::Duration;
 
 /// Creates and initializes a ParrotActorSystem with Actix backend for testing
 pub async fn setup_test_system() -> anyhow::Result<ParrotActorSystem> {
@@ -11,7 +13,9 @@ pub async fn setup_test_system() -> anyhow::Result<ParrotActorSystem> {
 
     // Create and register ActixActorSystem as the default system
     let actix_system = ActixActorSystem::new().await?;
-    system.register_actix_system("actix".to_string(), actix_system, true).await?;
+    system
+        .register_actix_system("actix".to_string(), actix_system, true)
+        .await?;
 
     Ok(system)
 }
@@ -34,4 +38,4 @@ where
 }
 
 /// Default wait time for async operations during tests in milliseconds
-pub const DEFAULT_WAIT_TIME: u64 = 100; 
+pub const DEFAULT_WAIT_TIME: u64 = 100;

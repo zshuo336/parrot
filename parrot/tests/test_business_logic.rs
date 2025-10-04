@@ -24,17 +24,20 @@ use parrot::thread::config::ThreadActorSystemConfig;
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::address::ActorRef as ActorRefTrait;
 use parrot_api::system::ActorSystemConfig;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 async fn setup(name: &str) -> (ParrotActorSystem, Arc<ThreadActorSystem>) {
-    let parrot = ParrotActorSystem::new(ActorSystemConfig::default()).await.unwrap();
+    let parrot = ParrotActorSystem::new(ActorSystemConfig::default())
+        .await
+        .unwrap();
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
-    parrot.register_thread_system(name.into(), ts.clone(), true).await.unwrap();
+    parrot
+        .register_thread_system(name.into(), ts.clone(), true)
+        .await
+        .unwrap();
     (parrot, ts)
 }
 
@@ -52,15 +55,21 @@ async fn ask_boxed<A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static>
 /// 业务回复：携带业务结果或业务错误（区别于引擎错误）
 #[derive(Debug, Clone, PartialEq)]
 enum AccountReply {
-    Ok(u64),              // 新余额
-    InsufficientFunds,    // 业务校验失败
+    Ok(u64),           // 新余额
+    InsufficientFunds, // 业务校验失败
 }
 
-struct Deposit { amount: u64 }
-struct Withdraw { amount: u64 }
+struct Deposit {
+    amount: u64,
+}
+struct Withdraw {
+    amount: u64,
+}
 struct GetBalance;
 
-struct AccountActor { balance: u64 }
+struct AccountActor {
+    balance: u64,
+}
 
 impl Actor for AccountActor {
     type Config = EmptyConfig;
@@ -68,7 +77,11 @@ impl Actor for AccountActor {
     fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         // ---- 业务逻辑（在 actor 内执行，这是被验证对象）----
         let reply: AccountReply = if let Some(d) = m.downcast_ref::<Deposit>() {
             self.balance += d.amount; // 存款无条件成功
@@ -84,19 +97,26 @@ impl Actor for AccountActor {
         } else if m.downcast_ref::<GetBalance>().is_some() {
             AccountReply::Ok(self.balance)
         } else {
-            return Box::pin(async { Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into())) });
+            return Box::pin(async {
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ))
+            });
         };
         Box::pin(async move { Ok(Box::new(reply) as BoxedMessage) })
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None // 强制走 receive_message 执行业务逻辑
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[test]
 fn b1_bank_account_business_invariants() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup("biz1").await;
         const INITIAL: u64 = 1_000;
@@ -164,12 +184,24 @@ fn b1_bank_account_business_invariants() {
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq)]
-struct StatsSnapshot { n: u64, sum: i64, min: i64, max: i64 }
+struct StatsSnapshot {
+    n: u64,
+    sum: i64,
+    min: i64,
+    max: i64,
+}
 
-struct SubmitValue { v: i64 }
+struct SubmitValue {
+    v: i64,
+}
 struct GetStats;
 
-struct StatsActor { n: u64, sum: i64, min: i64, max: i64 }
+struct StatsActor {
+    n: u64,
+    sum: i64,
+    min: i64,
+    max: i64,
+}
 
 impl Actor for StatsActor {
     type Config = EmptyConfig;
@@ -177,35 +209,65 @@ impl Actor for StatsActor {
     fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         if let Some(s) = m.downcast_ref::<SubmitValue>() {
             // 业务逻辑：聚合更新
             self.n += 1;
             self.sum += s.v;
-            if self.n == 1 || s.v < self.min { self.min = s.v; }
-            if self.n == 1 || s.v > self.max { self.max = s.v; }
+            if self.n == 1 || s.v < self.min {
+                self.min = s.v;
+            }
+            if self.n == 1 || s.v > self.max {
+                self.max = s.v;
+            }
             let n = self.n;
             Box::pin(async move { Ok(Box::new(n) as BoxedMessage) })
         } else if m.downcast_ref::<GetStats>().is_some() {
-            let snap = StatsSnapshot { n: self.n, sum: self.sum, min: self.min, max: self.max };
+            let snap = StatsSnapshot {
+                n: self.n,
+                sum: self.sum,
+                min: self.min,
+                max: self.max,
+            };
             Box::pin(async move { Ok(Box::new(snap) as BoxedMessage) })
         } else {
-            Box::pin(async { Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into())) })
+            Box::pin(async {
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ))
+            })
         }
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[test]
 fn b2_aggregation_exactness() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup("biz2").await;
         let stats = ts
-            .spawn_at::<StatsActor>(StatsActor { n: 0, sum: 0, min: 0, max: 0 }, "/biz/stats", None, Default::default())
+            .spawn_at::<StatsActor>(
+                StatsActor {
+                    n: 0,
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                },
+                "/biz/stats",
+                None,
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -219,25 +281,36 @@ fn b2_aggregation_exactness() {
                 let mut acks = 0u64;
                 for k in 0..PER {
                     let v: i64 = ((w * PER + k) as i64 % 2001) - 1000; // [-1000, 1000]
-                    let n = *ask_boxed(&s, Box::new(SubmitValue { v })).await.downcast::<u64>().unwrap();
+                    let n = *ask_boxed(&s, Box::new(SubmitValue { v }))
+                        .await
+                        .downcast::<u64>()
+                        .unwrap();
                     acks += n; // 消费 ack（单调递增序列号）
                 }
                 let _ = acks;
             }));
         }
-        for h in hs { h.await.unwrap(); }
+        for h in hs {
+            h.await.unwrap();
+        }
 
         // ---- 模型对照：数学期望 ----
         let total = WORKERS * PER;
         let expected_sum: i64 = (0..total).map(|i| (i as i64 % 2001) - 1000).sum();
         let expected_min: i64 = (0..total).map(|i| (i as i64 % 2001) - 1000).min().unwrap();
         let expected_max: i64 = (0..total).map(|i| (i as i64 % 2001) - 1000).max().unwrap();
-        let snap = *ask_boxed(&stats, Box::new(GetStats)).await.downcast::<StatsSnapshot>().unwrap();
+        let snap = *ask_boxed(&stats, Box::new(GetStats))
+            .await
+            .downcast::<StatsSnapshot>()
+            .unwrap();
         assert_eq!(snap.n, total, "count must be exactly-once");
         assert_eq!(snap.sum, expected_sum, "sum must match model");
         assert_eq!(snap.min, expected_min, "min must match model");
         assert_eq!(snap.max, expected_max, "max must match model");
-        println!("[B2] stats over {} concurrent values: n={} sum={} min={} max={} all match model ✓", total, snap.n, snap.sum, snap.min, snap.max);
+        println!(
+            "[B2] stats over {} concurrent values: n={} sum={} min={} max={} all match model ✓",
+            total, snap.n, snap.sum, snap.min, snap.max
+        );
         let _ = ts.shutdown_internal().await;
     });
 }
@@ -247,14 +320,32 @@ fn b2_aggregation_exactness() {
 // ===========================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum OrderState { Created, Paid, Shipped, Delivered, Cancelled }
+enum OrderState {
+    Created,
+    Paid,
+    Shipped,
+    Delivered,
+    Cancelled,
+}
 
 #[derive(Debug, Clone, PartialEq)]
-enum TransitionReply { Ok(OrderState), Invalid { from: OrderState, tried: &'static str } }
+enum TransitionReply {
+    Ok(OrderState),
+    Invalid {
+        from: OrderState,
+        tried: &'static str,
+    },
+}
 
-struct EvPay; struct EvShip; struct EvDeliver; struct EvCancel; struct GetOrderState;
+struct EvPay;
+struct EvShip;
+struct EvDeliver;
+struct EvCancel;
+struct GetOrderState;
 
-struct OrderMachine { state: OrderState }
+struct OrderMachine {
+    state: OrderState,
+}
 
 impl OrderMachine {
     /// 业务规则表：合法变迁
@@ -268,7 +359,10 @@ impl OrderMachine {
                 | (OrderState::Paid, "cancel")
         );
         if !ok {
-            return TransitionReply::Invalid { from: self.state, tried: ev };
+            return TransitionReply::Invalid {
+                from: self.state,
+                tried: ev,
+            };
         }
         self.state = match (self.state, ev) {
             (OrderState::Created, "pay") => OrderState::Paid,
@@ -288,27 +382,42 @@ impl Actor for OrderMachine {
         self.state = OrderState::Created;
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        let reply = if m.downcast_ref::<EvPay>().is_some() { self.transition("pay") }
-        else if m.downcast_ref::<EvShip>().is_some() { self.transition("ship") }
-        else if m.downcast_ref::<EvDeliver>().is_some() { self.transition("deliver") }
-        else if m.downcast_ref::<EvCancel>().is_some() { self.transition("cancel") }
-        else if m.downcast_ref::<GetOrderState>().is_some() {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        let reply = if m.downcast_ref::<EvPay>().is_some() {
+            self.transition("pay")
+        } else if m.downcast_ref::<EvShip>().is_some() {
+            self.transition("ship")
+        } else if m.downcast_ref::<EvDeliver>().is_some() {
+            self.transition("deliver")
+        } else if m.downcast_ref::<EvCancel>().is_some() {
+            self.transition("cancel")
+        } else if m.downcast_ref::<GetOrderState>().is_some() {
             return Box::pin(async move { Ok(Box::new(self.state) as BoxedMessage) });
         } else {
-            return Box::pin(async { Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into())) });
+            return Box::pin(async {
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ))
+            });
         };
         Box::pin(async move { Ok(Box::new(reply) as BoxedMessage) })
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[test]
 fn b3_order_state_machine() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup("biz3").await;
 
@@ -351,12 +460,26 @@ fn b3_order_state_machine() {
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq)]
-enum ReserveReply { Granted { remaining: u64 }, OutOfStock { available: u64 } }
-struct Reserve { item: String, qty: u64 }
-struct Restock { item: String, qty: u64 }
-struct GetStock { item: String }
+enum ReserveReply {
+    Granted { remaining: u64 },
+    OutOfStock { available: u64 },
+}
+struct Reserve {
+    item: String,
+    qty: u64,
+}
+struct Restock {
+    item: String,
+    qty: u64,
+}
+#[allow(dead_code)]
+struct GetStock {
+    item: String,
+}
 
-struct InventoryActor { stock: HashMap<String, u64> }
+struct InventoryActor {
+    stock: HashMap<String, u64>,
+}
 
 impl Actor for InventoryActor {
     type Config = EmptyConfig;
@@ -368,12 +491,18 @@ impl Actor for InventoryActor {
         }
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         let reply = if let Some(r) = m.downcast_ref::<Reserve>() {
             let avail = *self.stock.get(&r.item).unwrap_or(&0);
             if r.qty <= avail {
                 *self.stock.get_mut(&r.item).unwrap() -= r.qty;
-                ReserveReply::Granted { remaining: avail - r.qty }
+                ReserveReply::Granted {
+                    remaining: avail - r.qty,
+                }
             } else {
                 ReserveReply::OutOfStock { available: avail }
             }
@@ -382,22 +511,34 @@ impl Actor for InventoryActor {
             *self.stock.entry(rs.item.clone()).or_insert(0) += rs.qty;
             ReserveReply::Granted { remaining: 0 }
         } else {
-            return Box::pin(async { Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into())) });
+            return Box::pin(async {
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ))
+            });
         };
         Box::pin(async move { Ok(Box::new(reply) as BoxedMessage) })
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ChargeReply { Approved { remaining_funds: u64 }, Declined { required: u64, available: u64 } }
-struct Charge { amount: u64 }
+enum ChargeReply {
+    Approved { remaining_funds: u64 },
+    Declined { required: u64, available: u64 },
+}
+struct Charge {
+    amount: u64,
+}
 struct GetLedger;
 
-struct PaymentActor { funds: u64, charged_total: u64, tx_count: u64 }
+struct PaymentActor {
+    funds: u64,
+    charged_total: u64,
+    tx_count: u64,
+}
 
 impl Actor for PaymentActor {
     type Config = EmptyConfig;
@@ -405,16 +546,25 @@ impl Actor for PaymentActor {
     fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         if let Some(c) = m.downcast_ref::<Charge>() {
             if c.amount <= self.funds {
                 self.funds -= c.amount;
                 self.charged_total += c.amount;
                 self.tx_count += 1;
-                let r = ChargeReply::Approved { remaining_funds: self.funds };
+                let r = ChargeReply::Approved {
+                    remaining_funds: self.funds,
+                };
                 Box::pin(async move { Ok(Box::new(r) as BoxedMessage) })
             } else {
-                let r = ChargeReply::Declined { required: c.amount, available: self.funds };
+                let r = ChargeReply::Declined {
+                    required: c.amount,
+                    available: self.funds,
+                };
                 Box::pin(async move { Ok(Box::new(r) as BoxedMessage) })
             }
         } else if m.downcast_ref::<GetLedger>().is_some() {
@@ -422,23 +572,39 @@ impl Actor for PaymentActor {
             let snap = (self.funds, self.charged_total, self.tx_count);
             Box::pin(async move { Ok(Box::new(snap) as BoxedMessage) })
         } else {
-            Box::pin(async { Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into())) })
+            Box::pin(async {
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ))
+            })
         }
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum OrderOutcome { Confirmed, NoStock, NoFunds }
+enum OrderOutcome {
+    Confirmed,
+    NoStock,
+    NoFunds,
+}
 
 /// 带处理序号的业务回执：seq 由 orchestrator 单调分配 = 真实处理顺序。
 /// 模型对照必须按此顺序重放（并发到达顺序不确定，处理顺序才是不变量）。
 #[derive(Debug, Clone, PartialEq)]
-struct OrderReceipt { seq: u64, outcome: OrderOutcome }
-struct PlaceOrder { order_id: u64, item: String, qty: u64, unit_price: u64 }
+struct OrderReceipt {
+    seq: u64,
+    outcome: OrderOutcome,
+}
+#[allow(dead_code)]
+struct PlaceOrder {
+    order_id: u64,
+    item: String,
+    qty: u64,
+    unit_price: u64,
+}
 struct GetOrderCounts;
 
 /// 编排 actor：真正的多 actor 业务流程（Saga 模式 + 补偿）
@@ -459,27 +625,42 @@ impl Actor for OrderOrchestrator {
     fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             let Some(o) = m.downcast_ref::<PlaceOrder>() else {
                 if m.downcast_ref::<GetOrderCounts>().is_some() {
-                    return Ok(Box::new((self.confirmed, self.failed_no_stock, self.failed_no_funds)) as BoxedMessage);
+                    return Ok(
+                        Box::new((self.confirmed, self.failed_no_stock, self.failed_no_funds))
+                            as BoxedMessage,
+                    );
                 }
-                return Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into()));
+                return Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ));
             };
             self.seq += 1;
             let seq = self.seq;
             // ---- 业务流程（Saga）：预留库存 → 扣款；扣款失败补偿归还 ----
             let reserve = *self
                 .inventory
-                .ask(Box::new(Reserve { item: o.item.clone(), qty: o.qty }))
+                .ask(Box::new(Reserve {
+                    item: o.item.clone(),
+                    qty: o.qty,
+                }))
                 .await?
                 .downcast::<ReserveReply>()
                 .unwrap();
             match reserve {
                 ReserveReply::OutOfStock { .. } => {
                     self.failed_no_stock += 1;
-                    return Ok(Box::new(OrderReceipt { seq, outcome: OrderOutcome::NoStock }) as BoxedMessage);
+                    return Ok(Box::new(OrderReceipt {
+                        seq,
+                        outcome: OrderOutcome::NoStock,
+                    }) as BoxedMessage);
                 }
                 ReserveReply::Granted { .. } => {}
             }
@@ -495,29 +676,41 @@ impl Actor for OrderOrchestrator {
                     self.confirmed += 1;
                     *self.confirmed_qty.entry(o.item.clone()).or_insert(0) += o.qty;
                     self.confirmed_amount += amount;
-                    Ok(Box::new(OrderReceipt { seq, outcome: OrderOutcome::Confirmed }) as BoxedMessage)
+                    Ok(Box::new(OrderReceipt {
+                        seq,
+                        outcome: OrderOutcome::Confirmed,
+                    }) as BoxedMessage)
                 }
                 ChargeReply::Declined { .. } => {
                     // ---- 补偿事务：归还库存（业务正确性关键）----
                     let _ = self
                         .inventory
-                        .ask(Box::new(Restock { item: o.item.clone(), qty: o.qty }))
+                        .ask(Box::new(Restock {
+                            item: o.item.clone(),
+                            qty: o.qty,
+                        }))
                         .await?;
                     self.failed_no_funds += 1;
-                    Ok(Box::new(OrderReceipt { seq, outcome: OrderOutcome::NoFunds }) as BoxedMessage)
+                    Ok(Box::new(OrderReceipt {
+                        seq,
+                        outcome: OrderOutcome::NoFunds,
+                    }) as BoxedMessage)
                 }
             }
         })
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[test]
 fn b4_saga_pipeline_consistency() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup("biz4").await;
 
@@ -526,9 +719,9 @@ fn b4_saga_pipeline_consistency() {
             .spawn_at::<InventoryActor>(InventoryActor { stock: inv_init.clone() }, "/biz/inv", None, Default::default())
             .await
             .unwrap();
-        let PAY_INIT: u64 = 900;
+        let pay_init: u64 = 900;
         let pay = ts
-            .spawn_at::<PaymentActor>(PaymentActor { funds: PAY_INIT, charged_total: 0, tx_count: 0 }, "/biz/pay", None, Default::default())
+            .spawn_at::<PaymentActor>(PaymentActor { funds: pay_init, charged_total: 0, tx_count: 0 }, "/biz/pay", None, Default::default())
             .await
             .unwrap();
         let orch = ts
@@ -593,9 +786,9 @@ fn b4_saga_pipeline_consistency() {
             .map(|(_, qty, _, _)| *qty)
             .sum();
         assert!(
-            confirmed_amount_from_receipts <= PAY_INIT,
+            confirmed_amount_from_receipts <= pay_init,
             "conservation impossible: confirmed {} > initial funds {}",
-            confirmed_amount_from_receipts, PAY_INIT
+            confirmed_amount_from_receipts, pay_init
         );
 
         let (confirmed, no_stock, no_funds) =
@@ -611,7 +804,7 @@ fn b4_saga_pipeline_consistency() {
         // 支付台账 + 订单计数核算（库存守恒：初始 - 确认量 = 当前，因失败单已补偿）
         let (funds, charged_total, tx_count) = *ask_boxed(&pay, Box::new(GetLedger)).await.downcast::<(u64, u64, u64)>().unwrap();
         assert_eq!(charged_total, confirmed_amount_from_receipts, "资金守恒: ledger total must equal Σ confirmed receipts");
-        assert_eq!(funds, PAY_INIT - confirmed_amount_from_receipts, "资金守恒: funds = initial - confirmed");
+        assert_eq!(funds, pay_init - confirmed_amount_from_receipts, "资金守恒: funds = initial - confirmed");
         assert_eq!(tx_count, confirmed, "one charge per confirmed order");
         // 库存守恒：/widget 最终库存 = 100 - Σconfirmed widget qty
         let w_conf = confirmed_qty_widget;
@@ -630,7 +823,7 @@ fn b4_saga_pipeline_consistency() {
         assert!(no_funds > 0, "test must exercise compensation path");
         println!(
             "[B4] saga over 200 concurrent orders: confirmed={} no_stock={} no_funds(compensated)={} | funds {}→{} ✓ stock widget {}/{}, gadget {}/{} zero leakage ✓",
-            confirmed, no_stock, no_funds, PAY_INIT, funds, w_left, 100 - w_conf, g_left, 30 - g_conf
+            confirmed, no_stock, no_funds, pay_init, funds, w_left, 100 - w_conf, g_left, 30 - g_conf
         );
         let _ = ts.shutdown_internal().await;
     });
@@ -641,7 +834,9 @@ fn b4_saga_pipeline_consistency() {
 // ===========================================================================
 
 /// 业务：文本规范化（小写、按非字母切词、去重保序、逗号连接）
-struct NormalizeText { raw: String }
+struct NormalizeText {
+    raw: String,
+}
 struct NormalizeActor;
 
 fn normalize_ref(raw: &str) -> String {
@@ -662,9 +857,17 @@ impl Actor for NormalizeActor {
     fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         let Some(t) = m.downcast_ref::<NormalizeText>() else {
-            return Box::pin(async { Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into())) });
+            return Box::pin(async {
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ))
+            });
         };
         // actor 内独立实现同一业务规则（不同写法，验证语义等价而非复制粘贴）
         let mut words = Vec::new();
@@ -677,23 +880,30 @@ impl Actor for NormalizeActor {
                 words.push(std::mem::take(&mut cur));
             }
         }
-        if !cur.is_empty() { words.push(cur); }
+        if !cur.is_empty() {
+            words.push(cur);
+        }
         let mut deduped: Vec<String> = Vec::new();
         for w in words {
-            if !deduped.contains(&w) { deduped.push(w); }
+            if !deduped.contains(&w) {
+                deduped.push(w);
+            }
         }
         let result = deduped.join(",");
         Box::pin(async move { Ok(Box::new(result) as BoxedMessage) })
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[test]
 fn b5_business_computation_correctness() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup("biz5").await;
         let svc = ts.spawn_at::<NormalizeActor>(NormalizeActor, "/biz/norm", None, Default::default()).await.unwrap();
@@ -726,7 +936,11 @@ fn b5_business_computation_correctness() {
 
 #[test]
 fn b6_error_contract() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup("biz6").await;
         let acc = ts
@@ -754,11 +968,19 @@ fn b6_error_contract() {
 // B7 副作用审计流：业务事件被完整、有序记录
 // ===========================================================================
 
-struct BizEvent { id: u64, kind: &'static str }
-struct RecordEvent { id: u64, kind: &'static str }
+struct BizEvent {
+    id: u64,
+    kind: &'static str,
+}
+struct RecordEvent {
+    id: u64,
+    kind: &'static str,
+}
 struct GetAuditLog;
 
-struct AuditActor { log: Vec<(u64, &'static str)> }
+struct AuditActor {
+    log: Vec<(u64, &'static str)>,
+}
 
 impl Actor for AuditActor {
     type Config = EmptyConfig;
@@ -766,7 +988,11 @@ impl Actor for AuditActor {
     fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         if let Some(r) = m.downcast_ref::<RecordEvent>() {
             self.log.push((r.id, r.kind));
             Box::pin(async move { Ok(Box::new(()) as BoxedMessage) })
@@ -774,13 +1000,16 @@ impl Actor for AuditActor {
             let snapshot = self.log.clone();
             Box::pin(async move { Ok(Box::new(snapshot) as BoxedMessage) })
         } else {
-            Box::pin(async { Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into())) })
+            Box::pin(async {
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ))
+            })
         }
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 struct BusinessProcessor {
@@ -793,10 +1022,16 @@ impl Actor for BusinessProcessor {
     fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             let Some(e) = m.downcast_ref::<BizEvent>() else {
-                return Err(parrot_api::errors::ActorError::MessageHandlingError("unknown".into()));
+                return Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unknown".into(),
+                ));
             };
             // 业务处理 + 副作用：必须先完成业务决策再审计（或反之），二者一致
             let outcome: &'static str = match e.kind {
@@ -807,20 +1042,26 @@ impl Actor for BusinessProcessor {
             // 审计记录必须含原始事件与业务结果
             let _ = self
                 .audit
-                .ask(Box::new(RecordEvent { id: e.id, kind: outcome }))
+                .ask(Box::new(RecordEvent {
+                    id: e.id,
+                    kind: outcome,
+                }))
                 .await?;
             Ok(Box::new(outcome) as BoxedMessage)
         })
     }
-    fn receive_message_with_engine<'a>(&'a mut self, _m: BoxedMessage, _c: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 #[test]
 fn b7_side_effect_audit_trail() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup("biz7").await;
         let audit = ts.spawn_at::<AuditActor>(AuditActor { log: Vec::new() }, "/biz/audit", None, Default::default()).await.unwrap();

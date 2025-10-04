@@ -14,12 +14,11 @@
 use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
-use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
+use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 use parrot_api::address::ActorRefExt;
 use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
-use parrot_api_derive::{Message, ParrotActor};
-use std::sync::atomic::{AtomicU64, Ordering};
+use parrot_api_derive::Message;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -63,30 +62,21 @@ impl Actor for Counter {
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-        if let Some(m) = msg.downcast_ref::<Add>() {
-            self.value += m.0;
-            return Ok(Box::new(self.value) as BoxedMessage);
-        }
-        if msg.downcast_ref::<Get>().is_some() {
-            return Ok(Box::new(self.value) as BoxedMessage);
-        }
-        if let Some(p) = msg.downcast_ref::<Ping>() {
-            self.pings.push(p.0.clone());
-            return Ok(Box::new(format!("pong:{}", p.0)) as BoxedMessage);
-        }
+            if let Some(m) = msg.downcast_ref::<Add>() {
+                self.value += m.0;
+                return Ok(Box::new(self.value) as BoxedMessage);
+            }
+            if msg.downcast_ref::<Get>().is_some() {
+                return Ok(Box::new(self.value) as BoxedMessage);
+            }
+            if let Some(p) = msg.downcast_ref::<Ping>() {
+                self.pings.push(p.0.clone());
+                return Ok(Box::new(format!("pong:{}", p.0)) as BoxedMessage);
+            }
             Err(parrot_api::errors::ActorError::MessageHandlingError(
                 "unknown".to_string(),
             ))
         })
-    }
-
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _engine_ctx: EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -141,7 +131,12 @@ async fn scenario_actor_to_actor_ask_chain() {
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
     let counter = spawn(&ts, "/scenario/counter").await;
     let relay_ref = ts
-        .spawn_at::<Counter>(Counter::default(), "/scenario/relay-as-counter", None, ThreadActorConfig::default())
+        .spawn_at::<Counter>(
+            Counter::default(),
+            "/scenario/relay-as-counter",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .expect("spawn relay");
 
@@ -170,16 +165,11 @@ async fn scenario_lifecycle_stop_semantics() {
         assert_eq!(c.ask(Add(i)).await.unwrap(), (1..=i).sum::<u64>());
     }
     // Stop via the generic ActorRef trait.
-    use parrot_api::address::ActorRef;
     c.stop().await.expect("stop must succeed");
 
     // Post-stop ask: must terminate with an error (or documented behavior),
     // never hang. We bound it defensively with a timeout.
-    let r = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        c.ask(Get),
-    )
-    .await;
+    let r = tokio::time::timeout(std::time::Duration::from_secs(3), c.ask(Get)).await;
     match r {
         Err(_elapsed) => panic!("post-stop ask hung"),
         Ok(Err(_e)) => { /* expected: actor gone */ }
@@ -218,7 +208,11 @@ async fn scenario_concurrent_no_lost_updates() {
         h.await.unwrap();
     }
     let final_v = c.ask(Get).await.unwrap();
-    assert_eq!(final_v, PRODUCERS * PER, "every add must be applied exactly once");
+    assert_eq!(
+        final_v,
+        PRODUCERS * PER,
+        "every add must be applied exactly once"
+    );
 }
 
 /// Scenario 4: many actors, mixed load, interleaved — final states exact.
@@ -279,15 +273,6 @@ impl Actor for SometimesPanic {
         })
     }
 
-    fn receive_message_with_engine(
-        &mut self,
-        _msg: BoxedMessage,
-        _ctx: &mut Self::Context,
-        _engine_ctx: EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -297,9 +282,14 @@ impl Actor for SometimesPanic {
 async fn scenario_thread_panic_isolation() {
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
     let victim: Box<dyn parrot_api::address::ActorRef> = Box::new(
-        ts.spawn_at::<SometimesPanic>(SometimesPanic::default(), "/panic/victim", None, ThreadActorConfig::default())
-            .await
-            .expect("spawn victim"),
+        ts.spawn_at::<SometimesPanic>(
+            SometimesPanic::default(),
+            "/panic/victim",
+            None,
+            ThreadActorConfig::default(),
+        )
+        .await
+        .expect("spawn victim"),
     );
     let bystander = spawn(&ts, "/panic/bystander").await;
 
@@ -309,12 +299,19 @@ async fn scenario_thread_panic_isolation() {
     // Trigger a panic inside the actor's handler (batch panic isolation in
     // the processor catches it). The ask may error or time out — we only
     // require the engine to stay alive.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), victim_ask(victim.as_ref(), Add(13))).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        victim_ask(victim.as_ref(), Add(13)),
+    )
+    .await;
 
     // Bystander unaffected.
-    let v = tokio::time::timeout(std::time::Duration::from_secs(3), victim_ask(bystander.as_ref(), Add(7)))
-        .await
-        .expect("engine must survive actor panic");
+    let v = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        victim_ask(bystander.as_ref(), Add(7)),
+    )
+    .await
+    .expect("engine must survive actor panic");
     assert_eq!(v, Some(7));
 }
 

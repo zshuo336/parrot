@@ -55,6 +55,7 @@ struct Pool {
     acquired_fresh: u64,
     acquired_reused: u64,
     released: u64,
+    #[allow(dead_code)] // 统计面板字段（stats() 聚合展示）
     dropped_overflow: u64,
 }
 
@@ -110,8 +111,7 @@ pub fn acquire<T: Default + Send + 'static>() -> Pooled<T> {
         let reused = p
             .buckets
             .get_mut(&tid)
-            .map(|b| b.free.pop())
-            .flatten()
+            .and_then(|b| b.free.pop())
             .map(|any| {
                 // Recycle through downcast: exactly one TypeId compare.
                 match any.downcast::<T>() {
@@ -128,11 +128,15 @@ pub fn acquire<T: Default + Send + 'static>() -> Pooled<T> {
     match reused {
         Some(boxed) => {
             bump_counters(0, 1, 0, 0);
-            Pooled { inner: std::mem::ManuallyDrop::new(boxed), }
+            Pooled {
+                inner: std::mem::ManuallyDrop::new(boxed),
+            }
         }
         None => {
             bump_counters(1, 0, 0, 0);
-            Pooled { inner: std::mem::ManuallyDrop::new(Box::new(T::default())) }
+            Pooled {
+                inner: std::mem::ManuallyDrop::new(Box::new(T::default())),
+            }
         }
     }
 }
@@ -233,12 +237,16 @@ mod tests {
     #[derive(Clone)]
     struct Msg {
         seq: u64,
+        #[allow(dead_code)]
         payload: [u8; 64],
     }
 
     impl Default for Msg {
         fn default() -> Self {
-            Self { seq: 0, payload: [0; 64] }
+            Self {
+                seq: 0,
+                payload: [0; 64],
+            }
         }
     }
 
@@ -256,7 +264,7 @@ mod tests {
             assert_eq!(m2.seq, 42, "stale contents are preserved (Disruptor-style)");
         }
         let after = stats().acquired_reused;
-        assert!(after >= before + 1, "second acquire must reuse the recycled box");
+        assert!(after > before, "second acquire must reuse the recycled box");
     }
 
     #[test]
@@ -271,7 +279,11 @@ mod tests {
         }
         drop(held); // mass release -> overflow beyond cap
         let s = stats();
-        assert!(s.dropped_overflow >= 1, "overflow must be counted, got {:?}", s);
+        assert!(
+            s.dropped_overflow >= 1,
+            "overflow must be counted, got {:?}",
+            s
+        );
         // Next acquire still works (from the retained bucket).
         let _ = acquire::<Msg>();
     }

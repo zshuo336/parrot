@@ -38,7 +38,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use flume::{unbounded, Receiver, Sender};
+use flume::{Receiver, Sender, unbounded};
 use tokio::runtime::Builder;
 
 use crate::thread::mailbox::Mailbox;
@@ -56,9 +56,13 @@ struct Shard {
 }
 
 impl Shard {
+    #[allow(dead_code)] // 预留：显式构造入口
     fn new() -> Self {
         let (tx, _) = unbounded();
-        Self { tx, len: AtomicUsize::new(0) }
+        Self {
+            tx,
+            len: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -95,11 +99,13 @@ impl ShardedScheduler {
         for i in 0..n {
             let (tx, rx) = unbounded::<ShardItem>();
             let tx2 = tx.clone();
-            let shard = Arc::new(Shard { tx, len: AtomicUsize::new(0) });
+            let shard = Arc::new(Shard {
+                tx,
+                len: AtomicUsize::new(0),
+            });
             shards.push(shard);
 
             let shutdown = shutdown.clone();
-            let batch_size = batch_size;
             threads.push(
                 std::thread::Builder::new()
                     .name(format!("parrot-shard-{}", i))
@@ -172,11 +178,11 @@ impl ShardedScheduler {
             if shutting.load(Ordering::Relaxed) {
                 return;
             }
-            if let Some(strong) = weak.upgrade() {
-                if strong.schedule_state().try_enqueue() {
-                    shard.len.fetch_add(1, Ordering::Relaxed);
-                    let _ = shard.tx.send(ShardItem { mailbox: strong });
-                }
+            if let Some(strong) = weak.upgrade()
+                && strong.schedule_state().try_enqueue()
+            {
+                shard.len.fetch_add(1, Ordering::Relaxed);
+                let _ = shard.tx.send(ShardItem { mailbox: strong });
             }
         }));
 
@@ -184,7 +190,9 @@ impl ShardedScheduler {
         if mailbox.schedule_state().try_enqueue() {
             let shard = self.shards[idx].clone();
             shard.len.fetch_add(1, Ordering::Relaxed);
-            let _ = shard.tx.send(ShardItem { mailbox: mailbox.clone() });
+            let _ = shard.tx.send(ShardItem {
+                mailbox: mailbox.clone(),
+            });
         }
         Ok(())
     }
@@ -197,7 +205,10 @@ impl ShardedScheduler {
 
     /// Shard lengths (for metrics).
     pub fn shard_lengths(&self) -> Vec<usize> {
-        self.shards.iter().map(|s| s.len.load(Ordering::Relaxed)).collect()
+        self.shards
+            .iter()
+            .map(|s| s.len.load(Ordering::Relaxed))
+            .collect()
     }
 
     pub fn shard_count(&self) -> usize {
@@ -229,7 +240,10 @@ fn shard_loop(
     batch_size: usize,
 ) {
     // Current-thread runtime: actor futures on THIS thread only.
-    let rt = Builder::new_current_thread().enable_all().build().expect("shard runtime");
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("shard runtime");
     let _guard = rt.enter();
 
     loop {
@@ -242,8 +256,15 @@ fn shard_loop(
                 if let Some(processor) = mailbox.get_processor() {
                     if !processor.is_initialized() {
                         let p = processor.clone();
-                        if let Err(e) = rt.block_on(async move { p.initialize_and_start_erased().await }) {
-                            eprintln!("[shard-{}] init failed for {:?}: {}", shard_id, mailbox.path().path, e);
+                        if let Err(e) =
+                            rt.block_on(async move { p.initialize_and_start_erased().await })
+                        {
+                            eprintln!(
+                                "[shard-{}] init failed for {:?}: {}",
+                                shard_id,
+                                mailbox.path().path,
+                                e
+                            );
                             mailbox.schedule_state().force_release();
                             continue;
                         }
@@ -256,7 +277,12 @@ fn shard_loop(
                     match result {
                         Ok(fut) => {
                             if let Err(e) = rt.block_on(fut) {
-                                eprintln!("[shard-{}] batch error for {:?}: {}", shard_id, mailbox.path().path, e);
+                                eprintln!(
+                                    "[shard-{}] batch error for {:?}: {}",
+                                    shard_id,
+                                    mailbox.path().path,
+                                    e
+                                );
                                 mailbox.schedule_state().force_release();
                                 continue;
                             }
@@ -267,7 +293,12 @@ fn shard_loop(
                                 .cloned()
                                 .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
                                 .unwrap_or_else(|| "<non-string panic>".into());
-                            eprintln!("[shard-{}] PANIC in {:?}: {}", shard_id, mailbox.path().path, msg);
+                            eprintln!(
+                                "[shard-{}] PANIC in {:?}: {}",
+                                shard_id,
+                                mailbox.path().path,
+                                msg
+                            );
                             mailbox.schedule_state().force_release();
                             continue;
                         }

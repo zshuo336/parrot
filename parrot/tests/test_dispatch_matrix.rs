@@ -5,7 +5,7 @@
 //!
 //! - actor kind:    derive (sync) | derive (async opt-in) | manual
 //! - message class: success | user error | unhandled (None) | timeout |
-//!                  panic-in-handler
+//!   panic-in-handler
 //! - interaction:   ask | tell | send_with_timeout
 //!
 //! Every cell asserts the *observable contract* of the recent changes:
@@ -16,12 +16,12 @@
 //!    diagnostic error (NOT a silent drop);
 //! 3. panics in either path are isolated (engine survives, ask errors).
 
+use parrot::actix as __parrot_engine;
 use parrot::actix::{ActixActor, ActixActorSystem, ActixContext};
 use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
-use parrot_api::system::{ActorSystem, ActorSystemConfig};
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
 use std::time::Duration;
@@ -188,6 +188,13 @@ impl Actor for ManualMatrix {
         })
     }
 
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+}
+
+// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
+impl parrot_api::actor::ActixEngineExt for ManualMatrix {
     fn receive_message_with_engine<'a>(
         &'a mut self,
         msg: BoxedMessage,
@@ -202,12 +209,7 @@ impl Actor for ManualMatrix {
         }
         None
     }
-
-    fn state(&self) -> ActorState {
-        ActorState::Running
-    }
 }
-
 
 // ---------------------------------------------------------------------------
 // Matrix harness
@@ -222,9 +224,18 @@ enum Kind {
 
 async fn spawn_kind(sys: &ActixActorSystem, kind: &Kind) -> Box<dyn ActorRef> {
     match kind {
-        Kind::DeriveSync => sys.spawn_root_typed(DeriveSync { calls: 0 }, EmptyConfig).await.unwrap(),
-        Kind::DeriveAsync => sys.spawn_root_typed(DeriveAsync { calls: 0 }, EmptyConfig).await.unwrap(),
-        Kind::Manual => sys.spawn_root_typed(ManualMatrix { calls: 0 }, EmptyConfig).await.unwrap(),
+        Kind::DeriveSync => sys
+            .spawn_root_typed(DeriveSync { calls: 0 }, EmptyConfig)
+            .await
+            .unwrap(),
+        Kind::DeriveAsync => sys
+            .spawn_root_typed(DeriveAsync { calls: 0 }, EmptyConfig)
+            .await
+            .unwrap(),
+        Kind::Manual => sys
+            .spawn_root_typed(ManualMatrix { calls: 0 }, EmptyConfig)
+            .await
+            .unwrap(),
     }
 }
 
@@ -296,7 +307,12 @@ fn dispatch_matrix_360() {
 
             // --- user error path ---
             match ask_fail(r.as_ref()).await {
-                AskOutcome::UserErr(s) => assert!(s.contains("matrix-fail"), "{:?}: user error must propagate: {}", kind, s),
+                AskOutcome::UserErr(s) => assert!(
+                    s.contains("matrix-fail"),
+                    "{:?}: user error must propagate: {}",
+                    kind,
+                    s
+                ),
                 o => panic!("{:?}: Fail must error, got {:?}", kind, o),
             }
 
@@ -306,11 +322,18 @@ fn dispatch_matrix_360() {
             // through receive_message → 5+1=6.
             match ask_unhandled(r.as_ref()).await {
                 AskOutcome::NotHandledErr => {
-                    assert!(matches!(kind, Kind::DeriveSync | Kind::Manual),
-                        "{:?}: async path must handle Unhandled", kind);
+                    assert!(
+                        matches!(kind, Kind::DeriveSync | Kind::Manual),
+                        "{:?}: async path must handle Unhandled",
+                        kind
+                    );
                 }
                 AskOutcome::Good(v) => {
-                    assert!(matches!(kind, Kind::DeriveAsync), "{:?}: unexpected handler", kind);
+                    assert!(
+                        matches!(kind, Kind::DeriveAsync),
+                        "{:?}: unexpected handler",
+                        kind
+                    );
                     assert_eq!(v, 6, "{:?}: Unhandled(5) async path → 6", kind);
                 }
                 o => panic!("{:?}: Unhandled unexpected: {:?}", kind, o),
@@ -324,18 +347,28 @@ fn dispatch_matrix_360() {
             // 30ms budget must trip a timeout.
             match ask_timeout(r.as_ref()).await {
                 AskOutcome::TimeoutErr => {
-                    assert!(matches!(kind, Kind::DeriveAsync),
-                        "{:?}: only the async path can genuinely time out", kind);
+                    assert!(
+                        matches!(kind, Kind::DeriveAsync),
+                        "{:?}: only the async path can genuinely time out",
+                        kind
+                    );
                 }
                 AskOutcome::UserErr(s) if s.contains("Message not handled") => {
                     // Sync-path actors whose engine handlers skip Slow.
-                    assert!(matches!(kind, Kind::DeriveSync | Kind::Manual),
-                        "{:?}: async path must sleep, not NotHandled", kind);
+                    assert!(
+                        matches!(kind, Kind::DeriveSync | Kind::Manual),
+                        "{:?}: async path must sleep, not NotHandled",
+                        kind
+                    );
                 }
                 AskOutcome::UserErr(s) => {
                     assert!(
-                        s.to_lowercase().contains("timeout") || s.to_lowercase().contains("timed out") || s.contains("elapsed"),
-                        "{:?}: Slow ask must time out, got: {}", kind, s
+                        s.to_lowercase().contains("timeout")
+                            || s.to_lowercase().contains("timed out")
+                            || s.contains("elapsed"),
+                        "{:?}: Slow ask must time out, got: {}",
+                        kind,
+                        s
                     );
                 }
                 o => panic!("{:?}: Slow must not succeed within 30ms, got {:?}", kind, o),
@@ -343,7 +376,9 @@ fn dispatch_matrix_360() {
 
             // --- actor still alive after all of the above ---
             match ask_good(r.as_ref()).await {
-                AskOutcome::Good(v) => assert_eq!(v, 30, "{:?}: actor must survive the matrix", kind),
+                AskOutcome::Good(v) => {
+                    assert_eq!(v, 30, "{:?}: actor must survive the matrix", kind)
+                }
                 o => panic!("{:?}: actor died mid-matrix: {:?}", kind, o),
             }
         }
@@ -360,7 +395,9 @@ fn panic_isolation_matrix() {
 
         // DeriveAsync: panic inside the async handler.
         let r = spawn_kind(&sys, &Kind::DeriveAsync).await;
-        let boom = r.send_with_timeout(Box::new(Boom(1)), Some(Duration::from_millis(500))).await;
+        let boom = r
+            .send_with_timeout(Box::new(Boom(1)), Some(Duration::from_millis(500)))
+            .await;
         // Either an error surfaces (timeout/mailbox closed) — never a hang.
         // Engine liveness check: another actor still answers.
         let r2 = spawn_kind(&sys, &Kind::DeriveAsync).await;
@@ -372,7 +409,9 @@ fn panic_isolation_matrix() {
 
         // DeriveSync: panic inside the engine fast path.
         let r3 = spawn_kind(&sys, &Kind::DeriveSync).await;
-        let _ = r3.send_with_timeout(Box::new(Boom(2)), Some(Duration::from_millis(500))).await;
+        let _ = r3
+            .send_with_timeout(Box::new(Boom(2)), Some(Duration::from_millis(500)))
+            .await;
         let r4 = spawn_kind(&sys, &Kind::DeriveSync).await;
         match ask_good(r4.as_ref()).await {
             AskOutcome::Good(v) => assert_eq!(v, 30, "engine must survive sync-path panic"),
@@ -400,7 +439,12 @@ fn async_serialization_and_concurrency() {
             for i in 1..=10u64 {
                 let v = slow_ref.ask(Good(i)).await.unwrap();
                 // Serial + incrementing calls counter → v/10 strictly increasing
-                assert!(v / 10 >= last, "serialization violated: v={} last={}", v, last);
+                assert!(
+                    v / 10 >= last,
+                    "serialization violated: v={} last={}",
+                    v,
+                    last
+                );
                 last = v / 10;
             }
         });
@@ -419,6 +463,10 @@ fn async_serialization_and_concurrency() {
         // 10 × (2ms sleep + overhead) serial on one actor, while 20 fast asks
         // interleave — total should be tens of ms. Generous upper bound only
         // to catch gross serialization ACROSS actors (would be > 10× slower).
-        assert!(dt < Duration::from_secs(5), "cross-actor serialization suspected: {:?}", dt);
+        assert!(
+            dt < Duration::from_secs(5),
+            "cross-actor serialization suspected: {:?}",
+            dt
+        );
     });
 }

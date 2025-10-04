@@ -7,18 +7,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-    use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
     use parrot::thread::actor::ThreadActor;
     use parrot::thread::config::{SchedulingMode, ThreadActorConfig};
     use parrot::thread::context::ThreadContext;
-    use parrot::thread::mailbox::mpsc::MpscMailbox;
     use parrot::thread::mailbox::Mailbox;
-    use parrot::thread::processor::{ActorProcessor, ProcessorInterface};
+    use parrot::thread::mailbox::mpsc::MpscMailbox;
+    use parrot::thread::processor::ActorProcessor;
     use parrot::thread::scheduler::dedicated_thread::{
         DedicatedThreadConfig, DedicatedThreadScheduler, TypedThreadSchedulerExt,
     };
-    use std::any::Any;
+    use parrot_api::actor::{Actor, ActorState, EmptyConfig};
+    use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 
     /// A simple counting actor used by these tests.
     #[derive(Debug)]
@@ -34,7 +33,11 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async move {
                 if let Some(n) = msg.downcast_ref::<u64>() {
                     self.count += *n;
@@ -42,10 +45,6 @@ mod tests {
                 }
                 Ok(msg)
             })
-        }
-
-        fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-            None
         }
 
         fn state(&self) -> ActorState {
@@ -105,13 +104,19 @@ mod tests {
         // Push messages; the dedicated thread should drain them.
         for value in 1..=5u64 {
             mailbox
-                .push(Box::new(value) as BoxedMessage, parrot::thread::config::BackpressureStrategy::Block)
+                .push(
+                    Box::new(value) as BoxedMessage,
+                    parrot::thread::config::BackpressureStrategy::Block,
+                )
                 .await
                 .unwrap();
         }
 
         wait_until_empty(&mailbox).await;
-        assert!(mailbox.is_empty().await, "dedicated thread should drain the mailbox");
+        assert!(
+            mailbox.is_empty().await,
+            "dedicated thread should drain the mailbox"
+        );
 
         // Deschedule: thread removed
         scheduler.deschedule("test/dedicated/actor1").await.unwrap();

@@ -6,7 +6,6 @@
 
 mod engine_stress_common;
 
-use engine_stress_common::*;
 use parrot::thread::message_pool::{self, Pooled};
 use std::time::Instant;
 
@@ -17,7 +16,10 @@ struct PooledEcho {
 }
 impl Default for PooledEcho {
     fn default() -> Self {
-        Self { value: 0, _pad: [0; 64] }
+        Self {
+            value: 0,
+            _pad: [0; 64],
+        }
     }
 }
 
@@ -53,7 +55,10 @@ fn p1_p2_pool_vs_allocator() {
         alloc_wall.as_secs_f64() * 1000.0,
         pool_wall.as_secs_f64() * 1000.0,
         alloc_wall.as_secs_f64() / pool_wall.as_secs_f64(),
-        st.acquired_fresh, st.acquired_reused, st.dropped_overflow, sink % 2,
+        st.acquired_fresh,
+        st.acquired_reused,
+        st.dropped_overflow,
+        sink % 2,
     );
 
     // P2: 4 线程并发
@@ -73,7 +78,9 @@ fn p1_p2_pool_vs_allocator() {
         }));
     }
     let mut sink2 = 0u64;
-    for h in hs { sink2 = sink2.wrapping_add(h.join().unwrap()); }
+    for h in hs {
+        sink2 = sink2.wrapping_add(h.join().unwrap());
+    }
     let c_alloc = t2.elapsed();
 
     message_pool::clear_local();
@@ -91,7 +98,9 @@ fn p1_p2_pool_vs_allocator() {
         }));
     }
     let mut sink3 = 0u64;
-    for h in hs { sink3 = sink3.wrapping_add(h.join().unwrap()); }
+    for h in hs {
+        sink3 = sink3.wrapping_add(h.join().unwrap());
+    }
     let c_pool = t3.elapsed();
     println!(
         "[P2] 4-thread {} alloc+drop: allocator={:.1}ms pool={:.1}ms speedup={:.2}x sink={}/{}",
@@ -99,6 +108,7 @@ fn p1_p2_pool_vs_allocator() {
         c_alloc.as_secs_f64() * 1000.0,
         c_pool.as_secs_f64() * 1000.0,
         c_alloc.as_secs_f64() / c_pool.as_secs_f64(),
-        sink2 % 2, sink3 % 2,
+        sink2 % 2,
+        sink3 % 2,
     );
 }
