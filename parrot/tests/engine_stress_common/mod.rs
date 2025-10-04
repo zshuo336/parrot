@@ -1,3 +1,6 @@
+// 共享 bench 类型池：thread/actix 两侧按需取用（单侧未用属预期）
+#![allow(dead_code)]
+
 //! 引擎压测公共设施：双引擎共用的 actor 定义、计时器、结果收集。
 //!
 //! 设计原则：
@@ -5,8 +8,8 @@
 //! - 计时用 `Instant`，统计 p50/p90/p99/max/throughput
 //! - 所有 actor 状态外置到 `Arc<AtomicU64>`，避免引擎差异影响观察
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -85,12 +88,21 @@ pub struct LatencyStats {
 /// 对一组延迟样本（微秒）做分位数统计。
 pub fn latency_stats(mut samples: Vec<u128>) -> LatencyStats {
     if samples.is_empty() {
-        return LatencyStats { count: 0, p50_us: 0, p90_us: 0, p99_us: 0, max_us: 0, mean_us: 0.0 };
+        return LatencyStats {
+            count: 0,
+            p50_us: 0,
+            p90_us: 0,
+            p99_us: 0,
+            max_us: 0,
+            mean_us: 0.0,
+        };
     }
     samples.sort_unstable();
     let n = samples.len();
     let pick = |q: f64| -> u128 {
-        let idx = (((q / 100.0) * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+        let idx = (((q / 100.0) * n as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
         samples[idx]
     };
     let sum: u128 = samples.iter().sum();
@@ -131,7 +143,7 @@ impl BenchResult {
     pub fn print(&self) {
         let util = self
             .cpu_work_secs
-            .map(|w| format!(" | util={:.0}%", self.utilization() * 100.0))
+            .map(|_w| format!(" | util={:.0}%", self.utilization() * 100.0))
             .unwrap_or_default();
         println!(
             "[{}] {} | msgs={} | wall={:.3}s | tput={:.0}/s | lat p50={:.1}ms p90={:.1}ms p99={:.1}ms max={:.1}ms{} | correct={}",
@@ -185,13 +197,33 @@ impl Sink {
 /// （debug profile 约 0.194 G/s，若用 debug 跑请自行换算：场景时长 ×4.5。）
 pub const BURN_RATE: f64 = 880_000_000.0;
 
+/// 时长校准：按目标秒数求 burn_cpu 迭代数（对 llvm-cov 插桩/慢机鲁棒）。
+///
+/// 标定策略：三轮取最小单次耗时（首轮缓存冷偏慢），乘 0.8 安全系数
+/// （gate 宁可略短也不能超过 ask 默认 5s 超时）。
+pub fn calibrated_iters(secs: f64) -> u64 {
+    let probe = 8_000_000u64;
+    let mut best = f64::MAX;
+    let mut sink = 0u64;
+    for _ in 0..3 {
+        let t0 = Instant::now();
+        sink = sink.wrapping_add(burn_cpu(probe, 1));
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    std::hint::black_box(&sink);
+    (((secs * 0.8) / (best / probe as f64)) as u64).max(1_000)
+}
+
 /// CPU 工作负载：不可被优化器折叠的迭代混合运算。
 #[inline]
 pub fn burn_cpu(iterations: u64, salt: u64) -> u64 {
     let mut x: u64 = salt | 1;
     for i in 0..iterations {
         // 乘加 + 异或混合，无除法（除法太慢导致单次时间不可控）
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) ^ i;
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+            ^ i;
         if x == 42 {
             // 概率近乎为零，仅防分支消除
             return x;
@@ -212,7 +244,9 @@ pub struct Report {
 
 impl Report {
     pub fn new() -> Self {
-        Self { results: Mutex::new(Vec::new()) }
+        Self {
+            results: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn push(&self, r: BenchResult) {
@@ -222,13 +256,15 @@ impl Report {
 
     /// 输出对比小结（markdown 表格行）。
     pub fn dump_markdown(&self) -> String {
-        let mut out = String::from("| 场景 | 引擎 | 消息数 | 耗时(s) | 吞吐(/s) | p50(ms) | p90(ms) | p99(ms) | max(ms) | util | 正确 |\n|---|---|---|---|---|---|---|---|---|---|---|\n");
+        let mut out = String::from(
+            "| 场景 | 引擎 | 消息数 | 耗时(s) | 吞吐(/s) | p50(ms) | p90(ms) | p99(ms) | max(ms) | util | 正确 |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
+        );
         let mut rows = self.results.lock().unwrap().clone();
         rows.sort_by(|a, b| (&a.name, a.engine).cmp(&(&b.name, b.engine)));
         for r in rows {
             let util = r
                 .cpu_work_secs
-                .map(|w| format!("{:.0}%", r.utilization() * 100.0))
+                .map(|_w| format!("{:.0}%", r.utilization() * 100.0))
                 .unwrap_or_else(|| "-".into());
             out.push_str(&format!(
                 "| {} | {} | {} | {:.3} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} |\n",

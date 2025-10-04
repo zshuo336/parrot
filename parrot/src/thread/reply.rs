@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use parrot_api::{types::{BoxedMessage, ActorResult}, errors::ActorError};
+use parrot_api::{
+    errors::ActorError,
+    types::{ActorResult, BoxedMessage},
+};
 use std::fmt::Debug;
 use tokio::sync::oneshot;
 
@@ -87,4 +90,4 @@ mod tests {
         let repr = format!("{:?}", ThreadReplyChannel(tx));
         assert!(repr.contains("ThreadReplyChannel"));
     }
-} 
+}

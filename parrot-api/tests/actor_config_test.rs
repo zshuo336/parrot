@@ -48,16 +48,18 @@ impl Default for PartialCustomConfig {
 impl PartialCustomConfig {
     /// Create a configuration with a custom name; other fields use default values
     pub fn with_name(name: &str) -> Self {
-        let mut config = Self::default();
-        config.name = name.to_string();
-        config
+        Self {
+            name: name.to_string(),
+            ..Self::default()
+        }
     }
 
     /// Create a configuration with a custom timeout; other fields use default values
     pub fn with_timeout(timeout: Duration) -> Self {
-        let mut config = Self::default();
-        config.timeout = timeout;
-        config
+        Self {
+            timeout,
+            ..Self::default()
+        }
     }
 }
 
@@ -67,7 +69,7 @@ mod tests {
 
     #[test]
     fn test_empty_config_default() {
-        let config = EmptyConfig::default();
+        let config = EmptyConfig;
         // EmptyConfig should be zero-sized or very small
         assert!(
             std::mem::size_of_val(&config) <= std::mem::size_of::<usize>(),
@@ -82,7 +84,7 @@ mod tests {
         assert_eq!(config.name, "default-actor");
         assert_eq!(config.timeout, Duration::from_secs(30));
         assert_eq!(config.retries, 3);
-        assert_eq!(config.is_active, true);
+        assert!(config.is_active);
     }
 
     #[test]
@@ -92,21 +94,21 @@ mod tests {
         assert_eq!(default_config.name, "partial-default");
         assert_eq!(default_config.timeout, Duration::from_secs(10));
         assert_eq!(default_config.retries, 5);
-        assert_eq!(default_config.is_active, false);
+        assert!(!default_config.is_active);
 
         // Override name only
         let named_config = PartialCustomConfig::with_name("custom-name");
         assert_eq!(named_config.name, "custom-name");
         assert_eq!(named_config.timeout, Duration::from_secs(10));
         assert_eq!(named_config.retries, 5);
-        assert_eq!(named_config.is_active, false);
+        assert!(!named_config.is_active);
 
         // Override timeout only
         let timeout_config = PartialCustomConfig::with_timeout(Duration::from_secs(60));
         assert_eq!(timeout_config.name, "partial-default");
         assert_eq!(timeout_config.timeout, Duration::from_secs(60));
         assert_eq!(timeout_config.retries, 5);
-        assert_eq!(timeout_config.is_active, false);
+        assert!(!timeout_config.is_active);
     }
 
     #[test]
@@ -140,7 +142,7 @@ mod tests {
         assert_eq!(custom_config.name, "fully-custom");
         assert_eq!(custom_config.timeout, Duration::from_secs(120));
         assert_eq!(custom_config.retries, 10);
-        assert_eq!(custom_config.is_active, false);
+        assert!(!custom_config.is_active);
 
         // Compare with default to ensure they differ
         let default_config = CustomActorConfig::default();

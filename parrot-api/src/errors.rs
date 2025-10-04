@@ -1,5 +1,5 @@
 //! # Actor System Error Types
-//! 
+//!
 //! This module defines the error types used throughout the Parrot actor system.
 //! It provides a comprehensive error handling infrastructure that enables proper
 //! error propagation and handling across the actor hierarchy.
@@ -63,7 +63,7 @@ pub enum ActorError {
     /// * String - Detailed error message explaining the initialization failure
     #[error("Actor initialization failed: {0}")]
     InitializationError(String),
-    
+
     /// Error during message processing.
     ///
     /// This error occurs when an actor fails to process a message,
@@ -73,7 +73,7 @@ pub enum ActorError {
     /// * String - Detailed error message explaining the handling failure
     #[error("Message handling failed: {0}")]
     MessageHandlingError(String),
-    
+
     /// Actor has been stopped.
     ///
     /// This error indicates that an operation was attempted on a
@@ -81,7 +81,7 @@ pub enum ActorError {
     /// management.
     #[error("Actor stopped")]
     Stopped,
-    
+
     /// Operation timeout.
     ///
     /// This error occurs when an operation fails to complete within
@@ -101,7 +101,7 @@ pub enum ActorError {
     /// Internal system error.
     #[error("Internal error: {0}")]
     InternalError(String),
-    
+
     /// Process message error.
     ///
     /// This error occurs when a message is processed with an error.
@@ -129,3 +129,145 @@ pub enum ActorError {
     Other(#[from] anyhow::Error),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 全部 11 个变体的 Display 精确格式（稳定错误面，防止无意识改动）。
+    #[test]
+    fn display_all_variants() {
+        assert_eq!(
+            ActorError::InitializationError("bad cfg".into()).to_string(),
+            "Actor initialization failed: bad cfg"
+        );
+        assert_eq!(
+            ActorError::MessageHandlingError("bad msg".into()).to_string(),
+            "Message handling failed: bad msg"
+        );
+        assert_eq!(ActorError::Stopped.to_string(), "Actor stopped");
+        assert_eq!(ActorError::Timeout.to_string(), "Timeout");
+        assert_eq!(
+            ActorError::TimeoutDetail("5s".into()).to_string(),
+            "Timeout: 5s"
+        );
+        assert_eq!(
+            ActorError::ActorNotFound("/user/x".into()).to_string(),
+            "Actor not found: /user/x"
+        );
+        assert_eq!(
+            ActorError::InternalError("oops".into()).to_string(),
+            "Internal error: oops"
+        );
+        assert_eq!(
+            ActorError::ProcessMessageError("p".into()).to_string(),
+            "Process message error: p"
+        );
+        assert_eq!(
+            ActorError::ReplyChannelError("closed".into()).to_string(),
+            "Reply channel error: closed"
+        );
+        assert_eq!(
+            ActorError::Panic("boom".into()).to_string(),
+            "Panic: boom"
+        );
+        let other = ActorError::Other(anyhow::anyhow!("inner"));
+        assert_eq!(other.to_string(), "inner");
+    }
+
+    /// Other 变体保留错误源链（source chaining）。
+    #[test]
+    fn other_variant_preserves_source_chain() {
+        use std::error::Error as _;
+        // anyhow 包装一个带自身 source 的 std error，链应透传
+        #[derive(Debug, thiserror::Error)]
+        #[error("middle")]
+        struct Middle(#[source] std::io::Error);
+        let io_err = std::io::Error::other("root cause");
+        let inner = Middle(io_err);
+        let err = ActorError::Other(anyhow::Error::new(inner));
+        let src = err.source();
+        assert!(src.is_some(), "anyhow-wrapped std error must chain through");
+        // thiserror transparent 跳过 anyhow 层，链到 Middle 的错误链
+        let s = src.unwrap().to_string();
+        assert!(
+            s == "middle" || s == "root cause",
+            "source chain should reach Middle or its root, got {s}"
+        );
+        // 链最终必须到达 root cause
+        let mut cur = err.source();
+        let mut found_root = false;
+        while let Some(e) = cur {
+            if e.to_string() == "root cause" {
+                found_root = true;
+                break;
+            }
+            cur = e.source();
+        }
+        assert!(found_root, "root cause must be reachable via source chain");
+    }
+
+    /// From<anyhow::Error> 转换。
+    #[test]
+    fn from_anyhow_conversion() {
+        let e: ActorError = anyhow::anyhow!("wrapped").into();
+        assert!(matches!(e, ActorError::Other(_)));
+        assert_eq!(e.to_string(), "wrapped");
+    }
+
+    /// Debug 输出包含变体名（日志可辨识）。
+    #[test]
+    fn debug_names_are_stable() {
+        assert!(format!("{:?}", ActorError::Stopped).contains("Stopped"));
+        assert!(format!("{:?}", ActorError::Timeout).contains("Timeout"));
+        assert!(
+            format!("{:?}", ActorError::TimeoutDetail("x".into()))
+                .contains("TimeoutDetail")
+        );
+        assert!(
+            format!("{:?}", ActorError::Panic("x".into())).contains("Panic")
+        );
+    }
+
+    /// 所有变体可跨线程发送（ActorError: Send 断言）。
+    #[test]
+    fn all_variants_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ActorError>();
+        let e = ActorError::Panic("p".into());
+        std::thread::spawn(move || {
+            let _ = e.to_string();
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// 常见判别模式（supervisor 决策输入）。
+    #[test]
+    fn variant_matching_for_supervision() {
+        let cases: Vec<(ActorError, &str)> = vec![
+            (ActorError::Panic("p".into()), "panic"),
+            (ActorError::Stopped, "stopped"),
+            (ActorError::Timeout, "timeout"),
+            (ActorError::InitializationError("i".into()), "init"),
+        ];
+        for (e, kind) in cases {
+            let detected = match e {
+                ActorError::Panic(_) => "panic",
+                ActorError::Stopped => "stopped",
+                ActorError::Timeout | ActorError::TimeoutDetail(_) => "timeout",
+                _ => "init",
+            };
+            assert_eq!(detected, kind);
+        }
+    }
+
+    /// Timeout 与 TimeoutDetail 的判别一致性。
+    #[test]
+    fn timeout_variants_distinguishable() {
+        let a = ActorError::Timeout;
+        let b = ActorError::TimeoutDetail("detail".into());
+        assert!(matches!(a, ActorError::Timeout));
+        assert!(!matches!(a, ActorError::TimeoutDetail(_)));
+        assert!(matches!(b, ActorError::TimeoutDetail(_)));
+    }
+}

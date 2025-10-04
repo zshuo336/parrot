@@ -1,10 +1,11 @@
+#![allow(dead_code)] // 共享测试工具：按需取用
+
 //! Shared harness for the Akka-parity suite.
 
-use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
+use parrot::thread::config::ThreadActorSystemConfig;
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::address::ActorRefExt;
 use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
@@ -63,15 +64,6 @@ impl Actor for Counter {
         })
     }
 
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -100,15 +92,6 @@ impl Actor for Slowpoke {
             }
             Err(ActorError::MessageHandlingError("unknown".into()))
         })
-    }
-
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -142,15 +125,6 @@ impl Actor for SimpleWatched {
         })
     }
 
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -161,7 +135,9 @@ impl Actor for SimpleWatched {
 pub struct Ping;
 
 /// The `SimpleActor` trait alias used by some tests: sync-probe dispatch.
-pub trait SimpleActor: Sized + Actor<Context = ThreadContext<Self>> + Send + Sync + 'static {
+pub trait SimpleActor:
+    Sized + Actor<Context = ThreadContext<Self>> + Send + Sync + 'static
+{
     fn handle(&mut self, msg: &BoxedMessage) -> Option<ActorResult<BoxedMessage>>;
 
     fn receive_message<'a>(
@@ -176,15 +152,6 @@ pub trait SimpleActor: Sized + Actor<Context = ThreadContext<Self>> + Send + Syn
                 None => Ok(msg), // pass-through by default
             }
         })
-    }
-
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        self.handle(&msg)
     }
 
     fn state(&self) -> ActorState {
@@ -202,8 +169,10 @@ pub fn mk_system() -> std::sync::Arc<ThreadActorSystem> {
 
 /// Config with dedicated-thread scheduler capacity enabled.
 pub fn mk_system_with_dedicated() -> std::sync::Arc<ThreadActorSystem> {
-    let mut cfg = ThreadActorSystemConfig::default();
-    cfg.max_dedicated_threads = 8;
+    let cfg = ThreadActorSystemConfig {
+        max_dedicated_threads: 8,
+        ..Default::default()
+    };
     ThreadActorSystem::shared(cfg)
 }
 
@@ -218,12 +187,17 @@ where
         if cond().await {
             return;
         }
-        assert!(Instant::now() < deadline, "condition not met within {:?}", timeout);
+        assert!(
+            Instant::now() < deadline,
+            "condition not met within {:?}",
+            timeout
+        );
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
 }
 
 /// Box a typed thread ref into the erased ref type.
+#[allow(dead_code)]
 pub fn erased(r: impl parrot_api::address::ActorRef + 'static) -> BoxedActorRef {
     Box::new(r)
 }

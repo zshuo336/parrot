@@ -4,24 +4,29 @@ use parrot_api::address::ActorPath;
 use parrot_api::types::BoxedMessage;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
+use crate::thread::mailbox::MailboxItem;
 use crate::thread::processor::ProcessorInterface;
 
 /// A multi-producer, single-consumer mailbox implementation using flume.
 ///
 /// This mailbox allows multiple senders to send messages to a single consumer,
 /// which is typically an actor. It provides FIFO ordering guarantees.
+///
+/// M5: the internal channel carries [`MailboxItem`] values — ask envelopes
+/// flow **by value** (no envelope boxing); `pop` re-boxes for compat and
+/// `pop_item` is the single-block consumer path.
 pub struct MpscMailbox {
     /// The sending half of the channel
-    sender: Sender<BoxedMessage>,
+    sender: Sender<MailboxItem>,
     /// The receiving half of the channel
-    receiver: Receiver<BoxedMessage>,
+    receiver: Receiver<MailboxItem>,
     /// Path of the actor this mailbox belongs to
     path: ActorPath,
     /// Capacity of the mailbox
@@ -38,6 +43,15 @@ pub struct MpscMailbox {
     wake_hook: Mutex<Option<crate::thread::mailbox::WakeHook>>,
     /// Scheduling slot state (single-owner processing guard).
     schedule_state: crate::thread::mailbox::ScheduleState,
+    /// M2: high-priority lane (drained before the normal flume queue).
+    ///
+    /// Mutex<VecDeque> keeps the hot path (push/pop under contention) simple
+    /// and correct; priority messages are rare (system/death/control), so the
+    /// lock is effectively uncontended in practice.
+    high_lane: std::sync::Mutex<std::collections::VecDeque<MailboxItem>>,
+    /// M2: capacity already reserved from the normal queue by high-lane
+    /// messages (shared capacity accounting across both lanes).
+    high_reserved: AtomicUsize,
 }
 
 impl Debug for MpscMailbox {
@@ -47,7 +61,10 @@ impl Debug for MpscMailbox {
             .field("capacity", &self.capacity)
             .field("is_ready", &self.is_ready)
             .field("is_closed", &self.is_closed)
-            .field("processor", &self.processor.lock().map(|p| p.is_some()).unwrap_or(false))
+            .field(
+                "processor",
+                &self.processor.lock().map(|p| p.is_some()).unwrap_or(false),
+            )
             .finish()
     }
 }
@@ -73,11 +90,13 @@ impl MpscMailbox {
             processor,
             wake_hook,
             schedule_state: crate::thread::mailbox::ScheduleState::default(),
+            high_lane: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            high_reserved: AtomicUsize::new(0),
         }
     }
 
     /// Creates a clone of the sender that can be used to send messages to this mailbox.
-    pub fn sender(&self) -> Sender<BoxedMessage> {
+    pub fn sender(&self) -> Sender<MailboxItem> {
         self.sender.clone()
     }
 
@@ -90,11 +109,60 @@ impl MpscMailbox {
     fn closed(&self) -> bool {
         self.is_closed.load(Ordering::SeqCst)
     }
+
+    /// Signal work availability + wake hook (shared by all push paths).
+    fn signal_ready_and_wake(&self) {
+        self.is_ready.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+        self.fire_wake_hook();
+    }
 }
 
 #[async_trait]
 impl Mailbox for MpscMailbox {
-    async fn push(&self, msg: BoxedMessage, strategy: BackpressureStrategy) -> Result<(), MailboxError> {
+    async fn push(
+        &self,
+        msg: BoxedMessage,
+        strategy: BackpressureStrategy,
+    ) -> Result<(), MailboxError> {
+        self.push_item(MailboxItem::Plain(msg), strategy).await
+    }
+
+    /// M5 single-block path: push an ask envelope **by value**.
+    ///
+    /// flume's bounded ring buffer stores the item inline — zero envelope
+    /// boxing on this path.
+    ///
+    /// `parrot_envelope_legacy` feature：回退历史双装箱路径（信封先
+    /// `Box::new` 再 `push`），供 M5 灰度期回退（首个稳定版移除）。
+    #[cfg(not(feature = "parrot_envelope_legacy"))]
+    async fn push_ask(
+        &self,
+        envelope: crate::thread::envelope::AskEnvelope,
+        strategy: BackpressureStrategy,
+    ) -> Result<(), MailboxError> {
+        self.push_item(MailboxItem::Ask(envelope), strategy).await
+    }
+
+    /// Legacy escape hatch（见上）。
+    #[cfg(feature = "parrot_envelope_legacy")]
+    async fn push_ask(
+        &self,
+        envelope: crate::thread::envelope::AskEnvelope,
+        strategy: BackpressureStrategy,
+    ) -> Result<(), MailboxError> {
+        self.push_item(
+            MailboxItem::Plain(Box::new(envelope) as BoxedMessage),
+            strategy,
+        )
+        .await
+    }
+
+    async fn push_item(
+        &self,
+        item: MailboxItem,
+        strategy: BackpressureStrategy,
+    ) -> Result<(), MailboxError> {
         // Check if mailbox is already closed
         if self.closed() {
             return Err(MailboxError::Closed);
@@ -103,54 +171,41 @@ impl Mailbox for MpscMailbox {
         match strategy {
             BackpressureStrategy::DropNewest => {
                 // Try to send without waiting. If the mailbox is full, drop the message.
-                match self.sender.try_send(msg) {
+                match self.sender.try_send(item) {
                     Ok(_) => {
-                        // Signal that the mailbox has work
-                        self.is_ready.store(true, Ordering::SeqCst);
-                        self.notify.notify_one();
-                        self.fire_wake_hook();
+                        self.signal_ready_and_wake();
                         Ok(())
-                    },
+                    }
                     Err(flume::TrySendError::Full(_)) => {
                         // Mailbox is full, drop the message as per strategy
                         Ok(())
-                    },
-                    Err(flume::TrySendError::Disconnected(_)) => {
-                        Err(MailboxError::Closed)
                     }
+                    Err(flume::TrySendError::Disconnected(_)) => Err(MailboxError::Closed),
                 }
-            },
+            }
             BackpressureStrategy::Block => {
                 // Block until the message can be sent
-                match self.sender.send_async(msg).await {
+                match self.sender.send_async(item).await {
                     Ok(_) => {
-                        // Signal that the mailbox has work
-                        self.is_ready.store(true, Ordering::SeqCst);
-                        self.notify.notify_one();
-                        self.fire_wake_hook();
+                        self.signal_ready_and_wake();
                         Ok(())
-                    },
+                    }
                     Err(_) => Err(MailboxError::Closed),
                 }
-            },
+            }
             BackpressureStrategy::Error => {
                 // Try to send without waiting. If the mailbox is full, return an error.
-                match self.sender.try_send(msg) {
+                match self.sender.try_send(item) {
                     Ok(_) => {
-                        // Signal that the mailbox has work
-                        self.is_ready.store(true, Ordering::SeqCst);
-                        self.notify.notify_one();
-                        self.fire_wake_hook();
+                        self.signal_ready_and_wake();
                         Ok(())
-                    },
-                    Err(flume::TrySendError::Full(_)) => {
-                        Err(MailboxError::Full { capacity: self.capacity })
-                    },
-                    Err(flume::TrySendError::Disconnected(_)) => {
-                        Err(MailboxError::Closed)
                     }
+                    Err(flume::TrySendError::Full(_)) => Err(MailboxError::Full {
+                        capacity: self.capacity,
+                    }),
+                    Err(flume::TrySendError::Disconnected(_)) => Err(MailboxError::Closed),
                 }
-            },
+            }
             BackpressureStrategy::DropOldest => {
                 // If the mailbox is full, try to pop the oldest message first
                 if self.len().await >= self.capacity {
@@ -159,27 +214,157 @@ impl Mailbox for MpscMailbox {
                 }
 
                 // Then try to send the new message
-                match self.sender.try_send(msg) {
+                match self.sender.try_send(item) {
                     Ok(_) => {
-                        // Signal that the mailbox has work
-                        self.is_ready.store(true, Ordering::SeqCst);
-                        self.notify.notify_one();
-                        self.fire_wake_hook();
+                        self.signal_ready_and_wake();
                         Ok(())
-                    },
+                    }
                     Err(flume::TrySendError::Full(_)) => {
                         // This shouldn't happen as we just made room, but handle just in case
-                        Err(MailboxError::PushError("Failed to push message after dropping oldest".to_string()))
-                    },
-                    Err(flume::TrySendError::Disconnected(_)) => {
-                        Err(MailboxError::Closed)
+                        Err(MailboxError::PushError(
+                            "Failed to push message after dropping oldest".to_string(),
+                        ))
                     }
+                    Err(flume::TrySendError::Disconnected(_)) => Err(MailboxError::Closed),
                 }
-            },
+            }
         }
     }
 
-    async fn pop(&self) -> Option<BoxedMessage> {
+    /// M2: push with explicit priority lane selection.
+    ///
+    /// High-priority messages are buffered in the high lane which `pop`
+    /// drains first. Capacity accounting spans both lanes:
+    /// `flume.len() + high_lane.len() <= capacity`.
+    ///
+    /// Strategies:
+    /// - Block: wait (bounded poll) until capacity is available — system and
+    ///   death messages MUST NOT drop
+    /// - Error: fail fast when full
+    /// - DropNewest: drop the message when full (caller opted into lossy)
+    /// - DropOldest: drop the oldest message when full
+    ///
+    /// Returns `true` when the message entered the high lane.
+    async fn push_with_priority(
+        &self,
+        msg: BoxedMessage,
+        strategy: BackpressureStrategy,
+        high_priority: bool,
+    ) -> Result<bool, MailboxError> {
+        if !high_priority {
+            self.push(msg, strategy).await?;
+            return Ok(false);
+        }
+
+        if self.closed() {
+            return Err(MailboxError::Closed);
+        }
+
+        // Shared-capacity check across both lanes.
+        let total_len = self.len().await;
+
+        match strategy {
+            BackpressureStrategy::Block => {
+                // High-priority messages must not be lost. Poll with short
+                // sleeps until a consumer frees capacity. High-lane traffic
+                // is rare (system/death/control), so this is effectively
+                // uncontended; the bound (capacity × 10ms) prevents an
+                // unbreakable stall when the actor is wedged.
+                let mut waited = 0u64;
+                loop {
+                    if self.closed() {
+                        return Err(MailboxError::Closed);
+                    }
+                    if self.len().await < self.capacity {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    waited += 1;
+                    if waited > 10_000 {
+                        // ~10s bound: treat as a wedged consumer.
+                        return Err(MailboxError::Full {
+                            capacity: self.capacity,
+                        });
+                    }
+                }
+                self.high_reserved.fetch_add(1, Ordering::SeqCst);
+                self.high_lane
+                    .lock()
+                    .unwrap()
+                    .push_back(MailboxItem::Plain(msg));
+            }
+            BackpressureStrategy::Error => {
+                if total_len >= self.capacity {
+                    return Err(MailboxError::Full {
+                        capacity: self.capacity,
+                    });
+                }
+                self.high_reserved.fetch_add(1, Ordering::SeqCst);
+                self.high_lane
+                    .lock()
+                    .unwrap()
+                    .push_back(MailboxItem::Plain(msg));
+            }
+            BackpressureStrategy::DropNewest => {
+                if total_len >= self.capacity {
+                    return Ok(true); // dropped by caller's explicit choice
+                }
+                self.high_reserved.fetch_add(1, Ordering::SeqCst);
+                self.high_lane
+                    .lock()
+                    .unwrap()
+                    .push_back(MailboxItem::Plain(msg));
+            }
+            BackpressureStrategy::DropOldest => {
+                if total_len >= self.capacity {
+                    // Drop the oldest message (high lane first — it was the
+                    // oldest entry by arrival order at the front).
+                    let _ = self.pop().await;
+                }
+                self.high_reserved.fetch_add(1, Ordering::SeqCst);
+                self.high_lane
+                    .lock()
+                    .unwrap()
+                    .push_back(MailboxItem::Plain(msg));
+            }
+        }
+
+        self.signal_ready_and_wake();
+
+        Ok(true)
+    }
+
+    fn has_high_priority_messages(&self) -> bool {
+        !self.high_lane.lock().unwrap().is_empty()
+    }
+
+    /// M5: pop the internal item (ask envelopes by value).
+    async fn pop_item(&self) -> Option<MailboxItem> {
+        // M2: drain the high-priority lane first (O(1) jump over the
+        // normal backlog within this mailbox). Lock guard is dropped
+        // before any await point.
+        let high_msg = {
+            let mut lane = self.high_lane.lock().unwrap();
+            lane.pop_front()
+        };
+        if let Some(item) = high_msg {
+            self.high_reserved.fetch_sub(1, Ordering::SeqCst);
+            // If there are more messages, set ready flag again.
+            // Optimistic: flume len is atomic; high lane uses try_lock
+            // (uncontended in practice — only this actor's pushes touch it).
+            let more = !self.receiver.is_empty()
+                || self
+                    .high_lane
+                    .try_lock()
+                    .map(|l| !l.is_empty())
+                    .unwrap_or(true);
+            if more {
+                self.is_ready.store(true, Ordering::SeqCst);
+                self.notify.notify_one();
+            }
+            return Some(item);
+        }
+
         // Reset ready flag before attempting to receive
         self.is_ready.store(false, Ordering::SeqCst);
 
@@ -187,20 +372,30 @@ impl Mailbox for MpscMailbox {
         // requires `pop` to return `None` immediately when empty. Waiting for
         // new messages is the scheduling queue's responsibility (`Notify`).
         match self.receiver.try_recv() {
-            Ok(msg) => {
-                // If there are more messages, set ready flag again
-                if !self.is_empty().await {
+            Ok(item) => {
+                // If there are more messages, set ready flag again.
+                let more = !self.receiver.is_empty()
+                    || self
+                        .high_lane
+                        .try_lock()
+                        .map(|l| !l.is_empty())
+                        .unwrap_or(true);
+                if more {
                     self.is_ready.store(true, Ordering::SeqCst);
                     self.notify.notify_one();
                 }
-                Some(msg)
-            },
+                Some(item)
+            }
             Err(_) => None, // Channel is empty or disconnected
         }
     }
 
+    async fn pop(&self) -> Option<BoxedMessage> {
+        self.pop_item().await.map(|item| item.into_boxed_message())
+    }
+
     async fn is_empty(&self) -> bool {
-        self.receiver.is_empty()
+        self.receiver.is_empty() && self.high_lane.lock().unwrap().is_empty()
     }
 
     async fn signal_ready(&self) {
@@ -218,7 +413,7 @@ impl Mailbox for MpscMailbox {
     }
 
     async fn len(&self) -> usize {
-        self.receiver.len()
+        self.receiver.len() + self.high_lane.lock().unwrap().len()
     }
 
     async fn close(&self) {
@@ -229,9 +424,12 @@ impl Mailbox for MpscMailbox {
         drop(self.sender.clone());
 
         // Drain any remaining messages to ensure proper cleanup
-        while let Ok(_) = self.receiver.try_recv() {
+        while self.receiver.try_recv().is_ok() {
             // Nothing to do, just drain
         }
+        // M2: drain the high-priority lane as well
+        self.high_lane.lock().unwrap().clear();
+        self.high_reserved.store(0, Ordering::SeqCst);
 
         // Notify anyone waiting on this mailbox that it's now closed
         self.notify.notify_waiters();
@@ -295,23 +493,23 @@ mod tests {
 
     #[async_trait]
     impl ActorRef for MockActorRef {
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> { Box::pin(async { Ok(()) }) }
+        fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
         fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-            Box::pin(async move {
-                Ok(msg)
-            })
+            Box::pin(async move { Ok(msg) })
         }
 
-        fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-            Box::pin(async move {
-                Ok(msg)
-            })
+        fn send_with_timeout<'a>(
+            &'a self,
+            msg: BoxedMessage,
+            _timeout_duration: Option<Duration>,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move { Ok(msg) })
         }
 
         fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-            Box::pin(async move {
-                Ok(())
-            })
+            Box::pin(async { Ok(()) })
         }
 
         fn path(&self) -> String {
@@ -319,9 +517,7 @@ mod tests {
         }
 
         fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-            Box::pin(async move {
-                true
-            })
+            Box::pin(async { true })
         }
 
         fn clone_boxed(&self) -> BoxedActorRef {
@@ -353,7 +549,10 @@ mod tests {
 
         // Push a message
         let message: BoxedMessage = Box::new("test message");
-        mailbox.push(message, BackpressureStrategy::Block).await.unwrap();
+        mailbox
+            .push(message, BackpressureStrategy::Block)
+            .await
+            .unwrap();
 
         // Pop the message
         let received = mailbox.pop().await;
@@ -372,11 +571,16 @@ mod tests {
 
         // Fill the mailbox
         let message1: BoxedMessage = Box::new("message 1");
-        mailbox.push(message1, BackpressureStrategy::Block).await.unwrap();
+        mailbox
+            .push(message1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
 
         // Try to push with drop strategy
         let message2: BoxedMessage = Box::new("message 2");
-        let result = mailbox.push(message2, BackpressureStrategy::DropNewest).await;
+        let result = mailbox
+            .push(message2, BackpressureStrategy::DropNewest)
+            .await;
 
         // Should succeed but the message is dropped
         assert!(result.is_ok());
@@ -399,11 +603,16 @@ mod tests {
 
         // Fill the mailbox with first message
         let message1: BoxedMessage = Box::new("message 1");
-        mailbox.push(message1, BackpressureStrategy::Block).await.unwrap();
+        mailbox
+            .push(message1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
 
         // Try to push with DropOldest strategy
         let message2: BoxedMessage = Box::new("message 2");
-        let result = mailbox.push(message2, BackpressureStrategy::DropOldest).await;
+        let result = mailbox
+            .push(message2, BackpressureStrategy::DropOldest)
+            .await;
 
         // Should succeed
         assert!(result.is_ok());
@@ -425,7 +634,10 @@ mod tests {
 
         // Fill the mailbox
         let message1: BoxedMessage = Box::new("message 1");
-        mailbox.push(message1, BackpressureStrategy::Block).await.unwrap();
+        mailbox
+            .push(message1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
 
         // Try to push with error strategy
         let message2: BoxedMessage = Box::new("message 2");
@@ -458,7 +670,10 @@ mod tests {
         // Push some messages
         for i in 0..5 {
             let msg = Box::new(format!("Message {}", i)) as BoxedMessage;
-            mailbox.push(msg, BackpressureStrategy::Block).await.unwrap();
+            mailbox
+                .push(msg, BackpressureStrategy::Block)
+                .await
+                .unwrap();
         }
 
         // Close the mailbox
@@ -476,9 +691,9 @@ mod tests {
     #[tokio::test]
     async fn test_processor_association() {
         use crate::thread::actor::ThreadActor;
+        use crate::thread::config::ThreadActorConfig;
         use crate::thread::context::ThreadContext;
         use crate::thread::processor::ActorProcessor;
-        use crate::thread::config::ThreadActorConfig;
         use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 
         #[derive(Debug)]
@@ -488,16 +703,19 @@ mod tests {
             type Config = EmptyConfig;
             type Context = ThreadContext<Self>;
 
-            fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+            fn init<'a>(
+                &'a mut self,
+                _ctx: &'a mut Self::Context,
+            ) -> BoxedFuture<'a, ActorResult<()>> {
                 Box::pin(async { Ok(()) })
             }
 
-            fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            fn receive_message<'a>(
+                &'a mut self,
+                msg: BoxedMessage,
+                _ctx: &'a mut Self::Context,
+            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async move { Ok(msg) })
-            }
-
-            fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-                None
             }
 
             fn state(&self) -> ActorState {
@@ -522,5 +740,60 @@ mod tests {
         mailbox.set_processor(processor);
         assert!(mailbox.has_processor());
         assert!(mailbox.get_processor().is_some());
+    }
+
+    // ============ M5 单块信封路径 ============
+
+    #[tokio::test]
+    async fn test_push_ask_envelope_by_value_roundtrip() {
+        use crate::thread::envelope::AskEnvelope;
+
+        let path = create_test_actor_path("m5-actor");
+        let mailbox = MpscMailbox::new(10, path);
+
+        // inline ask：载荷零独立分配，信封按值入队
+        let (envelope, reply_rx) = AskEnvelope::new_inline(42u64);
+        mailbox
+            .push_ask(envelope, BackpressureStrategy::Block)
+            .await
+            .unwrap();
+
+        // pop_item：按值取出（零装箱）
+        let item = mailbox.pop_item().await.expect("item queued");
+        match item {
+            MailboxItem::Ask(env) => {
+                let (payload, reply) = env.into_parts_layered();
+                let boxed = payload.into_boxed();
+                assert_eq!(*boxed.downcast::<u64>().unwrap(), 42);
+                let _ = reply.send(Ok(Box::new("done") as BoxedMessage));
+            }
+            other => panic!("expected Ask item, got {:?}", other.into_boxed_message()),
+        }
+
+        let reply = reply_rx.await.unwrap().unwrap();
+        assert_eq!(*reply.downcast::<&str>().unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn test_pop_compat_reboxes_ask_envelope() {
+        use crate::thread::envelope::AskEnvelope;
+
+        let path = create_test_actor_path("m5-compat");
+        let mailbox = MpscMailbox::new(10, path);
+
+        let (envelope, _rx) = AskEnvelope::new_typed("big".to_string());
+        mailbox
+            .push_ask(envelope, BackpressureStrategy::Block)
+            .await
+            .unwrap();
+
+        // 兼容路径 pop：AskEnvelope 装箱还原（旧消费方仍可 downcast）
+        let boxed = mailbox.pop().await.expect("message queued");
+        let env = boxed
+            .downcast::<AskEnvelope>()
+            .expect("compat pop must re-box ask envelopes");
+        let (payload, _reply) = env.into_parts_layered();
+        let boxed = payload.into_boxed();
+        assert_eq!(*boxed.downcast::<String>().unwrap(), "big");
     }
 }

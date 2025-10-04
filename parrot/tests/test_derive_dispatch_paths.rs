@@ -8,7 +8,7 @@
 //!      `"Not use on actix engine"`;
 //!    - the new Actix async path (`use_async_handler() == true`) also
 //!      routes through `receive_message` and hit the same error branch —
-//!    derive users could not use async handlers at all.
+//!      derive users could not use async handlers at all.
 //! 2. **ADR-2**: `receive_message_with_engine` took a raw
 //!    `NonNull<dyn Any>`, leaking `unsafe` pointer semantics into user
 //!    handler signatures.
@@ -22,13 +22,12 @@
 //! - `handle_message_engine` now consumes the safe
 //!   [`EngineContextHandle`]: zero `unsafe` in user handler code.
 
-use parrot::actix::{ActixActorSystem, ActixActor, ActixContext};
-use parrot::system::ParrotActorSystem;
-use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
+use parrot::actix as __parrot_engine;
+use parrot::actix::ActixActorSystem;
+use parrot_api::actor::{Actor, EmptyConfig, EngineContextHandle};
 use parrot_api::address::ActorRefExt;
 use parrot_api::message::Message;
-use parrot_api::system::{ActorSystem, ActorSystemConfig};
-use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
+use parrot_api::types::{ActorResult, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
 use std::any::Any;
 use std::ptr::NonNull;
@@ -130,7 +129,9 @@ impl AsyncCounter {
             return Ok(Box::new(self.value) as BoxedMessage);
         }
         if msg.downcast_ref::<Describe>().is_some() {
-            return Ok(Box::new(format!("async value={} ops={}", self.value, self.ops)) as BoxedMessage);
+            return Ok(
+                Box::new(format!("async value={} ops={}", self.value, self.ops)) as BoxedMessage,
+            );
         }
         Err(parrot_api::errors::ActorError::MessageHandlingError(
             "unknown message type".to_string(),
@@ -156,26 +157,26 @@ impl AsyncCounter {
 fn derive_receive_message_forwards_to_handle_message() {
     // Actix actors must run inside an actix System (arbiter context).
     actix::System::new().block_on(async {
-    // This mirrors what the thread engine's primary path invokes.
-    // Constructing an ActixContext requires a live Addr, so the full
-    // engine path is covered by Part 2 (Actix e2e) below; here we verify
-    // the codegen contract through the trait object on the Actix engine.
-    let sys = ActixActorSystem::new().await.expect("actix system starts");
-    let aref = sys
-        .spawn_root_typed(Counter { value: 0, ops: 0 }, EmptyConfig)
-        .await
-        .expect("spawn derive Counter");
+        // This mirrors what the thread engine's primary path invokes.
+        // Constructing an ActixContext requires a live Addr, so the full
+        // engine path is covered by Part 2 (Actix e2e) below; here we verify
+        // the codegen contract through the trait object on the Actix engine.
+        let sys = ActixActorSystem::new().await.expect("actix system starts");
+        let aref = sys
+            .spawn_root_typed(Counter { value: 0, ops: 0 }, EmptyConfig)
+            .await
+            .expect("spawn derive Counter");
 
-    // Inc is NOT handled by handle_message_engine → the adapter now
-    // returns an explicit actionable error instead of silently dropping
-    // the message (was: opaque "No response from actor").
-    let r = aref.ask(Inc(7)).await;
-    let err = r.expect_err("unhandled sync message must be an explicit error");
-    assert!(err.to_string().contains("Message not handled"));
+        // Inc is NOT handled by handle_message_engine → the adapter now
+        // returns an explicit actionable error instead of silently dropping
+        // the message (was: opaque "No response from actor").
+        let r = aref.ask(Inc(7)).await;
+        let err = r.expect_err("unhandled sync message must be an explicit error");
+        assert!(err.to_string().contains("Message not handled"));
 
-    // Get IS handled by the engine fast path.
-    let r = aref.ask(Get).await.expect("get via fast path");
-    assert_eq!(r, 0);
+        // Get IS handled by the engine fast path.
+        let r = aref.ask(Get).await.expect("get via fast path");
+        assert_eq!(r, 0);
     });
 }
 
@@ -186,18 +187,18 @@ fn derive_receive_message_forwards_to_handle_message() {
 #[test]
 fn derive_async_handler_opt_in_runs_on_actix() {
     actix::System::new().block_on(async {
-    let sys = ActixActorSystem::new().await.expect("actix system starts");
-    let aref = sys
-        .spawn_root_typed(AsyncCounter { value: 0, ops: 0 }, EmptyConfig)
-        .await
-        .expect("spawn derive AsyncCounter");
+        let sys = ActixActorSystem::new().await.expect("actix system starts");
+        let aref = sys
+            .spawn_root_typed(AsyncCounter { value: 0, ops: 0 }, EmptyConfig)
+            .await
+            .expect("spawn derive AsyncCounter");
 
-    let r = aref.ask(Inc(3)).await.expect("async derive ask works");
-    assert_eq!(r, 3);
-    let r = aref.ask(Inc(4)).await.expect("second async ask");
-    assert_eq!(r, 7);
-    let r = aref.ask(Get).await.expect("async get");
-    assert_eq!(r, 7);
+        let r = aref.ask(Inc(3)).await.expect("async derive ask works");
+        assert_eq!(r, 3);
+        let r = aref.ask(Inc(4)).await.expect("second async ask");
+        assert_eq!(r, 7);
+        let r = aref.ask(Get).await.expect("async get");
+        assert_eq!(r, 7);
         let r = aref.ask(Describe).await.expect("async describe");
         assert_eq!(r, "async value=7 ops=2");
     });

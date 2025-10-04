@@ -8,11 +8,25 @@ fn test_system_config_defaults() {
     let config = ThreadActorSystemConfig::default();
 
     assert_eq!(config.shared_pool_size, num_cpus::get());
-    assert!(matches!(config.default_scheduling_mode, SchedulingMode::SharedPool { max_messages_per_run: 10 }));
+    assert!(matches!(
+        config.default_scheduling_mode,
+        SchedulingMode::SharedPool {
+            max_messages_per_run: 10
+        }
+    ));
     assert_eq!(config.default_mailbox_capacity, 1024);
     assert_eq!(config.default_ask_timeout, Duration::from_secs(5));
-    assert!(matches!(config.default_supervisor_strategy, SupervisorStrategy::Restart { max_retries: 3, within: _ }));
-    assert_eq!(config.default_backpressure_strategy, BackpressureStrategy::Block);
+    assert!(matches!(
+        config.default_supervisor_strategy,
+        SupervisorStrategy::Restart {
+            max_retries: 3,
+            within: _
+        }
+    ));
+    assert_eq!(
+        config.default_backpressure_strategy,
+        BackpressureStrategy::Block
+    );
     // Add checks for other defaults if they become non-optional
     // assert!(config.dedicated_thread_affinity_strategy.is_none());
     // assert_eq!(config.thread_name_prefix, "parrot-thread-worker-");
@@ -42,4 +56,4 @@ fn test_config_debug_format() {
     // Basic check to ensure Debug trait doesn't panic
     assert!(format!("{:?}", sys_config).contains("shared_pool_size"));
     assert!(format!("{:?}", actor_config).contains("scheduling_mode"));
-} 
+}

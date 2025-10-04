@@ -16,8 +16,8 @@
 //! Every scenario ends with an exact-value integrity assertion — a stress
 //! run that loses count FAILS, it does not just "finish".
 
+use parrot::actix as __parrot_engine;
 use parrot::actix::ActixActorSystem;
-use parrot::system::ParrotActorSystem;
 use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
@@ -25,15 +25,15 @@ use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
-use parrot_api::system::{ActorSystem, ActorSystemConfig};
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn stress_full() -> bool {
-    std::env::var("STRESS_FULL").map(|v| v == "1").unwrap_or(false)
+    std::env::var("STRESS_FULL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -98,15 +98,6 @@ impl Actor for StressCounter {
             }
             Err(ActorError::MessageHandlingError("unknown".into()))
         })
-    }
-
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _engine_ctx: EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -188,14 +179,16 @@ impl DeriveSyncBoom {
     }
 }
 
-async fn spawn_thread(
-    ts: &Arc<ThreadActorSystem>,
-    path: &str,
-) -> Box<dyn ActorRef> {
+async fn spawn_thread(ts: &Arc<ThreadActorSystem>, path: &str) -> Box<dyn ActorRef> {
     Box::new(
-        ts.spawn_at::<StressCounter>(StressCounter::default(), path, None, ThreadActorConfig::default())
-            .await
-            .expect("spawn stress actor"),
+        ts.spawn_at::<StressCounter>(
+            StressCounter::default(),
+            path,
+            None,
+            ThreadActorConfig::default(),
+        )
+        .await
+        .expect("spawn stress actor"),
     )
 }
 
@@ -221,7 +214,7 @@ async fn s1_thread_throughput_storm_200k() {
     let rate = n as f64 / dt.as_secs_f64();
     println!("S1 thread: {} asks in {:?} ({:.0}/s)", n, dt, rate);
     // Integrity: exact final value.
-    assert_eq!(r.ask(Get).await.unwrap(), n as u64);
+    assert_eq!(r.ask(Get).await.unwrap(), n);
     // Throughput sanity floor (generous; debug builds vary).
     assert!(rate > 1_000.0, "throughput too low: {:.0}/s", rate);
 }
@@ -244,7 +237,12 @@ fn s1_actix_throughput_storm_50k() {
             }
         }
         let dt = t0.elapsed();
-        println!("S1 actix: {} asks in {:?} ({:.0}/s)", n, dt, n as f64 / dt.as_secs_f64());
+        println!(
+            "S1 actix: {} asks in {:?} ({:.0}/s)",
+            n,
+            dt,
+            n as f64 / dt.as_secs_f64()
+        );
         // Exact integrity via the async path actor? DeriveSyncBoom's engine
         // handler accumulates; final Get not handled → skip, count proven above.
     });
@@ -256,7 +254,11 @@ fn s1_actix_throughput_storm_50k() {
 
 #[tokio::test]
 async fn s2_thread_concurrency_storm_64x() {
-    let (askers, per) = if stress_full() { (64, 1_000) } else { (16, 200) };
+    let (askers, per) = if stress_full() {
+        (64, 1_000)
+    } else {
+        (16, 200)
+    };
     let total = askers * per;
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
     let r = Arc::new(spawn_thread(&ts, "/s2/thread").await);
@@ -275,7 +277,12 @@ async fn s2_thread_concurrency_storm_64x() {
         h.await.unwrap();
     }
     let dt = t0.elapsed();
-    println!("S2 thread: {} concurrent asks in {:?} ({:.0}/s)", total, dt, total as f64 / dt.as_secs_f64());
+    println!(
+        "S2 thread: {} concurrent asks in {:?} ({:.0}/s)",
+        total,
+        dt,
+        total as f64 / dt.as_secs_f64()
+    );
     // Exact integrity — no lost updates, no duplicates.
     assert_eq!(r.ask(Get).await.unwrap(), total as u64);
 }
@@ -305,8 +312,17 @@ fn s2_actix_derive_async_concurrency_storm() {
             h.await.unwrap();
         }
         let dt = t0.elapsed();
-        println!("S2 actix derive-async: {} asks in {:?} ({:.0}/s)", askers * per, dt, (askers * per) as f64 / dt.as_secs_f64());
-        assert_eq!(r.ask(Get).await.unwrap(), (askers * per) as u64, "derive async fleet integrity");
+        println!(
+            "S2 actix derive-async: {} asks in {:?} ({:.0}/s)",
+            askers * per,
+            dt,
+            (askers * per) as f64 / dt.as_secs_f64()
+        );
+        assert_eq!(
+            r.ask(Get).await.unwrap(),
+            (askers * per) as u64,
+            "derive async fleet integrity"
+        );
     });
 }
 
@@ -372,15 +388,22 @@ async fn s4_thread_timeout_storm() {
 
     for i in 0..rounds {
         // Fast ask (1ms budget, immediate handler).
-        let v = r.send_with_timeout(Box::new(Add(1)), Some(Duration::from_millis(1_000))).await;
+        let v = r
+            .send_with_timeout(Box::new(Add(1)), Some(Duration::from_millis(1_000)))
+            .await;
         assert!(v.is_ok(), "fast ask must never time out");
         // Slow ask (handler sleeps 60ms, budget 10ms → must time out).
-        let slow = r.send_with_timeout(Box::new(Slow(60)), Some(Duration::from_millis(10))).await;
+        let slow = r
+            .send_with_timeout(Box::new(Slow(60)), Some(Duration::from_millis(10)))
+            .await;
         match slow {
             Err(e) => {
                 let s = e.to_string().to_lowercase();
-                assert!(s.contains("timeout") || s.contains("timed out") || s.contains("elapsed"),
-                    "expected timeout, got: {}", e);
+                assert!(
+                    s.contains("timeout") || s.contains("timed out") || s.contains("elapsed"),
+                    "expected timeout, got: {}",
+                    e
+                );
             }
             Ok(_) => { /* scheduling race: handler may sneak under — tolerated */ }
         }
@@ -389,11 +412,16 @@ async fn s4_thread_timeout_storm() {
     // Integrity: rounds Adds + (any completed) Slows landed exactly.
     let final_v = r.ask(Get).await.unwrap();
     assert!(
-        final_v == rounds as u64 || final_v > rounds as u64,
+        final_v >= rounds as u64,
         "final value must account for every completed op: {}",
         final_v
     );
-    println!("S4 thread: {} timeout rounds in {:?}, final={}", rounds, t0.elapsed(), final_v);
+    println!(
+        "S4 thread: {} timeout rounds in {:?}, final={}",
+        rounds,
+        t0.elapsed(),
+        final_v
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +430,11 @@ async fn s4_thread_timeout_storm() {
 
 #[tokio::test]
 async fn s5_thread_mixed_fleet_endurance() {
-    let (actors, rounds) = if stress_full() { (64, 2_000) } else { (12, 150) };
+    let (actors, rounds) = if stress_full() {
+        (64, 2_000)
+    } else {
+        (12, 150)
+    };
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
     let mut fleet = Vec::new();
     for i in 0..actors {
@@ -419,8 +451,13 @@ async fn s5_thread_mixed_fleet_endurance() {
         }
     }
     let dt = t0.elapsed();
-    println!("S5 thread: {} actors × {} rounds in {:?} ({:.0} msg/s)",
-        actors, rounds, dt, (actors * rounds) as f64 / dt.as_secs_f64());
+    println!(
+        "S5 thread: {} actors × {} rounds in {:?} ({:.0} msg/s)",
+        actors,
+        rounds,
+        dt,
+        (actors * rounds) as f64 / dt.as_secs_f64()
+    );
     for r in &fleet {
         assert_eq!(r.ask(Get).await.unwrap(), rounds as u64);
     }
@@ -432,7 +469,11 @@ async fn s5_thread_mixed_fleet_endurance() {
 
 #[test]
 fn s6_actix_derive_async_fleet_100() {
-    let (n_actors, per_actor, askers_per) = if stress_full() { (100, 100, 4) } else { (24, 25, 2) };
+    let (n_actors, per_actor, askers_per) = if stress_full() {
+        (100, 100, 4)
+    } else {
+        (24, 25, 2)
+    };
     actix::System::new().block_on(async {
         let sys = ActixActorSystem::new().await.expect("system");
         let mut fleet = Vec::new();
@@ -461,8 +502,13 @@ fn s6_actix_derive_async_fleet_100() {
         }
         let dt = t0.elapsed();
         let total = n_actors * per_actor * askers_per;
-        println!("S6 actix derive-async fleet: {} actors, {} msgs in {:?} ({:.0}/s)",
-            n_actors, total, dt, total as f64 / dt.as_secs_f64());
+        println!(
+            "S6 actix derive-async fleet: {} actors, {} msgs in {:?} ({:.0}/s)",
+            n_actors,
+            total,
+            dt,
+            total as f64 / dt.as_secs_f64()
+        );
 
         // Exact per-actor integrity.
         for r in &fleet {

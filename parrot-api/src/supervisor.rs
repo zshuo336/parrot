@@ -1,5 +1,5 @@
 //! # Actor Supervision System
-//! 
+//!
 //! This module provides the supervision infrastructure for the Parrot actor system,
 //! implementing fault tolerance through hierarchical error handling and recovery strategies.
 //!
@@ -37,12 +37,42 @@
 //! Note: registering the strategy with an actor system is
 //! implementation-specific; refer to the concrete system's builder API.
 
-use std::time::Duration;
+use crate::address::ActorRef;
+use crate::errors::ActorError;
+use async_trait::async_trait;
 use std::fmt::Debug;
 use std::sync::Arc;
-use async_trait::async_trait;
-use crate::errors::ActorError;
-use crate::address::ActorRef;
+use std::time::Duration;
+
+/// Why an actor terminated (M3 supervision: public death reason).
+///
+/// Carried by engine `Terminated` notifications so DeathWatch consumers
+/// can distinguish graceful stops from panics and escalations — parity
+/// with Akka's public `Terminated`/`DeathPact` distinction and Erlang's
+/// process exit reasons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeathReason {
+    /// Normal termination (`stop` / system shutdown / mailbox closed).
+    Normal,
+    /// The actor panicked; the payload message is the formatted panic.
+    Panic(String),
+    /// The actor was killed by the system (forced removal).
+    Killed,
+    /// The actor was stopped as part of an escalation cascade; the payload
+    /// message explains the originating failure.
+    Escalated(String),
+}
+
+impl std::fmt::Display for DeathReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeathReason::Normal => write!(f, "normal"),
+            DeathReason::Panic(m) => write!(f, "panic: {m}"),
+            DeathReason::Killed => write!(f, "killed"),
+            DeathReason::Escalated(m) => write!(f, "escalated: {m}"),
+        }
+    }
+}
 
 /// Decisions available to supervisors when handling actor failures.
 ///
@@ -54,17 +84,17 @@ pub enum SupervisionDecision {
     ///
     /// Use when the error is transient and doesn't affect actor state.
     Resume,
-    
+
     /// Recreate the actor, resetting its state to initial values.
     ///
     /// Use when the actor's state may be corrupted.
     Restart,
-    
+
     /// Terminate the actor permanently.
     ///
     /// Use when the error is unrecoverable or the actor is no longer needed.
     Stop,
-    
+
     /// Forward the error to the parent supervisor.
     ///
     /// Use when the error needs to be handled at a higher level.
@@ -203,10 +233,10 @@ impl SupervisorStrategy for DefaultStrategy {
 pub struct OneForOneStrategy {
     /// Maximum number of restarts allowed within the time window
     pub max_restarts: u32,
-    
+
     /// Time window for counting restarts
     pub within: Duration,
-    
+
     /// Function for making supervision decisions
     pub decider: BasicDecisionFn,
 }
@@ -246,10 +276,10 @@ impl SupervisorStrategy for OneForOneStrategy {
 pub struct OneForAllStrategy {
     /// Maximum number of restarts allowed within the time window
     pub max_restarts: u32,
-    
+
     /// Time window for counting restarts
     pub within: Duration,
-    
+
     /// Function for making supervision decisions
     pub decider: BasicDecisionFn,
 }
@@ -377,4 +407,321 @@ impl SupervisorStrategy for SupervisorStrategyType {
             Self::OneForAll(s) => s.handle_failure(failed_actor, error, failure_count).await,
         }
     }
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::{ActorPath, ActorRef};
+    use crate::errors::ActorError;
+    use crate::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
+    use std::time::Duration;
+
+    /// 一个恒死的占位 ActorRef，用于 handle_failure 参数传递。
+    #[derive(Debug)]
+    struct DeadRef;
+
+    #[async_trait]
+    impl ActorRef for DeadRef {
+        fn send<'a>(
+            &'a self,
+            _msg: BoxedMessage,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async { Err(ActorError::Stopped) })
+        }
+        fn send_with_timeout<'a>(
+            &'a self,
+            _msg: BoxedMessage,
+            _t: Option<std::time::Duration>,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async { Err(ActorError::Stopped) })
+        }
+        fn deliver<'a>(
+            &'a self,
+            _msg: BoxedMessage,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Err(ActorError::Stopped) })
+        }
+        fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Err(ActorError::Stopped) })
+        }
+        fn path(&self) -> String {
+            "dead://test".into()
+        }
+        fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+            Box::pin(async { false })
+        }
+        fn clone_boxed(&self) -> BoxedActorRef {
+            Box::new(DeadRef)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn dead_ref() -> Box<dyn ActorRef> {
+        Box::new(DeadRef)
+    }
+
+    fn any_err() -> ActorError {
+        ActorError::MessageHandlingError("boom".into())
+    }
+
+    // ---------------- DeathReason ----------------
+
+    #[test]
+    fn death_reason_display_variants() {
+        assert_eq!(DeathReason::Normal.to_string(), "normal");
+        assert_eq!(
+            DeathReason::Panic("x".into()).to_string(),
+            "panic: x"
+        );
+        assert_eq!(DeathReason::Killed.to_string(), "killed");
+        assert_eq!(
+            DeathReason::Escalated("cascade".into()).to_string(),
+            "escalated: cascade"
+        );
+    }
+
+    #[test]
+    fn death_reason_equality_and_clone() {
+        let a = DeathReason::Panic("p".into());
+        assert_eq!(a.clone(), DeathReason::Panic("p".into()));
+        assert_ne!(DeathReason::Normal, DeathReason::Killed);
+        assert_ne!(DeathReason::Panic("a".into()), DeathReason::Panic("b".into()));
+    }
+
+    // ---------------- BasicDecisionFn ----------------
+
+    #[test]
+    fn basic_decision_fn_dispatches_by_error() {
+        let d = BasicDecisionFn::new(|e| match e {
+            ActorError::Timeout => SupervisionDecision::Resume,
+            _ => SupervisionDecision::Stop,
+        });
+        assert_eq!(d.decide(&ActorError::Timeout), SupervisionDecision::Resume);
+        assert_eq!(
+            d.decide(&ActorError::InitializationError("x".into())),
+            SupervisionDecision::Stop
+        );
+    }
+
+    #[test]
+    fn basic_decision_fn_debug_and_clone() {
+        let d = BasicDecisionFn::new(|_| SupervisionDecision::Restart);
+        assert!(format!("{:?}", d).contains("BasicDecisionFn"));
+        let d2 = d.clone();
+        assert_eq!(d2.decide(&any_err()), SupervisionDecision::Restart);
+    }
+
+    // ---------------- DefaultStrategy ----------------
+
+    #[tokio::test]
+    async fn default_strategy_all_four_decisions() {
+        let cases = [
+            (DefaultStrategy::StopOnFailure, SupervisionDecision::Stop),
+            (DefaultStrategy::RestartOnFailure, SupervisionDecision::Restart),
+            (DefaultStrategy::ResumeOnFailure, SupervisionDecision::Resume),
+            (DefaultStrategy::EscalateFailure, SupervisionDecision::Escalate),
+        ];
+        for (strategy, want) in cases {
+            assert_eq!(
+                strategy.handle_failure(dead_ref(), &any_err(), 0).await,
+                want,
+                "strategy {:?}",
+                strategy
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_strategy_default_is_stop() {
+        assert!(matches!(
+            DefaultStrategy::default(),
+            DefaultStrategy::StopOnFailure
+        ));
+        assert_eq!(
+            DefaultStrategy::default()
+                .handle_failure(dead_ref(), &any_err(), 42)
+                .await,
+            SupervisionDecision::Stop
+        );
+    }
+
+    // ---------------- OneForOne / OneForAll ----------------
+
+    #[tokio::test]
+    async fn one_for_one_within_budget_uses_decider() {
+        let s = DefaultSupervisorStrategyFactory::one_for_one(3, Duration::from_secs(60));
+        // failure_count == max_restarts: 3 > 3 false → decider (default restart)
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 3).await,
+            SupervisionDecision::Restart
+        );
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 0).await,
+            SupervisionDecision::Restart
+        );
+    }
+
+    #[tokio::test]
+    async fn one_for_one_over_budget_stops() {
+        let s = DefaultSupervisorStrategyFactory::one_for_one(3, Duration::from_secs(60));
+        // failure_count > max_restarts → Stop（无论 decider）
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 4).await,
+            SupervisionDecision::Stop
+        );
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 1000).await,
+            SupervisionDecision::Stop
+        );
+    }
+
+    #[tokio::test]
+    async fn one_for_one_zero_budget_always_stops_after_first() {
+        let s = DefaultSupervisorStrategyFactory::one_for_one(0, Duration::from_secs(1));
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 1).await,
+            SupervisionDecision::Stop
+        );
+        // failure_count=0（首次失败）仍走 decider
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 0).await,
+            SupervisionDecision::Restart
+        );
+    }
+
+    #[tokio::test]
+    async fn one_for_one_custom_decider_overrides() {
+        let s = OneForOneStrategy {
+            max_restarts: 10,
+            within: Duration::from_secs(60),
+            decider: BasicDecisionFn::new(|e| {
+                if matches!(e, ActorError::Panic(_)) {
+                    SupervisionDecision::Escalate
+                } else {
+                    SupervisionDecision::Resume
+                }
+            }),
+        };
+        assert_eq!(
+            s.handle_failure(dead_ref(), &ActorError::Panic("p".into()), 1)
+                .await,
+            SupervisionDecision::Escalate
+        );
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 1).await,
+            SupervisionDecision::Resume
+        );
+    }
+
+    #[tokio::test]
+    async fn one_for_all_budget_boundary_matches_one_for_one() {
+        let s = DefaultSupervisorStrategyFactory::one_for_all(2, Duration::from_secs(30));
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 2).await,
+            SupervisionDecision::Restart
+        );
+        assert_eq!(
+            s.handle_failure(dead_ref(), &any_err(), 3).await,
+            SupervisionDecision::Stop
+        );
+    }
+
+    #[test]
+    fn strategy_debug_impls_show_params() {
+        let s = DefaultSupervisorStrategyFactory::one_for_one(5, Duration::from_secs(10));
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("max_restarts"));
+        assert!(dbg.contains("decider"));
+
+        let s2 = DefaultSupervisorStrategyFactory::one_for_all(5, Duration::from_secs(10));
+        assert!(format!("{:?}", s2).contains("OneForAllStrategy"));
+    }
+
+    #[test]
+    fn strategy_clone_preserves_behavior() {
+        let s = DefaultSupervisorStrategyFactory::one_for_one(1, Duration::from_secs(1));
+        let c = s.clone();
+        assert_eq!(c.max_restarts, 1);
+        assert_eq!(c.within, Duration::from_secs(1));
+    }
+
+    // ---------------- SupervisorStrategyType（枚举分发） ----------------
+
+    #[tokio::test]
+    async fn strategy_type_dispatches_to_inner() {
+        let cases: Vec<(SupervisorStrategyType, SupervisionDecision)> = vec![
+            (
+                SupervisorStrategyType::Default(DefaultStrategy::ResumeOnFailure),
+                SupervisionDecision::Resume,
+            ),
+            (
+                SupervisorStrategyType::OneForOne(
+                    DefaultSupervisorStrategyFactory::one_for_one(0, Duration::from_secs(1)),
+                ),
+                SupervisionDecision::Stop, // failure_count=1 > max=0
+            ),
+            (
+                SupervisorStrategyType::OneForAll(
+                    DefaultSupervisorStrategyFactory::one_for_all(9, Duration::from_secs(1)),
+                ),
+                SupervisionDecision::Restart, // decider 默认
+            ),
+        ];
+        for (ty, want) in cases {
+            assert_eq!(ty.handle_failure(dead_ref(), &any_err(), 1).await, want);
+        }
+    }
+
+    #[test]
+    fn strategy_type_default_is_default_stop() {
+        assert!(matches!(
+            SupervisorStrategyType::default(),
+            SupervisorStrategyType::Default(DefaultStrategy::StopOnFailure)
+        ));
+    }
+
+    // ---------------- 每错误类型 × 决策矩阵 ----------------
+
+    #[tokio::test]
+    async fn decider_sees_all_error_variants() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        let d = BasicDecisionFn::new(move |e| {
+            seen2.lock().unwrap().push(format!("{:?}", e));
+            SupervisionDecision::Restart
+        });
+        let errors = vec![
+            ActorError::InitializationError("i".into()),
+            ActorError::MessageHandlingError("m".into()),
+            ActorError::Stopped,
+            ActorError::Timeout,
+            ActorError::TimeoutDetail("t".into()),
+            ActorError::ActorNotFound("n".into()),
+            ActorError::InternalError("in".into()),
+            ActorError::ProcessMessageError("p".into()),
+            ActorError::ReplyChannelError("r".into()),
+            ActorError::Panic("pan".into()),
+        ];
+        for e in &errors {
+            assert_eq!(d.decide(e), SupervisionDecision::Restart);
+        }
+        assert_eq!(seen.lock().unwrap().len(), errors.len());
+        // anyhow 包装（Other）也必须可用
+        assert_eq!(
+            d.decide(&ActorError::Other(anyhow::anyhow!("o"))),
+            SupervisionDecision::Restart
+        );
+    }
+
+    // ---------------- ActorPath 占位（辅助覆盖地址构造） ----------------
+
+    #[test]
+    fn actor_path_placeholder_in_strategy_context() {
+        // 策略本身不读 path；此测试保证 DeadRef 的 path 稳定可用于日志
+        let p = ActorPath::placeholder("dead://test");
+        assert_eq!(p.path(), "dead://test");
+    }
+}

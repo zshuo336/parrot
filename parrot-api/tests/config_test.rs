@@ -4,11 +4,11 @@ use parrot_api::supervisor::{DefaultStrategy, SupervisorStrategyType};
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // Test default implementation of EmptyConfig
     #[test]
     fn test_empty_config_default() {
-        let config = EmptyConfig::default();
+        let config = EmptyConfig;
         // Verify that EmptyConfig implements Default trait
         assert!(std::any::Any::type_id(&config) == std::any::TypeId::of::<EmptyConfig>());
     }
@@ -68,7 +68,9 @@ mod tests {
         // Use custom values
         let custom_config = TestSystemConfig {
             name: "test-system".to_string(),
-            supervision_strategy: SupervisorStrategyType::Default(DefaultStrategy::RestartOnFailure),
+            supervision_strategy: SupervisorStrategyType::Default(
+                DefaultStrategy::RestartOnFailure,
+            ),
         };
 
         assert_eq!(custom_config.name, "test-system");

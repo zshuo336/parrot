@@ -1,5 +1,5 @@
 //! # Actor Message System
-//! 
+//!
 //! This module defines the message passing infrastructure for the Parrot actor system.
 //! It provides the core types and traits for type-safe, reliable message communication
 //! between actors.
@@ -45,13 +45,11 @@
 //! );
 //! ```
 
-use std::time::Duration;
-use std::any::Any;
-use std::sync::Arc;
-use uuid::Uuid;
 use crate::address::ActorRef;
 use crate::types::{BoxedMessage, SharedMessage};
-use std::any::TypeId;
+use std::any::Any;
+use std::time::Duration;
+use uuid::Uuid;
 /// Message ID type
 pub type MessageId = Uuid;
 
@@ -112,16 +110,16 @@ impl MessagePriority {
 
     /// Predefined priority: Background (10)
     pub const BACKGROUND: MessagePriority = MessagePriority(10);
-    
+
     /// Predefined priority: Low (30)
     pub const LOW: MessagePriority = MessagePriority(30);
-    
+
     /// Predefined priority: Normal (50)
     pub const NORMAL: MessagePriority = MessagePriority(50);
-    
+
     /// Predefined priority: High (70)
     pub const HIGH: MessagePriority = MessagePriority(70);
-    
+
     /// Predefined priority: Critical (90)
     pub const CRITICAL: MessagePriority = MessagePriority(90);
 
@@ -187,13 +185,15 @@ pub trait Message: Send + 'static {
     /// # Returns
     /// * `Ok(Result)` - Successfully extracted result
     /// * `Err(ActorError)` - Type conversion failed
-    fn extract_result(result: Box<dyn Any + Send>) -> Result<Self::Result, crate::errors::ActorError> {
-        result
-            .downcast::<Self::Result>()
-            .map(|b| *b)
-            .map_err(|_| crate::errors::ActorError::MessageHandlingError(
-                format!("Failed to downcast message result for {}", std::any::type_name::<Self>())
+    fn extract_result(
+        result: Box<dyn Any + Send>,
+    ) -> Result<Self::Result, crate::errors::ActorError> {
+        result.downcast::<Self::Result>().map(|b| *b).map_err(|_| {
+            crate::errors::ActorError::MessageHandlingError(format!(
+                "Failed to downcast message result for {}",
+                std::any::type_name::<Self>()
             ))
+        })
     }
 
     /// Validates the message content.
@@ -211,7 +211,7 @@ pub trait Message: Send + 'static {
     /// Returns the message type name.
     ///
     /// This is typically the struct name of the message type.
-    /// 
+    ///
     /// # Returns
     /// * `&'static str` - The type name of the message as a static string
     ///
@@ -222,7 +222,7 @@ pub trait Message: Send + 'static {
     /// impl Message for MyMessage {
     ///     type Result = ();
     /// }
-    /// 
+    ///
     /// let msg = MyMessage {};
     /// // Note: message_type returns std::any::type_name, which includes the
     /// // defining module path (e.g. "rust_out::MyMessage" in doctests).
@@ -235,7 +235,7 @@ pub trait Message: Send + 'static {
     /// Returns the message priority level.
     ///
     /// Default implementation returns Normal priority.
-    /// 
+    ///
     /// # Returns
     /// * `MessagePriority` - The priority level for this message
     ///
@@ -246,7 +246,7 @@ pub trait Message: Send + 'static {
     /// impl Message for MyMessage {
     ///     type Result = ();
     /// }
-    /// 
+    ///
     /// let msg = MyMessage {};
     /// assert_eq!(msg.priority(), MessagePriority::NORMAL);
     /// ```
@@ -257,18 +257,17 @@ pub trait Message: Send + 'static {
     /// Returns the message options for this message.
     ///
     /// Default implementation returns default message options.
-    /// 
+    ///
     /// # Returns
     /// * `MessageOptions` - The options for this message
     fn message_options(&self) -> Option<MessageOptions> {
         None
     }
 
-
     /// Converts message into a boxed message
     ///
     /// Boxes the message for type erasure in the actor system.
-    /// 
+    ///
     /// # Parameters
     /// * `msg` - The message to box
     ///
@@ -282,14 +281,16 @@ pub trait Message: Send + 'static {
     /// impl Message for MyMessage {
     ///     type Result = ();
     /// }
-    /// 
+    ///
     /// let msg = MyMessage {};
     /// let boxed = Message::into_boxed(msg);
     /// ```
-    fn into_boxed(msg: Self) -> BoxedMessage where Self: Sized {
+    fn into_boxed(msg: Self) -> BoxedMessage
+    where
+        Self: Sized,
+    {
         Box::new(msg)
     }
-
 }
 
 // create a trait for cloneable message
@@ -339,28 +340,28 @@ impl Clone for CloneableMessage {
 /// }
 impl CloneableMessage {
     /// convert a type that implements Message + Clone to CloneableMessage
-    pub fn from_message<T>(message: T) -> Self 
-    where 
-        T: Message + Clone + 'static
+    pub fn from_message<T>(message: T) -> Self
+    where
+        T: Message + Clone + 'static,
     {
         CloneableMessage {
-            message: Box::new(message) as Box<dyn CloneableMessageTrait>
+            message: Box::new(message) as Box<dyn CloneableMessageTrait>,
         }
     }
-    
+
     /// get the inner message
     pub fn into_boxed(self) -> BoxedMessage {
         self.message.into_boxed_message()
     }
 
     // create a CloneableMessage from any cloneable type
-    pub fn from_cloneable<T>(value: T) -> Self 
-    where 
-        T: Clone + Send + 'static
+    pub fn from_cloneable<T>(value: T) -> Self
+    where
+        T: Clone + Send + 'static,
     {
         // create a special wrapper type
         struct CloneableValue<T: Clone + Send + 'static>(T);
-        
+
         impl<T: Clone + Send + 'static> CloneableMessageTrait for CloneableValue<T> {
             fn clone_message(&self) -> Box<dyn CloneableMessageTrait> {
                 Box::new(CloneableValue(self.0.clone()))
@@ -369,12 +370,12 @@ impl CloneableMessage {
                 Box::new(self.0) as BoxedMessage
             }
         }
-        
+
         CloneableMessage {
-            message: Box::new(CloneableValue(value))
+            message: Box::new(CloneableValue(value)),
         }
     }
-    
+
     // Enhanced try_from_boxed method to support more types
     pub fn try_from_boxed(boxed: &BoxedMessage) -> Option<Self> {
         // 1. First try common types directly for efficiency
@@ -390,7 +391,7 @@ impl CloneableMessage {
             return Some(Self::from_cloneable(*u));
         } else if let Some(b) = boxed.as_ref().downcast_ref::<bool>() {
             return Some(Self::from_cloneable(*b));
-        } else if let Some(_) = boxed.as_ref().downcast_ref::<()>() {
+        } else if boxed.as_ref().downcast_ref::<()>().is_some() {
             return Some(Self::from_cloneable(()));
         } else if let Some(f) = boxed.as_ref().downcast_ref::<f32>() {
             return Some(Self::from_cloneable(*f));
@@ -399,9 +400,9 @@ impl CloneableMessage {
         } else if let Some(c) = boxed.as_ref().downcast_ref::<char>() {
             return Some(Self::from_cloneable(*c));
         }
-        
+
         // 2. Try custom message types
-        
+
         // For TestMessage type (explicit handling for test purposes)
         if std::any::type_name_of_val(boxed.as_ref()).contains("TestMessage") {
             // We can't directly clone custom types without knowing their type
@@ -409,7 +410,7 @@ impl CloneableMessage {
             // For now, we'll return None to indicate that custom types aren't supported yet
             return None;
         }
-        
+
         // Final fallback - we can't reliably clone unknown types
         None
     }
@@ -420,30 +421,31 @@ impl CloneableMessage {
 pub trait AnyMessage: Any + Send {
     /// Get message type for runtime type information
     fn message_type(&self) -> &'static str;
-    
+
     /// Message validation
     fn validate(&self) -> Result<(), crate::errors::ActorError>;
-    
+
     /// Message priority
     fn priority(&self) -> crate::message::MessagePriority;
-    
+
     /// Message options
     fn message_options(&self) -> Option<crate::message::MessageOptions>;
 }
 
 enum MessageContainer {
+    #[allow(dead_code)]
     Exclusive(BoxedMessage),
-    Shared(SharedMessage)
+    #[allow(dead_code)]
+    Shared(SharedMessage),
 }
 
-
 /// Implement From<MessageContainer> for BoxedMessage
-/// 
+///
 /// This implementation allows for conversion between MessageContainer and BoxedMessage.
-/// 
+///
 /// # Parameters
 /// * `container` - The MessageContainer to convert
-/// 
+///
 /// # Returns
 /// exclusive example:
 /// ```ignore
@@ -463,9 +465,7 @@ impl From<MessageContainer> for BoxedMessage {
             // return type is Box<dyn Any + Send>
             MessageContainer::Exclusive(boxed) => boxed,
             // return type is Box<Arc<dyn Any + Send + Sync>
-            MessageContainer::Shared(arc) => {
-                Box::new(arc)
-            }
+            MessageContainer::Shared(arc) => Box::new(arc),
         }
     }
 }
@@ -475,15 +475,15 @@ impl<T: Any + Message + Send> AnyMessage for T {
     fn message_type(&self) -> &'static str {
         <T as Message>::message_type(self)
     }
-    
+
     fn validate(&self) -> Result<(), crate::errors::ActorError> {
         <T as Message>::validate(self)
     }
-    
+
     fn priority(&self) -> crate::message::MessagePriority {
         <T as Message>::priority(self)
     }
-    
+
     fn message_options(&self) -> Option<crate::message::MessageOptions> {
         <T as Message>::message_options(self)
     }
@@ -500,8 +500,6 @@ impl<T: 'static + Clone + Send> BoxedMessageClone for T {
         Box::new(self.clone())
     }
 }
-
-
 
 /// Message options for controlling delivery and processing
 #[derive(Debug)]
@@ -547,9 +545,7 @@ impl MessageEnvelope {
         options: Option<MessageOptions>,
     ) -> Self {
         // if options are provided, use them, otherwise use the message options
-        let options = options.unwrap_or_else(
-            || payload.message_options().unwrap_or_default()
-        );
+        let options = options.unwrap_or_else(|| payload.message_options().unwrap_or_default());
         Self {
             id: Uuid::new_v4(),
             payload: Box::new(payload),
@@ -588,10 +584,9 @@ impl MessageEnvelope {
             message_type: std::any::type_name_of_val(&*boxed_msg),
             payload: boxed_msg,
             sender,
-            options
+            options,
         }
     }
-
 }
 
 /// Configuration for message retry behavior.
@@ -602,10 +597,10 @@ impl MessageEnvelope {
 pub struct RetryPolicy {
     /// Maximum number of retry attempts
     pub max_attempts: u32,
-    
+
     /// Base interval between retry attempts
     pub retry_interval: Duration,
-    
+
     /// Strategy for adjusting retry intervals
     pub backoff_strategy: BackoffStrategy,
 }
@@ -618,10 +613,10 @@ pub struct RetryPolicy {
 pub enum BackoffStrategy {
     /// Constant interval between retries
     Fixed,
-    
+
     /// Interval increases linearly with each attempt
     Linear,
-    
+
     /// Interval increases exponentially with each attempt
     Exponential {
         /// Multiplier for interval growth
@@ -663,4 +658,331 @@ mod tests {
     fn test_default_priority() {
         assert_eq!(MessagePriority::default(), MessagePriority::NORMAL);
     }
-} 
+
+    // ---------------- Display / TryFrom / new_unchecked ----------------
+
+    #[test]
+    fn priority_display_format() {
+        assert_eq!(MessagePriority::HIGH.to_string(), "Priority(70)");
+        assert_eq!(MessagePriority::new(0).unwrap().to_string(), "Priority(0)");
+    }
+
+    #[test]
+    fn priority_try_from_valid_and_invalid() {
+        let ok: Result<MessagePriority, _> = u8::try_into(0u8);
+        assert!(ok.is_ok());
+        let ok2: Result<MessagePriority, _> = 100u8.try_into();
+        assert!(ok2.is_ok());
+        let err: Result<MessagePriority, _> = 101u8.try_into();
+        let err = err.unwrap_err();
+        assert!(err.contains("between 0 and 100"));
+        let bad: Result<MessagePriority, _> = 255u8.try_into();
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn priority_new_unchecked_and_value() {
+        let p = MessagePriority::new_unchecked(42);
+        assert_eq!(p.value(), 42);
+    }
+
+    // ---------------- Message 默认方法 ----------------
+
+    struct TestMsg(u32);
+
+    impl Message for TestMsg {
+        type Result = u32;
+    }
+
+    #[test]
+    fn message_default_extract_result_roundtrip_and_mismatch() {
+        let boxed: Box<dyn Any + Send> = Box::new(7u32);
+        let r = <TestMsg as Message>::extract_result(boxed);
+        assert_eq!(r.unwrap(), 7);
+        // 类型不匹配 → 错误信息含类型名
+        let bad: Box<dyn Any + Send> = Box::new("str");
+        let e = <TestMsg as Message>::extract_result(bad).unwrap_err();
+        assert!(e.to_string().contains("downcast"));
+    }
+
+    #[test]
+    fn message_default_validate_is_ok() {
+        let r: Result<(), crate::errors::ActorError> = Message::validate(&TestMsg(1));
+        assert!(r.is_ok());
+    }
+
+    // ---------------- CloneableMessage ----------------
+
+    #[test]
+    fn cloneable_from_message_roundtrip() {
+        #[derive(Debug, Clone, PartialEq)]
+        struct M(u64);
+        impl Message for M {
+            type Result = ();
+        }
+        let c = CloneableMessage::from_message(M(5));
+        let c2 = c.clone();
+        // into_boxed 取回载荷
+        let b = c.into_boxed();
+        let m = b.downcast_ref::<M>().unwrap();
+        assert_eq!(*m, M(5));
+        // 克隆独立
+        let b2 = c2.into_boxed();
+        assert_eq!(b2.downcast_ref::<M>().unwrap().0, 5);
+    }
+
+    #[test]
+    fn cloneable_from_cloneable_arbitrary_type() {
+        let c = CloneableMessage::from_cloneable(vec![1i32, 2, 3]);
+        let c2 = c.clone();
+        let b = c.into_boxed();
+        let v = b.downcast_ref::<Vec<i32>>().unwrap();
+        assert_eq!(v, &vec![1, 2, 3]);
+        assert_eq!(c2.into_boxed().downcast_ref::<Vec<i32>>().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn try_from_boxed_common_primitive_types() {
+        // String
+        let s: BoxedMessage = Box::new("hello".to_string());
+        let c = CloneableMessage::try_from_boxed(&s).unwrap();
+        assert_eq!(
+            c.into_boxed().downcast_ref::<String>().unwrap(),
+            "hello"
+        );
+        // 整数族 / 浮点 / bool / unit / char 逐类型断言
+        let b: BoxedMessage = Box::new(7i32);
+        assert_eq!(
+            CloneableMessage::try_from_boxed(&b)
+                .unwrap()
+                .into_boxed()
+                .downcast_ref::<i32>()
+                .unwrap(),
+            &7
+        );
+        let b: BoxedMessage = Box::new(7i64);
+        assert_eq!(
+            CloneableMessage::try_from_boxed(&b)
+                .unwrap()
+                .into_boxed()
+                .downcast_ref::<i64>()
+                .unwrap(),
+            &7
+        );
+        let b: BoxedMessage = Box::new(7u32);
+        assert_eq!(
+            CloneableMessage::try_from_boxed(&b)
+                .unwrap()
+                .into_boxed()
+                .downcast_ref::<u32>()
+                .unwrap(),
+            &7
+        );
+        let b: BoxedMessage = Box::new(7u64);
+        assert_eq!(
+            CloneableMessage::try_from_boxed(&b)
+                .unwrap()
+                .into_boxed()
+                .downcast_ref::<u64>()
+                .unwrap(),
+            &7
+        );
+        let b: BoxedMessage = Box::new(true);
+        assert!(
+            *CloneableMessage::try_from_boxed(&b)
+                .unwrap()
+                .into_boxed()
+                .downcast_ref::<bool>()
+                .unwrap()
+        );
+        let b: BoxedMessage = Box::new(());
+        assert!(CloneableMessage::try_from_boxed(&b).is_some());
+        let b: BoxedMessage = Box::new(1.5f32);
+        assert_eq!(
+            *CloneableMessage::try_from_boxed(&b)
+                .unwrap()
+                .into_boxed()
+                .downcast_ref::<f32>()
+                .unwrap(),
+            1.5
+        );
+        let b: BoxedMessage = Box::new(1.5f64);
+        assert_eq!(
+            *CloneableMessage::try_from_boxed(&b)
+                .unwrap()
+                .into_boxed()
+                .downcast_ref::<f64>()
+                .unwrap(),
+            1.5
+        );
+        let b: BoxedMessage = Box::new('x');
+        assert_eq!(
+            *CloneableMessage::try_from_boxed(&b)
+                .unwrap()
+                .into_boxed()
+                .downcast_ref::<char>()
+                .unwrap(),
+            'x'
+        );
+    }
+
+    #[test]
+    fn try_from_boxed_unsupported_type_returns_none() {
+        struct Custom;
+        let b: BoxedMessage = Box::new(Custom);
+        assert!(CloneableMessage::try_from_boxed(&b).is_none());
+    }
+
+    // ---------------- AnyMessage / MessageContainer ----------------
+
+    #[test]
+    fn any_message_trait_object_delegates() {
+        struct M;
+        impl Message for M {
+            type Result = ();
+            fn message_type(&self) -> &'static str {
+                "M"
+            }
+            fn validate(&self) -> Result<(), crate::errors::ActorError> {
+                Err(crate::errors::ActorError::MessageHandlingError("custom".into()))
+            }
+            fn priority(&self) -> MessagePriority {
+                MessagePriority::CRITICAL
+            }
+            fn message_options(&self) -> Option<MessageOptions> {
+                Some(MessageOptions::default())
+            }
+        }
+        let m = M;
+        let am: &dyn AnyMessage = &m;
+        assert_eq!(am.message_type(), "M");
+        assert!(am.validate().is_err());
+        assert_eq!(am.priority(), MessagePriority::CRITICAL);
+        assert!(am.message_options().is_some());
+        // 默认实现版本
+        struct N;
+        impl Message for N {
+            type Result = ();
+        }
+        let an: &dyn AnyMessage = &N;
+        assert!(an.validate().is_ok());
+        assert_eq!(an.priority(), MessagePriority::NORMAL);
+        assert!(an.message_options().is_none());
+        // 默认 message_type 返回完整 type_name（含 crate 路径）
+        assert_eq!(an.message_type(), std::any::type_name::<N>());
+    }
+
+    // ---------------- BoxedMessageClone ----------------
+
+    #[test]
+    fn boxed_message_clone_for_clone_types() {
+        #[derive(Debug, Clone, PartialEq)]
+        struct V(u8);
+        let v = V(9);
+        let bc: &dyn BoxedMessageClone = &v;
+        let c = bc.clone_box();
+        assert_eq!(c.downcast_ref::<V>().unwrap(), &V(9));
+    }
+
+    // ---------------- MessageOptions / MessageEnvelope ----------------
+
+    #[test]
+    fn message_options_default() {
+        let o = MessageOptions::default();
+        assert!(o.timeout.is_none());
+        assert!(o.retry_policy.is_none());
+        assert_eq!(o.priority, MessagePriority::NORMAL);
+    }
+
+    #[test]
+    fn envelope_new_with_defaults_from_message() {
+        struct M;
+        impl Message for M {
+            type Result = ();
+            fn message_options(&self) -> Option<MessageOptions> {
+                Some(MessageOptions {
+                    timeout: Some(Duration::from_millis(5)),
+                    retry_policy: None,
+                    priority: MessagePriority::HIGH,
+                })
+            }
+        }
+        let e = MessageEnvelope::new(M, None, None);
+        assert_eq!(e.options.priority, MessagePriority::HIGH);
+        assert_eq!(e.options.timeout, Some(Duration::from_millis(5)));
+        assert!(e.sender.is_none());
+        assert_eq!(e.message_type, std::any::type_name::<M>());
+    }
+
+    #[test]
+    fn envelope_new_with_explicit_options_override() {
+        struct M;
+        impl Message for M {
+            type Result = ();
+        }
+        let opts = MessageOptions {
+            timeout: Some(Duration::from_secs(1)),
+            retry_policy: None,
+            priority: MessagePriority::CRITICAL,
+        };
+        let e = MessageEnvelope::new(M, None, Some(opts));
+        assert_eq!(e.options.priority, MessagePriority::CRITICAL);
+    }
+
+    #[test]
+    fn envelope_payload_accessors() {
+        #[derive(Debug, PartialEq)]
+        struct P(u16);
+        impl Message for P {
+            type Result = ();
+        }
+        let mut e = MessageEnvelope::new(P(3), None, None);
+        assert_eq!(e.payload::<P>(), Some(&P(3)));
+        assert_eq!(e.message::<P>(), Some(&P(3)));
+        // 可变访问
+        e.payload_mut::<P>().unwrap().0 = 4;
+        assert_eq!(e.payload::<P>(), Some(&P(4)));
+        e.message_mut::<P>().unwrap().0 = 5;
+        assert_eq!(e.message::<P>(), Some(&P(5)));
+        // 类型不匹配 → None
+        struct Q;
+        impl Message for Q {
+            type Result = ();
+        }
+        assert!(e.payload::<Q>().is_none());
+        assert!(e.message::<Q>().is_none());
+        assert!(e.payload_mut::<Q>().is_none());
+        assert!(e.message_mut::<Q>().is_none());
+    }
+
+    #[test]
+    fn envelope_from_boxed_sets_type_name() {
+        let boxed: BoxedMessage = Box::new(42u32);
+        let e = MessageEnvelope::from_boxed(boxed, None, MessageOptions::default());
+        // 已知限制：type_name_of_val 对 Box<dyn Any> 只能看到擦除后的
+        // trait-object 名（"dyn core::any::Any + ..."）。固化此行为；
+        // 若未来改为记录具体类型名，此断言会提醒更新调用方文档。
+        assert!(e.message_type.contains("dyn"), "was {}", e.message_type);
+        // id 唯一
+        let e2 = MessageEnvelope::from_boxed(Box::new(1u32), None, MessageOptions::default());
+        assert_ne!(e.id, e2.id);
+    }
+
+    // ---------------- RetryPolicy / BackoffStrategy ----------------
+
+    #[test]
+    fn retry_policy_and_backoff_variants_debug() {
+        let p = RetryPolicy {
+            max_attempts: 3,
+            retry_interval: Duration::from_millis(100),
+            backoff_strategy: BackoffStrategy::Exponential {
+                base: 2.0,
+                max_interval: Duration::from_secs(10),
+            },
+        };
+        assert_eq!(p.max_attempts, 3);
+        assert!(format!("{:?}", p).contains("Exponential"));
+        assert!(format!("{:?}", BackoffStrategy::Fixed).contains("Fixed"));
+        assert!(format!("{:?}", BackoffStrategy::Linear).contains("Linear"));
+    }
+}

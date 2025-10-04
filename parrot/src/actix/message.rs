@@ -1,9 +1,9 @@
+use actix::Message as ActixMessage;
+use parrot_api::errors::ActorError;
+use parrot_api::message::{Message, MessageEnvelope, MessageOptions};
+use parrot_api::types::{ActorResult, BoxedMessage};
 use std::any::Any;
 use uuid::Uuid;
-use actix::Message as ActixMessage;
-use parrot_api::message::{MessageEnvelope, Message, MessageOptions};
-use parrot_api::types::{BoxedMessage, ActorResult};
-use parrot_api::errors::ActorError;
 
 /// Wrapper for MessageEnvelope to implement actix::Message
 ///
@@ -24,10 +24,10 @@ impl ActixMessage for ActixMessageWrapper {
 pub trait MessageDowncast {
     /// Downcast the message to a specific type
     fn downcast<M: 'static>(self) -> Result<M, ActorError>;
-    
+
     /// Get a reference to the message as a specific type
     fn downcast_ref<M: 'static>(&self) -> Option<&M>;
-    
+
     /// Get a mutable reference to the message as a specific type
     fn downcast_mut<M: 'static>(&mut self) -> Option<&mut M>;
 }
@@ -36,14 +36,14 @@ impl MessageDowncast for BoxedMessage {
     fn downcast<M: 'static>(self) -> Result<M, ActorError> {
         match self.downcast::<M>() {
             Ok(boxed) => Ok(*boxed),
-            Err(original) => Err(ActorError::MessageHandlingError(
-                format!("Failed to downcast message: expected type {}, got {}",
-                        std::any::type_name::<M>(),
-                        std::any::type_name_of_val(&*original))
-            )),
+            Err(original) => Err(ActorError::MessageHandlingError(format!(
+                "Failed to downcast message: expected type {}, got {}",
+                std::any::type_name::<M>(),
+                std::any::type_name_of_val(&*original)
+            ))),
         }
     }
-    
+
     fn downcast_ref<M: 'static>(&self) -> Option<&M> {
         // Deref through the Box first: `self` is `&Box<dyn Any>`, and the
         // pointee (`dyn Any`) is what carries the concrete type. Calling
@@ -51,7 +51,7 @@ impl MessageDowncast for BoxedMessage {
         // reference itself is an `M` — always None.
         (**self).downcast_ref::<M>()
     }
-    
+
     fn downcast_mut<M: 'static>(&mut self) -> Option<&mut M> {
         (**self).downcast_mut::<M>()
     }
@@ -66,4 +66,4 @@ pub fn create_envelope<M: Message>(msg: M) -> MessageEnvelope {
         options: MessageOptions::default(),
         message_type: std::any::type_name::<M>(),
     }
-} 
+}

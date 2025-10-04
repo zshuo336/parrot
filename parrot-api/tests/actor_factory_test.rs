@@ -1,10 +1,7 @@
 use parrot_api::actor::{Actor, ActorConfig, ActorFactory, ActorState, EmptyConfig};
-use parrot_api::types::{BoxedMessage, ActorResult, BoxedFuture};
-use parrot_api::context::ActorContext;
-use std::time::Duration;
+use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::sync::Arc;
-use std::any::Any;
-use std::ptr::NonNull;
+use std::time::Duration;
 
 // Simple mock context for testing
 #[derive(Default)]
@@ -63,15 +60,6 @@ impl Actor for TestActor {
             // Return the original message
             Ok(msg)
         })
-    }
-
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _engine_ctx: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -157,15 +145,6 @@ impl Actor for EmptyConfigActor {
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move { Ok(msg) })
-    }
-
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _engine_ctx: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -271,7 +250,7 @@ mod tests {
     #[test]
     fn test_empty_config_actor_factory() {
         let factory = EmptyConfigActorFactory;
-        let config = EmptyConfig::default();
+        let config = EmptyConfig;
 
         let actor = factory.create(config);
 

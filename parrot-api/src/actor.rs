@@ -1,5 +1,5 @@
 //! # Actor Core API
-//! 
+//!
 //! This module defines the core Actor trait and related components that form the foundation of the Parrot actor system.
 //! The Actor trait provides the primary interface for implementing actors, defining their lifecycle, message handling,
 //! and stream processing capabilities.
@@ -21,7 +21,7 @@
 //! 4. Implement message handling logic
 //!
 //! ```rust
-//! use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
+//! use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 //! use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 //!
 //! struct MyActor {
@@ -42,26 +42,19 @@
 //!         Box::pin(async move { Ok(msg) })
 //!     }
 //!
-//!     fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-//!         None
-//!     }
-//!
 //!     fn state(&self) -> ActorState {
 //!         ActorState::Running
 //!     }
 //! }
 //! ```
+//!
 
-use std::any::Any;
-use std::future::Future;
-use std::ptr::NonNull;
-use crate::context::ActorContext;
-use crate::address::ActorRef;
 use crate::errors::ActorError;
-use crate::types::{BoxedMessage, BoxedFuture, ActorResult, BoxedActorRef};
-use crate::message::Message;
+use crate::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
+use std::any::Any;
+use std::ptr::NonNull;
 /// Actor lifecycle states that represent the current status of an actor in the system.
-/// 
+///
 /// The state transitions typically follow this order:
 /// 1. `Starting`: Initial state when actor is being created
 /// 2. `Running`: Normal operation state
@@ -80,14 +73,14 @@ pub enum ActorState {
 }
 
 /// Default empty configuration for actors that don't need any configuration.
-/// 
+///
 /// This type is provided as a convenience to avoid having to create an empty
 /// configuration type for every actor.
 #[derive(Debug, Default, Clone)]
 pub struct EmptyConfig;
 
 /// Configuration trait for actor initialization.
-/// 
+///
 /// Implement this trait to define custom configuration parameters for your actor.
 /// The configuration is passed to the actor during creation through the `ActorFactory`.
 pub trait ActorConfig: Send + Sync + 'static {}
@@ -96,12 +89,12 @@ pub trait ActorConfig: Send + Sync + 'static {}
 impl ActorConfig for EmptyConfig {}
 
 /// Factory trait for creating actor instances.
-/// 
+///
 /// This trait enables dependency injection and custom actor initialization.
 /// Implementations should create and return a new actor instance with the given configuration.
-/// 
+///
 /// # Type Parameters
-/// 
+///
 /// * `A` - The actor type this factory creates
 pub trait ActorFactory<A: Actor>: Send + 'static {
     /// Creates a new instance of the actor with the specified configuration
@@ -151,7 +144,8 @@ pub struct EngineContextHandle {
 
 impl std::fmt::Debug for EngineContextHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EngineContextHandle").finish_non_exhaustive()
+        f.debug_struct("EngineContextHandle")
+            .finish_non_exhaustive()
     }
 }
 
@@ -190,46 +184,43 @@ impl EngineContextHandle {
     }
 }
 
-
-
 /// Core trait that defines an actor's behavior and lifecycle.
-/// 
+///
 /// This trait is the foundation of the actor system, defining how actors:
 /// - Process messages
 /// - Handle streams
 /// - Manage lifecycle events
 /// - Interact with child actors
-/// 
+///
 /// # Type Parameters
-/// 
+///
 /// * `Config`: Configuration type for actor initialization
 /// * `Context`: Context type providing actor system services
-/// 
+///
 /// # Implementation Requirements
-/// 
+///
 /// Implementors must define:
 /// - Message handling logic in `receive_message`
 /// - State management through `state`
-/// 
+///
 /// Other methods have default implementations that can be overridden as needed.
 pub trait Actor: Send + 'static {
     /// Configuration type for actor initialization
     type Config: ActorConfig;
-    
+
     /// Context type providing access to actor system services
     type Context: ?Sized + Send;
 
-
     /// Initialize the actor with system resources and configuration.
-    /// 
+    ///
     /// Called once before the actor starts processing messages. Use this method to:
     /// - Set up initial state
     /// - Initialize resources
     /// - Register for system events
-    /// 
+    ///
     /// # Parameters
     /// * `ctx` - Mutable reference to actor context
-    /// 
+    ///
     /// # Returns
     /// `ActorResult<()>` indicating success or failure of initialization
     fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
@@ -237,53 +228,25 @@ pub trait Actor: Send + 'static {
     }
 
     /// Process an incoming message and produce a response.
-    /// 
+    ///
     /// This is the core message handling method that defines the actor's behavior.
     /// Implement this to:
     /// - Pattern match on message types
     /// - Update internal state
     /// - Produce responses
     /// - Interact with other actors
-    /// 
+    ///
     /// # Parameters
     /// * `msg` - Incoming message to process
     /// * `ctx` - Mutable reference to actor context
-    /// 
+    ///
     /// # Returns
     /// `ActorResult<BoxedMessage>` containing the response message or error
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
-
-    /// Process an incoming message and produce a response.
-    /// 
-    /// This is the engine fast-path handler (sync). Implement this to:
-    /// - Pattern match on message types
-    /// - Update internal state
-    /// 
-    /// # Parameters
-    /// * `msg` - Incoming message to process
-    /// * `ctx` - Mutable reference to actor context
-    /// * `engine_ctx` - Safe handle to the native engine context (e.g. the
-    ///   live actix `Context`). See [`EngineContextHandle`].
-    /// 
-    /// # Returns
-    /// `Option<ActorResult<BoxedMessage>>` — `Some(..)` fully handles the
-    /// message inline; `None` means "not handled" (engine-side fallback
-    /// semantics apply).
-    /// 
-    /// # Note
-    /// This method is only used on the engine side. The thread engine never
-    /// calls it; the Actix engine probes it first unless
-    /// [`use_async_handler`](Self::use_async_handler) is `true`.
-    /// 
-    /// # Engine Context
-    /// The handle wraps the native context pointer for the duration of this
-    /// call; use `downcast_ref` / `downcast_mut` to access engine resources
-    /// and services without any `unsafe` on the user side.
-    /// 
-    /// # Context
-    /// The context is a mutable reference to the parrot actor's context.
-    /// It is used to access the actor's resources and services.
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, ctx: &'a mut Self::Context, engine_ctx: EngineContextHandle) -> Option<ActorResult<BoxedMessage>>;
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
     /// Whether this actor wants its messages dispatched through the async
     /// [`receive_message`](Self::receive_message) path.
@@ -307,17 +270,21 @@ pub trait Actor: Send + 'static {
     }
 
     /// Handle an item from a stream.
-    /// 
+    ///
     /// Default implementation forwards to `receive_message`. Override to provide
     /// custom stream processing logic.
-    /// 
+    ///
     /// # Parameters
     /// * `item` - Stream item to process
     /// * `ctx` - Mutable reference to actor context
-    /// 
+    ///
     /// # Returns
     /// `ActorResult<BoxedMessage>` containing the processing result
-    fn handle_stream<'a>(&'a mut self, item: BoxedMessage, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn handle_stream<'a>(
+        &'a mut self,
+        item: BoxedMessage,
+        ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             // Forward the result from receive_message
             self.receive_message(item, ctx).await
@@ -325,69 +292,112 @@ pub trait Actor: Send + 'static {
     }
 
     /// Called when a stream starts.
-    /// 
+    ///
     /// Override to perform setup work for stream processing.
-    /// 
+    ///
     /// # Parameters
     /// * `ctx` - Mutable reference to actor context
-    fn stream_started<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn stream_started<'a>(
+        &'a mut self,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
     /// Called when a stream completes successfully.
-    /// 
+    ///
     /// Override to perform cleanup work after stream processing.
-    /// 
+    ///
     /// # Parameters
     /// * `ctx` - Mutable reference to actor context
-    fn stream_finished<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn stream_finished<'a>(
+        &'a mut self,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
     /// Called when a stream encounters an error.
-    /// 
+    ///
     /// Override to handle stream processing errors.
-    /// 
+    ///
     /// # Parameters
     /// * `err` - The error that occurred
     /// * `ctx` - Mutable reference to actor context
-    fn stream_error<'a>(&'a mut self, err: ActorError, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn stream_error<'a>(
+        &'a mut self,
+        err: ActorError,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move { Err(err) })
     }
 
     /// Perform cleanup before actor stops.
-    /// 
+    ///
     /// Override to:
     /// - Clean up resources
     /// - Save state
     /// - Notify other actors
-    /// 
+    ///
     /// # Parameters
     /// * `ctx` - Mutable reference to actor context
-    fn before_stop<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn before_stop<'a>(
+        &'a mut self,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
     /// Handle termination of a child actor.
-    /// 
+    ///
     /// Override to implement supervision strategies.
-    /// 
+    ///
     /// # Parameters
     /// * `child` - Reference to the terminated child actor
     /// * `ctx` - Mutable reference to actor context
-    fn handle_child_terminated<'a>(&'a mut self, _child: BoxedActorRef, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn handle_child_terminated<'a>(
+        &'a mut self,
+        _child: BoxedActorRef,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
     /// Get the current state of the actor.
-    /// 
+    ///
     /// This method should return the actor's current lifecycle state.
     /// Used by the system for:
     /// - Supervision
     /// - Resource management
     /// - Message routing
     fn state(&self) -> ActorState;
-} 
+}
+
+/// Actix 引擎侧扩展 trait：同步快路径（M6 从规范 `Actor` trait 移出）。
+///
+/// behaviour/runtime 二分原则：引擎特有的能力（actix 原生 Context 直访）
+/// 归引擎 crate 的扩展 trait；规范 trait 只留 `receive_message`。
+///
+/// trait 方法带默认体（`None` = 未处理）：只跑 thread 引擎的 actor 无需
+/// 实现本 trait；跑 actix 引擎的 actor 由适配层 bound 要求实现（derive
+/// 宏 `engine = "actix"` 分支自动生成，转发到用户的 `handle_message_engine`；
+/// 手写 actor 用空 impl `impl ActixEngineExt for X {}` 取默认值或自行覆盖）。
+///
+/// 注意：**故意不加 blanket impl**——stable Rust 无 specialization，
+/// blanket 会与 derive 生成的逐类型 impl 冲突（E0119）。
+pub trait ActixEngineExt: Actor {
+    /// 同步快路径：`Some(..)` 完全处理消息；`None` = 未处理
+    /// （引擎回退到 async `receive_message`）。
+    fn receive_message_with_engine<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        ctx: &'a mut Self::Context,
+        engine_ctx: EngineContextHandle,
+    ) -> Option<ActorResult<BoxedMessage>> {
+        let _ = (msg, ctx, engine_ctx);
+        None
+    }
+}
 
 #[cfg(test)]
 mod engine_context_handle_tests {
@@ -409,15 +419,24 @@ mod engine_context_handle_tests {
 
     #[test]
     fn downcast_ref_matches_type_and_value() {
-        let mut ctx = FakeEngineCtx { counter: 7, label: "arbiter-0".into() };
+        let mut ctx = FakeEngineCtx {
+            counter: 7,
+            label: "arbiter-0".into(),
+        };
         let h = mint(&mut ctx);
         assert_eq!(h.downcast_ref::<FakeEngineCtx>().unwrap().counter, 7);
-        assert_eq!(h.downcast_ref::<FakeEngineCtx>().unwrap().label, "arbiter-0");
+        assert_eq!(
+            h.downcast_ref::<FakeEngineCtx>().unwrap().label,
+            "arbiter-0"
+        );
     }
 
     #[test]
     fn downcast_ref_wrong_type_returns_none() {
-        let mut ctx = FakeEngineCtx { counter: 1, label: String::new() };
+        let mut ctx = FakeEngineCtx {
+            counter: 1,
+            label: String::new(),
+        };
         let h = mint(&mut ctx);
         assert!(h.downcast_ref::<u32>().is_none());
         assert!(h.downcast_ref::<String>().is_none());
@@ -427,7 +446,10 @@ mod engine_context_handle_tests {
 
     #[test]
     fn downcast_mut_allows_mutation_through_handle() {
-        let mut ctx = FakeEngineCtx { counter: 0, label: "a".into() };
+        let mut ctx = FakeEngineCtx {
+            counter: 0,
+            label: "a".into(),
+        };
         {
             let mut h = mint(&mut ctx);
             h.downcast_mut::<FakeEngineCtx>().unwrap().counter = 99;
@@ -439,7 +461,10 @@ mod engine_context_handle_tests {
 
     #[test]
     fn repeated_borrow_is_stable() {
-        let mut ctx = FakeEngineCtx { counter: 3, label: "x".into() };
+        let mut ctx = FakeEngineCtx {
+            counter: 3,
+            label: "x".into(),
+        };
         let h = mint(&mut ctx);
         for _ in 0..100 {
             assert_eq!(h.downcast_ref::<FakeEngineCtx>().unwrap().counter, 3);
@@ -448,7 +473,10 @@ mod engine_context_handle_tests {
 
     #[test]
     fn debug_impl_does_not_dereference() {
-        let mut ctx = FakeEngineCtx { counter: 0, label: String::new() };
+        let mut ctx = FakeEngineCtx {
+            counter: 0,
+            label: String::new(),
+        };
         let h = mint(&mut ctx);
         // Debug must not panic / must not require accessing the pointee's
         // internals through the raw pointer (finish_non_exhaustive).
@@ -493,15 +521,6 @@ mod engine_context_handle_tests {
             })
         }
 
-        fn receive_message_with_engine<'a>(
-            &'a mut self,
-            _msg: BoxedMessage,
-            _ctx: &'a mut Self::Context,
-            _engine_ctx: EngineContextHandle,
-        ) -> Option<ActorResult<BoxedMessage>> {
-            None
-        }
-
         fn state(&self) -> ActorState {
             ActorState::Running
         }
@@ -510,14 +529,20 @@ mod engine_context_handle_tests {
     #[tokio::test]
     async fn default_init_returns_ok() {
         let mut a = DefaultsOnlyActor { received: vec![] };
-        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext { registry: NoopStreamRegistry, spawner_impl: NoopSpawner });
+        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext {
+            registry: NoopStreamRegistry,
+            spawner_impl: NoopSpawner,
+        });
         assert!(a.init(ctx.as_mut()).await.is_ok());
     }
 
     #[tokio::test]
     async fn default_handle_stream_forwards_to_receive_message() {
         let mut a = DefaultsOnlyActor { received: vec![] };
-        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext { registry: NoopStreamRegistry, spawner_impl: NoopSpawner });
+        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext {
+            registry: NoopStreamRegistry,
+            spawner_impl: NoopSpawner,
+        });
         let r = a
             .handle_stream(Box::new(7u32), ctx.as_mut())
             .await
@@ -529,7 +554,10 @@ mod engine_context_handle_tests {
     #[tokio::test]
     async fn default_stream_lifecycle_hooks() {
         let mut a = DefaultsOnlyActor { received: vec![] };
-        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext { registry: NoopStreamRegistry, spawner_impl: NoopSpawner });
+        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext {
+            registry: NoopStreamRegistry,
+            spawner_impl: NoopSpawner,
+        });
         assert!(a.stream_started(ctx.as_mut()).await.is_ok());
         assert!(a.stream_finished(ctx.as_mut()).await.is_ok());
     }
@@ -537,7 +565,10 @@ mod engine_context_handle_tests {
     #[tokio::test]
     async fn default_stream_error_propagates_err() {
         let mut a = DefaultsOnlyActor { received: vec![] };
-        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext { registry: NoopStreamRegistry, spawner_impl: NoopSpawner });
+        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext {
+            registry: NoopStreamRegistry,
+            spawner_impl: NoopSpawner,
+        });
         let e = crate::errors::ActorError::MessageHandlingError("stream-err".into());
         let r = a.stream_error(e, ctx.as_mut()).await;
         assert!(r.is_err());
@@ -547,14 +578,20 @@ mod engine_context_handle_tests {
     #[tokio::test]
     async fn default_before_stop_returns_ok() {
         let mut a = DefaultsOnlyActor { received: vec![] };
-        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext { registry: NoopStreamRegistry, spawner_impl: NoopSpawner });
+        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext {
+            registry: NoopStreamRegistry,
+            spawner_impl: NoopSpawner,
+        });
         assert!(a.before_stop(ctx.as_mut()).await.is_ok());
     }
 
     #[tokio::test]
     async fn default_handle_child_terminated_returns_ok() {
         let mut a = DefaultsOnlyActor { received: vec![] };
-        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext { registry: NoopStreamRegistry, spawner_impl: NoopSpawner });
+        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext {
+            registry: NoopStreamRegistry,
+            spawner_impl: NoopSpawner,
+        });
         let dead: BoxedActorRef = Box::new(crate::address::DeadTargetRef);
         assert!(a.handle_child_terminated(dead, ctx.as_mut()).await.is_ok());
     }
@@ -594,7 +631,11 @@ mod engine_context_handle_tests {
             _actor: BoxedMessage,
             _config: BoxedMessage,
         ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
-            Box::pin(async { Err(crate::errors::ActorError::ActorNotFound("noop-spawner".into())) })
+            Box::pin(async {
+                Err(crate::errors::ActorError::ActorNotFound(
+                    "noop-spawner".into(),
+                ))
+            })
         }
 
         fn spawn_with_strategy<'a>(
@@ -603,7 +644,11 @@ mod engine_context_handle_tests {
             _config: BoxedMessage,
             _strategy: crate::supervisor::SupervisorStrategyType,
         ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
-            Box::pin(async { Err(crate::errors::ActorError::ActorNotFound("noop-spawner".into())) })
+            Box::pin(async {
+                Err(crate::errors::ActorError::ActorNotFound(
+                    "noop-spawner".into(),
+                ))
+            })
         }
     }
 
@@ -685,7 +730,11 @@ mod engine_context_handle_tests {
             None
         }
 
-        fn set_supervisor_strategy(&mut self, _strategy: crate::supervisor::SupervisorStrategyType) {}
+        fn set_supervisor_strategy(
+            &mut self,
+            _strategy: crate::supervisor::SupervisorStrategyType,
+        ) {
+        }
 
         fn path(&self) -> &crate::address::ActorPath {
             static NOOP_PATH: std::sync::OnceLock<crate::address::ActorPath> =
@@ -706,21 +755,29 @@ mod engine_context_handle_tests {
     /// exercised (context plumbing behind the trait defaults).
     #[tokio::test]
     async fn noop_context_full_surface() {
-        use crate::stream::StreamRegistry as _;
         use crate::context::ActorSpawner as _;
-        let mut ctx: Box<dyn crate::context::ActorContext> =
-            Box::new(NoopContext { registry: NoopStreamRegistry, spawner_impl: NoopSpawner });
+        use crate::stream::StreamRegistry as _;
+        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext {
+            registry: NoopStreamRegistry,
+            spawner_impl: NoopSpawner,
+        });
         let dead: BoxedActorRef = Box::new(crate::address::DeadTargetRef);
 
         assert!(ctx.send(dead.clone_boxed(), Box::new(1u32)).await.is_ok());
         assert!(ctx.ask(dead.clone_boxed(), Box::new(1u32)).await.is_err());
         assert!(ctx
-            .schedule_once(dead.clone_boxed(), Box::new(1u32), std::time::Duration::from_millis(1))
+            .schedule_once(
+                dead.clone_boxed(),
+                Box::new(1u32),
+                std::time::Duration::from_millis(1)
+            )
             .await
             .is_ok());
         #[derive(Clone)]
-        struct PeriodicTick(u32);
-        impl crate::message::Message for PeriodicTick { type Result = (); }
+        struct PeriodicTick(#[allow(dead_code)] u32);
+        impl crate::message::Message for PeriodicTick {
+            type Result = ();
+        }
         assert!(ctx
             .schedule_periodic(
                 dead.clone_boxed(),
@@ -754,7 +811,9 @@ mod engine_context_handle_tests {
         assert!(reg.add_stream_erased(empty).is_ok());
         let empty2: Box<dyn futures::Stream<Item = Box<dyn std::any::Any + Send>> + Send> =
             Box::new(futures::stream::empty());
-        assert!(reg.add_stream_with_handler_erased(empty2, Box::new(())).is_ok());
+        assert!(reg
+            .add_stream_with_handler_erased(empty2, Box::new(()))
+            .is_ok());
 
         let sp = NoopSpawner;
         let r = sp.spawn(Box::new(0u32), Box::new(0u32)).await;
@@ -774,21 +833,29 @@ mod engine_context_handle_tests {
     #[tokio::test]
     async fn defaults_only_actor_dispatch_arms() {
         let mut a = DefaultsOnlyActor { received: vec![] };
-        let mut ctx: Box<dyn crate::context::ActorContext> =
-            Box::new(NoopContext { registry: NoopStreamRegistry, spawner_impl: NoopSpawner });
+        let mut ctx: Box<dyn crate::context::ActorContext> = Box::new(NoopContext {
+            registry: NoopStreamRegistry,
+            spawner_impl: NoopSpawner,
+        });
 
         // receive_message: known type recorded, unknown passes through.
-        let r = a.receive_message(Box::new(5u32), ctx.as_mut()).await.unwrap();
+        let r = a
+            .receive_message(Box::new(5u32), ctx.as_mut())
+            .await
+            .unwrap();
         assert_eq!(*r.downcast::<u32>().unwrap(), 5);
-        let r = a.receive_message(Box::new("str"), ctx.as_mut()).await.unwrap();
+        let r = a
+            .receive_message(Box::new("str"), ctx.as_mut())
+            .await
+            .unwrap();
         assert!(r.downcast::<&str>().is_ok());
         assert_eq!(a.received, vec![5]);
 
-        // receive_message_with_engine default contract: None.
-        let data = 1u32;
-        let raw: std::ptr::NonNull<dyn std::any::Any> = std::ptr::NonNull::from(&data);
-        let h = unsafe { EngineContextHandle::from_raw(raw) };
-        assert!(a.receive_message_with_engine(Box::new(5u32), ctx.as_mut(), h).is_none());
+        // M6: `receive_message_with_engine` 已从规范 `Actor` trait 移出，
+        // 归 `ActixEngineExt` 扩展 trait。DefaultsOnlyActor 未实现该扩展，
+        // 其默认契约（None）由扩展 trait 的默认方法体覆盖（见
+        // engine.rs / actix 适配层测试）。此处验证规范面只剩
+        // `receive_message` 派发。
 
         // get_self_ref goes through the NoopContext path once.
         let _ = ctx.get_self_ref();

@@ -1,11 +1,14 @@
 use async_trait::async_trait;
-use ringbuf::{HeapRb, traits::{Observer, Split, Consumer, Producer}};
 use parrot_api::address::ActorPath;
 use parrot_api::types::BoxedMessage;
+use ringbuf::{
+    HeapRb,
+    traits::{Consumer, Observer, Producer, Split},
+};
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use crate::thread::config::BackpressureStrategy;
@@ -108,7 +111,11 @@ impl SpscRingbufMailbox {
 
 #[async_trait]
 impl Mailbox for SpscRingbufMailbox {
-    async fn push(&self, msg: BoxedMessage, strategy: BackpressureStrategy) -> Result<(), MailboxError> {
+    async fn push(
+        &self,
+        msg: BoxedMessage,
+        strategy: BackpressureStrategy,
+    ) -> Result<(), MailboxError> {
         if self.closed() {
             return Err(MailboxError::Closed);
         }
@@ -126,9 +133,11 @@ impl Mailbox for SpscRingbufMailbox {
                         self.notify_ready();
                         Ok(())
                     }
-                    Err(()) => Err(MailboxError::PushError("Failed to push message (ringbuf error)".to_string())),
+                    Err(()) => Err(MailboxError::PushError(
+                        "Failed to push message (ringbuf error)".to_string(),
+                    )),
                 }
-            },
+            }
             BackpressureStrategy::Block => {
                 if producer.is_full() {
                     drop(producer);
@@ -146,13 +155,20 @@ impl Mailbox for SpscRingbufMailbox {
                                     self.notify_ready();
                                     return Ok(());
                                 }
-                                Err(()) => return Err(MailboxError::PushError("Failed to push message (ringbuf error)".to_string())),
+                                Err(()) => {
+                                    return Err(MailboxError::PushError(
+                                        "Failed to push message (ringbuf error)".to_string(),
+                                    ));
+                                }
                             }
                         }
                         drop(p);
                         attempts += 1;
                     }
-                    Err(MailboxError::PushError("Failed to push message after multiple attempts (ringbuf error)".to_string()))
+                    Err(MailboxError::PushError(
+                        "Failed to push message after multiple attempts (ringbuf error)"
+                            .to_string(),
+                    ))
                 } else {
                     match Self::try_push_msg(&mut producer, msg) {
                         Ok(()) => {
@@ -160,13 +176,17 @@ impl Mailbox for SpscRingbufMailbox {
                             self.notify_ready();
                             Ok(())
                         }
-                        Err(()) => Err(MailboxError::PushError("Failed to push message (ringbuf error)".to_string())),
+                        Err(()) => Err(MailboxError::PushError(
+                            "Failed to push message (ringbuf error)".to_string(),
+                        )),
                     }
                 }
-            },
+            }
             BackpressureStrategy::Error => {
                 if producer.is_full() {
-                    return Err(MailboxError::Full { capacity: self.capacity });
+                    return Err(MailboxError::Full {
+                        capacity: self.capacity,
+                    });
                 }
                 match Self::try_push_msg(&mut producer, msg) {
                     Ok(()) => {
@@ -174,9 +194,11 @@ impl Mailbox for SpscRingbufMailbox {
                         self.notify_ready();
                         Ok(())
                     }
-                    Err(()) => Err(MailboxError::PushError("Failed to push message (ringbuf error)".to_string())),
+                    Err(()) => Err(MailboxError::PushError(
+                        "Failed to push message (ringbuf error)".to_string(),
+                    )),
                 }
-            },
+            }
             BackpressureStrategy::DropOldest => {
                 if producer.is_full() {
                     drop(producer);
@@ -193,7 +215,10 @@ impl Mailbox for SpscRingbufMailbox {
                             self.notify_ready();
                             Ok(())
                         }
-                        Err(()) => Err(MailboxError::PushError("Failed to push message after dropping oldest (ringbuf error)".to_string())),
+                        Err(()) => Err(MailboxError::PushError(
+                            "Failed to push message after dropping oldest (ringbuf error)"
+                                .to_string(),
+                        )),
                     }
                 } else {
                     match Self::try_push_msg(&mut producer, msg) {
@@ -202,10 +227,12 @@ impl Mailbox for SpscRingbufMailbox {
                             self.notify_ready();
                             Ok(())
                         }
-                        Err(()) => Err(MailboxError::PushError("Failed to push message (ringbuf error)".to_string())),
+                        Err(()) => Err(MailboxError::PushError(
+                            "Failed to push message (ringbuf error)".to_string(),
+                        )),
                     }
                 }
-            },
+            }
         }
     }
 
@@ -218,7 +245,7 @@ impl Mailbox for SpscRingbufMailbox {
             Some(msg) => {
                 self.decrement_count();
                 Some(msg)
-            },
+            }
             None => None,
         }
     }
@@ -246,7 +273,7 @@ impl Mailbox for SpscRingbufMailbox {
     async fn close(&self) {
         self.is_closed.store(true, Ordering::SeqCst);
         let mut consumer = self.consumer.lock().await;
-        while let Some(_) = consumer.try_pop() {
+        while consumer.try_pop().is_some() {
             self.decrement_count();
         }
         drop(consumer);
@@ -308,12 +335,18 @@ mod tests {
 
     #[async_trait]
     impl ActorRef for MockActorRef {
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> { Box::pin(async { Ok(()) }) }
+        fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
         fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async move { Ok(msg) })
         }
 
-        fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn send_with_timeout<'a>(
+            &'a self,
+            msg: BoxedMessage,
+            _timeout_duration: Option<Duration>,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async move { Ok(msg) })
         }
 
@@ -354,7 +387,10 @@ mod tests {
         let mailbox = SpscRingbufMailbox::new(10, path);
 
         let msg = Box::new("Hello, World!") as BoxedMessage;
-        mailbox.push(msg, BackpressureStrategy::Block).await.unwrap();
+        mailbox
+            .push(msg, BackpressureStrategy::Block)
+            .await
+            .unwrap();
 
         assert_eq!(mailbox.len().await, 1);
 
@@ -374,7 +410,10 @@ mod tests {
         let mailbox = SpscRingbufMailbox::new(1, path);
 
         let msg1 = Box::new("First message") as BoxedMessage;
-        mailbox.push(msg1, BackpressureStrategy::Block).await.unwrap();
+        mailbox
+            .push(msg1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
 
         let msg2 = Box::new("Second message") as BoxedMessage;
         let result = mailbox.push(msg2, BackpressureStrategy::DropNewest).await;
@@ -393,7 +432,10 @@ mod tests {
         let mailbox = SpscRingbufMailbox::new(1, path);
 
         let msg1 = Box::new("First message") as BoxedMessage;
-        mailbox.push(msg1, BackpressureStrategy::Block).await.unwrap();
+        mailbox
+            .push(msg1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
 
         let msg2 = Box::new("Second message") as BoxedMessage;
         let result = mailbox.push(msg2, BackpressureStrategy::Error).await;
@@ -407,7 +449,10 @@ mod tests {
         let mailbox = SpscRingbufMailbox::new(1, path);
 
         let msg1 = Box::new("First message") as BoxedMessage;
-        mailbox.push(msg1, BackpressureStrategy::Block).await.unwrap();
+        mailbox
+            .push(msg1, BackpressureStrategy::Block)
+            .await
+            .unwrap();
 
         let msg2 = Box::new("Second message") as BoxedMessage;
         let result = mailbox.push(msg2, BackpressureStrategy::DropOldest).await;
@@ -426,7 +471,10 @@ mod tests {
 
         for i in 0..5 {
             let msg = Box::new(format!("Message {}", i)) as BoxedMessage;
-            mailbox.push(msg, BackpressureStrategy::Block).await.unwrap();
+            mailbox
+                .push(msg, BackpressureStrategy::Block)
+                .await
+                .unwrap();
         }
 
         mailbox.close().await;

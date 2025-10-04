@@ -4,20 +4,20 @@
 
 mod engine_stress_common;
 
-use engine_stress_common::*;
 use anyhow::anyhow;
+use engine_stress_common::*;
 use parrot::system::ParrotActorSystem;
 use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::address::{ActorPath, ActorRef, ActorRefExt};
+use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
 use parrot_api::system::ActorSystemConfig;
-use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
-use std::sync::atomic::{AtomicU64, Ordering};
+use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -32,7 +32,11 @@ pub struct BenchActor {
 
 impl BenchActor {
     pub fn new(ops: Arc<AtomicU64>, cpu_sink: Arc<AtomicU64>) -> Self {
-        Self { ops, cpu_sink, messages: Arc::new(AtomicU64::new(0)) }
+        Self {
+            ops,
+            cpu_sink,
+            messages: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -52,15 +56,6 @@ impl Actor for BenchActor {
         // Thread 引擎通过 AskEnvelope/tell 走 receive_message；复用同一 dispatch 逻辑
         let res = dispatch_bench_message(self, msg);
         Box::pin(async move { res })
-    }
-
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        _engine: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        Some(dispatch_bench_message(self, msg))
     }
 
     fn state(&self) -> ActorState {
@@ -130,6 +125,7 @@ fn dispatch_bench_message(actor: &mut BenchActor, msg: BoxedMessage) -> ActorRes
 // Message impls
 
 // 让同步结果变成 future 的小助手
+#[allow(dead_code)] // bench 辅助 trait
 trait FutExt {
     fn fut(self) -> BoxedFuture<'static, ActorResult<BoxedMessage>>;
 }
@@ -143,55 +139,73 @@ impl FutExt for ActorResult<BoxedMessage> {
 impl Message for CpuTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for IoTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for LongRunningTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for Echo {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for GetCount {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for MinuteCpuTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for MediumCpuTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for TinyTask {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 impl Message for BatchEcho {
     type Result = u64;
     fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
-        r.downcast::<u64>().map(|b| *b).map_err(|_| ActorError::MessageHandlingError("type".into()))
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| ActorError::MessageHandlingError("type".into()))
     }
 }
 
@@ -202,19 +216,29 @@ impl Message for BatchEcho {
 async fn setup() -> anyhow::Result<(ParrotActorSystem, Arc<ThreadActorSystem>)> {
     let parrot = ParrotActorSystem::new(ActorSystemConfig::default()).await?;
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
-    parrot.register_thread_system("bench-thread".into(), ts.clone(), true).await?;
+    parrot
+        .register_thread_system("bench-thread".into(), ts.clone(), true)
+        .await?;
     Ok((parrot, ts))
 }
 
-async fn spawn_actor(ts: &Arc<ThreadActorSystem>, path: &str, ops: Arc<AtomicU64>, cpu_sink: Arc<AtomicU64>) -> Box<dyn ActorRef> {
+async fn spawn_actor(
+    ts: &Arc<ThreadActorSystem>,
+    path: &str,
+    ops: Arc<AtomicU64>,
+    cpu_sink: Arc<AtomicU64>,
+) -> Box<dyn ActorRef> {
     let r = ts
-        .spawn_at::<BenchActor>(BenchActor::new(ops, cpu_sink), path, None, ThreadActorConfig::default())
+        .spawn_at::<BenchActor>(
+            BenchActor::new(ops, cpu_sink),
+            path,
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .expect("spawn ok");
     Box::new(r)
 }
-
-use futures::FutureExt;
 
 // ---------------------------------------------------------------------------
 // 基准测量函数
@@ -245,7 +269,7 @@ async fn bench_sequential_ask(
         latencies: latency_stats(samples),
         correctness: true,
         cpu_work_secs: None,
-                note: String::new(),
+        note: String::new(),
     });
     let _ = msg;
     Ok(())
@@ -268,7 +292,11 @@ async fn bench_concurrent_ask(
             let mut local = Vec::with_capacity(per_task as usize);
             for i in 0..per_task {
                 let t0 = Instant::now();
-                let r = ar.ask(Echo { value: i + c as u64 }).await?;
+                let r = ar
+                    .ask(Echo {
+                        value: i + c as u64,
+                    })
+                    .await?;
                 assert_eq!(r, i + c as u64);
                 local.push(t0.elapsed().as_micros());
             }
@@ -291,7 +319,7 @@ async fn bench_concurrent_ask(
         latencies: latency_stats(samples),
         correctness: correct,
         cpu_work_secs: None,
-                note: format!("concurrency={}", concurrency),
+        note: format!("concurrency={}", concurrency),
     });
     Ok(())
 }
@@ -309,7 +337,9 @@ async fn bench_tell_throughput(
     let actor = ts.get_actor_ref(path).expect("actor exists");
     let start = Instant::now();
     for i in 0..n {
-        actor.send(Box::new(Echo { value: i }) as BoxedMessage).await?;
+        actor
+            .send(Box::new(Echo { value: i }) as BoxedMessage)
+            .await?;
     }
     // 等 drain
     let ok = wait_until(
@@ -327,7 +357,11 @@ async fn bench_tell_throughput(
         latencies: latency_stats(vec![]),
         correctness: ok,
         cpu_work_secs: None,
-                note: if ok { String::new() } else { "DRAIN TIMEOUT".into() },
+        note: if ok {
+            String::new()
+        } else {
+            "DRAIN TIMEOUT".into()
+        },
     });
     Ok(())
 }
@@ -341,6 +375,7 @@ async fn bench_tell_throughput(
 //   cargo test -p parrot --release -- --ignored --nocapture   # 只跑压测
 #[test]
 #[ignore]
+#[allow(non_local_definitions)] // bench 场景内聚：类型与 impl 同点定义
 fn thread_engine_full_suite() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
@@ -599,7 +634,7 @@ fn thread_engine_full_suite() {
             let ab = spawn_actor(&ts, "/bench/starve-b", ops_b.clone(), cpu_sink.clone()).await;
 
             let stop = Arc::new(AtomicU64::new(0));
-            let t_origin = Instant::now();
+            let _t_origin = Instant::now();
             let t_origin = Instant::now();
             let samples = Arc::new(std::sync::Mutex::new(Vec::<(u128, u128)>::new())); // (elapsed_ms, lat_us) // (elapsed_ms, lat_us)
             let ticker = {
@@ -715,9 +750,6 @@ fn thread_engine_full_suite() {
                         done.fetch_add(1, Ordering::Relaxed);
                         Ok(msg)
                     })
-                }
-                fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-                    None
                 }
                 fn state(&self) -> ActorState { ActorState::Running }
             }
@@ -978,9 +1010,6 @@ fn thread_engine_full_suite() {
                         Ok(Box::new(acc) as BoxedMessage)
                     })
                 }
-                fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _e: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-                    None
-                }
                 fn state(&self) -> ActorState { ActorState::Running }
             }
             impl Message for ChunkedLongTask {
@@ -991,7 +1020,7 @@ fn thread_engine_full_suite() {
             }
 
             let chunked = ts.spawn_at::<ChunkActor>(ChunkActor, "/bench/m3/chunked", None, ThreadActorConfig::default()).await.unwrap();
-            let chunked2 = ts.spawn_at::<ChunkActor>(ChunkActor, "/bench/m3/chunked2", None, ThreadActorConfig::default()).await.unwrap();
+            let _chunked2 = ts.spawn_at::<ChunkActor>(ChunkActor, "/bench/m3/chunked2", None, ThreadActorConfig::default()).await.unwrap();
             let solid = spawn_actor(&ts, "/bench/m3/solid", Arc::new(AtomicU64::new(0)), cpu_sink.clone()).await;
 
             // 对每个变体：发长任务（纯入队），随后立刻发 tiny ask（长超时）——
@@ -1080,7 +1109,7 @@ fn thread_engine_full_suite() {
                 let va = pa.ask(Echo { value: i }).await?;
                 let vb = pb.ask(Echo { value: va }).await?;
                 assert_eq!(vb, i);
-                if i % 10 == 0 { samples.push(t0.elapsed().as_micros()); }
+                if i.is_multiple_of(10) { samples.push(t0.elapsed().as_micros()); }
                 i += 1;
             }
             report.push(BenchResult {
@@ -1132,6 +1161,7 @@ fn thread_engine_full_suite() {
         {
             const PRODUCERS: usize = 8;
             const PER_PRODUCER: u64 = 5_000;   // 每个 5000 条
+            #[allow(dead_code)]
             const CONSUMER_WORK_US: u64 = 200; // 每条 ~200µs 处理
 
             let iters_per_msg: u64 = 170_000; // ~200µs 实测标定

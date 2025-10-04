@@ -1,23 +1,21 @@
 use std::sync::Arc;
-use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, error};
-use anyhow;
 
 use parrot_api::actor::Actor;
 use parrot_api::errors::ActorError;
-use parrot_api::types::{BoxedMessage, ActorResult, BoxedActorRef};
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedMessage};
 
 use crate::thread::actor::ThreadActor;
+use crate::thread::config::ThreadActorConfig;
 use crate::thread::context::ThreadContext;
-use crate::thread::mailbox::Mailbox;
 use crate::thread::envelope::ControlMessage;
 use crate::thread::error::SystemError;
-use crate::thread::config::ThreadActorConfig;
+use crate::thread::mailbox::Mailbox;
 
+use std::any::Any;
 use std::panic;
 use std::panic::AssertUnwindSafe;
-use std::any::Any;
 use tokio::sync::Mutex as AsyncMutex;
 
 /// Processor status
@@ -91,7 +89,9 @@ pub trait ProcessorInterface: ProcessorStatsTrait + Any + Send + Sync + 'static 
     fn is_initialized(&self) -> bool;
 
     /// Initialize the actor and transition it to Running state.
-    fn initialize_and_start_erased(self: Arc<Self>) -> BoxedProcessorFuture<Result<(), SystemError>>;
+    fn initialize_and_start_erased(
+        self: Arc<Self>,
+    ) -> BoxedProcessorFuture<Result<(), SystemError>>;
 
     /// Stop the actor gracefully.
     fn stop_erased(self: Arc<Self>) -> BoxedProcessorFuture<Result<(), SystemError>>;
@@ -108,6 +108,20 @@ pub trait ProcessorInterface: ProcessorStatsTrait + Any + Send + Sync + 'static 
     fn as_any(self: Arc<Self>) -> Arc<dyn Any>;
     fn as_any_ref(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// M2 reduction accounting: consecutive messages processed since the
+    /// last empty-mailbox drain. Workers consult this for fairness yields.
+    fn consecutive_reductions(&self) -> usize {
+        0
+    }
+
+    /// M2: reset the reduction budget after a fairness yield (BEAM
+    /// semantics: yield once, then full budget again).
+    fn reset_reduction_budget(&self) {}
+
+    /// M3 supervision: notify the owning system this actor panicked
+    /// (detached; never blocks the worker loop). Default: no-op.
+    fn notify_system_panic(&self, _panic_msg: String) {}
 }
 
 /// Boxed future used by [`ProcessorInterface`].
@@ -115,6 +129,7 @@ pub type BoxedProcessorFuture<T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
 
 /// Result type for actor execution: either unit or a boxed reply payload.
+#[allow(dead_code)] // M2 reduction 记账重构后保留形状
 pub type ActorExecutionResult = ActorResult<BoxedMessage>;
 
 /// Actor processor, responsible for managing an Actor's resources and message processing.
@@ -143,6 +158,12 @@ where
 
     /// Processor stats
     stats: Arc<ProcessorStats>,
+
+    /// M2 reduction accounting: messages processed since this actor last
+    /// yielded the worker *without* an empty mailbox (i.e. consecutive
+    /// monopolization count). Used to force a fairness yield so one slow
+    /// actor with a permanent backlog cannot starve others.
+    consecutive_reductions: AtomicUsize,
 }
 
 impl<A> ActorProcessor<A>
@@ -163,6 +184,7 @@ where
             config,
             status: Arc::new(AtomicUsize::new(ProcessorStatus::Initializing as usize)),
             stats: Arc::new(ProcessorStats::new()),
+            consecutive_reductions: AtomicUsize::new(0),
         }
     }
 
@@ -173,7 +195,8 @@ where
         let mut context = self.context.lock().await;
         if let Err(e) = actor.initialize(&mut context).await {
             error!("Failed to initialize actor at {}: {}", self.path, e);
-            self.status.store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
+            self.status
+                .store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
             self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
             return Err(SystemError::ActorCreationError(format!(
                 "Failed to initialize actor at {}: {}",
@@ -191,14 +214,16 @@ where
         let mut context = self.context.lock().await;
         if let Err(e) = actor.process_message(start_msg, &mut context).await {
             error!("Failed to start actor at {}: {}", self.path, e);
-            self.status.store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
+            self.status
+                .store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
             self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
             return Err(SystemError::ActorCreationError(format!(
                 "Failed to start actor at {}: {}",
                 self.path, e
             )));
         }
-        self.status.store(ProcessorStatus::Running as usize, Ordering::SeqCst);
+        self.status
+            .store(ProcessorStatus::Running as usize, Ordering::SeqCst);
         Ok(())
     }
 
@@ -213,14 +238,16 @@ where
         let mut context = self.context.lock().await;
         if let Err(e) = actor.process_message(stop_msg, &mut context).await {
             error!("Failed to stop actor at {}: {}", self.path, e);
-            self.status.store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
+            self.status
+                .store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
             self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
             return Err(SystemError::ShutdownError(format!(
                 "Failed to stop actor at {}: {}",
                 self.path, e
             )));
         }
-        self.status.store(ProcessorStatus::Stopped as usize, Ordering::SeqCst);
+        self.status
+            .store(ProcessorStatus::Stopped as usize, Ordering::SeqCst);
         Ok(())
     }
 
@@ -231,7 +258,10 @@ where
     }
 
     /// Process a single message with the actor under panic isolation.
-    async fn process_message(&self, msg: BoxedMessage) -> ActorResult<()> {
+    ///
+    /// M5: returns the actor's reply payload (previously discarded; the
+    /// by-value ask path needs it to fill the inline reply channel).
+    async fn process_message(&self, msg: BoxedMessage) -> ActorResult<BoxedMessage> {
         if self.get_status() != ProcessorStatus::Running {
             return Err(ActorError::MessageHandlingError(format!(
                 "Actor at {} is not running, current status: {:?}",
@@ -280,7 +310,7 @@ where
 
         self.stats.messages_processed.fetch_add(1, Ordering::SeqCst);
         match awaited {
-            Ok(_) => Ok(()),
+            Ok(reply) => Ok(reply),
             Err(e) => {
                 self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
                 error!("Error processing message for actor {}: {}", self.path, e);
@@ -309,34 +339,130 @@ where
 
         let mut processed = 0usize;
         let mut error_count = 0usize;
+        // M2 reduction budget (BEAM-style, batch adaptation):
+        //
+        // The actor accumulates `consecutive_reductions` across runs while
+        // its mailbox never drains. When the count crosses the threshold,
+        // this run is *truncated* (single message) and the counter RESETS —
+        // exactly POC beam-sched semantics (`if reductions >= budget {
+        // preemption; reductions = 0 }`): yield once, then full budget
+        // again.
+        //
+        // IMPORTANT: the counter is only *read* here as a hint. The actual
+        // truncation decision belongs to the worker (see worker.rs): a
+        // fairness yield only helps when OTHER mailboxes are waiting, so
+        // the worker checks `scheduling_queue.len() > 1` before honoring
+        // the budget yield. This keeps single-actor pipelines at full
+        // throughput (no self-yield churn) while protecting multi-actor
+        // fairness.
+        let effective_max = max_messages;
+        let budget_exhausted_hint = {
+            const YIELD_THRESHOLD_MULTIPLIER: usize = 4;
+            let consecutive = self.consecutive_reductions.load(Ordering::Relaxed);
+            let threshold = max_messages
+                .saturating_mul(YIELD_THRESHOLD_MULTIPLIER)
+                .max(max_messages);
+            consecutive >= threshold
+        };
+        let _ = budget_exhausted_hint; // worker consults consecutive_reductions() directly
 
-        for _ in 0..max_messages {
+        for _ in 0..effective_max {
             if self.get_status() != ProcessorStatus::Running {
                 break;
             }
 
-            match mailbox.pop().await {
-                Some(msg) => match self.process_message(msg).await {
-                    Ok(_) => {
-                        processed += 1;
-                        if yield_after_each_message {
-                            tokio::task::yield_now().await;
+            // M5: pop the internal item — ask envelopes arrive by value
+            // (single-block path, no envelope boxing in transit).
+            let item = mailbox.pop_item().await;
+            match item {
+                Some(crate::thread::mailbox::MailboxItem::Ask(mut envelope)) => {
+                    // AskEnvelope：拆出载荷与回复通道，按历史语义处理。
+                    // M5 按值路径：回复通道由本层直接回填（不经
+                    // ThreadActor::handle_ask_envelope 的装箱往返）。
+                    let reply = envelope.take_reply();
+                    let payload = std::mem::replace(
+                        &mut envelope.payload,
+                        crate::thread::envelope::AskPayload::Boxed(Box::new(())),
+                    );
+                    let msg = payload.into_boxed();
+                    let outcome = self.process_message(msg).await;
+                    processed += 1;
+                    match outcome {
+                        Ok(resp) => {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Ok(resp));
+                            }
+                            self.consecutive_reductions.fetch_add(1, Ordering::Relaxed);
+                            if yield_after_each_message {
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                        Err(e) => {
+                            let is_panic = matches!(e, ActorError::Panic(_));
+                            let repr = e.to_string();
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(e));
+                            }
+                            error_count += 1;
+                            if is_panic {
+                                return Err(SystemError::WorkerStateError(repr));
+                            }
                         }
                     }
-                    Err(e) => {
-                        processed += 1;
-                        error_count += 1;
-                        // A panic aborts the batch and is reported to the scheduler.
-                        if matches!(e, ActorError::Panic(_)) {
-                            return Err(SystemError::WorkerStateError(e.to_string()));
+                }
+                Some(crate::thread::mailbox::MailboxItem::Plain(msg)) => {
+                    match self.process_message(msg).await {
+                        Ok(_) => {
+                            processed += 1;
+                            self.consecutive_reductions.fetch_add(1, Ordering::Relaxed);
+                            if yield_after_each_message {
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                        Err(e) => {
+                            processed += 1;
+                            error_count += 1;
+                            // A panic aborts the batch and is reported to the scheduler.
+                            if matches!(e, ActorError::Panic(_)) {
+                                return Err(SystemError::WorkerStateError(e.to_string()));
+                            }
                         }
                     }
-                },
+                }
                 None => break, // mailbox drained
             }
         }
 
+        // M2: if the mailbox drained (no backlog left), the monopolization
+        // streak ends — reset consecutive accounting. A backlog (worker
+        // will re-queue) keeps the streak alive for the fairness yield.
+        if mailbox.is_empty().await {
+            self.consecutive_reductions.store(0, Ordering::Relaxed);
+        }
+
         Ok((processed, error_count))
+    }
+
+    /// M3: consecutive reduction count (messages processed since the last
+    /// empty-mailbox drain). Exposed for worker-side fairness decisions
+    /// and metrics.
+    pub fn consecutive_reductions(&self) -> usize {
+        self.consecutive_reductions.load(Ordering::Relaxed)
+    }
+
+    /// M3 supervision hook: notify the owning system that this actor
+    /// panicked. Called by the worker after a caught panic; the supervision
+    /// executor (restart / stop / escalate) runs detached on the system
+    /// runtime so the worker loop never blocks on the decision.
+    pub(crate) fn notify_system_panic(&self, panic_msg: String) {
+        let weak = self
+            .context
+            .try_lock()
+            .ok()
+            .map(|guard| guard.system_weak_ref());
+        if let Some(system) = weak.and_then(|w| w.upgrade()) {
+            system.runtime_spawn_supervision(self.path.clone(), panic_msg);
+        }
     }
 
     /// Pause the processor
@@ -404,7 +530,9 @@ where
         status != ProcessorStatus::Initializing && status != ProcessorStatus::Failed
     }
 
-    fn initialize_and_start_erased(self: Arc<Self>) -> BoxedProcessorFuture<Result<(), SystemError>> {
+    fn initialize_and_start_erased(
+        self: Arc<Self>,
+    ) -> BoxedProcessorFuture<Result<(), SystemError>> {
         Box::pin(async move { this_initialize_and_start(self).await })
     }
 
@@ -434,12 +562,22 @@ where
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+
+    fn consecutive_reductions(&self) -> usize {
+        ActorProcessor::consecutive_reductions(self)
+    }
+
+    fn reset_reduction_budget(&self) {
+        self.consecutive_reductions.store(0, Ordering::Relaxed);
+    }
+
+    fn notify_system_panic(&self, panic_msg: String) {
+        ActorProcessor::notify_system_panic(self, panic_msg)
+    }
 }
 
 /// Free functions used by the erased trait implementations.
-async fn this_initialize_and_start<A>(
-    this: Arc<ActorProcessor<A>>,
-) -> Result<(), SystemError>
+async fn this_initialize_and_start<A>(this: Arc<ActorProcessor<A>>) -> Result<(), SystemError>
 where
     A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
@@ -469,11 +607,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thread::context::ThreadContext;
-    use crate::thread::mailbox::mpsc::MpscMailbox;
     use crate::thread::actor::ThreadActor;
     use crate::thread::config::ThreadActorConfig;
+    use crate::thread::context::ThreadContext;
     use crate::thread::error::SystemError;
+    use crate::thread::mailbox::mpsc::MpscMailbox;
     use parrot_api::actor::{Actor, ActorState, EmptyConfig};
     use parrot_api::address::ActorPath;
     use parrot_api::types::BoxedFuture;
@@ -490,10 +628,7 @@ mod tests {
         type Config = EmptyConfig;
         type Context = ThreadContext<Self>;
 
-        fn init<'a>(
-            &'a mut self,
-            _ctx: &'a mut Self::Context,
-        ) -> BoxedFuture<'a, ActorResult<()>> {
+        fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -507,20 +642,15 @@ mod tests {
                     self.count += *v;
                     return Ok(Box::new(self.count) as BoxedMessage);
                 }
-                if msg.downcast_ref::<&str>().map(|s| *s == "boom").unwrap_or(false) {
+                if msg
+                    .downcast_ref::<&str>()
+                    .map(|s| *s == "boom")
+                    .unwrap_or(false)
+                {
                     panic!("boom requested");
                 }
                 Ok(msg)
             })
-        }
-
-        fn receive_message_with_engine<'a>(
-            &'a mut self,
-            _msg: BoxedMessage,
-            _ctx: &'a mut Self::Context,
-            _engine_ctx: parrot_api::actor::EngineContextHandle,
-        ) -> Option<ActorResult<BoxedMessage>> {
-            None
         }
 
         fn state(&self) -> ActorState {
@@ -565,9 +695,17 @@ mod tests {
     #[tokio::test]
     async fn test_processor_stop_transitions_status() {
         let processor = make_processor();
-        processor.clone().initialize_and_start_erased().await.unwrap();
+        processor
+            .clone()
+            .initialize_and_start_erased()
+            .await
+            .unwrap();
 
-        processor.clone().stop_erased().await.expect("stop should succeed");
+        processor
+            .clone()
+            .stop_erased()
+            .await
+            .expect("stop should succeed");
         assert_eq!(processor.get_status(), ProcessorStatus::Stopped);
         // Stopped processors are still "initialized" in the lifecycle sense
         // (they got past initialization); they merely refuse new batches.
@@ -589,12 +727,19 @@ mod tests {
     #[tokio::test]
     async fn test_process_batch_counts_and_drains() {
         let processor = make_processor();
-        processor.clone().initialize_and_start_erased().await.unwrap();
+        processor
+            .clone()
+            .initialize_and_start_erased()
+            .await
+            .unwrap();
 
         let mailbox: Arc<dyn Mailbox> = make_mailbox();
         for i in 1..=5u64 {
             mailbox
-                .push(Box::new(i), crate::thread::config::BackpressureStrategy::Block)
+                .push(
+                    Box::new(i),
+                    crate::thread::config::BackpressureStrategy::Block,
+                )
                 .await
                 .unwrap();
         }
@@ -619,11 +764,18 @@ mod tests {
     #[tokio::test]
     async fn test_process_batch_isolates_actor_panic() {
         let processor = make_processor();
-        processor.clone().initialize_and_start_erased().await.unwrap();
+        processor
+            .clone()
+            .initialize_and_start_erased()
+            .await
+            .unwrap();
 
         let mailbox: Arc<dyn Mailbox> = make_mailbox();
         mailbox
-            .push(Box::new("boom"), crate::thread::config::BackpressureStrategy::Block)
+            .push(
+                Box::new("boom"),
+                crate::thread::config::BackpressureStrategy::Block,
+            )
             .await
             .unwrap();
 
@@ -641,14 +793,21 @@ mod tests {
     #[tokio::test]
     async fn test_stats_tracking() {
         let processor = make_processor();
-        processor.clone().initialize_and_start_erased().await.unwrap();
+        processor
+            .clone()
+            .initialize_and_start_erased()
+            .await
+            .unwrap();
 
         let stats = processor.get_statistics().expect("stats present");
         assert_eq!(stats.messages_processed.load(Ordering::SeqCst), 0);
 
         let mailbox: Arc<dyn Mailbox> = make_mailbox();
         mailbox
-            .push(Box::new(1u64), crate::thread::config::BackpressureStrategy::Block)
+            .push(
+                Box::new(1u64),
+                crate::thread::config::BackpressureStrategy::Block,
+            )
             .await
             .unwrap();
         processor
@@ -663,7 +822,11 @@ mod tests {
     #[tokio::test]
     async fn test_pause_and_resume() {
         let processor = make_processor();
-        processor.clone().initialize_and_start_erased().await.unwrap();
+        processor
+            .clone()
+            .initialize_and_start_erased()
+            .await
+            .unwrap();
 
         processor.pause();
         assert_eq!(processor.get_status(), ProcessorStatus::Paused);
@@ -686,7 +849,9 @@ mod tests {
         // as_any_ref exposes &dyn Any; verify the concrete type is recoverable.
         let any_ref: &dyn Any = processor.as_any_ref();
         assert!(
-            any_ref.downcast_ref::<ActorProcessor<TestActor>>().is_some(),
+            any_ref
+                .downcast_ref::<ActorProcessor<TestActor>>()
+                .is_some(),
             "as_any_ref must expose the concrete processor type"
         );
         assert!(processor.path() == "test/processor");

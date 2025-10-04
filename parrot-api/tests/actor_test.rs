@@ -1,7 +1,6 @@
-use parrot_api::actor::{Actor, ActorState, ActorConfig, ActorFactory};
-use parrot_api::types::{BoxedMessage, ActorResult, BoxedFuture, BoxedActorRef};
+use parrot_api::actor::{Actor, ActorConfig, ActorFactory, ActorState};
 use parrot_api::errors::ActorError;
-use std::sync::{Arc, Mutex};
+use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::any::Any;
 use std::ptr::NonNull;
 
@@ -52,28 +51,33 @@ impl Actor for TestActor {
         })
     }
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             self.process_count += 1;
-            
+
             if let Some(increment) = msg.downcast_ref::<Increment>() {
                 self.counter += increment.0;
-                return Ok(Box::new(()) as BoxedMessage);
+                Ok(Box::new(()) as BoxedMessage)
             } else if msg.downcast_ref::<GetCounter>().is_some() {
-                return Ok(Box::new(self.counter) as BoxedMessage);
+                Ok(Box::new(self.counter) as BoxedMessage)
             } else if msg.downcast_ref::<Panic>().is_some() {
-                return Err(ActorError::MessageHandlingError("Panic message received".to_string()));
+                Err(ActorError::MessageHandlingError(
+                    "Panic message received".to_string(),
+                ))
             } else {
-                return Ok(msg); // Echo back unknown messages
+                Ok(msg) // Echo back unknown messages
             }
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
-    fn before_stop<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn before_stop<'a>(
+        &'a mut self,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async {
             self.stopped = true;
             self.state = ActorState::Stopped;
@@ -120,38 +124,52 @@ impl Actor for StreamTestActor {
     type Config = TestConfig;
     type Context = MockContext;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             Ok(msg) // Simply echo back messages
         })
     }
 
-    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
-
-    fn handle_stream<'a>(&'a mut self, item: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn handle_stream<'a>(
+        &'a mut self,
+        item: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             self.item_count += 1;
             Ok(item)
         })
     }
 
-    fn stream_started<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn stream_started<'a>(
+        &'a mut self,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async {
             self.stream_started = true;
             Ok(())
         })
     }
 
-    fn stream_finished<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn stream_finished<'a>(
+        &'a mut self,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async {
             self.stream_finished = true;
             Ok(())
         })
     }
 
-    fn stream_error<'a>(&'a mut self, err: ActorError, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+    fn stream_error<'a>(
+        &'a mut self,
+        err: ActorError,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             self.stream_error = Some(err.to_string());
             Ok(())
@@ -162,6 +180,9 @@ impl Actor for StreamTestActor {
         self.state
     }
 }
+
+// M6: 扩展 trait 空实现——同步快路径默认 None（测试断言默认行为）。
+impl parrot_api::actor::ActixEngineExt for TestActor {}
 
 // EngineContext Actor implementation
 struct EngineContextActor {
@@ -190,7 +211,11 @@ impl Actor for EngineContextActor {
     type Config = TestConfig;
     type Context = MockContext;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(increment) = msg.downcast_ref::<Increment>() {
                 self.counter += increment.0;
@@ -198,20 +223,6 @@ impl Actor for EngineContextActor {
             }
             Ok(msg)
         })
-    }
-    
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        // Try to get the custom engine context
-                if let Some(ctx) = engine_ctx.downcast_ref::<TestEngineContext>() {
-            if let Some(increment) = msg.downcast_ref::<Increment>() {
-                // Use the multiplier from the engine context
-                let inc_amount = increment.0 * ctx.multiplier;
-                self.engine_counter += inc_amount;
-                return Some(Ok(Box::new(self.engine_counter) as BoxedMessage));
-            }
-        }
-        
-        None
     }
 
     fn state(&self) -> ActorState {
@@ -236,20 +247,12 @@ impl Actor for EngineErrorActor {
     type Config = TestConfig;
     type Context = MockContext;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async move {
-            Ok(msg)
-        })
-    }
-    
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
-        if msg.downcast_ref::<Panic>().is_some() {
-            // Return an error for Panic messages
-            return Some(Err(ActorError::MessageHandlingError("Engine context error".to_string())));
-        }
-        
-        // For other message types, return None to fallback to regular handling
-        None
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move { Ok(msg) })
     }
 
     fn state(&self) -> ActorState {
@@ -299,49 +302,113 @@ impl Actor for EnhancedEngineActor {
     type Config = TestConfig;
     type Context = MockContext;
 
-    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             // Default message handling
             if let Some(increment) = msg.downcast_ref::<Increment>() {
                 self.counter += increment.0;
                 self.last_operation = Some("increment".to_string());
                 return Ok(Box::new(self.counter) as BoxedMessage);
-            } else if let Some(_) = msg.downcast_ref::<GetCounter>() {
+            } else if msg.downcast_ref::<GetCounter>().is_some() {
                 return Ok(Box::new(self.counter) as BoxedMessage);
-            } else if let Some(_) = msg.downcast_ref::<Reset>() {
+            } else if msg.downcast_ref::<Reset>().is_some() {
                 self.counter = 0;
                 self.last_operation = Some("reset".to_string());
                 return Ok(Box::new(()) as BoxedMessage);
             }
-            
+
             Ok(msg)
         })
     }
-    
-    fn receive_message_with_engine<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context, engine_ctx: parrot_api::actor::EngineContextHandle) -> Option<ActorResult<BoxedMessage>> {
+
+    fn state(&self) -> ActorState {
+        self.state
+    }
+}
+
+// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
+impl parrot_api::actor::ActixEngineExt for EngineContextActor {
+    fn receive_message_with_engine<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+        engine_ctx: parrot_api::actor::EngineContextHandle,
+    ) -> Option<ActorResult<BoxedMessage>> {
+        // Try to get the custom engine context
+        if let Some(ctx) = engine_ctx.downcast_ref::<TestEngineContext>() {
+            if let Some(increment) = msg.downcast_ref::<Increment>() {
+                // Use the multiplier from the engine context
+                let inc_amount = increment.0 * ctx.multiplier;
+                self.engine_counter += inc_amount;
+                return Some(Ok(Box::new(self.engine_counter) as BoxedMessage));
+            }
+        }
+
+        None
+    }
+}
+
+// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
+impl parrot_api::actor::ActixEngineExt for EngineErrorActor {
+    fn receive_message_with_engine<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+        _engine_ctx: parrot_api::actor::EngineContextHandle,
+    ) -> Option<ActorResult<BoxedMessage>> {
+        if msg.downcast_ref::<Panic>().is_some() {
+            // Return an error for Panic messages
+            return Some(Err(ActorError::MessageHandlingError(
+                "Engine context error".to_string(),
+            )));
+        }
+
+        // For other message types, return None to fallback to regular handling
+        None
+    }
+}
+
+// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
+impl parrot_api::actor::ActixEngineExt for EnhancedEngineActor {
+    fn receive_message_with_engine<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+        engine_ctx: parrot_api::actor::EngineContextHandle,
+    ) -> Option<ActorResult<BoxedMessage>> {
         // Try to get the engine context
-                
+
         if let Some(ctx) = engine_ctx.downcast_ref::<EnhancedEngineContext>() {
             // Check operation mode first
             match ctx.operation_mode {
                 OperationMode::ErrorProne => {
                     // Always return error in error-prone mode
-                    return Some(Err(ActorError::MessageHandlingError("Engine is in error mode".to_string())));
-                },
+                    return Some(Err(ActorError::MessageHandlingError(
+                        "Engine is in error mode".to_string(),
+                    )));
+                }
                 OperationMode::ReadOnly => {
                     // In read-only mode, only allow read operations
-                    if msg.downcast_ref::<GetCounter>().is_some() || msg.downcast_ref::<GetEngineCounter>().is_some() {
+                    if msg.downcast_ref::<GetCounter>().is_some()
+                        || msg.downcast_ref::<GetEngineCounter>().is_some()
+                    {
                         // Continue processing reads
                     } else {
                         // Return error for write operations
-                        return Some(Err(ActorError::MessageHandlingError("Engine is in read-only mode".to_string())));
+                        return Some(Err(ActorError::MessageHandlingError(
+                            "Engine is in read-only mode".to_string(),
+                        )));
                     }
-                },
+                }
                 OperationMode::Normal => {
                     // Continue with normal processing
                 }
             }
-            
+
             // Process different message types
             if let Some(increment) = msg.downcast_ref::<Increment>() {
                 let amount = increment.0 * ctx.multiplier;
@@ -352,23 +419,21 @@ impl Actor for EnhancedEngineActor {
                 self.engine_counter *= multiply.0 * ctx.multiplier;
                 self.last_operation = Some("engine_multiply".to_string());
                 return Some(Ok(Box::new(self.engine_counter) as BoxedMessage));
-            } else if let Some(_) = msg.downcast_ref::<GetEngineCounter>() {
+            } else if msg.downcast_ref::<GetEngineCounter>().is_some() {
                 return Some(Ok(Box::new(self.engine_counter) as BoxedMessage));
-            } else if let Some(_) = msg.downcast_ref::<Reset>() {
+            } else if msg.downcast_ref::<Reset>().is_some() {
                 self.engine_counter = 0;
                 self.last_operation = Some("engine_reset".to_string());
                 return Some(Ok(Box::new(()) as BoxedMessage));
-            } else if let Some(_) = msg.downcast_ref::<InvalidOperation>() {
-                return Some(Err(ActorError::MessageHandlingError("Invalid operation requested".to_string())));
+            } else if msg.downcast_ref::<InvalidOperation>().is_some() {
+                return Some(Err(ActorError::MessageHandlingError(
+                    "Invalid operation requested".to_string(),
+                )));
             }
         }
-        
+
         // Return None to fall back to regular message handling
         None
-    }
-
-    fn state(&self) -> ActorState {
-        self.state
     }
 }
 
@@ -376,12 +441,12 @@ impl Actor for EnhancedEngineActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+
     use tokio::runtime::Runtime;
 
     // Helper function to create a mock context
     fn create_mock_context() -> MockContext {
-        MockContext::default()
+        MockContext
     }
 
     // Test actor initialization
@@ -390,10 +455,10 @@ mod tests {
         let rt = Runtime::new().unwrap();
         let mut actor = TestActor::default();
         let mut ctx = create_mock_context();
-        
+
         assert_eq!(actor.state(), ActorState::Starting);
         assert!(!actor.initialized);
-        
+
         rt.block_on(async {
             let result = actor.init(&mut ctx).await;
             assert!(result.is_ok());
@@ -401,24 +466,24 @@ mod tests {
             assert_eq!(actor.state(), ActorState::Running);
         });
     }
-    
+
     // Test message handling
     #[test]
     fn test_message_handling() {
         let rt = Runtime::new().unwrap();
         let mut actor = TestActor::default();
         let mut ctx = create_mock_context();
-        
+
         rt.block_on(async {
             // Initialize first
             let _ = actor.init(&mut ctx).await;
-            
+
             // Test increment message
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
             let result = actor.receive_message(increment_msg, &mut ctx).await;
             assert!(result.is_ok());
             assert_eq!(actor.counter, 5);
-            
+
             // Test get counter message
             let get_counter_msg = Box::new(GetCounter) as BoxedMessage;
             let result = actor.receive_message(get_counter_msg, &mut ctx).await;
@@ -426,7 +491,7 @@ mod tests {
             let counter = result.unwrap().downcast::<u64>();
             assert!(counter.is_ok());
             assert_eq!(*counter.unwrap(), 5);
-            
+
             // Test error handling
             let panic_msg = Box::new(Panic) as BoxedMessage;
             let result = actor.receive_message(panic_msg, &mut ctx).await;
@@ -436,23 +501,23 @@ mod tests {
             } else {
                 panic!("Expected MessageHandlingError");
             }
-            
+
             // Verify process count
             assert_eq!(actor.process_count, 3);
         });
     }
-    
+
     // Test actor stopping
     #[test]
     fn test_actor_stopping() {
         let rt = Runtime::new().unwrap();
         let mut actor = TestActor::default();
         let mut ctx = create_mock_context();
-        
+
         rt.block_on(async {
             // Initialize first
             let _ = actor.init(&mut ctx).await;
-            
+
             // Stop the actor
             actor.state = ActorState::Stopping;
             let result = actor.before_stop(&mut ctx).await;
@@ -461,17 +526,17 @@ mod tests {
             assert_eq!(actor.state(), ActorState::Stopped);
         });
     }
-    
+
     // Test actor factory
     #[test]
     fn test_actor_factory() {
         let factory = TestActorFactory;
-        let actor = factory.create(TestConfig::default());
-        
+        let actor = factory.create(TestConfig);
+
         assert_eq!(actor.state(), ActorState::Starting);
         assert_eq!(actor.counter, 0);
     }
-    
+
     // Test receive_message_with_engine
     #[test]
     fn test_receive_message_with_engine() {
@@ -479,50 +544,57 @@ mod tests {
         let mut actor = TestActor::default();
         let mut ctx = create_mock_context();
         let engine_data = 42u32;
-        
+
         // Create raw pointer to engine data
-        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
-        
+        let engine_ctx =
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+
         rt.block_on(async {
             // Engine context handling should be None in the test actor
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                increment_msg,
+                &mut ctx,
+                engine_handle,
+            );
             assert!(result.is_none());
         });
-        
+
         // Clean up the raw pointer to avoid memory leak
         unsafe {
             let _ = Box::from_raw(engine_ctx.as_ptr());
         }
     }
-    
+
     // Test stream handling
     #[test]
     fn test_stream_handling() {
         let rt = Runtime::new().unwrap();
         let mut actor = StreamTestActor::default();
         let mut ctx = create_mock_context();
-        
+
         rt.block_on(async {
             // Test stream started
             let result = actor.stream_started(&mut ctx).await;
             assert!(result.is_ok());
             assert!(actor.stream_started);
-            
+
             // Test stream item processing
             let item1 = Box::new(42) as BoxedMessage;
             let item2 = Box::new("test") as BoxedMessage;
-            
+
             let _ = actor.handle_stream(item1, &mut ctx).await;
             let _ = actor.handle_stream(item2, &mut ctx).await;
             assert_eq!(actor.item_count, 2);
-            
+
             // Test stream finished
             let result = actor.stream_finished(&mut ctx).await;
             assert!(result.is_ok());
             assert!(actor.stream_finished);
-            
+
             // Test stream error
             let error = ActorError::Timeout;
             let result = actor.stream_error(error, &mut ctx).await;
@@ -530,20 +602,20 @@ mod tests {
             assert_eq!(actor.stream_error, Some("Timeout".to_string()));
         });
     }
-    
+
     // Test different actor states
     #[test]
     fn test_actor_states() {
         let mut actor = TestActor::default();
-        
+
         assert_eq!(actor.state(), ActorState::Starting);
-        
+
         actor.state = ActorState::Running;
         assert_eq!(actor.state(), ActorState::Running);
-        
+
         actor.state = ActorState::Stopping;
         assert_eq!(actor.state(), ActorState::Stopping);
-        
+
         actor.state = ActorState::Stopped;
         assert_eq!(actor.state(), ActorState::Stopped);
     }
@@ -554,20 +626,27 @@ mod tests {
         let rt = Runtime::new().unwrap();
         let mut actor = EngineContextActor::default();
         let mut ctx = create_mock_context();
-        
+
         // Create a test engine context with a multiplier
         let engine_data = TestEngineContext { multiplier: 2 };
-        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
-        
+        let engine_ctx =
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+
         rt.block_on(async {
             // Test message with engine context
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                increment_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             // Should have a result because we implemented custom handling
             assert!(result.is_some());
-            
+
             if let Some(Ok(boxed)) = result {
                 let value = boxed.downcast::<u64>().unwrap();
                 // Increment(5) * multiplier(2) = 10
@@ -577,7 +656,7 @@ mod tests {
             } else {
                 panic!("Expected Some(Ok) result");
             }
-            
+
             // Test regular message handling still works
             let normal_increment_msg = Box::new(Increment(7)) as BoxedMessage;
             let normal_result = actor.receive_message(normal_increment_msg, &mut ctx).await;
@@ -585,7 +664,7 @@ mod tests {
             assert_eq!(actor.counter, 7);
             assert_eq!(actor.engine_counter, 10); // Engine counter should be unchanged
         });
-        
+
         // Clean up the raw pointer
         unsafe {
             let _ = Box::from_raw(engine_ctx.as_ptr());
@@ -598,17 +677,24 @@ mod tests {
         let rt = Runtime::new().unwrap();
         let mut actor = EngineErrorActor::default();
         let mut ctx = create_mock_context();
-        
+
         // Create a simple engine context
         let engine_data = 42u32;
-        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
-        
+        let engine_ctx =
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+
         rt.block_on(async {
             // Test error case with Panic message
             let panic_msg = Box::new(Panic) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(panic_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                panic_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             // Should have Some(Err(...)) result
             assert!(result.is_some(), "Expected Some result");
             if let Some(result_inner) = result {
@@ -619,21 +705,27 @@ mod tests {
                     panic!("Wrong error type");
                 }
             }
-            
+
             // Test fallback case with Increment message
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                increment_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             // Should return None to indicate fallback to regular message handling
             assert!(result.is_none(), "Expected None result for fallback");
-            
+
             // Ensure regular handling still works - create a new message since the previous one was moved
             let new_increment_msg = Box::new(Increment(5)) as BoxedMessage;
             let normal_result = actor.receive_message(new_increment_msg, &mut ctx).await;
             assert!(normal_result.is_ok());
         });
-        
+
         // Clean up the raw pointer
         unsafe {
             let _ = Box::from_raw(engine_ctx.as_ptr());
@@ -646,20 +738,27 @@ mod tests {
         let rt = Runtime::new().unwrap();
         let mut actor = EnhancedEngineActor::default();
         let mut ctx = create_mock_context();
-        
+
         // Create normal mode engine context
-        let engine_data = EnhancedEngineContext { 
-            multiplier: 2, 
-            operation_mode: OperationMode::Normal 
+        let engine_data = EnhancedEngineContext {
+            multiplier: 2,
+            operation_mode: OperationMode::Normal,
         };
-        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
-        
+        let engine_ctx =
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+
         rt.block_on(async {
             // Test increment message
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                increment_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             assert!(result.is_some());
             if let Some(Ok(boxed)) = result {
                 let value = boxed.downcast::<u64>().unwrap();
@@ -669,12 +768,18 @@ mod tests {
             } else {
                 panic!("Expected Some(Ok) result for increment");
             }
-            
+
             // Test multiply message
             let multiply_msg = Box::new(Multiply(3)) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(multiply_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                multiply_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             assert!(result.is_some());
             if let Some(Ok(boxed)) = result {
                 let value = boxed.downcast::<u64>().unwrap();
@@ -684,12 +789,18 @@ mod tests {
             } else {
                 panic!("Expected Some(Ok) result for multiply");
             }
-            
+
             // Test get counter message
             let get_counter_msg = Box::new(GetEngineCounter) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(get_counter_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                get_counter_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             assert!(result.is_some());
             if let Some(Ok(boxed)) = result {
                 let value = boxed.downcast::<u64>().unwrap();
@@ -697,12 +808,18 @@ mod tests {
             } else {
                 panic!("Expected Some(Ok) result for get counter");
             }
-            
+
             // Test reset message
             let reset_msg = Box::new(Reset) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(reset_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                reset_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             assert!(result.is_some());
             if let Some(Ok(_)) = result {
                 assert_eq!(actor.engine_counter, 0);
@@ -710,12 +827,18 @@ mod tests {
             } else {
                 panic!("Expected Some(Ok) result for reset");
             }
-            
+
             // Test invalid operation
             let invalid_msg = Box::new(InvalidOperation) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(invalid_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                invalid_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             assert!(result.is_some());
             if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
                 assert_eq!(msg, "Invalid operation requested");
@@ -723,36 +846,43 @@ mod tests {
                 panic!("Expected Some(Err) result for invalid operation");
             }
         });
-        
+
         // Clean up the raw pointer
         unsafe {
             let _ = Box::from_raw(engine_ctx.as_ptr());
         }
     }
-    
+
     // Test read-only mode engine context
     #[test]
     fn test_readonly_engine_context() {
         let rt = Runtime::new().unwrap();
         let mut actor = EnhancedEngineActor::default();
         let mut ctx = create_mock_context();
-        
+
         // Set up engine counter first
         actor.engine_counter = 100;
-        
+
         // Create read-only mode engine context
-        let engine_data = EnhancedEngineContext { 
-            multiplier: 2, 
-            operation_mode: OperationMode::ReadOnly 
+        let engine_data = EnhancedEngineContext {
+            multiplier: 2,
+            operation_mode: OperationMode::ReadOnly,
         };
-        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
-        
+        let engine_ctx =
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+
         rt.block_on(async {
             // Test read operation should succeed
             let get_counter_msg = Box::new(GetEngineCounter) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(get_counter_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                get_counter_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             assert!(result.is_some());
             if let Some(Ok(boxed)) = result {
                 let value = boxed.downcast::<u64>().unwrap();
@@ -760,12 +890,18 @@ mod tests {
             } else {
                 panic!("Expected Some(Ok) result for read operation");
             }
-            
+
             // Test write operation should fail
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                increment_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             assert!(result.is_some());
             if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
                 assert_eq!(msg, "Engine is in read-only mode");
@@ -774,27 +910,28 @@ mod tests {
                 panic!("Expected Some(Err) result for write operation in read-only mode");
             }
         });
-        
+
         // Clean up the raw pointer
         unsafe {
             let _ = Box::from_raw(engine_ctx.as_ptr());
         }
     }
-    
+
     // Test error-prone engine context
     #[test]
     fn test_error_prone_engine_context() {
         let rt = Runtime::new().unwrap();
         let mut actor = EnhancedEngineActor::default();
         let mut ctx = create_mock_context();
-        
+
         // Create error-prone mode engine context
-        let engine_data = EnhancedEngineContext { 
-            multiplier: 2, 
-            operation_mode: OperationMode::ErrorProne 
+        let engine_data = EnhancedEngineContext {
+            multiplier: 2,
+            operation_mode: OperationMode::ErrorProne,
         };
-        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
-        
+        let engine_ctx =
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+
         rt.block_on(async {
             // All operations should fail in error-prone mode
             let operations = vec![
@@ -802,11 +939,17 @@ mod tests {
                 Box::new(GetEngineCounter) as BoxedMessage,
                 Box::new(Reset) as BoxedMessage,
             ];
-            
+
             for op in operations {
-                let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-                let result = actor.receive_message_with_engine(op, &mut ctx, engine_handle);
-                
+                let engine_handle =
+                    unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+                let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                    &mut actor,
+                    op,
+                    &mut ctx,
+                    engine_handle,
+                );
+
                 assert!(result.is_some());
                 if let Some(Err(ActorError::MessageHandlingError(msg))) = result {
                     assert_eq!(msg, "Engine is in error mode");
@@ -815,74 +958,82 @@ mod tests {
                 }
             }
         });
-        
+
         // Clean up the raw pointer
         unsafe {
             let _ = Box::from_raw(engine_ctx.as_ptr());
         }
     }
-    
+
     // Test fallback to regular message handling when engine context type doesn't match
     #[test]
     fn test_engine_context_type_mismatch() {
         let rt = Runtime::new().unwrap();
         let mut actor = EnhancedEngineActor::default();
         let mut ctx = create_mock_context();
-        
-        // Create a different type of engine context 
+
+        // Create a different type of engine context
         let engine_data = TestEngineContext { multiplier: 2 };
-        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
-        
+        let engine_ctx =
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+
         rt.block_on(async {
             // Should fall back to regular message handling
             let increment_msg = Box::new(Increment(5)) as BoxedMessage;
-            let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-            let result = actor.receive_message_with_engine(increment_msg, &mut ctx, engine_handle);
-            
+            let engine_handle =
+                unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+            let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                &mut actor,
+                increment_msg,
+                &mut ctx,
+                engine_handle,
+            );
+
             // Should be None to indicate fallback
             assert!(result.is_none());
-            
+
             // Now test the regular message handling worked
             let new_increment_msg = Box::new(Increment(5)) as BoxedMessage;
             let normal_result = actor.receive_message(new_increment_msg, &mut ctx).await;
-            
+
             assert!(normal_result.is_ok());
             assert_eq!(actor.counter, 5); // Regular counter incremented
             assert_eq!(actor.engine_counter, 0); // Engine counter unchanged
             assert_eq!(actor.last_operation, Some("increment".to_string()));
         });
-        
+
         // Clean up the raw pointer
         unsafe {
             let _ = Box::from_raw(engine_ctx.as_ptr());
         }
     }
-    
+
     // Test sequential processing of multiple messages
     #[test]
     fn test_sequential_engine_message_processing() {
         let rt = Runtime::new().unwrap();
         let mut actor = EnhancedEngineActor::default();
         let mut ctx = create_mock_context();
-        
+
         // Create normal mode engine context
-        let engine_data = EnhancedEngineContext { 
-            multiplier: 2, 
-            operation_mode: OperationMode::Normal 
+        let engine_data = EnhancedEngineContext {
+            multiplier: 2,
+            operation_mode: OperationMode::Normal,
         };
-        let engine_ctx = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
-        
+        let engine_ctx =
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(engine_data) as Box<dyn Any>)) };
+
         rt.block_on(async {
             // Sequence of operations: Increment -> Multiply -> Get -> Reset -> Get
-            let operations = vec![
+            let operations = [
                 (Box::new(Increment(10)) as BoxedMessage, 20), // 0 + (10*2) = 20
                 (Box::new(Multiply(3)) as BoxedMessage, 120),  // 20 * (3*2) = 120
                 (Box::new(GetEngineCounter) as BoxedMessage, 120), // Still 120
                 (Box::new(Reset) as BoxedMessage, 0),          // Reset to 0
                 (Box::new(GetEngineCounter) as BoxedMessage, 0), // Should be 0
             ];
-            
-            for (i, (op, expected)) in operations.iter().enumerate() {
+
+            for (i, (_op, expected)) in operations.iter().enumerate() {
                 // Create a new message for each iteration since we can't clone BoxedMessage
                 let message: BoxedMessage = match i {
                     0 => Box::new(Increment(10)),
@@ -892,34 +1043,52 @@ mod tests {
                     4 => Box::new(GetEngineCounter),
                     _ => unreachable!(),
                 };
-                
-                let engine_handle = unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
-                let result = actor.receive_message_with_engine(message, &mut ctx, engine_handle);
-                
-                assert!(result.is_some(), "Operation {} should return Some result", i);
-                
+
+                let engine_handle =
+                    unsafe { parrot_api::actor::EngineContextHandle::from_raw(engine_ctx) };
+                let result = parrot_api::actor::ActixEngineExt::receive_message_with_engine(
+                    &mut actor,
+                    message,
+                    &mut ctx,
+                    engine_handle,
+                );
+
+                assert!(
+                    result.is_some(),
+                    "Operation {} should return Some result",
+                    i
+                );
+
                 match result {
                     Some(Ok(boxed)) => {
-                        if i != 3 { // Skip Reset which returns unit
-                            let value = boxed.downcast::<u64>().unwrap_or_else(|_| 
+                        if i != 3 {
+                            // Skip Reset which returns unit
+                            let value = boxed.downcast::<u64>().unwrap_or_else(|_| {
                                 panic!("Expected u64 value for operation {}", i)
+                            });
+                            assert_eq!(
+                                *value, *expected,
+                                "Operation {} should return expected value",
+                                i
                             );
-                            assert_eq!(*value, *expected, "Operation {} should return expected value", i);
                         }
-                    },
+                    }
                     Some(Err(e)) => panic!("Operation {} failed: {:?}", i, e),
                     None => panic!("Operation {} returned None", i),
                 }
-                
+
                 // Verify engine counter after each operation
-                assert_eq!(actor.engine_counter, *expected, 
-                          "Engine counter should be {} after operation {}", expected, i);
+                assert_eq!(
+                    actor.engine_counter, *expected,
+                    "Engine counter should be {} after operation {}",
+                    expected, i
+                );
             }
         });
-        
+
         // Clean up the raw pointer
         unsafe {
             let _ = Box::from_raw(engine_ctx.as_ptr());
         }
     }
-} 
+}

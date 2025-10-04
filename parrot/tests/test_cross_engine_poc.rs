@@ -21,10 +21,9 @@ use parrot::thread::config::ThreadActorSystemConfig;
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
-use parrot_api::address::{ActorPath, ActorRef, ActorRefExt};
+use parrot_api::address::{ActorPath, ActorRefExt};
 use parrot_api::system::ActorSystemConfig;
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
-use std::sync::Arc;
 use std::time::Duration;
 
 // ===========================================================================
@@ -32,20 +31,32 @@ use std::time::Duration;
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq)]
-struct Ping { hop: u64, payload: u64 }
+struct Ping {
+    hop: u64,
+    payload: u64,
+}
 
 #[derive(Debug, Clone, PartialEq)]
-struct Pong { hop: u64, echo: u64 }
+struct Pong {
+    hop: u64,
+    echo: u64,
+}
 
 /// thread actor 不认识的消息（测 X5 错误契约）
 #[derive(Debug)]
 struct OnlyActix;
 
 /// 让 thread actor 主动跨引擎 ask 对方的指令（测 X6）
-struct AskRemote { remote: BoxedActorRef, value: u64 }
+struct AskRemote {
+    remote: BoxedActorRef,
+    value: u64,
+}
 
 /// 让 thread actor 主动 tell 对方的指令（测 X4 由 thread 侧发起）
-struct TellRemote { remote: BoxedActorRef, value: u64 }
+struct TellRemote {
+    remote: BoxedActorRef,
+    value: u64,
+}
 
 struct GetSeen;
 
@@ -55,6 +66,7 @@ struct GetSeen;
 
 struct ThreadSide {
     /// 跨引擎持有的对方引用（actix actor 的 BoxedActorRef）
+    #[allow(dead_code)]
     remote: Option<BoxedActorRef>,
     seen: std::sync::Mutex<Vec<u64>>,
 }
@@ -67,23 +79,36 @@ impl Actor for ThreadSide {
         Box::pin(async { Ok(()) })
     }
 
-    fn receive_message<'a>(&'a mut self, m: BoxedMessage, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn receive_message<'a>(
+        &'a mut self,
+        m: BoxedMessage,
+        _c: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(p) = m.downcast_ref::<Ping>() {
                 // 收到 actix 侧发来的 Ping：记录并回 Pong（跨引擎 ask 的应答方向）
                 self.seen.lock().unwrap().push(p.payload);
-                Ok(Box::new(Pong { hop: p.hop, echo: p.payload }) as BoxedMessage)
+                Ok(Box::new(Pong {
+                    hop: p.hop,
+                    echo: p.payload,
+                }) as BoxedMessage)
             } else if let Some(ar) = m.downcast_ref::<AskRemote>() {
                 // X6：handler 内嵌套跨引擎 ask（thread handler 跑在 spawn_blocking，安全）
                 let pong: Pong = ar
                     .remote
-                    .ask(Ping { hop: 99, payload: ar.value })
+                    .ask(Ping {
+                        hop: 99,
+                        payload: ar.value,
+                    })
                     .await?;
                 self.seen.lock().unwrap().push(pong.echo);
                 Ok(Box::new(pong.echo) as BoxedMessage)
             } else if let Some(t) = m.downcast_ref::<TellRemote>() {
                 // X4：tell 远端（不等待）
-                t.remote.tell(Ping { hop: 98, payload: t.value });
+                t.remote.tell(Ping {
+                    hop: 98,
+                    payload: t.value,
+                });
                 Ok(Box::new(()) as BoxedMessage)
             } else if m.downcast_ref::<GetSeen>().is_some() {
                 let snapshot = self.seen.lock().unwrap().clone();
@@ -96,16 +121,9 @@ impl Actor for ThreadSide {
         })
     }
 
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _m: BoxedMessage,
-        _c: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None // 强制走 receive_message（async 路径，支持嵌套 await）
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 // ===========================================================================
@@ -114,13 +132,38 @@ impl Actor for ThreadSide {
 
 use parrot::actix::actor::ActixActor;
 use parrot::actix::context::ActixContext;
-use parrot::actix::message::ActixMessageWrapper;
 use parrot_api::message::Message;
 
-impl Message for Ping { type Result = Pong; fn extract_result(r: BoxedMessage) -> ActorResult<Pong> { r.downcast::<Pong>().map(|b| *b).map_err(|_| parrot_api::errors::ActorError::MessageHandlingError("type".into())) } }
-impl Message for Pong { type Result = Pong; fn extract_result(r: BoxedMessage) -> ActorResult<Pong> { r.downcast::<Pong>().map(|b| *b).map_err(|_| parrot_api::errors::ActorError::MessageHandlingError("type".into())) } }
-impl Message for TellRemote { type Result = (); fn extract_result(_r: BoxedMessage) -> ActorResult<()> { Ok(()) } }
-impl Message for AskRemote { type Result = u64; fn extract_result(r: BoxedMessage) -> ActorResult<u64> { r.downcast::<u64>().map(|b| *b).map_err(|_| parrot_api::errors::ActorError::MessageHandlingError("type".into())) } }
+impl Message for Ping {
+    type Result = Pong;
+    fn extract_result(r: BoxedMessage) -> ActorResult<Pong> {
+        r.downcast::<Pong>()
+            .map(|b| *b)
+            .map_err(|_| parrot_api::errors::ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for Pong {
+    type Result = Pong;
+    fn extract_result(r: BoxedMessage) -> ActorResult<Pong> {
+        r.downcast::<Pong>()
+            .map(|b| *b)
+            .map_err(|_| parrot_api::errors::ActorError::MessageHandlingError("type".into()))
+    }
+}
+impl Message for TellRemote {
+    type Result = ();
+    fn extract_result(_r: BoxedMessage) -> ActorResult<()> {
+        Ok(())
+    }
+}
+impl Message for AskRemote {
+    type Result = u64;
+    fn extract_result(r: BoxedMessage) -> ActorResult<u64> {
+        r.downcast::<u64>()
+            .map(|b| *b)
+            .map_err(|_| parrot_api::errors::ActorError::MessageHandlingError("type".into()))
+    }
+}
 
 struct ActixSide {
     seen: std::sync::Mutex<Vec<u64>>,
@@ -139,9 +182,20 @@ impl Actor for ActixSide {
         _m: BoxedMessage,
         _c: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async { Err(parrot_api::errors::ActorError::MessageHandlingError("use engine path".into())) })
+        Box::pin(async {
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "use engine path".into(),
+            ))
+        })
     }
 
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+}
+
+// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
+impl parrot_api::actor::ActixEngineExt for ActixSide {
     fn receive_message_with_engine<'a>(
         &'a mut self,
         m: BoxedMessage,
@@ -151,7 +205,10 @@ impl Actor for ActixSide {
         // 同步引擎路径：actix 默认走这里
         if let Some(p) = m.downcast_ref::<Ping>() {
             self.seen.lock().unwrap().push(p.payload);
-            Some(Ok(Box::new(Pong { hop: p.hop, echo: p.payload }) as BoxedMessage))
+            Some(Ok(Box::new(Pong {
+                hop: p.hop,
+                echo: p.payload,
+            }) as BoxedMessage))
         } else if m.downcast_ref::<OnlyActix>().is_some() {
             Some(Ok(Box::new(42u64) as BoxedMessage))
         } else {
@@ -160,8 +217,6 @@ impl Actor for ActixSide {
             )))
         }
     }
-
-    fn state(&self) -> ActorState { ActorState::Running }
 }
 
 // ===========================================================================
