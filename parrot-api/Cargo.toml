@@ -5,6 +5,11 @@ edition = "2021"
 description = "An abstract Actor programming model interface layer"
 license = "MIT"
 
+[features]
+# 远程消息契约（DEV_01 §3.4）：启用后暴露 RemoteMessage trait 与 CodecRegistration。
+# parrot-remote 依赖 parrot-api 时开启；不用 remote 的用户零开销（不拖 serde/inventory）。
+remote = ["dep:serde", "dep:inventory", "dep:bincode"]
+
 [dependencies]
 async-trait = "0.1"
 thiserror = "2.0.11"
@@ -14,4 +19,7 @@ flume = "0.11.1"
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"], optional = true }
+inventory = { version = "0.3", optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
 parrot-api-derive = { path = "../parrot-api-derive" } 

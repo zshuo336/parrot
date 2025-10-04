@@ -22,6 +22,8 @@
 
 use crate::actor::Actor;
 use crate::address::{ActorPath, ActorRef};
+use crate::errors::ActorError;
+use crate::receptionist::{ReceptionistKey, ReceptionistStream};
 use crate::message::{CloneableMessage, Message};
 use crate::stream::StreamRegistry;
 use crate::supervisor::SupervisorStrategyType;
@@ -348,6 +350,27 @@ pub trait ActorContext: Send + Sync {
 
     /// Returns mutable access to actor spawning interface.
     fn spawner(&mut self) -> &mut dyn ActorSpawner;
+
+    // ---------------- Receptionist（DEV_02 §3.1 / K2） ----------------
+    // 双引擎 context 各自转发实现（remote 未启用时默认 Unsupported）。
+
+    /// 注册到 receptionist（key 命名空间 "{scope}/{name}"）。
+    fn receptionist_register(&mut self, _key: ReceptionistKey) -> BoxedFuture<'static, ActorResult<()>> {
+        Box::pin(async { Err(ActorError::InternalError("receptionist not enabled".into())) })
+    }
+
+    /// 去注册。
+    fn receptionist_deregister(&mut self, _key: &ReceptionistKey) -> BoxedFuture<'static, ActorResult<()>> {
+        Box::pin(async { Err(ActorError::InternalError("receptionist not enabled".into())) })
+    }
+
+    /// 订阅 key 变更流（先回放快照再续流）。
+    fn receptionist_subscribe<'a>(
+        &'a mut self,
+        _key: ReceptionistKey,
+    ) -> BoxedFuture<'a, ActorResult<ReceptionistStream>> {
+        Box::pin(async { Err(ActorError::InternalError("receptionist not enabled".into())) })
+    }
 }
 
 /// Extension methods for message handling.

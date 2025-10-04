@@ -135,6 +135,20 @@ impl ActorSystemImpl {
     }
 }
 
+/// 远程网关（trait 倒置——parrot 只认接口，parrot-remote 在应用层注入）。
+///
+/// 为什么 trait 而非直接依赖：parrot import parrot-remote 会引入可选依赖
+/// 耦合（不用 remote 的用户也被拖编译）。倒置后桥/远程件只依赖 parrot-api
+/// （E5.2 分层铁律，与网关模式同构）。
+pub trait RemoteGateway: Send + Sync + 'static {
+    /// parrot:// 前缀路径 → 远程 ActorRef（本地未命中时的三级路由出口）
+    fn lookup(&self, path: &str) -> Option<Box<dyn parrot_api::address::ActorRef>>;
+}
+
+/// Receptionist 网关（K2）——trait 定义在 parrot-api::receptionist（分层：
+/// parrot 与 parrot-remote 共见，同 RemoteGateway 的倒置模式）。
+pub use parrot_api::receptionist::ReceptionistGateway;
+
 /// ParrotActorSystem manages multiple ActorSystem implementations
 pub struct ParrotActorSystem {
     // Main system configuration
@@ -144,6 +158,13 @@ pub struct ParrotActorSystem {
     systems: RwLock<HashMap<String, ActorSystemImpl>>,
     // Default system name
     default_system: RwLock<Option<String>>,
+    // Remote gateway (optional; DEV_01 §3.7 facade 三级路由的远程出口)
+    remote: RwLock<Option<std::sync::Arc<dyn RemoteGateway>>>,
+    // Receptionist gateway（K2——双引擎 context 三方法转发出口）
+    receptionist: RwLock<Option<std::sync::Arc<dyn ReceptionistGateway>>>,
+    // 前缀通配处理器（DEV_04 §7.1——ShardRouter 的 `/user/entity-*` 注册面；
+    // 本地 registry 特例：命中即拦截，位于本地默认系统查找之前）
+    prefix_handlers: RwLock<Vec<(String, std::sync::Arc<dyn ActorRef>)>>,
 }
 
 impl ParrotActorSystem {
@@ -153,7 +174,57 @@ impl ParrotActorSystem {
             config,
             systems: RwLock::new(HashMap::new()),
             default_system: RwLock::new(None),
+            remote: RwLock::new(None),
+            receptionist: RwLock::new(None),
+            prefix_handlers: RwLock::new(Vec::new()),
         })
+    }
+
+    /// Register a receptionist gateway（K2 注入面——context 三方法出口）。
+    ///
+    /// 注入时向已注册的 thread 引擎系统下发（后注册的 thread 系统在
+    /// register_thread_system 时继承）。
+    pub async fn register_receptionist_gateway(
+        &self,
+        gw: std::sync::Arc<dyn ReceptionistGateway>,
+    ) -> Result<(), SystemError> {
+        {
+            let mut g = self
+                .receptionist
+                .write()
+                .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
+            *g = Some(gw.clone());
+        }
+        // 下发到已注册的 thread 系统
+        if let Ok(systems) = self.systems.read() {
+            for sys in systems.values() {
+                if let ActorSystemImpl::Thread(ts) = sys {
+                    ts.set_receptionist_gateway(gw.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 全局 receptionist 句柄（双引擎 context 转发用——Weak 防循环持有）。
+    pub fn receptionist_gateway(&self) -> Option<std::sync::Arc<dyn ReceptionistGateway>> {
+        self.receptionist.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Register a remote gateway（与 register_thread_system 同族命名/风格）。
+    ///
+    /// 注入后 `get_actor` 的解析管线变为三级：本地 default → 本地遍历 →
+    /// 远程网关（parrot:// 前缀路径）。本地优先级不变（05 §3.2 ①）。
+    pub async fn register_remote_gateway(
+        &self,
+        gw: std::sync::Arc<dyn RemoteGateway>,
+    ) -> Result<(), SystemError> {
+        let mut g = self
+            .remote
+            .write()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
+        *g = Some(gw);
+        Ok(())
     }
 
     /// Register an Actix system
@@ -190,6 +261,11 @@ impl ParrotActorSystem {
             .systems
             .write()
             .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
+
+        // K2：facade 已有 receptionist 网关 → 新 thread 系统继承（context 三方法可用）
+        if let Some(gw) = self.receptionist_gateway() {
+            system.set_receptionist_gateway(gw);
+        }
 
         // Store the system
         systems.insert(name.clone(), ActorSystemImpl::Thread(system));
@@ -296,6 +372,16 @@ impl ParrotActorSystem {
 
     /// Query actor by path
     pub async fn internal_get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
+        // 远程分支（一级）：parrot:// 前缀且网关注册 → 远程 ref。
+        // 置于本地解析之前——parrot:// 是显式远程意图（05 §3.2 解析管线：
+        // 显式协议前缀优先于本地命中；本地系统注册的是 /user/... 本地路径）
+        if path.path.starts_with("parrot://")
+            && let Ok(g) = self.remote.read()
+            && let Some(gw) = g.as_ref()
+        {
+            return gw.lookup(&path.path);
+        }
+
         // Try to get the actor from the default system
         let default_system = match self.get_default_system_name() {
             Ok(name) => name,
@@ -325,6 +411,15 @@ impl ParrotActorSystem {
                     return Some(actor);
                 }
             }
+        }
+
+        // 前缀通配兜底（DEV_04 §7.1）：显式 actor 未命中 → 最长前缀
+        // handler（ShardRouter 惰性激活入口）。位于本地查找之后——
+        // 显式 spawn 的 actor 优先于通配。
+        if let Ok(g) = self.prefix_handlers.read()
+            && let Some((_, handler)) = g.iter().find(|(p, _)| path.path.starts_with(p.as_str()))
+        {
+            return Some(handler.clone_boxed());
         }
 
         None
@@ -499,6 +594,38 @@ impl ParrotActorSystem {
         }
     }
 
+    /// 注册前缀通配处理器（DEV_04 §7.1——ShardRouter 的 facade 注册面）。
+    ///
+    /// `prefix` 如 "/user/entity-"：任何以之前缀开头的路径未命中显式
+    /// actor 时路由到 `handler`（最长前缀优先）。用于 cluster sharding
+    /// 的实体惰性激活——`/user/entity-{key}` → ShardRouter → ring 放置。
+    ///
+    /// 顺序（DEV_04 §7.1）：本地前缀 handler 在**远程分支之前**、显式
+    /// 本地查找之后——前缀是"本地 registry 特例"而非远程意图。
+    pub fn register_prefix_handler(
+        &self,
+        prefix: impl Into<String>,
+        handler: std::sync::Arc<dyn ActorRef>,
+    ) -> Result<(), SystemError> {
+        let mut g = self
+            .prefix_handlers
+            .write()
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("prefix handler lock poisoned")))?;
+        let prefix = prefix.into();
+        if !prefix.ends_with('-') && !prefix.ends_with('/') {
+            return Err(SystemError::ActorCreationError(format!(
+                "prefix handler must end with '-' or '/' (got {prefix:?})——通配语义锚点"
+            )));
+        }
+        // 最长前缀优先：插到更短前缀之前（查找线性扫，命中即中）
+        let pos = g
+            .iter()
+            .position(|(p, _)| p.len() < prefix.len())
+            .unwrap_or(g.len());
+        g.insert(pos, (prefix, handler));
+        Ok(())
+    }
+
     /// Get a thread engine system by name
     pub fn get_thread_system(&self, name: &str) -> Result<Arc<ThreadActorSystem>, SystemError> {
         match self.get_system_impl(name)? {
@@ -518,6 +645,9 @@ impl ActorSystem for ParrotActorSystem {
             config,
             systems: RwLock::new(HashMap::new()),
             default_system: RwLock::new(None),
+            remote: RwLock::new(None),
+            receptionist: RwLock::new(None),
+            prefix_handlers: RwLock::new(Vec::new()),
         })
     }
 

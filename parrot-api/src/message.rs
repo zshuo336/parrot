@@ -50,6 +50,9 @@ use crate::types::{BoxedMessage, SharedMessage};
 use std::any::Any;
 use std::time::Duration;
 use uuid::Uuid;
+
+#[cfg(feature = "remote")]
+use serde::{de::DeserializeOwned, Serialize};
 /// Message ID type
 pub type MessageId = Uuid;
 
@@ -688,7 +691,7 @@ mod tests {
 
     // ---------------- Message 默认方法 ----------------
 
-    struct TestMsg(u32);
+    struct TestMsg(#[allow(dead_code)] u32);
 
     impl Message for TestMsg {
         type Result = u32;
@@ -985,4 +988,54 @@ mod tests {
         assert!(format!("{:?}", BackoffStrategy::Fixed).contains("Fixed"));
         assert!(format!("{:?}", BackoffStrategy::Linear).contains("Linear"));
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Remote messaging contract (DEV_01 §3.4 / TECH_DESIGN_05 §3.1)
+// ---------------------------------------------------------------------------
+
+/// 编解码注册项：derive 宏生成的 inventory 条目（禁止手写 submit）。
+///
+/// `encode`/`decode` 是类型擦除的 bincode 包装；`type_id` 供发送侧
+/// TypeId -> TYPE_KEY 反查（encode_outgoing 出口）。
+#[cfg(feature = "remote")]
+pub struct CodecRegistration {
+    /// "bin:{crate}::{Type}#v{n}" / "pb:{package}.{Message}"（07 §2.1 type_key 规范）
+    pub type_key: &'static str,
+    /// 注册消息类型的 TypeId
+    pub type_id: std::any::TypeId,
+    /// &BoxedMessage -> bincode bytes（内部 downcast 到具体类型）
+    pub encode: fn(&BoxedMessage) -> Result<Vec<u8>, String>,
+    /// bincode bytes -> BoxedMessage（内部具体类型装箱）
+    pub decode: fn(&[u8]) -> Result<BoxedMessage, String>,
+}
+
+#[cfg(feature = "remote")]
+inventory::collect!(CodecRegistration);
+
+/// 远程可达消息契约（05 §3.1）。实现由 #[derive(RemoteMessage)] 生成，禁止手写 impl。
+///
+/// 格式："bin:{crate}::{Type}#v{n}"（默认 #v1；布局变更显式改键，06 I1）
+#[cfg(feature = "remote")]
+pub trait RemoteMessage: Message + Serialize + DeserializeOwned {
+    /// 线上类型键（两端一致才可互通；schema-diff 对拍凭据）
+    const TYPE_KEY: &'static str;
+}
+
+#[cfg(feature = "remote")]
+pub use inventory;
+
+// bincode 包装（类型擦除边界；#[derive(RemoteMessage)] 生成代码引用）。
+#[cfg(feature = "remote")]
+pub fn serde_remote_serialize<T: Serialize>(v: &T) -> Result<Vec<u8>, String> {
+    bincode::serde::encode_to_vec(v, bincode::config::standard())
+        .map_err(|e| format!("bincode encode: {e}"))
+}
+
+#[cfg(feature = "remote")]
+pub fn serde_remote_deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .map(|(v, _)| v)
+        .map_err(|e| format!("bincode decode: {e}"))
 }

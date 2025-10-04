@@ -140,6 +140,9 @@ pub struct ThreadActorSystem {
 
     /// Weak self reference used by contexts (set right after construction)
     self_weak: Mutex<Option<Weak<ThreadActorSystem>>>,
+
+    /// K2 receptionist 网关（可选——facade 注册后注入；context 三方法出口）
+    receptionist: RwLock<Option<Arc<dyn crate::system::ReceptionistGateway>>>,
 }
 
 impl fmt::Debug for ThreadActorSystem {
@@ -197,7 +200,18 @@ impl ThreadActorSystem {
             ),
             started_at: Instant::now(),
             self_weak: Mutex::new(None),
+            receptionist: RwLock::new(None),
         }
+    }
+
+    /// K2：注入 receptionist 网关（facade 注册时下发）。
+    pub fn set_receptionist_gateway(&self, gw: Arc<dyn crate::system::ReceptionistGateway>) {
+        *self.receptionist.write().unwrap() = Some(gw);
+    }
+
+    /// K2：receptionist 网关句柄（context 转发用）。
+    pub fn receptionist_gateway(&self) -> Option<Arc<dyn crate::system::ReceptionistGateway>> {
+        self.receptionist.read().unwrap().clone()
     }
 
     /// Create and initialize a shared (`Arc`) system.

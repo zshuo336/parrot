@@ -1,5 +1,9 @@
 Cargo.lock
-docs/
+# docs 目录整体不入库，但协议冻结件（E1.15 对账基件）与 G5 验收报告例外。
+# 注意用 docs/* 而非 docs/：整目录忽略时 git 不进入目录，否定规则无法生效。
+docs/*
+!docs/vectors/
+!docs/SCALE_REPORT.md
 tasks/
 target/
 temp_code/
@@ -9,3 +13,27 @@ gitcmd.sh
 .D*
 .C*
 .c*
+
+# ---- P6 提交范围控制（2026-10-05）----
+# IDE / 编辑器
+.metals/
+.vscode/
+.idea/
+# JS 构建产物与依赖
+node_modules/
+dist/
+# JVM / Python / Erlang 构建产物
+*.class
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+_build/
+*.beam
+# C/C++ 编译产物
+*.o
+*.a
+*.so
+*.dylib
+# 系统文件
+.DS_Store

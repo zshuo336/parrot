@@ -2,6 +2,7 @@ use proc_macro::TokenStream;
 
 mod actor;
 mod message;
+mod remote;
 mod typed;
 
 /// Derives the Message trait for a type with extended functionality.
@@ -105,6 +106,25 @@ mod typed;
 /// # Ok(())
 /// # }
 /// ```
+/// Derives the remote-messaging contract for a message type (DEV_01 §3.4).
+///
+/// Generates:
+/// - `impl RemoteMessage for T` with `TYPE_KEY` (default `bin:{crate}::{T}#v1`)
+/// - an `inventory::submit!` CodecRegistration entry (bincode wrappers)
+///
+/// Override the key with `#[remote(key = "pb:pkg.Msg")]`.
+///
+/// ```ignore
+/// // Requires: serde::Serialize + serde::DeserializeOwned + parrot-api "remote" feature.
+/// #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, RemoteMessage)]
+/// #[remote(key = "bin:myapp::Echo#v2")]
+/// struct Echo(u64);
+/// ```
+#[proc_macro_derive(RemoteMessage, attributes(remote))]
+pub fn derive_remote_message(input: TokenStream) -> TokenStream {
+    remote::derive_remote_message_impl(input)
+}
+
 #[proc_macro_derive(Message, attributes(message))]
 pub fn derive_message(input: TokenStream) -> TokenStream {
     message::derive_message_impl(input)
