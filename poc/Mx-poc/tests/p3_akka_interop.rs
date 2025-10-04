@@ -32,14 +32,6 @@ impl Actor for RustService {
             }
         })
     }
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _m: BoxedMessage,
-        _c: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -51,7 +43,7 @@ async fn p3_rust_akka_interop_over_tcp() {
     install_poc_messages();
 
     // 1. 编译 JVM 网关（若无 class）
-    let gw_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../akka-gw");
+    let gw_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../remote-poc/akka-gw");
     if !std::path::Path::new(&format!("{gw_dir}/AkkaGw.class")).exists() {
         let st = std::process::Command::new("javac")
             .current_dir(gw_dir)

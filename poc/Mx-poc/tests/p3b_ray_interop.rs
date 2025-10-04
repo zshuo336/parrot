@@ -30,14 +30,6 @@ impl Actor for RustService {
             }
         })
     }
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _m: BoxedMessage,
-        _c: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -48,7 +40,7 @@ async fn p3b_rust_ray_interop_over_tcp() {
     CodecRegistry::reset();
     install_poc_messages();
 
-    let gw_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../ray-adapter");
+    let gw_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../remote-poc/ray-adapter");
     let port = 9843u16;
 
     let mut py = std::process::Command::new("python3")

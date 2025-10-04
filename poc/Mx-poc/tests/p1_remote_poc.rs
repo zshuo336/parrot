@@ -40,14 +40,6 @@ impl Actor for EchoActor {
         })
     }
 
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _m: BoxedMessage,
-        _c: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None // 走 async 路径
-    }
 
     fn state(&self) -> ActorState {
         ActorState::Running
@@ -159,14 +151,6 @@ async fn rc6_timeout_semantics() {
                 }
                 Err(parrot_api::errors::ActorError::MessageHandlingError("unsupported".into()))
             })
-        }
-        fn receive_message_with_engine<'a>(
-            &'a mut self,
-            _m: BoxedMessage,
-            _c: &'a mut Self::Context,
-            _e: parrot_api::actor::EngineContextHandle,
-        ) -> Option<ActorResult<BoxedMessage>> {
-            None
         }
         fn state(&self) -> ActorState {
             ActorState::Running
