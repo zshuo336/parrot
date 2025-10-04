@@ -4,7 +4,7 @@
 
 use crate::frame::Frame;
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// 连接发送端（克隆共享；内部 mpsc 串行化写侧）。

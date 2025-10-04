@@ -1,7 +1,6 @@
 //! POC 消息定义 + 编解码注册（跨语言 golden 一致性共用这套 TYPE_KEY）。
 
 use crate::codec::CodecRegistry;
-use parrot_api::types::BoxedMessage;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ping(pub u64);
