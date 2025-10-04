@@ -1,0 +1,51 @@
+{
+  "format": "parrot-wire-1.0",
+  "frozen": true,
+  "note": "只增不改：修改 = 协议 break = 走 version 协商（07 X2）",
+  "vectors": [
+    {
+      "bytes_hex": "2b0000000110000001000000000000000008000000000000020000002f780800000062696e3a743a3a4d00000000ab",
+      "correlation_id": 1,
+      "frame_type": "0x10",
+      "hop_count": 0,
+      "hop_limit": 8,
+      "name": "ask-basic",
+      "path": "/x",
+      "payload_hex": "00000000ab",
+      "type_key": "bin:t::M"
+    },
+    {
+      "bytes_hex": "280000000113000000000000000000000008000000000000020000002f790800000062696e3a743a3a540102",
+      "correlation_id": 0,
+      "frame_type": "0x13",
+      "hop_count": 0,
+      "hop_limit": 8,
+      "name": "tell-basic",
+      "path": "/y",
+      "payload_hex": "0102",
+      "type_key": "bin:t::T"
+    },
+    {
+      "bytes_hex": "2d00000001120000070000000000000000080000000000000000000000000000030000006163746f722073746f70706564",
+      "correlation_id": 7,
+      "frame_type": "0x12",
+      "hop_count": 0,
+      "hop_limit": 8,
+      "name": "reply-err-stopped",
+      "path": "",
+      "payload_hex": "030000006163746f722073746f70706564",
+      "type_key": ""
+    },
+    {
+      "bytes_hex": "1c00000001030000000000000000000000080000000000000000000000000000",
+      "correlation_id": 0,
+      "frame_type": "0x03",
+      "hop_count": 0,
+      "hop_limit": 8,
+      "name": "heartbeat",
+      "path": "",
+      "payload_hex": "",
+      "type_key": ""
+    }
+  ]
+}
