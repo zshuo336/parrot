@@ -1,0 +1,13 @@
+[project]
+name = "parrot-protocol-py"
+version = "0.1.0"
+description = "Parrot Wire 1.0 Python protocol stack + Ray adapter (DEV_03 §5 / E4)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+ray = ["ray>=2.9"]
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
