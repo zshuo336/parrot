@@ -80,6 +80,7 @@ pub mod errors;
 pub mod macros;
 pub mod message;
 pub mod priority;
+pub mod receptionist;
 pub mod runtime;
 pub mod stream;
 pub mod supervisor;

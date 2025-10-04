@@ -423,6 +423,50 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         self.receive_timeout
     }
 
+    // ---------------- K2 receptionist 转发（DEV_02 §3.1 依赖注入） ----------------
+
+    fn receptionist_register(
+        &mut self,
+        key: parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<()>> {
+        let gw = self.system().and_then(|s| s.receptionist_gateway());
+        let path = self.path.path().to_string();
+        Box::pin(async move {
+            match gw {
+                Some(g) => g.register(key, path).await,
+                None => Err(ActorError::InternalError("receptionist not enabled".into())),
+            }
+        })
+    }
+
+    fn receptionist_deregister(
+        &mut self,
+        key: &parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<()>> {
+        let gw = self.system().and_then(|s| s.receptionist_gateway());
+        let key = key.clone();
+        let path = self.path.path().to_string();
+        Box::pin(async move {
+            match gw {
+                Some(g) => g.deregister(key, path).await,
+                None => Err(ActorError::InternalError("receptionist not enabled".into())),
+            }
+        })
+    }
+
+    fn receptionist_subscribe<'a>(
+        &'a mut self,
+        key: parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'a, ActorResult<parrot_api::receptionist::ReceptionistStream>> {
+        let gw = self.system().and_then(|s| s.receptionist_gateway());
+        Box::pin(async move {
+            match gw {
+                Some(g) => g.subscribe(key).await,
+                None => Err(ActorError::InternalError("receptionist not enabled".into())),
+            }
+        })
+    }
+
     fn set_supervisor_strategy(&mut self, strategy: SupervisorStrategyType) {
         use parrot_api::supervisor::{DefaultStrategy, OneForAllStrategy, OneForOneStrategy};
         self.supervisor_strategy = match strategy {

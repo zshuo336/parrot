@@ -299,4 +299,27 @@ where
         // Implementation will be provided by the actor system
         unimplemented!("spawner not implemented in context")
     }
+
+    // ---------------- K2 receptionist（actix 侧默认 Unsupported——网关注入仅 thread 系；actix 引擎用户经 facade API 直用） ----------------
+
+    fn receptionist_register(
+        &mut self,
+        _key: parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<()>> {
+        Box::pin(async { Err(ActorError::InternalError("receptionist not enabled".into())) })
+    }
+
+    fn receptionist_deregister(
+        &mut self,
+        _key: &parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<()>> {
+        Box::pin(async { Err(ActorError::InternalError("receptionist not enabled".into())) })
+    }
+
+    fn receptionist_subscribe<'a>(
+        &'a mut self,
+        _key: parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'a, ActorResult<parrot_api::receptionist::ReceptionistStream>> {
+        Box::pin(async { Err(ActorError::InternalError("receptionist not enabled".into())) })
+    }
 }

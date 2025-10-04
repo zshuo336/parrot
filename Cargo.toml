@@ -4,7 +4,9 @@ members = [
     "parrot",
     "parrot-api",
     "parrot-api-derive",
-    "parrot-api-derive-tests"
+    "parrot-api-derive-tests",
+    "parrot-remote",
+    "tools/federation-lab"
 ]
 
 [workspace.dependencies]
