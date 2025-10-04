@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-parrot-remote = { path = "../../parrot-remote" }
+parrot-remote = { path = "../../crates/parrot-remote" }
 
 [[bin]]
 name = "federation-lab"

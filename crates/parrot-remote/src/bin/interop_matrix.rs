@@ -8,7 +8,7 @@
 //! 5. RTT p50 <300µs 门禁（DEV_02 §6.3——超标 exit 1）
 //!
 //! jar 路径解析顺序：$PARROT_JVM_JAR / target/scala-* 不适用（Maven）→
-//! parrot-protocol-jvm/target/parrot-protocol-jvm-*.jar（repo 根/工作目录双探测）。
+//! interop/jvm/target/parrot-protocol-jvm-*.jar（repo 根/工作目录双探测）。
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -106,9 +106,9 @@ fn find_jar() -> Option<PathBuf> {
             return Some(pb);
         }
     }
-    // repo 根 / cwd 双探测：parrot-protocol-jvm/target/*.jar（shaded 或普通皆可）
+    // repo 根 / cwd 双探测：interop/jvm/target/*.jar（shaded 或普通皆可）
     for base in ["..", "."] {
-        let dir = PathBuf::from(base).join("parrot-protocol-jvm/target");
+        let dir = PathBuf::from(base).join("interop/jvm/target");
         if let Ok(rd) = std::fs::read_dir(&dir) {
             let mut best: Option<PathBuf> = None;
             for e in rd.flatten() {
@@ -131,7 +131,7 @@ fn find_jar() -> Option<PathBuf> {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let jar = find_jar().unwrap_or_else(|| {
-        eprintln!("interop-matrix: parrot-protocol-jvm jar not found (set PARROT_JVM_JAR or build via mvn package)");
+        eprintln!("interop-matrix: interop/jvm jar not found (set PARROT_JVM_JAR or build via mvn package)");
         std::process::exit(2);
     });
     println!("jvm jar: {}", jar.display());
