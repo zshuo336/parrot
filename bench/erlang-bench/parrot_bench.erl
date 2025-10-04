@@ -17,7 +17,7 @@
 
 %% ======================= 速率缩放 =======================
 
--define(SCALE, 2200).  %% Rust/Erlang iters 比（时间对等）
+-define(SCALE, 24).  %% Rust/Erlang iters 比（2026-10-04 重标定：BEAM 实测 ~36M iters/s）
 
 iters_for(RustIters) ->
     max(1, RustIters div ?SCALE).
@@ -379,7 +379,7 @@ main(_Args) ->
     A15 ! {tell_minute, iters_for(30000000000), 1},
     [A15 ! {tell_medium, iters_for(2400000000), K} || K <- lists:seq(1, 6)],
     [A15 ! {tell_tiny, K} || K <- lists:seq(1, 4000)],
-    wait_until(fun() -> ask(A15, {get_count}, 30000) >= 2 + 6 * 2 end, 300000),
+    wait_until(fun() -> ask(A15, {get_count}, 300000) >= 2 + 6 * 2 end, 300000),
     S15 = now_us(),
     _ = ask(A15, {ask_tiny, 0}, 120000),
     Tail15 = (now_us() - S15) / 1000,
