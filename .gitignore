@@ -1,9 +1,4 @@
 Cargo.lock
-# docs 目录整体不入库，但协议冻结件（E1.15 对账基件）与 G5 验收报告例外。
-# 注意用 docs/* 而非 docs/：整目录忽略时 git 不进入目录，否定规则无法生效。
-docs/*
-!docs/vectors/
-!docs/SCALE_REPORT.md
 tasks/
 target/
 temp_code/
