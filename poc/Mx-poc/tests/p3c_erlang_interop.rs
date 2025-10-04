@@ -30,14 +30,6 @@ impl Actor for RustService {
             }
         })
     }
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _m: BoxedMessage,
-        _c: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
     fn state(&self) -> ActorState {
         ActorState::Running
     }
@@ -48,7 +40,7 @@ async fn p3c_rust_erlang_interop_over_tcp() {
     CodecRegistry::reset();
     install_poc_messages();
 
-    let gw_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../erlang-gw");
+    let gw_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../remote-poc/erlang-gw");
     // 编译（无 beam 时）
     if !std::path::Path::new(&format!("{gw_dir}/erlang_gw.beam")).exists() {
         let st = std::process::Command::new("erlc")

@@ -178,14 +178,6 @@ impl Actor for EchoForDiscovery {
             }
         })
     }
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        _m: BoxedMessage,
-        _c: &'a mut Self::Context,
-        _e: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
     fn state(&self) -> ActorState {
         ActorState::Running
     }
