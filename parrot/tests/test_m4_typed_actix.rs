@@ -241,9 +241,17 @@ fn m4_actix_static_actors_run_in_parallel() {
         let _ = one.ask(Burn(WORK * ACTORS as u64)).await.unwrap();
         let serial = t1.elapsed();
 
-        // 并行应不慢于串行的 1.2 倍（CI 抖动容忍；理想是 ~4x 加速）
+        // 并行应不慢于串行的 1.2 倍（CI 抖动容忍；理想是 ~4x 加速）。
+        // llvm-cov 例外：覆盖率插桩的共享计数器使多线程热循环产生
+        // 缓存行争用（串行标定正常、并行伪性变慢 3-12x），此时只验证
+        // 正确性不验证加速比。
+        let (ratio, slack) = if std::env::var("CARGO_LLVM_COV").is_ok() {
+            (6.0, 0.5)
+        } else {
+            (1.2, 0.05)
+        };
         assert!(
-            parallel.as_secs_f64() < serial.as_secs_f64() * 1.2 + 0.05,
+            parallel.as_secs_f64() < serial.as_secs_f64() * ratio + slack,
             "static actors must run in parallel: parallel={parallel:?} serial={serial:?}"
         );
     });
