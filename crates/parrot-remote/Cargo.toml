@@ -6,6 +6,7 @@ description = "Parrot remote layer: Wire 1.0 framing, transports, codec registry
 license = "MIT"
 
 [dependencies]
+parrot-config = { path = "../parrot-config" }
 parrot-api = { path = "../parrot-api", features = ["remote"] }
 tokio = { version = "1", features = ["net", "time", "sync", "io-util", "rt-multi-thread", "macros", "test-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }

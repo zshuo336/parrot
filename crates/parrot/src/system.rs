@@ -227,6 +227,20 @@ impl ParrotActorSystem {
         Ok(())
     }
 
+    /// 配置切面一站式入口：单进程纯本地引擎（thread）从折叠配置构建。
+    ///
+    /// 业务代码零部署参数——物理参数全部来自 `ParrotConfig`（三层：
+    /// 代码 > 文件 > 默认）。远程接入见 parrot-remote 的
+    /// `RemoteConfig::from_resolved`。
+    pub async fn from_config(
+        r: &parrot_config::Resolved,
+    ) -> Result<Arc<crate::thread::system::ThreadActorSystem>, SystemError> {
+        let sys = crate::thread::system::ThreadActorSystem::new(
+            crate::thread::config::ThreadActorSystemConfig::from_resolved(r),
+        );
+        Ok(std::sync::Arc::new(sys))
+    }
+
     /// Register an Actix system
     pub async fn register_actix_system(
         &self,

@@ -19,6 +19,29 @@ pub struct NodeAddr {
     pub addr: SocketAddr,
 }
 
+impl std::str::FromStr for NodeAddr {
+    type Err = String;
+    /// "scheme://node_id@host:port" / "host:port"（node_id 缺省=host:port）。
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (scheme, rest) = match s.split_once("://") {
+            Some((sc, r)) => (sc.to_string(), r),
+            None => ("tcp".to_string(), s),
+        };
+        let (node_id, hostport) = match rest.split_once('@') {
+            Some((n, h)) => (n.to_string(), h),
+            None => (hostport_default_id(rest), rest),
+        };
+        let addr: SocketAddr = hostport
+            .parse()
+            .map_err(|e| format!("bad addr {hostport:?}: {e}"))?;
+        Ok(Self { node_id, scheme, addr })
+    }
+}
+
+fn hostport_default_id(s: &str) -> String {
+    s.to_string()
+}
+
 impl NodeAddr {
     pub fn tcp(node_id: impl Into<String>, addr: SocketAddr) -> Self {
         Self {

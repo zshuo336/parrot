@@ -35,6 +35,7 @@ pub struct QuicTransport {
     inbound: mpsc::Sender<InboundItem>,
     on_disconnect: OnDisconnect,
     shutdown: tokio::sync::watch::Sender<bool>,
+    knobs: Option<crate::transport::RuntimeKnobs>,
     endpoint: quinn::Endpoint,
     client_cfg: quinn::ClientConfig,
 }
@@ -47,6 +48,7 @@ impl QuicTransport {
         shutdown: tokio::sync::watch::Sender<bool>,
         bind: SocketAddr,
         crypto: QuicCrypto,
+        knobs: Option<crate::transport::RuntimeKnobs>,
     ) -> Result<Self, RemoteError> {
         let client = crypto.client; // ALPN 已在构造侧设置
         let endpoint = quinn::Endpoint::server(crypto.server, bind)
@@ -56,6 +58,7 @@ impl QuicTransport {
             inbound,
             on_disconnect,
             shutdown,
+            knobs,
             endpoint,
             client_cfg: client,
         })
@@ -98,6 +101,7 @@ impl Transport for QuicTransport {
                 inbound: self.inbound.clone(),
                 on_disconnect: self.on_disconnect.clone(),
                 shutdown: self.shutdown.subscribe(),
+                knobs: self.knobs,
             },
         )
         .await
@@ -129,6 +133,7 @@ impl Transport for QuicTransport {
                 inbound: self.inbound.clone(),
                 on_disconnect: self.on_disconnect.clone(),
                 shutdown: self.shutdown.subscribe(),
+                knobs: self.knobs,
             },
         )
         .await
@@ -253,6 +258,7 @@ mod tests {
             sd_b,
             "127.0.0.1:0".parse().unwrap(),
             dev_crypto(),
+            None,
         )
         .unwrap();
         let ta = QuicTransport::new(
@@ -265,6 +271,7 @@ mod tests {
             sd_a,
             "127.0.0.1:0".parse().unwrap(),
             dev_crypto(),
+            None,
         )
         .unwrap();
         let addr = NodeAddr::tcp("quic-b", tb.local_addr());

@@ -142,6 +142,30 @@ impl Default for ThreadActorSystemConfig {
 }
 
 impl ThreadActorSystemConfig {
+    /// 配置切面：从 parrot-config 折叠结果生成（[thread] 节——文件层
+    /// 加载由 parrot-config 负责）。未覆盖字段保持 Default（与现行为一致）。
+    pub fn from_resolved(r: &parrot_config::Resolved) -> Self {
+        let d = Self::default();
+        Self {
+            name: r
+                .remote
+                .node
+                .node_id
+                .clone()
+                .unwrap_or(d.name),
+            shared_pool_size: r.thread.shared_pool_size,
+            shared_burst_workers_max: r.thread.shared_burst_workers_max,
+            shared_burst_backlog_threshold_ms: r.thread.shared_burst_backlog_threshold_ms,
+            shared_burst_idle_timeout_ms: r.thread.shared_burst_idle_timeout_ms,
+            shared_queue_capacity: r.thread.shared_queue_capacity,
+            max_dedicated_threads: r.thread.max_dedicated_threads,
+            default_mailbox_capacity: r.thread.default_mailbox_capacity,
+            default_ask_timeout: std::time::Duration::from_millis(r.thread.default_ask_timeout_ms),
+            shutdown_timeout: std::time::Duration::from_millis(r.thread.shutdown_timeout_ms),
+            ..d
+        }
+    }
+
     /// Merge system configuration with actor-specific configuration.
     /// This applies defaults from the system config where the actor config doesn't specify values.
     pub fn merge_with_actor_config(&self, actor_config: &ThreadActorConfig) -> ThreadActorConfig {
