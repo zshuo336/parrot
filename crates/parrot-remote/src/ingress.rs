@@ -25,22 +25,125 @@ pub trait LocalLookup: Send + Sync + 'static {
 /// 死信计数（TELL miss 目标——无回程信道，只记 metric + debug 日志）。
 pub static DEAD_TELL_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// hub 转发计数（observability：跨节点帧转发量）。
+pub static RELAYED_ASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RELAYED_TELL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 转发指标门面（集成测试/运维观测——不暴露 Atomic 原语）。
+pub struct RelayMetrics;
+
+impl RelayMetrics {
+    pub fn relayed_ask() -> u64 {
+        RELAYED_ASK.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn relayed_tell() -> u64 {
+        RELAYED_TELL.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// 转发映射：forward_cid → (orig_cid, 回源 FrameSender, 到期时刻)。
+///
+/// hub 路由（07 §6）核心结构：入站 ASK 目标节点非本节点时，分配新 cid
+/// 转发到目标节点；REPLY/REPLY_ERR 回来按新 cid 查表还原 orig_cid，经
+/// 保存的回源 sender 送回发起方。条目带 TTL（防目标节点泄漏——超时清理
+/// 由 complete/断连时的懒扫描兜底）。
+pub struct RelayTable {
+    slots: std::sync::Mutex<std::collections::HashMap<
+        u64,
+        (u64, FrameSender, std::time::Instant),
+    >>,
+    ttl: std::time::Duration,
+}
+
+impl RelayTable {
+    pub fn new() -> Self {
+        Self {
+            slots: std::sync::Mutex::new(Default::default()),
+            ttl: std::time::Duration::from_secs(65),
+        }
+    }
+
+    /// 登记映射（forward_cid 分配方：hub 的 CallbackRegistry.next_cid）。
+    pub fn insert(&self, forward_cid: u64, orig_cid: u64, back: FrameSender) {
+        self.slots
+            .lock()
+            .unwrap()
+            .insert(forward_cid, (orig_cid, back, std::time::Instant::now()));
+    }
+
+    /// 取出并移除（REPLY 回程一次性消费）。过期条目返回 None（懒清理）。
+    pub fn take(&self, forward_cid: u64) -> Option<(u64, FrameSender)> {
+        let mut g = self.slots.lock().unwrap();
+        match g.remove(&forward_cid) {
+            Some((orig, back, at)) if at.elapsed() < self.ttl => Some((orig, back)),
+            _ => None,
+        }
+    }
+
+    /// 目标节点断连：其作为转发目标的所有挂起条目失效（回源 REPLY_ERR）。
+    /// 返回失效条目（调用方逐条发 ConnectionLost 错误帧）。
+    pub fn fail_target(&self, target: &str) -> Vec<(u64, u64, FrameSender)> {
+        let mut g = self.slots.lock().unwrap();
+        let hit: Vec<u64> = g
+            .iter()
+            .filter(|(_, (_, back, _))| back.node_id() == target)
+            .map(|(cid, _)| *cid)
+            .collect();
+        hit.iter()
+            .filter_map(|cid| g.remove(cid).map(|(o, b, _)| (*cid, o, b)))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.lock().unwrap().len()
+    }
+}
+
+impl Default for RelayTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Ingress {
     pub local: Arc<dyn LocalLookup>,
     pub callbacks: Arc<CallbackRegistry>,
     /// P2：SYSTEM_EVENT 分流钩子（admin/gossip/receptionist——system.rs 注入；
     /// None 时吞帧防御式丢弃）。
     sys_event: std::sync::RwLock<Option<Arc<dyn SysEventHook>>>,
+    /// hub 转发出口（07 §6）：None = 本节点非路由节点（miss 一律 ActorNotFound）；
+    /// Some = 目标 parrot://{node}/... 非本节点时查表转发（网关两两互通）。
+    relay: std::sync::RwLock<Option<Arc<dyn RelayRouter>>>,
+    /// 转发 cid 映射表（REPLY 回源还原）。
+    pub relay_table: Arc<RelayTable>,
+}
+
+/// hub 转发出口（system.rs 注入——按 node 查出站 sender + 分配转发 cid）。
+#[async_trait::async_trait]
+pub trait RelayRouter: Send + Sync + 'static {
+    /// 目标节点直连 sender（无直连 → None → RouteUnreachable 回源）。
+    fn sender_of(&self, node: &str) -> Option<FrameSender>;
+    /// 新转发 cid（hub 侧唯一——与本地 ask 的 cid 空间共用计数器防撞）。
+    fn next_cid(&self) -> u64;
+    /// 本节点 id（判"目标是本节点还是他节点"）。
+    fn self_node(&self) -> &str;
 }
 
 impl Ingress {
-    /// 构造（P1 兼容：无钩子）。
+    /// 构造（P1 兼容：无钩子、无转发）。
     pub fn new(local: Arc<dyn LocalLookup>, callbacks: Arc<CallbackRegistry>) -> Self {
         Self {
             local,
             callbacks,
             sys_event: std::sync::RwLock::new(None),
+            relay: std::sync::RwLock::new(None),
+            relay_table: Arc::new(RelayTable::new()),
         }
+    }
+
+    /// 转发出口注入（system.rs——星型拓扑两两互通的关键一步）。
+    pub fn relay_slot(&self) -> std::sync::RwLockWriteGuard<'_, Option<Arc<dyn RelayRouter>>> {
+        self.relay.write().unwrap()
     }
 
     /// 钩子注入/替换（system.rs install_admin_hook 用）。
@@ -64,6 +167,13 @@ fn local_path(path: &str) -> &str {
         }
     }
     path
+}
+
+/// 路径 → 目标节点 id（parrot://{node}/...；其他形态返回 None——非路由路径）。
+fn target_node(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("parrot://")?;
+    let idx = rest.find('/')?;
+    Some(&rest[..idx])
 }
 
 impl Ingress {
@@ -149,18 +259,24 @@ impl Ingress {
                 return;
             }
         };
-        // 本地解析（facade 注入）
+        // 本地解析（facade 注入）；miss 且目标是其他 parrot 节点 → hub 转发
         let local_ref = match self.local.lookup(local_path(&frame.path)).await {
             Some(r) => r,
             None => {
-                let _ = back
-                    .send(Frame::reply_err(
-                        cid,
-                        &frame.path,
-                        ErrCode::ActorNotFound,
-                        &frame.path,
-                    ))
-                    .await;
+                // hub 路由（07 §6）：parrot://{other}/... 由本节点中转。
+                // RouteUnreachable/ConnectionLost 的错误帧 try_relay_ask 已
+                // 自行回源；这里只兜底 ActorNotFound（常规 miss 语义）。
+                if self.try_relay_ask(&frame, back, cid).await == Some(ErrCode::ActorNotFound)
+                {
+                    let _ = back
+                        .send(Frame::reply_err(
+                            cid,
+                            &frame.path,
+                            ErrCode::ActorNotFound,
+                            &frame.path,
+                        ))
+                        .await;
+                }
                 return;
             }
         };
@@ -211,6 +327,78 @@ impl Ingress {
         }
     }
 
+    /// hub 转发 ASK：目标是其他节点且本节点有路由能力 → 转发 + 映射登记。
+    /// 返回 Some(code) = 未转发（code 是应回源的错误码；ActorNotFound =
+    /// 常规 miss 语义）；None = 已转发（等 REPLY 自动回源）。
+    async fn try_relay_ask(
+        &self,
+        frame: &Frame,
+        back: &FrameSender,
+        orig_cid: u64,
+    ) -> Option<ErrCode> {
+        // ① 非 parrot://{node}/ 路径 → 常规 ActorNotFound（不是路由问题）
+        let Some(target) = target_node(&frame.path) else {
+            return Some(ErrCode::ActorNotFound);
+        };
+        // ② 路由能力未注入（非 hub 节点）或目标是本节点 → 常规 ActorNotFound
+        let Some(router) = self
+            .relay
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|r| target != r.self_node())
+        else {
+            return Some(ErrCode::ActorNotFound);
+        };
+        // ③ 有路由能力但无直连 → RouteUnreachable（比 ActorNotFound 语义准）
+        let Some(sender) = router.sender_of(target) else {
+            let _ = back
+                .send(Frame::reply_err(
+                    orig_cid,
+                    &frame.path,
+                    ErrCode::RouteUnreachable,
+                    &format!("no route to {target}"),
+                ))
+                .await;
+            return Some(ErrCode::RouteUnreachable);
+        };
+        // 转发：新 cid + hop_count+1（防环；≥hop_limit 由对端 Frame 校验拒收）
+        let forward_cid = router.next_cid();
+        let mut fwd = frame.clone();
+        fwd.header.correlation_id = forward_cid;
+        fwd.header.hop_count = fwd.header.hop_count.saturating_add(1);
+        if sender.send(fwd).await.is_err() {
+            let _ = back
+                .send(Frame::reply_err(
+                    orig_cid,
+                    &frame.path,
+                    ErrCode::ConnectionLost,
+                    "relay link closed",
+                ))
+                .await;
+            return Some(ErrCode::ConnectionLost);
+        }
+        // 映射登记（REPLY 回来自动还原回源）
+        self.relay_table.insert(forward_cid, orig_cid, back.clone());
+        RELAYED_ASK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(%target, forward_cid, orig_cid, "relayed ask");
+        None
+    }
+
+    /// REPLY 回源：先查转发映射（本节点作为 hub 中转的回程），命中则
+    /// 还原 orig_cid 送回源连接；未命中走本地回调表（本节点发起的 ask）。
+    fn relay_reply(&self, frame: &Frame) -> bool {
+        let cid = frame.header.correlation_id;
+        if let Some((orig_cid, back)) = self.relay_table.take(cid) {
+            let mut out = frame.clone();
+            out.header.correlation_id = orig_cid;
+            back.send_frame(out);
+            tracing::debug!(cid, orig_cid, "relayed reply");
+            return true;
+        }
+        false
+    }
+
     async fn on_tell(&self, frame: Frame) {
         let decoded = match CodecRegistry::global().decode_incoming(&frame.type_key, &frame.payload)
         {
@@ -223,10 +411,37 @@ impl Ingress {
         if let Some(r) = self.local.lookup(local_path(&frame.path)).await {
             // deliver 挂起 = 读循环挂起 = 对端背压贯通（05 §6.3，RC8）
             let _ = r.deliver(decoded).await;
+        } else if self.try_relay_tell(&frame) {
+            // hub 中转（TELL 无回程——fire-and-forget 转发）
         } else {
             DEAD_TELL_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(path = %frame.path, "TELL to unknown actor (dead letter)");
         }
+    }
+
+    /// hub 转发 TELL（无回程语义——转发成功即完事）。
+    fn try_relay_tell(&self, frame: &Frame) -> bool {
+        let Some(target) = target_node(&frame.path) else {
+            return false;
+        };
+        let Ok(g) = self.relay.read() else { return false };
+        let Some(router) = g.as_ref() else {
+            return false;
+        };
+        if target == router.self_node() {
+            return false;
+        }
+        let Some(sender) = router.sender_of(target) else {
+            return false;
+        };
+        let mut fwd = frame.clone();
+        fwd.header.hop_count = fwd.header.hop_count.saturating_add(1);
+        if sender.send_frame_sync(fwd).is_err() {
+            return false;
+        }
+        RELAYED_TELL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(%target, "relayed tell");
+        true
     }
 
     async fn on_stop(&self, frame: Frame) {
@@ -236,6 +451,10 @@ impl Ingress {
     }
 
     fn on_reply(&self, frame: Frame) {
+        // hub 中转回程优先（本节点转发的 ask 的 REPLY——还原 cid 回源）
+        if self.relay_reply(&frame) {
+            return;
+        }
         let cid = frame.header.correlation_id;
         match frame.header.frame_type {
             frame_type::REPLY => {
@@ -388,7 +607,7 @@ mod tests {
     async fn ingress_dispatch_matrix() {
         let (ig, ch) = ingress();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(16);
-        let back = FrameSender { tx };
+        let back = FrameSender::anon(tx);
 
         // ① ASK miss → REPLY_ERR(ActorNotFound)（消息键已注册，decode 通过后 lookup miss）
         let ask_payload = {
@@ -474,7 +693,7 @@ mod tests {
     async fn ingress_error_frame_swallowed() {
         let (ig, _cb) = ingress();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
-        let back = FrameSender { tx };
+        let back = FrameSender::anon(tx);
         ig.dispatch(Frame::error_frame(ErrCode::Overloaded, "busy"), &back, "n1")
             .await;
         // 无回帧
@@ -486,7 +705,7 @@ mod tests {
     async fn ingress_handshake_frame_swallowed() {
         let (ig, _cb) = ingress();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
-        let back = FrameSender { tx };
+        let back = FrameSender::anon(tx);
         ig.dispatch(Frame::heartbeat(), &back, "n1").await;
         assert!(rx.try_recv().is_err());
     }
@@ -507,7 +726,7 @@ mod tests {
         // dispatch 走同分支：回 REPLY_ERR(ProtocolViolation)
         let (ig, _cb) = ingress();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
-        let back = FrameSender { tx };
+        let back = FrameSender::anon(tx);
         ig.dispatch(f, &back, "n1").await;
         let got = rx.recv().await.unwrap();
         assert_eq!(got.header.frame_type, frame_type::REPLY_ERR);
@@ -527,7 +746,7 @@ mod tests {
     async fn ingress_ask_unknown_key() {
         let (ig, _) = ingress();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(16);
-        let back = FrameSender { tx };
+        let back = FrameSender::anon(tx);
         ig.dispatch(
             Frame::ask(7, "/user/echo", "bin:nowhere::Z#v1", Bytes::new(), None),
             &back,

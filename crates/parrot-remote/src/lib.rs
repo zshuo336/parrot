@@ -42,7 +42,7 @@ pub use bytes;
 pub use error::{ErrCode, RemoteError};
 pub use frame::{golden_vectors, Frame, FrameError, FrameHeader, GoldenVector};
 pub use handshake::{negotiate_caps, HandshakeAckBody, HandshakeBody, TopologyRole};
-pub use ingress::{LocalLookup, DEAD_TELL_DROPPED};
+pub use ingress::{LocalLookup, RelayMetrics, DEAD_TELL_DROPPED};
 pub use node::{NodeAddr, NodeId, NodeState, NodeStatus, NodeTable};
 pub use ref_::{RemoteActorRef, RemoteInner};
 pub use registry::{CallbackRegistry, ReplyPayload};
