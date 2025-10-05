@@ -29,6 +29,9 @@ pub struct RemoteConfig {
     pub heartbeat_enabled: bool,
     /// 附加能力位（E4/E1：连 pb-only 对端时叠加 caps::PB；默认 0=纯 bin）。
     pub extra_caps: u32,
+    /// 本节点拓扑角色（07 §6）：Normal（默认）/ Hub（星型中心——spoke
+    /// 将其链路作为默认路由 uplink）/ Border（联邦边界，同 Hub 待遇）。
+    pub topology_role: crate::handshake::TopologyRole,
 }
 
 impl RemoteConfig {
@@ -41,7 +44,14 @@ impl RemoteConfig {
             callback_capacity: 65536,
             heartbeat_enabled: true,
             extra_caps: 0,
+            topology_role: crate::handshake::TopologyRole::Normal,
         }
+    }
+
+    /// 声明拓扑角色（hub 节点显式 Hub——spoke 据握手 ACK 识别 uplink）。
+    pub fn with_role(mut self, role: crate::handshake::TopologyRole) -> Self {
+        self.topology_role = role;
+        self
     }
 
     pub fn mem(node_id: impl Into<String>) -> Self {
@@ -53,6 +63,7 @@ impl RemoteConfig {
             callback_capacity: 65536,
             heartbeat_enabled: true,
             extra_caps: 0,
+            topology_role: crate::handshake::TopologyRole::Normal,
         }
     }
 
@@ -66,6 +77,7 @@ impl RemoteConfig {
             callback_capacity: 65536,
             heartbeat_enabled: true,
             extra_caps: 0,
+            topology_role: crate::handshake::TopologyRole::Normal,
         }
     }
 
@@ -88,6 +100,9 @@ pub struct RemoteActorSystem {
     inbound_rx: tokio::sync::Mutex<mpsc::Receiver<(Frame, FrameSender, String)>>,
     /// 已建立连接（node_id → sender/status）
     links: tokio::sync::Mutex<Vec<(String, FrameSender, Arc<NodeStatus>)>>,
+    /// 星型 uplink（07 §6）：hub/border 链路的 sender——目标不在直连表
+    /// 时的默认路由出口。
+    uplink: std::sync::RwLock<Option<FrameSender>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// K0：admin 回执挂起表（req_id → oneshot）
     admin_pending: Arc<crate::admin::AdminPending>,
@@ -107,6 +122,7 @@ impl RemoteActorSystem {
         let handshake = HandshakeBody {
             node_id: config.node_id.clone(),
             capabilities: crate::handshake::caps::BIN | config.extra_caps,
+            topology_role: config.topology_role,
             ..Default::default()
         };
         // 断连清理：单链路 → fail_node（其它链路不受牵连——K6 多联）；
@@ -164,6 +180,7 @@ impl RemoteActorSystem {
             inbound_tx: in_tx,
             inbound_rx: tokio::sync::Mutex::new(in_rx),
             links: tokio::sync::Mutex::new(Vec::new()),
+            uplink: std::sync::RwLock::new(None),
             shutdown_tx,
             admin_pending: Arc::new(crate::admin::AdminPending::default()),
             admin_req_id: std::sync::atomic::AtomicU64::new(1),
@@ -178,6 +195,11 @@ impl RemoteActorSystem {
     /// 启动：listen（若配置）+ 入站分发循环 + 连接种子。
     pub async fn start(self: &Arc<Self>) -> Result<(), RemoteError> {
         self.install_admin_hook();
+        // hub 转发出口注入（07 §6 两两互通：A→hub→B 中转；Weak 防循环引用）
+        *self.ingress.relay_slot() = Some(Arc::new(SystemRelay {
+            system: Arc::downgrade(self),
+            self_node: self.config.node_id.clone(),
+        }));
         // 入站分发循环
         let this = self.clone();
         let mut shutdown = self.shutdown_tx.subscribe();
@@ -309,6 +331,17 @@ impl RemoteActorSystem {
             .lock()
             .await
             .push((conn.node_id.clone(), conn.sender.clone(), status.clone()));
+        // 星型 uplink 记录（07 §6）：对端角色是 hub/border → 此链路可做
+        // 默认路由（目标不在直连表时经它中转）。多个 hub 取最新（hub
+        // 主备是 P5 拓扑管理的职责）。
+        if matches!(
+            conn.peer_role,
+            crate::handshake::TopologyRole::Hub | crate::handshake::TopologyRole::Border
+        ) {
+            let mut g = self.uplink.write().unwrap();
+            *g = Some(conn.sender.clone());
+            tracing::info!(node = %conn.node_id, role = ?conn.peer_role, "uplink set");
+        }
         // NodeTable 同步（remote_ref require 校验通过）
         self.nodes.add_seed(NodeAddr {
             node_id: conn.node_id.clone(),
@@ -318,7 +351,6 @@ impl RemoteActorSystem {
                 .peer
                 .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
         });
-        let _ = status;
         // 关闭信号 → 移除 link + Disconnected（回调可能早于 NodeTable 填充——容忍）
         let mut closed = conn.closed;
         let node_id = conn.node_id.clone();
@@ -326,6 +358,12 @@ impl RemoteActorSystem {
         tokio::spawn(async move {
             let _ = (&mut closed).await;
             this.links.lock().await.retain(|(n, _, _)| n != &node_id);
+            // uplink 失效清理（该 hub 断连——读侧 try_send 失败自然兜底）
+            let mut g = this.uplink.write().unwrap();
+            if g.as_ref().map(|s| s.node_id() == node_id).unwrap_or(false) {
+                *g = None;
+                tracing::info!(node = %node_id, "uplink cleared");
+            }
             if let Some((_, st)) = this.nodes.get(&node_id) {
                 st.set(NodeState::Disconnected);
             }
@@ -338,10 +376,15 @@ impl RemoteActorSystem {
     }
 
     /// 解析远程路径拿 ref（校验 parrot:// 前缀 + node 在表）。
+    /// 星型放宽（07 §6）：node 不在直连表但有 uplink hub → 仍可建 ref
+    /// （默认路由——帧先发 hub，由其中转到目标）。
     pub fn remote_ref(&self, path: &str) -> Result<RemoteActorRef, RemoteError> {
         let node = crate::node::node_of_path(path)
             .ok_or_else(|| RemoteError::Transport(format!("not a parrot:// path: {path}")))?;
-        self.nodes.require(node)?;
+        let has_uplink = self.uplink.read().map(|g| g.is_some()).unwrap_or(false);
+        if self.nodes.require(node).is_err() && !has_uplink {
+            return Err(RemoteError::UnknownNode(node.to_string()));
+        }
         let links = self.links.try_lock();
         let nodes = match links {
             Ok(g) => g
@@ -354,6 +397,7 @@ impl RemoteActorSystem {
             nodes,
             callbacks: self.callbacks.clone(),
             self_node: self.config.node_id.clone(),
+            uplink: self.uplink.read().ok().and_then(|g| g.clone()),
         });
         Ok(RemoteActorRef::new(path, node, inner))
     }
@@ -591,5 +635,43 @@ impl RemoteGatewayImpl {
             .remote_ref(path)
             .ok()
             .map(|r| Box::new(r) as Box<dyn parrot_api::address::ActorRef>)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// hub 转发出口（07 §6）：星型拓扑两两互通——A→hub→B 中转。
+// Weak 防循环引用（RemoteActorSystem 持 ingress，ingress 持 router，router
+// 只 Weak 指回系统——shutdown 后自动失效）。
+// ══════════════════════════════════════════════════════════════════════════
+
+struct SystemRelay {
+    system: std::sync::Weak<RemoteActorSystem>,
+    /// self node_id 副本（trait 返回 &str 借用 self——避免 upgrade 临时值）
+    self_node: String,
+}
+
+#[async_trait::async_trait]
+impl crate::ingress::RelayRouter for SystemRelay {
+    fn sender_of(&self, node: &str) -> Option<crate::transport::FrameSender> {
+        let sys = self.system.upgrade()?;
+        // try_lock：转发路径非阻塞（busy 时短暂 miss → RouteUnreachable
+        // 由上层语义兜底；避免 hub 转发把 ingress 循环挂死在锁上）
+        let g = sys.links.try_lock().ok()?;
+        g.iter()
+            .find(|(n, _, _)| n == node)
+            .map(|(_, s, _)| s.clone())
+    }
+
+    fn next_cid(&self) -> u64 {
+        // 与本地 ask 共用 cid 计数器（CallbackRegistry 分配器）——
+        // 转发 cid 与本地 cid 同空间，防 REPLY 回程映射撞号
+        self.system
+            .upgrade()
+            .map(|s| s.callbacks.next_cid())
+            .unwrap_or(0)
+    }
+
+    fn self_node(&self) -> &str {
+        &self.self_node
     }
 }

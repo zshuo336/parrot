@@ -1,0 +1,109 @@
+# 由 gen-mesh.sh 生成（N=5）——勿手改；重新生成：./gen-mesh.sh 5
+# 拓扑：链式种子 parrot-i → parrot-(i-1)；mesh 网络 IP 固定（172.28.0.0/16 段）
+name: parrot-mesh-5
+
+x-common: &common
+  image: parrot-node:latest
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+  restart: unless-stopped
+  networks:
+    mesh:
+      # 固定 IP（4 起——.1/.2 网关/DNS 保留）：探测与断言确定性
+      ipv4_address: 172.28.0.9
+
+services:
+  parrot-1:
+    <<: *common
+    container_name: mesh-parrot-1
+    environment:
+      PARROT_NODE_ID: parrot-1
+      PARROT_BIND: 0.0.0.0:9801
+      PARROT_SEEDS: ""
+      PARROT_ACTORS: echo,counter,kv,slow
+    networks:
+      mesh:
+        ipv4_address: 172.28.0.4
+    ports:
+      - "21801:9801"
+  parrot-2:
+    <<: *common
+    container_name: mesh-parrot-2
+    environment:
+      PARROT_NODE_ID: parrot-2
+      PARROT_BIND: 0.0.0.0:9801
+      PARROT_SEEDS: "parrot-1=172.28.0.4:9801"
+      PARROT_ACTORS: echo,counter,kv,slow
+    networks:
+      mesh:
+        ipv4_address: 172.28.0.5
+    ports:
+      - "21802:9801"
+  parrot-3:
+    <<: *common
+    container_name: mesh-parrot-3
+    environment:
+      PARROT_NODE_ID: parrot-3
+      PARROT_BIND: 0.0.0.0:9801
+      PARROT_SEEDS: "parrot-2=172.28.0.5:9801"
+      PARROT_ACTORS: echo,counter,kv,slow
+    networks:
+      mesh:
+        ipv4_address: 172.28.0.6
+    ports:
+      - "21803:9801"
+  parrot-4:
+    <<: *common
+    container_name: mesh-parrot-4
+    environment:
+      PARROT_NODE_ID: parrot-4
+      PARROT_BIND: 0.0.0.0:9801
+      PARROT_SEEDS: "parrot-3=172.28.0.6:9801"
+      PARROT_ACTORS: echo,counter,kv,slow
+    networks:
+      mesh:
+        ipv4_address: 172.28.0.7
+    ports:
+      - "21804:9801"
+  parrot-5:
+    <<: *common
+    container_name: mesh-parrot-5
+    environment:
+      PARROT_NODE_ID: parrot-5
+      PARROT_BIND: 0.0.0.0:9801
+      PARROT_SEEDS: "parrot-4=172.28.0.7:9801"
+      PARROT_ACTORS: echo,counter,kv,slow
+    networks:
+      mesh:
+        ipv4_address: 172.28.0.8
+    ports:
+      - "21805:9801"
+  probe:
+    <<: *common
+    container_name: mesh-probe
+    profiles: ["probe"]
+    entrypoint: ["/usr/local/bin/parrot-probe"]
+    command:
+      - parrot-1=172.28.0.4:9801
+      - parrot-2=172.28.0.5:9801
+      - parrot-3=172.28.0.6:9801
+      - parrot-4=172.28.0.7:9801
+      - parrot-5=172.28.0.8:9801
+    depends_on:
+      - parrot-1
+      - parrot-2
+      - parrot-3
+      - parrot-4
+      - parrot-5
+    restart: "no"
+    networks:
+      mesh:
+        ipv4_address: 172.28.0.10
+
+networks:
+  mesh:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

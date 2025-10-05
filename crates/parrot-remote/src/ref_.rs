@@ -24,6 +24,9 @@ pub struct RemoteInner {
     pub nodes: Vec<(String, FrameSender, Arc<NodeStatus>)>,
     pub callbacks: Arc<CallbackRegistry>,
     pub self_node: String,
+    /// 星型拓扑默认路由（07 §6）：目标节点不在直连表时经 hub 中转。
+    /// None = 无 uplink（纯直连模式——miss 即 fail）。
+    pub uplink: Option<FrameSender>,
 }
 
 impl RemoteInner {
@@ -33,6 +36,7 @@ impl RemoteInner {
             .iter()
             .find(|(n, _, _)| n == node_id)
             .map(|(_, s, _)| s)
+            .or_else(|| self.uplink.as_ref())
     }
 }
 
@@ -214,9 +218,10 @@ mod tests {
         status.set(NodeState::Connected);
         (
             Arc::new(RemoteInner {
-                nodes: vec![("n1".into(), crate::transport::FrameSender { tx }, status)],
+                nodes: vec![("n1".into(), crate::transport::FrameSender::anon(tx), status)],
                 callbacks: Arc::new(CallbackRegistry::new(8)),
                 self_node: "self".into(),
+                uplink: None,
             }),
             rx,
         )
@@ -229,6 +234,7 @@ mod tests {
             nodes: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new(8)),
             self_node: "test".into(),
+            uplink: None,
         });
         let r = RemoteActorRef::new("/x", "n", inner);
         #[derive(Debug)]
@@ -246,6 +252,7 @@ mod tests {
             nodes: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new(8)),
             self_node: "test".into(),
+            uplink: None,
         });
         let r = RemoteActorRef::new("/x", "ghost", inner.clone());
         #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -320,9 +327,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(16);
         let status = Arc::new(NodeStatus::default());
         let inner = Arc::new(RemoteInner {
-            nodes: vec![("n1".into(), crate::transport::FrameSender { tx }, status)],
+            nodes: vec![("n1".into(), crate::transport::FrameSender::anon(tx), status)],
             callbacks: Arc::new(CallbackRegistry::new(1)),
             self_node: "self".into(),
+            uplink: None,
         });
         // 预占满（cid=1000）
         let (otx, _orx) = tokio::sync::oneshot::channel();

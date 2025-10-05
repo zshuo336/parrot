@@ -32,9 +32,32 @@ pub const OUTBOUND_QUEUE: usize = 1024; // 出站队列容量（天然反压）
 #[derive(Clone)]
 pub struct FrameSender {
     pub(crate) tx: mpsc::Sender<Frame>,
+    /// 归属对端 node_id（hub 转发 fail_target 定位用——run_connection 注入；
+    /// 构造后不变）。
+    peer_node: Arc<std::sync::OnceLock<String>>,
 }
 
 impl FrameSender {
+    /// 构造（peer_node 已知——转发失效定位用）。
+    pub fn new(tx: mpsc::Sender<Frame>, peer_node: impl Into<String>) -> Self {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let _ = cell.set(peer_node.into());
+        Self { tx, peer_node: cell }
+    }
+
+    /// 测试构造（无 peer 标注——node_id() 返回 "?"）。
+    pub fn anon(tx: mpsc::Sender<Frame>) -> Self {
+        Self {
+            tx,
+            peer_node: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// 对端 node_id（未标注返回 "?"——转发失效定位退化为全表扫描）。
+    pub fn node_id(&self) -> &str {
+        self.peer_node.get().map(String::as_str).unwrap_or("?")
+    }
+
     pub async fn send(&self, f: Frame) -> Result<(), RemoteError> {
         self.tx
             .send(f)
@@ -43,6 +66,16 @@ impl FrameSender {
     }
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
+    }
+
+    /// 便捷回源（relayed reply——REPLY/REPLY_ERR 同入口：换 cid 原样回送）。
+    pub fn send_frame(&self, f: Frame) {
+        let _ = self.tx.try_send(f);
+    }
+
+    /// 同步转发（TELL 中转——队列满返回 Err，调用方记死信）。
+    pub fn send_frame_sync(&self, f: Frame) -> Result<(), RemoteError> {
+        self.tx.try_send(f).map_err(|_| RemoteError::Transport("relay queue full".into()))
     }
 }
 
@@ -64,6 +97,8 @@ pub struct ConnectionHandle {
     pub node_id: String,
     pub sender: FrameSender,
     pub info: ConnectionInfo,
+    /// 对端拓扑角色（握手协商保留——spoke 据此识别 uplink hub）。
+    pub peer_role: crate::handshake::TopologyRole,
     /// 断连通知（ConnectionTask 结束时触发一次）
     pub closed: oneshot::Receiver<()>,
 }
@@ -207,6 +242,7 @@ where
         }
     };
     let remote_node_id = peer_body.node_id.clone();
+    let peer_role = peer_body.topology_role;
 
     let (closed_tx, closed_rx) = oneshot::channel::<()>();
     let info = ConnectionInfo {
@@ -219,7 +255,7 @@ where
     let dis = on_disconnect.clone();
 
     // ---- 驱动循环 ----
-    let back_sender = FrameSender { tx: tx.clone() };
+    let back_sender = FrameSender::new(tx.clone(), remote_node_id.as_str());
     let from_node = remote_node_id.clone();
     tokio::spawn(async move {
         let mut rx = rx;
@@ -344,9 +380,10 @@ where
     });
 
     Ok(ConnectionHandle {
-        node_id: remote_node_id,
-        sender: FrameSender { tx },
+        node_id: remote_node_id.clone(),
+        sender: FrameSender::new(tx, remote_node_id),
         info,
+        peer_role,
         closed: closed_rx,
     })
 }
