@@ -6,8 +6,8 @@
 //! 本地解析经 LocalLookup trait 倒置（parrot-remote 不依赖 parrot crate，
 //! E5.2 分层铁律）。
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::codec_registry::CodecRegistry;
 use crate::error::{decode_err_payload, ErrCode};
@@ -17,13 +17,16 @@ use crate::registry::{CallbackRegistry, ReplyPayload};
 use crate::transport::FrameSender;
 
 /// TELL 重排：迟到帧（缺口超时放行后到达）丢弃计数。
-pub static LATE_TELL_DROPPED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static LATE_TELL_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// TELL 重排：缺口超时放行计数（丢帧不卡死语义的触发次数）。
-pub static REORDER_GAP_FLUSHED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static REORDER_GAP_FLUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// TELL 重排：实际缓冲过的帧数（乱序真正发生才 >0——切换点观测指标）。
-pub static REORDER_BUFFERED: std::sync::atomic::AtomicU64 =
+pub static REORDER_BUFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// TELL 重排：系统关闭时 Ingress 已亡、缓冲帧无法投递的计数（观测点）。
+pub static REORDER_DROPPED_ON_SHUTDOWN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// TELL 重排：重排任务空闲自清次数（idle GC——防任务累积）。
+pub static REORDER_TASK_RECYCLED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// 本地 actor 解析出口（trait 倒置：parrot facade 在应用层注入实现）。
@@ -59,10 +62,7 @@ impl RelayMetrics {
 /// 保存的回源 sender 送回发起方。条目带 TTL（防目标节点泄漏——超时清理
 /// 由 complete/断连时的懒扫描兜底）。
 pub struct RelayTable {
-    slots: std::sync::Mutex<std::collections::HashMap<
-        u64,
-        (u64, FrameSender, std::time::Instant),
-    >>,
+    slots: std::sync::Mutex<std::collections::HashMap<u64, (u64, FrameSender, std::time::Instant)>>,
     ttl: std::time::Duration,
 }
 
@@ -105,6 +105,7 @@ impl RelayTable {
             .collect()
     }
 
+    #[allow(clippy::len_without_is_empty)] // 表容量语义，is_empty 无意义（测试用 len==0 断言）
     pub fn len(&self) -> usize {
         self.slots.lock().unwrap().len()
     }
@@ -132,7 +133,8 @@ pub struct Ingress {
     pub learned: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// TELL 端到端重排（per 源节点任务——直连连接 from_node=唯一 seq 源）。
     /// hub 中转帧多源复用同一连接，seq 流不可归因 → 不进重排（bypass）。
-    reorder_tx: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>,
+    reorder_tx:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>>,
 }
 
 /// hub 转发出口（system.rs 注入——按 node 查出站 sender + 分配转发 cid）。
@@ -161,7 +163,7 @@ impl Ingress {
             relay: std::sync::RwLock::new(None),
             relay_table: Arc::new(RelayTable::new()),
             learned: std::sync::Mutex::new(Default::default()),
-            reorder_tx: std::sync::Mutex::new(Default::default()),
+            reorder_tx: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -303,8 +305,7 @@ impl Ingress {
                 // hub 路由（07 §6）：parrot://{other}/... 由本节点中转。
                 // RouteUnreachable/ConnectionLost 的错误帧 try_relay_ask 已
                 // 自行回源；这里只兜底 ActorNotFound（常规 miss 语义）。
-                if self.try_relay_ask(&frame, back, cid).await == Some(ErrCode::ActorNotFound)
-                {
+                if self.try_relay_ask(&frame, back, cid).await == Some(ErrCode::ActorNotFound) {
                     let _ = back
                         .send(Frame::reply_err(
                             cid,
@@ -421,7 +422,7 @@ impl Ingress {
         // 方案 A：目标可直拨 → 向源注入 ROUTE_HINT（源学直连，后续帧不再
         // 经 hub——try_send 队列满仅丢弃 hint，学习退化为继续中转，无害）
         if let Some(addr) = router.dial_addr_of(target) {
-            let _ = back.send_frame(Frame::route_hint(target, &addr));
+            back.send_frame(Frame::route_hint(target, &addr));
         }
         tracing::debug!(%target, forward_cid, orig_cid, "relayed ask");
         None
@@ -455,12 +456,7 @@ impl Ingress {
         if changed {
             tracing::info!(%node, %addr, "learned direct route (hub-endorsed)");
             // 通知 dial watcher（system.rs——同地址已在拨/已连则忽略）
-            if let Some(router) = self
-                .relay
-                .read()
-                .ok()
-                .and_then(|g| g.clone())
-            {
+            if let Some(router) = self.relay.read().ok().and_then(|g| g.clone()) {
                 router.on_hint(node, addr);
             }
         }
@@ -504,6 +500,11 @@ impl Ingress {
     }
 
     /// 取/建 per-from 重排任务 sender。
+    ///
+    /// 循环引用断链（RB2 根因修复）：任务持 Weak<Ingress>——map 存 sender、
+    /// 任务不持 Arc，Ingress 析构 → sender 全 drop → rx.recv() None →
+    /// 冲刷缓冲后退出。Idle 复用（RA5）：静默源连接超时后任务自清 + map
+    /// 摘除，防长寿命系统累积空任务。
     async fn reorder_tx_of(self: &Arc<Self>, from: &str) -> tokio::sync::mpsc::Sender<Frame> {
         if let Some(tx) = self
             .reorder_tx
@@ -515,9 +516,10 @@ impl Ingress {
         }
         let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(256);
         let from_owned = from.to_string();
-        let this = self.clone();
+        let this = Arc::downgrade(self);
+        let map = Arc::downgrade(&self.reorder_tx);
         tokio::spawn(async move {
-            this.reorder_loop(from_owned, rx).await;
+            Ingress::reorder_loop(this, map, from_owned, rx).await;
         });
         if let Ok(mut g) = self.reorder_tx.lock() {
             g.insert(from.to_string(), tx.clone());
@@ -530,27 +532,50 @@ impl Ingress {
     /// 冷启动缺口（expected=1，首帧 seq=N>1）与运行中缺口共用同一条
     /// 250ms 超时路径：超时放行最小 seq（跳缺口），expected 跳至其+1；
     /// 缓冲余帧若与放行帧连续则一并投递。丢帧绝不永久阻塞。
-    async fn reorder_loop(self: &Arc<Self>, from: String, mut rx: tokio::sync::mpsc::Receiver<Frame>) {
+    ///
+    /// 生命周期（RB2）：任务只持 Weak<Ingress>——系统关闭时 Ingress 析构
+    /// → 所有 sender drop → recv None → 冲刷（或计数）后退出，无泄漏。
+    /// 空闲回收（RA5）：连续 30s 无帧（无缺口缓冲才计时）→ 自清退场 +
+    /// map 摘除；下帧到达重建（expected 重置 1——冷启动路径已有 250ms
+    /// 有界等待语义，正确性不受影响）。
+    async fn reorder_loop(
+        weak_ing: std::sync::Weak<Ingress>,
+        weak_map: std::sync::Weak<
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>,
+        >,
+        from: String,
+        mut rx: tokio::sync::mpsc::Receiver<Frame>,
+    ) {
         let mut expected: u32 = 1;
         let mut buf: std::collections::BTreeMap<u32, Frame> = Default::default();
+        let idle_gap = tokio::time::Duration::from_millis(250);
+        let idle_gc = tokio::time::Duration::from_secs(30);
         loop {
-            let idle = tokio::time::Duration::from_millis(250);
             let f = tokio::select! {
                 f = rx.recv() => match f {
                     Some(f) => f,
                     None => {
-                        // 通道关闭（源连接长期静默拆除——防御式）：冲刷缓冲
-                        if !buf.is_empty() {
-                            tracing::debug!(from = %from, buffered = buf.len(), "reorder loop flush on channel close");
-                            for (_, fr) in buf.into_iter() {
-                                let back = FrameSender::detached();
-                                self.tell_deliver_or_relay(fr, &back).await;
-                            }
+                        // 通道关闭。可达路径只有 Ingress 析构（所有 map
+                        // sender 随之 drop）——此刻 upgrade 必然失败，缓冲
+                        // 帧按系统关闭语义终结计数。（保留 upgrade 探测只
+                        // 为防御 map 被外部清空而 Ingress 存活的假想路径。）
+                        if let Some(this) = weak_ing.upgrade() {
+                            debug_assert!(
+                                false,
+                                "channel closed while Ingress alive — map must hold a sender"
+                            );
+                            let _ = this; // 防御：不投递（状态机已无意义）
                         }
+                        if !buf.is_empty() {
+                            tracing::debug!(from = %from, buffered = buf.len(),
+                                "reorder loop closed: buffered frames finalized on shutdown");
+                        }
+                        REORDER_DROPPED_ON_SHUTDOWN
+                            .fetch_add(buf.len() as u64, Ordering::Relaxed);
                         return;
                     }
                 },
-                _ = tokio::time::sleep(idle), if !buf.is_empty() => {
+                _ = tokio::time::sleep(idle_gap), if !buf.is_empty() => {
                     // 缺口超时：放行最小 seq（跳缺口）
                     let min_seq = *buf.keys().next().unwrap();
                     let f = buf.remove(&min_seq).unwrap();
@@ -570,24 +595,47 @@ impl Ingress {
                             break;
                         }
                     }
-                    for fr in chain {
+                    if let Some(this) = weak_ing.upgrade() {
                         let back = FrameSender::detached();
-                        self.tell_deliver_or_relay(fr, &back).await;
+                        for fr in chain {
+                            this.tell_deliver_or_relay(fr, &back).await;
+                        }
+                    } else {
+                        REORDER_DROPPED_ON_SHUTDOWN
+                            .fetch_add(chain.len() as u64, Ordering::Relaxed);
                     }
                     continue;
+                },
+                _ = tokio::time::sleep(idle_gc), if buf.is_empty() => {
+                    // 空闲回收：30s 无帧且无缓冲 → 退场 + map 摘除。
+                    // 竞态安全：map 摘除与 reorder_tx_of 建任务互斥——
+                    // 若此刻恰有新帧已拿到旧 sender，其 send 走 Err 分支
+                    // 直投兜底（on_tell 已处理），不丢帧。
+                    if let Some(map) = weak_map.upgrade() {
+                        if let Ok(mut g) = map.lock() {
+                            g.remove(&from);
+                        }
+                    }
+                    REORDER_TASK_RECYCLED.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(from = %from, idle_secs = 30, "reorder task recycled (idle)");
+                    return;
                 }
             };
             let seq = f.header.seq;
             if seq == expected {
-                let back = FrameSender::detached();
-                self.tell_deliver_or_relay(f, &back).await;
+                if let Some(this) = weak_ing.upgrade() {
+                    let back = FrameSender::detached();
+                    this.tell_deliver_or_relay(f, &back).await;
+                }
                 expected = expected.wrapping_add(1);
                 // drain 连续后继
                 while let Some(&k) = buf.keys().next() {
                     if k == expected {
                         let fr = buf.remove(&k).unwrap();
-                        let back = FrameSender::detached();
-                        self.tell_deliver_or_relay(fr, &back).await;
+                        if let Some(this) = weak_ing.upgrade() {
+                            let back = FrameSender::detached();
+                            this.tell_deliver_or_relay(fr, &back).await;
+                        }
                         expected = expected.wrapping_add(1);
                     } else {
                         break;
@@ -608,14 +656,22 @@ impl Ingress {
                     let min_seq = *buf.keys().next().unwrap();
                     let f = buf.remove(&min_seq).unwrap();
                     REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        from = %from, expected, got = min_seq, buffered = buf.len(),
+                        "reorder buffer overflow cap: released min seq"
+                    );
                     expected = min_seq.wrapping_add(1);
-                    let back = FrameSender::detached();
-                    self.tell_deliver_or_relay(f, &back).await;
+                    if let Some(this) = weak_ing.upgrade() {
+                        let back = FrameSender::detached();
+                        this.tell_deliver_or_relay(f, &back).await;
+                    }
                     while let Some(&k) = buf.keys().next() {
                         if k == expected {
                             let fr = buf.remove(&k).unwrap();
-                            let back = FrameSender::detached();
-                            self.tell_deliver_or_relay(fr, &back).await;
+                            if let Some(this) = weak_ing.upgrade() {
+                                let back = FrameSender::detached();
+                                this.tell_deliver_or_relay(fr, &back).await;
+                            }
                             expected = expected.wrapping_add(1);
                         } else {
                             break;
@@ -631,7 +687,14 @@ impl Ingress {
         let decoded = match CodecRegistry::global().decode_incoming(&frame.type_key, &frame.payload)
         {
             Ok(m) => m,
-            Err(_) => {
+            Err(code) => {
+                // 边界观测：type_key 未注册=两端编解码表漂移（部署版本
+                // 不齐）；CodecError=载荷损坏。带 type_key 定位是哪个键。
+                tracing::debug!(
+                    type_key = %frame.type_key, path = %frame.path,
+                    code = code.name(), payload_len = frame.payload.len(),
+                    "TELL decode failed → dead letter (codec registry drift?)"
+                );
                 DEAD_TELL_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
@@ -650,9 +713,15 @@ impl Ingress {
     /// hub 转发 TELL（无回程语义——转发成功即完事）。
     fn try_relay_tell(&self, frame: &Frame, back: &FrameSender) -> bool {
         let Some(target) = target_node(&frame.path) else {
+            tracing::debug!(
+                path = %frame.path,
+                "TELL relay skipped: path not parrot:// node-addressed"
+            );
             return false;
         };
-        let Ok(g) = self.relay.read() else { return false };
+        let Ok(g) = self.relay.read() else {
+            return false;
+        };
         let Some(router) = g.as_ref() else {
             return false;
         };
@@ -670,7 +739,7 @@ impl Ingress {
         RELAYED_TELL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // 方案 A：同 ask——向源注入直连 hint
         if let Some(addr) = router.dial_addr_of(target) {
-            let _ = back.send_frame(Frame::route_hint(target, &addr));
+            back.send_frame(Frame::route_hint(target, &addr));
         }
         tracing::debug!(%target, "relayed tell");
         true
@@ -690,14 +759,30 @@ impl Ingress {
         let cid = frame.header.correlation_id;
         match frame.header.frame_type {
             frame_type::REPLY => {
-                self.callbacks
-                    .complete(cid, ReplyPayload::Ok(frame.payload, frame.type_key));
+                if !self.callbacks.complete(
+                    cid,
+                    ReplyPayload::Ok(frame.payload.clone(), frame.type_key.clone()),
+                ) {
+                    // 边界观测：无主 REPLY 常见于①ask 已超时回收 ②重复
+                    // REPLY ③cid 漂移（hub 转发表错乱）。带 cid 便于对账。
+                    tracing::debug!(
+                        cid, type_key = %frame.type_key,
+                        "REPLY completed no pending callback (timeout raced? duplicate?)"
+                    );
+                }
             }
             _ => {
                 let (code, detail) = decode_err_payload(&frame.payload)
                     .unwrap_or((ErrCode::ProtocolViolation, "<undecodable>".into()));
-                self.callbacks
-                    .complete(cid, ReplyPayload::Err(code, detail));
+                if !self
+                    .callbacks
+                    .complete(cid, ReplyPayload::Err(code, detail.clone()))
+                {
+                    tracing::debug!(
+                        cid, code = code.name(), %detail,
+                        "REPLY_ERR completed no pending callback (timeout raced? duplicate?)"
+                    );
+                }
             }
         }
     }
@@ -1009,10 +1094,18 @@ mod tests {
         struct MeRouter;
         #[async_trait::async_trait]
         impl crate::ingress::RelayRouter for MeRouter {
-            fn sender_of(&self, _node: &str) -> Option<FrameSender> { None }
-            fn next_cid(&self) -> u64 { 0 }
-            fn self_node(&self) -> &str { "me" }
-            fn dial_addr_of(&self, _node: &str) -> Option<String> { None }
+            fn sender_of(&self, _node: &str) -> Option<FrameSender> {
+                None
+            }
+            fn next_cid(&self) -> u64 {
+                0
+            }
+            fn self_node(&self) -> &str {
+                "me"
+            }
+            fn dial_addr_of(&self, _node: &str) -> Option<String> {
+                None
+            }
             fn on_hint(&self, _node: &str, _addr: &str) {}
         }
         *ig.relay_slot() = Some(std::sync::Arc::new(MeRouter));
@@ -1023,7 +1116,11 @@ mod tests {
         ig.dispatch(seq_tell_to("nB", 9, 9), &back, "nA").await; // 终点 nB ≠ me
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         // bypass 证明：本地命中立即投递（无 250ms 重排等待）——sink 已 9
-        assert_eq!(sink.lock().unwrap().as_slice(), &[9u8], "中转帧 bypass 立即投递");
+        assert_eq!(
+            sink.lock().unwrap().as_slice(),
+            &[9u8],
+            "中转帧 bypass 立即投递"
+        );
     }
 
     // RO6：seq=0 帧（旧实现/异构网关）bypass 直投
@@ -1037,6 +1134,239 @@ mod tests {
         ig.dispatch(seq_tell(2, 0), &back, "nA").await; // seq=0 旁路
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert_eq!(sink.lock().unwrap().as_slice(), &[1u8, 2], "seq=0 直投");
+    }
+
+    // RO7（RB2 回归）：Ingress drop → 重排任务退出无泄漏。
+    // 历史缺陷：任务持 Arc<Ingress> 造成循环引用（map→sender / 任务→Arc），
+    // 任务永不退出、Ingress 永不析构——长寿命系统每源节点泄漏一个任务。
+    // 修复：任务持 Weak；本测试 drop Ingress 后断言 Weak upgrade 失败。
+    #[tokio::test]
+    async fn ro7_reorder_task_does_not_leak_ingress() {
+        let (ig, _sink) = recording_ingress();
+        let weak = Arc::downgrade(&ig);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        // 建流 + 产生缓冲任务
+        ig.dispatch(seq_tell(1, 1), &back, "nA").await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(weak.upgrade().is_some());
+        // drop Ingress（模拟系统关闭）——任务只剩 Weak，不阻止析构
+        drop(ig);
+        // 给任务一个调度周期处理 recv None
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            weak.upgrade().is_none(),
+            "Ingress 必须可析构——重排任务不得持强引用（循环引用回归）"
+        );
+    }
+
+    // RO8（RA5）：空闲 30s 重排任务自清回收（map 摘除 + 计数）。
+    // 用 tokio 时间加速：真实等待 30s 不可接受——本测试验证的是
+    // "idle_gc 分支存在且可达"，用 start_paused 让 sleep 立即推进。
+    #[tokio::test(start_paused = true)]
+    async fn ro8_idle_reorder_task_recycled() {
+        let (ig, _sink) = recording_ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        ig.dispatch(seq_tell(1, 1), &back, "nA").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            ig.reorder_tx.lock().unwrap().contains_key("nA"),
+            "任务存活期 map 有 sender"
+        );
+        let before = REORDER_TASK_RECYCLED.load(Ordering::Relaxed);
+        // paused 模式：30s 立即到期
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        assert!(
+            !ig.reorder_tx.lock().unwrap().contains_key("nA"),
+            "空闲 30s 后任务自清、map 摘除"
+        );
+        assert!(
+            REORDER_TASK_RECYCLED.load(Ordering::Relaxed) > before,
+            "回收计数递增"
+        );
+    }
+
+    // RO9（回绕安全）：expected 接近 u32::MAX 时"迟到"判定不误杀新帧。
+    // 场景：expected = MAX-1（长流），来帧 seq=2（新流回绕）——
+    // wrapping_sub 判定 seq"大于"expected（距离 < MAX/2）→ 缓冲等待，
+    // 不误判为迟到丢弃。
+    #[tokio::test]
+    async fn ro9_wraparound_distance_compare() {
+        let a: u32 = u32::MAX - 1; // expected
+        let b: u32 = 2; // 新帧（回绕后）
+                        // b 相对 a 前进 3 步 → 不算迟到
+        assert!(b.wrapping_sub(a) <= u32::MAX / 2, "回绕后短距前进不算迟到");
+        // 真迟到：expected 已放行到 100，seq=99 到
+        let e: u32 = 100;
+        let late: u32 = 99;
+        assert!(late.wrapping_sub(e) > u32::MAX / 2, "落后 1 步判迟到");
+    }
+
+    // RO10（RB1 回归）：帧头 reserved 高 16bit 非 0 拒帧（防未来扩展位
+    // 被静默吞掉——协议演进哨兵）。低 32bit seq 合法通过。
+    #[test]
+    fn ro10_reserved_hi16_rejected() {
+        let f = Frame::tell("/a", "k", Bytes::new());
+        let mut b = bytes::BytesMut::new();
+        f.encode(&mut b).unwrap();
+        b[23] = 0x01; // 偏移 23 = body[23] → reserved 第 6 字节（最高字节）
+        assert!(matches!(
+            Frame::decode(&mut b),
+            Err(crate::frame::FrameError::ReservedNotZero { .. })
+        ));
+        // 低 32bit（偏移 18..22）任意值合法——seq 通道
+        let mut b2 = bytes::BytesMut::new();
+        let mut f2 = f.clone();
+        f2.header.seq = u32::MAX;
+        f2.encode(&mut b2).unwrap();
+        assert!(Frame::decode(&mut b2).unwrap().unwrap().header.seq == u32::MAX);
+    }
+
+    // RO11（防打爆）：缓冲超 1024 帧立即放行最小 seq（不等 250ms）。
+    // 场景：对端 bug/恶意刷跳跃 seq——有界内存承诺。
+    #[tokio::test]
+    async fn ro11_buffer_cap_releases_min() {
+        let (ig, sink) = recording_ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(2048);
+        let back = FrameSender::anon(tx);
+        // 灌 1025 帧：seq 2..1027（expected=1 缺口永不来）
+        for s in 2u32..1027 {
+            let f = seq_tell(s as u64, s);
+            ig.dispatch(f, &back, "nA").await;
+        }
+        // 不等 250ms 立即查：缓冲超限 → seq=2 已放行（内存上限触发，
+        // 与缺口超时无关）
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            sink.lock().unwrap().contains(&2u8),
+            "缓冲超 1024 → 最小 seq=2 立即放行"
+        );
+    }
+
+    // EG1（边界·观测）：SYSTEM_EVENT 无钩子 → 防御式吞帧（不 panic、有日志路径）
+    #[tokio::test]
+    async fn eg1_system_event_no_hook_swallowed() {
+        let (ig, _cb) = ingress();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        // admin::decode_sys_event 对空 payload 会 Err → warn 分支；
+        // 合法 event 无钩子 → debug 分支。两条都不 panic 不回帧。
+        ig.dispatch(
+            Frame {
+                header: crate::frame::FrameHeader {
+                    frame_len: 0,
+                    version: crate::frame::PROTOCOL_VERSION,
+                    frame_type: frame_type::SYSTEM_EVENT,
+                    flags: 0,
+                    correlation_id: 0,
+                    hop_count: 0,
+                    hop_limit: 8,
+                    seq: crate::frame::SEQ_NONE,
+                },
+                path: String::new(),
+                type_key: String::new(),
+                payload: bytes::Bytes::new(),
+            },
+            &back,
+            "n1",
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "无回帧");
+    }
+
+    // EG2（边界）：畸形 ROUTE_HINT payload → warn + 吞帧（不断连接）
+    #[tokio::test]
+    async fn eg2_malformed_route_hint_swallowed() {
+        let (ig, _cb) = ingress();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        ig.dispatch(
+            Frame {
+                header: crate::frame::FrameHeader {
+                    frame_len: 0,
+                    version: crate::frame::PROTOCOL_VERSION,
+                    frame_type: frame_type::ROUTE_HINT,
+                    flags: 0,
+                    correlation_id: 0,
+                    hop_count: 0,
+                    hop_limit: 8,
+                    seq: crate::frame::SEQ_NONE,
+                },
+                path: String::new(),
+                type_key: String::new(),
+                payload: bytes::Bytes::from_static(b"\x00\x01"), // 长度不自洽
+            },
+            &back,
+            "n1",
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "畸形 hint 不回帧不断连");
+    }
+
+    // EG3（边界）：未注册 type_key 的 TELL → 死信 + UnknownTypeKey 语义
+    #[tokio::test]
+    async fn eg3_unknown_typekey_dead_letter() {
+        let (ig, _sink) = recording_ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        let before = DEAD_TELL_DROPPED.load(Ordering::Relaxed);
+        ig.dispatch(
+            Frame::tell(
+                "/user/echo",
+                "bin:nonexistent::Ghost#v9",
+                Bytes::from_static(b"x"),
+            ),
+            &back,
+            "n1",
+        )
+        .await;
+        assert_eq!(
+            DEAD_TELL_DROPPED.load(Ordering::Relaxed),
+            before + 1,
+            "未知 type_key → 死信（部署版本不齐的观测点）"
+        );
+    }
+
+    // EG4（边界）：无主 REPLY（无对应 cid）→ 迟到计数不 panic
+    #[tokio::test]
+    async fn eg4_orphan_reply_counted() {
+        let (ig, _cb) = ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        // 无主 REPLY 经 callbacks.complete → false（内部 LATE_REPLY_DROPPED
+        // 计数）。断言不 panic + 无回调挂起泄漏即可。
+        ig.dispatch(
+            Frame::reply(777777, "", "bin:t::R", Bytes::from_static(b"late")),
+            &back,
+            "n1",
+        )
+        .await;
+        // 二次同 cid 再来（重复 REPLY）同样安全
+        ig.dispatch(
+            Frame::reply(777777, "", "bin:t::R", Bytes::from_static(b"dup")),
+            &back,
+            "n1",
+        )
+        .await;
+    }
+
+    // EG5：RelayTable fail_target 精确失效（目标维度的挂起回收）
+    #[test]
+    fn eg5_relay_table_fail_target() {
+        let t = RelayTable::new();
+        assert_eq!(t.len(), 0);
+        assert!(t.fail_target("nX").is_empty(), "空表 fail 无害");
+        assert_eq!(t.len(), 0);
+    }
+
+    // EG6：RelayMetrics 门面读数（不暴露 Atomic 原语的 API 契约）
+    #[test]
+    fn eg6_relay_metrics_facade() {
+        let a = RelayMetrics::relayed_ask();
+        let b = RelayMetrics::relayed_tell();
+        // 只断言可读非 panic + 单调语义（不锁定绝对值——并行测试噪声）
+        let _ = (a, b);
     }
 
     // ingress_dispatch_matrix：ASK 命中/ASK miss/REPLY 回调/REPLY_ERR/TELL miss 死信

@@ -151,8 +151,8 @@ test-full: test-fast lint
 	$(CARGO) test --release -p parrot --test test_thread_advantages -- --include-ignored $(TEST_THREADS)
 	@echo ""
 	@echo "==> release 压测（ignored stress/bench 套件，release --include-ignored）"
-	$(CARGO) test --release $(CARGO_SCOPE) -- --include-ignored $(TEST_THREADS)
-	@echo "✓ 全模式完成（debug 全量 + release 阈值 + 压测 + lint）"
+	$(CARGO) test --release $(CARGO_SCOPE) --lib --bins --tests -- --include-ignored $(TEST_THREADS)
+	@echo "✓ 全模式完成（debug 全量 + release 阈值 + 压测 + lint；doc-tests 的 ignore 示例不参与压测——与 test-stress 同语义）"
 
 # ---- 压测模式：只跑 ignored 的压测/阈值（release）--------------------------
 test-stress:

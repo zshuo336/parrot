@@ -257,7 +257,11 @@ impl Frame {
 
     /// 解 ROUTE_HINT payload → (node, addr)。
     pub fn parse_route_hint(payload: &[u8]) -> Result<(String, String), FrameError> {
-        let bad = |n: usize| FrameError::MalformedLengths { flen: n as u32, plen: 0, klen: 0 };
+        let bad = |n: usize| FrameError::MalformedLengths {
+            flen: n as u32,
+            plen: 0,
+            klen: 0,
+        };
         if payload.len() < 4 {
             return Err(bad(payload.len()));
         }
@@ -266,8 +270,7 @@ impl Frame {
             return Err(bad(payload.len()));
         }
         let node = std::str::from_utf8(&payload[2..2 + nlen]).map_err(|_| bad(nlen))?;
-        let alen =
-            u16::from_le_bytes([payload[2 + nlen], payload[3 + nlen]]) as usize;
+        let alen = u16::from_le_bytes([payload[2 + nlen], payload[3 + nlen]]) as usize;
         let aoff = 2 + nlen + 2;
         if payload.len() < aoff + alen {
             return Err(bad(payload.len()));
@@ -388,6 +391,10 @@ impl Frame {
         }
         let body_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if body_len > MAX_FRAME_LEN {
+            tracing::warn!(
+                len = body_len, max = MAX_FRAME_LEN,
+                "frame length exceeds cap (corrupted stream? malicious peer? mismatched MAX_FRAME_LEN)"
+            );
             return Err(FrameError::TooLarge {
                 len: body_len,
                 max: MAX_FRAME_LEN,
@@ -399,6 +406,12 @@ impl Frame {
         buf.advance(4);
         let version = buf.get_u8();
         if version != PROTOCOL_VERSION {
+            tracing::warn!(
+                expect = PROTOCOL_VERSION,
+                got = version,
+                body_len,
+                "wire version mismatch (peer on different protocol major?)"
+            );
             return Err(FrameError::VersionMismatch {
                 expect: PROTOCOL_VERSION,
                 got: version,
@@ -427,6 +440,14 @@ impl Frame {
                 | frame_type::ERROR
         );
         if !known {
+            // 边界观测（RB3 类教训）：未知码点几乎必是两端协议版本漂移——
+            // 静默断连最难排查，这里带全上下文打点（hex 便于对照 wire 文档）
+            tracing::warn!(
+                got = format!("0x{ft:02X}"),
+                version,
+                body_len,
+                "unknown frame type rejected (peer protocol newer? check frame.rs frame_type)"
+            );
             return Err(FrameError::UnknownFrameType { got: ft });
         }
         let fl = buf.get_u16_le();
@@ -438,12 +459,24 @@ impl Frame {
         let seq = buf.get_u32_le();
         let reserved_hi: u64 = buf.get_u16_le() as u64;
         if reserved_hi != 0 {
+            tracing::warn!(
+                got = format!("0x{reserved_hi:04X}"),
+                ft = format!("0x{ft:02X}"),
+                cid,
+                seq,
+                "reserved high 16bit non-zero (peer using unallocated extension?)"
+            );
             return Err(FrameError::ReservedNotZero {
                 got: reserved_hi << 32,
             });
         }
         let path_len = buf.get_u32_le() as usize;
         let path = String::from_utf8(buf.copy_to_bytes(path_len).to_vec()).map_err(|e| {
+            tracing::warn!(
+                len = path_len,
+                valid_up_to = e.utf8_error().valid_up_to(),
+                "path field not valid UTF-8 (codec mismatch or stream corruption)"
+            );
             FrameError::Utf8 {
                 field: "path",
                 source: e.utf8_error(),
@@ -451,12 +484,30 @@ impl Frame {
         })?;
         let key_len = buf.get_u32_le() as usize;
         let key = String::from_utf8(buf.copy_to_bytes(key_len).to_vec()).map_err(|e| {
+            tracing::warn!(
+                len = key_len,
+                valid_up_to = e.utf8_error().valid_up_to(),
+                "type_key field not valid UTF-8 (codec mismatch or stream corruption)"
+            );
             FrameError::Utf8 {
                 field: "type_key",
                 source: e.utf8_error(),
             }
         })?;
         let payload_len = body_len as usize - BODY_FIXED_OVERHEAD - path_len - key_len;
+        if path_len + key_len + BODY_FIXED_OVERHEAD > body_len as usize {
+            tracing::warn!(
+                flen = body_len,
+                plen = path_len,
+                klen = key_len,
+                "declared lengths exceed frame body (corrupted or hostile frame)"
+            );
+            return Err(FrameError::MalformedLengths {
+                flen: body_len,
+                plen: path_len as u32,
+                klen: key_len as u32,
+            });
+        }
         let payload = buf.copy_to_bytes(payload_len);
         let header = FrameHeader {
             frame_len: body_len,
@@ -543,7 +594,7 @@ impl Frame {
                 correlation_id: 0, // 批载体无整体 cid
                 hop_count,
                 hop_limit: DEFAULT_HOP_LIMIT,
-                    seq: crate::frame::SEQ_NONE,
+                seq: crate::frame::SEQ_NONE,
             },
             path: first.path.clone(),
             type_key: first.type_key.clone(),

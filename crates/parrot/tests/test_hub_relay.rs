@@ -13,7 +13,7 @@ use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, EmptyConfig};
-use parrot_api::address::{ActorPath, ActorRef, ActorRefExt};
+use parrot_api::address::{ActorPath, ActorRef};
 use parrot_api::system::{ActorSystem, ActorSystemConfig};
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_remote::{LocalLookup, RemoteActorSystem, RemoteConfig as RCfg};
@@ -119,9 +119,9 @@ impl LocalLookup for FacadeLookup {
 
 /// 星型三节点：a、b 互不直连，各连 hub（TCP）。
 async fn star_topology() -> (
-    Arc<RemoteActorSystem>, // a
-    Arc<RemoteActorSystem>, // b
-    Arc<RemoteActorSystem>, // hub
+    Arc<RemoteActorSystem>,                       // a
+    Arc<RemoteActorSystem>,                       // b
+    Arc<RemoteActorSystem>,                       // hub
     std::sync::Arc<std::sync::atomic::AtomicU64>, // b 的 note 计数
 ) {
     // hub：无本地 actor（纯路由）
@@ -156,7 +156,9 @@ async fn star_topology() -> (
         .await
         .unwrap();
     ts_b.spawn_at(
-        NoteActor { count: counter.clone() },
+        NoteActor {
+            count: counter.clone(),
+        },
         "/user/note",
         None,
         ThreadActorConfig::default(),
@@ -266,7 +268,7 @@ async fn rh3_no_route_err() {
 async fn rh4_relay_link_loss_fails_pending() {
     let (ra, rb, _hub, _) = star_topology().await;
     // 拆掉 hub↔B 链路（B 主动断）
-    rb.shutdown().await;
+    let _ = rb.shutdown().await;
     // 给断连传播留时间
     tokio::time::sleep(Duration::from_millis(300)).await;
     let r = ra.remote_ref("parrot://node-b/user/echo").unwrap();
@@ -337,8 +339,11 @@ async fn rh6_direct_link_learned_from_hint() {
         l.local_addr().unwrap().port()
     };
     let rb = RemoteActorSystem::new(
-        RCfg::tcp("node-b", Some(format!("127.0.0.1:{b_port}").parse().unwrap()))
-            .with_direct_addr(format!("127.0.0.1:{b_port}")),
+        RCfg::tcp(
+            "node-b",
+            Some(format!("127.0.0.1:{b_port}").parse().unwrap()),
+        )
+        .with_direct_addr(format!("127.0.0.1:{b_port}")),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
@@ -464,7 +469,9 @@ async fn rh7_tell_order_preserved_across_route_switch() {
         .unwrap();
     let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     ts_b.spawn_at(
-        OrderActor { order: order.clone() },
+        OrderActor {
+            order: order.clone(),
+        },
         "/user/order",
         None,
         ThreadActorConfig::default(),
@@ -476,8 +483,11 @@ async fn rh7_tell_order_preserved_across_route_switch() {
         l.local_addr().unwrap().port()
     };
     let rb = RemoteActorSystem::new(
-        RCfg::tcp("node-b", Some(format!("127.0.0.1:{b_port}").parse().unwrap()))
-            .with_direct_addr(format!("127.0.0.1:{b_port}")),
+        RCfg::tcp(
+            "node-b",
+            Some(format!("127.0.0.1:{b_port}").parse().unwrap()),
+        )
+        .with_direct_addr(format!("127.0.0.1:{b_port}")),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
@@ -565,3 +575,155 @@ async fn rh7_tell_order_preserved_across_route_switch() {
     assert_eq!(got, expect, "跨切换点 TELL 全序保持（seq 重排生效）");
 }
 
+// ===========================================================================
+// RH8（整合·压力）：直连高吞吐 TELL 流 5000 帧全序 + 不丢（重排网关在
+// 高速流下的正确性——不只是切换点边界）
+// ===========================================================================
+
+#[tokio::test]
+async fn rh8_direct_high_throughput_order() {
+    // 两节点直连（无 hub）
+    let facade_b = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
+    let ts_b = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    facade_b
+        .register_thread_system("eng".into(), ts_b.clone(), true)
+        .await
+        .unwrap();
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    ts_b.spawn_at(
+        OrderActor {
+            order: order.clone(),
+        },
+        "/user/order",
+        None,
+        ThreadActorConfig::default(),
+    )
+    .await
+    .unwrap();
+    let rb = RemoteActorSystem::new(
+        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())),
+        Arc::new(FacadeLookup {
+            facade: facade_b.clone(),
+        }),
+    )
+    .unwrap();
+    rb.start().await.unwrap();
+    let b_port = rb.local_addr().unwrap().port();
+
+    let ra = RemoteActorSystem::new(
+        RCfg::tcp("node-a", None),
+        Arc::new(FacadeLookup {
+            facade: Arc::new(
+                ParrotActorSystem::new(ActorSystemConfig::default())
+                    .await
+                    .unwrap(),
+            ),
+        }),
+    )
+    .unwrap();
+    ra.start().await.unwrap();
+    ra.connect(&parrot_remote::NodeAddr::tcp(
+        "node-b",
+        format!("127.0.0.1:{b_port}").parse().unwrap(),
+    ))
+    .await
+    .unwrap();
+    eventually(Duration::from_secs(3), || async {
+        ra.remote_ref("parrot://node-b/user/order").is_ok()
+    })
+    .await;
+
+    let r = ra.remote_ref("parrot://node-b/user/order").unwrap();
+    let t0 = std::time::Instant::now();
+    for i in 0..5000u64 {
+        r.deliver(Box::new(HNote(i))).await.unwrap();
+    }
+    let send_elapsed = t0.elapsed();
+    eventually(Duration::from_secs(15), || async {
+        order.lock().unwrap().len() == 5000
+    })
+    .await;
+    let got = order.lock().unwrap().clone();
+    let expect: Vec<u64> = (0..5000u64).collect();
+    assert_eq!(got, expect, "5000 帧直连流全序无丢失");
+    // 观测记录：send 侧耗时（背压贯通体现——deliver 受 B 侧消费节流）
+    println!("rh8: 5000 tells sent in {send_elapsed:?}");
+}
+
+// ===========================================================================
+// RH9（整合·关闭）：发送方关闭后再发 tell 不悬挂（重排通道关闭兜底直投）
+// ===========================================================================
+
+#[tokio::test]
+async fn rh9_shutdown_no_hang() {
+    let facade_b = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
+    let ts_b = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    facade_b
+        .register_thread_system("eng".into(), ts_b.clone(), true)
+        .await
+        .unwrap();
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    ts_b.spawn_at(
+        OrderActor {
+            order: order.clone(),
+        },
+        "/user/order",
+        None,
+        ThreadActorConfig::default(),
+    )
+    .await
+    .unwrap();
+    let rb = RemoteActorSystem::new(
+        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())),
+        Arc::new(FacadeLookup {
+            facade: facade_b.clone(),
+        }),
+    )
+    .unwrap();
+    rb.start().await.unwrap();
+    let b_port = rb.local_addr().unwrap().port();
+    let ra = RemoteActorSystem::new(
+        RCfg::tcp("node-a", None),
+        Arc::new(FacadeLookup {
+            facade: Arc::new(
+                ParrotActorSystem::new(ActorSystemConfig::default())
+                    .await
+                    .unwrap(),
+            ),
+        }),
+    )
+    .unwrap();
+    ra.start().await.unwrap();
+    ra.connect(&parrot_remote::NodeAddr::tcp(
+        "node-b",
+        format!("127.0.0.1:{b_port}").parse().unwrap(),
+    ))
+    .await
+    .unwrap();
+    eventually(Duration::from_secs(3), || async {
+        ra.remote_ref("parrot://node-b/user/order").is_ok()
+    })
+    .await;
+    // 建流 + 发送 + 关闭 B（接收方 Ingress 析构 → 重排任务 recv None 退出）
+    let r = ra.remote_ref("parrot://node-b/user/order").unwrap();
+    r.deliver(Box::new(HNote(1))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = rb.shutdown().await;
+    // A 侧再发：连接已断 → deliver 快速失败（不悬挂）
+    let t0 = std::time::Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(3), r.deliver(Box::new(HNote(2)))).await;
+    assert!(
+        res.is_ok(),
+        "tell after peer shutdown must resolve fast (got {:?}, elapsed {:?})",
+        res.map(|_| ()),
+        t0.elapsed()
+    );
+}

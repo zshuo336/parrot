@@ -42,7 +42,10 @@ impl FrameSender {
     pub fn new(tx: mpsc::Sender<Frame>, peer_node: impl Into<String>) -> Self {
         let cell = Arc::new(std::sync::OnceLock::new());
         let _ = cell.set(peer_node.into());
-        Self { tx, peer_node: cell }
+        Self {
+            tx,
+            peer_node: cell,
+        }
     }
 
     /// 测试构造（无 peer 标注——node_id() 返回 "?"）。
@@ -75,7 +78,9 @@ impl FrameSender {
 
     /// 同步转发（TELL 中转——队列满返回 Err，调用方记死信）。
     pub fn send_frame_sync(&self, f: Frame) -> Result<(), RemoteError> {
-        self.tx.try_send(f).map_err(|_| RemoteError::Transport("relay queue full".into()))
+        self.tx
+            .try_send(f)
+            .map_err(|_| RemoteError::Transport("relay queue full".into()))
     }
 
     /// 无连接回程（重排任务投递用——TELL 无回程语义，relay miss 走死信）。
@@ -560,6 +565,138 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// E3 半开检测：对端静默（不发帧不回 ACK）→ 5×2s 后 A 侧主动断开。
+    /// 真实等待 10s+（> HEARTBEAT_MAX_LOSS × HEARTBEAT_INTERVAL）——
+    /// 慢但真：验证 tokio interval 与 last_seen 交互的物理时序正确性。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_half_open_detected() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (a_read, a_write) = tokio::io::split(a);
+        let (b_read, b_write) = tokio::io::split(b);
+        let hs_a = HandshakeBody {
+            node_id: "a".into(),
+            ..Default::default()
+        };
+        let (in_tx, _in_rx) = mpsc::channel::<(Frame, FrameSender, String)>(64);
+        let noop: OnDisconnect = Arc::new(|_| {});
+        let (sd_a, _) = tokio::sync::watch::channel(false);
+
+        // A 侧正常跑连接
+        let h1 = tokio::spawn(run_connection(
+            tokio::io::join(a_read, a_write),
+            ConnParams {
+                side: ConnSide::Connect,
+                local_addr: None,
+                peer_addr: None,
+                scheme: "mem",
+                local_handshake: hs_a,
+                inbound: in_tx,
+                on_disconnect: noop.clone(),
+                shutdown: sd_a.subscribe(),
+            },
+        ));
+        // B 侧：字节级静默对端。手动完成握手（读掉 A 的 HANDSHAKE 帧、
+        // 回一个合法 HANDSHAKE_ACK），随后**只读不写**——吞掉 A 的所有
+        // HEARTBEAT 不回 ACK。模拟真实半开（对端活着/NAT 单向断）。
+        // duplex 下 EOF 与静默在 A 的 read 侧不可区分，但心跳丢失计数
+        // 路径独立于 read EOF——B 保持读开（不 drop b_read）确保不会 EOF，
+        // 唯一触发断开的就是 missed >= 5。
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut b_rd, mut b_wr) = (b_read, b_write);
+            // ① 读 A 的 HANDSHAKE 帧（4B len 前缀 + body）
+            let mut len_buf = [0u8; 4];
+            b_rd.read_exact(&mut len_buf).await.unwrap();
+            let body_len = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; body_len];
+            b_rd.read_exact(&mut body).await.unwrap();
+            // ② 回 HANDSHAKE_ACK（最小合法 TLV：node_id 必填，其余默认）
+            let mut ack_body = bytes::BytesMut::new();
+            crate::handshake::HandshakeAckBody {
+                node_id: "b".into(),
+                realm: None,
+                cluster: None,
+                capabilities: 3,
+                max_frame_len: 1024 * 1024,
+                topology_role: crate::handshake::TopologyRole::Normal,
+                hop_limit: 8,
+                direct_addr: None,
+                chosen_codec: "bin".into(),
+            }
+            .encode_tlv(&mut ack_body);
+            let ack = crate::frame::Frame::handshake_ack(ack_body.freeze());
+            let mut out = bytes::BytesMut::new();
+            ack.encode(&mut out).unwrap();
+            b_wr.write_all(&out).await.unwrap();
+            // ③ 静默期：持续读（吞 A 的心跳），永不写。读到 EOF（A 断开）
+            // 才退出。
+            let mut sink = vec![0u8; 8192];
+            loop {
+                match b_rd.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        });
+
+        let c1 = tokio::time::timeout(Duration::from_secs(5), h1)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(c1.node_id, "b");
+
+        // A 侧心跳每 2s 发一次（B 静默不回）；5 次丢失（≈10s）→ 半开断开
+        let t0 = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(15), c1.closed)
+            .await
+            .expect("half-open must close connection within ~10s")
+            .unwrap();
+        let dt = t0.elapsed();
+        assert!(
+            dt >= Duration::from_secs(9),
+            "断开不得早于 5×2s-容差（实测 {dt:?}）——过早=心跳计数 bug"
+        );
+        assert!(
+            dt <= Duration::from_secs(14),
+            "断开不得晚于 ~14s（实测 {dt:?}）——过晚=检测失效"
+        );
+    }
+
+    /// FrameSender::is_closed：writer 退出后可观测（重连循环的判据）。
+    #[tokio::test]
+    async fn frame_sender_is_closed_observable() {
+        let (tx, rx) = mpsc::channel::<Frame>(1);
+        let fs = FrameSender::anon(tx);
+        assert!(!fs.is_closed());
+        drop(rx);
+        // mpsc 关闭传播：send 侧在 capacity 满后感知。立即态可能仍 open，
+        // 试发一帧后必 closed。
+        let _ = fs.send(Frame::heartbeat()).await;
+        assert!(
+            fs.is_closed(),
+            "receiver dropped → sender must observe closed"
+        );
+    }
+
+    /// FrameError → RemoteError 转换表（wire 层错误到传输错误的映射冻结）。
+    #[test]
+    fn frame_error_to_remote_error_mapping() {
+        let e = RemoteError::from(FrameError::TooLarge { len: 99, max: 16 });
+        assert!(e.to_string().contains("超限"), "TooLarge 映射: {e}");
+        let e2 = RemoteError::from(FrameError::MalformedLengths {
+            flen: 1,
+            plen: 2,
+            klen: 3,
+        });
+        assert!(e2.to_string().contains("长度"), "Malformed 映射: {e2}");
+        // FrameError 携带 io（tap_io 链经 FrameError::Io 中转）
+        let io_err = std::io::Error::other("boom");
+        let fe = FrameError::from(io_err);
+        let e3 = RemoteError::from(fe);
+        assert!(matches!(e3, RemoteError::Frame(_)), "io→Frame→Remote: {e3}");
     }
 
     #[test]

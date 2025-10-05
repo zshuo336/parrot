@@ -51,7 +51,7 @@ impl RemoteInner {
             .iter()
             .find(|(n, _, _)| n == node_id)
             .map(|(_, s, _)| s)
-            .or_else(|| self.uplink.as_ref())
+            .or(self.uplink.as_ref())
     }
 }
 
