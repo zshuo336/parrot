@@ -1,0 +1,19 @@
+[package]
+name = "crawler-lab"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "五运行时爬虫+索引+搜索应用（框架/应用分离示范：只依赖 parrot 公共 API，不进驻框架源码树）"
+
+[[bin]]
+name = "crawler-lab"
+path = "src/main.rs"
+
+[dependencies]
+parrot-api = { path = "../../crates/parrot-api" }
+parrot-remote = { path = "../../crates/parrot-remote" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# 消息 codec 注册（inventory submit）走 parrot-api 公共面——应用自有键空间
+# bin:crawl/*（与框架注册表同进程合并，键不冲突）

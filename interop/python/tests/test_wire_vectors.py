@@ -97,7 +97,7 @@ def test_handshake_tlv_layout():
     fields = dict(parse_tlv(body))
     assert fields[1] == b"py-node-1"
     (caps,) = struct.unpack("<I", fields[4])
-    assert caps == 0x02, "python stack is pb-only"
+    assert caps == 0x03, "python stack is bin|pb (crawler-lab dual-stack)"
     assert fields[8] == b"pb", "chosen codec"
 
 

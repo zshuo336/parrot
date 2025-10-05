@@ -274,6 +274,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut targets = Vec::new();
     let (mut pages, mut depth, mut fanout, mut batch) = (500u64, 2u16, 3u64, 32usize);
+    // 双模式组网：
+    //   A direct   —— 显式 erl=/ray=/jvm= 网关地址（测试形态：点对点指定）
+    //   B registry —— 应用只给 --bind 监听，网关主动拨号注册（生产形态：
+    //                 应用零网关地址知识；等待 erl-gw-1/ray-gw-1/jvm-search-1
+    //                 三节点入表后自动开始）
+    let mut bind_addr: Option<std::net::SocketAddr> = None;
+    let mut wait_secs: u64 = 60;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -293,6 +300,14 @@ fn main() {
                 batch = args[i + 1].parse().unwrap();
                 i += 2
             }
+            "--bind" => {
+                bind_addr = Some(args[i + 1].parse().unwrap());
+                i += 2
+            }
+            "--wait" => {
+                wait_secs = args[i + 1].parse().unwrap();
+                i += 2
+            }
             _ => {
                 if let Some((id, addr)) = args[i].split_once('=') {
                     let sa = addr.parse().unwrap_or_else(|_| {
@@ -308,28 +323,32 @@ fn main() {
             }
         }
     }
-    let erl = targets
-        .iter()
-        .find(|t| t.node_id == "erl")
-        .cloned()
-        .unwrap_or_else(|| panic!("需 erl=host:port"));
-    let ray = targets
-        .iter()
-        .find(|t| t.node_id == "ray")
-        .cloned()
-        .unwrap_or_else(|| panic!("需 ray=host:port"));
-    let jvm = targets
-        .iter()
-        .find(|t| t.node_id == "jvm")
-        .cloned()
-        .unwrap_or_else(|| panic!("需 jvm=host:port"));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
-    let code = rt.block_on(run(&erl, &ray, &jvm, pages, depth, fanout, batch));
+    let code = rt.block_on(async {
+        match bind_addr {
+            // 模式 B：registry（网关主动注册）
+            Some(bind) => run_registry(bind, wait_secs, pages, depth, fanout, batch).await,
+            // 模式 A：direct（显式网关地址）
+            None => {
+                let pick = |id: &str| {
+                    targets
+                        .iter()
+                        .find(|t| t.node_id == id)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            panic!("direct 模式需 {id}=host:port（或用 --bind 走 registry 模式）")
+                        })
+                };
+                let (erl, ray, jvm) = (pick("erl"), pick("ray"), pick("jvm"));
+                run_direct(&erl, &ray, &jvm, pages, depth, fanout, batch).await
+            }
+        }
+    });
     std::process::exit(code);
 }
 
@@ -366,12 +385,13 @@ impl Metrics {
     }
 }
 
-async fn run(
+/// 模式 A：direct——应用主动连三网关（显式地址；测试形态）。
+async fn run_direct(
     erl: &NodeAddr,
     ray: &NodeAddr,
     jvm: &NodeAddr,
     pages: u64,
-    max_depth: u16,
+    depth: u16,
     fanout: u64,
     batch: usize,
 ) -> i32 {
@@ -388,7 +408,71 @@ async fn run(
             }
         }
     }
+    println!("[lab] 组网模式：direct（应用主动拨号网关）");
+    run_scenario(&client, pages, depth, fanout, batch).await
+}
 
+/// 模式 B：registry——应用只监听，网关主动拨号注册（生产形态）。
+///
+/// 拓扑：应用 = parrot 节点（bind 公网地址）；erl/ray/jvm 网关启动参数
+/// 指向应用地址主动 connect；框架 accept 侧同样把对端 node_id/sender 写入
+/// NodeTable + links——应用等三网关就绪后开始（零网关地址知识）。
+async fn run_registry(
+    bind: std::net::SocketAddr,
+    wait_secs: u64,
+    pages: u64,
+    depth: u16,
+    fanout: u64,
+    batch: usize,
+) -> i32 {
+    let client = RemoteActorSystem::new(
+        RemoteConfig::tcp("crawler-lab", Some(bind)),
+        Arc::new(NoopLookup),
+    )
+    .unwrap();
+    client.start().await.unwrap();
+    let local = client.local_addr().expect("bound");
+    println!("[lab] 组网模式：registry（应用监听 {local}，等待网关注册…）");
+
+    // 等待三个网关 node 入表（NodeTable require 可查 = 链路可用）
+    let need = ["erl-gw-1", "ray-gw-1", "jvm-search-1"];
+    let deadline = Instant::now() + std::time::Duration::from_secs(wait_secs);
+    loop {
+        let ready = need
+            .iter()
+            .filter(|n| client.nodes.get(n).is_some())
+            .count();
+        if ready == need.len() {
+            println!("[lab] 三网关已全部注册：{:?}", need);
+            break;
+        }
+        if Instant::now() > deadline {
+            eprintln!("[lab] 等待网关注册超时（{wait_secs}s，就绪 {ready}/3）");
+            return 1;
+        }
+        // 已注册的先报进度
+        if ready > 0 {
+            println!("[lab]   已注册 {ready}/3 …");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    // 链路 sender 就绪需要 accept 任务跑完 register_link——给一次让出窗口
+    for _ in 0..50 {
+        if client.links_snapshot().await.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    run_scenario(&client, pages, depth, fanout, batch).await
+}
+
+async fn run_scenario(
+    client: &Arc<RemoteActorSystem>,
+    pages: u64,
+    max_depth: u16,
+    fanout: u64,
+    batch: usize,
+) -> i32 {
     // node_id 必须与各网关握手自报一致（erl: erl-gw-1 / ray: ray-gw-1 / jvm: jvm-search-1）
     let frontier = client
         .remote_ref("parrot://erl-gw-1/user/frontier")
