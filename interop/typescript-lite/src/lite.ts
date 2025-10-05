@@ -177,6 +177,16 @@ export class ParrotLite {
       }
       return;
     }
+    // 心跳应答（hub 2s 探活——10s 无 ACK 判死；lite 必须回）
+    if (ft === FT.HEARTBEAT) {
+      this.send(buildFrame(FT.HEARTBEAT_ACK, cid, "", "", new Uint8Array(0)));
+      return;
+    }
+    // ROUTE_HINT（0x24）：hub 注入直连地址。lite 走 ws/简化 tcp——
+    // 直连学习暂不启用，吞帧（前向兼容，不断连）。
+    if (ft === 0x24) {
+      return;
+    }
     if (ft === FT.ASK) {
       const actor = this.actors.get(path) ?? this.actors.get(stripPrefix(path));
       const rt = splitReplyTo(payload);

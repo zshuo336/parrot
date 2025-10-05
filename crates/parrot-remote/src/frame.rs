@@ -49,6 +49,9 @@ pub mod frame_type {
     pub const RESOLVE_Q: u8 = 0x21; // P1 收到回 ERROR 断连（P5）
     pub const RESOLVE_R: u8 = 0x22;
     pub const INVALIDATE: u8 = 0x23;
+    /// 方案 A 学习通道：hub 中转时向源节点推送目标直连地址（spoke 缓存后
+    /// 直拨目标，流量不再经 hub）。payload = [u16 node_len][node][u16 addr_len][addr]。
+    pub const ROUTE_HINT: u8 = 0x24;
     pub const ERROR: u8 = 0x7F;
 }
 
@@ -224,6 +227,43 @@ impl Frame {
         }
     }
 
+    /// ROUTE_HINT（方案 A）：hub → 源 spoke，告知目标节点直连地址。
+    /// payload = [u16 node_len][node][u16 addr_len][addr]，addr = "host:port"。
+    pub fn route_hint(node: &str, addr: &str) -> Frame {
+        let mut p = bytes::BytesMut::new();
+        p.put_u16_le(node.len() as u16);
+        p.put_slice(node.as_bytes());
+        p.put_u16_le(addr.len() as u16);
+        p.put_slice(addr.as_bytes());
+        Frame {
+            header: Self::new_header(frame_type::ROUTE_HINT, 0),
+            path: String::new(),
+            type_key: String::new(),
+            payload: p.freeze(),
+        }
+    }
+
+    /// 解 ROUTE_HINT payload → (node, addr)。
+    pub fn parse_route_hint(payload: &[u8]) -> Result<(String, String), FrameError> {
+        let bad = |n: usize| FrameError::MalformedLengths { flen: n as u32, plen: 0, klen: 0 };
+        if payload.len() < 4 {
+            return Err(bad(payload.len()));
+        }
+        let nlen = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+        if payload.len() < 2 + nlen + 2 {
+            return Err(bad(payload.len()));
+        }
+        let node = std::str::from_utf8(&payload[2..2 + nlen]).map_err(|_| bad(nlen))?;
+        let alen =
+            u16::from_le_bytes([payload[2 + nlen], payload[3 + nlen]]) as usize;
+        let aoff = 2 + nlen + 2;
+        if payload.len() < aoff + alen {
+            return Err(bad(payload.len()));
+        }
+        let addr = std::str::from_utf8(&payload[aoff..aoff + alen]).map_err(|_| bad(alen))?;
+        Ok((node.to_string(), addr.to_string()))
+    }
+
     pub fn error_frame(code: ErrCode, detail: &str) -> Frame {
         Frame {
             header: Self::new_header(frame_type::ERROR, 0),
@@ -369,6 +409,7 @@ impl Frame {
                 | frame_type::RESOLVE_Q
                 | frame_type::RESOLVE_R
                 | frame_type::INVALIDATE
+                | frame_type::ROUTE_HINT
                 | frame_type::ERROR
         );
         if !known {

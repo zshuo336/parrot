@@ -47,24 +47,50 @@ final class ParrotTransportExtension(
     boundPort = f.channel().localAddress().asInstanceOf[java.net.InetSocketAddress].getPort
   }
 
-  /** 注册模式（双模式组网）：主动拨号 parrot 节点并发起客户端握手
+  /** 注册模式（双模式组网 + 容灾重连）：主动拨号 parrot 节点并发起客户端握手
     * （发 HANDSHAKE → 收 ACK），随后与被动模式同一 handler 服务。
+    * 断线（channelInactive）→ scheduler 指数退避重拨（1s→60s 封顶）——
+    * hub 重启/网络抖动后 JVM 网关自动重新接入，不再成为孤儿。
     */
   def registerTo(parrotHost: String, parrotPort: Int): Unit = {
     group = new NioEventLoopGroup(1, new DefaultThreadFactory("parrot-jvm-netty"))
-    val b = new io.netty.bootstrap.Bootstrap()
-      .group(group)
-      .channel(classOf[io.netty.channel.socket.nio.NioSocketChannel])
-      .handler(new io.netty.channel.ChannelInitializer[io.netty.channel.socket.SocketChannel] {
-        override def initChannel(ch: io.netty.channel.socket.SocketChannel): Unit = {
-          ch.pipeline()
-            .addLast(new WireDecoder())
-            .addLast(new WireEncoder())
-            .addLast(new ParrotClientHandler(bridge, nodeId))
+    val scheduler = system.scheduler
+    import system.executionContext
+    @volatile var attempt = 0
+
+    def dial(): Unit = {
+      val b = new io.netty.bootstrap.Bootstrap()
+        .group(group)
+        .channel(classOf[io.netty.channel.socket.nio.NioSocketChannel])
+        .handler(new io.netty.channel.ChannelInitializer[io.netty.channel.socket.SocketChannel] {
+          override def initChannel(ch: io.netty.channel.socket.SocketChannel): Unit = {
+            ch.pipeline()
+              // 半开检测：10s 无入帧判 hub 死亡 → 关连接 → inactive → 重拨
+              .addLast(new io.netty.handler.timeout.IdleStateHandler(10, 0, 0))
+              .addLast(new WireDecoder())
+              .addLast(new WireEncoder())
+              .addLast(new ParrotClientHandler(bridge, nodeId))
+          }
+        })
+      val f = b.connect(parrotHost, parrotPort)
+      f.addListener { (future: io.netty.channel.ChannelFuture) =>
+        if (future.isSuccess) {
+          attempt = 0 // 成功即重置退避
+        } else {
+          val delay = math.min(60, math.pow(2, math.min(attempt, 6))).seconds
+          attempt += 1
+          System.err.println(s"[parrot-jvm] connect parrot failed (${future.cause()}); retry in $delay")
+          scheduler.scheduleOnce(java.time.Duration.ofSeconds(delay.toSeconds), () => dial(), system.executionContext)
         }
-      })
-    val f = b.connect(parrotHost, parrotPort).sync()
-    f.channel().closeFuture().sync() // 驻留（连接生命周期 = 进程生命周期）
+      }
+      f.channel().closeFuture().addListener { (_: io.netty.channel.ChannelFuture) =>
+        val delay = math.min(60, math.pow(2, math.min(attempt, 6))).seconds
+        attempt += 1
+        System.err.println(s"[parrot-jvm] parrot link lost; reconnecting in $delay")
+        scheduler.scheduleOnce(java.time.Duration.ofSeconds(delay.toSeconds), () => dial(), system.executionContext)
+      }
+    }
+    dial()
   }
 
   def shutdown(): Unit = if (group != null) group.shutdownGracefully()
@@ -210,6 +236,10 @@ class ParrotServerHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
         )
       case FrameType.HEARTBEAT =>
         ctx.writeAndFlush(WireFrame.Frame(1, FrameType.HEARTBEAT_ACK, 0, 0, 0, 8, "", "", Array.emptyByteArray))
+      case FrameType.ROUTE_HINT =>
+      // 方案 A：hub 注入直连地址。JVM 客户端形态暂不建直连（出站经
+      // akka selection 路由——直连优化属 Rust/erl/py spoke 侧）；吞帧
+      // 不断连（协议前向兼容：未知帧类型才断）。
       case _ => // 握手重复/未知——断连
         ctx.close()
     }
@@ -258,5 +288,17 @@ final class ParrotClientHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
       return
     }
     super.channelRead0(ctx, msg) // 握手后：复用 server 分发
+  }
+
+  /** 半开检测：IdleStateHandler 10s 无入帧 → 关连接（registerTo 的
+    * closeFuture 监听触发退避重拨）。hub 侧心跳 2s——10s 静默 = 死链。
+    */
+  override def userEventTriggered(ctx: ChannelHandlerContext, evt: java.lang.Object): Unit = {
+    evt match {
+      case idle: io.netty.handler.timeout.IdleStateEvent if idle.state() == io.netty.handler.timeout.IdleState.READER_IDLE =>
+        System.err.println(s"[parrot-jvm] parrot silent >10s — half-open, closing")
+        ctx.close()
+      case _ => super.userEventTriggered(ctx, evt)
+    }
   }
 }

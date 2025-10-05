@@ -27,6 +27,7 @@ FT_ASK = 0x10
 FT_REPLY = 0x11
 FT_REPLY_ERR = 0x12
 FT_TELL = 0x13
+FT_ROUTE_HINT = 0x24  # 方案 A：hub 注入目标直连地址（学习后直拨）
 
 # flags 位
 FLAG_TELL_ACK = 0x0001  # E2 durable tell ACK 位

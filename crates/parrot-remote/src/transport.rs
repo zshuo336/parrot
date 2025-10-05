@@ -99,6 +99,8 @@ pub struct ConnectionHandle {
     pub info: ConnectionInfo,
     /// 对端拓扑角色（握手协商保留——spoke 据此识别 uplink hub）。
     pub peer_role: crate::handshake::TopologyRole,
+    /// 对端可直拨地址（方案 A：握手 DIRECT_ADDR 声明；None = 不可直拨）。
+    pub peer_dial_addr: Option<String>,
     /// 断连通知（ConnectionTask 结束时触发一次）
     pub closed: oneshot::Receiver<()>,
 }
@@ -214,6 +216,7 @@ where
                 max_frame_len: ack_body.max_frame_len,
                 topology_role: ack_body.topology_role,
                 hop_limit: ack_body.hop_limit,
+                direct_addr: ack_body.direct_addr,
             }
         }
         ConnSide::Accept => {
@@ -230,6 +233,7 @@ where
                 max_frame_len: local_handshake.max_frame_len.min(theirs.max_frame_len),
                 topology_role: local_handshake.topology_role,
                 hop_limit: local_handshake.hop_limit,
+                direct_addr: local_handshake.direct_addr.clone(),
                 chosen_codec: "bin".into(),
             };
             let mut body = BytesMut::new();
@@ -243,6 +247,7 @@ where
     };
     let remote_node_id = peer_body.node_id.clone();
     let peer_role = peer_body.topology_role;
+    let peer_dial_addr = peer_body.direct_addr.clone();
 
     let (closed_tx, closed_rx) = oneshot::channel::<()>();
     let info = ConnectionInfo {
@@ -384,6 +389,7 @@ where
         sender: FrameSender::new(tx, remote_node_id),
         info,
         peer_role,
+        peer_dial_addr,
         closed: closed_rx,
     })
 }

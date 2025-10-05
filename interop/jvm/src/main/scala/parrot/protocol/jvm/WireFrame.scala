@@ -27,6 +27,7 @@ object WireFrame {
     val STOP: Byte = 0x14
     val FRAGMENT: Byte = 0x15
     val SYSTEM_EVENT: Byte = 0x20
+    val ROUTE_HINT: Byte = 0x24
     val ERROR: Byte = 0x7F
   }
 

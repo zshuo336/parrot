@@ -28,6 +28,7 @@ from .wire import (
     FT_HEARTBEAT_ACK,
     FT_REPLY,
     FT_REPLY_ERR,
+    FT_ROUTE_HINT,
     FT_TELL,
     FrameDecoder,
     build_frame,
@@ -114,65 +115,147 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
         _probe = ray.remote(_Ready).remote()
         ray.get(_probe.ready.remote())
         host, _, pport = parrot_addr.partition(":")
-        sock = socket.create_connection((host, int(pport)), timeout=10)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        out: queue.Queue[bytes] = queue.Queue()
 
-        def writer() -> None:
+        # ---- 容灾：重连监督 + 半开检测（与 Rust hub 心跳对称）----
+        # connect_loop：断线/半开 → 指数退避重拨（1s→60s）→ 重新握手注册。
+        # 首连成功打印 RAY_GW_REGISTERED（stdout 契约）；重连静默恢复。
+        import time as _time
+
+        def connect_loop() -> None:
+            attempt = 0
+            announced = False
             while True:
-                sock.sendall(out.get())
-
-        threading.Thread(target=writer, daemon=True).start()
-
-        from concurrent.futures import ThreadPoolExecutor
-
-        pool = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
-
-        def reply(cid: int, key: str, payload: bytes) -> None:
-            out.put(build_frame(FT_REPLY, cid, "", key, payload))
-
-        def reply_err(cid: int, code: int, detail: str) -> None:
-            out.put(build_frame(FT_REPLY_ERR, cid, "", "", encode_err_payload(code, detail)))
-
-        def run_ask(cid: int, type_key: str, payload: bytes) -> None:
-            try:
-                rkey, rpayload = ray.get(worker.ask.remote(type_key, payload))
-                reply(cid, rkey, rpayload)
-            except Exception as e:  # noqa: BLE001
-                reply_err(cid, ERR_UNKNOWN_TYPE_KEY, str(e))
-
-        dec = FrameDecoder()
-        # 客户端握手：发 HANDSHAKE → 等 ACK
-        out.put(build_frame(FT_HANDSHAKE, 1, "", "__handshake__",
-                            handshake_body("ray-gw-1")))
-        handshake_done = False
-        print(f"RAY_GW_REGISTERED={parrot_addr}", flush=True)
-        while True:
-            try:
-                chunk = sock.recv(65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            dec.feed(chunk)
-            while (f := dec.next_frame()) is not None:
+                if attempt:
+                    _time.sleep(min(60.0, 1.0 * (2 ** min(attempt, 6))))
                 try:
-                    if not handshake_done:
-                        if f.ft == FT_HANDSHAKE_ACK:
-                            print(f"[ray-gw] parrot {parrot_addr} handshake ok", file=sys.stderr, flush=True)
-                            handshake_done = True
+                    s = socket.create_connection((host, int(pport)), timeout=10)
+                except OSError as e:
+                    print(f"[ray-gw] connect parrot failed: {e!r}", file=sys.stderr, flush=True)
+                    attempt += 1
+                    continue
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                try:
+                    serve_link(s, attempt, announced)
+                    announced = True  # serve_link 正常返回 = 曾成功注册
+                except _HalfOpen:
+                    print("[ray-gw] parrot silent >10s — half-open, reconnecting",
+                          file=sys.stderr, flush=True)
+                attempt = 0 if announced else attempt + 1
+
+        class _HalfOpen(Exception):
+            pass
+
+        def serve_link(sock: socket.socket, _attempt: int, announced: bool) -> None:
+            out_local: queue.Queue[bytes] = queue.Queue()
+
+            def writer() -> None:
+                while True:
+                    sock.sendall(out_local.get())
+
+            threading.Thread(target=writer, daemon=True).start()
+
+            from concurrent.futures import ThreadPoolExecutor
+
+            pool_local = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
+
+            def reply(cid: int, key: str, payload: bytes) -> None:
+                out_local.put(build_frame(FT_REPLY, cid, "", key, payload))
+
+            def reply_err(cid: int, code: int, detail: str) -> None:
+                out_local.put(build_frame(FT_REPLY_ERR, cid, "", "", encode_err_payload(code, detail)))
+
+            def run_ask(cid: int, type_key: str, payload: bytes) -> None:
+                try:
+                    rkey, rpayload = ray.get(worker.ask.remote(type_key, payload))
+                    reply(cid, rkey, rpayload)
+                except Exception as e:  # noqa: BLE001
+                    reply_err(cid, ERR_UNKNOWN_TYPE_KEY, str(e))
+
+            # 方案 A：直连学习表 node → socket（hint 到达后台拨号建立）
+            direct_links: dict[str, socket.socket] = {}
+
+            def on_route_hint(payload: bytes) -> None:
+                try:
+                    nlen = int.from_bytes(payload[0:2], "little")
+                    node = payload[2:2 + nlen].decode()
+                    alen = int.from_bytes(payload[2 + nlen:4 + nlen], "little")
+                    addr = payload[4 + nlen:4 + nlen + alen].decode()
+                except Exception:  # noqa: BLE001
+                    return
+                if node in direct_links:
+                    return
+
+                def dial() -> None:
+                    h, _, p = addr.partition(":")
+                    try:
+                        ds = socket.create_connection((h, int(p)), timeout=10)
+                        ds.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        # 客户端握手（对端 accept 侧回 ACK）
+                        out_d: queue.Queue[bytes] = queue.Queue()
+
+                        def w_d() -> None:
+                            while True:
+                                ds.sendall(out_d.get())
+
+                        threading.Thread(target=w_d, daemon=True).start()
+                        out_d.put(build_frame(FT_HANDSHAKE, 1, "", "__handshake__",
+                                              handshake_body("ray-gw-1")))
+                        # 简化：不等待 ACK 即登记（对端 accept 逻辑固定回 ACK；
+                        # 失败由 socket 异常清理）。直连承载 ASK/TELL 出站。
+                        direct_links[node] = ds
+                        print(f"[ray-gw] direct link to {node} up", file=sys.stderr, flush=True)
+                    except OSError as e:
+                        print(f"[ray-gw] direct dial {node} failed: {e!r}",
+                              file=sys.stderr, flush=True)
+
+                threading.Thread(target=dial, daemon=True).start()
+
+            dec_local = FrameDecoder()
+            handshake_done = False
+            last_inbound = _time.monotonic()
+            if not announced:
+                print(f"RAY_GW_REGISTERED={parrot_addr}", flush=True)
+            out_local.put(build_frame(FT_HANDSHAKE, 1, "", "__handshake__",
+                                      handshake_body("ray-gw-1")))
+            sock.settimeout(5.0)  # 半开检测唤醒周期
+            try:
+                while True:
+                    try:
+                        chunk = sock.recv(65536)
+                    except socket.timeout:
+                        if _time.monotonic() - last_inbound > 10.0:
+                            raise _HalfOpen()
                         continue
-                    if f.ft == FT_ASK:
-                        reply_to, real_payload = split_reply_to(f.payload) or ("", f.payload)
-                        _ = reply_to
-                        pool.submit(run_ask, f.cid, f.type_key, real_payload)
-                    elif f.ft == FT_TELL:
-                        worker.deliver.remote(f.type_key, f.payload)
-                    elif f.ft == FT_HEARTBEAT:
-                        out.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
-                except Exception as loop_err:  # noqa: BLE001
-                    print(f"[ray-gw] frame loop error: {loop_err!r}", file=sys.stderr, flush=True)
-        pool.shutdown(wait=False)
+                    if not chunk:
+                        return
+                    last_inbound = _time.monotonic()
+                    dec_local.feed(chunk)
+                    while (f := dec_local.next_frame()) is not None:
+                        try:
+                            if not handshake_done:
+                                if f.ft == FT_HANDSHAKE_ACK:
+                                    print(f"[ray-gw] parrot {parrot_addr} handshake ok",
+                                          file=sys.stderr, flush=True)
+                                    handshake_done = True
+                                continue
+                            if f.ft == FT_ASK:
+                                reply_to, real_payload = split_reply_to(f.payload) or ("", f.payload)
+                                _ = reply_to
+                                pool_local.submit(run_ask, f.cid, f.type_key, real_payload)
+                            elif f.ft == FT_TELL:
+                                worker.deliver.remote(f.type_key, f.payload)
+                            elif f.ft == FT_HEARTBEAT:
+                                out_local.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
+                            elif f.ft == FT_ROUTE_HINT:
+                                on_route_hint(f.payload)
+                        except Exception as loop_err:  # noqa: BLE001
+                            print(f"[ray-gw] frame loop error: {loop_err!r}",
+                                  file=sys.stderr, flush=True)
+            finally:
+                pool_local.shutdown(wait=False)
+                sock.close()
+
+        connect_loop()
         return
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
