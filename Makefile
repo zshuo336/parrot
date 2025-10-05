@@ -62,7 +62,7 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-all build-ts build-cpp build-jvm build-python \
-        test test-fast test-full test-stress test-polyglot test-full-polyglot \
+        test test-fast test-full test-stress test-polyglot test-full-polyglot test-lab \
         lint fmt clippy bench matrix clean distclean \
         ts py jvm erl cpp check-ts check-py check-jvm check-erl check-cpp \
         build-release-bins
@@ -163,8 +163,25 @@ test-stress:
 test-polyglot: check-ts check-py check-jvm check-erl check-cpp
 	@echo "✓ 多语言模式完成（TS/Python/JVM/Erlang/C++）"
 
+# ---- 五运行时全链集成场景（crawler-lab：大规模爬虫+索引+Web 检索）----------
+# 依赖齐备才跑（erl/java/python+ray/node）；缺项跳过并提示。
+LAB_SCRIPT := deploy/crawler-lab/run-lab.sh
+test-lab:
+	@if [ -x "$(LAB_SCRIPT)" ] && command -v erl >/dev/null 2>&1 \
+	   && command -v java >/dev/null 2>&1 && command -v node >/dev/null 2>&1 \
+	   && python3 -c "import ray" >/dev/null 2>&1; then \
+		$(CARGO) build -p parrot-node --bin parrot-crawler-lab $(CARGO_Q) ; \
+		./$(LAB_SCRIPT) --pages 200 --depth 2 --fanout 3 --batch 32 ; \
+	else \
+		echo "==> [lab] 跳过（需 erl+java+node+python3/ray 工具链）" ; \
+	fi
+	@echo "✓ 五运行时全链场景完成（Erlang+Rust+Ray+Akka+TS-Lite）"
+
 test-full-polyglot: test-full test-polyglot
 	@echo "✓ 全模式 + 多语言完成"
+
+test-everything: test-full-polyglot test-lab
+	@echo "✓ 全量 + 五运行时场景完成"
 
 # ---- 多语言单项快捷方式 ----------------------------------------------------
 ts: build-ts
