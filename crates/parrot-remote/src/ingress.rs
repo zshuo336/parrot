@@ -1,8 +1,10 @@
 //! 职责：入站帧分发——ASK/TELL/STOP → 本地 actor；REPLY → 回调表（05 §6.1）。
 //!
-//! P1 入站串行：每连接单任务顺序处理（HOL 是已知特性，P2 拆 worker 池
-//! ——06 I2，文档明示不修补）。本地解析经 LocalLookup trait 倒置
-//! （parrot-remote 不依赖 parrot crate，E5.2 分层铁律）。
+//! I2（06）：入站 ASK 并发化——每帧 spawn 独立任务处理（慢 actor 不再
+//! 阻塞同连接的后续帧；REPLY 乱序经 cid 配对天然支持）。TELL 保持串行
+//! deliver（05 §6.3 背压贯通语义——对端过载时读循环挂起是有意行为）。
+//! 本地解析经 LocalLookup trait 倒置（parrot-remote 不依赖 parrot crate，
+//! E5.2 分层铁律）。
 
 use std::sync::Arc;
 
@@ -67,9 +69,20 @@ fn local_path(path: &str) -> &str {
 impl Ingress {
     /// 处理一帧入站（来自 ConnectionTask 的 inbound 队列）。
     /// `back` 是该连接的回程发送端（REPLY 用）。
-    pub async fn dispatch(&self, frame: Frame, back: &FrameSender, from_node: &str) {
+    ///
+    /// I2：ASK 并发分发——spawn 独立任务（慢 actor 不阻塞同连接的后续帧；
+    /// REPLY 乱序经 cid 配对天然支持）。FrameSender 是 Clone，move 安全。
+    /// TELL 保持串行 deliver（05 §6.3 背压贯通——对端过载时读循环挂起
+    /// 是有意语义，不并发化）。
+    pub async fn dispatch(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
         match frame.header.frame_type {
-            frame_type::ASK => self.on_ask(frame, back).await,
+            frame_type::ASK => {
+                let back = back.clone();
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.on_ask(frame, &back).await;
+                });
+            }
             frame_type::TELL => self.on_tell(frame).await,
             frame_type::STOP => self.on_stop(frame).await,
             frame_type::REPLY | frame_type::REPLY_ERR => self.on_reply(frame),
