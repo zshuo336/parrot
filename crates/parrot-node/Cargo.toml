@@ -1,0 +1,30 @@
+[package]
+name = "parrot-node"
+version = "0.1.0"
+edition = "2021"
+description = "Parrot standard node runtime: facade + thread engine + remote TCP (deployment unit)"
+license = "MIT"
+
+# 部署单元（应用层组装 crate）：parrot(facade) + parrot-remote(传输) 在此合流。
+# 这是 E5.2 分层的预期组装点——库 crate 之间互不依赖，部署产物统一组装。
+
+[dependencies]
+parrot = { path = "../parrot" }
+parrot-api = { path = "../parrot-api", features = ["remote"] }
+parrot-remote = { path = "../parrot-remote" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+futures = "0.3"
+
+[lib]
+name = "parrot_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "parrot-node"
+path = "src/main.rs"
+
+[[bin]]
+name = "parrot-probe"
+path = "src/bin/parrot-probe.rs"

@@ -1,0 +1,97 @@
+# ============================================================================
+#  Parrot 一键正式环境（docker compose）
+#
+#  拉起一个 3 节点 Parrot 集群 + 1 个 Ray(Python) 网关：
+#    parrot-1 ──┐
+#    parrot-2 ──┼── Wire 1.0/TCP 集群网（9801）
+#    parrot-3 ──┘
+#    ray-gw   ──── 独立网关节点（Python Ray 侧，9851）
+#
+#  用法：
+#    cd deploy/parrot-stack && docker compose up -d --build
+#    docker compose run --rm probe            # 全量验收（P1-P7）
+#    docker compose logs -f parrot-1
+#    docker compose down -v
+# ============================================================================
+
+name: parrot-stack
+
+x-parrot-common: &parrot-common
+  image: parrot-node:latest
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+  restart: unless-stopped
+
+services:
+  parrot-1:
+    <<: *parrot-common
+    container_name: parrot-1
+    environment:
+      PARROT_NODE_ID: parrot-1
+      PARROT_BIND: 0.0.0.0:9801
+      PARROT_ACTORS: echo,counter,kv,slow
+    ports:
+      - "19801:9801"
+
+  parrot-2:
+    <<: *parrot-common
+    container_name: parrot-2
+    depends_on:
+      - parrot-1
+    environment:
+      PARROT_NODE_ID: parrot-2
+      PARROT_BIND: 0.0.0.0:9801
+      PARROT_SEEDS: parrot-1=parrot-1:9801
+      PARROT_ACTORS: echo,counter,kv,slow
+    ports:
+      - "19802:9801"
+
+  parrot-3:
+    <<: *parrot-common
+    container_name: parrot-3
+    depends_on:
+      - parrot-2
+    environment:
+      PARROT_NODE_ID: parrot-3
+      PARROT_BIND: 0.0.0.0:9801
+      PARROT_SEEDS: parrot-2=parrot-2:9801,parrot-1=parrot-1:9801
+      PARROT_ACTORS: echo,counter,kv,slow
+    ports:
+      - "19803:9801"
+
+  # Ray 网关（Python 侧多 actor 运行环境——异构互操作面）。
+  # Ray 属重依赖（~500MB），默认注释；启用方法：
+  #   docker compose --profile ray up -d
+  ray-gw:
+    image: python:3.11-slim
+    container_name: parrot-ray-gw
+    profiles: ["ray"]
+    depends_on:
+      - parrot-1
+    working_dir: /gw
+    volumes:
+      - ../../interop/python:/gw:ro
+    environment:
+      PYTHONPATH: /gw
+      PARROT_RAY_GW_WORKERS: "8"
+    command: >
+      bash -c "pip install --no-cache-dir -q 'ray>=2.9'
+               && python3 -m parrot_protocol.ray_gw 9851"
+    ports:
+      - "19851:9851"
+
+  # 验收器（docker compose run --rm probe）
+  probe:
+    <<: *parrot-common
+    container_name: parrot-probe
+    entrypoint: ["/usr/local/bin/parrot-probe"]
+    command:
+      - parrot-1=parrot-1:9801
+      - parrot-2=parrot-2:9801
+      - parrot-3=parrot-3:9801
+    depends_on:
+      - parrot-1
+      - parrot-2
+      - parrot-3
+    restart: "no"
