@@ -20,6 +20,9 @@ pub mod tlv_tag {
     pub const TOPOLOGY_ROLE: u8 = 6;
     /// u8，缺省 8
     pub const HOP_LIMIT: u8 = 7;
+    /// 可选："host:port"（方案 A 直连学习——spoke 声明可被直拨的监听地址；
+    /// 缺省/空 = 不可直拨，hub 不注入 ROUTE_HINT）。
+    pub const DIRECT_ADDR: u8 = 8;
 }
 
 pub mod caps {
@@ -75,6 +78,8 @@ pub struct HandshakeBody {
     pub max_frame_len: u32,
     pub topology_role: TopologyRole,
     pub hop_limit: u8,
+    /// 可直拨监听地址 "host:port"（方案 A；None = 不可直拨）。
+    pub direct_addr: Option<String>,
 }
 
 impl Default for HandshakeBody {
@@ -87,6 +92,7 @@ impl Default for HandshakeBody {
             max_frame_len: crate::frame::MAX_FRAME_LEN,
             topology_role: TopologyRole::Normal,
             hop_limit: crate::frame::DEFAULT_HOP_LIMIT,
+            direct_addr: None,
         }
     }
 }
@@ -101,6 +107,8 @@ pub struct HandshakeAckBody {
     pub max_frame_len: u32,
     pub topology_role: TopologyRole,
     pub hop_limit: u8,
+    /// 可直拨监听地址（方案 A）。
+    pub direct_addr: Option<String>,
     /// 协商出的栈（"bin"/"pb"——1.0 固定 bin 优先）
     pub chosen_codec: String,
 }
@@ -197,6 +205,12 @@ fn decode_common(tlvs: &[(u8, Vec<u8>)]) -> Result<HandshakeBody, HandshakeError
         Some((_, v)) => return Err(HandshakeError::BadLen(tlv_tag::HOP_LIMIT, v.len())),
         None => crate::frame::DEFAULT_HOP_LIMIT,
     };
+    let direct_addr = match take_one(tlvs, tlv_tag::DIRECT_ADDR)? {
+        Some((_, v)) if !v.is_empty() => Some(
+            String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::DIRECT_ADDR))?,
+        ),
+        _ => None,
+    };
     Ok(HandshakeBody {
         node_id,
         realm,
@@ -205,6 +219,7 @@ fn decode_common(tlvs: &[(u8, Vec<u8>)]) -> Result<HandshakeBody, HandshakeError
         max_frame_len,
         topology_role,
         hop_limit,
+        direct_addr,
     })
 }
 
@@ -220,6 +235,9 @@ fn encode_common(b: &HandshakeBody, buf: &mut BytesMut) {
     put_tlv(buf, tlv_tag::MAX_FRAME_LEN, &b.max_frame_len.to_le_bytes());
     put_tlv(buf, tlv_tag::TOPOLOGY_ROLE, &[b.topology_role as u8]);
     put_tlv(buf, tlv_tag::HOP_LIMIT, &[b.hop_limit]);
+    if let Some(d) = &b.direct_addr {
+        put_tlv(buf, tlv_tag::DIRECT_ADDR, d.as_bytes());
+    }
 }
 
 impl HandshakeBody {
@@ -244,19 +262,20 @@ impl HandshakeAckBody {
                 max_frame_len: self.max_frame_len,
                 topology_role: self.topology_role,
                 hop_limit: self.hop_limit,
+                direct_addr: self.direct_addr.clone(),
             },
             buf,
         );
-        // ACK 专有：chosen_codec（tag 8，ACK 方记录协商结果）
-        put_tlv(buf, 8, self.chosen_codec.as_bytes());
+        // ACK 专有：chosen_codec（tag 9——8 已被 DIRECT_ADDR 占用）
+        put_tlv(buf, 9, self.chosen_codec.as_bytes());
     }
 
     pub fn decode_tlv(payload: &[u8]) -> Result<Self, HandshakeError> {
         let tlvs = read_tlv(payload)?;
         let common = decode_common(&tlvs)?;
         let mut chosen = "bin".to_string();
-        if let Some((_, v)) = tlvs.iter().find(|(t, _)| *t == 8) {
-            chosen = String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(8))?;
+        if let Some((_, v)) = tlvs.iter().find(|(t, _)| *t == 9) {
+            chosen = String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(9))?;
         }
         Ok(Self {
             node_id: common.node_id,
@@ -266,6 +285,7 @@ impl HandshakeAckBody {
             max_frame_len: common.max_frame_len,
             topology_role: common.topology_role,
             hop_limit: common.hop_limit,
+            direct_addr: common.direct_addr,
             chosen_codec: chosen,
         })
     }
@@ -293,6 +313,7 @@ mod tests {
             max_frame_len: 1024 * 1024,
             topology_role: TopologyRole::Hub,
             hop_limit: 6,
+            direct_addr: Some("10.0.0.1:9000".into()),
         }
     }
 
@@ -312,6 +333,7 @@ mod tests {
             max_frame_len: 512 * 1024,
             topology_role: TopologyRole::Normal,
             hop_limit: 8,
+            direct_addr: None,
             chosen_codec: "bin".into(),
         };
         let mut buf2 = BytesMut::new();

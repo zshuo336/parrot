@@ -116,6 +116,9 @@ pub struct Ingress {
     relay: std::sync::RwLock<Option<Arc<dyn RelayRouter>>>,
     /// 转发 cid 映射表（REPLY 回源还原）。
     pub relay_table: Arc<RelayTable>,
+    /// 方案 A 学习缓存（node → 直连地址）。hub 注入 ROUTE_HINT 时写入；
+    /// RemoteActorSystem::remote_ref 构建 ref 时读取（有直连表优先直连）。
+    pub learned: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// hub 转发出口（system.rs 注入——按 node 查出站 sender + 分配转发 cid）。
@@ -127,6 +130,11 @@ pub trait RelayRouter: Send + Sync + 'static {
     fn next_cid(&self) -> u64;
     /// 本节点 id（判"目标是本节点还是他节点"）。
     fn self_node(&self) -> &str;
+    /// 目标节点的直连拨号地址（方案 A：hub 中转时向源注入 ROUTE_HINT；
+    /// 目标不可直拨 → None 不注入）。
+    fn dial_addr_of(&self, node: &str) -> Option<String>;
+    /// 学习通知（方案 A）：spoke 收到 ROUTE_HINT 后回调——触发后台拨号。
+    fn on_hint(&self, node: &str, addr: &str);
 }
 
 impl Ingress {
@@ -138,6 +146,7 @@ impl Ingress {
             sys_event: std::sync::RwLock::new(None),
             relay: std::sync::RwLock::new(None),
             relay_table: Arc::new(RelayTable::new()),
+            learned: std::sync::Mutex::new(Default::default()),
         }
     }
 
@@ -193,7 +202,7 @@ impl Ingress {
                     this.on_ask(frame, &back).await;
                 });
             }
-            frame_type::TELL => self.on_tell(frame).await,
+            frame_type::TELL => self.on_tell(frame, back).await,
             frame_type::STOP => self.on_stop(frame).await,
             frame_type::REPLY | frame_type::REPLY_ERR => self.on_reply(frame),
             frame_type::SYSTEM_EVENT => {
@@ -216,6 +225,19 @@ impl Ingress {
                 let (code, detail) = decode_err_payload(&frame.payload)
                     .unwrap_or((ErrCode::ProtocolViolation, "<undecodable>".into()));
                 tracing::warn!(node = %from_node, code = code.name(), %detail, "remote ERROR frame");
+            }
+            frame_type::ROUTE_HINT => {
+                // 方案 A 学习通道（07 §6.2）：hub 告知目标直连地址 → 记入
+                // 学习缓存，由 direct_dialer 后台拨号（不阻塞分发循环）。
+                match Frame::parse_route_hint(&frame.payload) {
+                    Ok((node, addr)) => {
+                        tracing::debug!(%node, %addr, "route hint learned");
+                        self.on_route_hint(&node, &addr, back).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "malformed ROUTE_HINT dropped");
+                    }
+                }
             }
             // 心跳/握手由 ConnectionTask 处理；集群帧在连接层已断连——防御式吞掉
             _ => {
@@ -381,6 +403,11 @@ impl Ingress {
         // 映射登记（REPLY 回来自动还原回源）
         self.relay_table.insert(forward_cid, orig_cid, back.clone());
         RELAYED_ASK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 方案 A：目标可直拨 → 向源注入 ROUTE_HINT（源学直连，后续帧不再
+        // 经 hub——try_send 队列满仅丢弃 hint，学习退化为继续中转，无害）
+        if let Some(addr) = router.dial_addr_of(target) {
+            let _ = back.send_frame(Frame::route_hint(target, &addr));
+        }
         tracing::debug!(%target, forward_cid, orig_cid, "relayed ask");
         None
     }
@@ -399,7 +426,32 @@ impl Ingress {
         false
     }
 
-    async fn on_tell(&self, frame: Frame) {
+    /// ROUTE_HINT 学习（方案 A）：hub 背书的直连地址入缓存；地址变化
+    /// （节点重启换端口）覆盖旧值。拨号由 system 侧 watcher 异步执行。
+    async fn on_route_hint(&self, node: &str, addr: &str, _back: &FrameSender) {
+        let changed = {
+            let mut g = self.learned.lock().unwrap();
+            let changed = g.get(node).map(|a| a != addr).unwrap_or(true);
+            if changed {
+                g.insert(node.to_string(), addr.to_string());
+            }
+            changed
+        };
+        if changed {
+            tracing::info!(%node, %addr, "learned direct route (hub-endorsed)");
+            // 通知 dial watcher（system.rs——同地址已在拨/已连则忽略）
+            if let Some(router) = self
+                .relay
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+            {
+                router.on_hint(node, addr);
+            }
+        }
+    }
+
+    async fn on_tell(&self, frame: Frame, back: &FrameSender) {
         let decoded = match CodecRegistry::global().decode_incoming(&frame.type_key, &frame.payload)
         {
             Ok(m) => m,
@@ -411,7 +463,7 @@ impl Ingress {
         if let Some(r) = self.local.lookup(local_path(&frame.path)).await {
             // deliver 挂起 = 读循环挂起 = 对端背压贯通（05 §6.3，RC8）
             let _ = r.deliver(decoded).await;
-        } else if self.try_relay_tell(&frame) {
+        } else if self.try_relay_tell(&frame, back) {
             // hub 中转（TELL 无回程——fire-and-forget 转发）
         } else {
             DEAD_TELL_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -420,7 +472,7 @@ impl Ingress {
     }
 
     /// hub 转发 TELL（无回程语义——转发成功即完事）。
-    fn try_relay_tell(&self, frame: &Frame) -> bool {
+    fn try_relay_tell(&self, frame: &Frame, back: &FrameSender) -> bool {
         let Some(target) = target_node(&frame.path) else {
             return false;
         };
@@ -440,6 +492,10 @@ impl Ingress {
             return false;
         }
         RELAYED_TELL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 方案 A：同 ask——向源注入直连 hint
+        if let Some(addr) = router.dial_addr_of(target) {
+            let _ = back.send_frame(Frame::route_hint(target, &addr));
+        }
         tracing::debug!(%target, "relayed tell");
         true
     }

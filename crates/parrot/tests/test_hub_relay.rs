@@ -164,7 +164,7 @@ async fn star_topology() -> (
     .await
     .unwrap();
     let rb = RemoteActorSystem::new(
-        RCfg::tcp("node-b", None),
+        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
@@ -292,3 +292,111 @@ async fn rh5_hop_count_incremented() {
     assert!(n >= 1, "hub should have relayed at least one ask, got {n}");
     let _ = hub;
 }
+
+// ===========================================================================
+// RH6（方案 A）：B 声明 direct_addr → A 首访经 hub 学习 hint → 后台直连
+// 建立 → A 的 links 出现 node-b（后续帧直发，不再中转）
+// ===========================================================================
+
+#[tokio::test]
+async fn rh6_direct_link_learned_from_hint() {
+    // hub
+    let hub = RemoteActorSystem::new(
+        RCfg::tcp("hub", Some("127.0.0.1:0".parse().unwrap()))
+            .with_role(parrot_remote::TopologyRole::Hub),
+        Arc::new(FacadeLookup {
+            facade: Arc::new(
+                ParrotActorSystem::new(ActorSystemConfig::default())
+                    .await
+                    .unwrap(),
+            ),
+        }),
+    )
+    .unwrap();
+    hub.start().await.unwrap();
+    let hub_port = hub.local_addr().unwrap().port();
+
+    // b：声明 direct_addr（listen :0 的真实端口——握手带上）
+    let facade_b = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
+    let ts_b = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    facade_b
+        .register_thread_system("eng".into(), ts_b.clone(), true)
+        .await
+        .unwrap();
+    ts_b.spawn_at(EchoActor, "/user/echo", None, ThreadActorConfig::default())
+        .await
+        .unwrap();
+    // b：声明 direct_addr。端口策略：先占后放取空闲端口，再用该端口构造
+    // （bind 固定端口——声明地址 = 实际 listen 地址，无重启竞态）。
+    let b_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let rb = RemoteActorSystem::new(
+        RCfg::tcp("node-b", Some(format!("127.0.0.1:{b_port}").parse().unwrap()))
+            .with_direct_addr(format!("127.0.0.1:{b_port}")),
+        Arc::new(FacadeLookup {
+            facade: facade_b.clone(),
+        }),
+    )
+    .unwrap();
+    rb.start().await.unwrap();
+    rb.connect(&parrot_remote::NodeAddr::tcp(
+        "hub",
+        format!("127.0.0.1:{hub_port}").parse().unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    // a：连 hub
+    let ra = RemoteActorSystem::new(
+        RCfg::tcp("node-a", None),
+        Arc::new(FacadeLookup {
+            facade: Arc::new(
+                ParrotActorSystem::new(ActorSystemConfig::default())
+                    .await
+                    .unwrap(),
+            ),
+        }),
+    )
+    .unwrap();
+    ra.start().await.unwrap();
+    ra.connect(&parrot_remote::NodeAddr::tcp(
+        "hub",
+        format!("127.0.0.1:{hub_port}").parse().unwrap(),
+    ))
+    .await
+    .unwrap();
+    eventually(Duration::from_secs(3), || async {
+        ra.remote_ref("parrot://hub/user/echo").is_ok()
+    })
+    .await;
+
+    // 首访：经 hub 中转（A 尚无 node-b 直连）——hint 注入 + 后台拨号
+    let r = ra.remote_ref("parrot://node-b/user/echo").unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), r.send(Box::new(HPing(42))))
+        .await
+        .expect("first (relayed) ask timeout");
+    assert_eq!(reply.unwrap().downcast::<HPong>().unwrap().0, 42);
+
+    // 直连建立（hint → 后台拨号 → A 的 links 出现 node-b）
+    eventually(Duration::from_secs(5), || async {
+        ra.links_snapshot()
+            .await
+            .iter()
+            .any(|(n, _, _)| n == "node-b")
+    })
+    .await;
+
+    // 直连后的 ask（同 ref——sender_of 直连表优先，不再经 hub）
+    let r2 = ra.remote_ref("parrot://node-b/user/echo").unwrap();
+    let reply2 = tokio::time::timeout(Duration::from_secs(5), r2.send(Box::new(HPing(7))))
+        .await
+        .expect("direct ask timeout");
+    assert_eq!(reply2.unwrap().downcast::<HPong>().unwrap().0, 7);
+}
+

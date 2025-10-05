@@ -32,6 +32,9 @@ pub struct RemoteConfig {
     /// 本节点拓扑角色（07 §6）：Normal（默认）/ Hub（星型中心——spoke
     /// 将其链路作为默认路由 uplink）/ Border（联邦边界，同 Hub 待遇）。
     pub topology_role: crate::handshake::TopologyRole,
+    /// 本节点可被直拨的监听地址 "host:port"（方案 A：握手时声明，hub 据此
+    /// 向其他 spoke 注入 ROUTE_HINT；None = 不可直拨，只走 hub 中转）。
+    pub direct_addr: Option<String>,
 }
 
 impl RemoteConfig {
@@ -45,12 +48,20 @@ impl RemoteConfig {
             heartbeat_enabled: true,
             extra_caps: 0,
             topology_role: crate::handshake::TopologyRole::Normal,
+            direct_addr: None,
         }
     }
 
     /// 声明拓扑角色（hub 节点显式 Hub——spoke 据握手 ACK 识别 uplink）。
     pub fn with_role(mut self, role: crate::handshake::TopologyRole) -> Self {
         self.topology_role = role;
+        self
+    }
+
+    /// 声明可直拨地址（方案 A：spoke 有 listen 端口时设置——hub 会把它
+    /// 以 ROUTE_HINT 注入给通信对端，促成 spoke 两两直连）。
+    pub fn with_direct_addr(mut self, addr: impl Into<String>) -> Self {
+        self.direct_addr = Some(addr.into());
         self
     }
 
@@ -64,6 +75,7 @@ impl RemoteConfig {
             heartbeat_enabled: true,
             extra_caps: 0,
             topology_role: crate::handshake::TopologyRole::Normal,
+            direct_addr: None,
         }
     }
 
@@ -78,6 +90,7 @@ impl RemoteConfig {
             heartbeat_enabled: true,
             extra_caps: 0,
             topology_role: crate::handshake::TopologyRole::Normal,
+            direct_addr: None,
         }
     }
 
@@ -103,6 +116,9 @@ pub struct RemoteActorSystem {
     /// 星型 uplink（07 §6）：hub/border 链路的 sender——目标不在直连表
     /// 时的默认路由出口。
     uplink: std::sync::RwLock<Option<FrameSender>>,
+    /// 对端直拨地址表（方案 A：hub 注入 ROUTE_HINT 的数据源；握手
+    /// DIRECT_ADDR 声明维护）。
+    dial_addrs: std::sync::Mutex<std::collections::HashMap<String, String>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// K0：admin 回执挂起表（req_id → oneshot）
     admin_pending: Arc<crate::admin::AdminPending>,
@@ -123,6 +139,7 @@ impl RemoteActorSystem {
             node_id: config.node_id.clone(),
             capabilities: crate::handshake::caps::BIN | config.extra_caps,
             topology_role: config.topology_role,
+            direct_addr: config.direct_addr.clone(),
             ..Default::default()
         };
         // 断连清理：单链路 → fail_node（其它链路不受牵连——K6 多联）；
@@ -181,6 +198,7 @@ impl RemoteActorSystem {
             inbound_rx: tokio::sync::Mutex::new(in_rx),
             links: tokio::sync::Mutex::new(Vec::new()),
             uplink: std::sync::RwLock::new(None),
+            dial_addrs: std::sync::Mutex::new(Default::default()),
             shutdown_tx,
             admin_pending: Arc::new(crate::admin::AdminPending::default()),
             admin_req_id: std::sync::atomic::AtomicU64::new(1),
@@ -342,6 +360,13 @@ impl RemoteActorSystem {
             *g = Some(conn.sender.clone());
             tracing::info!(node = %conn.node_id, role = ?conn.peer_role, "uplink set");
         }
+        // 方案 A：对端声明的直拨地址入表（hub 中转时作为 ROUTE_HINT 数据源）
+        if let Some(d) = &conn.peer_dial_addr {
+            self.dial_addrs
+                .lock()
+                .unwrap()
+                .insert(conn.node_id.clone(), d.clone());
+        }
         // NodeTable 同步（remote_ref require 校验通过）
         self.nodes.add_seed(NodeAddr {
             node_id: conn.node_id.clone(),
@@ -357,7 +382,10 @@ impl RemoteActorSystem {
         let this = self.clone();
         tokio::spawn(async move {
             let _ = (&mut closed).await;
+            tracing::debug!(node = %node_id, "connection closed (register_link watcher)");
             this.links.lock().await.retain(|(n, _, _)| n != &node_id);
+            // 直拨地址随链路失效清除（节点重启换端口后由新握手重新声明）
+            this.dial_addrs.lock().unwrap().remove(&node_id);
             // uplink 失效清理（该 hub 断连——读侧 try_send 失败自然兜底）
             let mut g = this.uplink.write().unwrap();
             if g.as_ref().map(|s| s.node_id() == node_id).unwrap_or(false) {
@@ -378,12 +406,34 @@ impl RemoteActorSystem {
     /// 解析远程路径拿 ref（校验 parrot:// 前缀 + node 在表）。
     /// 星型放宽（07 §6）：node 不在直连表但有 uplink hub → 仍可建 ref
     /// （默认路由——帧先发 hub，由其中转到目标）。
-    pub fn remote_ref(&self, path: &str) -> Result<RemoteActorRef, RemoteError> {
+    /// 方案 A：learned 直连地址存在且链路已断 → 触发重拨（hint 数据源
+    /// 是 hub，地址新鲜度可信；拨号异步，本次仍走 uplink 兜底）。
+    pub fn remote_ref(self: &Arc<Self>, path: &str) -> Result<RemoteActorRef, RemoteError> {
         let node = crate::node::node_of_path(path)
             .ok_or_else(|| RemoteError::Transport(format!("not a parrot:// path: {path}")))?;
         let has_uplink = self.uplink.read().map(|g| g.is_some()).unwrap_or(false);
-        if self.nodes.require(node).is_err() && !has_uplink {
+        let in_links = self
+            .links
+            .try_lock()
+            .map(|g| g.iter().any(|(n, _, _)| n == node))
+            .unwrap_or(false);
+        if self.nodes.require(node).is_err() && !in_links && !has_uplink {
             return Err(RemoteError::UnknownNode(node.to_string()));
+        }
+        // 方案 A 重拨：有学习地址 + 链路缺失 → spawn 直拨（不阻塞 ref 构建）
+        if !in_links {
+            if let Some(addr) = self.ingress.learned.lock().unwrap().get(node).cloned() {
+                if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+                    let this = self.clone();
+                    let node_s = node.to_string();
+                    tokio::spawn(async move {
+                        let na = crate::node::NodeAddr::tcp(node_s.clone(), sa);
+                        if let Err(e) = this.connect(&na).await {
+                            tracing::debug!(node = %node_s, %addr, err = %e, "re-dial direct link failed");
+                        }
+                    });
+                }
+            }
         }
         let links = self.links.try_lock();
         let nodes = match links {
@@ -673,5 +723,41 @@ impl crate::ingress::RelayRouter for SystemRelay {
 
     fn self_node(&self) -> &str {
         &self.self_node
+    }
+
+    fn dial_addr_of(&self, node: &str) -> Option<String> {
+        let sys = self.system.upgrade()?;
+        let addr = sys.dial_addrs.lock().unwrap().get(node).cloned();
+        addr
+    }
+
+    /// 方案 A 学习回调：后台拨直连（不阻塞 ingress——spawn；已在连/拨中
+    /// 忽略；失败静默，后续 hint 或回落 uplink 兜底）。
+    fn on_hint(&self, node: &str, addr: &str) {
+        let Some(sys) = self.system.upgrade() else { return };
+        // 已有该节点直连链路 → 无需动作（新地址不同时也重拨：先移除旧链）
+        let already = sys
+            .links
+            .try_lock()
+            .map(|g| g.iter().any(|(n, _, _)| n == node))
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        let sys2 = sys.clone();
+        let node = node.to_string();
+        let addr = addr.to_string();
+        tokio::spawn(async move {
+            match addr.parse::<std::net::SocketAddr>() {
+                Ok(sa) => {
+                    let na = crate::node::NodeAddr::tcp(node.clone(), sa);
+                    match sys2.connect(&na).await {
+                        Ok(()) => tracing::info!(%node, %addr, "direct link established"),
+                        Err(e) => tracing::debug!(%node, %addr, err = %e, "direct dial failed (fallback uplink)"),
+                    }
+                }
+                Err(_) => tracing::debug!(%addr, "hint addr unparseable"),
+            }
+        });
     }
 }
