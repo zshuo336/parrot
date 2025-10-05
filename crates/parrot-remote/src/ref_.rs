@@ -27,9 +27,24 @@ pub struct RemoteInner {
     /// 星型拓扑默认路由（07 §6）：目标节点不在直连表时经 hub 中转。
     /// None = 无 uplink（纯直连模式——miss 即 fail）。
     pub uplink: Option<FrameSender>,
+    /// 端到端 TELL 序号分配（per 目标节点单调递增，从 1 起；跨路径切换
+    /// 连续——接收端据此重排。外层 Mutex 简单正确：临界区仅查表+自增，
+    /// 无 await；高并发 TELL 热点可换 sharded，当前压测未见瓶颈）。
+    pub(crate) seq_counters: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl RemoteInner {
+    /// 取目标节点下一序号（首帧 =1；u32 回绕在 2^32 帧后——接收端
+    /// expected 同步回绕，语义仍单调）。
+    pub fn next_seq(&self, node: String) -> u32 {
+        let mut g = self.seq_counters.lock().unwrap();
+        let c = g.entry(node).or_insert(0u32);
+        *c = c.wrapping_add(1);
+        if *c == 0 {
+            *c = 1; // 回绕跳过 0 哨兵
+        }
+        *c
+    }
     /// 出站链路：按 node_id 查（P1 单链路；fail-over 是 P2 重连任务职责）。
     fn sender_of(&self, node_id: &str) -> Option<&FrameSender> {
         self.nodes
@@ -162,8 +177,12 @@ impl ActorRef for RemoteActorRef {
             let sender = self.inner.sender_of(&self.node_id).ok_or_else(|| {
                 ActorError::InternalError(format!("remote link to {} unavailable", self.node_id))
             })?;
+            // 端到端 seq（per 目标节点单调递增）：接收端 TELL 重排用。
+            // 分配与入队同线程紧邻（先取号再 send），原子计数保证唯一性；
+            // 极端并发下 33 先于 32 入队由接收端重排兜底。
+            let seq = self.inner.next_seq(self.node_id.clone());
             sender
-                .send(Frame::tell(&self.path, &key, payload))
+                .send(Frame::tell_with_seq(&self.path, &key, payload, seq))
                 .await
                 .map_err(|e| ErrCode::ConnectionLost.to_actor_error(e.to_string()))?;
             Ok(())
@@ -222,6 +241,7 @@ mod tests {
                 callbacks: Arc::new(CallbackRegistry::new(8)),
                 self_node: "self".into(),
                 uplink: None,
+                seq_counters: Default::default(),
             }),
             rx,
         )
@@ -235,6 +255,7 @@ mod tests {
             callbacks: Arc::new(CallbackRegistry::new(8)),
             self_node: "test".into(),
             uplink: None,
+            seq_counters: Default::default(),
         });
         let r = RemoteActorRef::new("/x", "n", inner);
         #[derive(Debug)]
@@ -253,6 +274,7 @@ mod tests {
             callbacks: Arc::new(CallbackRegistry::new(8)),
             self_node: "test".into(),
             uplink: None,
+            seq_counters: Default::default(),
         });
         let r = RemoteActorRef::new("/x", "ghost", inner.clone());
         #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -331,6 +353,7 @@ mod tests {
             callbacks: Arc::new(CallbackRegistry::new(1)),
             self_node: "self".into(),
             uplink: None,
+            seq_counters: Default::default(),
         });
         // 预占满（cid=1000）
         let (otx, _orx) = tokio::sync::oneshot::channel();

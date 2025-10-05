@@ -64,7 +64,10 @@ parrot/tests/test_remote_semantics.rs  # RC1–RC8 语义跨网复跑
 8     8    correlation_id   u64 LE（ASK/REPLY/REPLY_ERR 配对；TELL=0 或去重序号）
 16    1    hop_count        中继已跳数，起始 0；每经一跳 +1
 17    1    hop_limit        上限，默认 8（HELLO 协商）；hop_count≥hop_limit 丢弃回 RouteUnreachable
-18    6    reserved         u48 保留 0
+18    6    reserved         u48：低 32bit = 端到端 seq（TELL 重排序号——
+                         per 源节点单调递增、跨路径切换连续，0=不参与
+                         重排即旧语义；接收端 seq 流见 06 §TELL 重排网关）；
+                         高 16bit 保留 0（非 0 拒帧——未来扩展再分配）
 24    4    path_len         u32 LE
 28    var  path_bytes       UTF-8 逻辑地址（parrot://node/sys/user/uuid，07 §3.1）
 28+p  4    type_key_len     u32 LE

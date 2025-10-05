@@ -400,3 +400,168 @@ async fn rh6_direct_link_learned_from_hint() {
     assert_eq!(reply2.unwrap().downcast::<HPong>().unwrap().0, 7);
 }
 
+// ===========================================================================
+// RH7（端到端重排）：TELL 流跨中转→直连切换点，B 收到的顺序与 A 发送
+// 顺序一致（seq 重排网关在 B 侧生效——uplink 在途帧 bypass 先投 + 直连
+// 帧 seq 对齐，物理乱序被吸收）。
+// ===========================================================================
+
+/// 顺序录制 actor：记 HNote 到达序（Vec<u64>）。
+struct OrderActor {
+    order: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+impl Actor for OrderActor {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        let order = self.order.clone();
+        Box::pin(async move {
+            if let Some(HNote(v)) = msg.downcast_ref::<HNote>() {
+                order.lock().unwrap().push(*v);
+                return Ok(Box::new(HPong(*v)) as BoxedMessage);
+            }
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
+        })
+    }
+    fn state(&self) -> parrot_api::actor::ActorState {
+        parrot_api::actor::ActorState::Running
+    }
+}
+
+#[tokio::test]
+async fn rh7_tell_order_preserved_across_route_switch() {
+    // 拓扑复用 RH6 形态：hub + b（direct_addr）+ a
+    let hub = RemoteActorSystem::new(
+        RCfg::tcp("hub", Some("127.0.0.1:0".parse().unwrap()))
+            .with_role(parrot_remote::TopologyRole::Hub),
+        Arc::new(FacadeLookup {
+            facade: Arc::new(
+                ParrotActorSystem::new(ActorSystemConfig::default())
+                    .await
+                    .unwrap(),
+            ),
+        }),
+    )
+    .unwrap();
+    hub.start().await.unwrap();
+    let hub_port = hub.local_addr().unwrap().port();
+
+    let facade_b = Arc::new(
+        ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap(),
+    );
+    let ts_b = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    facade_b
+        .register_thread_system("eng".into(), ts_b.clone(), true)
+        .await
+        .unwrap();
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    ts_b.spawn_at(
+        OrderActor { order: order.clone() },
+        "/user/order",
+        None,
+        ThreadActorConfig::default(),
+    )
+    .await
+    .unwrap();
+    let b_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let rb = RemoteActorSystem::new(
+        RCfg::tcp("node-b", Some(format!("127.0.0.1:{b_port}").parse().unwrap()))
+            .with_direct_addr(format!("127.0.0.1:{b_port}")),
+        Arc::new(FacadeLookup {
+            facade: facade_b.clone(),
+        }),
+    )
+    .unwrap();
+    rb.start().await.unwrap();
+    rb.connect(&parrot_remote::NodeAddr::tcp(
+        "hub",
+        format!("127.0.0.1:{hub_port}").parse().unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    let ra = RemoteActorSystem::new(
+        RCfg::tcp("node-a", None),
+        Arc::new(FacadeLookup {
+            facade: Arc::new(
+                ParrotActorSystem::new(ActorSystemConfig::default())
+                    .await
+                    .unwrap(),
+            ),
+        }),
+    )
+    .unwrap();
+    ra.start().await.unwrap();
+    ra.connect(&parrot_remote::NodeAddr::tcp(
+        "hub",
+        format!("127.0.0.1:{hub_port}").parse().unwrap(),
+    ))
+    .await
+    .unwrap();
+    eventually(Duration::from_secs(3), || async {
+        ra.remote_ref("parrot://hub/user/echo").is_ok()
+    })
+    .await;
+
+    // 阶段1（中转期）：A 连发 N 条 TELL（走 uplink 中转——帧带 seq 但
+    // hub 中转路径 B 侧 bypass 直投；TCP FIFO 保序）
+    let r = ra.remote_ref("parrot://node-b/user/order").unwrap();
+    for i in 0..20u64 {
+        r.deliver(Box::new(HNote(i))).await.unwrap();
+    }
+    eventually(Duration::from_secs(3), || async {
+        order.lock().unwrap().len() == 20
+    })
+    .await;
+    assert_eq!(
+        order.lock().unwrap().clone(),
+        (0..20u64).collect::<Vec<_>>(),
+        "中转期顺序正确（TCP FIFO + bypass）"
+    );
+
+    // 阶段2：触发直连学习（一次 ask 换 hint——与 tell 流不同 ref 无干扰）
+    let r_ask = ra.remote_ref("parrot://node-b/user/order").unwrap();
+    // OrderActor 只回 HNote；ask HPing 会 MessageHandlingError——改发 HNote
+    // ask：send 走 ASK，OrderActor 回 HPong
+    let _ = tokio::time::timeout(Duration::from_secs(5), r_ask.send(Box::new(HNote(999))))
+        .await
+        .expect("relay ask timeout");
+    eventually(Duration::from_secs(5), || async {
+        ra.links_snapshot()
+            .await
+            .iter()
+            .any(|(n, _, _)| n == "node-b")
+    })
+    .await;
+
+    // 阶段3（切换点）：立刻连发 20 条——前几条可能仍在 uplink 在途/新直连
+    // 已启用，seq 重排应吸收任何物理乱序。直连首帧 seq=21 进入 B 侧全新
+    // 重排流（expected=1 冷启动）→ 250ms 缺口超时放行 21 → 连 drain
+    // 22..40——整段保序，只付一次 250ms 切换税。
+    for i in 20..40u64 {
+        r.deliver(Box::new(HNote(i))).await.unwrap();
+    }
+    eventually(Duration::from_secs(5), || async {
+        let g = order.lock().unwrap();
+        g.len() == 41
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await; // 静置收尾
+    let got = order.lock().unwrap().clone();
+    // 终序：中转期 0..20 → ask 999（中转 bypass）→ 直连期 20..40
+    // （冷启动 250ms 放行后整段连 drain）
+    let expect: Vec<u64> = (0..20u64).chain([999u64]).chain(20..40u64).collect();
+    assert_eq!(got, expect, "跨切换点 TELL 全序保持（seq 重排生效）");
+}
+

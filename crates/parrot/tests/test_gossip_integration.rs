@@ -51,6 +51,7 @@ fn gossip_frame(g: &MembershipGossip) -> Frame {
             correlation_id: 0,
             hop_count: 0,
             hop_limit: 8,
+            seq: parrot_remote::frame::SEQ_NONE,
         },
         path: String::new(),
         type_key: String::new(),
