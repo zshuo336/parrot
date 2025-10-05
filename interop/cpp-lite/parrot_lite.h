@@ -88,6 +88,17 @@ typedef void (*pl_on_ask_t)(const char *from_path, const char *type_key,
                             uint64_t cid);
 void pl_poll(int timeout_ms);
 
+/// 启动后台泵线程（机器人主控形态：免手动 pl_poll；回调线程=泵线程）。
+/// 幂等；返回 0 成功 / -5 线程创建失败。
+int pl_pump_start(void);
+
+/// 停止后台泵线程（幂等；pl_close 前调用更优雅）。
+void pl_pump_stop(void);
+
+/// 编译期轮询后端描述（"epoll"/"kqueue"/"poll"——auto 时含降级提示，
+/// 如 "kqueue-or-poll"；运行时实际生效以 pl_pollset_backend() 为准）。
+const char *pl_backend_name(void);
+
 /// 注册 on_ask 回调（pl_poll 派发用；NULL 清除）。
 void pl_set_on_ask(pl_on_ask_t cb, void *userdata);
 
@@ -123,7 +134,7 @@ struct Frame {
   std::vector<uint8_t> encode() const;
 };
 
-// 帧解析器（非消费式半包——同 TS FrameDecoder）
+// 帧解析器（游标式半包——DEV_08：消费只推进游标，压缩惰性摊销）
 class FrameDecoder {
 public:
   void feed(const uint8_t *data, size_t len);
@@ -132,6 +143,8 @@ public:
 
 private:
   std::vector<uint8_t> buf_;
+  size_t pos_ = 0;      // 已消费游标
+  void compact();       // 前缀过半才 memmove（批量帧 O(N) 总代价）
 };
 
 uint64_t new_cid(); // 随机（splitmix64 种子——仅客户端用途）

@@ -30,17 +30,62 @@ object WireFrame {
     val ERROR: Byte = 0x7F
   }
 
-  final case class Frame(
-      version: Byte,
-      frameType: Byte,
-      flags: Int,
-      correlationId: Long,
-      hopCount: Byte,
-      hopLimit: Byte,
-      path: String,
-      typeKey: String,
-      payload: Array[Byte]
+  /** payload 双形态（DEV_08 零拷贝）：
+    * - Netty 路径：retainedBuf（readRetainedSlice 直传，由 encoder release）；
+    * - 纯编解码/单测：bytes（lazy 物化）。
+    * 二者互斥：构造时二选一，另一侧首次访问时物化（Netty 切片→数组仅
+    * 在确实需要数组形态时发生——热路径零拷贝）。
+    */
+  final class Frame(
+      val version: Byte,
+      val frameType: Byte,
+      val flags: Int,
+      val correlationId: Long,
+      val hopCount: Byte,
+      val hopLimit: Byte,
+      val path: String,
+      val typeKey: String,
+      bytes0: Array[Byte],
+      buf0: io.netty.buffer.ByteBuf
   ) {
+    private var _bytes: Array[Byte] = bytes0
+    private var _buf: io.netty.buffer.ByteBuf = buf0
+
+    def this(version: Byte, frameType: Byte, flags: Int, correlationId: Long,
+             hopCount: Byte, hopLimit: Byte, path: String, typeKey: String,
+             payload: Array[Byte]) =
+      this(version, frameType, flags, correlationId, hopCount, hopLimit, path, typeKey, payload, null)
+
+    private[jvm] def this(version: Byte, frameType: Byte, flags: Int, correlationId: Long,
+                          hopCount: Byte, hopLimit: Byte, path: String, typeKey: String,
+                          payloadBuf: io.netty.buffer.ByteBuf) =
+      this(version, frameType, flags, correlationId, hopCount, hopLimit, path, typeKey, null, payloadBuf)
+
+    /** 数组形态（需拷贝时一次性物化）。 */
+    def payload: Array[Byte] = {
+      if (_bytes == null) {
+        val b = new Array[Byte](_buf.readableBytes())
+        val dup = _buf.duplicate() // 不动读指针
+        dup.readBytes(b)
+        _bytes = b
+      }
+      _bytes
+    }
+
+    /** ByteBuf 视图（热路径——零拷贝）。 */
+    private[jvm] def payloadBytes: io.netty.buffer.ByteBuf =
+      if (_buf != null) _buf
+      else {
+        _buf = io.netty.buffer.Unpooled.wrappedBuffer(_bytes)
+        _buf
+      }
+
+    /** 消费掉 retained 资源（encoder 写完调用；幂等）。 */
+    private[jvm] def releaseBuf(): Unit = {
+      if (_buf != null && _buf.refCnt() > 0) _buf.release()
+      _buf = null
+    }
+
     def encode(): Array[Byte] = {
       val pathB = path.getBytes(UTF_8)
       val keyB  = typeKey.getBytes(UTF_8)
@@ -67,6 +112,38 @@ object WireFrame {
       System.arraycopy(payload, 0, out, p, payload.length)
       out
     }
+
+    override def equals(that: Any): Boolean = that match {
+      case f: Frame =>
+        version == f.version && frameType == f.frameType && flags == f.flags &&
+          correlationId == f.correlationId && hopCount == f.hopCount && hopLimit == f.hopLimit &&
+          path == f.path && typeKey == f.typeKey &&
+          java.util.Arrays.equals(payload, f.payload)
+      case _ => false
+    }
+
+    override def hashCode(): Int =
+      java.util.Objects.hash(
+        Byte.box(version), Byte.box(frameType), Int.box(flags), Long.box(correlationId),
+        Byte.box(hopCount), Byte.box(hopLimit), path, typeKey, java.util.Arrays.hashCode(payload)
+      )
+
+    override def toString: String =
+      s"Frame($version, $frameType, $flags, $correlationId, $hopCount, $hopLimit, $path, $typeKey, payload[${payload.length}])"
+  }
+
+  object Frame {
+    /** Array 形态工厂（旧 case class 构造兼容点）。 */
+    def apply(version: Byte, frameType: Byte, flags: Int, correlationId: Long,
+              hopCount: Byte, hopLimit: Byte, path: String, typeKey: String,
+              payload: Array[Byte]): Frame =
+      new Frame(version, frameType, flags, correlationId, hopCount, hopLimit, path, typeKey, payload)
+
+    /** ByteBuf 形态工厂（Netty 零拷贝路径——retained 切片归本帧）。 */
+    private[jvm] def apply(version: Byte, frameType: Byte, flags: Int, correlationId: Long,
+                           hopCount: Byte, hopLimit: Byte, path: String, typeKey: String,
+                           payloadBuf: io.netty.buffer.ByteBuf): Frame =
+      new Frame(version, frameType, flags, correlationId, hopCount, hopLimit, path, typeKey, payloadBuf)
   }
 
   private def readU32(b: Array[Byte], off: Int): Long =

@@ -7,6 +7,7 @@
 -export([run/0, all/0]).
 
 -define(ASK, 16#10).
+-define(REPLY, 16#11).
 -define(REPLY_ERR, 16#12).
 
 all() ->
@@ -16,7 +17,9 @@ all() ->
      {"pipeline two frames", fun t_pipeline/0},
      {"handshake tlv layout", fun t_handshake/0},
      {"service dialects", fun t_service/0},
-     {"err payload layout", fun t_err/0}].
+     {"err payload layout", fun t_err/0},
+     {"DEV_08 slow ask not blocking heartbeat", fun t_slow_ask_concurrency/0},
+     {"DEV_08 slow ask not blocking fast ask", fun t_slow_fast_ask/0}].
 
 run() ->
     Fail = lists:foldl(
@@ -77,6 +80,77 @@ t_service() ->
 
 t_err() ->
     <<13:16/little, 0:16/little, "forbidden">> = parrot_gw:err_payload(13, "forbidden").
+
+%% ---------- DEV_08 并发模型（真实网关进程 + socket） ----------
+
+t_slow_ask_concurrency() ->
+    %% 注入慢 service：bin:u:Ping sleep 300ms（其余原逻辑）
+    Slow = fun(<<"bin:u:Ping">> = K, P) ->
+                   receive after 300 -> ok end,
+                   parrot_gw:service(K, P);
+              (K, P) -> parrot_gw:service(K, P)
+           end,
+    {ok, Port} = parrot_gw:start(0, Slow),
+    {ok, S} = gw_connect(Port),
+    try
+        %% 慢 ASK + 立即心跳：心跳 ACK 必须在慢 REPLY 之前到达
+        %% reply_to 前缀：u32 len=3 + "a/l"（与载荷长度声明严格一致）
+        Ask = parrot_gw:build_frame(?ASK, 100, <<"/user/x">>, <<"bin:u:Ping">>,
+                                    <<3:32/little, "a/l", 42:64/little>>),
+        Hb = parrot_gw:build_frame(16#03, 101, <<>>, <<>>, <<>>),
+        ok = gen_tcp:send(S, <<Ask/binary, Hb/binary>>),
+        T0 = os:timestamp(),
+        {16#04, _} = gw_recv_ft(S),               %% HEARTBEAT_ACK 先到
+        HbMs = timer:now_diff(os:timestamp(), T0) div 1000,
+        {?REPLY, 100} = gw_recv_ft_cid(S),        %% 慢 REPLY 随后
+        true = HbMs < 250                          %% 300ms 慢 service 期间已应答
+    after
+        gen_tcp:close(S)
+    end.
+
+t_slow_fast_ask() ->
+    Slow = fun(<<"bin:u:Ping">> = K, P) ->
+                   receive after 300 -> ok end,
+                   parrot_gw:service(K, P);
+              (K, P) -> parrot_gw:service(K, P)
+           end,
+    {ok, Port} = parrot_gw:start(0, Slow),
+    {ok, S} = gw_connect(Port),
+    try
+        SlowF = parrot_gw:build_frame(?ASK, 200, <<"/u">>, <<"bin:u:Ping">>,
+                                      <<3:32/little, "a/l", 1:64/little>>),
+        FastF = parrot_gw:build_frame(?ASK, 201, <<"/u">>, <<"bin:u:Add">>,
+                                      <<3:32/little, "a/l", 3:64/little, 4:64/little>>),
+        ok = gen_tcp:send(S, <<SlowF/binary, FastF/binary>>),
+        %% 快 ASK（Add，未注入）的 REPLY 必须先到
+        {?REPLY, 201} = gw_recv_ft_cid(S),
+        {?REPLY, 200} = gw_recv_ft_cid(S)
+    after
+        gen_tcp:close(S)
+    end.
+
+gw_connect(Port) ->
+    {ok, S} = gen_tcp:connect("127.0.0.1", Port, [binary, {packet, raw},
+                                                   {active, false}, {nodelay, true}]),
+    Hs = parrot_gw:build_frame(16#01, 1, <<>>, <<"__handshake__">>, <<>>),
+    ok = gen_tcp:send(S, Hs),
+    {16#02, _} = gw_recv_ft(S),
+    {ok, S}.
+
+gw_recv_ft(S) -> gw_recv_loop(S, fun(Ft, _Cid) -> {Ft, none} end, <<>>).
+gw_recv_ft_cid(S) -> gw_recv_loop(S, fun(Ft, Cid) -> {Ft, Cid} end, <<>>).
+
+gw_recv_loop(S, Pick, Buf) ->
+    case parrot_gw:parse_frame(Buf) of
+        {ok, Ft, _Fl, Cid, _P, _K, _Pay, Tail} ->
+            case Pick(Ft, Cid) of
+                skip -> gw_recv_loop(S, Pick, Tail);
+                R -> R
+            end;
+        {more, _} ->
+            {ok, D} = gen_tcp:recv(S, 0, 5000),
+            gw_recv_loop(S, Pick, <<Buf/binary, D/binary>>)
+    end.
 
 %% ---------- util ----------
 

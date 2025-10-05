@@ -96,11 +96,12 @@ fn run_cpp_interop(port: u16) -> (bool, String) {
     let bin = std::env::temp_dir().join(format!("pl_interop_{}", std::process::id()));
     let cc = std::env::var("CXX").unwrap_or_else(|_| "clang++".into());
     let build = std::process::Command::new(&cc)
-        .args(["-std=c++17", "-Wall", "-Wextra"])
+        .args(["-std=c++17", "-O2", "-Wall", "-Wextra"])
         .arg("-I")
         .arg(&dir)
         .arg(&src)
         .arg(dir.join("parrot_lite.cpp"))
+        .arg(dir.join("parrot_poll.cpp"))
         .arg("-o")
         .arg(&bin)
         .output()
@@ -114,6 +115,37 @@ fn run_cpp_interop(port: u16) -> (bool, String) {
         .arg(port.to_string())
         .output()
         .expect("run cpp interop");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// DEV_08：C++ 并发/性能门禁（后端探测 + 游标解码 + 8 线程并发 ask）。
+fn run_cpp_perf(port: u16) -> (bool, String) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interop/cpp-lite");
+    let bin = std::env::temp_dir().join(format!("pl_perf_{}", std::process::id()));
+    let cc = std::env::var("CXX").unwrap_or_else(|_| "clang++".into());
+    let build = std::process::Command::new(&cc)
+        .args(["-std=c++17", "-O2", "-Wall", "-Wextra"])
+        .arg("-I")
+        .arg(&dir)
+        .arg(dir.join("test_perf.cpp"))
+        .arg(dir.join("parrot_lite.cpp"))
+        .arg(dir.join("parrot_poll.cpp"))
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("spawn compiler");
+    assert!(
+        build.status.success(),
+        "C++ perf build failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let out = std::process::Command::new(&bin)
+        .arg(port.to_string())
+        .output()
+        .expect("run cpp perf");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -147,6 +179,17 @@ async fn cpp_interop_ask() {
     print!("{stdout}");
     assert!(ok, "cpp interop binary failed");
     assert!(stdout.contains("CABI-INTEROP PASS"), "gate marker missing");
+
+    // DEV_08 性能门禁：后端探测 + 游标解码 + 并发 ask（复用同 echo 节点）
+    let (pok, pout) = run_cpp_perf(port);
+    print!("{pout}");
+    assert!(pok, "cpp perf binary failed");
+    assert!(
+        pout.contains("P1 backend-select PASS")
+            && pout.contains("P2 decoder-bulk PASS")
+            && pout.contains("P3 concurrent-ask PASS"),
+        "perf gate markers missing"
+    );
 
     server.shutdown().await.ok();
 }

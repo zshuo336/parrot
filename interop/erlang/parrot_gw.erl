@@ -11,8 +11,8 @@
 %% 握手 TLV: tag u8 + len u16 LE + value（NODE_ID=1 CAPS=4 MAX_FRAME_LEN=5
 %% TOPOLOGY_ROLE=6 HOP_LIMIT=7；ACK 加 CHOSEN_CODEC=8）
 -module(parrot_gw).
--export([main/1, service/2, build_frame/5, build_frame/6, parse_frame/1,
-         handshake_body/1, handshake_ack_body/1, err_payload/2]).
+-export([main/1, start/1, start/2, service/2, build_frame/5, build_frame/6,
+         parse_frame/1, handshake_body/1, handshake_ack_body/1, err_payload/2]).
 
 -define(VER, 1).
 -define(ASK, 16#10).
@@ -99,37 +99,53 @@ main(Args) ->
                [P] when is_integer(P) -> P;
                _ -> 0
            end,
-    {ok, LSock} = gen_tcp:listen(Port, [binary, {packet, raw}, {active, false},
-                                        {nodelay, true}, {reuseaddr, true}]),
-    {ok, RealPort} = inet:port(LSock),
+    {ok, RealPort} = start(Port),
     io:format("PARROT_ERL_PORT=~p~n", [RealPort]),
-    {ok, Sock} = gen_tcp:accept(LSock),
-    gen_tcp:close(LSock),
-    log("rust node connected: ~p~n", [inet:peername(Sock)]),
-    loop(Sock, <<>>),
-    halt(0).
+    receive stop_gateway -> halt(0) end.   %% 驻留（被 kill 或 halt）
+
+%% DEV_08 测试口：启动网关并直接返回端口（不打印——测试免 stdout 捕获）。
+%% ServiceFun 可注入（默认 ?MODULE:service/2——测试注入慢实现验证并发结构）。
+start(Port) -> start(Port, fun ?MODULE:service/2).
+start(Port, ServiceFun) ->
+    Self = self(),
+    _Gw = spawn(fun() ->
+                        {ok, LSock} = gen_tcp:listen(Port, [binary, {packet, raw},
+                                                            {active, false},
+                                                            {nodelay, true},
+                                                            {reuseaddr, true},
+                                                            {send_timeout, 5000},
+                                                            {send_timeout_close, true}]),
+                        {ok, RealPort} = inet:port(LSock),
+                        Self ! {gw_port, RealPort},
+                        {ok, Sock} = gen_tcp:accept(LSock),
+                        gen_tcp:close(LSock),
+                        put(service_fun, ServiceFun),
+                        log("rust node connected: ~p~n", [inet:peername(Sock)]),
+                        loop(Sock, <<>>)
+                end),
+    receive {gw_port, P} -> {ok, P} after 5000 -> {error, gw_start_timeout} end.
 
 log(Fmt, Args) ->
     %% 网关日志走 stderr（stdout 契约只留端口行）
     io:format(standard_error, Fmt, Args).
 
+%% DEV_08 修复：先榨干缓冲区内的完整帧再 recv（原实现每次 recv 只解析
+%% 一帧，同批到达的第二帧滞留缓冲直到新数据到达——流水线/合发场景的
+%% 解析级队头阻塞；单帧逐发的旧客户端形态掩盖了此 bug）。
 loop(Sock, Buf0) ->
-    case gen_tcp:recv(Sock, 0, 30000) of
-        {ok, Data} ->
-            Buf = <<Buf0/binary, Data/binary>>,
-            case parse_frame(Buf) of
-                {more, Rest} ->
-                    loop(Sock, Rest);
-                {ok, Ft, Flags, Cid, _Path, Key, Payload, Tail} ->
-                    handle(Sock, Ft, Flags, Cid, Key, Payload),
-                    loop(Sock, Tail)
-            end;
-        {error, timeout} ->
-            loop(Sock, Buf0);
-        {error, closed} ->
-            log("connection closed~n", []);
-        {error, Reason} ->
-            log("recv error ~p~n", [Reason])
+    case parse_frame(Buf0) of
+        {ok, Ft, Flags, Cid, _Path, Key, Payload, Tail} ->
+            handle(Sock, Ft, Flags, Cid, Key, Payload),
+            loop(Sock, Tail);
+        {more, Rest} ->
+            case gen_tcp:recv(Sock, 0, infinity) of
+                {ok, Data} ->
+                    loop(Sock, <<Rest/binary, Data/binary>>);
+                {error, closed} ->
+                    log("connection closed~n", []);
+                {error, Reason} ->
+                    log("recv error ~p~n", [Reason])
+            end
     end.
 
 handle(Sock, Ft, _Flags, Cid, Key, Payload) ->
@@ -145,18 +161,32 @@ handle(Sock, Ft, _Flags, Cid, Key, Payload) ->
         ?ASK ->
             %% 剥 reply_to 前缀（4B len + path；回程经 cid 配对）
             Real = split_reply_to(Payload),
-            Res = try {ok, service(Key, Real)}
-                  catch _:R -> {error, R} end,
-            case Res of
-                {ok, {RK, RP}} ->
-                    gen_tcp:send(Sock, build_frame(?REPLY, Cid, <<"">>, RK, RP));
-                {error, Reason} ->
-                    Err = unicode:characters_to_binary(io_lib:format("~p", [Reason])),
-                    gen_tcp:send(Sock, build_frame(?REPLY_ERR, Cid, <<"">>, <<"">>,
-                                                   err_payload(6, Err)))
-            end;
+            %% DEV_08：worker 进程执行（慢 service 不阻塞后续帧——OTP 每
+            %% 进程一调度单元，正是 erlang 并发原生的形态）。Svc 闭包捕获
+            %% （spawn 不继承 process dictionary——直接变量捕获）。
+            Svc = case get(service_fun) of
+                      F when is_function(F, 2) -> F;
+                      _ -> fun ?MODULE:service/2
+                  end,
+            spawn(fun() ->
+                          Res = try {ok, Svc(Key, Real)}
+                                catch _:R -> {error, R} end,
+                          case Res of
+                              {ok, {RK, RP}} ->
+                                  gen_tcp:send(Sock, build_frame(?REPLY, Cid, <<"">>, RK, RP));
+                              {error, Reason} ->
+                                  Err = unicode:characters_to_binary(
+                                          io_lib:format("~p", [Reason])),
+                                  gen_tcp:send(Sock, build_frame(?REPLY_ERR, Cid, <<"">>, <<"">>,
+                                                                 err_payload(6, Err)))
+                          end
+                  end);
         ?TELL ->
-            spawn(fun() -> try service(Key, Payload) catch _:_ -> ok end end);
+            Svc2 = case get(service_fun) of
+                       F2 when is_function(F2, 2) -> F2;
+                       _ -> fun ?MODULE:service/2
+                   end,
+            spawn(fun() -> try Svc2(Key, Payload) catch _:_ -> ok end end);
         _ ->
             ok
     end.

@@ -156,8 +156,8 @@ test-full: test-fast lint
 
 # ---- 压测模式：只跑 ignored 的压测/阈值（release）--------------------------
 test-stress:
-	$(CARGO) test --release $(CARGO_SCOPE) $(CARGO_FEAT) -- --include-ignored $(TEST_THREADS) $(EXTRA)
-	@echo "✓ 压测模式完成（release --include-ignored）"
+	$(CARGO) test --release $(CARGO_SCOPE) $(CARGO_FEAT) --lib --bins --tests -- --include-ignored $(TEST_THREADS) $(EXTRA)
+	@echo "✓ 压测模式完成（release --include-ignored；doc-tests 由 fast/full 覆盖——ignore 示例不参与压测语义）"
 
 # ---- 多语言模式：TS + Python + JVM + Erlang + C++（缺工具链 SKIP）----------
 test-polyglot: check-ts check-py check-jvm check-erl check-cpp
