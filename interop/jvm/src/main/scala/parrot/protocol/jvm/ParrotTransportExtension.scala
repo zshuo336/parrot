@@ -47,6 +47,26 @@ final class ParrotTransportExtension(
     boundPort = f.channel().localAddress().asInstanceOf[java.net.InetSocketAddress].getPort
   }
 
+  /** 注册模式（双模式组网）：主动拨号 parrot 节点并发起客户端握手
+    * （发 HANDSHAKE → 收 ACK），随后与被动模式同一 handler 服务。
+    */
+  def registerTo(parrotHost: String, parrotPort: Int): Unit = {
+    group = new NioEventLoopGroup(1, new DefaultThreadFactory("parrot-jvm-netty"))
+    val b = new io.netty.bootstrap.Bootstrap()
+      .group(group)
+      .channel(classOf[io.netty.channel.socket.nio.NioSocketChannel])
+      .handler(new io.netty.channel.ChannelInitializer[io.netty.channel.socket.SocketChannel] {
+        override def initChannel(ch: io.netty.channel.socket.SocketChannel): Unit = {
+          ch.pipeline()
+            .addLast(new WireDecoder())
+            .addLast(new WireEncoder())
+            .addLast(new ParrotClientHandler(bridge, nodeId))
+        }
+      })
+    val f = b.connect(parrotHost, parrotPort).sync()
+    f.channel().closeFuture().sync() // 驻留（连接生命周期 = 进程生命周期）
+  }
+
   def shutdown(): Unit = if (group != null) group.shutdownGracefully()
 }
 
@@ -118,9 +138,10 @@ final class WireEncoder extends io.netty.handler.codec.MessageToByteEncoder[Wire
   }
 }
 
-final class ParrotServerHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
+class ParrotServerHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
     extends SimpleChannelInboundHandler[WireFrame.Frame] {
-  private var handshaken = false
+  /** 子类（注册模式 client handler）可见——客户端握手完成后置位复用分发。 */
+  protected var handshaken = false
 
   override def channelRead0(ctx: ChannelHandlerContext, msg: WireFrame.Frame): Unit = {
     import WireFrame.FrameType
@@ -205,4 +226,37 @@ object ParrotServerHandler {
     _system.map(_.scheduler).getOrElse(
       throw new IllegalStateException("initSystem not called")
     )
+}
+
+/** 注册模式 handler：连接建立即发 HANDSHAKE（客户端侧），收到 ACK 后
+  * 进入与 server 相同的帧分发（复用 server 的握手后分支）。
+  */
+final class ParrotClientHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
+    extends ParrotServerHandler(bridge, nodeId) {
+
+  private var clientHandshaken = false
+
+  override def channelActive(ctx: ChannelHandlerContext): Unit = {
+    // 客户端侧握手：主动发 HANDSHAKE，等对端 ACK（channelRead 覆盖分支处理）
+    ctx.writeAndFlush(
+      WireFrame.Frame(1, WireFrame.FrameType.HANDSHAKE, 0, 1, 0, 8, "", "__handshake__",
+        WireFrame.handshakeBody(nodeId))
+    )
+  }
+
+  override def channelRead0(ctx: ChannelHandlerContext, msg: WireFrame.Frame): Unit = {
+    import WireFrame.FrameType
+    if (!clientHandshaken) {
+      msg.frameType match {
+        case FrameType.HANDSHAKE_ACK =>
+          clientHandshaken = true
+          handshaken = true // 父类分发放行（同一连接已完成握手语义）
+          System.out.println(s"PARROT_JVM_REGISTERED=$nodeId")
+          System.out.flush()
+        case _ => ctx.close() // 未完成握手先数据 = 协议违规
+      }
+      return
+    }
+    super.channelRead0(ctx, msg) // 握手后：复用 server 分发
+  }
 }

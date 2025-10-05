@@ -2,6 +2,10 @@
 
 > 大规模爬虫 + 索引构建 + 用户 Web 检索——异构 actor 运行时按技术强项分工，
 > 通过 Wire 1.0 协议两两互通，端到端可验证、可监控、可回归。
+>
+> **框架/应用分离**：本场景是 `apps/crawler-lab` 独立应用 crate——只依赖
+> parrot 公共 API（parrot-api/parrot-remote），不进驻框架源码树；框架
+> 迭代与应用演进完全解耦（业界框架/应用分层惯例）。
 
 ## 1. 场景架构
 
@@ -75,9 +79,36 @@ TS 终端经 JVM 网关消费索引（第五运行时出口）。
 # 依赖：erl / java(已 mvn package) / python3+ray / node / cargo
 make test-lab                    # 200 页标准回归（Makefile 集成）
 ./deploy/crawler-lab/run-lab.sh --pages 20000 --depth 4 --fanout 5 --batch 256
+LAB_MODE=registry ./deploy/crawler-lab/run-lab.sh --pages 200   # 注册模式
 ```
 
-场景驱动器（Rust）：`crates/parrot-node/src/bin/parrot-crawler-lab.rs`
+### 双模式组网
+
+**direct（默认）**——应用主动拨号三网关（显式地址；测试形态）：
+```
+erl=127.0.0.1:19861 ray=127.0.0.1:19863 jvm=127.0.0.1:19862
+```
+
+**registry**——应用只监听 `--bind 0.0.0.0:19870`，三网关启动即**主动拨号
+注册到应用**（`parrot=host:port` 参数；生产形态）：
+
+| 网关 | 注册参数 | 客户端握手实现 |
+|---|---|---|
+| Erlang | `parrot_gw:main([0, "parrot=h:p"])` | `register_parrot/1`（gen_tcp:connect + HS→ACK） |
+| Ray | `ray_gw 0 parrot=h:p` | `serve(parrot_addr=...)`（create_connection + HS→ACK） |
+| Akka | `CrawlerSearchMain 0 parrot=h:p` | Netty Bootstrap + `ParrotClientHandler` |
+
+角色对调语义：注册模式下网关做 Wire **客户端**（发 HANDSHAKE → 收
+HANDSHAKE_ACK），应用 Rust 侧 accept 路径协商（`negotiate_caps`）后回 ACK
+并将对端 node_id 写入 NodeTable/links——应用零网关地址知识，等三节点入表
+即自动开始场景。两模式产出**逐位一致**（同种子同数据——组网方向不改变
+语义；三方对账 33 terms/5578 postings 双模式相同）。
+
+注：网关能力位统一声明 `bin|pb 双栈（0x03）`——accept 侧协商需要公共栈
+（direct 模式 Rust 做客户端不协商所以历史 pb-only 声明未暴露此问题）。
+
+场景驱动器（Rust 应用，框架/应用分离）：`apps/crawler-lab/src/main.rs`
+（独立 crate——只依赖 parrot-api/parrot-remote 公共 API，不进驻框架源码树）
 - **阶段 0** 网关方言 sanity（三网关探活）
 - **阶段 1** 种子注入 Erlang frontier
 - **阶段 2** 爬取循环（合成页面 → 出链回注 → 双路索引缓冲 flush）

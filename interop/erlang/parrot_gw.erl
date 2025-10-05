@@ -12,7 +12,8 @@
 %% TOPOLOGY_ROLE=6 HOP_LIMIT=7；ACK 加 CHOSEN_CODEC=8）
 -module(parrot_gw).
 -export([main/1, start/1, start/2, service/2, build_frame/5, build_frame/6,
-         parse_frame/1, handshake_body/1, handshake_ack_body/1, err_payload/2]).
+         parse_frame/1, handshake_body/1, handshake_ack_body/1, err_payload/2,
+         parse_port/1]).
 
 -define(VER, 1).
 -define(ASK, 16#10).
@@ -143,14 +144,82 @@ err_payload(Code, Detail) ->
 %% ============ main（网关进程入口） ============
 
 main(Args) ->
-    Port = case Args of
-               [P] when is_list(P) -> list_to_integer(P);
-               [P] when is_integer(P) -> P;
-               _ -> 0
-           end,
-    {ok, RealPort} = start(Port),
-    io:format("PARROT_ERL_PORT=~p~n", [RealPort]),
-    receive stop_gateway -> halt(0) end.   %% 驻留（被 kill 或 halt）
+    %% 双模式组网（业界标准：网关既可被动等 parrot 连入，也可主动注册）：
+    %%   ["Port"]                    —— 被动模式（listen 等 parrot 拨入）
+    %%   ["Port", "parrot=Host:Port"]—— 注册模式（启动后主动拨号 parrot 应用，
+    %%                                  握手后同一 loop 服务——生产拓扑形态）
+    case Args of
+        [P, "parrot=" ++ Target] ->
+            Port = ?MODULE:parse_port(P),
+            {ok, RealPort} = start(Port),
+            io:format("PARROT_ERL_PORT=~p~n", [RealPort]),
+            register_parrot(Target),
+            receive stop_gateway -> halt(0) end;
+        _ ->
+            Port = case Args of
+                       [P] when is_list(P) -> list_to_integer(P);
+                       [P] when is_integer(P) -> P;
+                       _ -> 0
+                   end,
+            {ok, RealPort} = start(Port),
+            io:format("PARROT_ERL_PORT=~p~n", [RealPort]),
+            receive stop_gateway -> halt(0) end   %% 驻留（被 kill 或 halt）
+    end.
+
+parse_port(P) when is_list(P) -> list_to_integer(P);
+parse_port(P) when is_integer(P) -> P;
+parse_port(_) -> 0.
+
+%% 注册模式：主动拨号 parrot 节点。Rust 侧 connect 语义 = 发 HANDSHAKE
+%% 等 ACK——本网关实现的是 accept 侧（收 HS 回 ACK），所以这里做**角色对调**：
+%% 等 parrot 侧连入本网关（它 accept 同样建链）不适用；正解 = 本网关做
+%% 客户端完整握手（发 HS → 收 ACK），随后复用同一帧循环。
+register_parrot(Target) ->
+    [Host, PortS] = string:split(Target, ":"),
+    Port = list_to_integer(PortS),
+    Self = self(),
+    spawn(fun() ->
+                  case gen_tcp:connect(Host, Port, [binary, {packet, raw},
+                                                    {active, false},
+                                                    {nodelay, true}],
+                                       5000) of
+                      {ok, Sock} ->
+                          log("registering to parrot ~s:~p~n", [Host, Port]),
+                          %% 客户端握手：发 HANDSHAKE，等 HANDSHAKE_ACK
+                          Hs = iolist_to_binary(handshake_body("erl-gw-1")),
+                          ok = gen_tcp:send(Sock, build_frame(?HANDSHAKE, 1, <<"">>,
+                                                              <<"__handshake__">>, Hs)),
+                          case recv_frame(Sock, <<>>) of
+                              {ok, ?HANDSHAKE_ACK, _Cid, _Path, _Key, _Payload} ->
+                                  log("parrot handshake ok — serving~n", []),
+                                  put(service_fun, fun ?MODULE:service/2),
+                                  Self ! registered,
+                                  loop(Sock, <<>>);
+                              Other ->
+                                  log("parrot handshake FAILED: ~p~n", [Other]),
+                                  Self ! {register_failed, Other}
+                          end;
+                      {error, Why} ->
+                          log("connect parrot FAILED: ~p~n", [Why]),
+                          Self ! {register_failed, Why}
+                  end
+          end),
+    receive
+        registered           -> ok;
+        {register_failed, R} -> halt(1)
+    after 10000 -> halt(2)
+    end.
+
+recv_frame(Sock, Buf) ->
+    case parse_frame(Buf) of
+        {ok, Ft, _Flags, Cid, Path, Key, Payload, _Tail} ->
+            {ok, Ft, Cid, Path, Key, Payload};
+        {more, Rest} ->
+            case gen_tcp:recv(Sock, 0, 5000) of
+                {ok, D} -> recv_frame(Sock, <<Rest/binary, D/binary>>);
+                {error, E} -> {error, E}
+            end
+    end.
 
 %% DEV_08 测试口：启动网关并直接返回端口（不打印——测试免 stdout 捕获）。
 %% ServiceFun 可注入（默认 ?MODULE:service/2——测试注入慢实现验证并发结构）。

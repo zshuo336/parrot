@@ -174,7 +174,9 @@ TLV_TOPOLOGY_ROLE = 6
 TLV_HOP_LIMIT = 7
 TLV_CHOSEN_CODEC = 8
 
-CAPS_PB_ONLY = 0x02  # Python/TS 侧一律 pb 栈（07 §8.1 接入矩阵）
+CAPS_PB_ONLY = 0x02  # 07 §8.1 接入矩阵原始值（历史——pb-only 时期）
+CAPS_BIN_PB = 0x03   # bin|pb 双栈（crawler-lab 起 bin: 裸键载荷走本网关——
+                     # 注册模式下 Rust accept 侧协商需要公共栈；erl/jvm 同步）
 
 
 def _tlv(tag: int, value: bytes) -> bytes:
@@ -183,7 +185,7 @@ def _tlv(tag: int, value: bytes) -> bytes:
 
 def handshake_body(node_id: str) -> bytes:
     out = _tlv(TLV_NODE_ID, node_id.encode())
-    out += _tlv(TLV_CAPABILITIES, struct.pack("<I", CAPS_PB_ONLY))
+    out += _tlv(TLV_CAPABILITIES, struct.pack("<I", CAPS_BIN_PB))
     out += _tlv(TLV_MAX_FRAME_LEN, struct.pack("<I", 1 << 20))
     out += _tlv(TLV_TOPOLOGY_ROLE, bytes([0]))
     out += _tlv(TLV_HOP_LIMIT, bytes([8]))

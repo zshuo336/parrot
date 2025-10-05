@@ -33,6 +33,7 @@ from .wire import (
     build_frame,
     encode_err_payload,
     handshake_ack_body,
+    handshake_body,
     parse_tlv,
     split_reply_to,
 )
@@ -67,10 +68,14 @@ class ParrotDispatcher:
         return fn(type_key, payload)
 
 
-def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None) -> None:
+def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
+          parrot_addr: str | None = None) -> None:
     """启动网关（阻塞）。
 
     - ray.init 参数可注入（测试用 num_cpus=2 / include_dashboard=False）
+    - parrot_addr（双模式组网之注册模式）：给出 "host:port" 时不再被动
+      accept，而是主动拨号 parrot 节点并发起客户端握手（发 HANDSHAKE →
+      收 HANDSHAKE_ACK），随后同一帧循环服务——生产拓扑形态。
     - dispatcher 可注入（默认空——无 handler 时 ASK 一律 UnknownTypeKey）
     - DEV_08 并发模型：收包线程只做帧解码与派发；ASK 的 ray.get 在
       worker 线程池执行（慢 handler 不阻塞后续帧/心跳）；回复经
@@ -96,6 +101,79 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None) -> None:
             self._d.dispatch(type_key, payload)  # 不 get（非取消语义）
 
     worker = RayWorker.remote(dispatch)
+
+    if parrot_addr:
+        # 注册模式：主动拨号 parrot 节点 + 客户端握手（Rust 侧 accept 后
+        # 会回 HANDSHAKE_ACK——随后双向帧流与被动模式完全一致）
+        # worker 就绪等待：actor 异步调度（SchedulingCancelled 规避——
+        # ray.get 强制等待首个任务落位再进入帧循环）
+        class _Ready:
+            def ready(self) -> bool:
+                return True
+
+        _probe = ray.remote(_Ready).remote()
+        ray.get(_probe.ready.remote())
+        host, _, pport = parrot_addr.partition(":")
+        sock = socket.create_connection((host, int(pport)), timeout=10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        out: queue.Queue[bytes] = queue.Queue()
+
+        def writer() -> None:
+            while True:
+                sock.sendall(out.get())
+
+        threading.Thread(target=writer, daemon=True).start()
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
+
+        def reply(cid: int, key: str, payload: bytes) -> None:
+            out.put(build_frame(FT_REPLY, cid, "", key, payload))
+
+        def reply_err(cid: int, code: int, detail: str) -> None:
+            out.put(build_frame(FT_REPLY_ERR, cid, "", "", encode_err_payload(code, detail)))
+
+        def run_ask(cid: int, type_key: str, payload: bytes) -> None:
+            try:
+                rkey, rpayload = ray.get(worker.ask.remote(type_key, payload))
+                reply(cid, rkey, rpayload)
+            except Exception as e:  # noqa: BLE001
+                reply_err(cid, ERR_UNKNOWN_TYPE_KEY, str(e))
+
+        dec = FrameDecoder()
+        # 客户端握手：发 HANDSHAKE → 等 ACK
+        out.put(build_frame(FT_HANDSHAKE, 1, "", "__handshake__",
+                            handshake_body("ray-gw-1")))
+        handshake_done = False
+        print(f"RAY_GW_REGISTERED={parrot_addr}", flush=True)
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            dec.feed(chunk)
+            while (f := dec.next_frame()) is not None:
+                try:
+                    if not handshake_done:
+                        if f.ft == FT_HANDSHAKE_ACK:
+                            print(f"[ray-gw] parrot {parrot_addr} handshake ok", file=sys.stderr, flush=True)
+                            handshake_done = True
+                        continue
+                    if f.ft == FT_ASK:
+                        reply_to, real_payload = split_reply_to(f.payload) or ("", f.payload)
+                        _ = reply_to
+                        pool.submit(run_ask, f.cid, f.type_key, real_payload)
+                    elif f.ft == FT_TELL:
+                        worker.deliver.remote(f.type_key, f.payload)
+                    elif f.ft == FT_HEARTBEAT:
+                        out.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
+                except Exception as loop_err:  # noqa: BLE001
+                    print(f"[ray-gw] frame loop error: {loop_err!r}", file=sys.stderr, flush=True)
+        pool.shutdown(wait=False)
+        return
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -179,6 +257,10 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None) -> None:
 
 def main(argv: list[str]) -> None:
     port = int(argv[1]) if len(argv) > 1 else 9851
+    # 双模式组网：argv[2] = "parrot=host:port" → 注册模式（主动拨号 parrot）
+    parrot_addr = None
+    if len(argv) > 2 and argv[2].startswith("parrot="):
+        parrot_addr = argv[2][len("parrot="):]
     d = ParrotDispatcher()
 
     @d.handler("bin:u:Ping")
@@ -235,7 +317,7 @@ def main(argv: list[str]) -> None:
         postings = sum(len(v) for v in _index.values())
         return ("bin:crawl/IndexStatsR", struct.pack("<IQ", len(_index), postings))
 
-    serve(port, d)
+    serve(port, d, parrot_addr=parrot_addr)
 
 
 if __name__ == "__main__":

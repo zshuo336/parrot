@@ -170,7 +170,7 @@ test-lab:
 	@if [ -x "$(LAB_SCRIPT)" ] && command -v erl >/dev/null 2>&1 \
 	   && command -v java >/dev/null 2>&1 && command -v node >/dev/null 2>&1 \
 	   && python3 -c "import ray" >/dev/null 2>&1; then \
-		$(CARGO) build -p parrot-node --bin parrot-crawler-lab $(CARGO_Q) ; \
+		$(CARGO) build -p crawler-lab $(CARGO_Q) ; \
 		./$(LAB_SCRIPT) --pages 200 --depth 2 --fanout 3 --batch 32 ; \
 	else \
 		echo "==> [lab] 跳过（需 erl+java+node+python3/ray 工具链）" ; \

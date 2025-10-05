@@ -97,8 +97,17 @@ object CrawlerSearchMain {
   }
 
   def main(args: Array[String]): Unit = {
+    // 双模式组网：
+    //   [port]              —— 被动模式（listen 等 parrot 拨入）
+    //   [port, parrot=h:p]  —— 注册模式（主动拨号 parrot 应用并驻留）
+    //   [port, idle]        —— 被动 + idle 秒超时
     val port = if (args.length > 0) args(0).toInt else 0
-    val idle = if (args.length > 1) args(1).toInt else 3600
+    val parrotReg = args.find(_.startsWith("parrot=")).map(_.stripPrefix("parrot="))
+    val idle = args
+      .drop(1)
+      .find(_.forall(_.isDigit))
+      .map(_.toInt)
+      .getOrElse(3600)
 
     val guardian = Behaviors.setup[BridgeMsg] { ctx =>
       val search = ctx.spawn(searchActor(5), "search")
@@ -107,9 +116,20 @@ object CrawlerSearchMain {
       val bridge = ctx.spawn(BridgeActor(path => targets.get(path)), "bridge")
       val ext = new ParrotTransportExtension(ctx.system, bridge, "jvm-search-1")
       ParrotServerHandler.initSystem(ctx.system)
-      ext.listen(port)
-      System.out.println(s"PARROT_JVM_PORT=${ext.port}")
-      System.out.flush()
+      parrotReg match {
+        case Some(target) =>
+          // 注册模式：注册到 parrot 后驻留（registerTo 内部 sync 等待连接关闭）
+          val Array(host, p) = target.split(":")
+          System.out.println(s"PARROT_JVM_REGISTERING=$target")
+          System.out.flush()
+          ctx.executionContext.execute(() =>
+            ext.registerTo(host, p.toInt)
+          )
+        case None =>
+          ext.listen(port)
+          System.out.println(s"PARROT_JVM_PORT=${ext.port}")
+          System.out.flush()
+      }
       Behaviors.empty
     }
     val sys = ActorSystem(guardian, "parrot-crawler")

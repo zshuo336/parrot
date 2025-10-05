@@ -28,7 +28,3 @@ path = "src/main.rs"
 [[bin]]
 name = "parrot-probe"
 path = "src/bin/parrot-probe.rs"
-
-[[bin]]
-name = "parrot-crawler-lab"
-path = "src/bin/parrot-crawler-lab.rs"
