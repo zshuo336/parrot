@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -35,6 +36,8 @@ pub struct RemoteConfig {
     /// 本节点可被直拨的监听地址 "host:port"（方案 A：握手时声明，hub 据此
     /// 向其他 spoke 注入 ROUTE_HINT；None = 不可直拨，只走 hub 中转）。
     pub direct_addr: Option<String>,
+    /// 连接层运行时旋钮（配置切面——None=编译期默认，等价迁移前行为）。
+    pub knobs: Option<crate::transport::RuntimeKnobs>,
 }
 
 impl RemoteConfig {
@@ -49,6 +52,7 @@ impl RemoteConfig {
             extra_caps: 0,
             topology_role: crate::handshake::TopologyRole::Normal,
             direct_addr: None,
+            knobs: None,
         }
     }
 
@@ -76,6 +80,7 @@ impl RemoteConfig {
             extra_caps: 0,
             topology_role: crate::handshake::TopologyRole::Normal,
             direct_addr: None,
+            knobs: None,
         }
     }
 
@@ -91,11 +96,51 @@ impl RemoteConfig {
             extra_caps: 0,
             topology_role: crate::handshake::TopologyRole::Normal,
             direct_addr: None,
+            knobs: None,
         }
     }
 
     pub fn with_seeds(mut self, seeds: Vec<NodeAddr>) -> Self {
         self.seeds = seeds;
+        self
+    }
+
+    /// 配置切面：从 parrot-config 的折叠结果生成（文件层加载由
+    /// parrot-config 负责，此处只消费最终值）。
+    pub fn from_resolved(r: &parrot_config::Resolved) -> Self {
+        let mut cfg = Self::tcp(
+            r.remote.node.node_id.clone().unwrap_or_else(|| "parrot-node".into()),
+            r.remote.node.bind.as_deref().and_then(|b| b.parse().ok()),
+        );
+        cfg.seeds = r
+            .remote
+            .node
+            .seeds
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        cfg.topology_role = match r.remote.node.topology_role {
+            parrot_config::TopologyRoleValue::Normal => crate::handshake::TopologyRole::Normal,
+            parrot_config::TopologyRoleValue::Hub => crate::handshake::TopologyRole::Hub,
+            parrot_config::TopologyRoleValue::Border => crate::handshake::TopologyRole::Border,
+            parrot_config::TopologyRoleValue::Directory => crate::handshake::TopologyRole::Directory,
+        };
+        cfg.direct_addr = r.remote.node.direct_addr.clone();
+        cfg.extra_caps = r.remote.extra_caps;
+        cfg.knobs = Some(crate::transport::RuntimeKnobs {
+            heartbeat_interval: Duration::from_millis(r.remote.transport.heartbeat_interval_ms),
+            heartbeat_max_loss: r.remote.transport.heartbeat_max_loss,
+            outbound_queue: r.remote.transport.outbound_queue,
+            reorder_gap_timeout_ms: r.remote.reorder.gap_timeout_ms,
+            reorder_buffer_cap: r.remote.reorder.buffer_cap,
+            default_hop_limit: r.remote.transport.default_hop_limit,
+        });
+        cfg
+    }
+
+    /// 配置切面：旋钮覆盖（代码层——最高优先级）。
+    pub fn with_knobs(mut self, knobs: crate::transport::RuntimeKnobs) -> Self {
+        self.knobs = Some(knobs);
         self
     }
 }
@@ -134,14 +179,25 @@ impl RemoteActorSystem {
     ) -> Result<Arc<Self>, RemoteError> {
         let callbacks = Arc::new(CallbackRegistry::new(config.callback_capacity));
         let ingress = Arc::new(Ingress::new(local, callbacks.clone()));
+        // 配置切面：重排旋钮下发（None=默认 250ms/1024，等价迁移前行为）
+        if let Some(k) = &config.knobs {
+            ingress.set_reorder_knobs(
+                Duration::from_millis(k.reorder_gap_timeout_ms),
+                k.reorder_buffer_cap,
+            );
+        }
         let (in_tx, in_rx) = mpsc::channel::<(Frame, FrameSender, String)>(1024);
-        let handshake = HandshakeBody {
+        let mut handshake = HandshakeBody {
             node_id: config.node_id.clone(),
             capabilities: crate::handshake::caps::BIN | config.extra_caps,
             topology_role: config.topology_role,
             direct_addr: config.direct_addr.clone(),
             ..Default::default()
         };
+        // 配置切面：hop_limit（None=DEFAULT_HOP_LIMIT=8，等价迁移前）
+        if let Some(k) = &config.knobs {
+            handshake.hop_limit = k.default_hop_limit;
+        }
         // 断连清理：单链路 → fail_node（其它链路不受牵连——K6 多联）；
         // 系统级 shutdown 才 fail_all（shutdown() 方法内）。
         let cb2 = callbacks.clone();
@@ -161,6 +217,7 @@ impl RemoteActorSystem {
                 in_tx.clone(),
                 dis,
                 shutdown_tx.clone(),
+                config.knobs,
             )),
             "quic" => {
                 // rustls CryptoProvider 进程级幂等安装（ring 族）
@@ -175,6 +232,7 @@ impl RemoteActorSystem {
                     shutdown_tx.clone(),
                     bind,
                     crate::transport::quic::dev_crypto_insecure(),
+                    config.knobs,
                 )?)
             }
             _ => Box::new(crate::transport::tcp::TcpTransport::new(
@@ -182,6 +240,7 @@ impl RemoteActorSystem {
                 in_tx.clone(),
                 dis,
                 shutdown_tx.clone(),
+                config.knobs,
             )),
         };
         for seed in &config.seeds {
@@ -290,6 +349,7 @@ impl RemoteActorSystem {
                     inbound: peer_in,
                     on_disconnect: peer_dis,
                     shutdown: peer_sys.shutdown_tx.subscribe(),
+                    knobs: peer_sys.config.knobs,
                 },
             )
             .await?;
@@ -324,6 +384,7 @@ impl RemoteActorSystem {
                 inbound: my_in,
                 on_disconnect: my_dis,
                 shutdown: self.shutdown_tx.subscribe(),
+                knobs: self.config.knobs,
             },
         )
         .await?;

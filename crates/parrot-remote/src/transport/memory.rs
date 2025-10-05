@@ -32,6 +32,7 @@ pub struct MemoryTransport {
     inbound: mpsc::Sender<InboundItem>,
     on_disconnect: OnDisconnect,
     shutdown: tokio::sync::watch::Sender<bool>,
+    knobs: Option<crate::transport::RuntimeKnobs>,
     node_id: String,
     accept_tx: Offer,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<DuplexStream>>,
@@ -43,6 +44,7 @@ impl MemoryTransport {
         inbound: mpsc::Sender<InboundItem>,
         on_disconnect: OnDisconnect,
         shutdown: tokio::sync::watch::Sender<bool>,
+        knobs: Option<crate::transport::RuntimeKnobs>,
     ) -> Self {
         let (accept_tx, accept_rx) = mpsc::channel(16);
         let node_id = handshake.node_id.clone();
@@ -56,6 +58,7 @@ impl MemoryTransport {
             inbound,
             on_disconnect,
             shutdown,
+            knobs,
             node_id,
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
@@ -99,6 +102,7 @@ impl Transport for MemoryTransport {
                 inbound: self.inbound.clone(),
                 on_disconnect: self.on_disconnect.clone(),
                 shutdown: self.shutdown.subscribe(),
+                knobs: self.knobs,
             },
         )
         .await
@@ -127,6 +131,7 @@ impl Transport for MemoryTransport {
                 inbound: self.inbound.clone(),
                 on_disconnect: self.on_disconnect.clone(),
                 shutdown: self.shutdown.subscribe(),
+                knobs: self.knobs,
             },
         )
         .await
@@ -160,6 +165,7 @@ mod tests {
             in_a,
             noop.clone(),
             sd_a,
+            None,
         );
         let mb = MemoryTransport::new(
             HandshakeBody {
@@ -169,6 +175,7 @@ mod tests {
             in_b,
             noop,
             sd_b,
+            None,
         );
         // 并行 accept/connect（串行 await 会死锁：accept 等投递）
         let accept_fut = tokio::spawn(async move { mb.accept().await });

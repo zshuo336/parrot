@@ -188,6 +188,41 @@ pub struct ConnParams {
     pub inbound: mpsc::Sender<(Frame, FrameSender, String)>,
     pub on_disconnect: OnDisconnect,
     pub shutdown: tokio::sync::watch::Receiver<bool>,
+    /// 运行时旋钮（配置切面——None=编译期默认常量，零迁移成本）。
+    pub knobs: Option<RuntimeKnobs>,
+}
+
+/// 连接层运行时旋钮（原写死常量参数化——配置切面 `[remote.transport]`）。
+///
+/// 默认值 = 迁移前常量原值（HEARTBEAT_INTERVAL=2s / MAX_LOSS=5 /
+/// OUTBOUND_QUEUE=1024），保证零配置部署行为字节级不变。
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeKnobs {
+    /// 心跳发送间隔（半开检测粒度）。
+    pub heartbeat_interval: Duration,
+    /// 连续丢失多少个间隔判半开断开。
+    pub heartbeat_max_loss: u32,
+    /// 出站帧队列容量（满=天然反压）。
+    pub outbound_queue: usize,
+    /// TELL 重排缺口等待上限（缺省 250ms）。
+    pub reorder_gap_timeout_ms: u64,
+    /// 重排缓冲帧数上限（缺省 1024）。
+    pub reorder_buffer_cap: usize,
+    /// 帧默认跳数上限（缺省 8）。
+    pub default_hop_limit: u8,
+}
+
+impl Default for RuntimeKnobs {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            heartbeat_max_loss: HEARTBEAT_MAX_LOSS,
+            outbound_queue: OUTBOUND_QUEUE,
+            reorder_gap_timeout_ms: 250,
+            reorder_buffer_cap: 1024,
+            default_hop_limit: crate::frame::DEFAULT_HOP_LIMIT,
+        }
+    }
 }
 
 pub async fn run_connection<S>(io: S, p: ConnParams) -> Result<ConnectionHandle, RemoteError>
@@ -203,9 +238,11 @@ where
         inbound,
         on_disconnect,
         mut shutdown,
+        knobs,
     } = p;
+    let knobs = knobs.unwrap_or_default();
     let mut framed = tokio_util::codec::Framed::new(io, FrameCodec);
-    let (tx, rx) = mpsc::channel::<Frame>(OUTBOUND_QUEUE);
+    let (tx, rx) = mpsc::channel::<Frame>(knobs.outbound_queue);
 
     // ---- 握手阶段 ----
     let peer_body: HandshakeBody = match side {
@@ -277,7 +314,7 @@ where
         let mut rx = rx;
         let mut missed: u32 = 0;
         let mut last_seen = Instant::now();
-        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut interval = tokio::time::interval(knobs.heartbeat_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         if *shutdown.borrow() {
             dis(&node_id_cb);
@@ -377,12 +414,12 @@ where
                     }
                 }
                 _ = interval.tick() => {
-                    if last_seen.elapsed() >= HEARTBEAT_INTERVAL {
+                    if last_seen.elapsed() >= knobs.heartbeat_interval {
                         missed = missed.saturating_add(1);
                     }
-                    if missed >= HEARTBEAT_MAX_LOSS {
+                    if missed >= knobs.heartbeat_max_loss {
                         // 半开判定（E3：≤10s 检出）
-                        tracing::warn!(node = %node_id_cb, "heartbeat lost x{HEARTBEAT_MAX_LOSS}, half-open detected");
+                        tracing::warn!(node = %node_id_cb, "heartbeat lost x{}, half-open detected", knobs.heartbeat_max_loss);
                         break;
                     }
                     if framed.send(Frame::heartbeat()).await.is_err() {
@@ -465,6 +502,7 @@ mod tests {
                 inbound: in_tx,
                 on_disconnect: noop.clone(),
                 shutdown: sd_a.subscribe(),
+                knobs: None,
             },
         ));
         let h2 = tokio::spawn(run_connection(
@@ -478,6 +516,7 @@ mod tests {
                 inbound: in_tx2,
                 on_disconnect: noop,
                 shutdown: sd_b.subscribe(),
+                knobs: None,
             },
         ));
         let (c1, c2) = tokio::join!(h1, h2);
@@ -595,6 +634,7 @@ mod tests {
                 inbound: in_tx,
                 on_disconnect: noop.clone(),
                 shutdown: sd_a.subscribe(),
+                knobs: None,
             },
         ));
         // B 侧：字节级静默对端。手动完成握手（读掉 A 的 HANDSHAKE 帧、
@@ -662,6 +702,101 @@ mod tests {
         assert!(
             dt <= Duration::from_secs(14),
             "断开不得晚于 ~14s（实测 {dt:?}）——过晚=检测失效"
+        );
+    }
+
+    /// 配置切面：心跳旋钮实际生效——300ms×2 ≈ 0.6s 检出半开
+    /// （默认 2s×5=10s。旋钮未流入驱动循环则本测试超时失败）。
+    #[tokio::test]
+    async fn heartbeat_knobs_accelerate_detection() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (a_read, a_write) = tokio::io::split(a);
+        let (b_read, b_write) = tokio::io::split(b);
+        let hs_a = HandshakeBody {
+            node_id: "knob-a".into(),
+            ..Default::default()
+        };
+        let (in_tx, _in_rx) = mpsc::channel::<(Frame, FrameSender, String)>(64);
+        let noop: OnDisconnect = Arc::new(|_| {});
+        let (sd_a, _) = tokio::sync::watch::channel(false);
+
+        let h1 = tokio::spawn(run_connection(
+            tokio::io::join(a_read, a_write),
+            ConnParams {
+                side: ConnSide::Connect,
+                local_addr: None,
+                peer_addr: None,
+                scheme: "mem",
+                local_handshake: hs_a,
+                inbound: in_tx,
+                on_disconnect: noop.clone(),
+                shutdown: sd_a.subscribe(),
+                knobs: Some(RuntimeKnobs {
+                    heartbeat_interval: Duration::from_millis(300),
+                    heartbeat_max_loss: 2,
+                    outbound_queue: 64,
+                    reorder_gap_timeout_ms: 250,
+                    reorder_buffer_cap: 1024,
+                    default_hop_limit: 8,
+                }),
+            },
+        ));
+        // 静默对端：握手后只读不写（同上测试的模式）
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut b_rd, mut b_wr) = (b_read, b_write);
+            let mut len_buf = [0u8; 4];
+            b_rd.read_exact(&mut len_buf).await.unwrap();
+            let body_len = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; body_len];
+            b_rd.read_exact(&mut body).await.unwrap();
+            let mut ack_body = bytes::BytesMut::new();
+            crate::handshake::HandshakeAckBody {
+                node_id: "knob-b".into(),
+                realm: None,
+                cluster: None,
+                capabilities: 3,
+                max_frame_len: 1024 * 1024,
+                topology_role: crate::handshake::TopologyRole::Normal,
+                hop_limit: 8,
+                direct_addr: None,
+                chosen_codec: "bin".into(),
+            }
+            .encode_tlv(&mut ack_body);
+            let ack = crate::frame::Frame::handshake_ack(ack_body.freeze());
+            let mut out = bytes::BytesMut::new();
+            ack.encode(&mut out).unwrap();
+            b_wr.write_all(&out).await.unwrap();
+            let mut sink = vec![0u8; 8192];
+            loop {
+                match b_rd.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        });
+
+        let c1 = tokio::time::timeout(Duration::from_secs(5), h1)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(c1.node_id, "knob-b");
+
+        // 旋钮下 300ms×2 ≈ 0.6s 断开（若未生效=10s → 3s 超时兜底失败）
+        let t0 = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(3), c1.closed)
+            .await
+            .expect("knobbed half-open must close within ~0.6s")
+            .unwrap();
+        let dt = t0.elapsed();
+        assert!(
+            dt >= Duration::from_millis(500),
+            "断开不得早于 2×300ms-容差（实测 {dt:?}）"
+        );
+        assert!(
+            dt <= Duration::from_secs(2),
+            "断开不得晚于 ~2s（实测 {dt:?}）——旋钮未生效=默认 10s"
         );
     }
 

@@ -135,6 +135,9 @@ pub struct Ingress {
     /// hub 中转帧多源复用同一连接，seq 流不可归因 → 不进重排（bypass）。
     reorder_tx:
         Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>>,
+    /// 重排旋钮（配置切面 [remote.reorder]——默认=原写死值 250ms/1024）。
+    reorder_gap_timeout: std::sync::Mutex<std::time::Duration>,
+    reorder_buffer_cap: std::sync::Mutex<usize>,
 }
 
 /// hub 转发出口（system.rs 注入——按 node 查出站 sender + 分配转发 cid）。
@@ -164,6 +167,22 @@ impl Ingress {
             relay_table: Arc::new(RelayTable::new()),
             learned: std::sync::Mutex::new(Default::default()),
             reorder_tx: Arc::new(std::sync::Mutex::new(Default::default())),
+            reorder_gap_timeout: std::sync::Mutex::new(std::time::Duration::from_millis(250)),
+            reorder_buffer_cap: std::sync::Mutex::new(1024),
+        }
+    }
+
+    /// 配置切面：重排旋钮注入（RemoteActorSystem 构造时下发）。
+    pub fn set_reorder_knobs(
+        &self,
+        gap_timeout: std::time::Duration,
+        buffer_cap: usize,
+    ) {
+        if let Ok(mut g) = self.reorder_gap_timeout.lock() {
+            *g = gap_timeout;
+        }
+        if let Ok(mut c) = self.reorder_buffer_cap.lock() {
+            *c = buffer_cap;
         }
     }
 
@@ -548,7 +567,20 @@ impl Ingress {
     ) {
         let mut expected: u32 = 1;
         let mut buf: std::collections::BTreeMap<u32, Frame> = Default::default();
-        let idle_gap = tokio::time::Duration::from_millis(250);
+        // 旋钮启动时快照（任务生命周期内固定——避免运行中改配置引发
+        // expected 语义漂移；下个任务自然用新值）
+        let (idle_gap, buffer_cap) = weak_ing
+            .upgrade()
+            .map(|this| {
+                (
+                    *this.reorder_gap_timeout.lock().unwrap_or_else(|e| e.into_inner()),
+                    *this.reorder_buffer_cap.lock().unwrap_or_else(|e| e.into_inner()),
+                )
+            })
+            .unwrap_or((
+                std::time::Duration::from_millis(250),
+                1024,
+            ));
         let idle_gc = tokio::time::Duration::from_secs(30);
         loop {
             let f = tokio::select! {
@@ -651,7 +683,7 @@ impl Ingress {
                 if buf.insert(seq, f).is_none() {
                     REORDER_BUFFERED.fetch_add(1, Ordering::Relaxed);
                 }
-                if buf.len() > 1024 {
+                if buf.len() > buffer_cap {
                     // 防打爆上限：放行最小 seq（跳缺口）
                     let min_seq = *buf.keys().next().unwrap();
                     let f = buf.remove(&min_seq).unwrap();
@@ -1048,6 +1080,26 @@ mod tests {
         assert!(
             REORDER_GAP_FLUSHED.load(Ordering::Relaxed) > flushed_before,
             "gap flush 计数递增"
+        );
+    }
+
+    // RO2-K：配置切面——gap 旋钮实际生效（50ms vs 默认 250ms 对照时序）
+    #[tokio::test]
+    async fn ro2k_gap_knob_shortens_wait() {
+        let (ig, sink) = recording_ingress();
+        // 旋钮：50ms 缺口等待（远小于默认 250ms）
+        ig.set_reorder_knobs(std::time::Duration::from_millis(50), 1024);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        ig.dispatch(seq_tell(1, 1), &back, "nK").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        ig.dispatch(seq_tell(3, 3), &back, "nK").await; // 2 缺失
+        // 50ms 旋钮窗口后应放行（默认 250ms 此刻仍缓冲——时序即证明）
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            sink.lock().unwrap().as_slice(),
+            &[1u8, 3],
+            "50ms 旋钮：~150ms 时已放行（默认 250ms 必仍缓冲）"
         );
     }
 

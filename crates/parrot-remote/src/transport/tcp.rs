@@ -22,6 +22,7 @@ pub struct TcpTransport {
         tokio::sync::mpsc::Sender<(crate::frame::Frame, crate::transport::FrameSender, String)>,
     on_disconnect: OnDisconnect,
     shutdown: tokio::sync::watch::Sender<bool>,
+    knobs: Option<crate::transport::RuntimeKnobs>,
     listener: Mutex<Option<Arc<TcpListener>>>,
 }
 
@@ -35,12 +36,14 @@ impl TcpTransport {
         )>,
         on_disconnect: OnDisconnect,
         shutdown: tokio::sync::watch::Sender<bool>,
+        knobs: Option<crate::transport::RuntimeKnobs>,
     ) -> Self {
         Self {
             handshake,
             inbound,
             on_disconnect,
             shutdown,
+            knobs,
             listener: Mutex::new(None),
         }
     }
@@ -66,6 +69,7 @@ impl Transport for TcpTransport {
                 inbound: self.inbound.clone(),
                 on_disconnect: self.on_disconnect.clone(),
                 shutdown: self.shutdown.subscribe(),
+                knobs: self.knobs,
             },
         )
         .await
@@ -102,6 +106,7 @@ impl Transport for TcpTransport {
                 inbound: self.inbound.clone(),
                 on_disconnect: self.on_disconnect.clone(),
                 shutdown: self.shutdown.subscribe(),
+                knobs: self.knobs,
             },
         )
         .await
@@ -150,6 +155,7 @@ mod tests {
             in_a,
             noop.clone(),
             sd_a,
+            None,
         );
         let tb = TcpTransport::new(
             HandshakeBody {
@@ -159,6 +165,7 @@ mod tests {
             in_b,
             noop,
             sd_b,
+            None,
         );
         // bind → 公布端口 → 并行 accept/connect（POC 教训：勿串行阻塞）
         tb.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();

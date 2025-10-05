@@ -1,0 +1,13 @@
+[package]
+name = "parrot-config"
+version = "0.1.0"
+edition = "2021"
+description = "Parrot 配置切面：TOML 加载 + 三层合并（代码 > 文件 > 默认）+ 运行时旋钮参数化。纯数据 crate，无运行时依赖。"
+license = "MIT"
+
+[dependencies]
+parrot-api = { path = "../parrot-api" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"

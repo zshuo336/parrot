@@ -5,6 +5,7 @@ members = [
     "crates/parrot-api",
     "crates/parrot-api-derive",
     "crates/parrot-api-derive-tests",
+    "crates/parrot-config",
     "crates/parrot-remote",
     "crates/parrot-node",
     "apps/crawler-lab",
