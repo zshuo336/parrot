@@ -72,10 +72,7 @@ async fn parse_targets(args: &[String]) -> Vec<NodeAddr> {
                 // 域名：阻塞解析（启动一次性；clone 进 'static 闭包）
                 let hostport = addr.trim().to_string();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    hostport
-                        .to_socket_addrs()
-                        .ok()
-                        .and_then(|mut i| i.next())
+                    hostport.to_socket_addrs().ok().and_then(|mut i| i.next())
                 })
                 .await
                 .ok()
@@ -95,11 +92,8 @@ async fn parse_targets(args: &[String]) -> Vec<NodeAddr> {
 }
 
 async fn run(targets: &[NodeAddr], full: bool) -> i32 {
-    let client = RemoteActorSystem::new(
-        RemoteConfig::tcp("probe", None),
-        Arc::new(NoopLookup),
-    )
-    .unwrap();
+    let client =
+        RemoteActorSystem::new(RemoteConfig::tcp("probe", None), Arc::new(NoopLookup)).unwrap();
     client.start().await.unwrap();
     for t in targets {
         match client.connect(t).await {
@@ -152,8 +146,12 @@ async fn run(targets: &[NodeAddr], full: bool) -> i32 {
         return 1;
     }
     if !check(&format!("P1 kv on {pid}"), || async {
-        let kv = client.remote_ref(&format!("parrot://{pid}/user/kv")).unwrap();
-        kv.send(Box::new(NPut("k1".into(), "v1".into()))).await.unwrap();
+        let kv = client
+            .remote_ref(&format!("parrot://{pid}/user/kv"))
+            .unwrap();
+        kv.send(Box::new(NPut("k1".into(), "v1".into())))
+            .await
+            .unwrap();
         let g = kv.send(Box::new(NGet("k1".into()))).await.unwrap();
         g.downcast_ref::<NGot>().unwrap().0.as_deref() == Some("v1")
     })
@@ -244,7 +242,9 @@ async fn run(targets: &[NodeAddr], full: bool) -> i32 {
 
     // ---- P5 并发恰好一次 ----
     if !check(&format!("P5 128 concurrent asks on {pid}"), || async {
-        let echo = client.remote_ref(&format!("parrot://{pid}/user/echo")).unwrap();
+        let echo = client
+            .remote_ref(&format!("parrot://{pid}/user/echo"))
+            .unwrap();
         let mut tasks = Vec::new();
         for i in 0..128u64 {
             let e = echo.clone();
@@ -267,8 +267,12 @@ async fn run(targets: &[NodeAddr], full: bool) -> i32 {
 
     // ---- P6 隔离：slow(600ms) 与 echo 并发，echo 不被拖慢 ----
     if !check(&format!("P6 isolation slow-vs-echo on {pid}"), || async {
-        let slow = client.remote_ref(&format!("parrot://{pid}/user/slow")).unwrap();
-        let echo = client.remote_ref(&format!("parrot://{pid}/user/echo")).unwrap();
+        let slow = client
+            .remote_ref(&format!("parrot://{pid}/user/slow"))
+            .unwrap();
+        let echo = client
+            .remote_ref(&format!("parrot://{pid}/user/echo"))
+            .unwrap();
         let slow_task = tokio::spawn(async move {
             let r = slow.send(Box::new(NSlowEcho(600))).await.unwrap();
             r.downcast_ref::<NEchoed>().unwrap().0
@@ -289,7 +293,9 @@ async fn run(targets: &[NodeAddr], full: bool) -> i32 {
 
     // ---- P7 延迟采样（观测，不门禁——网络环境主导）----
     {
-        let echo = client.remote_ref(&format!("parrot://{pid}/user/echo")).unwrap();
+        let echo = client
+            .remote_ref(&format!("parrot://{pid}/user/echo"))
+            .unwrap();
         let mut lat = Vec::new();
         for i in 0..600u64 {
             let t0 = Instant::now();
@@ -302,9 +308,17 @@ async fn run(targets: &[NodeAddr], full: bool) -> i32 {
         lat.sort_unstable();
         let p50 = lat[lat.len() / 2];
         let p99 = lat[(lat.len() * 99) / 100];
-        println!("[probe] P7 echo RTT: n={} p50={}µs p99={}µs", lat.len(), p50, p99);
+        println!(
+            "[probe] P7 echo RTT: n={} p50={}µs p99={}µs",
+            lat.len(),
+            p50,
+            p99
+        );
         if p50 > 50_000 {
-            eprintln!("[probe] WARN: p50 {}µs > 50ms（跨机网络主导属预期；本机部署请检查）", p50);
+            eprintln!(
+                "[probe] WARN: p50 {}µs > 50ms（跨机网络主导属预期；本机部署请检查）",
+                p50
+            );
         }
     }
 

@@ -191,6 +191,50 @@ def main(argv: list[str]) -> None:
         a, b = struct.unpack("<QQ", p)
         return ("bin:u:AddR", struct.pack("<Q", a + b + 1000))  # ray 方言 +1000
 
+    # ---- 爬虫场景：索引构建（crawler-lab；CPU 密集——分词/词频/合并）----
+    # 索引分片：dict[term -> dict[doc_id -> tf]]（进程内 ray worker 共享字典，
+    # deliver/ask 均可写——网关单 worker actor 串行化保证无锁一致）
+    _index: dict[str, dict[int, int]] = {}
+
+    def _decode_pages(p: bytes) -> list[tuple[int, bytes]]:
+        """[n u32][{doc u64|len u32|html}...]"""
+        (n,) = struct.unpack_from("<I", p, 0)
+        off, pages = 4, []
+        for _ in range(n):
+            doc, ln = struct.unpack_from("<QI", p, off)
+            off += 12
+            pages.append((doc, p[off : off + ln]))
+            off += ln
+        return pages
+
+    _STOP = set(
+        "the a an of to in and or for on with at by is it as be html head title page body".split()
+    )
+
+    def _tokenize(html: bytes) -> list[str]:
+        text = html.decode("utf-8", errors="replace").lower()
+        for ch in "<>=/\"'!?,.:;()[]{}":
+            text = text.replace(ch, " ")
+        return [t for t in text.split() if t and t not in _STOP and len(t) > 1]
+
+    @d.handler("bin:crawl/IndexPage")
+    def _index_page(_k: str, p: bytes) -> tuple[str, bytes]:
+        pages = _decode_pages(p)
+        terms = 0
+        for doc, html in pages:
+            for t in _tokenize(html):
+                slot = _index.setdefault(t, {})
+                slot[doc] = slot.get(doc, 0) + 1
+                terms += 1
+        return ("bin:crawl/IndexAck", struct.pack("<II", len(pages), terms))
+
+    @d.handler("bin:crawl/IndexStats")
+    def _index_stats(_k: str, _p: bytes) -> tuple[str, bytes]:
+        # [docs u32][terms u32][postings u64]（docs 由调用侧对账——此处
+        # 索引视角：去重词数 + 总 posting 数）
+        postings = sum(len(v) for v in _index.values())
+        return ("bin:crawl/IndexStatsR", struct.pack("<IQ", len(_index), postings))
+
     serve(port, d)
 
 

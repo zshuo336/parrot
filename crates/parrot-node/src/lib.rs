@@ -252,9 +252,7 @@ where
             .ts
             .spawn_at(actor, &path, None, ThreadActorConfig::default())
             .await
-            .map_err(|e| {
-                parrot_api::errors::ActorError::InternalError(format!("spawn: {e}"))
-            })?;
+            .map_err(|e| parrot_api::errors::ActorError::InternalError(format!("spawn: {e}")))?;
         Ok(Box::new(r) as BoxedActorRef)
     })
 }
@@ -294,7 +292,8 @@ pub struct FacadeLookup;
 #[async_trait::async_trait]
 impl LocalLookup for FacadeLookup {
     async fn lookup(&self, path: &str) -> Option<Box<dyn ActorRef>> {
-        node().facade
+        node()
+            .facade
             .get_actor(&parrot_api::address::ActorPath::placeholder(path))
             .await
     }
@@ -390,9 +389,8 @@ pub async fn parse_seeds(s: String) -> Vec<NodeAddr> {
 pub async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler");
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = term.recv() => {},

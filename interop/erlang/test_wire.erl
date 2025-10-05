@@ -66,8 +66,8 @@ t_handshake() ->
     TailLen = byte_size(Ack),
     Tail = binary:part(Ack, TailLen - 5, 5),
     <<8:8, 2:16/little, "pb">> = Tail,
-    %% caps=pb-only（bit1）
-    <<1:8, 8:16/little, "erl-test", 4:8, 4:16/little, 2:32/little, _/binary>> = Body.
+    %% caps=bin|pb（bit0|bit1——crawler-lab 起放宽为双栈）
+    <<1:8, 8:16/little, "erl-test", 4:8, 4:16/little, 3:32/little, _/binary>> = Body.
 
 t_service() ->
     {<<"bin:u:Pong">>, <<103:64/little>>} =

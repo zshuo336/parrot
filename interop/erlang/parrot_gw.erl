@@ -63,7 +63,8 @@ parse_frame(Buf) ->
 
 tlv(Tag, V) -> <<Tag:8, (byte_size(V)):16/little, V/binary>>.
 
-caps_pb_only() -> 16#02.  %% erlang 网关 pb 栈（07 §8.1）
+caps_pb_only() -> 16#03.  %% bin+pb 双栈（07 §8.1 原始 pb-only；crawler-lab
+                           %% 起 bin: 裸键载荷也走本网关——能力位放宽为双栈）
 
 handshake_body(NodeId) ->
     Id = to_bin(NodeId),
@@ -76,12 +77,60 @@ handshake_body(NodeId) ->
 handshake_ack_body(NodeId) ->
     handshake_body(NodeId) ++ [tlv(8, <<"pb">>)].
 
+%% ============ 爬虫场景：URL Frontier（crawler-lab 集成） ============
+%% ETS 去重表 + 有序队列；批量 pop/push（LE 编解码与 Rust 侧逐字节对齐：
+%% push=[n u32][{id u64|len u32|url|depth u16}...]；next=[n u32] → 同构批次）。
+
+crawl_init() ->
+    ets:new(crawl_frontier, [named_table, public, ordered_set,
+                             {write_concurrency, true},
+                             {read_concurrency, true}]),
+    ets:new(crawl_seen, [named_table, public, {write_concurrency, true}]),
+    ok.
+
+crawl_push(<<Count:32/little, Entries/binary>>) ->
+    crawl_push_entries(Count, Entries),
+    ok.
+
+crawl_push_entries(0, <<>>) -> ok;
+crawl_push_entries(N, <<Id:64/little, UrlLen:32/little,
+                        Url:UrlLen/binary, Depth:16/little, Rest/binary>>) ->
+    case ets:insert_new(crawl_seen, {Id}) of
+        true  -> ets:insert(crawl_frontier, {Id, Url, Depth});
+        false -> ok
+    end,
+    crawl_push_entries(N - 1, Rest);
+crawl_push_entries(_, _) -> ok.  %% 截断容错
+
+crawl_next(<<N:32/little>>) ->
+    Batch = crawl_take(N, [], ets:first(crawl_frontier)),
+    Enc = crawl_encode_batch(Batch, <<(length(Batch)):32/little>>),
+    {<<"bin:crawl/FrontierBatch">>, Enc}.
+
+crawl_take(0, Acc, _) -> lists:reverse(Acc);
+crawl_take(_, Acc, '$end_of_table') -> lists:reverse(Acc);
+crawl_take(N, Acc, Id) ->
+    [{Id, Url, Depth}] = ets:lookup(crawl_frontier, Id),
+    ets:delete(crawl_frontier, Id),
+    crawl_take(N - 1, [{Id, Url, Depth} | Acc], ets:next(crawl_frontier, Id)).
+
+crawl_encode_batch([], Acc) -> Acc;
+crawl_encode_batch([{Id, Url, Depth} | T], Acc) ->
+    U = byte_size(Url),
+    crawl_encode_batch(T, <<Acc/binary, Id:64/little, U:32/little, Url:U/binary,
+                            Depth:16/little>>).
+
 %% ============ Erlang actor 服务（方言可辨识） ============
 
 service(<<"bin:u:Ping">>, <<N:64/little>>) ->
     {<<"bin:u:Pong">>, <<(N + 3):64/little>>};   %% erlang 方言 +3
 service(<<"bin:u:Add">>, <<A:64/little, B:64/little>>) ->
     {<<"bin:u:AddR">>, <<(A + B + 10000):64/little>>};  %% erlang 方言 +10000
+service(<<"bin:crawl/FrontierPush">>, Payload) ->
+    crawl_push(Payload),
+    {<<"bin:crawl/FrontierAck">>, <<1:32/little>>};
+service(<<"bin:crawl/FrontierNext">>, Payload) ->
+    crawl_next(Payload);
 service(Key, _Payload) ->
     erlang:error({unknown_service, Key}).
 
@@ -107,6 +156,7 @@ main(Args) ->
 %% ServiceFun 可注入（默认 ?MODULE:service/2——测试注入慢实现验证并发结构）。
 start(Port) -> start(Port, fun ?MODULE:service/2).
 start(Port, ServiceFun) ->
+    try crawl_init() catch _:_ -> ok end,   %% 幂等启动（重复 start——named_table 已存在则忽略）
     Self = self(),
     _Gw = spawn(fun() ->
                         {ok, LSock} = gen_tcp:listen(Port, [binary, {packet, raw},
