@@ -42,6 +42,18 @@ path = "src/bin/dump_vectors.rs"
 name = "remote-bench"
 path = "src/bin/remote_bench.rs"
 
+[[bin]]
+name = "interop-matrix"
+path = "src/bin/interop_matrix.rs"
+
+[[bin]]
+name = "interop-ray"
+path = "src/bin/interop_ray.rs"
+
+[[bin]]
+name = "interop-erl"
+path = "src/bin/interop_erl.rs"
+
 [dev-dependencies]
 prost-build = "0.14.4"
 rcgen = "0.14.10"
