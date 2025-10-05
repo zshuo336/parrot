@@ -7,6 +7,7 @@
 //! E5.2 分层铁律）。
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::codec_registry::CodecRegistry;
 use crate::error::{decode_err_payload, ErrCode};
@@ -14,6 +15,16 @@ use crate::frame::{frame_type, Frame};
 use crate::node::NodeState;
 use crate::registry::{CallbackRegistry, ReplyPayload};
 use crate::transport::FrameSender;
+
+/// TELL 重排：迟到帧（缺口超时放行后到达）丢弃计数。
+pub static LATE_TELL_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// TELL 重排：缺口超时放行计数（丢帧不卡死语义的触发次数）。
+pub static REORDER_GAP_FLUSHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// TELL 重排：实际缓冲过的帧数（乱序真正发生才 >0——切换点观测指标）。
+pub static REORDER_BUFFERED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// 本地 actor 解析出口（trait 倒置：parrot facade 在应用层注入实现）。
 #[async_trait::async_trait]
@@ -119,6 +130,9 @@ pub struct Ingress {
     /// 方案 A 学习缓存（node → 直连地址）。hub 注入 ROUTE_HINT 时写入；
     /// RemoteActorSystem::remote_ref 构建 ref 时读取（有直连表优先直连）。
     pub learned: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// TELL 端到端重排（per 源节点任务——直连连接 from_node=唯一 seq 源）。
+    /// hub 中转帧多源复用同一连接，seq 流不可归因 → 不进重排（bypass）。
+    reorder_tx: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>,
 }
 
 /// hub 转发出口（system.rs 注入——按 node 查出站 sender + 分配转发 cid）。
@@ -147,6 +161,7 @@ impl Ingress {
             relay: std::sync::RwLock::new(None),
             relay_table: Arc::new(RelayTable::new()),
             learned: std::sync::Mutex::new(Default::default()),
+            reorder_tx: std::sync::Mutex::new(Default::default()),
         }
     }
 
@@ -202,7 +217,7 @@ impl Ingress {
                     this.on_ask(frame, &back).await;
                 });
             }
-            frame_type::TELL => self.on_tell(frame, back).await,
+            frame_type::TELL => self.on_tell(frame, back, from_node).await,
             frame_type::STOP => self.on_stop(frame).await,
             frame_type::REPLY | frame_type::REPLY_ERR => self.on_reply(frame),
             frame_type::SYSTEM_EVENT => {
@@ -451,7 +466,168 @@ impl Ingress {
         }
     }
 
-    async fn on_tell(&self, frame: Frame, back: &FrameSender) {
+    /// TELL 入站：端到端重排网关。
+    ///
+    /// 三类路径：
+    /// 1. **终点是本节点的直连 seq 帧**：per-from 重排任务——seq 流来自
+    ///    唯一源（直连对端），流身份成立，可安全重排
+    /// 2. **中转帧**（目标节点非本节点，含来自 uplink hub 的和 hub 收到
+    ///    的跨 spoke 帧）：seq 流多目标/多源交错不可归因 → bypass 直转
+    /// 3. **seq==0 帧**：旧实现/异构网关 → bypass 直投（兼容语义）
+    ///
+    /// 重排任务冷启动：首帧 seq=N>1（切换后直连新流）→ 缓冲等 250ms——
+    /// 在途 uplink 前缀帧走 bypass 路径先投（时序恰好正确），超时放行 N。
+    /// 背压：bounded channel 满则 dispatch 挂起 → 读循环挂起（RC8 贯通）。
+    async fn on_tell(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
+        let seq = frame.header.seq;
+        let self_node = self
+            .relay
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|r| r.self_node().to_string()));
+        // 终点判定：无 relay（非路由节点）→ 本地路径直投；有 relay →
+        // 目标节点 == 本节点才重排（中转帧 bypass）
+        let destined_here = match &self_node {
+            None => true,
+            Some(me) => target_node(&frame.path).map(|t| t == me).unwrap_or(true),
+        };
+        if seq == crate::frame::SEQ_NONE || !destined_here {
+            self.tell_deliver_or_relay(frame, back).await;
+            return;
+        }
+        // 直连 seq 帧 → per-from 重排任务
+        let tx = self.reorder_tx_of(from_node).await;
+        if let Err(e) = tx.send(frame).await {
+            // 重排任务已消亡（不该发生——仅 actor 系统关闭时）→ 直投兜底
+            self.tell_deliver_or_relay(e.0, back).await;
+        }
+    }
+
+    /// 取/建 per-from 重排任务 sender。
+    async fn reorder_tx_of(self: &Arc<Self>, from: &str) -> tokio::sync::mpsc::Sender<Frame> {
+        if let Some(tx) = self
+            .reorder_tx
+            .lock()
+            .ok()
+            .and_then(|g| g.get(from).cloned())
+        {
+            return tx;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(256);
+        let from_owned = from.to_string();
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.reorder_loop(from_owned, rx).await;
+        });
+        if let Ok(mut g) = self.reorder_tx.lock() {
+            g.insert(from.to_string(), tx.clone());
+        }
+        tx
+    }
+
+    /// per 源节点重排循环：expected/BTreeMap 状态机 + recv 超时冲刷。
+    ///
+    /// 冷启动缺口（expected=1，首帧 seq=N>1）与运行中缺口共用同一条
+    /// 250ms 超时路径：超时放行最小 seq（跳缺口），expected 跳至其+1；
+    /// 缓冲余帧若与放行帧连续则一并投递。丢帧绝不永久阻塞。
+    async fn reorder_loop(self: &Arc<Self>, from: String, mut rx: tokio::sync::mpsc::Receiver<Frame>) {
+        let mut expected: u32 = 1;
+        let mut buf: std::collections::BTreeMap<u32, Frame> = Default::default();
+        loop {
+            let idle = tokio::time::Duration::from_millis(250);
+            let f = tokio::select! {
+                f = rx.recv() => match f {
+                    Some(f) => f,
+                    None => {
+                        // 通道关闭（源连接长期静默拆除——防御式）：冲刷缓冲
+                        if !buf.is_empty() {
+                            tracing::debug!(from = %from, buffered = buf.len(), "reorder loop flush on channel close");
+                            for (_, fr) in buf.into_iter() {
+                                let back = FrameSender::detached();
+                                self.tell_deliver_or_relay(fr, &back).await;
+                            }
+                        }
+                        return;
+                    }
+                },
+                _ = tokio::time::sleep(idle), if !buf.is_empty() => {
+                    // 缺口超时：放行最小 seq（跳缺口）
+                    let min_seq = *buf.keys().next().unwrap();
+                    let f = buf.remove(&min_seq).unwrap();
+                    REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        from = %from, expected, got = min_seq,
+                        "reorder gap timeout: released buffered TELL (missing frame presumed lost)"
+                    );
+                    expected = min_seq.wrapping_add(1);
+                    // 连续后继一并放行
+                    let mut chain = vec![f];
+                    while let Some(&k) = buf.keys().next() {
+                        if k == expected {
+                            chain.push(buf.remove(&k).unwrap());
+                            expected = expected.wrapping_add(1);
+                        } else {
+                            break;
+                        }
+                    }
+                    for fr in chain {
+                        let back = FrameSender::detached();
+                        self.tell_deliver_or_relay(fr, &back).await;
+                    }
+                    continue;
+                }
+            };
+            let seq = f.header.seq;
+            if seq == expected {
+                let back = FrameSender::detached();
+                self.tell_deliver_or_relay(f, &back).await;
+                expected = expected.wrapping_add(1);
+                // drain 连续后继
+                while let Some(&k) = buf.keys().next() {
+                    if k == expected {
+                        let fr = buf.remove(&k).unwrap();
+                        let back = FrameSender::detached();
+                        self.tell_deliver_or_relay(fr, &back).await;
+                        expected = expected.wrapping_add(1);
+                    } else {
+                        break;
+                    }
+                }
+            } else if seq.wrapping_sub(expected) > u32::MAX / 2 {
+                // seq "小于" expected（回绕安全比较）→ 迟到帧，丢弃
+                LATE_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(from = %from, seq, expected, "late TELL dropped (gap already flushed)");
+            } else {
+                // seq "大于" expected → 缓冲（BTreeMap 去重天然幂等——
+                // 同 seq 重复帧只保一个，防对端 bug 打爆内存）
+                if buf.insert(seq, f).is_none() {
+                    REORDER_BUFFERED.fetch_add(1, Ordering::Relaxed);
+                }
+                if buf.len() > 1024 {
+                    // 防打爆上限：放行最小 seq（跳缺口）
+                    let min_seq = *buf.keys().next().unwrap();
+                    let f = buf.remove(&min_seq).unwrap();
+                    REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
+                    expected = min_seq.wrapping_add(1);
+                    let back = FrameSender::detached();
+                    self.tell_deliver_or_relay(f, &back).await;
+                    while let Some(&k) = buf.keys().next() {
+                        if k == expected {
+                            let fr = buf.remove(&k).unwrap();
+                            let back = FrameSender::detached();
+                            self.tell_deliver_or_relay(fr, &back).await;
+                            expected = expected.wrapping_add(1);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// TELL 实际投递（本地命中 / hub 中转 / 死信）——原 on_tell 主体。
+    async fn tell_deliver_or_relay(&self, frame: Frame, back: &FrameSender) {
         let decoded = match CodecRegistry::global().decode_incoming(&frame.type_key, &frame.payload)
         {
             Ok(m) => m,
@@ -656,6 +832,211 @@ mod tests {
             Arc::new(Ingress::new(Arc::new(TestLookup), callbacks.clone())),
             callbacks,
         )
+    }
+
+    /// 录制型 Lookup：按投递顺序记录 TELL payload 内容（重排测试观测点）。
+    struct RecordingLookup(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[async_trait]
+    impl LocalLookup for RecordingLookup {
+        async fn lookup(&self, path: &str) -> Option<Box<dyn ActorRef>> {
+            if path == "/user/echo" {
+                Some(Box::new(RecordingRef(self.0.clone())))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// 录制型 Ref：deliver 时把 TestAsk.0 追加进共享 Vec（投递顺序即答案）。
+    #[derive(Debug)]
+    struct RecordingRef(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[async_trait]
+    impl ActorRef for RecordingRef {
+        fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            self.send_with_timeout(msg, None)
+        }
+        fn send_with_timeout<'a>(
+            &'a self,
+            msg: BoxedMessage,
+            _timeout: Option<std::time::Duration>,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move { Ok(msg) })
+        }
+        fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+            let sink = self.0.clone();
+            Box::pin(async move {
+                if let Some(m) = msg.downcast_ref::<TestAsk>() {
+                    sink.lock().unwrap().push(m.0 as u8);
+                }
+                Ok(())
+            })
+        }
+        fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+        fn path(&self) -> String {
+            "/user/echo".into()
+        }
+        fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+            Box::pin(async move { true })
+        }
+        fn clone_boxed(&self) -> BoxedActorRef {
+            Box::new(RecordingRef(self.0.clone()))
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn recording_ingress() -> (Arc<Ingress>, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Arc::new(Ingress::new(
+                Arc::new(RecordingLookup(sink.clone())),
+                Arc::new(CallbackRegistry::new(64)),
+            )),
+            sink,
+        )
+    }
+
+    /// 构造 seq TELL（TestAsk(v) 编码——v 同时用作投递序标记）。
+    fn seq_tell(v: u64, seq: u32) -> Frame {
+        seq_tell_to("nA", v, seq)
+    }
+
+    fn seq_tell_to(node: &str, v: u64, seq: u32) -> Frame {
+        let (_, payload) = crate::codec_registry::CodecRegistry::global()
+            .encode_outgoing(&(Box::new(TestAsk(v)) as BoxedMessage))
+            .unwrap();
+        Frame::tell_with_seq(
+            &format!("parrot://{node}/user/echo"),
+            "bin:parrot_remote::TestAsk#v1",
+            Bytes::from(payload),
+            seq,
+        )
+    }
+
+    // RO1：seq 乱序到达（33 先于 32）→ 接收端按序投递（先发 1,2 建基线）
+    #[tokio::test]
+    async fn ro1_out_of_order_reordered() {
+        let (ig, sink) = recording_ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        ig.dispatch(seq_tell(1, 1), &back, "nA").await;
+        ig.dispatch(seq_tell(2, 2), &back, "nA").await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(sink.lock().unwrap().as_slice(), &[1u8, 2], "基线 1,2 先投");
+        // 乱序：4 先到（缓冲），3 后到（触发 drain → 3,4 连投）
+        ig.dispatch(seq_tell(4, 4), &back, "nA").await;
+        ig.dispatch(seq_tell(3, 3), &back, "nA").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            sink.lock().unwrap().as_slice(),
+            &[1u8, 2, 3, 4],
+            "乱序 4/3 应重排为 3,4"
+        );
+    }
+
+    // RO2：缺口超时放行（seq=5 到、4 永不来）→ 250ms 后放行 5，不卡死
+    #[tokio::test]
+    async fn ro2_gap_timeout_flushes() {
+        let (ig, sink) = recording_ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        ig.dispatch(seq_tell(1, 1), &back, "nA").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let flushed_before = REORDER_GAP_FLUSHED.load(Ordering::Relaxed);
+        ig.dispatch(seq_tell(5, 5), &back, "nA").await; // 2..4 缺失
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(
+            sink.lock().unwrap().is_empty() || sink.lock().unwrap().as_slice() == [1u8],
+            "缺口期 5 不投（等 2..4）"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            sink.lock().unwrap().as_slice(),
+            &[1u8, 5],
+            "超时后放行 5（跳过 2..4）"
+        );
+        assert!(
+            REORDER_GAP_FLUSHED.load(Ordering::Relaxed) > flushed_before,
+            "gap flush 计数递增"
+        );
+    }
+
+    // RO3：迟到帧丢弃（超时放行 5 后 4 才到）→ LATE_TELL_DROPPED + 不投递
+    #[tokio::test]
+    async fn ro3_late_frame_dropped() {
+        let (ig, sink) = recording_ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        ig.dispatch(seq_tell(1, 1), &back, "nA").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        ig.dispatch(seq_tell(5, 5), &back, "nA").await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // 超时放行 5
+        let late_before = LATE_TELL_DROPPED.load(Ordering::Relaxed);
+        ig.dispatch(seq_tell(4, 4), &back, "nA").await; // 迟到
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(sink.lock().unwrap().as_slice(), &[1u8, 5], "迟到 4 不投");
+        assert!(
+            LATE_TELL_DROPPED.load(Ordering::Relaxed) > late_before,
+            "迟到计数递增"
+        );
+    }
+
+    // RO4：冷启动缺口（首帧 seq=N>1——切换后新直连流）→ 250ms 放行
+    #[tokio::test]
+    async fn ro4_cold_start_gap_released() {
+        let (ig, sink) = recording_ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        ig.dispatch(seq_tell(7, 7), &back, "nA").await; // expected=1，7>1
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(sink.lock().unwrap().is_empty(), "冷启动缺口期不投");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(sink.lock().unwrap().as_slice(), &[7u8], "超时放行 7");
+    }
+
+    // RO5：中转帧 bypass 重排（目标非本节点 → 直转不缓冲）。
+    // 场景：本节点是 spoke（self=me），帧终点 parrot://nB/...（我经
+    // uplink 中转）——seq 再大也不进重排。
+    #[tokio::test]
+    async fn ro5_relayed_frames_bypass_reorder() {
+        let (ig, sink) = recording_ingress();
+        // 注入最小 relay：self_node="me"（终点判定启用）
+        struct MeRouter;
+        #[async_trait::async_trait]
+        impl crate::ingress::RelayRouter for MeRouter {
+            fn sender_of(&self, _node: &str) -> Option<FrameSender> { None }
+            fn next_cid(&self) -> u64 { 0 }
+            fn self_node(&self) -> &str { "me" }
+            fn dial_addr_of(&self, _node: &str) -> Option<String> { None }
+            fn on_hint(&self, _node: &str, _addr: &str) {}
+        }
+        *ig.relay_slot() = Some(std::sync::Arc::new(MeRouter));
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        // 终点 nB ≠ me → bypass（本地 lookup miss → try_relay_tell →
+        // sender None → 死信；关键断言：不缓冲——立即死信计数）
+        ig.dispatch(seq_tell_to("nB", 9, 9), &back, "nA").await; // 终点 nB ≠ me
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        // bypass 证明：本地命中立即投递（无 250ms 重排等待）——sink 已 9
+        assert_eq!(sink.lock().unwrap().as_slice(), &[9u8], "中转帧 bypass 立即投递");
+    }
+
+    // RO6：seq=0 帧（旧实现/异构网关）bypass 直投
+    #[tokio::test]
+    async fn ro6_seq_none_bypasses() {
+        let (ig, sink) = recording_ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
+        let back = FrameSender::anon(tx);
+        ig.dispatch(seq_tell(1, 1), &back, "nA").await; // 建流 expected=2
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        ig.dispatch(seq_tell(2, 0), &back, "nA").await; // seq=0 旁路
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(sink.lock().unwrap().as_slice(), &[1u8, 2], "seq=0 直投");
     }
 
     // ingress_dispatch_matrix：ASK 命中/ASK miss/REPLY 回调/REPLY_ERR/TELL miss 死信

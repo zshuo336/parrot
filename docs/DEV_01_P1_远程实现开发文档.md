@@ -151,7 +151,9 @@ pub struct FrameHeader {
     pub correlation_id: u64,
     pub hop_count: u8,
     pub hop_limit: u8,
-    // reserved u48 不进结构（恒 0，编解码直写）
+    // reserved u48：低 32bit = 端到端 seq（TELL 重排用，0=不参与——
+    // 与旧实现/异构网关字节兼容）；高 16bit 仍保留 0（非 0 拒帧）
+    pub seq: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

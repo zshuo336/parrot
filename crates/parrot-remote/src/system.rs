@@ -448,6 +448,7 @@ impl RemoteActorSystem {
             callbacks: self.callbacks.clone(),
             self_node: self.config.node_id.clone(),
             uplink: self.uplink.read().ok().and_then(|g| g.clone()),
+            seq_counters: Default::default(),
         });
         Ok(RemoteActorRef::new(path, node, inner))
     }
@@ -561,6 +562,7 @@ impl RemoteActorSystem {
                 correlation_id: req_id,
                 hop_count: 0,
                 hop_limit: 8,
+                    seq: crate::frame::SEQ_NONE,
             },
             path: String::new(),
             type_key: String::new(),
@@ -666,6 +668,7 @@ impl crate::ingress::SysEventHook for AdminHook {
                                 correlation_id: 0,
                                 hop_count: 0,
                                 hop_limit: 8,
+                    seq: crate::frame::SEQ_NONE,
                             },
                             path: String::new(),
                             type_key: String::new(),

@@ -77,6 +77,12 @@ impl FrameSender {
     pub fn send_frame_sync(&self, f: Frame) -> Result<(), RemoteError> {
         self.tx.try_send(f).map_err(|_| RemoteError::Transport("relay queue full".into()))
     }
+
+    /// 无连接回程（重排任务投递用——TELL 无回程语义，relay miss 走死信）。
+    pub fn detached() -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self::anon(tx)
+    }
 }
 
 /// 传输载体抽象。P1：tcp/mem；P2：quic（07 §8.1 scheme() 统一命名）。
@@ -509,6 +515,7 @@ mod tests {
                     correlation_id: 0,
                     hop_count: 0,
                     hop_limit: 8,
+                    seq: crate::frame::SEQ_NONE,
                 },
                 path: String::new(),
                 type_key: String::new(),
@@ -540,6 +547,7 @@ mod tests {
                     correlation_id: 0,
                     hop_count: 0,
                     hop_limit: 8,
+                    seq: crate::frame::SEQ_NONE,
                 },
                 path: String::new(),
                 type_key: String::new(),

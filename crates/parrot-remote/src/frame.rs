@@ -64,8 +64,9 @@ pub mod flags {
     pub const APP_ENCRYPTED: u16 = 1 << 5; // 1.0 可选
 }
 
-/// reserved u48 掩码（6 字节低位）
-const RESERVED_MASK: u64 = 0xFFFF_FFFF_FFFF;
+/// 端到端序列号哨兵：0 = 本帧不参与重排（旧实现/异构网关发的帧——
+/// 接收端直接投递不缓冲）。有效 seq 从 1 起。
+pub const SEQ_NONE: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
@@ -122,6 +123,9 @@ pub struct FrameHeader {
     pub correlation_id: u64,
     pub hop_count: u8,
     pub hop_limit: u8,
+    /// 端到端序列号（per 源节点单调递增，TELL 重排用；0=不参与）。
+    /// wire 位：reserved u48 的低 32bit。
+    pub seq: u32,
 }
 
 /// Wire 帧：头 + path + type_key + payload。
@@ -143,6 +147,7 @@ impl Frame {
             correlation_id: cid,
             hop_count: 0,
             hop_limit: DEFAULT_HOP_LIMIT,
+            seq: SEQ_NONE,
         }
     }
 
@@ -180,6 +185,13 @@ impl Frame {
             type_key: type_key.to_string(),
             payload,
         }
+    }
+
+    /// 带端到端 seq 的 TELL（reserved 低 32bit——重排用，见 ingress::ReorderTable）。
+    pub fn tell_with_seq(path: &str, type_key: &str, payload: Bytes, seq: u32) -> Frame {
+        let mut f = Self::tell(path, type_key, payload);
+        f.header.seq = seq;
+        f
     }
 
     pub fn reply(cid: u64, path: &str, type_key: &str, payload: Bytes) -> Frame {
@@ -357,8 +369,10 @@ impl Frame {
         buf.put_u64_le(self.header.correlation_id);
         buf.put_u8(self.header.hop_count);
         buf.put_u8(self.header.hop_limit);
-        // reserved u48 = 0（6 字节，偏移 18..24）
-        buf.put_slice(&[0u8; 6]);
+        // reserved u48（6 字节，偏移 18..24）：低 32bit = seq（0=不参与
+        // 重排——与旧实现字节兼容），高 16bit 仍保留 0
+        buf.put_u32_le(self.header.seq);
+        buf.put_slice(&[0u8; 2]);
         buf.put_u32_le(path_b.len() as u32);
         buf.put_slice(path_b);
         buf.put_u32_le(key_b.len() as u32);
@@ -420,16 +434,12 @@ impl Frame {
         let hop_count = buf.get_u8();
         let hop_limit = buf.get_u8();
         // reserved u48（帧偏移 18..24）——此前已顺序消费 ver/ft/flags/cid/hop 共 14B
-        let reserved_bytes = buf.copy_to_bytes(6);
-        let mut reserved: u64 = 0;
-        for i in 0..6 {
-            reserved |= (reserved_bytes[i] as u64) << (8 * i);
-        }
-        let _ = reserved;
-        let reserved_check: u64 = reserved & RESERVED_MASK;
-        if reserved_check != 0 {
+        // 低 32bit = seq（端到端重排序号，0=不参与）；高 16bit 保留必须 0
+        let seq = buf.get_u32_le();
+        let reserved_hi: u64 = buf.get_u16_le() as u64;
+        if reserved_hi != 0 {
             return Err(FrameError::ReservedNotZero {
-                got: reserved_check,
+                got: reserved_hi << 32,
             });
         }
         let path_len = buf.get_u32_le() as usize;
@@ -456,6 +466,7 @@ impl Frame {
             correlation_id: cid,
             hop_count,
             hop_limit,
+            seq,
         };
         Ok(Some(Frame {
             header,
@@ -532,6 +543,7 @@ impl Frame {
                 correlation_id: 0, // 批载体无整体 cid
                 hop_count,
                 hop_limit: DEFAULT_HOP_LIMIT,
+                    seq: crate::frame::SEQ_NONE,
             },
             path: first.path.clone(),
             type_key: first.type_key.clone(),
@@ -583,6 +595,7 @@ impl Frame {
                     correlation_id: cid,
                     hop_count: self.header.hop_count,
                     hop_limit: self.header.hop_limit,
+                    seq: crate::frame::SEQ_NONE,
                 },
                 path: self.path.clone(),
                 type_key: self.type_key.clone(),
@@ -789,14 +802,21 @@ mod tests {
             Frame::decode(&mut b),
             Err(FrameError::UnknownFrameType { got: 0x33 })
         ));
-        // reserved 脏
+        // reserved 高 16bit 脏（低 32bit 现在是合法 seq——只有高位仍拒）
         let mut b = BytesMut::new();
         f.encode(&mut b).unwrap();
-        b[18] = 0xFF;
+        b[22] = 0xFF; // 偏移 22 = reserved 第 5 字节（高位段）
         assert!(matches!(
             Frame::decode(&mut b),
             Err(FrameError::ReservedNotZero { .. })
         ));
+        // reserved 低 32bit = seq：合法帧（重排语义——不再拒）
+        let mut b = BytesMut::new();
+        let mut f2 = f.clone();
+        f2.header.seq = 42;
+        f2.encode(&mut b).unwrap();
+        let got = Frame::decode(&mut b).unwrap().unwrap();
+        assert_eq!(got.header.seq, 42);
         // 坏 UTF-8（path）
         let mut b = BytesMut::new();
         f.encode(&mut b).unwrap();
