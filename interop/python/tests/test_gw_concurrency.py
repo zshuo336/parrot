@@ -141,7 +141,9 @@ class Client:
         )
         self._wait(lambda f: f.ft == wire.FT_HANDSHAKE_ACK)
 
-    def _wait(self, pred, timeout=5.0):
+    def _wait(self, pred, timeout=10.0):
+        # timeout 10s：慢 handler 1s × 5 裕度——并行测试满载机器上
+        # 线程调度可能拉长数倍（flaky 教训：5s 在 cargo 全测并行时偶超）
         deadline = time.time() + timeout
         with self.cond:
             while True:

@@ -65,7 +65,9 @@ t_handshake() ->
     Ack = iolist_to_binary(parrot_gw:handshake_ack_body("erl-test")),
     TailLen = byte_size(Ack),
     Tail = binary:part(Ack, TailLen - 5, 5),
-    <<8:8, 2:16/little, "pb">> = Tail,
+    %% chosen_codec 用 tag 9（RB1：tag 8 已被 DIRECT_ADDR 占用——
+    %% tag 分配表见 parrot-remote/src/handshake.rs 头注）
+    <<9:8, 2:16/little, "pb">> = Tail,
     %% caps=bin|pb（bit0|bit1——crawler-lab 起放宽为双栈）
     <<1:8, 8:16/little, "erl-test", 4:8, 4:16/little, 3:32/little, _/binary>> = Body.
 

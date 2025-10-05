@@ -562,7 +562,7 @@ impl RemoteActorSystem {
                 correlation_id: req_id,
                 hop_count: 0,
                 hop_limit: 8,
-                    seq: crate::frame::SEQ_NONE,
+                seq: crate::frame::SEQ_NONE,
             },
             path: String::new(),
             type_key: String::new(),
@@ -668,7 +668,7 @@ impl crate::ingress::SysEventHook for AdminHook {
                                 correlation_id: 0,
                                 hop_count: 0,
                                 hop_limit: 8,
-                    seq: crate::frame::SEQ_NONE,
+                                seq: crate::frame::SEQ_NONE,
                             },
                             path: String::new(),
                             type_key: String::new(),
@@ -737,7 +737,9 @@ impl crate::ingress::RelayRouter for SystemRelay {
     /// 方案 A 学习回调：后台拨直连（不阻塞 ingress——spawn；已在连/拨中
     /// 忽略；失败静默，后续 hint 或回落 uplink 兜底）。
     fn on_hint(&self, node: &str, addr: &str) {
-        let Some(sys) = self.system.upgrade() else { return };
+        let Some(sys) = self.system.upgrade() else {
+            return;
+        };
         // 已有该节点直连链路 → 无需动作（新地址不同时也重拨：先移除旧链）
         let already = sys
             .links
@@ -756,7 +758,9 @@ impl crate::ingress::RelayRouter for SystemRelay {
                     let na = crate::node::NodeAddr::tcp(node.clone(), sa);
                     match sys2.connect(&na).await {
                         Ok(()) => tracing::info!(%node, %addr, "direct link established"),
-                        Err(e) => tracing::debug!(%node, %addr, err = %e, "direct dial failed (fallback uplink)"),
+                        Err(e) => {
+                            tracing::debug!(%node, %addr, err = %e, "direct dial failed (fallback uplink)")
+                        }
                     }
                 }
                 Err(_) => tracing::debug!(%addr, "hint addr unparseable"),
