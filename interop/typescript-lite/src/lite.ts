@@ -58,6 +58,7 @@ export class ParrotLite {
   private registrations: Array<{ key: string; path: string }> = [];
   private backoffMs = 1000;
   private closed = false;
+  private isTcp = false; // tcp:// 直连形态（DEV_08：Node 环境跳过 WS 层）
 
   private constructor(private opts: ParrotLiteOptions) {}
 
@@ -73,6 +74,67 @@ export class ParrotLite {
   }
 
   private async dial(): Promise<void> {
+    // DEV_08：tcp:// 且 Node net 可用 → 原生 socket 直连（省 WS 帧/握手
+    // 开销与 utf8 校验；浏览器环境自动回落 WS 兜底链）。动态探测不加
+    // @types/node（bundle 预算 50KB min+gz——类型层零依赖）。
+    const raw = this.opts.url;
+    const wantTcp = raw.startsWith("tcp://") || raw.startsWith("parrot://");
+    if (wantTcp && !this.opts.wsFactory) {
+      // 动态 require（tsc 零依赖：构造器形态绕开模块解析——bundle 不含
+      // node:net，浏览器运行时抛错走 catch 回落 WS）
+      type NodeSocket = {
+        write: (b: Uint8Array) => boolean;
+        destroy: () => void;
+        on: (ev: string, cb: (buf?: { buffer: ArrayBuffer; byteOffset: number; length: number }) => void) => void;
+      };
+      type NodeNet = { connect: (port: number, host: string) => NodeSocket };
+      let net: NodeNet | null = null;
+      try {
+        // Node ≥22: process.getBuiltinModule（ESM 安全）；旧 Node/浏览器:
+        // Function 构造的 CommonJS require。均失败 → WS 兜底。
+        const g = globalThis as unknown as {
+          process?: { getBuiltinModule?: (m: string) => NodeNet };
+        };
+        if (typeof g.process?.getBuiltinModule === "function") {
+          net = g.process.getBuiltinModule("net") ?? null;
+        } else {
+          const dynamicRequire = new Function("m", "return require(m)") as (m: string) => NodeNet;
+          net = dynamicRequire("net");
+        }
+      } catch {
+        net = null; // 浏览器/无 Node —— 走 WS 兜底
+      }
+      if (net) {
+        const u = new URL(raw.replace(/^parrot/, "tcp"));
+        const sock = net.connect(Number(u.port), u.hostname);
+        const adapter: MinimalWS = {
+          readyState: 0,
+          send: (d) => void sock.write(d),
+          close: () => void sock.destroy(),
+          onopen: null,
+          onclose: null,
+          onerror: null,
+          onmessage: null,
+        };
+        sock.on("connect", () => {
+          adapter.readyState = 1;
+          adapter.onopen?.();
+        });
+        sock.on("data", (buf?: { buffer: ArrayBuffer; byteOffset: number; length: number }) => {
+          if (buf) adapter.onmessage?.({ data: buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length) });
+        });
+        sock.on("close", () => adapter.onclose?.());
+        sock.on("error", () => adapter.onerror?.());
+        await new Promise<void>((res, rej) => {
+          adapter.onopen = () => res();
+          adapter.onerror = () => rej(new Error("tcp connect failed"));
+        });
+        this.ws = adapter;
+        this.isTcp = true;
+        this.startReceive(adapter);
+        return;
+      }
+    }
     const ws = this.opts.wsFactory
       ? this.opts.wsFactory(this.url())
       : (new WebSocket(this.url()) as unknown as MinimalWS);
@@ -82,6 +144,11 @@ export class ParrotLite {
       ws.onerror = () => rej(new Error("ws connect failed"));
     });
     this.ws = ws;
+    this.isTcp = false;
+    this.startReceive(ws);
+  }
+
+  private startReceive(ws: MinimalWS): void {
     ws.onmessage = (ev) => this.onBytes(new Uint8Array(ev.data as ArrayBuffer));
     ws.onclose = () => this.reconnect();
     // 握手（pb-only caps——07 §8.1）
@@ -211,7 +278,7 @@ export class ParrotLite {
 
 function opts_url(u: string): string {
   if (u.startsWith("quic://")) return u.replace(/^quic/, "ws"); // 降级链（§2.3）
-  if (u.startsWith("tcp://")) return u.replace(/^tcp/, "ws");
+  if (u.startsWith("tcp://")) return u.replace(/^tcp/, "ws"); // 浏览器兜底（Node 走原生直连）
   return u;
 }
 

@@ -8,7 +8,9 @@ import assert from "node:assert/strict";
 import { ParrotLite } from "../dist/lite.js";
 
 const port = process.argv[2] ?? "9871";
-const url = `ws://127.0.0.1:${port}`;
+// DEV_08：tcp:// 原生直连（lite 内置 Node net 探测——无 wsFactory 注入；
+// 若环境无 Node 则本脚本不可用——CI 在 Node 下跑）
+const url = `tcp://127.0.0.1:${port}`;
 
 // Rust 网关直连形态：lite 原生 WS 二进制帧（Rust 侧 TcpTransport 不说 WS——
 // 本互测经桥层语义对齐：直接 TCP 帧流。node 无原生 TCP 客户端的 WS 语义，
@@ -47,7 +49,7 @@ function tcpWs(urlStr) {
   return ws;
 }
 
-const node = await ParrotLite.connect({ url, nodeId: "ts-lite-1", wsFactory: tcpWs });
+const node = await ParrotLite.connect({ url, nodeId: "ts-lite-1" });
 console.log("handshake ok (ACK received, no error)");
 
 // 本地 actor：Rust → lite 方向 ask

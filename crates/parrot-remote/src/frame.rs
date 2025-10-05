@@ -260,9 +260,15 @@ impl Frame {
                 klen: 0,
             });
         }
-        let mut b = self.payload.clone();
-        let rlen = b.get_u32_le() as usize;
-        if b.len() < rlen {
+        // 零整段 clone 读前缀（DEV_08：slice 直读——payload 为 Vec<u8>，
+        // 旧实现 clone 整段 BytesMut 再消费是大载荷入站隐性分配热点）
+        let rlen = u32::from_le_bytes([
+            self.payload[0],
+            self.payload[1],
+            self.payload[2],
+            self.payload[3],
+        ]) as usize;
+        if self.payload.len() < 4 + rlen {
             return Err(FrameError::MalformedLengths {
                 flen: self.header.frame_len,
                 plen: rlen as u32,
@@ -273,7 +279,7 @@ impl Frame {
             None
         } else {
             Some(
-                String::from_utf8(b.copy_to_bytes(rlen).to_vec()).map_err(|e| {
+                String::from_utf8(self.payload[4..4 + rlen].to_vec()).map_err(|e| {
                     FrameError::Utf8 {
                         field: "reply_to",
                         source: e.utf8_error(),
@@ -281,7 +287,7 @@ impl Frame {
                 })?,
             )
         };
-        Ok((reply_to, b))
+        Ok((reply_to, self.payload[4 + rlen..].to_vec().into()))
     }
 
     /// 编码进 buf（含 4B frame_len 前缀）。

@@ -72,23 +72,39 @@ export function buildFrame(
   return out;
 }
 
-/** 非消费式半包解码器。 */
+/** 游标式半包解码器（DEV_08：消费只推进游标，压缩惰性摊销——
+ * 旧实现 feed 全量合并 + nextFrame slice 整体拷贝，批量 N 帧为 O(N²)）。 */
 export class FrameDecoder {
   private buf: Uint8Array = new Uint8Array(0);
+  private pos = 0; // 已消费游标
 
   feed(data: Uint8Array): void {
-    const merged = new Uint8Array(this.buf.length + data.length);
-    merged.set(this.buf);
-    merged.set(data, this.buf.length);
+    if (this.pos > 0 && this.pos >= this.buf.length) {
+      // 缓冲已耗尽：直接换新（免合并拷贝）
+      this.buf = data;
+      this.pos = 0;
+      return;
+    }
+    const merged = new Uint8Array(this.buf.length - this.pos + data.length);
+    merged.set(this.buf.subarray(this.pos));
+    merged.set(data, this.buf.length - this.pos);
     this.buf = merged;
+    this.pos = 0;
   }
 
   nextFrame(): Frame | null {
-    if (this.buf.length < 4) return null;
+    const avail = this.buf.length - this.pos;
+    if (avail < 4) {
+      this.compact();
+      return null;
+    }
     const dv = new DataView(this.buf.buffer, this.buf.byteOffset);
-    const bodyLen = dv.getUint32(0, true);
-    if (this.buf.length < 4 + bodyLen) return null;
-    const body = this.buf.subarray(4, 4 + bodyLen);
+    const bodyLen = dv.getUint32(this.pos, true);
+    if (avail < 4 + bodyLen) {
+      this.compact();
+      return null;
+    }
+    const body = this.buf.subarray(this.pos + 4, this.pos + 4 + bodyLen);
     const bdv = new DataView(body.buffer, body.byteOffset);
     const ver = bdv.getUint8(0);
     if (ver !== WIRE_VERSION) throw new Error(`unsupported wire version ${ver}`);
@@ -103,8 +119,21 @@ export class FrameDecoder {
     const keyLen = bdv.getUint32(keyOff, true);
     const typeKey = dec.decode(body.subarray(keyOff + 4, keyOff + 4 + keyLen));
     const payload = body.slice(keyOff + 4 + keyLen);
-    this.buf = this.buf.slice(4 + bodyLen);
+    this.pos += 4 + bodyLen;
+    this.compact();
     return { ft, flags, cid, hopCount, hopLimit, path, typeKey, payload };
+  }
+
+  /** 已消费前缀过半（或耗尽）才拷贝压缩——批量帧总代价 O(N)。 */
+  private compact(): void {
+    if (this.pos === 0) return;
+    if (this.pos >= this.buf.length) {
+      this.buf = new Uint8Array(0);
+      this.pos = 0;
+    } else if (this.pos * 2 >= this.buf.length) {
+      this.buf = this.buf.slice(this.pos);
+      this.pos = 0;
+    }
   }
 }
 

@@ -50,7 +50,10 @@ final class ParrotTransportExtension(
   def shutdown(): Unit = if (group != null) group.shutdownGracefully()
 }
 
-/** 半包解码器：复刻 Frame::decode 语义（不足一帧不消费 readerIndex）。 */
+/** 半包解码器：直接在 ByteBuf 上解析（DEV_08 零拷贝——跳过旧实现
+  * readBytes→Array→WireFrame.decode 的中转拷贝）。语义复刻 Frame::decode：
+  * 不足一帧不推进 readerIndex。
+  */
 final class WireDecoder extends ByteToMessageDecoder {
   override def decode(ctx: ChannelHandlerContext, in: ByteBuf, out: java.util.List[Object]): Unit = {
     if (in.readableBytes() < 4) return
@@ -60,18 +63,59 @@ final class WireDecoder extends ByteToMessageDecoder {
       return
     }
     if (in.readableBytes() < 4 + bodyLen) return // 半包：不消费
-    val buf = new Array[Byte](4 + bodyLen)
-    in.readBytes(buf)
-    WireFrame.decode(buf) match {
-      case Some((frame, _)) => out.add(frame)
-      case None             => ctx.close() // 坏帧断连
+    val frameStart = in.readerIndex()
+    in.skipBytes(4) // body_len 前缀
+    val version = in.readByte()
+    if (version != WireFrame.PROTOCOL_VERSION) {
+      in.readerIndex(frameStart)
+      ctx.close() // 坏版本断连
+      return
     }
+    val ft     = in.readByte()
+    val flags  = in.readShortLE() & 0xFFFF
+    val cid    = in.readLongLE()
+    val hopCnt = in.readByte()
+    val hopLmt = in.readByte()
+    in.skipBytes(6) // reserved u48
+    val pathLen = in.readIntLE()
+    val path    = in.readCharSequence(pathLen, java.nio.charset.StandardCharsets.UTF_8).toString
+    val keyLen  = in.readIntLE()
+    val key     = in.readCharSequence(keyLen, java.nio.charset.StandardCharsets.UTF_8).toString
+    val payloadLen = bodyLen - WireFrame.BODY_FIXED_OVERHEAD - pathLen - keyLen
+    if (payloadLen < 0 || in.readableBytes() < payloadLen) {
+      in.readerIndex(frameStart) // 长度域不一致——保守按半包处理
+      return
+    }
+    // payload 直接 retain 切片（引用计数随帧传递；encoder 消费后 release）
+    val payload = in.readRetainedSlice(payloadLen)
+    val f = new WireFrame.Frame(version, ft, flags, cid, hopCnt, hopLmt, path, key, payload)
+    out.add(f)
   }
 }
 
+/** 零拷贝编码：直接写 ByteBuf（跳过 encode() 数组中转）。 */
 final class WireEncoder extends io.netty.handler.codec.MessageToByteEncoder[WireFrame.Frame] {
-  override def encode(ctx: ChannelHandlerContext, msg: WireFrame.Frame, out: ByteBuf): Unit =
-    out.writeBytes(msg.encode())
+  override def encode(ctx: ChannelHandlerContext, msg: WireFrame.Frame, out: ByteBuf): Unit = {
+    val pathB = msg.path.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    val keyB  = msg.typeKey.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    val payload = msg.payloadBytes
+    val body = WireFrame.BODY_FIXED_OVERHEAD + pathB.length + keyB.length + payload.readableBytes()
+    out.ensureWritable(4 + body)
+    out.writeIntLE(body)
+    out.writeByte(msg.version)
+    out.writeByte(msg.frameType)
+    out.writeShortLE(msg.flags)
+    out.writeLongLE(msg.correlationId)
+    out.writeByte(msg.hopCount)
+    out.writeByte(msg.hopLimit)
+    out.writeZero(6) // reserved u48
+    out.writeIntLE(pathB.length)
+    out.writeBytes(pathB)
+    out.writeIntLE(keyB.length)
+    out.writeBytes(keyB)
+    out.writeBytes(payload) // ByteBuf 直写（不落堆数组）
+    msg.releaseBuf() // retained 切片生命周期到此（数组形态 no-op）
+  }
 }
 
 final class ParrotServerHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
