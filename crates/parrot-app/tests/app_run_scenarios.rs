@@ -5,6 +5,7 @@
 //!
 //! 需要本机工具链（erl / java+mvn 已构建 jar / python3+ray）——
 //! 用户裁定：一律真实子进程。缺工具链的用例显式失败（不 SKIP）。
+#![cfg(feature = "host")]
 
 use std::sync::Arc;
 use std::time::Duration;

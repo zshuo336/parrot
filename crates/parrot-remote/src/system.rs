@@ -109,7 +109,11 @@ impl RemoteConfig {
     /// parrot-config 负责，此处只消费最终值）。
     pub fn from_resolved(r: &parrot_config::Resolved) -> Self {
         let mut cfg = Self::tcp(
-            r.remote.node.node_id.clone().unwrap_or_else(|| "parrot-node".into()),
+            r.remote
+                .node
+                .node_id
+                .clone()
+                .unwrap_or_else(|| "parrot-node".into()),
             r.remote.node.bind.as_deref().and_then(|b| b.parse().ok()),
         );
         cfg.seeds = r
@@ -123,7 +127,9 @@ impl RemoteConfig {
             parrot_config::TopologyRoleValue::Normal => crate::handshake::TopologyRole::Normal,
             parrot_config::TopologyRoleValue::Hub => crate::handshake::TopologyRole::Hub,
             parrot_config::TopologyRoleValue::Border => crate::handshake::TopologyRole::Border,
-            parrot_config::TopologyRoleValue::Directory => crate::handshake::TopologyRole::Directory,
+            parrot_config::TopologyRoleValue::Directory => {
+                crate::handshake::TopologyRole::Directory
+            }
         };
         cfg.direct_addr = r.remote.node.direct_addr.clone();
         cfg.extra_caps = r.remote.extra_caps;
@@ -169,6 +175,10 @@ pub struct RemoteActorSystem {
     admin_pending: Arc<crate::admin::AdminPending>,
     /// K0：req_id 计数（单调）
     admin_req_id: std::sync::atomic::AtomicU64,
+    /// B1（DEV_09）：admin-v2 回执挂起表 + req_id 计数 + 组件执行器槽。
+    admin_pending_v2: Arc<crate::admin_v2::AdminPendingV2>,
+    admin_req_id_v2: std::sync::atomic::AtomicU64,
+    component_executor: std::sync::RwLock<Option<Arc<dyn crate::admin_v2::ComponentExecutor>>>,
 }
 
 impl RemoteActorSystem {
@@ -261,6 +271,9 @@ impl RemoteActorSystem {
             shutdown_tx,
             admin_pending: Arc::new(crate::admin::AdminPending::default()),
             admin_req_id: std::sync::atomic::AtomicU64::new(1),
+            admin_pending_v2: Arc::new(crate::admin_v2::AdminPendingV2::default()),
+            admin_req_id_v2: std::sync::atomic::AtomicU64::new(1),
+            component_executor: std::sync::RwLock::new(None),
         }))
     }
 
@@ -525,11 +538,15 @@ impl RemoteActorSystem {
     fn install_admin_hook(self: &Arc<Self>) {
         let local = self.ingress.local.clone();
         let pending = self.admin_pending.clone();
+        let pending_v2 = self.admin_pending_v2.clone();
+        let executor = self.component_executor.read().unwrap().clone();
         let membership = self.membership.clone();
         let self_node = self.config.node_id.clone();
         let hook = AdminHook {
             local,
             pending,
+            pending_v2,
+            executor,
             membership,
             self_node,
         };
@@ -641,11 +658,176 @@ impl RemoteActorSystem {
         }
     }
 
+    // ── B1（DEV_09 §3.2）：admin-v2 组件级部署三方法 ──────────
+
+    /// 安装目标节点组件执行器（方言挂接点：parrot Executor / 网关 admin 分支）。
+    pub fn set_component_executor(&self, ex: Option<Arc<dyn crate::admin_v2::ComponentExecutor>>) {
+        *self.component_executor.write().unwrap() = ex;
+    }
+
+    /// v2 命令往返（与 v1 admin_roundtrip 同构——挂起表/超时独立）。
+    async fn admin_roundtrip_v2(
+        self: &Arc<Self>,
+        node: &str,
+        mut cmd: crate::admin_v2::AdminCommandV2,
+    ) -> Result<crate::admin_v2::AdminReplyV2, RemoteError> {
+        use std::sync::atomic::Ordering;
+        let req_id = self.admin_req_id_v2.fetch_add(1, Ordering::Relaxed);
+        cmd.set_req_id(req_id);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.admin_pending_v2.insert(req_id, tx);
+        let sender = self
+            .links
+            .lock()
+            .await
+            .iter()
+            .find(|(n, _, _)| n == node)
+            .map(|(_, s, _)| s.clone())
+            .ok_or_else(|| RemoteError::UnknownNode(node.into()))?;
+        let payload = crate::admin_v2::encode_admin_cmd_v2(&cmd);
+        let frame = Frame {
+            header: crate::frame::FrameHeader {
+                frame_len: 0,
+                version: crate::frame::PROTOCOL_VERSION,
+                frame_type: crate::frame::frame_type::SYSTEM_EVENT,
+                flags: 0,
+                correlation_id: req_id,
+                hop_count: 0,
+                hop_limit: 8,
+                seq: crate::frame::SEQ_NONE,
+            },
+            path: String::new(),
+            type_key: String::new(),
+            payload,
+        };
+        if sender.send(frame).await.is_err() {
+            return Err(RemoteError::Transport(
+                "admin v2 send failed (link down)".into(),
+            ));
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(_)) => Err(RemoteError::Transport(
+                "admin v2 reply channel dropped".into(),
+            )),
+            Err(_) => Err(RemoteError::Transport("admin v2 timeout 30s".into())),
+        }
+    }
+
+    /// 部署组件到指定节点（四方言统一入口；实例路径清单回执）。
+    pub async fn deploy_component(
+        self: &Arc<Self>,
+        node: &str,
+        c: crate::admin_v2::ComponentDeploy,
+    ) -> Result<Vec<String>, RemoteError> {
+        let reply = self
+            .admin_roundtrip_v2(
+                node,
+                crate::admin_v2::AdminCommandV2::DeployComponent {
+                    req_id: 0,
+                    component: c,
+                },
+            )
+            .await?;
+        match reply {
+            crate::admin_v2::AdminReplyV2::Deployed { instances, .. } => Ok(instances),
+            crate::admin_v2::AdminReplyV2::Failed { code, detail, .. } => Err(
+                RemoteError::Transport(format!("deploy failed: {code:#06x} {detail}")),
+            ),
+            other => Err(RemoteError::Transport(format!(
+                "unexpected admin v2 reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// 排空组件（优雅停——在途消息处理完或超时；返回 (drained, aborted)）。
+    pub async fn drain_component(
+        self: &Arc<Self>,
+        node: &str,
+        prefix: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(usize, usize), RemoteError> {
+        let reply = self
+            .admin_roundtrip_v2(
+                node,
+                crate::admin_v2::AdminCommandV2::DrainComponent {
+                    req_id: 0,
+                    path_prefix: prefix.into(),
+                    timeout_ms: timeout.as_millis() as u64,
+                },
+            )
+            .await?;
+        match reply {
+            crate::admin_v2::AdminReplyV2::Drained {
+                drained, aborted, ..
+            } => Ok((drained, aborted)),
+            crate::admin_v2::AdminReplyV2::Failed { code, detail, .. } => Err(
+                RemoteError::Transport(format!("drain failed: {code:#06x} {detail}")),
+            ),
+            other => Err(RemoteError::Transport(format!(
+                "unexpected admin v2 reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// 停组件（立即——路径前缀下全部实例）。
+    pub async fn stop_component(
+        self: &Arc<Self>,
+        node: &str,
+        prefix: &str,
+    ) -> Result<(), RemoteError> {
+        let reply = self
+            .admin_roundtrip_v2(
+                node,
+                crate::admin_v2::AdminCommandV2::StopComponent {
+                    req_id: 0,
+                    path_prefix: prefix.into(),
+                },
+            )
+            .await?;
+        match reply {
+            crate::admin_v2::AdminReplyV2::Stopped { .. } => Ok(()),
+            crate::admin_v2::AdminReplyV2::Failed { code, detail, .. } => Err(
+                RemoteError::Transport(format!("stop failed: {code:#06x} {detail}")),
+            ),
+            other => Err(RemoteError::Transport(format!(
+                "unexpected admin v2 reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// 查组件状态（路径前缀匹配）。
+    pub async fn component_status(
+        self: &Arc<Self>,
+        node: &str,
+        prefix: &str,
+    ) -> Result<Vec<crate::admin_v2::ComponentStateReport>, RemoteError> {
+        let reply = self
+            .admin_roundtrip_v2(
+                node,
+                crate::admin_v2::AdminCommandV2::ComponentStatus {
+                    req_id: 0,
+                    path_prefix: prefix.into(),
+                },
+            )
+            .await?;
+        match reply {
+            crate::admin_v2::AdminReplyV2::Status { states, .. } => Ok(states),
+            crate::admin_v2::AdminReplyV2::Failed { code, detail, .. } => Err(
+                RemoteError::Transport(format!("status failed: {code:#06x} {detail}")),
+            ),
+            other => Err(RemoteError::Transport(format!(
+                "unexpected admin v2 reply: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<(), RemoteError> {
         let _ = self.shutdown_tx.send(true); // ConnectionTask 全部退出 → closed 信号 → links 清
         self.links.lock().await.clear();
         self.callbacks
             .fail_all(crate::error::ErrCode::ConnectionLost, "system shutdown");
+        self.admin_pending_v2.fail_all("system shutdown");
         Ok(())
     }
 }
@@ -666,6 +848,9 @@ pub struct RemoteGatewayImpl(Arc<RemoteActorSystem>);
 struct AdminHook {
     local: Arc<dyn LocalLookup>,
     pending: Arc<crate::admin::AdminPending>,
+    /// B1（DEV_09）：v2 回执完成 + 目标节点组件执行器。
+    pending_v2: Arc<crate::admin_v2::AdminPendingV2>,
+    executor: Option<Arc<dyn crate::admin_v2::ComponentExecutor>>,
     /// S1：gossip 合并目标（RemoteActorSystem.membership 共享）。
     membership: Arc<tokio::sync::Mutex<crate::swim::Membership>>,
     self_node: String,
@@ -691,6 +876,31 @@ impl crate::ingress::SysEventHook for AdminHook {
             }
             crate::admin::SysEvent::AdminReply(r) => {
                 self.pending.complete(r);
+            }
+            // B1（DEV_09）：v2 命令 → 本节点执行器；回执 → 挂起表。
+            crate::admin::SysEvent::AdminCommandV2(cmd) => {
+                if !crate::admin::admin_allowed(_from) {
+                    let _ = back
+                        .send(Frame::reply_err(
+                            cmd.req_id(),
+                            "",
+                            crate::error::ErrCode::Forbidden,
+                            "admin requires role=admin",
+                        ))
+                        .await;
+                    return;
+                }
+                let reply_to = format!("parrot://{}/_admin", self.self_node);
+                crate::admin_v2::handle_admin_command_v2(
+                    cmd,
+                    self.executor.as_deref(),
+                    back,
+                    &reply_to,
+                )
+                .await;
+            }
+            crate::admin::SysEvent::AdminReplyV2(r) => {
+                self.pending_v2.complete(r);
             }
             // K1/S1：入站 gossip 两级语义（DEV_06 §2）
             crate::admin::SysEvent::MembershipGossip(body) => {

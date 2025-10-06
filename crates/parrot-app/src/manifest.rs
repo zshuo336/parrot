@@ -469,6 +469,66 @@ pub fn component_config_flat(c: &ComponentSpec) -> BTreeMap<String, String> {
 // 测试（§5.1 Manifest 25+——校验全分支 + roundtrip 字节一致）
 // ============================================================================
 
+// ─────────────────────────────────────────────────────────────
+// BD-1：AdminArtifactRef ↔ ArtifactRef 转换（serde 同形互锁）
+// ─────────────────────────────────────────────────────────────
+
+impl From<ArtifactRef> for parrot_remote::admin_v2::AdminArtifactRef {
+    fn from(a: ArtifactRef) -> Self {
+        use parrot_remote::admin_v2::AdminArtifactRef;
+        match a {
+            ArtifactRef::Props { factory } => AdminArtifactRef::Props { factory },
+            ArtifactRef::Wasm { digest, uri } => AdminArtifactRef::Wasm { digest, uri },
+            ArtifactRef::Dylib { digest, uri, abi } => AdminArtifactRef::Dylib { digest, uri, abi },
+            ArtifactRef::Jvm { main_class, coords } => AdminArtifactRef::Jvm { main_class, coords },
+            ArtifactRef::PyModule {
+                module,
+                runtime_env,
+            } => AdminArtifactRef::PyModule {
+                module,
+                // toml::Value → TOML 文本（wire 同形策略见 admin_v2.rs 文档）
+                runtime_env: runtime_env.and_then(|v| toml::to_string(&v).ok()),
+            },
+            ArtifactRef::Beam { app } => AdminArtifactRef::Beam { app },
+        }
+    }
+}
+
+impl From<parrot_remote::admin_v2::AdminArtifactRef> for ArtifactRef {
+    fn from(a: parrot_remote::admin_v2::AdminArtifactRef) -> Self {
+        use parrot_remote::admin_v2::AdminArtifactRef;
+        match a {
+            AdminArtifactRef::Props { factory } => ArtifactRef::Props { factory },
+            AdminArtifactRef::Wasm { digest, uri } => ArtifactRef::Wasm { digest, uri },
+            AdminArtifactRef::Dylib { digest, uri, abi } => ArtifactRef::Dylib { digest, uri, abi },
+            AdminArtifactRef::Jvm { main_class, coords } => ArtifactRef::Jvm { main_class, coords },
+            AdminArtifactRef::PyModule {
+                module,
+                runtime_env,
+            } => ArtifactRef::PyModule {
+                module,
+                // TOML 文本 → toml::Value（解析失败容忍 None——方言侧兜底）
+                runtime_env: runtime_env.and_then(|s| toml::from_str(&s).ok()),
+            },
+            AdminArtifactRef::Beam { app } => ArtifactRef::Beam { app },
+        }
+    }
+}
+
+impl From<InstancePolicy> for parrot_remote::admin_v2::AdminInstancePolicy {
+    fn from(p: InstancePolicy) -> Self {
+        use parrot_remote::admin_v2::AdminInstancePolicy;
+        match p {
+            InstancePolicy::Singleton => AdminInstancePolicy::Singleton,
+            InstancePolicy::Pool(count) => AdminInstancePolicy::Pool { count },
+            InstancePolicy::Sharded(count) => AdminInstancePolicy::Sharded { count },
+            // Ephemeral 按需实例——wire 上与 Singleton 同形（count=1；
+            // 差异语义留驻本地 manifest 层）
+            InstancePolicy::Ephemeral => AdminInstancePolicy::Singleton,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,5 +1000,70 @@ Props = { factory = "f" }
         }
         // 未知引擎名拒绝
         assert!(toml::from_str::<EngineWrap>("value = \"golang\"\n").is_err());
+    }
+    // ── BD-1：AdminArtifactRef 同形互锁 ──────────────────────
+    #[test]
+    fn bd1_artifact_ref_roundtrip_all_kinds() {
+        use parrot_remote::admin_v2::AdminArtifactRef;
+        let arts = vec![
+            ArtifactRef::Props {
+                factory: "f".into(),
+            },
+            ArtifactRef::Beam { app: "a".into() },
+            ArtifactRef::PyModule {
+                module: "m".into(),
+                runtime_env: None,
+            },
+            ArtifactRef::Jvm {
+                main_class: "M".into(),
+                coords: None,
+            },
+            ArtifactRef::Wasm {
+                digest: "d".into(),
+                uri: "u".into(),
+            },
+            ArtifactRef::Dylib {
+                digest: "d".into(),
+                uri: "u".into(),
+                abi: 1,
+            },
+        ];
+        for a in arts {
+            let wire: AdminArtifactRef = a.clone().into();
+            let back: ArtifactRef = wire.into();
+            assert_eq!(back, a);
+        }
+    }
+
+    #[test]
+    fn bd1_instance_policy_maps() {
+        use parrot_remote::admin_v2::AdminInstancePolicy;
+        assert_eq!(
+            AdminInstancePolicy::from(InstancePolicy::Singleton),
+            AdminInstancePolicy::Singleton
+        );
+        assert_eq!(
+            AdminInstancePolicy::from(InstancePolicy::Pool(3)),
+            AdminInstancePolicy::Pool { count: 3 }
+        );
+    }
+
+    #[test]
+    fn bd1_pymodule_runtime_env_text_roundtrip() {
+        use parrot_remote::admin_v2::AdminArtifactRef;
+        let orig = ArtifactRef::PyModule {
+            module: "jobs".into(),
+            runtime_env: Some(toml::Value::Table(
+                [(
+                    "pip".to_string(),
+                    toml::Value::Array(vec![toml::Value::from("requests")]),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+        };
+        let wire: AdminArtifactRef = orig.clone().into();
+        let back: ArtifactRef = wire.into();
+        assert_eq!(back, orig, "toml 文本互转保真");
     }
 }

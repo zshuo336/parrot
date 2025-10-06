@@ -34,7 +34,11 @@ impl std::str::FromStr for NodeAddr {
         let addr: SocketAddr = hostport
             .parse()
             .map_err(|e| format!("bad addr {hostport:?}: {e}"))?;
-        Ok(Self { node_id, scheme, addr })
+        Ok(Self {
+            node_id,
+            scheme,
+            addr,
+        })
     }
 }
 

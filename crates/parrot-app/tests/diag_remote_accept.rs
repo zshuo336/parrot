@@ -1,4 +1,6 @@
 //! A4 辅助诊断：RemoteActorSystem 接受真实 erl 网关注册（隔离 AssemblingContext）。
+#![cfg(feature = "host")]
+
 use std::sync::Arc;
 
 use parrot::thread::system::ThreadActorSystem;

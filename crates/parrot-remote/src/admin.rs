@@ -19,9 +19,12 @@ use crate::ingress::LocalLookup;
 ///
 /// 布局：`[u8 tag][bincode(body)]`；tag: 0x01=AdminCommand, 0x02=AdminReply,
 /// 0x10=MembershipGossip(K1), 0x20=ReceptionistSync(K2)。
+/// v2（DEV_09 B1）：0x03=AdminCommandV2, 0x04=AdminReplyV2（组件级部署协议）。
 pub mod sys_event_tag {
     pub const ADMIN_CMD: u8 = 0x01;
     pub const ADMIN_REPLY: u8 = 0x02;
+    pub const ADMIN_CMD_V2: u8 = 0x03;
+    pub const ADMIN_REPLY_V2: u8 = 0x04;
     pub const MEMBERSHIP_GOSSIP: u8 = 0x10;
     pub const RECEPTIONIST_SYNC: u8 = 0x20;
 }
@@ -109,17 +112,30 @@ pub fn decode_sys_event(payload: &[u8]) -> Result<SysEvent, RemoteError> {
         )),
         sys_event_tag::MEMBERSHIP_GOSSIP => Ok(SysEvent::MembershipGossip(body.to_vec().into())),
         sys_event_tag::RECEPTIONIST_SYNC => Ok(SysEvent::ReceptionistSync(body.to_vec().into())),
+        sys_event_tag::ADMIN_CMD_V2 => Ok(SysEvent::AdminCommandV2(
+            bincode::serde::decode_from_slice(body, bincode::config::standard())
+                .map_err(|e| RemoteError::Codec(format!("admin cmd v2 decode: {e}")))?
+                .0,
+        )),
+        sys_event_tag::ADMIN_REPLY_V2 => Ok(SysEvent::AdminReplyV2(
+            bincode::serde::decode_from_slice(body, bincode::config::standard())
+                .map_err(|e| RemoteError::Codec(format!("admin reply v2 decode: {e}")))?
+                .0,
+        )),
         other => Err(RemoteError::Codec(format!(
             "unknown SYSTEM_EVENT tag 0x{other:02X}"
         ))),
     }
 }
 
-/// SYSTEM_EVENT 载荷四形态统一视图（ingress 分发用）。
+/// SYSTEM_EVENT 载荷形态统一视图（ingress 分发用）。
 #[derive(Debug, Clone)]
 pub enum SysEvent {
     AdminCommand(AdminCommand),
     AdminReply(AdminReply),
+    /// v2（DEV_09 B1）——组件级部署协议（admin_v2 模块）。
+    AdminCommandV2(crate::admin_v2::AdminCommandV2),
+    AdminReplyV2(crate::admin_v2::AdminReplyV2),
     MembershipGossip(bytes::Bytes),
     ReceptionistSync(bytes::Bytes),
 }

@@ -7,6 +7,7 @@
 
 pub mod acl;
 pub mod admin;
+pub mod admin_v2;
 pub mod cache;
 pub mod codec;
 pub mod codec_registry;
