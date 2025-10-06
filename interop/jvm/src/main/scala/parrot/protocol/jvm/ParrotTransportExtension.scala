@@ -23,7 +23,8 @@ import scala.util.{Failure, Success}
 final class ParrotTransportExtension(
     system: ActorSystem[_],
     bridge: ActorRef[BridgeMsg],
-    nodeId: String
+    nodeId: String,
+    adminPort: Option[ActorRef[AdminPort.Msg]] = None
 ) {
   private var group: NioEventLoopGroup = _
   @volatile private var boundPort: Int = -1
@@ -37,10 +38,10 @@ final class ParrotTransportExtension(
       .channel(classOf[NioServerSocketChannel])
       .childHandler(new ChannelInitializer[SocketChannel] {
         override def initChannel(ch: SocketChannel): Unit = {
-          ch.pipeline()
+            ch.pipeline()
             .addLast(new WireDecoder())
             .addLast(new WireEncoder())
-            .addLast(new ParrotServerHandler(bridge, nodeId))
+            .addLast(new ParrotServerHandler(bridge, nodeId, adminPort))
         }
       })
     val f = b.bind(port0).sync()
@@ -69,7 +70,7 @@ final class ParrotTransportExtension(
               .addLast(new io.netty.handler.timeout.IdleStateHandler(10, 0, 0))
               .addLast(new WireDecoder())
               .addLast(new WireEncoder())
-              .addLast(new ParrotClientHandler(bridge, nodeId))
+              .addLast(new ParrotClientHandler(bridge, nodeId, adminPort))
           }
         })
       val f = b.connect(parrotHost, parrotPort)
@@ -164,7 +165,11 @@ final class WireEncoder extends io.netty.handler.codec.MessageToByteEncoder[Wire
   }
 }
 
-class ParrotServerHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
+class ParrotServerHandler(
+    bridge: ActorRef[BridgeMsg],
+    nodeId: String,
+    adminPort: Option[ActorRef[AdminPort.Msg]] = None
+)
     extends SimpleChannelInboundHandler[WireFrame.Frame] {
   /** 子类（注册模式 client handler）可见——客户端握手完成后置位复用分发。 */
   protected var handshaken = false
@@ -236,6 +241,34 @@ class ParrotServerHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
         )
       case FrameType.HEARTBEAT =>
         ctx.writeAndFlush(WireFrame.Frame(1, FrameType.HEARTBEAT_ACK, 0, 0, 0, 8, "", "", Array.emptyByteArray))
+      case FrameType.SYSTEM_EVENT =>
+        // B5（DEV_09）：admin-v2（tag 0x03）→ AdminPort 执行回 0x04 回执帧；
+        // 其它 tag（gossip 等）吞帧不断连（与 ray/erl 方言一致）。
+        val payload = msg.payload
+        if (payload.nonEmpty && (payload(0) & 0xFF) == AdminV2Codec.TagAdminCmdV2) {
+          adminPort match {
+            case Some(port) =>
+              val sink = new AdminPort.ReplySink {
+                override def send(cid: Long, replyTo: String, out: Array[Byte]): Unit =
+                  // 回执帧：type_key 留空；path 回写发起方 reply_to
+                  ctx.writeAndFlush(
+                    WireFrame.Frame(1, FrameType.SYSTEM_EVENT, 0, cid, 0, 8, replyTo, "", out)
+                  )
+              }
+              port ! AdminPort.CmdIn(msg.correlationId, msg.path, payload, sink)
+            case None =>
+              ctx.writeAndFlush(
+                WireFrame.Frame(
+                  1, FrameType.SYSTEM_EVENT, 0, msg.correlationId, 0, 8, "", "",
+                  AdminV2Codec.encodeReply(
+                    AdminV2Codec.AdminReplyV2.Failed(
+                      msg.correlationId, AdminV2Executor.ErrDialectMismatch, "admin port disabled"
+                    )
+                  )
+                )
+              )
+          }
+        } // 非 admin tag：吞帧（前向兼容）
       case FrameType.ROUTE_HINT =>
       // 方案 A：hub 注入直连地址。JVM 客户端形态暂不建直连（出站经
       // akka selection 路由——直连优化属 Rust/erl/py spoke 侧）；吞帧
@@ -261,8 +294,11 @@ object ParrotServerHandler {
 /** 注册模式 handler：连接建立即发 HANDSHAKE（客户端侧），收到 ACK 后
   * 进入与 server 相同的帧分发（复用 server 的握手后分支）。
   */
-final class ParrotClientHandler(bridge: ActorRef[BridgeMsg], nodeId: String)
-    extends ParrotServerHandler(bridge, nodeId) {
+final class ParrotClientHandler(
+    bridge: ActorRef[BridgeMsg],
+    nodeId: String,
+    adminPort: Option[ActorRef[AdminPort.Msg]] = None
+) extends ParrotServerHandler(bridge, nodeId, adminPort) {
 
   private var clientHandshaken = false
 

@@ -147,7 +147,7 @@ crawl_encode_batch([{Id, Url, Depth} | T], Acc) ->
 %% Option = 0/1+体；String/Vec = varint len + 元素。
 %% 冻结事实源：docs/vectors/admin_v2.json（六向量逐字节互锁）。
 
--define(FT_SYSTEM_EVENT, 16#05).
+-define(FT_SYSTEM_EVENT, 16#20).  %% B4 对齐修正：Rust frame_type::SYSTEM_EVENT（0x05 是 HEARTBEAT_ACK 段——错值会静默丢帧）
 -define(TAG_ADMIN_CMD_V2, 16#03).
 -define(TAG_ADMIN_REPLY_V2, 16#04).
 %% v2 错误码扩展段

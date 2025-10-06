@@ -59,8 +59,9 @@ object ParrotGatewayMain {
       // resolve：路径名 → guardian 子 ref（用本地 map，不用 ctx.child——那是调用者自己的子）
       val targets = Map("echo" -> echo.unsafeUpcast[Any], "cpu" -> cpu.unsafeUpcast[Any])
       val bridge = ctx.spawn(BridgeActor(path => targets.get(path)), "bridge")
-      // Netty server
-      val ext = new ParrotTransportExtension(ctx.system, bridge, "jvm-gw-1")
+      // B5（DEV_09）：admin-v2 AdminPort（deploy/drain/stop/status）
+      val admin = ctx.spawn(AdminPort(ctx.system), "admin-port")
+      val ext = new ParrotTransportExtension(ctx.system, bridge, "jvm-gw-1", Some(admin))
       ParrotServerHandler.initSystem(ctx.system)
       ext.listen(port)
       System.out.println(s"PARROT_JVM_PORT=${ext.port}")
