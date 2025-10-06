@@ -34,3 +34,4 @@ path = "src/bin/parrot-probe.rs"
 [dev-dependencies]
 hex = "0.4"
 sha2 = "0.10"
+bytes = "1"

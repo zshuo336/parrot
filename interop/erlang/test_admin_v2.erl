@@ -16,7 +16,7 @@
 
 -define(ASK, 16#10).
 -define(REPLY, 16#11).
--define(SYSTEM_EVENT, 16#05).
+-define(SYSTEM_EVENT, 16#20).
 
 all() ->
     [{"admin_v2 golden deploy cmd", fun t_golden_deploy_cmd/0},
