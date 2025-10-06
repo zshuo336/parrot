@@ -1,0 +1,31 @@
+{
+  "format": "parrot-admin-v2",
+  "frozen": true,
+  "note": "只增不改：修改 = 协议 break。payload = [u8 tag][bincode standard(body)]；tag 0x03=CMD_V2 0x04=REPLY_V2",
+  "vectors": [
+    {
+      "name": "v2-deploy-props-singleton",
+      "payload_hex": "030001046563686f05312e302e3000086170702e6563686f0000"
+    },
+    {
+      "name": "v2-drain",
+      "payload_hex": "030102092f757365722f696478fb8813"
+    },
+    {
+      "name": "v2-stop",
+      "payload_hex": "030203092f757365722f696478"
+    },
+    {
+      "name": "v2-status",
+      "payload_hex": "030304062f757365722f"
+    },
+    {
+      "name": "v2-reply-deployed",
+      "payload_hex": "040001010a2f757365722f6563686f"
+    },
+    {
+      "name": "v2-reply-failed",
+      "payload_hex": "040409fb020a0b6e6f206578656375746f72"
+    }
+  ]
+}

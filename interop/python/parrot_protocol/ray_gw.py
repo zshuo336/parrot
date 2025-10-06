@@ -29,6 +29,7 @@ from .wire import (
     FT_REPLY,
     FT_REPLY_ERR,
     FT_ROUTE_HINT,
+    FT_SYSTEM_EVENT,
     FT_TELL,
     FrameDecoder,
     build_frame,
@@ -44,6 +45,248 @@ ERR_UNKNOWN_TYPE_KEY = 6
 # DEV_08：ASK 执行池大小（慢 handler 并发度；环境变量可覆盖——
 # PARROT_RAY_GW_WORKERS=1 即退化为旧行为做 A/B 对照）
 RAY_GW_ASK_WORKERS = int(os.environ.get("PARROT_RAY_GW_WORKERS", "8"))
+
+
+# ---------------- B3（DEV_09）：admin-v2 ray 方言执行器 ----------------
+# DeployComponent{PyModule} → ray job API submit(working_dir=module 目录,
+# runtime_env) → module 内 parrot_entry(ctx) 起命名 actor；
+# Drain/Stop → ray kill 命名 actor；Status → 网关侧登记表 + ray 探活。
+
+
+class RayAdminExecutor:
+    """admin-v2 四命令的 ray 方言实现。
+
+    组件登记表：name → {version, paths, handles}（进程内；网关单点）。
+    实例路径与 parrot/erl/jvm 方言同规：/user/{name}[-{i}]——
+    path_prefix 匹配规则与 Rust 侧一致（整段相等或后随 '-'）。
+    """
+
+    def __init__(self, out_queue, ray_module=None) -> None:
+        self._out = out_queue          # 回帧队列（writer 线程消费）
+        self._ray = ray_module         # 可注入（测试桩）；None → import ray
+        self._components: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    # ---- ray 句柄（惰性导入；测试注入桩）----
+    @property
+    def ray(self):
+        if self._ray is None:
+            import ray  # noqa: PLC0415（网关进程内惰性——测试可先注入桩）
+            self._ray = ray
+        return self._ray
+
+    # ---- 回帧 ----
+    def _send_reply(self, req_id: int, reply: dict, reply_to: str) -> None:
+        from .admin_v2 import encode_admin_reply_v2
+
+        self._out.put(
+            build_frame(FT_SYSTEM_EVENT, req_id, reply_to, "",
+                        encode_admin_reply_v2(reply))
+        )
+
+    # ---- SYSTEM_EVENT 入口（serve 帧循环调用）----
+    def on_frame(self, cid: int, reply_to: str, payload: bytes) -> bool:
+        """SYSTEM_EVENT 帧 → admin v2 命令处理。返回 True = 已消费。"""
+        from .admin_v2 import (
+            TAG_ADMIN_CMD_V2,
+            decode_admin_cmd_v2,
+            decode_tag,
+        )
+
+        try:
+            tag = decode_tag(payload)
+        except ValueError:
+            return False  # 非 admin-v2（gossip 等）——原路透传给调用方忽略
+        if tag != TAG_ADMIN_CMD_V2:
+            return False  # 回执帧不落在网关侧（发起方 pending 表消费）
+        cmd = decode_admin_cmd_v2(payload)
+        # 命令执行线程池外跑（deploy 可能拉 ray job——秒级；不阻塞收帧）
+        threading.Thread(
+            target=self._dispatch, args=(cmd, reply_to), daemon=True
+        ).start()
+        return True
+
+    def _dispatch(self, cmd: dict, reply_to: str) -> None:
+        from .admin_v2 import (
+            ERR_ARTIFACT_FETCH,
+            ERR_COMPONENT_NOT_FOUND,
+            ERR_DIALECT_MISMATCH,
+            ERR_DRAIN_TIMEOUT,
+        )
+
+        kind = cmd["kind"]
+        try:
+            if kind == "deploy":
+                reply = self.deploy(cmd["component"])
+            elif kind == "drain":
+                d, a = self.drain(cmd["path_prefix"], cmd["timeout_ms"])
+                reply = {"kind": "drained", "drained": d, "aborted": a}
+            elif kind == "stop":
+                reply = self.stop(cmd["path_prefix"])
+            elif kind == "status":
+                reply = self.status(cmd["path_prefix"])
+            else:  # pragma: no cover —— 解码层已限四形态
+                reply = {"kind": "failed", "code": ERR_DIALECT_MISMATCH,
+                         "detail": f"unknown kind {kind}"}
+        except _NotFound as e:
+            reply = {"kind": "failed", "code": ERR_COMPONENT_NOT_FOUND,
+                     "detail": f"no component under {e}"}
+        except Exception as e:  # noqa: BLE001
+            reply = {"kind": "failed", "code": ERR_ARTIFACT_FETCH, "detail": str(e)}
+        reply["req_id"] = cmd["req_id"]
+        self._send_reply(cmd["req_id"], reply, reply_to)
+
+    # ---- Deploy：PyModule → ray job → parrot_entry(ctx) 命名 actor ----
+    def deploy(self, comp: dict) -> dict:
+        from .admin_v2 import ERR_DIALECT_MISMATCH
+
+        art = comp["artifact"]
+        if art["kind"] != "pymodule":
+            return {
+                "kind": "failed",
+                "code": ERR_DIALECT_MISMATCH,
+                "detail": f"ray executor expects PyModule, got {art['kind']}",
+            }
+        module_dir = os.path.dirname(art["module"].replace(".", "/")) or "."
+        # runtime_env：TOML 文本 → dict（py3.11+ tomllib；旧版容错降级）
+        env_dict: dict = {}
+        re_text = art.get("runtime_env")
+        if re_text:
+            try:
+                import tomllib  # noqa: PLC0415
+
+                env_dict = tomllib.loads(re_text)
+            except ImportError:
+                env_dict = {"pip": [], "env_vars": {}, "_raw": re_text}
+        ray = self.ray
+        # ray job submission（集群形态）——本地 init 形态退化为
+        # importlib 直载 module + 本地调用 parrot_entry
+        instances = _expand_paths(comp["name"], comp["instances"])
+        try:
+            handles = self._launch(comp, module_dir, env_dict, instances)
+        except Exception as e:  # noqa: BLE001
+            return {
+                "kind": "failed",
+                "code": 0x0A00,
+                "detail": f"ray launch failed: {e}",
+            }
+        with self._lock:
+            self._components[comp["name"]] = {
+                "version": comp["version"],
+                "paths": instances,
+                "handles": handles,
+            }
+        return {"kind": "deployed", "instances": instances}
+
+    def _launch(self, comp: dict, module_dir: str, env_dict: dict, instances: list[str]):
+        """PyModule 启动：module 目录为 working_dir。
+
+        真 ray 集群：JobSubmissionClient().submit(working_dir, entrypoint)。
+        本地 ray.init（测试/单机形态）：importlib 直载 + parrot_entry 本地起
+        命名 actor（ray.get 强制落位——与 serve 的 worker 就绪等待同式）。
+        """
+        import importlib
+
+        module_name = comp["artifact"]["module"]
+        mod = importlib.import_module(module_name)
+        entry = getattr(mod, "parrot_entry", None)
+        if entry is None:
+            raise RuntimeError(f"{module_name} has no parrot_entry(ctx)")
+        ray = self.ray
+        # parrot_entry(ctx) → dispatcher 工厂；ctx 含 instances/env
+        handles = []
+        for path in instances:
+            h = entry({"path": path, "env": env_dict, "ray": ray})
+            handles.append(h)
+        return handles
+
+    # ---- Drain：排空（命名 actor 优雅停——ray 无 drain 原语，
+    #      语义映射为 drain 钩子调用 + ray.kill(no_restart=True)）----
+    def drain(self, prefix: str, timeout_ms: int) -> tuple[int, int]:
+        comps = self._match(prefix)
+        if not comps:
+            raise _NotFound(prefix)
+        drained = aborted = 0
+        deadline = time.monotonic() + min(timeout_ms, 60000) / 1000.0
+        for name, info in comps:
+            ok = True
+            for h in info["handles"]:
+                try:
+                    if hasattr(h, "parrot_drain"):
+                        h.parrot_drain.remote()
+                        self.ray.get(h.parrot_drain.remote())
+                except Exception:  # noqa: BLE001
+                    ok = False
+            if ok and time.monotonic() < deadline:
+                self._kill_handles(info["handles"])
+                drained += len(info["paths"])
+            else:
+                aborted += len(info["paths"])
+            with self._lock:
+                self._components.pop(name, None)
+        return drained, aborted
+
+    # ---- Stop：立即停（ray.kill 全部实例句柄）----
+    def stop(self, prefix: str) -> dict:
+        comps = self._match(prefix)
+        if not comps:
+            raise _NotFound(prefix)
+        for name, info in comps:
+            self._kill_handles(info["handles"])
+            with self._lock:
+                self._components.pop(name, None)
+        return {"kind": "stopped"}
+
+    # ---- Status：登记表 + 句柄探活（stub：alive 标记；真 ray：登记表为准）----
+    def status(self, prefix: str) -> dict:
+        comps = self._match(prefix)
+        if not comps:
+            raise _NotFound(prefix)
+        states = []
+        for _name, info in comps:
+            alive = all(
+                getattr(h, "alive", True) for h in info["handles"]
+            )
+            for p in info["paths"]:
+                states.append({
+                    "path": p,
+                    "state": "running" if alive else "degraded",
+                    "version": info["version"],
+                })
+        return {"kind": "status", "states": states}
+
+    # ---- 前缀匹配（Rust 侧同规：整段相等或后随 '-'）----
+    def _match(self, prefix: str) -> list[tuple[str, dict]]:
+        with self._lock:
+            return [
+                (name, dict(info))
+                for name, info in self._components.items()
+                if any(
+                    p == prefix or (p.startswith(prefix) and p[len(prefix) : len(prefix) + 1] == "-")
+                    for p in info["paths"]
+                )
+            ]
+
+    def _kill_handles(self, handles: list) -> None:
+        ray = self.ray
+        for h in handles:
+            try:
+                ray.kill(h, no_restart=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+class _NotFound(Exception):
+    """组件未部署（Stop/Status/Drain 找不到实例 → 0x0A03）。"""
+
+
+def _expand_paths(name: str, policy: dict) -> list[str]:
+    """实例路径展开（与 parrot-app/Rust executor 同规）。"""
+    if policy["kind"] == "singleton":
+        return [f"/user/{name}"]
+    n = policy["count"]
+    return [f"/user/{name}-{i}" for i in range(n)]
+
 
 
 class ParrotDispatcher:
@@ -158,6 +401,9 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
 
             pool_local = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
 
+            # B3（DEV_09）：admin-v2 执行器（回帧经 out_local——writer 线程）
+            admin_local = RayAdminExecutor(out_local)
+
             def reply(cid: int, key: str, payload: bytes) -> None:
                 out_local.put(build_frame(FT_REPLY, cid, "", key, payload))
 
@@ -248,6 +494,9 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
                                 out_local.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
                             elif f.ft == FT_ROUTE_HINT:
                                 on_route_hint(f.payload)
+                            elif f.ft == FT_SYSTEM_EVENT:
+                                # B3：admin-v2（0x03 命令）——执行器消费；其余忽略
+                                admin_local.on_frame(f.cid, f.path, f.payload)
                         except Exception as loop_err:  # noqa: BLE001
                             print(f"[ray-gw] frame loop error: {loop_err!r}",
                                   file=sys.stderr, flush=True)
@@ -297,6 +546,9 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
         except Exception as e:  # noqa: BLE001
             reply_err(cid, ERR_UNKNOWN_TYPE_KEY, str(e))
 
+    # B3（DEV_09）：admin-v2 执行器（回帧经 out 队列——writer 线程）
+    admin_exec = RayAdminExecutor(out)
+
     dec = FrameDecoder()
     handshake_done = False
     while True:
@@ -333,6 +585,9 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
                     worker.deliver.remote(f.type_key, f.payload)
                 elif f.ft == FT_HEARTBEAT:
                     out.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
+                elif f.ft == FT_SYSTEM_EVENT:
+                    # B3（DEV_09）：admin-v2（0x03 命令）——执行器消费；其余忽略
+                    admin_exec.on_frame(f.cid, f.path, f.payload)
             except Exception as loop_err:  # noqa: BLE001
                 print(f"[ray-gw] frame loop error: {loop_err!r}", file=sys.stderr, flush=True)
     pool.shutdown(wait=False)
