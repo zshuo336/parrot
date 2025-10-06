@@ -783,6 +783,37 @@ impl Actor for WasmActor {
 // ══════════════════════════════════════════════════════════════════════════
 
 /// 内置 actor spawn（name: echo|counter|kv|slow → /user/<name>）。
+/// 内置组件清单（G2/M3 DEV_09）：builtin_app.toml 驱动 + PARROT_ACTORS
+/// overlay 过滤。
+///
+/// 语义（与旧 env 路径等价）：
+/// - PARROT_ACTORS 未设 → Manifest 全部组件；
+/// - PARROT_ACTORS="echo,kv" → 交集过滤（保持旧逗号分置语义）；
+/// - 过滤后为空 → 空（显式不起任何内置 actor——合法）。
+pub fn builtin_manifest_components() -> Vec<String> {
+    builtin_manifest_components_from(std::env::var("PARROT_ACTORS").ok().as_deref())
+}
+
+/// 可测形态（filter 显式注入）。
+pub fn builtin_manifest_components_from(filter: Option<&str>) -> Vec<String> {
+    // Manifest 与二进制同目录分发（include_str 编译期嵌入——部署零文件依赖）
+    static BUILTIN_TOML: &str = include_str!("../builtin_app.toml");
+    let m = parrot_app::manifest::AppManifest::from_toml(BUILTIN_TOML)
+        .expect("builtin_app.toml 编译期已验证（单测锚定）");
+    let all: Vec<String> = m.components.iter().map(|c| c.name.clone()).collect();
+    match filter {
+        None => all,
+        Some(f) if f.trim().is_empty() => vec![],
+        Some(f) => {
+            let want: std::collections::BTreeSet<&str> =
+                f.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            all.into_iter()
+                .filter(|n| want.contains(n.as_str()))
+                .collect()
+        }
+    }
+}
+
 pub async fn spawn_builtin(ts: &Arc<ThreadActorSystem>, which: &str) {
     use parrot_api::types::BoxedActorRef as BRef;
     fn boxed<A>(r: parrot::thread::address::ThreadActorRef<A>) -> BRef

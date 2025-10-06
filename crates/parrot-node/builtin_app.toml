@@ -1,0 +1,38 @@
+# builtin_app.toml —— parrot-node 内置组件 Manifest（DEV_09 G2/M3）
+#
+# 声明化改造：main.rs 启动从手写 spawn_builtin 循环改为读取本 Manifest
+# （cmd_run 同族路径）；PARROT_ACTORS 语义保持——变为 overlay 过滤器
+#（逗号分置组件名，缺省全部）。
+#
+# 四内置组件（与 spawn_builtin 一一对应——PropsFactory 名即 which 键）：
+
+name = "parrot-node-builtin"
+version = "1.0.0"
+
+[[components]]
+name = "echo"
+engine = "parrot"
+
+[components.artifact]
+Props = { factory = "builtin.echo" }
+
+[[components]]
+name = "counter"
+engine = "parrot"
+
+[components.artifact]
+Props = { factory = "builtin.counter" }
+
+[[components]]
+name = "kv"
+engine = "parrot"
+
+[components.artifact]
+Props = { factory = "builtin.kv" }
+
+[[components]]
+name = "slow"
+engine = "parrot"
+
+[components.artifact]
+Props = { factory = "builtin.slow" }

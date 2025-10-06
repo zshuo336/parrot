@@ -25,12 +25,6 @@ async fn main() {
     let node_id = std::env::var("PARROT_NODE_ID").unwrap_or_else(|_| "node-1".into());
     let bind = std::env::var("PARROT_BIND").unwrap_or_else(|_| "0.0.0.0:9801".into());
     let seeds = parrot_node::parse_seeds(std::env::var("PARROT_SEEDS").unwrap_or_default()).await;
-    let actors: Vec<String> = std::env::var("PARROT_ACTORS")
-        .unwrap_or_else(|_| "echo,counter,kv,slow".into())
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
 
     // 1. facade + 真实 thread 引擎
     let facade = Arc::new(
@@ -50,9 +44,10 @@ async fn main() {
     .ok()
     .expect("node state singleton");
 
-    // 2. 内置 actor 族
-    for name in &actors {
-        spawn_builtin(&ts, name).await;
+    // 2. 内置 actor 族（G2/M3：builtin_app.toml Manifest 驱动——
+    //    PARROT_ACTORS 语义不变，变为 overlay 过滤器）
+    for name in parrot_node::builtin_manifest_components() {
+        spawn_builtin(&ts, &name).await;
     }
 
     // 3. 远程系统（TCP listen）；B2：caps 置位 ARTIFACTS + 安装组件执行器

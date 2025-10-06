@@ -129,21 +129,9 @@ impl ArtifactRef {
         }
     }
 
-    /// → admin-v2 镜像形态（E1 deploy 载荷生成用）。
-    /// PyModule.runtime_env：TOML 值 → 文本（方言侧再解析）。
+    /// → admin-v2 镜像形态（E1 deploy 载荷生成用——BD-1 From 委托）。
     pub fn into_admin(self) -> parrot_remote::admin_v2::AdminArtifactRef {
-        use parrot_remote::admin_v2::AdminArtifactRef as A;
-        match self {
-            ArtifactRef::Props { factory } => A::Props { factory },
-            ArtifactRef::Wasm { digest, uri } => A::Wasm { digest, uri },
-            ArtifactRef::Dylib { digest, uri, abi } => A::Dylib { digest, uri, abi },
-            ArtifactRef::Jvm { main_class, coords } => A::Jvm { main_class, coords },
-            ArtifactRef::PyModule { module, runtime_env } => A::PyModule {
-                module,
-                runtime_env: runtime_env.map(|v| v.to_string()),
-            },
-            ArtifactRef::Beam { app } => A::Beam { app },
-        }
+        self.into()
     }
 }
 

@@ -25,6 +25,7 @@ pub mod host;
 pub mod manifest;
 pub mod orchestrator;
 pub mod planner;
+pub mod test_support;
 
 pub use assemble::{
     apply_overlay, hook_phase, DeployError, DeployResult, GatewayFactory, LocalDeployer,
