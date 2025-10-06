@@ -528,9 +528,17 @@ impl Frame {
     }
 
     /// PARROT_TRACE=frame 的单行摘要（E5.5：人类/机器/LLM 三态可读）。
+    ///
+    /// F1（DEV_09 §3.6）：`TRACING` 位帧输出 `trace_id=cid` 字段——
+    /// span 聚合按 trace_id 关联（与 record-replay 数据源同构）。
     pub fn trace_line(&self) -> String {
+        let trace = if self.header.flags & flags::TRACING != 0 {
+            format!(" trace_id={}", self.header.correlation_id)
+        } else {
+            String::new()
+        };
         format!(
-            "frame ft=0x{:02X} cid={} hop={}/{} flags=0x{:04X} path={:?} key={:?} len={}",
+            "frame ft=0x{:02X} cid={} hop={}/{} flags=0x{:04X}{trace} path={:?} key={:?} len={}",
             self.header.frame_type,
             self.header.correlation_id,
             self.header.hop_count,
@@ -540,6 +548,12 @@ impl Frame {
             self.type_key,
             self.payload.len()
         )
+    }
+
+    /// 本帧 trace_id（TRACING 位帧 = cid；未标记帧 None——不参与
+    /// span 聚合）。
+    pub fn trace_id(&self) -> Option<u64> {
+        (self.header.flags & flags::TRACING != 0).then_some(self.header.correlation_id)
     }
 
     // ── D3 · BATCH 批量帧（DEV_04 §4 / 06 P4.3）────────────────────────

@@ -65,7 +65,7 @@ SHELL := /bin/bash
         test test-fast test-full test-stress test-polyglot test-full-polyglot test-lab \
         lint fmt clippy bench matrix clean distclean \
         ts py jvm erl cpp check-ts check-py check-jvm check-erl check-cpp \
-        build-release-bins
+        build-release-bins twin-app
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────
 help: ## 显示本帮助
@@ -271,3 +271,8 @@ clean:
 
 distclean: clean
 	rm -rf $(TS_DIR)/node_modules
+
+
+# ---- F4（DEV_09）：App 孪生门禁——Manifest 输入 ---------------------------
+twin-app:
+	$(CARGO) run -p federation-lab -- twin-app --manifest $(MANIFEST)

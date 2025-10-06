@@ -5,6 +5,7 @@
 
 pub mod actix;
 pub mod logging;
+pub mod mirror;
 pub mod system;
 pub mod thread;
 
