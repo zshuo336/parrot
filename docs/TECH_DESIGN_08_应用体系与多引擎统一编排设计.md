@@ -403,6 +403,8 @@ Pending → Planning → Draining → Deploying → Verifying(健康探针+回�
 
 ## 11. 落地路线图与测试矩阵
 
+> §11.2 是全量测试计划。**三份上位文档共同约束**：[DEV_00 §1](./DEV_00_总体测试与验收计划.md)（L0-L4 执行矩阵/频次/门禁）· [DEV_00 §4](./DEV_00_总体测试与验收计划.md)（验收五步流程）· [03 §质量分析](./TECH_DESIGN_03_质量分析与改进路线.md)（覆盖率方法与防退化）。本节把三者具体化到应用体系，并升级两条门禁：**代码覆盖率 100%（可测性设计达到，不可达项白名单报批）**；**多引擎测试标准对齐既有五语言矩阵（L2 vectors + L3 混沌 + L4 门禁值）**。
+
 ### 11.1 阶段切分（每阶段：DEV 文档先行 → 实现 → 四层测试 → 全量回归）
 
 | 阶段 | 内容 | 交付物 | 依赖 |
@@ -415,18 +417,85 @@ Pending → Planning → Draining → Deploying → Verifying(健康探针+回�
 | **F. debug 套件** | trace span 树 / 镜像 actor / record-replay / 孪生门禁接入 | 五能力 CLI + CI 门禁 | E（D3/D5 部分可提前） |
 | **G. 验收** | crawler-lab 改造为 App（跨四引擎）+ 全量回归 + 性能门禁 | DEV_08 DoD 核销 | 全部 |
 
-### 11.2 测试矩阵（摘要——DEV_08 展开）
+### 11.2 测试计划（全量——按既有五引擎矩阵标准制定；DEV_08 展开为逐函数测试义务）
 
-| 层 | 代表用例 |
+#### 11.2.0 覆盖率铁律（100% 承诺的实现机制）
+
+- **门禁**：新增 crate（`parrot-app`/`parrot-wasm`/`parrot-abi`/orchestrator 模块）行覆盖 **100%**，分支覆盖 ≥95%；workspace 总量不低于现状（91.1%+）且只升不降。
+- **可达性方法论**（继承 remote 层 91.1% 实战经验）：① 一切外部副作用（wasmtime/libloading/网关进程/ray API）走 trait 边界注入，测试替身可达全分支；② 状态机穷举（升级/卸载/调和的每个转移弧显式用例）；③ 错误注入点显式建模（`DeployError`/`UnloadError` 枚举驱动）；④ 生产代码不允许 `#[cfg(test)]` 分支（可测性靠设计不靠宏）。
+- **白名单制度**：真不可测项（dlclose 后 UB 探测、JVM GC 触发 classloader 回收等）逐项列入 `docs/coverage-waiver.md`，写明不可测原因 + 替代验证手段（孪生/混沌/文档断言），**需求方签批**后计入豁免。白名单条目上限 10，超限视为设计缺陷返工。
+
+#### 11.2.1 L0/L1 单元测试（每提交，CI ≤10min，阻塞合并）
+
+| 模块 | 用例族 | 数量级 |
+|---|---|---|
+| Manifest | 校验全分支：DAG 环拒绝/wiring 不可达/semver 非法/组件重名/engine 未知/artifact 与 engine 不匹配/空组件表/TOML↔Rust roundtrip 字节一致 | 25+ |
+| Planner | 拓扑排序稳定性（同输入同序）/依赖缺失报错定位精确/placement 过滤全匹配全不匹配/并发 planner 幂等 | 15+ |
+| AssemblingContext | 依赖序装配/装配失败回滚（已起组件逆序停）/config_overlay 合并优先级（Y3 裁定）/hooks 时序断言 | 20+ |
+| admin-v2 协议 | 编解码 roundtrip/req_id 去重/超时回执/旧节点 Unsupported 能力位预判（Y1）/四方言同一 ComponentDeploy 向量输出一致（golden 化） | 20+ |
+| parrot-wasm | WIT 绑定 roundtrip/fuel 耗尽→OverQuota→监督接管/epoch 抢占/句柄表越界拒绝/组件 panic→错误码/沙箱能力制（无权限 ctx 调用被拒）/实例 drop 内存回收断言 | 30+ |
+| parrot-abi/dylib | ABI 版本不匹配拒绝/parrot_min 校验/panic 双边界（dylib 侧 catch + 宿主侧防御）/四步卸载协议每步状态断言/drain 超时强制路径/重载后全局状态无污染/soname 新旧共存 | 35+ |
+| Orchestrator | 调和 diff 全形态（缺/多/版本旧/失联/重启）/状态机全转移弧（含 Rollback 每个入口）/desired 持久化重放/幂等（同命令 N 次=1 次效果） | 40+ |
+| Executor | artifact 三形态分发校验（digest 不符拒绝）/能力位上报/就绪协议兼容 | 15+ |
+
+#### 11.2.2 L2 场景 + 跨引擎集成（每 PR，CI docker ≤25min，阻塞合并）
+
+**单引擎内场景（三形态产物各一套，共 9 套）**：加载→ask/tell→drain→卸载→重载→内存无泄漏（进程 RSS 断言）→异常注入（加载中 kill/卸载中来消息）。
+
+**多引擎集成（对齐 crawler-lab / 五语言 vectors 标准）**：
+
+| 用例族 | 内容 | 门禁 |
+|---|---|---|
+| MG1-4 | 单 App 跨 parrot+akka+ray+erlang：deploy→组件全 Running→跨引擎 ask/tell 全链→status 聚合视图 | 全通 |
+| MG5-8 | 升级三策略各跨引擎一场：HotSwap（erlang 模块热换+路由原子切+seq 保序断言）/Rolling（分片逐换+新旧共存期消息版本校验）/Recreate（状态迁移+回滚） | 切换零丢帧（durable WAL 断言） |
+| MG9-10 | 引擎重启无感：akka 网关 GatewayRestart（drain→restart→reconcile 全自动，应用侧零错误）/parrot-node 重启同构 | 重连窗口内 ask 失败率=0（排队重试） |
+| MG11 | admin-v2 四方言契约：同一 Manifest 依次部署到四引擎，ComponentStatus 输出结构一致（golden） | 字节级一致 |
+| MG12 | 本地/集群同构：`app run` 与 `app deploy` 同一 Manifest，消息轨迹（cid 序列+payload hash）一致 | 序列一致 |
+| Vectors | admin-v2 帧 + WIT 编解码 golden vectors 四语言各自跑（rust/jvm/py/erl） | 冻结不变 |
+
+#### 11.2.3 L3 混沌（每夜，独立 runner ≤60min，报警+阻塞 release）
+
+复用 DEV_00 六注入器，注入对象升级为 App 级：
+
+| 场景 | 断言 |
 |---|---|
-| 单元 | Manifest 校验（DAG 环/wiring 不可达/版本非法）；WIT 绑定 roundtrip；ABI 版本拒绝；卸载栅栏 |
-| 场景 | 三形态产物各：加载→消息→drain→卸载→重载（内存无泄漏断言）；四引擎 adapter 各：deploy/status/drain/reconcile 幂等 |
-| 集成 | 单 app 跨四引擎本地 run；集群 deploy→升级 HotSwap/Rolling/Recreate→回滚；网关重启自动对账；镜像调试零干扰断言 |
-| 孪生 | 升级状态机全分支混沌注入；50 集群孪生 app 图遍历 |
-| 性能门禁 | Props vs Wasm vs Dylib ask 基准（门禁：wasm 开销 <10µs/消息、dylib <1µs）；Orchestrator 调和延迟 <1s（百组件） |
-| 回归 | 全 workspace + polyglot（make matrix）+ golden vectors 字节不变 + 现有 1740+ 用例零失败 |
+| 升级中 kill -9 目标 Executor | RolloutTracker 自动 Rollback，App 恢复 Running，WAL 重放零丢 |
+| Orchestrator 多数派分区 | 少数派不下发任何部署（Raft 安全性）；愈合后调和收敛 |
+| 网关双杀（akka+ray 同时） | App 降级清单正确；恢复后自动 reconcile |
+| drain 半程消息风暴 | drain_timeout 兜底路径触发，DRAIN_ABORTED 计数=预期 |
+| dylib 卸载后立刻 dlopen 新版 | 全局状态无污染（禁清单扫描 + 运行断言双验证） |
+| wasm fuel 风暴组件 | OverQuota→监督 Restart 限频，不影响同 Executor 其它组件 |
 
-### 11.3 性能预算（对齐 07 §14）
+#### 11.2.4 L4 验收基准（release + 每夜缩减，独占裸机）
+
+| 基准 | 门禁 |
+|---|---|
+| 三形态 ask 开销 | Props=现状基线（字节级不变）/ Dylib 增量 <1µs / Wasm 增量 <10µs |
+| 编排面 | deploy 回执 P99 <1s；调和周期 <5s（百组件 App）；HotSwap 升级端到端 <10s（含 drain） |
+| 孪生门禁 | App 图 ≤100 组件全分支混沌 <10min（CI 档）；50 集群档 <6h |
+| 回放 | record→replay 确定性（同输入 N 次回放轨迹 hash 一致） |
+
+#### 11.2.5 回归义务（每阶段出口）
+
+- `make test-full` + `MODE=polyglot`（五语言）+ `MODE=stress` + lint 全绿
+- golden vectors（帧/WIT/admin-v2 三套）字节不变
+- 现有全部用例（1740+）零失败；存量引擎迁移场景（§11.3）作为**重构后的活体回归基准**
+
+### 11.3 存量引擎迁移：全量重构为应用体系的实例（需求 2 裁定，2026-10-06 确认）
+
+**定位声明**：现有全部引擎侧资产——crawler-lab（四运行时集成实验室）、federation-lab（50 集群孪生）、parrot-node 内置 actor 族、interop 四网关示例——**不是遗留物，而是应用体系完成后的首批迁移对象与活体验收例子**。迁移完成前，应用体系不算交付（G 阶段 DoD 的组成部分）。
+
+| # | 存量资产 | 迁移后形态 | 迁移收益（同时是验收断言） |
+|---|---|---|---|
+| M1 | crawler-lab `main.rs` 手写编排（~700 行：网关地址解析/消息注册/拓扑装配/数据流驱动） | `crawler.app.toml` Manifest（frontier=erlang / index=ray / search=akka / crawl+hub=parrot）+ `parrot app run` | 编排代码 ≤50 行；四引擎组件声明式可 diff；**G 阶段主验收场景** |
+| M2 | federation-lab composegen | 基础设施层不动（Y2 裁定）+ 孪生输入从裸拓扑升级为 **AppManifest 驱动**（§7 D4 孪生门禁的输入源） | 同一 Manifest 既跑真实集群又跑孪生 |
+| M3 | parrot-node 内置 actor（echo/counter/kv/slow + deploy.* PropsFactory） | 内置 actor 改为**默认 App**（`builtin.app.toml`），parrot-node 启动即 `app run` | parrot-node 自身成为应用体系首个自举用户（吃自己狗粮） |
+| M4 | interop 四网关手写 main/示例 handler | 各网关 admin-v2 Executor 化后的回归用例库（MG11 契约测试的 fixture） | 网关示例与契约测试单一事实源 |
+| M5 | crawler-lab/RH/CFG 等既有集成测试 | 语义不变，装配入口改为 Manifest（断言逻辑零改动） | 回归基线连续性：迁移前后消息轨迹（cid 序列）一致 |
+
+迁移原则：**行为等价优先**——M1/M3/M5 均以"迁移前后可观测行为（消息轨迹/性能门禁/输出）不变"为验收线；迁移中暴露的手写编排隐式依赖，回流为 Manifest 模型能力（如 crawler-lab 的批量参数 → `ComponentSpec::config`）。
+
+### 11.4 性能预算（对齐 07 §14）
 
 - 编排面（非热路径）：deploy 回执 P99 < 1s（单跳网关）；调和周期 5s 级
 - 数据面零损：L1 组件路径与现状字节级一致（回归门禁）；L2/L3 组件按各自基准门禁约束
@@ -456,3 +525,5 @@ Pending → Planning → Draining → Deploying → Verifying(健康探针+回�
 | 3. 多引擎统一提交/部署/管理/升级（自动无感透明） | §3 + §5 + §6 |
 | 4. 大型任务调试测试 | §7 |
 | 5. library / 语言 VM 预演 | §8 |
+| 6. 充分测试计划（100% 覆盖率） | §11.2（全量五层测试计划 + 覆盖率铁律与白名单制度） |
+| 7. 存量引擎全部重构为新体系的实例 | §11.3（M1-M5 迁移裁定：迁移完成前应用体系不算交付） |
