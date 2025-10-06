@@ -16,7 +16,7 @@
 | [DEV_05](./DEV_05_P5_联邦控制面开发文档.md) | P5 联邦控制面：拓扑三模式/RouteGossip/RelayHub/自研 Raft/Directory/缓存三态/前缀 ACL/LiveKit 桥 | P5 | ✅ 已交付 | 07 §5/§6/§8.3 |
 | [DEV_06](./DEV_06_P6_规模化开发文档.md) | P6 规模化：digest/路由与目录分片/50 集群仿真/百万节点数字孪生 | P6 | ✅ 已交付 | 07 §14.4 |
 | DEV_08 | 配置切面：parrot-config（TOML 三层合并/RuntimeKnobs 参数化） | cfg | ✅ 已交付（2026-10-05；[TECH_DESIGN_08](./TECH_DESIGN_08_配置切面设计.md)） | 08 全文 |
-| DEV_09 | 应用体系与多引擎统一编排：AppManifest/admin-v2/Orchestrator/wasm/dylib/调试五件套 | A-G | 📋 待施工（设计已冻结于 [TECH_DESIGN_09](./TECH_DESIGN_09_应用体系与多引擎统一编排设计.md)，2026-10-06 确认） | 09 全文 |
+| [DEV_09](./DEV_09_应用体系与多引擎统一编排开发文档.md) | 应用体系与多引擎统一编排：AppManifest/admin-v2 四方言/parrot-wasm/parrot-abi dylib/Orchestrator/调试五件套/M1-M5 存量迁移（T 任务 A1-G3，关键路径约 32 工程日） | A-G | ✅ 已交付（施工合同，2026-10-06；代码进度按 §5.6 DoD 命令表核销） | 09 全文 |
 
 ## 每份 DEV 文档的强制结构（模板）
 
