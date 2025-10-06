@@ -173,11 +173,7 @@ impl Ingress {
     }
 
     /// 配置切面：重排旋钮注入（RemoteActorSystem 构造时下发）。
-    pub fn set_reorder_knobs(
-        &self,
-        gap_timeout: std::time::Duration,
-        buffer_cap: usize,
-    ) {
+    pub fn set_reorder_knobs(&self, gap_timeout: std::time::Duration, buffer_cap: usize) {
         if let Ok(mut g) = self.reorder_gap_timeout.lock() {
             *g = gap_timeout;
         }
@@ -573,14 +569,17 @@ impl Ingress {
             .upgrade()
             .map(|this| {
                 (
-                    *this.reorder_gap_timeout.lock().unwrap_or_else(|e| e.into_inner()),
-                    *this.reorder_buffer_cap.lock().unwrap_or_else(|e| e.into_inner()),
+                    *this
+                        .reorder_gap_timeout
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    *this
+                        .reorder_buffer_cap
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
                 )
             })
-            .unwrap_or((
-                std::time::Duration::from_millis(250),
-                1024,
-            ));
+            .unwrap_or((std::time::Duration::from_millis(250), 1024));
         let idle_gc = tokio::time::Duration::from_secs(30);
         loop {
             let f = tokio::select! {
@@ -1094,7 +1093,7 @@ mod tests {
         ig.dispatch(seq_tell(1, 1), &back, "nK").await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         ig.dispatch(seq_tell(3, 3), &back, "nK").await; // 2 缺失
-        // 50ms 旋钮窗口后应放行（默认 250ms 此刻仍缓冲——时序即证明）
+                                                        // 50ms 旋钮窗口后应放行（默认 250ms 此刻仍缓冲——时序即证明）
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert_eq!(
             sink.lock().unwrap().as_slice(),
