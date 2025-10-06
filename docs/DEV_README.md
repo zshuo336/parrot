@@ -15,6 +15,7 @@
 | [DEV_04](./DEV_04_P4_集群深化开发文档.md) | P4 集群深化：sharding/singleton/批量帧/C++ lite/C ABI | P4 | ✅ 已交付 | 06 第三部分 |
 | [DEV_05](./DEV_05_P5_联邦控制面开发文档.md) | P5 联邦控制面：拓扑三模式/RouteGossip/RelayHub/自研 Raft/Directory/缓存三态/前缀 ACL/LiveKit 桥 | P5 | ✅ 已交付 | 07 §5/§6/§8.3 |
 | [DEV_06](./DEV_06_P6_规模化开发文档.md) | P6 规模化：digest/路由与目录分片/50 集群仿真/百万节点数字孪生 | P6 | ✅ 已交付 | 07 §14.4 |
+| DEV_08 | 应用体系与多引擎统一编排：AppManifest/admin-v2/Orchestrator/wasm/dylib/调试五件套 | A-G | 📋 待施工（设计已冻结于 [TECH_DESIGN_08](./TECH_DESIGN_08_应用体系与多引擎统一编排设计.md)，2026-10-06 确认） | 08 全文 |
 
 ## 每份 DEV 文档的强制结构（模板）
 
