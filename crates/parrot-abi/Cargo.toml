@@ -1,0 +1,41 @@
+[package]
+name = "parrot-abi"
+version = "0.1.0"
+edition = "2021"
+description = "Parrot dylib component ABI: repr(C) boundary contract + safe-load/unload protocol (DEV_09 D)"
+license = "MIT"
+
+# D 阶段（DEV_09 §3.4 / 09 §4.3）：
+# - lib.rs   = D1 纯类型（repr(C)——dylib 双端共同依赖，零 std 之外依赖）
+# - loader.rs = D2 宿主侧加载器（libloading；feature gate——默认纯类型）
+# fixture（tests/fixtures/testcomp + violating）为独立 workspace 成员由
+# 测试构建脚本拉起（cdylib crate-type），产物 .dylib/.so 跨平台。
+
+[features]
+default = []
+# 宿主侧加载器（libloading/tokio 重依赖——按需启用；与 parrot-wasm 同策略 R1）
+loader = ["dep:libloading", "dep:sha2", "dep:hex", "dep:tokio"]
+
+[dependencies]
+# D1 面（default feature）零依赖——thiserror 仅错误类型格式化
+thiserror = "2.0"
+libloading = { version = "0.8", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+tokio = { version = "1", features = ["time"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[dev-dependencies.parrot-abi]
+path = "."
+features = ["loader"]
+
+[[bench]]
+name = "abi_bench"
+harness = false
+
+[lib]
+name = "parrot_abi"
+path = "src/lib.rs"

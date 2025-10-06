@@ -1,0 +1,13 @@
+[package]
+name = "parrot-abi-violating"
+version = "0.1.0"
+edition = "2021"
+description = "D 阶段违反禁止清单 fixture（BD-2：#[used] static 模拟 TLS 注册扫描目标，不真制造 UB）"
+
+[lib]
+name = "parrot_abi_violating"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+parrot-abi = { path = "../../../", default-features = false }

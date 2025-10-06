@@ -1,0 +1,13 @@
+[package]
+name = "parrot-abi-testcomp"
+version = "0.1.0"
+edition = "2021"
+description = "D 阶段规范 dylib fixture（DEV_09 §3.4 BD-2）"
+
+[lib]
+name = "parrot_abi_testcomp"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+parrot-abi = { path = "../../../", default-features = false }
