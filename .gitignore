@@ -33,3 +33,5 @@ _build/
 # 系统文件
 .DS_Store
 interop/cpp-lite/bin/
+*.dump
+erl_crash.dump
