@@ -14,6 +14,7 @@ pub mod assemble;
 #[cfg(feature = "host")]
 pub mod host;
 pub mod manifest;
+pub mod orchestrator;
 pub mod planner;
 
 pub use assemble::{

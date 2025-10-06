@@ -128,6 +128,23 @@ impl ArtifactRef {
             ArtifactRef::Beam { .. } => "beam",
         }
     }
+
+    /// → admin-v2 镜像形态（E1 deploy 载荷生成用）。
+    /// PyModule.runtime_env：TOML 值 → 文本（方言侧再解析）。
+    pub fn into_admin(self) -> parrot_remote::admin_v2::AdminArtifactRef {
+        use parrot_remote::admin_v2::AdminArtifactRef as A;
+        match self {
+            ArtifactRef::Props { factory } => A::Props { factory },
+            ArtifactRef::Wasm { digest, uri } => A::Wasm { digest, uri },
+            ArtifactRef::Dylib { digest, uri, abi } => A::Dylib { digest, uri, abi },
+            ArtifactRef::Jvm { main_class, coords } => A::Jvm { main_class, coords },
+            ArtifactRef::PyModule { module, runtime_env } => A::PyModule {
+                module,
+                runtime_env: runtime_env.map(|v| v.to_string()),
+            },
+            ArtifactRef::Beam { app } => A::Beam { app },
+        }
+    }
 }
 
 /// 实例策略（09 §2.2）。
@@ -164,6 +181,17 @@ pub struct PlacementConstraint {
     /// 反亲和：同组件实例不共置。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub anti_affinity: bool,
+}
+
+impl PlacementConstraint {
+    /// 节点名粗匹配（role/realm/label 出现在节点 id 即可——E1 首版
+    /// 规则；空约束恒真）。
+    pub fn matches(&self, node: &str) -> bool {
+        [self.role.as_deref(), self.realm.as_deref(), self.label.as_deref()]
+            .into_iter()
+            .flatten()
+            .all(|k| node.contains(k))
+    }
 }
 
 /// 升级策略（09 §6.1 三策略）。
@@ -428,6 +456,11 @@ pub enum AppLoadError {
 }
 
 impl AppManifest {
+    /// 校验（自由函数包装——orchestrator submit 路径）。
+    pub fn validate_or_err(&self) -> Result<(), String> {
+        crate::manifest::validate(self).map_err(|e| format!("{e:?}"))
+    }
+
     /// 序列化为 TOML 文本（roundtrip 字节稳定的规范序：结构体字段序固定）。
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string(self)
