@@ -12,6 +12,7 @@ license = "MIT"
 parrot = { path = "../parrot" }
 parrot-api = { path = "../parrot-api", features = ["remote"] }
 parrot-remote = { path = "../parrot-remote" }
+parrot-app = { path = "../parrot-app" }
 parrot-wasm = { path = "../parrot-wasm", optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
