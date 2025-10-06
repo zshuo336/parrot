@@ -1,0 +1,36 @@
+[package]
+name = "parrot-app"
+version = "0.1.0"
+edition = "2021"
+description = "Parrot 应用体系：AppManifest 声明式应用模型 + Planner + AssemblingContext（DEV_09 A 阶段）"
+license = "MIT"
+
+# 分层铁律（09 §2.2）：应用定义与本地组装。不依赖 parrot 主 crate
+# （引擎访问经 parrot-remote facade 协议 / PropsFactory 机制）。
+[dependencies]
+parrot-api = { path = "../parrot-api", features = ["remote"] }
+parrot-config = { path = "../parrot-config" }
+parrot-remote = { path = "../parrot-remote" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+
+# 宿主形态（09 §2.2 分层：宿主 Runner 依赖引擎；lib 本体零引擎依赖）。
+parrot = { path = "../parrot", optional = true }
+
+[lib]
+name = "parrot_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "parrot-app"
+path = "src/bin/cli.rs"
+required-features = ["host"]
+
+[features]
+default = []
+host = ["dep:parrot"]

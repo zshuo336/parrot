@@ -1,0 +1,31 @@
+==> [1/5] Erlang frontier 网关
+==> [2/5] JVM(akka) 搜索网关
+==> [3/5] Ray(python) 索引网关
+    三网关就绪（erl:19861 jvm:19862 ray:19863）
+==> [4/5] Rust 应用（apps/crawler-lab——爬取→双路索引→搜索验证）
+[lab] connected: erl
+[lab] connected: ray
+[lab] connected: jvm
+[lab] 组网模式：direct（应用主动拨号网关）
+[lab] === 阶段 0：网关方言 sanity ===
+[lab] erl 网关 alive（FrontierBatch n=0）
+[lab] ray 网关 alive（IndexAck(0,0)）
+[lab] jvm 网关 alive: {"terms":0,"postings":0,"queries":0}
+[lab] === 阶段 1：种子注入 frontier（pages=60）===
+[lab] 种子 60 条已注入（228µs）
+[lab] === 阶段 2：爬取循环（depth≤2 fanout=3）===
+[lab] 爬取完成：fetched=60（去重后）pushed_total=99 耗时 11.910917ms
+[lab] === 阶段 3：索引对账 ===
+[lab] ray 索引: terms=33 postings=1746（本地对账 unique_terms=33）
+[lab] jvm 倒排: {"terms":33,"postings":1746,"queries":0}
+[lab] === 阶段 4：搜索验证 ===
+[lab] search ["parrot"] → [{"doc":9,"score":7},{"doc":28,"score":7},{"doc":16,"score":5},{"doc":21,"score":5},{"doc":42,"score":5}]
+[lab] search ["actor", "cluster"] → [{"doc":39,"score":10},{"doc":1,"score":9},{"doc":27,"score":9},{"doc":51,"score":9},{"doc":7,"score":8}]
+[lab] search ["crawler", "index", "search"] → [{"doc":13,"score":19},{"doc":9,"score":15},{"doc":35,"score":14},{"doc":6,"score":12},{"doc":7,"score":12}]
+[lab] search ["raft", "swim"] → [{"doc":28,"score":12},{"doc":51,"score":11},{"doc":16,"score":9},{"doc":20,"score":9},{"doc":10,"score":8}]
+[lab] jvm healthz: {"terms":33,"postings":1746,"queries":4}
+[lab     0s] done           pushed=   99 fetched=   60 ray_pages=   60 jvm_terms=   1746
+
+crawler-lab PASS（四运行时全链集成）
+==> [5/5] TS Lite 用户终端（真实'用户 Web 访问'——Node tcp:// 直连 JVM 网关）
+==> 完成 rc=0（direct 模式；网关日志：/tmp/lab_*.out）
