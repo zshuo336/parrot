@@ -115,19 +115,18 @@ mod tests {
             name: name.into(),
             engine,
             artifact: match engine {
-                EngineKind::Erlang => ArtifactRef::Beam { app: name.into() },
-                EngineKind::Ray => ArtifactRef::PyModule {
-                    module: name.into(),
-                    runtime_env: None,
-                },
+                EngineKind::Erlang => ArtifactRef::Beam { app: name.into(), uri: None },
+                EngineKind::Ray => ArtifactRef::PyModule { module: name.into(), runtime_env: None, uri: None },
                 EngineKind::Akka => ArtifactRef::Jvm {
                     main_class: format!("main.{name}"),
                     coords: None,
+                    uri: None,
                 },
                 _ => ArtifactRef::Props {
                     factory: format!("f-{name}"),
                 },
             },
+            alt_artifact: None,
             instances: InstancePolicy::Singleton,
             placement: Default::default(),
             upgrade: Default::default(),

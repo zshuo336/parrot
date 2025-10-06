@@ -32,16 +32,35 @@ pub enum AdminArtifactRef {
     /// parrot 本地工厂名（inventory PropsFactory）。
     Props { factory: String },
     /// Erlang beam：模块目录 + 模块名。
-    Beam { app: String },
+    ///
+    /// R3：`uri`（file:// 目录形态）= beam 构建产物目录（add_patha 首）。
+    Beam {
+        app: String,
+        /// bincode 线上形态：与 runtime_env/coords 一致——Option 恒写
+        /// 存在字节（0=None）。不可加 skip_serializing_if：四方言解码
+        /// 器（erl/ray/jvm）按位置读存在字节，skip 会错位致崩溃。
+        #[serde(default)]
+        uri: Option<String>,
+    },
     /// Python 模块：ray job working_dir（runtime_env 为 TOML 文本形态）。
+    ///
+    /// R3：`uri`（file:// 目录形态）= app 源码 working_dir。
     PyModule {
         module: String,
         runtime_env: Option<String>,
+        /// 线上恒写存在字节（同 Beam.uri——见上）。
+        #[serde(default)]
+        uri: Option<String>,
     },
     /// JVM：main 类 + 可选坐标（child-first loader 数据源）。
+    ///
+    /// R3：`uri`（file:// jar 形态）指向 app 构建产物；与 coords 互补。
     Jvm {
         main_class: String,
         coords: Option<String>,
+        /// 线上恒写存在字节（同 Beam.uri——见上）。
+        #[serde(default)]
+        uri: Option<String>,
     },
     /// wasm 组件（C 阶段）。
     Wasm { digest: String, uri: String },
@@ -605,14 +624,17 @@ mod tests {
             },
             AdminArtifactRef::Beam {
                 app: "frontier".into(),
+                uri: None,
             },
             AdminArtifactRef::PyModule {
                 module: "crawler_jobs".into(),
                 runtime_env: None,
+                uri: None,
             },
             AdminArtifactRef::Jvm {
                 main_class: "parrot.Crawler".into(),
                 coords: Some("file:///tmp/a.jar".into()),
+                uri: None,
             },
             AdminArtifactRef::Wasm {
                 digest: "sha256:aa".into(),

@@ -367,7 +367,7 @@ mod tests {
             artifact: ArtifactRef::Props {
                 factory: format!("f-{name}"),
             },
-            instances: InstancePolicy::Singleton,
+            alt_artifact: None,            instances: InstancePolicy::Singleton,
             placement: Default::default(),
             upgrade: Default::default(),
             deps: vec![],
@@ -698,6 +698,7 @@ mod tests {
             name: "c".into(),
             engine: EngineKind::Parrot,
             artifact: a,
+            alt_artifact: None,
             ..spec("c")
         };
         use parrot_remote::admin_v2::AdminArtifactRef as A;
@@ -713,8 +714,8 @@ mod tests {
                 },
             ),
             (
-                mk(ArtifactRef::Beam { app: "app1".into() }),
-                A::Beam { app: "app1".into() },
+                mk(ArtifactRef::Beam { app: "app1".into(), uri: None }),
+                A::Beam { app: "app1".into(), uri: None },
             ),
         ];
         for (spec, want) in cases {

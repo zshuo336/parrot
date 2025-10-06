@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- crawler-lab 应用包（jvm 方言组件——R1 应用体系架构纠正）。
+     产物：crawler-lab-jvm 组件 jar（SearchComponent——ComponentSpi 实现）。
+     网关 jar 作为 system-scope 依赖（deploy 时 child-first loader 载入本 jar；
+     BridgeAsk/ComponentSpi 等协议类型由网关 classloader 提供——同身份）。 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>apps.crawler-lab</groupId>
+    <artifactId>crawler-lab-jvm</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <scala.major>2.13</scala.major>
+        <scala.version>${scala.major}.16</scala.version>
+        <akka.version>2.6.20</akka.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.scala-lang</groupId>
+            <artifactId>scala-library</artifactId>
+            <version>${scala.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.typesafe.akka</groupId>
+            <artifactId>akka-actor-typed_2.13</artifactId>
+            <version>${akka.version}</version>
+        </dependency>
+        <!-- 网关协议 jar（ComponentSpi/BridgeAsk 类型源）——编译期解析，
+             运行期由网关父 classloader 提供（deploy 不分发网关依赖）。 -->
+        <dependency>
+            <groupId>parrot.protocol</groupId>
+            <artifactId>parrot-protocol-jvm</artifactId>
+            <version>0.1.0</version>
+            <scope>system</scope>
+            <systemPath>${basedir}/../../../interop/jvm/target/parrot-protocol-jvm-0.1.0.jar</systemPath>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>4.9.2</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <scalaVersion>${scala.version}</scalaVersion>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

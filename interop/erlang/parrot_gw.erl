@@ -96,49 +96,6 @@ handshake_ack_body(NodeId) ->
     %% ACK 专有 chosen_codec 用 tag 9（8 已被 DIRECT_ADDR 占用）
     handshake_body(NodeId) ++ [tlv(9, <<"pb">>)].
 
-%% ============ 爬虫场景：URL Frontier（crawler-lab 集成） ============
-%% ETS 去重表 + 有序队列；批量 pop/push（LE 编解码与 Rust 侧逐字节对齐：
-%% push=[n u32][{id u64|len u32|url|depth u16}...]；next=[n u32] → 同构批次）。
-
-crawl_init() ->
-    ets:new(crawl_frontier, [named_table, public, ordered_set,
-                             {write_concurrency, true},
-                             {read_concurrency, true}]),
-    ets:new(crawl_seen, [named_table, public, {write_concurrency, true}]),
-    ets:new(?DIRECT_TAB, [named_table, public, {read_concurrency, true}]),
-    ok.
-
-crawl_push(<<Count:32/little, Entries/binary>>) ->
-    crawl_push_entries(Count, Entries),
-    ok.
-
-crawl_push_entries(0, <<>>) -> ok;
-crawl_push_entries(N, <<Id:64/little, UrlLen:32/little,
-                        Url:UrlLen/binary, Depth:16/little, Rest/binary>>) ->
-    case ets:insert_new(crawl_seen, {Id}) of
-        true  -> ets:insert(crawl_frontier, {Id, Url, Depth});
-        false -> ok
-    end,
-    crawl_push_entries(N - 1, Rest);
-crawl_push_entries(_, _) -> ok.  %% 截断容错
-
-crawl_next(<<N:32/little>>) ->
-    Batch = crawl_take(N, [], ets:first(crawl_frontier)),
-    Enc = crawl_encode_batch(Batch, <<(length(Batch)):32/little>>),
-    {<<"bin:crawl/FrontierBatch">>, Enc}.
-
-crawl_take(0, Acc, _) -> lists:reverse(Acc);
-crawl_take(_, Acc, '$end_of_table') -> lists:reverse(Acc);
-crawl_take(N, Acc, Id) ->
-    [{Id, Url, Depth}] = ets:lookup(crawl_frontier, Id),
-    ets:delete(crawl_frontier, Id),
-    crawl_take(N - 1, [{Id, Url, Depth} | Acc], ets:next(crawl_frontier, Id)).
-
-crawl_encode_batch([], Acc) -> Acc;
-crawl_encode_batch([{Id, Url, Depth} | T], Acc) ->
-    U = byte_size(Url),
-    crawl_encode_batch(T, <<Acc/binary, Id:64/little, U:32/little, Url:U/binary,
-                            Depth:16/little>>).
 
 %% ============ B4（DEV_09）：admin-v2 编解码 + Beam 热加载 ============
 %% payload = [u8 tag][bincode standard(body)]；tag 0x03=CMD 0x04=REPLY
@@ -197,11 +154,19 @@ bc_get_opt_bytes(<<1:8, Bin0/binary>>) ->
 bc_put_artifact({props, Factory}) ->
     <<0:8, (bc_put_str(Factory))/binary>>;
 bc_put_artifact({beam, App}) ->
-    <<1:8, (bc_put_str(App))/binary>>;
+    <<1:8, (bc_put_str(App))/binary, 0:8>>;  %% uri None（R3 补位）
+bc_put_artifact({beam, App, Uri}) ->
+    <<1:8, (bc_put_str(App))/binary, (bc_put_opt_str(Uri))/binary>>;
 bc_put_artifact({pymodule, Module, Env}) ->
-    <<2:8, (bc_put_str(Module))/binary, (bc_put_opt_str(Env))/binary>>;
+    <<2:8, (bc_put_str(Module))/binary, (bc_put_opt_str(Env))/binary, 0:8>>;
+bc_put_artifact({pymodule, Module, Env, Uri}) ->
+    <<2:8, (bc_put_str(Module))/binary, (bc_put_opt_str(Env))/binary,
+      (bc_put_opt_str(Uri))/binary>>;
 bc_put_artifact({jvm, MainClass, Coords}) ->
-    <<3:8, (bc_put_str(MainClass))/binary, (bc_put_opt_str(Coords))/binary>>;
+    <<3:8, (bc_put_str(MainClass))/binary, (bc_put_opt_str(Coords))/binary, 0:8>>;
+bc_put_artifact({jvm, MainClass, Coords, Uri}) ->
+    <<3:8, (bc_put_str(MainClass))/binary, (bc_put_opt_str(Coords))/binary,
+      (bc_put_opt_str(Uri))/binary>>;
 bc_put_artifact({wasm, Digest, Uri}) ->
     <<4:8, (bc_put_str(Digest))/binary, (bc_put_str(Uri))/binary>>;
 bc_put_artifact({dylib, Digest, Uri, Abi}) ->
@@ -219,15 +184,19 @@ bc_get_opt_str(<<1:8, Bin0/binary>>) ->
 bc_get_artifact(<<0:8, Bin0/binary>>) ->
     {F, Rest} = bc_get_str(Bin0), {{props, F}, Rest};
 bc_get_artifact(<<1:8, Bin0/binary>>) ->
-    {App, Rest} = bc_get_str(Bin0), {{beam, App}, Rest};
+    {App, Bin1} = bc_get_str(Bin0),
+    {Uri, Rest} = bc_get_opt_str(Bin1),
+    {{beam, App, Uri}, Rest};
 bc_get_artifact(<<2:8, Bin0/binary>>) ->
     {M, Bin1} = bc_get_str(Bin0),
-    {Env, Rest} = bc_get_opt_str(Bin1),
-    {{pymodule, M, Env}, Rest};
+    {Env, Bin2} = bc_get_opt_str(Bin1),
+    {Uri, Rest} = bc_get_opt_str(Bin2),
+    {{pymodule, M, Env, Uri}, Rest};
 bc_get_artifact(<<3:8, Bin0/binary>>) ->
     {MC, Bin1} = bc_get_str(Bin0),
-    {Coords, Rest} = bc_get_opt_str(Bin1),
-    {{jvm, MC, Coords}, Rest};
+    {Coords, Bin2} = bc_get_opt_str(Bin1),
+    {Uri, Rest} = bc_get_opt_str(Bin2),
+    {{jvm, MC, Coords, Uri}, Rest};
 bc_get_artifact(<<4:8, Bin0/binary>>) ->
     {D, Bin1} = bc_get_str(Bin0), {U, Rest} = bc_get_str(Bin1),
     {{wasm, D, U}, Rest};
@@ -402,9 +371,20 @@ admin_instance_paths(Name, {sharded, N}) ->
 %%   2. /tmp/parrot-artifacts/{app}/（Manifest 形态惯例）
 %%   3. 当前 code path（beam 已在搜索路径——纯 load_abs）
 %% 登记表写入 {Name, Version, Paths, Module}。
-admin_deploy({Name, Version, {beam, App}, Instances, _Config}) ->
+admin_deploy({Name, Version, {beam, App, Uri}, Instances, _Config}) ->
     try
         Module = binary_to_atom(App, utf8),
+        %% R3：uri（file:// 目录形态）优先加入 code path——app 构建产物直发
+        case Uri of
+            undefined -> ok;
+            << "file://", Dir/binary >> ->
+                DirS = binary_to_list(Dir),
+                case lists:member(DirS, code:get_path()) of
+                    true  -> ok;
+                    false -> code:add_patha(DirS)
+                end;
+            _ -> ok
+        end,
         add_artifact_paths(App),
         %% OTP 热替换语义（B4 规格 code:load_abs + restart_child 的方言落点）：
         %%   purge（清旧版）→ load_file（沿 code path 载新版——artifact dir
@@ -412,6 +392,12 @@ admin_deploy({Name, Version, {beam, App}, Instances, _Config}) ->
         code:purge(Module),
         case code:load_file(Module) of
             {module, Module} ->
+                %% 组件契约：deploy 后首问前调用 parrot_init/0（幂等——
+                %% 组件自建状态；frontier 的 ets 表等）。无导出则跳过。
+                case erlang:function_exported(Module, parrot_init, 0) of
+                    true -> catch Module:parrot_init();
+                    false -> ok
+                end,
                 Paths = admin_instance_paths(Name, Instances),
                 ets:insert(?ADMIN_TAB, {Name, Version, Paths, Module}),
                 {deployed, Paths};
@@ -501,6 +487,7 @@ admin_match(Prefix) ->
 %% 返回 {ok, ReplyFrame} | ignore（非 admin-v2 tag）。
 admin_handle_frame(Sock, Cid, Path, <<?TAG_ADMIN_CMD_V2:8, _/binary>> = Payload) ->
     Cmd = decode_admin_cmd_v2(Payload),
+    log("admin cmd decoded: ~p~n", [Cmd]),
     Reply = case Cmd of
                 {deploy_component, ReqId, Deploy} ->
                     admin_reply(ReqId, admin_deploy(Deploy));
@@ -525,17 +512,40 @@ admin_reply(ReqId, {status_reply, States}) -> {status, ReqId, States};
 admin_reply(ReqId, {failed, Code, Detail}) -> {failed, ReqId, Code, Detail}.
 
 %% ============ Erlang actor 服务（方言可辨识） ============
+%% R4（应用体系架构纠正）：已部署组件优先——service/2 先查 ADMIN_TAB
+%% （Deploy{Beam} 载入的业务模块），命中即转派 Module:parrot_service/2；
+%% 未命中走网关内置探针（bin:u:*——连通性/方言键验证，非业务）。
+%% 网关不再内置 crawler 业务 handler（业务代码已迁 apps/*/erlang/）。
 
-service(<<"bin:u:Ping">>, <<N:64/little>>) ->
+service(Key, Payload) ->
+    case component_service(Key, Payload) of
+        {ok, Reply}    -> Reply;
+        {error, miss}  -> builtin_service(Key, Payload)
+    end.
+
+%% 已部署组件转派（按登记序遍历——单键单组件为常态）。
+component_service(Key, Payload) ->
+    try ets:tab2list(?ADMIN_TAB) of
+        Comps -> component_service_loop(Comps, Key, Payload)
+    catch
+        _:_ -> {error, miss}
+    end.
+
+component_service_loop([], _Key, _Payload) -> {error, miss};
+component_service_loop([{_, _, _, Module} | T], Key, Payload) ->
+    case erlang:function_exported(Module, parrot_service, 2) of
+        true ->
+            case try Module:parrot_service(Key, Payload) catch _:_ -> error end of
+                {ReplyKey, ReplyBody} -> {ok, {ReplyKey, ReplyBody}};
+                _ -> component_service_loop(T, Key, Payload)
+            end;
+        false -> component_service_loop(T, Key, Payload)
+    end.
+builtin_service(<<"bin:u:Ping">>, <<N:64/little>>) ->
     {<<"bin:u:Pong">>, <<(N + 3):64/little>>};   %% erlang 方言 +3
-service(<<"bin:u:Add">>, <<A:64/little, B:64/little>>) ->
+builtin_service(<<"bin:u:Add">>, <<A:64/little, B:64/little>>) ->
     {<<"bin:u:AddR">>, <<(A + B + 10000):64/little>>};  %% erlang 方言 +10000
-service(<<"bin:crawl/FrontierPush">>, Payload) ->
-    crawl_push(Payload),
-    {<<"bin:crawl/FrontierAck">>, <<1:32/little>>};
-service(<<"bin:crawl/FrontierNext">>, Payload) ->
-    crawl_next(Payload);
-service(Key, _Payload) ->
+builtin_service(Key, _Payload) ->
     erlang:error({unknown_service, Key}).
 
 %% ============ 错误体（[u16 code][u16 rsv][detail utf8]） ============
@@ -640,6 +650,7 @@ conn_loop(Sock, Buf0) ->
     case parse_frame(Buf0) of
         {ok, Ft, Flags, Cid, Path, Key, Payload, Tail} ->
             put(last_inbound, erlang:system_time(millisecond)),
+            log("RX ft=~p cid=~p len=~p~n", [Ft, Cid, byte_size(Payload)]),
             handle(Sock, Ft, Flags, Cid, Path, Key, Payload),
             conn_loop(Sock, Tail);
         {more, Rest} ->
@@ -681,7 +692,9 @@ recv_frame(Sock, Buf) ->
 %% ServiceFun 可注入（默认 ?MODULE:service/2——测试注入慢实现验证并发结构）。
 start(Port) -> start(Port, fun ?MODULE:service/2).
 start(Port, ServiceFun) ->
-    try crawl_init() catch _:_ -> ok end,   %% 幂等启动（重复 start——named_table 已存在则忽略）
+    try ets:info(?DIRECT_TAB) =:= undefined andalso
+        ets:new(?DIRECT_TAB, [named_table, public, {read_concurrency, true}])
+    catch _:_ -> ok end,   %% 网关直连表（幂等——业务表已迁 app 组件）
     try admin_init() catch _:_ -> ok end,   %% B4：admin-v2 登记表（同幂等语义）
     Self = self(),
     _Gw = spawn(fun() ->
@@ -735,7 +748,7 @@ handle(Sock, Ft, _Flags, Cid, Path, Key, Payload) ->
         ?FT_SYSTEM_EVENT ->
             %% B4（DEV_09）：admin-v2 命令（0x03）——执行+回帧；其余 tag 忽略
             try admin_handle_frame(Sock, Cid, Path, Payload)
-            catch _:R -> log("admin frame error ~p~n", [R])
+            catch Class:R:Stk -> log("admin frame error ~p:~p~n  at ~p~n", [Class, R, Stk])
             end;
         ?ROUTE_HINT ->
             %% 方案 A：hub 背书的直连地址 → 后台拨号（不阻塞收帧循环）。

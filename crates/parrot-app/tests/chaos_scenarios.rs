@@ -24,7 +24,8 @@ fn spec(name: &str) -> ComponentSpec {
     ComponentSpec {
         name: name.into(),
         engine: EngineKind::Erlang,
-        artifact: ArtifactRef::Beam { app: name.into() },
+        artifact: ArtifactRef::Beam { app: name.into(), uri: None },
+        alt_artifact: None,
         instances: InstancePolicy::Singleton,
         placement: Default::default(),
         upgrade: Default::default(),
@@ -92,9 +93,7 @@ fn chaos_partition_minority_no_deploys() {
     // 多数派：经 submit 提交新 desired（升级入口——登记在途）
     let mut majority = sup(manifest(vec![spec("frontier")]));
     let mut v2 = spec("frontier");
-    v2.artifact = ArtifactRef::Beam {
-        app: "frontier-v2".into(),
-    };
+    v2.artifact = ArtifactRef::Beam { app: "frontier-v2".into(), uri: None };
     majority.submit(manifest(vec![v2])).unwrap();
     // 少数派：旧 desired（分区——Raft 提交未达其 store）
     let minority = sup(manifest(vec![spec("frontier")]));

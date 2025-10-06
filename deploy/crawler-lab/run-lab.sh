@@ -45,9 +45,11 @@ if [ "$LAB_MODE" = "registry" ]; then
   PIDS+=("$!")
 
   echo "==> [registry] 起 JVM(akka) 搜索网关（注册）"
+  # R1：业务网关 CrawlerSearchMain 已删——通用宿主 ParrotGatewayMain +
+  # deploy{Jvm} 载入 app 制品（apps/crawler-lab/jvm → crawler-lab-jvm jar）
   (cd interop/jvm/target && \
    exec java -cp "parrot-protocol-jvm-0.1.0.jar:$(cat cp.txt)" \
-     parrot.protocol.jvm.CrawlerSearchMain 0 "parrot=127.0.0.1:19870" 7200 \
+     parrot.protocol.jvm.ParrotGatewayMain 0 "parrot=127.0.0.1:19870" "node=jvm-search-1" 7200 \
    > /tmp/lab_jvm.out 2>&1) &
   PIDS+=("$!")
 
@@ -73,9 +75,10 @@ ERL_PID=$!
 PIDS+=("$ERL_PID")
 
 echo "==> [2/5] JVM(akka) 搜索网关"
+# R1：通用宿主 ParrotGatewayMain（业务经 deploy 载入——非 CrawlerSearchMain）
 (cd interop/jvm/target && \
  exec java -cp "parrot-protocol-jvm-0.1.0.jar:$(cat cp.txt)" \
-   parrot.protocol.jvm.CrawlerSearchMain 19862 7200 > /tmp/lab_jvm.out 2>&1) &
+   parrot.protocol.jvm.ParrotGatewayMain 19862 "node=jvm-search-1" 7200 > /tmp/lab_jvm.out 2>&1) &
 JVM_PID=$!
 PIDS+=("$JVM_PID")
 

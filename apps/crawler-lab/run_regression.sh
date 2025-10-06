@@ -21,7 +21,7 @@ GOLDEN="apps/crawler-lab/golden/pre_migration_output.txt"
 OUT="/tmp/crawler_regression.out"
 
 echo "==> [1/3] 构建 crawler-lab"
-cargo build -p crawler-lab -q || { echo "构建失败"; exit 1; }
+cargo build -p crawler-lab -q --release || { echo "构建失败"; exit 1; }
 
 echo "==> [2/3] 四运行时全链（golden 同参数：pages=60 depth=2 fanout=3 batch=32）"
 if ! ./deploy/crawler-lab/run-lab.sh --pages 60 --depth 2 --fanout 3 --batch 32 --skip-ts > "$OUT" 2>&1; then

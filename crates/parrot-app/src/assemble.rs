@@ -278,6 +278,7 @@ async fn rollback(
                         artifact: crate::manifest::ArtifactRef::Props {
                             factory: String::new(),
                         },
+                        alt_artifact: None,
                         instances: crate::manifest::InstancePolicy::Singleton,
                         placement: Default::default(),
                         upgrade: Default::default(),
@@ -727,7 +728,7 @@ mod tests {
             artifact: ArtifactRef::Props {
                 factory: format!("app.{name}"),
             },
-            instances: InstancePolicy::Singleton,
+            alt_artifact: None,            instances: InstancePolicy::Singleton,
             placement: PlacementConstraint::default(),
             upgrade: UpgradePolicy::default(),
             deps: deps.iter().map(|s| s.to_string()).collect(),
@@ -770,7 +771,7 @@ mod tests {
         erl.engine = EngineKind::Erlang;
         erl.artifact = ArtifactRef::Beam {
             app: "frontier".into(),
-        };
+         uri: None,};
         let m = manifest(vec![comp("hub", &[]), erl]);
         let plan = plan(&m, &LocalTopology).unwrap();
         let d = make_deployer(&j);
@@ -1095,7 +1096,7 @@ mod tests {
         bad.artifact = ArtifactRef::PyModule {
             module: "m".into(),
             runtime_env: None,
-        };
+         uri: None,};
         let m = manifest(vec![bad]);
         let plan = plan(&m, &LocalTopology).unwrap();
         let d = make_deployer(&j);

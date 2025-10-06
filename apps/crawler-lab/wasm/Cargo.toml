@@ -1,0 +1,18 @@
+[package]
+name = "crawler-lab-wasm"
+version = "1.0.0"
+edition = "2021"
+description = "crawler-lab parrot 组件（wasm 形态——R2 双形态之一）"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# 独立 workspace（wasm 交叉编译目标与主构建隔离——与 parrot-wasm fixture 同规）
+[workspace]
+
+[dependencies]
+wit-bindgen = "0.57"
+
+[profile.release]
+opt-level = 1

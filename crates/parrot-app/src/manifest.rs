@@ -34,6 +34,10 @@ pub struct ComponentSpec {
     pub name: String,
     pub engine: EngineKind,
     pub artifact: ArtifactRef,
+    /// R2 双形态：主 artifact 之外的备选形态（如 Dylib 主 + Wasm 沙箱）。
+    /// 部署系统按节点能力/策略选择；两形态须同键同行为。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_artifact: Option<ArtifactRef>,
     #[serde(default)]
     pub instances: InstancePolicy,
     #[serde(default)]
@@ -102,18 +106,36 @@ pub enum ArtifactRef {
         abi: u32,
     },
     /// akka 网关：child-first URLClassLoader 加载。
+    ///
+    /// R3：`uri` 指向 app 构建产物（jar 路径——file:// 形态）；缺省时
+    /// coords 兼容旧形态（坐标/内联 uri）。
     Jvm {
         main_class: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         coords: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
     },
     /// ray 网关：python 模块（ray job API working_dir）。
+    ///
+    /// R3：`uri` 指向 app 源码目录（working_dir——file:// 形态）；缺省时
+    /// 沿 module 相对发现（旧形态）。
     PyModule {
         module: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_env: Option<toml::value::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
     },
     /// erlang 网关：OTP app（code:load_abs 热加载）。
-    Beam { app: String },
+    ///
+    /// R3：`uri` 指向 app 构建产物目录（beam 所在——file:// 形态）；
+    /// 缺省时沿网关 artifact 目录发现（旧形态）。
+    Beam {
+        app: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
 }
 
 impl ArtifactRef {
@@ -336,7 +358,7 @@ pub fn validate(m: &AppManifest) -> Result<(), Vec<ManifestError>> {
         errs.push(ManifestError::CycleDetected(cycle));
     }
 
-    // ⑥ engine-artifact 匹配表
+    // ⑥ engine-artifact 匹配表（含 R2 alt_artifact 备选形态）
     for c in &m.components {
         if !c.engine.accepts(&c.artifact) {
             errs.push(ManifestError::EngineArtifactMismatch {
@@ -344,6 +366,15 @@ pub fn validate(m: &AppManifest) -> Result<(), Vec<ManifestError>> {
                 engine: c.engine,
                 artifact: c.artifact.kind().to_string(),
             });
+        }
+        if let Some(alt) = &c.alt_artifact {
+            if !c.engine.accepts(alt) {
+                errs.push(ManifestError::EngineArtifactMismatch {
+                    comp: c.name.clone(),
+                    engine: c.engine,
+                    artifact: format!("alt:{}", alt.kind()),
+                });
+            }
         }
     }
 
@@ -505,16 +536,20 @@ impl From<ArtifactRef> for parrot_remote::admin_v2::AdminArtifactRef {
             ArtifactRef::Props { factory } => AdminArtifactRef::Props { factory },
             ArtifactRef::Wasm { digest, uri } => AdminArtifactRef::Wasm { digest, uri },
             ArtifactRef::Dylib { digest, uri, abi } => AdminArtifactRef::Dylib { digest, uri, abi },
-            ArtifactRef::Jvm { main_class, coords } => AdminArtifactRef::Jvm { main_class, coords },
+            ArtifactRef::Jvm { main_class, coords, uri } => {
+                AdminArtifactRef::Jvm { main_class, coords, uri }
+            }
             ArtifactRef::PyModule {
                 module,
                 runtime_env,
+                uri,
             } => AdminArtifactRef::PyModule {
                 module,
                 // toml::Value → TOML 文本（wire 同形策略见 admin_v2.rs 文档）
                 runtime_env: runtime_env.and_then(|v| toml::to_string(&v).ok()),
+                uri,
             },
-            ArtifactRef::Beam { app } => AdminArtifactRef::Beam { app },
+            ArtifactRef::Beam { app, uri } => AdminArtifactRef::Beam { app, uri },
         }
     }
 }
@@ -526,16 +561,20 @@ impl From<parrot_remote::admin_v2::AdminArtifactRef> for ArtifactRef {
             AdminArtifactRef::Props { factory } => ArtifactRef::Props { factory },
             AdminArtifactRef::Wasm { digest, uri } => ArtifactRef::Wasm { digest, uri },
             AdminArtifactRef::Dylib { digest, uri, abi } => ArtifactRef::Dylib { digest, uri, abi },
-            AdminArtifactRef::Jvm { main_class, coords } => ArtifactRef::Jvm { main_class, coords },
+            AdminArtifactRef::Jvm { main_class, coords, uri } => {
+                ArtifactRef::Jvm { main_class, coords, uri }
+            }
             AdminArtifactRef::PyModule {
                 module,
                 runtime_env,
+                uri,
             } => ArtifactRef::PyModule {
                 module,
                 // TOML 文本 → toml::Value（解析失败容忍 None——方言侧兜底）
                 runtime_env: runtime_env.and_then(|s| toml::from_str(&s).ok()),
+                uri,
             },
-            AdminArtifactRef::Beam { app } => ArtifactRef::Beam { app },
+            AdminArtifactRef::Beam { app, uri } => ArtifactRef::Beam { app, uri },
         }
     }
 }
@@ -565,7 +604,7 @@ mod tests {
             artifact: ArtifactRef::Props {
                 factory: format!("app.{name}"),
             },
-            instances: InstancePolicy::Singleton,
+            alt_artifact: None,            instances: InstancePolicy::Singleton,
             placement: PlacementConstraint::default(),
             upgrade: UpgradePolicy::default(),
             deps: vec![],
@@ -729,12 +768,12 @@ mod tests {
             ArtifactRef::Jvm {
                 main_class: "M".into(),
                 coords: None,
-            },
+             uri: None,},
             ArtifactRef::PyModule {
                 module: "m".into(),
                 runtime_env: None,
-            },
-            ArtifactRef::Beam { app: "a".into() },
+             uri: None,},
+            ArtifactRef::Beam { app: "a".into() , uri: None,},
         ];
         let mut matched = 0;
         for e in engines {
@@ -841,7 +880,7 @@ mod tests {
                         digest: "abc".into(),
                         uri: "file:///a.wasm".into(),
                     },
-                    instances: InstancePolicy::Sharded(4),
+                    alt_artifact: None,                    instances: InstancePolicy::Sharded(4),
                     placement: PlacementConstraint {
                         role: Some("hub".into()),
                         realm: None,
@@ -867,8 +906,8 @@ mod tests {
                     artifact: ArtifactRef::Jvm {
                         main_class: "Main".into(),
                         coords: Some("g:a:1".into()),
-                    },
-                    instances: InstancePolicy::Pool(3),
+                     uri: None,},
+                    alt_artifact: None,                    instances: InstancePolicy::Pool(3),
                     placement: Default::default(),
                     upgrade: UpgradePolicy::Recreate { state_snapshots: 2 },
                     deps: vec!["p".into()],
@@ -881,8 +920,8 @@ mod tests {
                     artifact: ArtifactRef::PyModule {
                         module: "m".into(),
                         runtime_env: Some(toml::Value::from(true)),
-                    },
-                    instances: InstancePolicy::Ephemeral,
+                     uri: None,},
+                    alt_artifact: None,                    instances: InstancePolicy::Ephemeral,
                     placement: Default::default(),
                     upgrade: UpgradePolicy::HotSwap {
                         drain_timeout_ms: 500,
@@ -896,8 +935,8 @@ mod tests {
                     engine: EngineKind::Erlang,
                     artifact: ArtifactRef::Beam {
                         app: "frontier".into(),
-                    },
-                    instances: InstancePolicy::Singleton,
+                     uri: None,},
+                    alt_artifact: None,                    instances: InstancePolicy::Singleton,
                     placement: Default::default(),
                     upgrade: UpgradePolicy::default(),
                     deps: vec![],
@@ -1034,15 +1073,15 @@ Props = { factory = "f" }
             ArtifactRef::Props {
                 factory: "f".into(),
             },
-            ArtifactRef::Beam { app: "a".into() },
+            ArtifactRef::Beam { app: "a".into() , uri: None,},
             ArtifactRef::PyModule {
                 module: "m".into(),
                 runtime_env: None,
-            },
+             uri: None,},
             ArtifactRef::Jvm {
                 main_class: "M".into(),
                 coords: None,
-            },
+             uri: None,},
             ArtifactRef::Wasm {
                 digest: "d".into(),
                 uri: "u".into(),
@@ -1086,9 +1125,91 @@ Props = { factory = "f" }
                 .into_iter()
                 .collect(),
             )),
-        };
+         uri: None,};
         let wire: AdminArtifactRef = orig.clone().into();
         let back: ArtifactRef = wire.into();
         assert_eq!(back, orig, "toml 文本互转保真");
+    }
+}
+
+#[cfg(test)]
+mod r5_tests {
+    use super::*;
+
+    /// R2/R3：alt_artifact 校验 + uri 字段 roundtrip + 新形态 manifest 解析。
+    #[test]
+    fn alt_artifact_mismatch_rejected() {
+        let m = AppManifest {
+            name: "t".into(),
+            version: "1.0.0".into(),
+            components: vec![ComponentSpec {
+                name: "hub".into(),
+                engine: EngineKind::Parrot,
+                artifact: ArtifactRef::Dylib {
+                    digest: "sha256:a".into(),
+                    uri: "file://d.dylib".into(),
+                    abi: 1,
+                },
+                // Beam 不是 parrot 引擎可接受的备选 → 报错
+                alt_artifact: Some(ArtifactRef::Beam {
+                    app: "x".into(),
+                    uri: None,
+                }),
+                instances: InstancePolicy::Singleton,
+                placement: Default::default(),
+                upgrade: Default::default(),
+                deps: vec![],
+                config: None,
+                hooks: Default::default(),
+            }],
+            wiring: vec![],
+            config_overlay: Default::default(),
+        };
+        let errs = validate(&m).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ManifestError::EngineArtifactMismatch { artifact, .. } if artifact.starts_with("alt:")
+        )));
+    }
+
+    #[test]
+    fn crawler_app_new_form_parses() {
+        // R5：apps/crawler-lab/crawler.app.toml 新形态（uri/alt_artifact）
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/crawler-lab/crawler.app.toml");
+        let src = std::fs::read_to_string(&p).unwrap();
+        let m: AppManifest = toml::from_str(&src).unwrap();
+        assert_eq!(m.version, "2.0.0");
+        let crawler = m.components.iter().find(|c| c.name == "crawler").unwrap();
+        // 双形态：Dylib 主 + Wasm 备
+        assert_eq!(crawler.artifact.kind(), "dylib");
+        assert_eq!(crawler.alt_artifact.as_ref().unwrap().kind(), "wasm");
+        // 三方言组件 uri 指向 app 内构建产物
+        let f = m.components.iter().find(|c| c.name == "frontier").unwrap();
+        assert!(matches!(&f.artifact, ArtifactRef::Beam { uri: Some(u), .. } if u.contains("erlang/")));
+        let i = m.components.iter().find(|c| c.name == "index").unwrap();
+        assert!(matches!(&i.artifact, ArtifactRef::PyModule { uri: Some(u), .. } if u.contains("python/")));
+        let s = m.components.iter().find(|c| c.name == "search").unwrap();
+        assert!(matches!(&s.artifact, ArtifactRef::Jvm { uri: Some(u), .. } if u.contains(".jar")));
+        validate(&m).unwrap();
+    }
+
+    #[test]
+    fn artifact_uri_roundtrip_toml() {
+        // R3：uri 字段 TOML 双形态（有/无）
+        let toml_src = r#"
+            name = "t"
+            version = "1.0.0"
+            [[components]]
+            name = "f"
+            engine = "erlang"
+            artifact = { Beam = { app = "frontier", uri = "file://erlang/" } }
+        "#;
+        let m: AppManifest = toml::from_str(toml_src).unwrap();
+        let out = toml::to_string(&m).unwrap();
+        let m2: AppManifest = toml::from_str(&out).unwrap();
+        assert_eq!(m, m2);
+        // uri 保留
+        assert!(matches!(m.components[0].artifact, ArtifactRef::Beam { ref uri, .. } if uri.is_some()));
     }
 }

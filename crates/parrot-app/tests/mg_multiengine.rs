@@ -139,6 +139,7 @@ fn comp(name: &str, engine: EngineKind, artifact: ArtifactRef) -> ComponentSpec 
         name: name.into(),
         engine,
         artifact,
+        alt_artifact: None,
         instances: InstancePolicy::Singleton,
         placement: PlacementConstraint::default(),
         upgrade: UpgradePolicy::default(),
@@ -164,24 +165,25 @@ async fn mg_multiengine_deploy_running_ask_status_full_chain() {
     let frontier = comp(
         "frontier",
         EngineKind::Erlang,
-        ArtifactRef::Beam {
-            app: "frontier".into(),
-        },
+        ArtifactRef::Beam { app: "frontier".into(), uri: None },
     );
     let mut index = comp(
         "index",
         EngineKind::Ray,
-        ArtifactRef::PyModule {
-            module: "index".into(),
-            runtime_env: None,
-        },
+        ArtifactRef::PyModule { module: "index".into(), runtime_env: None, uri: None },
     );
     let mut search = comp(
         "search",
         EngineKind::Akka,
         ArtifactRef::Jvm {
-            main_class: "parrot.protocol.jvm.CrawlerSearchMain".into(),
+            main_class: "crawler.search.SearchComponent".into(),
             coords: None,
+            uri: Some(format!(
+                "file://{}",
+                repo_root()
+                    .join("apps/crawler-lab/jvm/target/crawler-lab-jvm-1.0.0.jar")
+                    .display()
+            )),
         },
     );
     let mut hub = comp(
@@ -282,9 +284,7 @@ async fn mg_erlang_gateway_smoke() {
         comp(
             "frontier",
             EngineKind::Erlang,
-            ArtifactRef::Beam {
-                app: "frontier".into(),
-            },
+            ArtifactRef::Beam { app: "frontier".into(), uri: None },
         ),
         103,
     )
@@ -299,10 +299,7 @@ async fn mg_ray_gateway_smoke() {
         comp(
             "index",
             EngineKind::Ray,
-            ArtifactRef::PyModule {
-                module: "index".into(),
-                runtime_env: None,
-            },
+            ArtifactRef::PyModule { module: "index".into(), runtime_env: None, uri: None },
         ),
         102,
     )
