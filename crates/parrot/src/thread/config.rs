@@ -147,12 +147,7 @@ impl ThreadActorSystemConfig {
     pub fn from_resolved(r: &parrot_config::Resolved) -> Self {
         let d = Self::default();
         Self {
-            name: r
-                .remote
-                .node
-                .node_id
-                .clone()
-                .unwrap_or(d.name),
+            name: r.remote.node.node_id.clone().unwrap_or(d.name),
             shared_pool_size: r.thread.shared_pool_size,
             shared_burst_workers_max: r.thread.shared_burst_workers_max,
             shared_burst_backlog_threshold_ms: r.thread.shared_burst_backlog_threshold_ms,

@@ -158,7 +158,10 @@ impl RolloutTracker {
                 self.enter(P::Planning);
                 // 计划完成即进入排空（自动弧——计划本身无副作用）
                 self.enter(P::Draining);
-                Ok(RolloutAction::StartDrain { comp, timeout_ms: 5_000 })
+                Ok(RolloutAction::StartDrain {
+                    comp,
+                    timeout_ms: 5_000,
+                })
             }
             (P::Draining, RolloutEvent::Drained { aborted }) => {
                 self.aborted_total += aborted;
@@ -227,12 +230,18 @@ pub struct MultiRollout {
 impl MultiRollout {
     pub fn new(comps: Vec<String>) -> Self {
         Self {
-            trackers: comps.into_iter().map(|c| (c.clone(), RolloutTracker::new(c))).collect(),
+            trackers: comps
+                .into_iter()
+                .map(|c| (c.clone(), RolloutTracker::new(c)))
+                .collect(),
         }
     }
 
     /// 广播事件（依赖序由调用方保证——此处逐 tracker 传递）。
-    pub fn broadcast(&mut self, e: RolloutEvent) -> Vec<(String, Result<RolloutAction, RolloutError>)> {
+    pub fn broadcast(
+        &mut self,
+        e: RolloutEvent,
+    ) -> Vec<(String, Result<RolloutAction, RolloutError>)> {
         self.trackers
             .iter_mut()
             .map(|(name, t)| (name.clone(), t.advance(e.clone())))
@@ -246,9 +255,7 @@ impl MultiRollout {
 
     /// 任一回滚。
     pub fn any_rollback(&self) -> bool {
-        self.trackers
-            .values()
-            .any(|t| t.rollback_reason.is_some())
+        self.trackers.values().any(|t| t.rollback_reason.is_some())
     }
 }
 
@@ -262,20 +269,29 @@ mod tests {
         let mut t = RolloutTracker::new("frontier");
         assert_eq!(
             t.advance(RolloutEvent::PlanReady).unwrap(),
-            RolloutAction::StartDrain { comp: "frontier".into(), timeout_ms: 5_000 }
+            RolloutAction::StartDrain {
+                comp: "frontier".into(),
+                timeout_ms: 5_000
+            }
         );
         assert!(t.in_phase(RolloutPhase::Draining));
         assert_eq!(
             t.advance(RolloutEvent::Drained { aborted: 0 }).unwrap(),
-            RolloutAction::StartDeploy { comp: "frontier".into() }
+            RolloutAction::StartDeploy {
+                comp: "frontier".into()
+            }
         );
         assert_eq!(
             t.advance(RolloutEvent::DeployOk).unwrap(),
-            RolloutAction::StartVerify { comp: "frontier".into() }
+            RolloutAction::StartVerify {
+                comp: "frontier".into()
+            }
         );
         assert_eq!(
             t.advance(RolloutEvent::VerifyOk).unwrap(),
-            RolloutAction::SwitchRoutes { comp: "frontier".into() }
+            RolloutAction::SwitchRoutes {
+                comp: "frontier".into()
+            }
         );
         assert_eq!(
             t.advance(RolloutEvent::SwitchDone).unwrap(),
@@ -304,7 +320,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             a,
-            RolloutAction::Rollback { comp: "c".into(), reason: "health check failed".into() }
+            RolloutAction::Rollback {
+                comp: "c".into(),
+                reason: "health check failed".into()
+            }
         );
         assert!(t.in_phase(RolloutPhase::RollingBack));
         assert_eq!(t.rollback_reason.as_deref(), Some("health check failed"));
@@ -327,7 +346,9 @@ mod tests {
     fn node_lost_in_draining_rolls_back() {
         let mut t = RolloutTracker::new("c");
         t.advance(RolloutEvent::PlanReady).unwrap();
-        let a = t.advance(RolloutEvent::NodeLost("parrot-gw-1".into())).unwrap();
+        let a = t
+            .advance(RolloutEvent::NodeLost("parrot-gw-1".into()))
+            .unwrap();
         assert!(matches!(a, RolloutAction::Rollback { .. }));
         assert!(t.in_phase(RolloutPhase::RollingBack));
     }
@@ -397,7 +418,10 @@ mod tests {
         t.advance(RolloutEvent::PlanReady).unwrap();
         t.advance(RolloutEvent::Drained { aborted: 0 }).unwrap();
         t.advance(RolloutEvent::DeployOk).unwrap();
-        match t.advance(RolloutEvent::VerifyFail("timeout 3s".into())).unwrap() {
+        match t
+            .advance(RolloutEvent::VerifyFail("timeout 3s".into()))
+            .unwrap()
+        {
             RolloutAction::Rollback { reason, .. } => assert_eq!(reason, "timeout 3s"),
             other => panic!("{other:?}"),
         }
@@ -448,8 +472,16 @@ mod tests {
         m.broadcast(RolloutEvent::Drained { aborted: 0 });
         m.broadcast(RolloutEvent::DeployOk);
         // a 验证失败、b 通过
-        m.trackers.get_mut("a").unwrap().advance(RolloutEvent::VerifyFail("x".into())).unwrap();
-        m.trackers.get_mut("b").unwrap().advance(RolloutEvent::VerifyOk).unwrap();
+        m.trackers
+            .get_mut("a")
+            .unwrap()
+            .advance(RolloutEvent::VerifyFail("x".into()))
+            .unwrap();
+        m.trackers
+            .get_mut("b")
+            .unwrap()
+            .advance(RolloutEvent::VerifyOk)
+            .unwrap();
         assert!(m.any_rollback());
         assert!(!m.all_done());
     }

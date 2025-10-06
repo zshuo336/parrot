@@ -423,8 +423,8 @@ mod tests {
     #[test]
     fn negotiate_artifacts_is_orthogonal_to_codec() {
         // ARTIFACTS 只在双方都置位时保留在交集里；不影响 codec 协商成败
-        let common = negotiate_caps(caps::BIN | caps::ARTIFACTS, caps::BIN | caps::ARTIFACTS)
-            .unwrap();
+        let common =
+            negotiate_caps(caps::BIN | caps::ARTIFACTS, caps::BIN | caps::ARTIFACTS).unwrap();
         assert_eq!(common & caps::ARTIFACTS, caps::ARTIFACTS);
         // 单侧置位 → 交集无该位，但仍握手成功（BIN 公共）
         let common = negotiate_caps(caps::BIN | caps::ARTIFACTS, caps::BIN).unwrap();

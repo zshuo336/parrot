@@ -7,7 +7,9 @@
 //!   （in-flight 计数 + drain_timeout 兜底 → force dlclose 告警）
 //! - `scan_violations`：TLS 析构注册/线程创建/signal 安装（nm/otool 扫描）
 
-use crate::{AbiComponent, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, ABI_META_SYMBOL, ABI_OK, PARROT_ABI_VERSION};
+use crate::{
+    AbiComponent, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, ABI_META_SYMBOL, ABI_OK, PARROT_ABI_VERSION,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -150,14 +152,16 @@ impl DylibLoader {
         if !digest.is_empty() {
             use sha2::{Digest, Sha256};
             let got = hex::encode(Sha256::digest(&bytes));
-            let want = digest.strip_prefix("sha256:").unwrap_or(digest).to_ascii_lowercase();
+            let want = digest
+                .strip_prefix("sha256:")
+                .unwrap_or(digest)
+                .to_ascii_lowercase();
             if got != want {
                 return Err(LoadError::Digest { want, got });
             }
         }
         unsafe {
-            let lib = libloading::Library::new(path)
-                .map_err(|e| LoadError::Open(e.to_string()))?;
+            let lib = libloading::Library::new(path).map_err(|e| LoadError::Open(e.to_string()))?;
             let meta: libloading::Symbol<*const AbiMeta> = lib
                 .get(ABI_META_SYMBOL.as_bytes())
                 .map_err(|e| LoadError::Symbol(e.to_string()))?;
@@ -188,11 +192,7 @@ impl DylibLoader {
     }
 
     /// construct（catch_unwind 双保险——dylib 侧已 catch，宿主再包一层）。
-    pub fn construct(
-        &self,
-        h: &DylibHandle,
-        cfg: AbiStr,
-    ) -> Result<*mut AbiComponent, LoadError> {
+    pub fn construct(&self, h: &DylibHandle, cfg: AbiStr) -> Result<*mut AbiComponent, LoadError> {
         unsafe {
             let out: *mut AbiComponent = std::ptr::null_mut();
             let mut out = out;
@@ -201,7 +201,7 @@ impl DylibLoader {
                 construct_fn(cfg, &mut out as *mut *mut AbiComponent)
             }))
             .unwrap_or(99); // 宿主侧 panic 码（ABI_ERR_* 之外——诊断可辨）
-            // 注：99 = 宿主侧 panic 码（ABI_ERR_* 之外——诊断可辨）
+                            // 注：99 = 宿主侧 panic 码（ABI_ERR_* 之外——诊断可辨）
             if r != ABI_OK || out.is_null() {
                 return Err(LoadError::Construct {
                     code: r,
@@ -261,10 +261,7 @@ impl DylibLoader {
         match r {
             Ok(code) if code == ABI_OK => Ok(()),
             Ok(code) => Err((code, format!("handle_msg code={code}"))),
-            Err(p) => Err((
-                crate::ABI_ERR_PANIC,
-                format!("dylib panic: {p:?}"),
-            )),
+            Err(p) => Err((crate::ABI_ERR_PANIC, format!("dylib panic: {p:?}"))),
         }
     }
 
@@ -359,17 +356,28 @@ impl DylibLoader {
     pub fn scan_violations(path: &Path) -> Vec<Violation> {
         let mut v = Vec::new();
         // ── 1) 未定义符号（线程/signal）──
-        if let Ok(o) = std::process::Command::new("nm").arg("-u").arg(path).output() {
+        if let Ok(o) = std::process::Command::new("nm")
+            .arg("-u")
+            .arg(path)
+            .output()
+        {
             if o.status.success() {
                 for line in String::from_utf8_lossy(&o.stdout).lines() {
                     let sym = line.trim();
                     if sym == "pthread_create" || sym == "_pthread_create" {
-                        v.push(Violation::ThreadSpawn { symbol: sym.to_string() });
-                    } else if sym == "signal" || sym == "_signal"
-                        || sym == "sigaction" || sym == "_sigaction"
-                        || sym == "sigsetjmp" || sym == "_sigsetjmp"
+                        v.push(Violation::ThreadSpawn {
+                            symbol: sym.to_string(),
+                        });
+                    } else if sym == "signal"
+                        || sym == "_signal"
+                        || sym == "sigaction"
+                        || sym == "_sigaction"
+                        || sym == "sigsetjmp"
+                        || sym == "_sigsetjmp"
                     {
-                        v.push(Violation::SignalHandler { symbol: sym.to_string() });
+                        v.push(Violation::SignalHandler {
+                            symbol: sym.to_string(),
+                        });
                     }
                 }
             }

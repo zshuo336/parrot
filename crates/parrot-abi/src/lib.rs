@@ -74,7 +74,10 @@ impl AbiMsg {
     /// # Safety
     /// type_key 必须指向 key_len 字节有效内存。
     pub unsafe fn key<'a>(&self) -> &'a str {
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.type_key, self.key_len as usize))
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            self.type_key,
+            self.key_len as usize,
+        ))
     }
 
     /// payload 读回。
@@ -161,7 +164,10 @@ impl AbiMeta {
     /// # Safety
     /// name 必须指向 name_len 字节有效内存。
     pub unsafe fn name_str<'a>(&self) -> &'a str {
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.name, self.name_len as usize))
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            self.name,
+            self.name_len as usize,
+        ))
     }
 }
 

@@ -114,7 +114,15 @@ impl RecordSink for MemSink {
 
 /// record 便利构造（帧字段 → JsonlRecord；seq 由 sink 侧单调保证——
 /// 调用方传入自增计数器）。
-pub fn record_sink(seq: u64, cid: u64, dir: &str, frame_type: u8, path: &str, type_key: &str, payload: &[u8]) -> JsonlRecord {
+pub fn record_sink(
+    seq: u64,
+    cid: u64,
+    dir: &str,
+    frame_type: u8,
+    path: &str,
+    type_key: &str,
+    payload: &[u8],
+) -> JsonlRecord {
     JsonlRecord {
         seq,
         cid,
@@ -240,7 +248,11 @@ mod tests {
     #[test]
     fn by_cid_filter() {
         let log = ReplayLog {
-            records: vec![rec(1, 1, "/a", b""), rec(2, 2, "/b", b""), rec(3, 1, "/c", b"")],
+            records: vec![
+                rec(1, 1, "/a", b""),
+                rec(2, 2, "/b", b""),
+                rec(3, 1, "/c", b""),
+            ],
         };
         assert_eq!(log.by_cid(1).len(), 2);
         assert_eq!(log.by_cid(2).len(), 1);
@@ -250,18 +262,29 @@ mod tests {
     #[test]
     fn replay_in_order_and_abort_on_err() {
         let log = ReplayLog {
-            records: vec![rec(1, 1, "/a", b""), rec(2, 1, "/b", b""), rec(3, 1, "/c", b"")],
+            records: vec![
+                rec(1, 1, "/a", b""),
+                rec(2, 1, "/b", b""),
+                rec(3, 1, "/c", b""),
+            ],
         };
         let mut seen = Vec::new();
-        let n = log.replay(|r| {
-            seen.push(r.path.clone());
-            Ok(())
-        })
-        .unwrap();
+        let n = log
+            .replay(|r| {
+                seen.push(r.path.clone());
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(n, 3);
         assert_eq!(seen, vec!["/a", "/b", "/c"]);
         // 中止弧：第二条失败
-        let r = log.replay(|r| if r.seq == 2 { Err("boom".into()) } else { Ok(()) });
+        let r = log.replay(|r| {
+            if r.seq == 2 {
+                Err("boom".into())
+            } else {
+                Ok(())
+            }
+        });
         assert!(matches!(r, Err(ReplayError::BadLine { line: 2, .. })));
     }
 

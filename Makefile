@@ -274,5 +274,7 @@ distclean: clean
 
 
 # ---- F4（DEV_09）：App 孪生门禁——Manifest 输入 ---------------------------
+# 默认输入：crawler-lab 迁移后的 crawler.app.toml（M1+M2 联合验收）
+MANIFEST ?= apps/crawler-lab/crawler.app.toml
 twin-app:
 	$(CARGO) run -p federation-lab -- twin-app --manifest $(MANIFEST)

@@ -284,17 +284,15 @@ impl ParrotConfig {
             tracing::debug!(path = %path.display(), "config file absent — file layer skipped");
             return Ok(self);
         }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Io {
-                path: path.display().to_string(),
-                source: e,
-            })?;
+        let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?;
         let expanded = expand_env(&raw);
-        let file: toml::Value = toml::from_str(&expanded)
-            .map_err(|e| ConfigError::Parse {
-                path: path.display().to_string(),
-                source: e,
-            })?;
+        let file: toml::Value = toml::from_str(&expanded).map_err(|e| ConfigError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        })?;
         self.merge_toml(&file);
         Ok(self)
     }
@@ -308,7 +306,11 @@ impl ParrotConfig {
     /// TOML 值合并进自身（仅填 None 字段——已 Some 的代码设置不被覆盖）。
     fn merge_toml(&mut self, file: &toml::Value) {
         if let Some(th) = file.get("thread").and_then(|v| v.as_table()) {
-            merge_opt(&mut self.thread.shared_pool_size, "thread.shared_pool_size", th);
+            merge_opt(
+                &mut self.thread.shared_pool_size,
+                "thread.shared_pool_size",
+                th,
+            );
             merge_opt(
                 &mut self.thread.shared_burst_workers_max,
                 "thread.shared_burst_workers_max",
@@ -349,11 +351,21 @@ impl ParrotConfig {
                 "thread.shutdown_timeout_ms",
                 th,
             );
-            warn_unknown(th, "thread", &[
-                "shared_pool_size","shared_burst_workers_max","shared_burst_backlog_threshold_ms",
-                "shared_burst_idle_timeout_ms","shared_queue_capacity","max_dedicated_threads",
-                "default_mailbox_capacity","default_ask_timeout_ms","shutdown_timeout_ms",
-            ]);
+            warn_unknown(
+                th,
+                "thread",
+                &[
+                    "shared_pool_size",
+                    "shared_burst_workers_max",
+                    "shared_burst_backlog_threshold_ms",
+                    "shared_burst_idle_timeout_ms",
+                    "shared_queue_capacity",
+                    "max_dedicated_threads",
+                    "default_mailbox_capacity",
+                    "default_ask_timeout_ms",
+                    "shutdown_timeout_ms",
+                ],
+            );
         }
         if let Some(rm) = file.get("remote").and_then(|v| v.as_table()) {
             if let Some(n) = rm.get("node").and_then(|v| v.as_table()) {
@@ -376,9 +388,18 @@ impl ParrotConfig {
                         sec.seeds = Some(seeds);
                     }
                 }
-                warn_unknown(n, "remote.node", &[
-                    "node_id","bind","topology_role","direct_addr","seeds","scheme",
-                ]);
+                warn_unknown(
+                    n,
+                    "remote.node",
+                    &[
+                        "node_id",
+                        "bind",
+                        "topology_role",
+                        "direct_addr",
+                        "seeds",
+                        "scheme",
+                    ],
+                );
                 if let Some(role) = &sec.topology_role {
                     if TopologyRoleValue::parse(role).is_none() {
                         tracing::warn!(
@@ -390,25 +411,52 @@ impl ParrotConfig {
             }
             if let Some(t) = rm.get("transport").and_then(|v| v.as_table()) {
                 let sec = &mut self.remote.transport;
-                merge_opt(&mut sec.heartbeat_interval_ms, "remote.transport.heartbeat_interval_ms", t);
-                merge_opt(&mut sec.heartbeat_max_loss, "remote.transport.heartbeat_max_loss", t);
-                merge_opt(&mut sec.outbound_queue, "remote.transport.outbound_queue", t);
-                merge_opt(&mut sec.default_hop_limit, "remote.transport.default_hop_limit", t);
-                warn_unknown(t, "remote.transport", &[
-                    "heartbeat_interval_ms","heartbeat_max_loss","outbound_queue","default_hop_limit",
-                ]);
+                merge_opt(
+                    &mut sec.heartbeat_interval_ms,
+                    "remote.transport.heartbeat_interval_ms",
+                    t,
+                );
+                merge_opt(
+                    &mut sec.heartbeat_max_loss,
+                    "remote.transport.heartbeat_max_loss",
+                    t,
+                );
+                merge_opt(
+                    &mut sec.outbound_queue,
+                    "remote.transport.outbound_queue",
+                    t,
+                );
+                merge_opt(
+                    &mut sec.default_hop_limit,
+                    "remote.transport.default_hop_limit",
+                    t,
+                );
+                warn_unknown(
+                    t,
+                    "remote.transport",
+                    &[
+                        "heartbeat_interval_ms",
+                        "heartbeat_max_loss",
+                        "outbound_queue",
+                        "default_hop_limit",
+                    ],
+                );
             }
             if let Some(r) = rm.get("reorder").and_then(|v| v.as_table()) {
                 let sec = &mut self.remote.reorder;
                 merge_opt(&mut sec.gap_timeout_ms, "remote.reorder.gap_timeout_ms", r);
                 merge_opt(&mut sec.buffer_cap, "remote.reorder.buffer_cap", r);
-                warn_unknown(r, "remote.reorder", &["gap_timeout_ms","buffer_cap"]);
+                warn_unknown(r, "remote.reorder", &["gap_timeout_ms", "buffer_cap"]);
             }
             if let Some(c) = rm.get("codec").and_then(|v| v.as_table()) {
-                merge_opt(&mut self.remote.codec.extra_caps, "remote.codec.extra_caps", c);
+                merge_opt(
+                    &mut self.remote.codec.extra_caps,
+                    "remote.codec.extra_caps",
+                    c,
+                );
                 warn_unknown(c, "remote.codec", &["extra_caps"]);
             }
-            warn_unknown(rm, "remote", &["node","transport","reorder","codec"]);
+            warn_unknown(rm, "remote", &["node", "transport", "reorder", "codec"]);
         }
         warn_unknown(
             file.as_table().unwrap_or(&toml::map::Map::new()),
@@ -525,9 +573,7 @@ impl ParrotConfig {
                     heartbeat_max_loss: tr
                         .heartbeat_max_loss
                         .unwrap_or_else(Defaults::heartbeat_max_loss),
-                    outbound_queue: tr
-                        .outbound_queue
-                        .unwrap_or_else(Defaults::outbound_queue),
+                    outbound_queue: tr.outbound_queue.unwrap_or_else(Defaults::outbound_queue),
                     default_hop_limit: tr
                         .default_hop_limit
                         .unwrap_or_else(Defaults::default_hop_limit),
@@ -552,28 +598,79 @@ impl ParrotConfig {
     /// 全键文档（运维参考——`parrot-config --dump-docs` 的数据源）。
     pub fn documented() -> BTreeMap<&'static str, &'static str> {
         let mut m = BTreeMap::new();
-        m.insert("thread.shared_pool_size", "共享调度池核心线程数（默认 CPU 核数）");
-        m.insert("thread.shared_burst_workers_max", "弹性突发 worker 上限（默认 CPU 核数）");
-        m.insert("thread.shared_burst_backlog_threshold_ms", "队列积压多久后扩突发 worker（默认 100ms）");
-        m.insert("thread.shared_burst_idle_timeout_ms", "突发 worker 空闲多久回收（默认 5000ms）");
-        m.insert("thread.shared_queue_capacity", "共享调度队列容量（默认 10000）");
+        m.insert(
+            "thread.shared_pool_size",
+            "共享调度池核心线程数（默认 CPU 核数）",
+        );
+        m.insert(
+            "thread.shared_burst_workers_max",
+            "弹性突发 worker 上限（默认 CPU 核数）",
+        );
+        m.insert(
+            "thread.shared_burst_backlog_threshold_ms",
+            "队列积压多久后扩突发 worker（默认 100ms）",
+        );
+        m.insert(
+            "thread.shared_burst_idle_timeout_ms",
+            "突发 worker 空闲多久回收（默认 5000ms）",
+        );
+        m.insert(
+            "thread.shared_queue_capacity",
+            "共享调度队列容量（默认 10000）",
+        );
         m.insert("thread.max_dedicated_threads", "专用线程上限（默认 32）");
-        m.insert("thread.default_mailbox_capacity", "actor 默认邮箱容量（默认 1024）");
-        m.insert("thread.default_ask_timeout_ms", "ask 默认超时（默认 5000ms）");
+        m.insert(
+            "thread.default_mailbox_capacity",
+            "actor 默认邮箱容量（默认 1024）",
+        );
+        m.insert(
+            "thread.default_ask_timeout_ms",
+            "ask 默认超时（默认 5000ms）",
+        );
         m.insert("thread.shutdown_timeout_ms", "系统关闭超时（默认 10000ms）");
-        m.insert("remote.node.node_id", "节点唯一 id（部署身份——必填于多节点拓扑）");
+        m.insert(
+            "remote.node.node_id",
+            "节点唯一 id（部署身份——必填于多节点拓扑）",
+        );
         m.insert("remote.node.bind", "监听地址 host:port（如 0.0.0.0:9801）");
-        m.insert("remote.node.topology_role", "拓扑角色 normal|hub|border|directory（默认 normal）");
-        m.insert("remote.node.direct_addr", "可直拨地址（方案 A——hub 据此注入 ROUTE_HINT）");
-        m.insert("remote.node.seeds", "种子节点地址列表 [\"tcp://host:port\"]");
+        m.insert(
+            "remote.node.topology_role",
+            "拓扑角色 normal|hub|border|directory（默认 normal）",
+        );
+        m.insert(
+            "remote.node.direct_addr",
+            "可直拨地址（方案 A——hub 据此注入 ROUTE_HINT）",
+        );
+        m.insert(
+            "remote.node.seeds",
+            "种子节点地址列表 [\"tcp://host:port\"]",
+        );
         m.insert("remote.node.scheme", "传输载体 tcp|mem（默认 tcp）");
-        m.insert("remote.transport.heartbeat_interval_ms", "心跳间隔（默认 2000ms）");
-        m.insert("remote.transport.heartbeat_max_loss", "心跳丢失多少次判半开断开（默认 5）");
-        m.insert("remote.transport.outbound_queue", "出站帧队列容量（默认 1024，天然反压）");
-        m.insert("remote.transport.default_hop_limit", "帧默认跳数上限（默认 8）");
-        m.insert("remote.reorder.gap_timeout_ms", "TELL 重排缺口等待上限（默认 250ms）");
+        m.insert(
+            "remote.transport.heartbeat_interval_ms",
+            "心跳间隔（默认 2000ms）",
+        );
+        m.insert(
+            "remote.transport.heartbeat_max_loss",
+            "心跳丢失多少次判半开断开（默认 5）",
+        );
+        m.insert(
+            "remote.transport.outbound_queue",
+            "出站帧队列容量（默认 1024，天然反压）",
+        );
+        m.insert(
+            "remote.transport.default_hop_limit",
+            "帧默认跳数上限（默认 8）",
+        );
+        m.insert(
+            "remote.reorder.gap_timeout_ms",
+            "TELL 重排缺口等待上限（默认 250ms）",
+        );
         m.insert("remote.reorder.buffer_cap", "重排缓冲帧数上限（默认 1024）");
-        m.insert("remote.codec.extra_caps", "附加能力位（连 pb-only 对端时叠加）");
+        m.insert(
+            "remote.codec.extra_caps",
+            "附加能力位（连 pb-only 对端时叠加）",
+        );
         m
     }
 }
@@ -677,14 +774,18 @@ fn expand_env(raw: &str) -> String {
     // 简单扫描——配置文件规模小，重复扫描可接受；无 '}' 收尾的残缺
     // `${` 保持原样（提示配置书写错误，不静默吞）
     while let Some(start) = out.find("${") {
-        let Some(end_rel) = out[start..].find('}') else { break };
+        let Some(end_rel) = out[start..].find('}') else {
+            break;
+        };
         let end = start + end_rel;
         let inner = &out[start + 2..end];
         let (name, default) = match inner.split_once(":-") {
             Some((n, d)) => (n, Some(d)),
             None => (inner, None),
         };
-        let val = std::env::var(name).ok().or_else(|| default.map(String::from));
+        let val = std::env::var(name)
+            .ok()
+            .or_else(|| default.map(String::from));
         let replacement = val.unwrap_or_default();
         out.replace_range(start..=end, &replacement);
     }
@@ -724,11 +825,7 @@ fn merge_opt_str(
     }
 }
 
-fn warn_unknown(
-    table: &toml::map::Map<String, toml::Value>,
-    section: &str,
-    known: &[&str],
-) {
+fn warn_unknown(table: &toml::map::Map<String, toml::Value>, section: &str, known: &[&str]) {
     for k in table.keys() {
         if !known.contains(&k.as_str()) {
             tracing::warn!(section, key = %k, "unknown config key ignored (typo or newer version?)");
@@ -769,7 +866,11 @@ mod tests {
             "[remote.transport]\nheartbeat_interval_ms = 500\n\n[thread]\ndefault_mailbox_capacity = 7\n",
         )
         .unwrap();
-        let r = ParrotConfig::builder().load_file(&tmp).unwrap().build().unwrap();
+        let r = ParrotConfig::builder()
+            .load_file(&tmp)
+            .unwrap()
+            .build()
+            .unwrap();
         std::fs::remove_file(&tmp).ok();
         assert_eq!(r.remote.transport.heartbeat_interval_ms, 500);
         assert_eq!(r.thread.default_mailbox_capacity, 7);
@@ -781,11 +882,7 @@ mod tests {
     #[test]
     fn c3_code_beats_file() {
         let tmp = std::env::temp_dir().join(format!("pcfg_c3_{}.toml", std::process::id()));
-        std::fs::write(
-            &tmp,
-            "[remote.transport]\nheartbeat_interval_ms = 999\n",
-        )
-        .unwrap();
+        std::fs::write(&tmp, "[remote.transport]\nheartbeat_interval_ms = 999\n").unwrap();
         let r = ParrotConfig::builder()
             .load_file(&tmp)
             .unwrap()
@@ -793,7 +890,10 @@ mod tests {
             .build()
             .unwrap();
         std::fs::remove_file(&tmp).ok();
-        assert_eq!(r.remote.transport.heartbeat_interval_ms, 111, "代码层必须赢");
+        assert_eq!(
+            r.remote.transport.heartbeat_interval_ms, 111,
+            "代码层必须赢"
+        );
     }
 
     // C4：builder 先设、后 load——顺序无关（契约是"层"不是"调用序"）
@@ -837,9 +937,18 @@ mod tests {
 
     #[test]
     fn v2_hop_limit_range() {
-        assert!(ParrotConfig::builder().remote_default_hop_limit(0).build().is_err());
-        assert!(ParrotConfig::builder().remote_default_hop_limit(65).build().is_err());
-        assert!(ParrotConfig::builder().remote_default_hop_limit(8).build().is_ok());
+        assert!(ParrotConfig::builder()
+            .remote_default_hop_limit(0)
+            .build()
+            .is_err());
+        assert!(ParrotConfig::builder()
+            .remote_default_hop_limit(65)
+            .build()
+            .is_err());
+        assert!(ParrotConfig::builder()
+            .remote_default_hop_limit(8)
+            .build()
+            .is_ok());
     }
 
     #[test]
@@ -873,7 +982,11 @@ mod tests {
             "[remote.node]\nnode_id = \"${PCFG_TEST_NODE}\"\nbind = \"${PCFG_TEST_UNSET:-127.0.0.1:9801}\"\n",
         )
         .unwrap();
-        let r = ParrotConfig::builder().load_file(&tmp).unwrap().build().unwrap();
+        let r = ParrotConfig::builder()
+            .load_file(&tmp)
+            .unwrap()
+            .build()
+            .unwrap();
         std::fs::remove_file(&tmp).ok();
         std::env::remove_var("PCFG_TEST_NODE");
         assert_eq!(r.remote.node.node_id.as_deref(), Some("env-node-42"));
@@ -923,7 +1036,11 @@ extra_caps = 2
 "#,
         )
         .unwrap();
-        let r = ParrotConfig::builder().load_file(&tmp).unwrap().build().unwrap();
+        let r = ParrotConfig::builder()
+            .load_file(&tmp)
+            .unwrap()
+            .build()
+            .unwrap();
         std::fs::remove_file(&tmp).ok();
         assert_eq!(r.thread.shared_pool_size, 3);
         assert_eq!(r.thread.shared_burst_workers_max, 2);
@@ -951,13 +1068,28 @@ extra_caps = 2
     // topology_role 解析全枚举 + 非法回退 normal
     #[test]
     fn f2_role_parsing() {
-        assert_eq!(TopologyRoleValue::parse("hub"), Some(TopologyRoleValue::Hub));
-        assert_eq!(TopologyRoleValue::parse("HUB"), Some(TopologyRoleValue::Hub));
-        assert_eq!(TopologyRoleValue::parse("border"), Some(TopologyRoleValue::Border));
-        assert_eq!(TopologyRoleValue::parse("directory"), Some(TopologyRoleValue::Directory));
+        assert_eq!(
+            TopologyRoleValue::parse("hub"),
+            Some(TopologyRoleValue::Hub)
+        );
+        assert_eq!(
+            TopologyRoleValue::parse("HUB"),
+            Some(TopologyRoleValue::Hub)
+        );
+        assert_eq!(
+            TopologyRoleValue::parse("border"),
+            Some(TopologyRoleValue::Border)
+        );
+        assert_eq!(
+            TopologyRoleValue::parse("directory"),
+            Some(TopologyRoleValue::Directory)
+        );
         assert_eq!(TopologyRoleValue::parse("nonsense"), None);
         // 非法角色 → 默认 Normal（warn 日志路径）
-        let r = ParrotConfig::builder().remote_topology_role("nonsense").build().unwrap();
+        let r = ParrotConfig::builder()
+            .remote_topology_role("nonsense")
+            .build()
+            .unwrap();
         assert_eq!(r.remote.node.topology_role, TopologyRoleValue::Normal);
     }
 

@@ -13,9 +13,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use parrot_remote::admin::{
-    decode_sys_event, SysEvent,
-};
+use parrot_remote::admin::{decode_sys_event, SysEvent};
 use parrot_remote::admin_v2::{
     encode_admin_cmd_v2, AdminArtifactRef, AdminCommandV2, AdminInstancePolicy, AdminReplyV2,
     ComponentDeploy,
@@ -189,10 +187,7 @@ impl RawClient {
         };
         let mut enc = BytesMut::new();
         hs.encode(&mut enc).map_err(|e| e.to_string())?;
-        stream
-            .write_all(&enc)
-            .await
-            .map_err(|e| e.to_string())?;
+        stream.write_all(&enc).await.map_err(|e| e.to_string())?;
         let mut c = Self {
             stream,
             buf: BytesMut::new(),
@@ -229,7 +224,10 @@ impl RawClient {
     async fn send(&mut self, f: Frame) -> R<()> {
         let mut enc = BytesMut::new();
         f.encode(&mut enc).map_err(|e| e.to_string())?;
-        self.stream.write_all(&enc).await.map_err(|e| e.to_string())?;
+        self.stream
+            .write_all(&enc)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -279,7 +277,9 @@ fn stub_deploy(name: &str, pool: usize) -> AdminCommandV2 {
 
 #[tokio::test]
 async fn jvm_gateway_admin_v2_full_chain() {
-    let Some((port, _reaper)) = find_jvm_setup() else { return };
+    let Some((port, _reaper)) = find_jvm_setup() else {
+        return;
+    };
     let mut c = RawClient::connect(port).await.expect("connect + handshake");
 
     // ── MG11 jvm 侧：deploy（Props → jvm 方言应答 DialectMismatch 0x0A02）──

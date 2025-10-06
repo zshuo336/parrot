@@ -145,7 +145,10 @@ mod tests {
         // kill：links 帧失去 erl-gw-1
         h.apply_links(vec![]);
         let o2 = h.observed();
-        assert!(!o2.any_running("frontier"), "gateway down must degrade observed state");
+        assert!(
+            !o2.any_running("frontier"),
+            "gateway down must degrade observed state"
+        );
         assert!(o2.live_nodes.is_empty());
     }
 

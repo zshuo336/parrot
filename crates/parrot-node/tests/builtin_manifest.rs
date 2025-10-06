@@ -34,7 +34,10 @@ fn filter_empty_string_means_none() {
 
 #[test]
 fn filter_unknown_names_ignored() {
-    assert_eq!(builtin_manifest_components_from(Some("echo,nope")), vec!["echo"]);
+    assert_eq!(
+        builtin_manifest_components_from(Some("echo,nope")),
+        vec!["echo"]
+    );
 }
 
 #[test]
@@ -52,10 +55,7 @@ fn all_components_are_parrot_engine_props() {
     for c in &m.components {
         assert_eq!(c.engine.as_str(), "parrot", "{} 引擎漂移", c.name);
         assert!(
-            matches!(
-                &c.artifact,
-                parrot_app::manifest::ArtifactRef::Props { .. }
-            ),
+            matches!(&c.artifact, parrot_app::manifest::ArtifactRef::Props { .. }),
             "{} 非 Props 形态",
             c.name
         );

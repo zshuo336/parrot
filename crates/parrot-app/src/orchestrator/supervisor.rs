@@ -178,7 +178,11 @@ pub struct AppSupervisor {
 }
 
 impl AppSupervisor {
-    pub fn new(manifest: AppManifest, store: Arc<dyn DesiredStateStore>, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(
+        manifest: AppManifest,
+        store: Arc<dyn DesiredStateStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             desired: manifest,
             store,
@@ -258,18 +262,28 @@ impl AppSupervisor {
             if !versions.iter().all(|v| v == "1") {
                 // 形态 3：版本不符（desired 部署版本约定 "1"——
                 // deploy_payload 同约定；无在途登记走同步重建弧）
-                actions.push(ReconcileAction::Drain { comp: spec.name.clone() });
-                actions.push(ReconcileAction::Deploy { comp: spec.name.clone(), node });
+                actions.push(ReconcileAction::Drain {
+                    comp: spec.name.clone(),
+                });
+                actions.push(ReconcileAction::Deploy {
+                    comp: spec.name.clone(),
+                    node,
+                });
                 converged = false;
                 continue;
             }
             if have < want {
                 // 形态 4a：实例不足
-                actions.push(ReconcileAction::Deploy { comp: spec.name.clone(), node });
+                actions.push(ReconcileAction::Deploy {
+                    comp: spec.name.clone(),
+                    node,
+                });
                 converged = false;
             } else if have > want {
                 // 形态 4b：实例过剩
-                actions.push(ReconcileAction::Drain { comp: spec.name.clone() });
+                actions.push(ReconcileAction::Drain {
+                    comp: spec.name.clone(),
+                });
                 converged = false;
             } else if !observed.any_running(&spec.name) {
                 // 形态 5：全实例非 running（starting 等）——等监督
@@ -350,7 +364,9 @@ mod tests {
         ComponentSpec {
             name: name.into(),
             engine: EngineKind::Parrot,
-            artifact: ArtifactRef::Props { factory: format!("f-{name}") },
+            artifact: ArtifactRef::Props {
+                factory: format!("f-{name}"),
+            },
             instances: InstancePolicy::Singleton,
             placement: Default::default(),
             upgrade: Default::default(),
@@ -389,7 +405,10 @@ mod tests {
         let r = s.reconcile_once(&ObservedState::default());
         assert_eq!(
             r.actions,
-            vec![ReconcileAction::Deploy { comp: "a".into(), node: "parrot-gw-1".into() }]
+            vec![ReconcileAction::Deploy {
+                comp: "a".into(),
+                node: "parrot-gw-1".into()
+            }]
         );
         assert!(!r.converged);
     }
@@ -410,8 +429,12 @@ mod tests {
         assert_eq!(
             r.actions,
             vec![
-                ReconcileAction::Drain { comp: "orphan".into() },
-                ReconcileAction::Stop { comp: "orphan".into() },
+                ReconcileAction::Drain {
+                    comp: "orphan".into()
+                },
+                ReconcileAction::Stop {
+                    comp: "orphan".into()
+                },
             ]
         );
         assert!(!r.converged);
@@ -425,7 +448,10 @@ mod tests {
             r.actions,
             vec![
                 ReconcileAction::Drain { comp: "a".into() },
-                ReconcileAction::Deploy { comp: "a".into(), node: "parrot-gw-1".into() },
+                ReconcileAction::Deploy {
+                    comp: "a".into(),
+                    node: "parrot-gw-1".into()
+                },
             ]
         );
     }
@@ -473,7 +499,10 @@ mod tests {
                 .collect(),
         );
         let r4 = s.reconcile_once(&o4);
-        assert_eq!(r4.actions, vec![ReconcileAction::Drain { comp: "p".into() }]);
+        assert_eq!(
+            r4.actions,
+            vec![ReconcileAction::Drain { comp: "p".into() }]
+        );
     }
 
     // ── 幂等 ──
@@ -510,7 +539,9 @@ mod tests {
             Arc::new(FakeClock::new(0)),
         );
         let mut v2 = spec("a");
-        v2.artifact = ArtifactRef::Props { factory: "f-a-v2".into() };
+        v2.artifact = ArtifactRef::Props {
+            factory: "f-a-v2".into(),
+        };
         s.submit(manifest("app", vec![v2])).unwrap();
         let (rev, m) = store.latest().unwrap().unwrap();
         assert_eq!(rev, 1);
@@ -536,7 +567,9 @@ mod tests {
     fn in_flight_upgrade_waits() {
         let mut s = sup(manifest("app", vec![spec("a")]));
         let mut v2 = spec("a");
-        v2.artifact = ArtifactRef::Props { factory: "v2".into() };
+        v2.artifact = ArtifactRef::Props {
+            factory: "v2".into(),
+        };
         s.submit(manifest("app", vec![v2])).unwrap();
         let r = s.reconcile_once(&report("a", "running", "1"));
         assert!(matches!(r.actions[0], ReconcileAction::Wait { .. }));
@@ -574,10 +607,11 @@ mod tests {
         ));
         assert_eq!(
             d.artifact,
-            parrot_remote::admin_v2::AdminArtifactRef::Props { factory: "f-p".into() }
+            parrot_remote::admin_v2::AdminArtifactRef::Props {
+                factory: "f-p".into()
+            }
         );
     }
-
 
     // ── E1 补充（凑 20+：边界形态）──
 
@@ -634,7 +668,9 @@ mod tests {
         let mut s = sup(manifest("app", vec![spec("a")]));
         let mut v2 = spec("a");
         v2.upgrade = UpgradePolicy::Rolling { max_surge: 2 };
-        v2.artifact = ArtifactRef::Props { factory: "v2".into() };
+        v2.artifact = ArtifactRef::Props {
+            factory: "v2".into(),
+        };
         s.submit(manifest("app", vec![v2])).unwrap();
         assert!(matches!(
             s.upgrade_in_flight("a"),
@@ -647,7 +683,9 @@ mod tests {
         let mut s = sup(manifest("app", vec![spec("a"), spec("b")]));
         // 只换 a；b 不动
         let mut v2 = spec("a");
-        v2.artifact = ArtifactRef::Props { factory: "v2".into() };
+        v2.artifact = ArtifactRef::Props {
+            factory: "v2".into(),
+        };
         let b = spec("b");
         s.submit(manifest("app", vec![v2, b])).unwrap();
         assert!(s.upgrade_in_flight("a").is_some());
@@ -664,8 +702,20 @@ mod tests {
         };
         use parrot_remote::admin_v2::AdminArtifactRef as A;
         let cases = vec![
-            (mk(ArtifactRef::Wasm { digest: "d".into(), uri: "u".into() }), A::Wasm { digest: "d".into(), uri: "u".into() }),
-            (mk(ArtifactRef::Beam { app: "app1".into() }), A::Beam { app: "app1".into() }),
+            (
+                mk(ArtifactRef::Wasm {
+                    digest: "d".into(),
+                    uri: "u".into(),
+                }),
+                A::Wasm {
+                    digest: "d".into(),
+                    uri: "u".into(),
+                },
+            ),
+            (
+                mk(ArtifactRef::Beam { app: "app1".into() }),
+                A::Beam { app: "app1".into() },
+            ),
         ];
         for (spec, want) in cases {
             assert_eq!(AppSupervisor::deploy_payload(&spec).artifact, want);

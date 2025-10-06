@@ -75,7 +75,8 @@ fn main() {
                 .and_then(|p| args.get(p + 1))
                 .cloned()
                 .unwrap_or_else(|| "crawler.app.toml".into());
-            let m = match parrot_app::manifest::AppManifest::from_file(std::path::Path::new(&path)) {
+            let m = match parrot_app::manifest::AppManifest::from_file(std::path::Path::new(&path))
+            {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("manifest 读取失败（{path}）：{e}");

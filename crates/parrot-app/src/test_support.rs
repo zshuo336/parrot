@@ -4,7 +4,9 @@
 //! 返回 refs 视图 + teardown。装配类集成测试的公共收敛点：
 //! 断言逻辑零改动，装配样板不再逐测试复制。
 
-use crate::assemble::{AssemblingContext, DeployError, GatewayFactory, LocalDeployer, ParrotSpawner};
+use crate::assemble::{
+    AssemblingContext, DeployError, GatewayFactory, LocalDeployer, ParrotSpawner,
+};
 use crate::manifest::AppManifest;
 use crate::planner::{self, TopologyView};
 use parrot_api::types::BoxedActorRef;
@@ -25,7 +27,10 @@ struct LocalDeployerStorage {
 impl Assembled {
     /// 单组件首实例引用便捷取用。
     pub fn first(&self, comp: &str) -> Option<BoxedActorRef> {
-        self.ctx.component_refs(comp).and_then(|r| r.first()).map(|r| r.clone_boxed())
+        self.ctx
+            .component_refs(comp)
+            .and_then(|r| r.first())
+            .map(|r| r.clone_boxed())
     }
 
     /// 组件全部实例引用。

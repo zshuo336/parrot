@@ -238,8 +238,7 @@ pub mod runtime {
     /// handler export 句柄（typed funcs——消息热路径零查表）。
     pub struct ParrotComponent {
         instance: wasmtime::component::Instance,
-        handle_fn:
-            wasmtime::component::TypedFunc<(Msg,), (Result<Vec<u8>, String>,)>,
+        handle_fn: wasmtime::component::TypedFunc<(Msg,), (Result<Vec<u8>, String>,)>,
         tell_fn: wasmtime::component::TypedFunc<(Msg,), ()>,
         on_start_fn: wasmtime::component::TypedFunc<(), ()>,
         on_drain_fn: wasmtime::component::TypedFunc<(), ()>,
@@ -357,7 +356,11 @@ pub mod runtime {
 
     impl WasmComponent {
         /// ask 入口：bytes → WIT msg → handle → bytes（与 codec_registry 同构）。
-        pub fn handle(&mut self, type_key: &str, payload: &[u8]) -> Result<Vec<u8>, ComponentError> {
+        pub fn handle(
+            &mut self,
+            type_key: &str,
+            payload: &[u8],
+        ) -> Result<Vec<u8>, ComponentError> {
             self.enter_message_scope();
             let r = self.bindings.handle_fn.call(
                 &mut self.store,
@@ -445,7 +448,8 @@ pub mod runtime {
                 self.poisoned = false;
             }
             let _ = self.store.set_fuel(self.cfg.fuel_per_message);
-            self.store.set_epoch_deadline(self.cfg.epoch_deadline.max(1));
+            self.store
+                .set_epoch_deadline(self.cfg.epoch_deadline.max(1));
         }
 
         fn exit_message_scope<T>(&mut self, _r: &Result<T, wasmtime::Error>) {

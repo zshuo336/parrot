@@ -9,8 +9,8 @@
 //!    状态机入口位——CI 混沌调度的静态计划面）。
 
 use parrot_app::manifest::{AppManifest, UpgradePolicy};
-use parrot_app::planner;
 use parrot_app::orchestrator::rollout::RolloutTracker;
+use parrot_app::planner;
 
 /// App 孪生门禁报告。
 #[derive(Debug, Clone, PartialEq)]
@@ -108,9 +108,7 @@ pub fn twin_app(m: &AppManifest) -> TwinAppReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parrot_app::manifest::{
-        ArtifactRef, ComponentSpec, EngineKind, InstancePolicy, WireSpec,
-    };
+    use parrot_app::manifest::{ArtifactRef, ComponentSpec, EngineKind, InstancePolicy, WireSpec};
 
     fn spec(name: &str, engine: EngineKind) -> ComponentSpec {
         ComponentSpec {
@@ -118,12 +116,17 @@ mod tests {
             engine,
             artifact: match engine {
                 EngineKind::Erlang => ArtifactRef::Beam { app: name.into() },
-                EngineKind::Ray => ArtifactRef::PyModule { module: name.into(), runtime_env: None },
+                EngineKind::Ray => ArtifactRef::PyModule {
+                    module: name.into(),
+                    runtime_env: None,
+                },
                 EngineKind::Akka => ArtifactRef::Jvm {
                     main_class: format!("main.{name}"),
                     coords: None,
                 },
-                _ => ArtifactRef::Props { factory: format!("f-{name}") },
+                _ => ArtifactRef::Props {
+                    factory: format!("f-{name}"),
+                },
             },
             instances: InstancePolicy::Singleton,
             placement: Default::default(),
@@ -166,8 +169,7 @@ mod tests {
         );
         let r = twin_app(&m);
         assert!(r.passed);
-        let map: std::collections::BTreeMap<_, _> =
-            r.node_map.clone().into_iter().collect();
+        let map: std::collections::BTreeMap<_, _> = r.node_map.clone().into_iter().collect();
         assert_eq!(map["erl-comp"], "erlang-gw-1");
         assert_eq!(map["py-comp"], "ray-gw-1");
         assert_eq!(map["jvm-comp"], "akka-gw-1");
@@ -202,7 +204,9 @@ mod tests {
     #[test]
     fn upgrade_matrix_all_strategies() {
         let mut hot = spec("hot", EngineKind::Parrot);
-        hot.upgrade = UpgradePolicy::HotSwap { drain_timeout_ms: 1 };
+        hot.upgrade = UpgradePolicy::HotSwap {
+            drain_timeout_ms: 1,
+        };
         let mut roll = spec("roll", EngineKind::Parrot);
         roll.upgrade = UpgradePolicy::Rolling { max_surge: 1 };
         let mut rec = spec("rec", EngineKind::Parrot);
@@ -223,7 +227,10 @@ mod tests {
             to: "b:/user/in".into(),
             qos: "lan".into(),
         };
-        let m = manifest(vec![spec("a", EngineKind::Parrot), spec("b", EngineKind::Parrot)], vec![w]);
+        let m = manifest(
+            vec![spec("a", EngineKind::Parrot), spec("b", EngineKind::Parrot)],
+            vec![w],
+        );
         let r = twin_app(&m);
         assert_eq!(r.wires, 1);
     }

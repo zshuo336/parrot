@@ -31,7 +31,12 @@ fn rss_kb() -> Option<u64> {
         let s = std::fs::read_to_string("/proc/self/status").ok()?;
         for line in s.lines() {
             if let Some(v) = line.strip_prefix("VmRSS:") {
-                return v.trim_end_matches(" kB").trim().parse::<u64>().ok().map(|k| k);
+                return v
+                    .trim_end_matches(" kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .map(|k| k);
             }
         }
         None
@@ -54,14 +59,8 @@ async fn dylib_load_unload_cycle_rss_stable() {
         unsafe {
             let mut buf = vec![0u8; 4096];
             let mut rb = AbiReplyBuf::new(&mut buf);
-            DylibLoader::handle_msg(
-                &DylibLoader,
-                &h,
-                c,
-                AbiMsg::new("echo", b"cycle"),
-                &mut rb,
-            )
-            .unwrap();
+            DylibLoader::handle_msg(&DylibLoader, &h, c, AbiMsg::new("echo", b"cycle"), &mut rb)
+                .unwrap();
             assert_eq!(&buf[..rb.written as usize], b"cycle");
         }
         let r = DylibLoader::unload(&DylibLoader, h, Duration::from_millis(300))

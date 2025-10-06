@@ -367,8 +367,7 @@ pub mod executor_v2 {
                 AdminArtifactRef::Wasm { digest, uri }
                 | AdminArtifactRef::Dylib { digest, uri, .. } => {
                     let local = Self::materialize(uri).map_err(|e| (v2_err::ARTIFACT_FETCH, e))?;
-                    Self::verify(&local, digest)
-                        .map_err(|e| (v2_err::ARTIFACT_DIGEST, e))?;
+                    Self::verify(&local, digest).map_err(|e| (v2_err::ARTIFACT_DIGEST, e))?;
                     Ok(local)
                 }
                 // 非本方言 artifact：Executor 侧应在路由前拒绝（DIALECT_MISMATCH）
@@ -390,9 +389,7 @@ pub mod executor_v2 {
                 let p = if rest.starts_with('/') {
                     rest
                 } else {
-                    rest.split_once('/')
-                        .map(|(_, path)| path)
-                        .unwrap_or(rest)
+                    rest.split_once('/').map(|(_, path)| path).unwrap_or(rest)
                 };
                 let path = std::path::PathBuf::from(format!("/{p}"));
                 if path.is_file() {
@@ -416,7 +413,10 @@ pub mod executor_v2 {
             use sha2::{Digest, Sha256};
             let bytes = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
             let actual = hex::encode(Sha256::digest(&bytes));
-            let expect = digest.strip_prefix("sha256:").unwrap_or(digest).to_ascii_lowercase();
+            let expect = digest
+                .strip_prefix("sha256:")
+                .unwrap_or(digest)
+                .to_ascii_lowercase();
             if actual != expect {
                 return Err(format!(
                     "sha256 mismatch: want {expect}, got {actual} ({path:?})"
@@ -525,8 +525,7 @@ pub mod executor_v2 {
                 .into_iter()
                 .filter(|p| {
                     p == prefix
-                        || (p.starts_with(prefix)
-                            && p.as_bytes().get(prefix.len()) == Some(&b'-'))
+                        || (p.starts_with(prefix) && p.as_bytes().get(prefix.len()) == Some(&b'-'))
                 })
                 .collect()
         }
@@ -538,7 +537,9 @@ pub mod executor_v2 {
             // 已有路径集合；此处统一取最长匹配）。首版规则：rsplitonce
             // 取 `-` 前段（多实例命名约定优先），无 `-` 整段即名。
             match rest.rsplit_once('-') {
-                Some((name, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+                Some((name, tail))
+                    if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) =>
+                {
                     name.to_string()
                 }
                 _ => rest.to_string(),
@@ -549,7 +550,10 @@ pub mod executor_v2 {
         fn forget_versions(&self, paths: &[String]) {
             let comps: std::collections::HashSet<String> =
                 paths.iter().map(|p| Self::path_to_component(p)).collect();
-            self.versions.lock().unwrap().retain(|k, _| !comps.contains(k));
+            self.versions
+                .lock()
+                .unwrap()
+                .retain(|k, _| !comps.contains(k));
         }
     }
 
@@ -568,12 +572,7 @@ pub mod executor_v2 {
             }
         }
 
-        async fn drain(
-            &self,
-            req_id: u64,
-            prefix: &str,
-            timeout_ms: u64,
-        ) -> AdminReplyV2 {
+        async fn drain(&self, req_id: u64, prefix: &str, timeout_ms: u64) -> AdminReplyV2 {
             let paths = self.matching_paths(prefix);
             if paths.is_empty() {
                 return failed_v2(
@@ -661,10 +660,7 @@ pub mod executor_v2 {
 
     /// 命令直通辅助（handle_admin_command_v2 之外的进程内入口——
     /// 测试与 bin 安装共用；回包已含 req_id）。
-    pub async fn exec_command_v2(
-        ts: &Arc<ThreadActorSystem>,
-        cmd: AdminCommandV2,
-    ) -> AdminReplyV2 {
+    pub async fn exec_command_v2(ts: &Arc<ThreadActorSystem>, cmd: AdminCommandV2) -> AdminReplyV2 {
         let ex = NodeComponentExecutor::new(ts.clone());
         match cmd {
             AdminCommandV2::DeployComponent { req_id, component } => {
@@ -762,9 +758,9 @@ impl Actor for WasmActor {
                             "wasm OverQuota: out of fuel".into(),
                         ))
                     }
-                    Err(e) => Err(parrot_api::errors::ActorError::MessageHandlingError(format!(
-                        "wasm trap: {e}"
-                    ))),
+                    Err(e) => Err(parrot_api::errors::ActorError::MessageHandlingError(
+                        format!("wasm trap: {e}"),
+                    )),
                 };
             }
             Err(parrot_api::errors::ActorError::MessageHandlingError(
@@ -805,8 +801,11 @@ pub fn builtin_manifest_components_from(filter: Option<&str>) -> Vec<String> {
         None => all,
         Some(f) if f.trim().is_empty() => vec![],
         Some(f) => {
-            let want: std::collections::BTreeSet<&str> =
-                f.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let want: std::collections::BTreeSet<&str> = f
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
             all.into_iter()
                 .filter(|n| want.contains(n.as_str()))
                 .collect()
