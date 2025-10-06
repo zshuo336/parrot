@@ -31,6 +31,13 @@ pub mod caps {
     pub const ZSTD: u32 = 1 << 2;
     pub const QUIC: u32 = 1 << 3;
     pub const WS: u32 = 1 << 4;
+    /// B2（DEV_09）：节点支持 admin-v2 组件部署（ArtifactChannel + Executor）。
+    /// 发起侧预判：未置位节点不发 DeployComponent（老节点回 Unsupported）。
+    pub const ARTIFACTS: u32 = 1 << 5;
+    /// C 阶段 feature gate：wasmtime 运行时（节点如实上报——未启用不发）。
+    pub const WASM: u32 = 1 << 6;
+    /// D 阶段 feature gate：cdylib 动态加载（节点如实上报——未启用不发）。
+    pub const DYLIB: u32 = 1 << 7;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -400,5 +407,27 @@ mod tests {
             HandshakeBody::decode_tlv(&[1, 0x10, 0]),
             Err(HandshakeError::Truncated(1, 0x10, 0))
         ));
+    }
+
+    // ── B2（DEV_09）：caps 扩展位 ──────────────────────────
+    #[test]
+    fn artifact_caps_bit_values() {
+        assert_eq!(caps::ARTIFACTS, 1 << 5);
+        assert_eq!(caps::WASM, 1 << 6);
+        assert_eq!(caps::DYLIB, 1 << 7);
+        // 与既有位互不重叠
+        let all = caps::BIN | caps::PB | caps::ZSTD | caps::QUIC | caps::WS;
+        assert_eq!(all & (caps::ARTIFACTS | caps::WASM | caps::DYLIB), 0);
+    }
+
+    #[test]
+    fn negotiate_artifacts_is_orthogonal_to_codec() {
+        // ARTIFACTS 只在双方都置位时保留在交集里；不影响 codec 协商成败
+        let common = negotiate_caps(caps::BIN | caps::ARTIFACTS, caps::BIN | caps::ARTIFACTS)
+            .unwrap();
+        assert_eq!(common & caps::ARTIFACTS, caps::ARTIFACTS);
+        // 单侧置位 → 交集无该位，但仍握手成功（BIN 公共）
+        let common = negotiate_caps(caps::BIN | caps::ARTIFACTS, caps::BIN).unwrap();
+        assert_eq!(common & caps::ARTIFACTS, 0);
     }
 }

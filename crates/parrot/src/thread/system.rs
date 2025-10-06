@@ -677,6 +677,15 @@ impl ThreadActorSystem {
         self.registry.read().unwrap().len()
     }
 
+    /// List all registered actor paths (B2/DEV_09：admin-v2 Status/Stop
+    /// 前缀匹配需要枚举 registry 键；只读快照，排序保证确定性).
+    pub fn actor_paths(&self) -> Vec<String> {
+        let registry = self.registry.read().unwrap();
+        let mut paths: Vec<String> = registry.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
     /// Broadcast a message to all registered actors.
     pub async fn broadcast_message(&self, msg: BoxedMessage) -> Result<(), SystemError> {
         if self.is_shutting_down() {
