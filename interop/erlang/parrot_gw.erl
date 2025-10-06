@@ -13,7 +13,13 @@
 -module(parrot_gw).
 -export([main/1, start/1, start/2, service/2, build_frame/5, build_frame/6,
          parse_frame/1, handshake_body/1, handshake_body/2, handshake_ack_body/1,
-         err_payload/2, parse_port/1]).
+         err_payload/2, parse_port/1,
+         %% B4（DEV_09）：admin-v2 编解码 + 四命令（测试直呼）
+         encode_admin_cmd_v2/1, decode_admin_cmd_v2/1,
+         encode_admin_reply_v2/1, decode_admin_reply_v2/1,
+         admin_init/0, admin_deploy/1, admin_stop/1, admin_drain/2,
+         admin_status/1, admin_instance_paths/2, instance_count/1,
+         bc_put_varint/1, bc_get_varint/1]).
 
 -define(VER, 1).
 -define(ASK, 16#10).
@@ -134,6 +140,390 @@ crawl_encode_batch([{Id, Url, Depth} | T], Acc) ->
     crawl_encode_batch(T, <<Acc/binary, Id:64/little, U:32/little, Url:U/binary,
                             Depth:16/little>>).
 
+%% ============ B4（DEV_09）：admin-v2 编解码 + Beam 热加载 ============
+%% payload = [u8 tag][bincode standard(body)]；tag 0x03=CMD 0x04=REPLY
+%% bincode varint：值≤250 单字节；0xFB+u16LE / 0xFC+u32LE / 0xFD+u64LE。
+%% serde 形态：enum = [varint 变体索引][字段序体]（externally tagged）；
+%% Option = 0/1+体；String/Vec = varint len + 元素。
+%% 冻结事实源：docs/vectors/admin_v2.json（六向量逐字节互锁）。
+
+-define(FT_SYSTEM_EVENT, 16#05).
+-define(TAG_ADMIN_CMD_V2, 16#03).
+-define(TAG_ADMIN_REPLY_V2, 16#04).
+%% v2 错误码扩展段
+-define(V2_ARTIFACT_FETCH, 16#0A00).
+-define(V2_ARTIFACT_DIGEST, 16#0A01).
+-define(V2_DIALECT_MISMATCH, 16#0A02).
+-define(V2_COMPONENT_NOT_FOUND, 16#0A03).
+-define(V2_DRAIN_TIMEOUT, 16#0A04).
+-define(V2_FACTORY_NOT_FOUND, 16#0A05).
+-define(V2_SPAWN_FAILED, 16#0A06).
+%% 组件登记表（admin-v2 Deploy 写入 / Status 报告 / Stop 清除）
+-define(ADMIN_TAB, parrot_admin_components).
+
+%% ---- varint ----
+
+bc_put_varint(V) when V =< 250 -> <<V:8>>;
+bc_put_varint(V) when V =< 16#FFFF -> <<16#FB:8, V:16/little>>;
+bc_put_varint(V) when V =< 16#FFFFFFFF -> <<16#FC:8, V:32/little>>;
+bc_put_varint(V) -> <<16#FD:8, V:64/little>>.
+
+bc_get_varint(<<B0:8, Rest/binary>>) when B0 =< 16#FA -> {B0, Rest};
+bc_get_varint(<<16#FB:8, V:16/little, Rest/binary>>) -> {V, Rest};
+bc_get_varint(<<16#FC:8, V:32/little, Rest/binary>>) -> {V, Rest};
+bc_get_varint(<<16#FD:8, V:64/little, Rest/binary>>) -> {V, Rest}.
+
+%% ---- 基础 serde 形态 ----
+
+bc_put_str(S) -> B = to_bin(S), <<(bc_put_varint(byte_size(B)))/binary, B/binary>>.
+
+bc_get_str(Bin0) ->
+    {N, Bin1} = bc_get_varint(Bin0),
+    <<S:N/binary, Rest/binary>> = Bin1,
+    {S, Rest}.
+
+%% Option<binary>：0=None；1=varint len + bytes
+bc_put_opt_bytes(undefined) -> <<0:8>>;
+bc_put_opt_bytes(B) -> <<1:8, (bc_put_varint(byte_size(B)))/binary, B/binary>>.
+
+bc_get_opt_bytes(<<0:8, Rest/binary>>) -> {undefined, Rest};
+bc_get_opt_bytes(<<1:8, Bin0/binary>>) ->
+    {N, Bin1} = bc_get_varint(Bin0),
+    <<B:N/binary, Rest/binary>> = Bin1,
+    {B, Rest}.
+
+%% ---- AdminArtifactRef（变体 0..5）----
+
+bc_put_artifact({props, Factory}) ->
+    <<0:8, (bc_put_str(Factory))/binary>>;
+bc_put_artifact({beam, App}) ->
+    <<1:8, (bc_put_str(App))/binary>>;
+bc_put_artifact({pymodule, Module, Env}) ->
+    <<2:8, (bc_put_str(Module))/binary, (bc_put_opt_str(Env))/binary>>;
+bc_put_artifact({jvm, MainClass, Coords}) ->
+    <<3:8, (bc_put_str(MainClass))/binary, (bc_put_opt_str(Coords))/binary>>;
+bc_put_artifact({wasm, Digest, Uri}) ->
+    <<4:8, (bc_put_str(Digest))/binary, (bc_put_str(Uri))/binary>>;
+bc_put_artifact({dylib, Digest, Uri, Abi}) ->
+    <<5:8, (bc_put_str(Digest))/binary, (bc_put_str(Uri))/binary,
+      (bc_put_varint(Abi))/binary>>.
+
+bc_put_opt_str(undefined) -> <<0:8>>;
+bc_put_opt_str(S) -> <<1:8, (bc_put_str(S))/binary>>.
+
+bc_get_opt_str(<<0:8, Rest/binary>>) -> {undefined, Rest};
+bc_get_opt_str(<<1:8, Bin0/binary>>) ->
+    {S, Rest} = bc_get_str(Bin0),
+    {S, Rest}.
+
+bc_get_artifact(<<0:8, Bin0/binary>>) ->
+    {F, Rest} = bc_get_str(Bin0), {{props, F}, Rest};
+bc_get_artifact(<<1:8, Bin0/binary>>) ->
+    {App, Rest} = bc_get_str(Bin0), {{beam, App}, Rest};
+bc_get_artifact(<<2:8, Bin0/binary>>) ->
+    {M, Bin1} = bc_get_str(Bin0),
+    {Env, Rest} = bc_get_opt_str(Bin1),
+    {{pymodule, M, Env}, Rest};
+bc_get_artifact(<<3:8, Bin0/binary>>) ->
+    {MC, Bin1} = bc_get_str(Bin0),
+    {Coords, Rest} = bc_get_opt_str(Bin1),
+    {{jvm, MC, Coords}, Rest};
+bc_get_artifact(<<4:8, Bin0/binary>>) ->
+    {D, Bin1} = bc_get_str(Bin0), {U, Rest} = bc_get_str(Bin1),
+    {{wasm, D, U}, Rest};
+bc_get_artifact(<<5:8, Bin0/binary>>) ->
+    {D, Bin1} = bc_get_str(Bin0), {U, Bin2} = bc_get_str(Bin1),
+    {Abi, Rest} = bc_get_varint(Bin2),
+    {{dylib, D, U, Abi}, Rest}.
+
+%% ---- AdminInstancePolicy（0=Singleton 1=Pool 2=Sharded）----
+
+bc_put_policy(singleton) -> <<0:8>>;
+bc_put_policy({pool, N}) -> <<1:8, (bc_put_varint(N))/binary>>;
+bc_put_policy({sharded, N}) -> <<2:8, (bc_put_varint(N))/binary>>.
+
+bc_get_policy(<<0:8, Rest/binary>>) -> {singleton, Rest};
+bc_get_policy(<<1:8, Bin0/binary>>) ->
+    {N, Rest} = bc_get_varint(Bin0), {{pool, N}, Rest};
+bc_get_policy(<<2:8, Bin0/binary>>) ->
+    {N, Rest} = bc_get_varint(Bin0), {{sharded, N}, Rest}.
+
+instance_count(singleton) -> 1;
+instance_count({pool, N}) -> N;
+instance_count({sharded, N}) -> N.
+
+%% ---- ComponentDeploy ----
+%% {deploy, Name, Version, Artifact, Instances, Config}
+
+bc_put_deploy({Name, Version, Artifact, Instances, Config}) ->
+    <<(bc_put_str(Name))/binary, (bc_put_str(Version))/binary,
+      (bc_put_artifact(Artifact))/binary, (bc_put_policy(Instances))/binary,
+      (bc_put_opt_bytes(Config))/binary>>.
+
+bc_get_deploy(Bin0) ->
+    {Name, Bin1} = bc_get_str(Bin0),
+    {Version, Bin2} = bc_get_str(Bin1),
+    {Artifact, Bin3} = bc_get_artifact(Bin2),
+    {Instances, Bin4} = bc_get_policy(Bin3),
+    {Config, Rest} = bc_get_opt_bytes(Bin4),
+    {{Name, Version, Artifact, Instances, Config}, Rest}.
+
+%% ---- AdminCommandV2 ----
+%% {deploy_component, ReqId, Deploy}
+%% {drain_component, ReqId, Prefix, TimeoutMs}
+%% {stop_component, ReqId, Prefix}
+%% {component_status, ReqId, Prefix}
+
+encode_admin_cmd_v2(Cmd) ->
+    <<?TAG_ADMIN_CMD_V2:8, (enc_cmd_body(Cmd))/binary>>.
+
+enc_cmd_body({deploy_component, ReqId, Deploy}) ->
+    <<0:8, (bc_put_varint(ReqId))/binary, (bc_put_deploy(Deploy))/binary>>;
+enc_cmd_body({drain_component, ReqId, Prefix, TimeoutMs}) ->
+    <<1:8, (bc_put_varint(ReqId))/binary, (bc_put_str(Prefix))/binary,
+      (bc_put_varint(TimeoutMs))/binary>>;
+enc_cmd_body({stop_component, ReqId, Prefix}) ->
+    <<2:8, (bc_put_varint(ReqId))/binary, (bc_put_str(Prefix))/binary>>;
+enc_cmd_body({component_status, ReqId, Prefix}) ->
+    <<3:8, (bc_put_varint(ReqId))/binary, (bc_put_str(Prefix))/binary>>.
+
+decode_admin_cmd_v2(<<?TAG_ADMIN_CMD_V2:8, Body/binary>>) ->
+    {Cmd, <<>>} = dec_cmd_body(Body),
+    Cmd.
+
+dec_cmd_body(<<0:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {Deploy, Rest} = bc_get_deploy(Bin1),
+    {{deploy_component, ReqId, Deploy}, Rest};
+dec_cmd_body(<<1:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {Prefix, Bin2} = bc_get_str(Bin1),
+    {TimeoutMs, Rest} = bc_get_varint(Bin2),
+    {{drain_component, ReqId, Prefix, TimeoutMs}, Rest};
+dec_cmd_body(<<2:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {Prefix, Rest} = bc_get_str(Bin1),
+    {{stop_component, ReqId, Prefix}, Rest};
+dec_cmd_body(<<3:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {Prefix, Rest} = bc_get_str(Bin1),
+    {{component_status, ReqId, Prefix}, Rest}.
+
+%% ---- AdminReplyV2 ----
+%% {deployed, ReqId, [Path]}
+%% {drained, ReqId, Drained, Aborted}
+%% {stopped, ReqId}
+%% {status, ReqId, [{Path, State, Version}]}
+%% {failed, ReqId, Code, Detail}
+
+encode_admin_reply_v2(Reply) ->
+    <<?TAG_ADMIN_REPLY_V2:8, (enc_reply_body(Reply))/binary>>.
+
+enc_reply_body({deployed, ReqId, Paths}) ->
+    N = length(Paths),
+    List = << <<(bc_put_str(P))/binary>> || P <- Paths >>,
+    <<0:8, (bc_put_varint(ReqId))/binary, (bc_put_varint(N))/binary, List/binary>>;
+enc_reply_body({drained, ReqId, Drained, Aborted}) ->
+    <<1:8, (bc_put_varint(ReqId))/binary, (bc_put_varint(Drained))/binary,
+      (bc_put_varint(Aborted))/binary>>;
+enc_reply_body({stopped, ReqId}) ->
+    <<2:8, (bc_put_varint(ReqId))/binary>>;
+enc_reply_body({status, ReqId, States}) ->
+    N = length(States),
+    List = << <<(bc_put_str(P))/binary, (bc_put_str(S))/binary,
+                (bc_put_str(V))/binary>> || {P, S, V} <- States >>,
+    <<3:8, (bc_put_varint(ReqId))/binary, (bc_put_varint(N))/binary, List/binary>>;
+enc_reply_body({failed, ReqId, Code, Detail}) ->
+    <<4:8, (bc_put_varint(ReqId))/binary, (bc_put_varint(Code))/binary,
+      (bc_put_str(Detail))/binary>>.
+
+decode_admin_reply_v2(<<?TAG_ADMIN_REPLY_V2:8, Body/binary>>) ->
+    {Reply, <<>>} = dec_reply_body(Body),
+    Reply.
+
+dec_reply_body(<<0:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {N, Bin2} = bc_get_varint(Bin1),
+    {Paths, Rest} = bc_get_str_list(N, Bin2),
+    {{deployed, ReqId, Paths}, Rest};
+dec_reply_body(<<1:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {D, Bin2} = bc_get_varint(Bin1),
+    {A, Rest} = bc_get_varint(Bin2),
+    {{drained, ReqId, D, A}, Rest};
+dec_reply_body(<<2:8, Bin0/binary>>) ->
+    {ReqId, Rest} = bc_get_varint(Bin0),
+    {{stopped, ReqId}, Rest};
+dec_reply_body(<<3:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {N, Bin2} = bc_get_varint(Bin1),
+    {States, Rest} = bc_get_states(N, Bin2),
+    {{status, ReqId, States}, Rest};
+dec_reply_body(<<4:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {Code, Bin2} = bc_get_varint(Bin1),
+    {Detail, Rest} = bc_get_str(Bin2),
+    {{failed, ReqId, Code, Detail}, Rest}.
+
+bc_get_str_list(0, Bin) -> {[], Bin};
+bc_get_str_list(N, Bin0) ->
+    {S, Bin1} = bc_get_str(Bin0),
+    {Rest, Bin2} = bc_get_str_list(N - 1, Bin1),
+    {[S | Rest], Bin2}.
+
+bc_get_states(0, Bin) -> {[], Bin};
+bc_get_states(N, Bin0) ->
+    {P, Bin1} = bc_get_str(Bin0),
+    {S, Bin2} = bc_get_str(Bin1),
+    {V, Bin3} = bc_get_str(Bin2),
+    {Rest, Bin4} = bc_get_states(N - 1, Bin3),
+    {[{P, S, V} | Rest], Bin4}.
+
+%% ---- admin-v2 四命令执行（Beam 热加载方言）----
+
+admin_init() ->
+    case ets:info(?ADMIN_TAB) of
+        undefined -> ets:new(?ADMIN_TAB, [named_table, public, set,
+                                          {read_concurrency, true}]);
+        _ -> ok
+    end.
+
+%% 实例路径展开（与 parrot-app/Rust/Python 同规）
+admin_instance_paths(Name, singleton) -> [<<"/user/", Name/binary>>];
+admin_instance_paths(Name, {pool, N}) ->
+    [<<"/user/", Name/binary, $-, (integer_to_binary(I))/binary>> || I <- lists:seq(0, N - 1)];
+admin_instance_paths(Name, {sharded, N}) ->
+    admin_instance_paths(Name, {pool, N}).
+
+%% Deploy{Beam}：ArtifactDir 加 code path → code:load_abs(Module) 热加载
+%% （新 beam 替换旧版本——OTP code replacement 语义；后续 service 分发即新
+%% 模块行为）。ArtifactDir 发现顺序：
+%%   1. $PARROT_ARTIFACT_DIR（与 Rust/Python 方言同约定）
+%%   2. /tmp/parrot-artifacts/{app}/（Manifest 形态惯例）
+%%   3. 当前 code path（beam 已在搜索路径——纯 load_abs）
+%% 登记表写入 {Name, Version, Paths, Module}。
+admin_deploy({Name, Version, {beam, App}, Instances, _Config}) ->
+    try
+        Module = binary_to_atom(App, utf8),
+        add_artifact_paths(App),
+        %% OTP 热替换语义（B4 规格 code:load_abs + restart_child 的方言落点）：
+        %%   purge（清旧版）→ load_file（沿 code path 载新版——artifact dir
+        %%   已 add_patha 在首，同名模块即热替换；后续调用走新版代码）。
+        code:purge(Module),
+        case code:load_file(Module) of
+            {module, Module} ->
+                Paths = admin_instance_paths(Name, Instances),
+                ets:insert(?ADMIN_TAB, {Name, Version, Paths, Module}),
+                {deployed, Paths};
+            {error, Why} ->
+                {failed, ?V2_SPAWN_FAILED,
+                 iolist_to_binary(io_lib:format("load_file ~s: ~p", [App, Why]))}
+        end
+    catch
+        _:R -> {failed, ?V2_SPAWN_FAILED,
+                iolist_to_binary(io_lib:format("deploy: ~p", [R]))}
+    end;
+admin_deploy({_Name, _V, Other, _I, _C}) ->
+    {failed, ?V2_DIALECT_MISMATCH,
+     iolist_to_binary(io_lib:format("erl executor expects Beam, got ~p", [Other]))}.
+
+%% artifact 目录发现 + add_patha（幂等——已在 path 则跳过）
+add_artifact_paths(App) ->
+    Dirs = artifact_dirs(App),
+    [begin
+         case lists:member(D, code:get_path()) of
+             true -> ok;
+             false -> code:add_patha(D)
+         end
+     end || D <- Dirs],
+    ok.
+
+artifact_dirs(App) ->
+    EnvDir = case os:getenv("PARROT_ARTIFACT_DIR") of
+                 false -> "/tmp/parrot-artifacts";
+                 D -> D
+             end,
+    AppS = binary_to_list(App),
+    [filename:join(EnvDir, AppS), EnvDir].
+
+%% Stop：登记表清除（beam 模块保留——code:replace_semaphore 语义之外
+%% 的最小方言实现；热加载测试关注行为切换而非卸载）。
+admin_stop(Prefix) ->
+    case admin_match(Prefix) of
+        [] -> {failed, ?V2_COMPONENT_NOT_FOUND,
+               iolist_to_binary(io_lib:format("no component under ~s", [Prefix]))};
+        Comps ->
+            lists:foreach(fun({Name, _, _, _}) ->
+                            ets:delete(?ADMIN_TAB, Name)
+                          end, Comps),
+            stopped
+    end.
+
+%% Drain：erlang 无邮箱排空原语映射（网关 service 无状态进程 per-ask）——
+%% 语义映射为登记表组件全部优雅清除（drained=实例数 / aborted=0）。
+admin_drain(Prefix, _TimeoutMs) ->
+    case admin_match(Prefix) of
+        [] -> {failed, ?V2_COMPONENT_NOT_FOUND,
+               iolist_to_binary(io_lib:format("no component under ~s", [Prefix]))};
+        Comps ->
+            N = lists:sum([length(P) || {_, _, P, _} <- Comps]),
+            lists:foreach(fun({Name, _, _, _}) ->
+                            ets:delete(?ADMIN_TAB, Name)
+                          end, Comps),
+            {drained_reply, N, 0}
+    end.
+
+admin_status(Prefix) ->
+    case admin_match(Prefix) of
+        [] -> {failed, ?V2_COMPONENT_NOT_FOUND,
+               iolist_to_binary(io_lib:format("no component under ~s", [Prefix]))};
+        Comps ->
+            States = [{P, <<"running">>, V}
+                      || {_, V, Paths, _} <- Comps, P <- Paths],
+            {status_reply, States}
+    end.
+
+%% 前缀匹配（Rust/Python 同规：整段相等或后随 '-'）
+admin_match(Prefix) ->
+    ets:foldl(fun({_Name, _V, Paths, _M} = E, Acc) ->
+                  Match = fun(P) ->
+                                  P =:= Prefix orelse
+                                    (binary:match(P, Prefix) =:= {0, byte_size(Prefix)}
+                                     andalso binary:at(P, byte_size(Prefix)) =:= $-)
+                          end,
+                  case lists:any(Match, Paths) of
+                      true -> [E | Acc];
+                      false -> Acc
+                  end
+              end, [], ?ADMIN_TAB).
+
+%% SYSTEM_EVENT payload 分发：admin-v2 命令 → 执行 → 回帧。
+%% 返回 {ok, ReplyFrame} | ignore（非 admin-v2 tag）。
+admin_handle_frame(Sock, Cid, Path, <<?TAG_ADMIN_CMD_V2:8, _/binary>> = Payload) ->
+    Cmd = decode_admin_cmd_v2(Payload),
+    Reply = case Cmd of
+                {deploy_component, ReqId, Deploy} ->
+                    admin_reply(ReqId, admin_deploy(Deploy));
+                {drain_component, ReqId, Prefix, TimeoutMs} ->
+                    admin_reply(ReqId, admin_drain(Prefix, TimeoutMs));
+                {stop_component, ReqId, Prefix} ->
+                    admin_reply(ReqId, admin_stop(Prefix));
+                {component_status, ReqId, Prefix} ->
+                    admin_reply(ReqId, admin_status(Prefix))
+            end,
+    gen_tcp:send(Sock, build_frame(?FT_SYSTEM_EVENT, Cid, Path, <<>>,
+                                   encode_admin_reply_v2(Reply))),
+    ok;
+admin_handle_frame(_Sock, _Cid, _Path, _) ->
+    ignore.
+
+%% 方言内部形态 → AdminReplyV2 tuple
+admin_reply(ReqId, {deployed, Paths}) -> {deployed, ReqId, Paths};
+admin_reply(ReqId, {drained_reply, D, A}) -> {drained, ReqId, D, A};
+admin_reply(ReqId, stopped) -> {stopped, ReqId};
+admin_reply(ReqId, {status_reply, States}) -> {status, ReqId, States};
+admin_reply(ReqId, {failed, Code, Detail}) -> {failed, ReqId, Code, Detail}.
+
 %% ============ Erlang actor 服务（方言可辨识） ============
 
 service(<<"bin:u:Ping">>, <<N:64/little>>) ->
@@ -250,7 +640,7 @@ conn_loop(Sock, Buf0) ->
     case parse_frame(Buf0) of
         {ok, Ft, Flags, Cid, Path, Key, Payload, Tail} ->
             put(last_inbound, erlang:system_time(millisecond)),
-            handle(Sock, Ft, Flags, Cid, Key, Payload),
+            handle(Sock, Ft, Flags, Cid, Path, Key, Payload),
             conn_loop(Sock, Tail);
         {more, Rest} ->
             Now = erlang:system_time(millisecond),
@@ -292,6 +682,7 @@ recv_frame(Sock, Buf) ->
 start(Port) -> start(Port, fun ?MODULE:service/2).
 start(Port, ServiceFun) ->
     try crawl_init() catch _:_ -> ok end,   %% 幂等启动（重复 start——named_table 已存在则忽略）
+    try admin_init() catch _:_ -> ok end,   %% B4：admin-v2 登记表（同幂等语义）
     Self = self(),
     _Gw = spawn(fun() ->
                         {ok, LSock} = gen_tcp:listen(Port, [binary, {packet, raw},
@@ -314,13 +705,11 @@ log(Fmt, Args) ->
     %% 网关日志走 stderr（stdout 契约只留端口行）
     io:format(standard_error, Fmt, Args).
 
-%% DEV_08 修复：先榨干缓冲区内的完整帧再 recv（原实现每次 recv 只解析
-%% 一帧，同批到达的第二帧滞留缓冲直到新数据到达——流水线/合发场景的
-%% 解析级队头阻塞；单帧逐发的旧客户端形态掩盖了此 bug）。
+%% loop（被动模式）：Frame path 字段透传 handle（admin 回帧的 reply_to）
 loop(Sock, Buf0) ->
     case parse_frame(Buf0) of
-        {ok, Ft, Flags, Cid, _Path, Key, Payload, Tail} ->
-            handle(Sock, Ft, Flags, Cid, Key, Payload),
+        {ok, Ft, Flags, Cid, Path, Key, Payload, Tail} ->
+            handle(Sock, Ft, Flags, Cid, Path, Key, Payload),
             loop(Sock, Tail);
         {more, Rest} ->
             case gen_tcp:recv(Sock, 0, infinity) of
@@ -333,7 +722,7 @@ loop(Sock, Buf0) ->
             end
     end.
 
-handle(Sock, Ft, _Flags, Cid, Key, Payload) ->
+handle(Sock, Ft, _Flags, Cid, Path, Key, Payload) ->
     case Ft of
         ?HANDSHAKE ->
             log("handshake received~n", []),
@@ -343,6 +732,11 @@ handle(Sock, Ft, _Flags, Cid, Key, Payload) ->
                                             AckBody));
         ?HEARTBEAT ->
             gen_tcp:send(Sock, build_frame(?HEARTBEAT_ACK, Cid, <<"">>, <<"">>, <<>>));
+        ?FT_SYSTEM_EVENT ->
+            %% B4（DEV_09）：admin-v2 命令（0x03）——执行+回帧；其余 tag 忽略
+            try admin_handle_frame(Sock, Cid, Path, Payload)
+            catch _:R -> log("admin frame error ~p~n", [R])
+            end;
         ?ROUTE_HINT ->
             %% 方案 A：hub 背书的直连地址 → 后台拨号（不阻塞收帧循环）。
             %% 已有该 node 直连则忽略（断连时 ets 清理由 dial 进程负责）。

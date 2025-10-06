@@ -193,7 +193,7 @@ py: build-python
 jvm: build-jvm
 	cd $(JVM_DIR) && mvn -q -s settings-central.xml test
 
-ERL_RUN := erl -noshell -pa . -eval 'c:c(parrot_gw), c:c(test_wire), test_wire:run(), halt().'
+ERL_RUN := erl -noshell -pa . -eval 'c:c(parrot_gw), c:c(test_wire), c:c(test_admin_v2), test_wire:run(), test_admin_v2:run(), halt().'
 
 erl:
 	cd $(ERL_DIR) && $(ERL_RUN)
