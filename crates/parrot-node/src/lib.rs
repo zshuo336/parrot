@@ -690,6 +690,95 @@ pub mod executor_v2 {
 pub use executor_v2::{exec_command_v2, exec_deploy_v2, ArtifactChannel, NodeComponentExecutor};
 
 // ══════════════════════════════════════════════════════════════════════════
+// C 阶段（DEV_09 §3.3）：WasmActor——wasm 组件的引擎形态接线
+// ══════════════════════════════════════════════════════════════════════════
+
+/// wasm actor 消息（与 RemoteEnvelope 同构：type_key + bytes——codec_registry 惯例）。
+#[cfg(feature = "wasm")]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WasmAsk {
+    pub type_key: String,
+    pub payload: Vec<u8>,
+}
+
+/// wasm actor 回复（handle 出参原样 bytes）。
+#[cfg(feature = "wasm")]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WasmReply(pub Vec<u8>);
+
+#[cfg(feature = "wasm")]
+impl parrot_api::message::Message for WasmAsk {
+    type Result = WasmReply;
+}
+
+/// wasm 组件 actor：每实例包一个 `WasmComponent`（fuel/epoch 沙箱内
+/// 执行 handle/tell）。消息 `WasmAsk` → 组件 handle → `WasmReply`；
+/// trap → `ActorError::OverQuota`（OutOfFuel）或 `MessageHandlingError`
+/// （其余 trap——监督层按常规重启策略处置）。
+#[cfg(feature = "wasm")]
+pub struct WasmActor {
+    component: parrot_wasm::runtime::WasmComponent,
+}
+
+#[cfg(feature = "wasm")]
+impl WasmActor {
+    /// 从已实例化组件构造（init 时 on_start）。
+    pub fn new(mut component: parrot_wasm::runtime::WasmComponent) -> ActorResult<Self> {
+        component.on_start().map_err(|e| {
+            parrot_api::errors::ActorError::InitializationError(format!("wasm on_start: {e}"))
+        })?;
+        Ok(Self { component })
+    }
+
+    /// 组件指标（take 语义——宿主监控用）。
+    pub fn take_metrics(&mut self) -> parrot_wasm::WasmMetrics {
+        self.component.take_metrics()
+    }
+
+    /// drain 钩子透传。
+    pub fn drain(&mut self) -> Result<(), parrot_wasm::ComponentError> {
+        self.component.on_drain()
+    }
+}
+
+#[cfg(feature = "wasm")]
+impl Actor for WasmActor {
+    type Config = EmptyConfig;
+    type Context = parrot::thread::ThreadContext<Self>;
+
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            if let Some(ask) = msg.downcast_ref::<WasmAsk>() {
+                return match self.component.handle(&ask.type_key, &ask.payload) {
+                    Ok(out) => Ok(Box::new(WasmReply(out)) as BoxedMessage),
+                    // fuel 耗尽 → OverQuota 语义（MessageHandlingError 带
+                    // 标记前缀——监督层可辨识限频）
+                    Err(parrot_wasm::ComponentError::OutOfFuel) => {
+                        Err(parrot_api::errors::ActorError::MessageHandlingError(
+                            "wasm OverQuota: out of fuel".into(),
+                        ))
+                    }
+                    Err(e) => Err(parrot_api::errors::ActorError::MessageHandlingError(format!(
+                        "wasm trap: {e}"
+                    ))),
+                };
+            }
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "wasm actor: unhandled message".into(),
+            ))
+        })
+    }
+
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // bin 辅助
 // ══════════════════════════════════════════════════════════════════════════
 

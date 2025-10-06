@@ -1,0 +1,19 @@
+[package]
+name = "parrot-wasm-fixture"
+version = "0.1.0"
+edition = "2021"
+description = "C 阶段测试 fixture：实现 parrot:component@0.1.0 冻结世界的示例组件"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# 独立 workspace（不入主 workspace——wasm 交叉编译目标与主构建隔离）
+[workspace]
+
+[dependencies]
+wit-bindgen = "0.57"
+
+[profile.release]
+opt-level = 1 # 夹具不需极致优化（spin 死循环任何档都触发 fuel）

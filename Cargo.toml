@@ -9,6 +9,7 @@ members = [
     "crates/parrot-remote",
     "crates/parrot-app",
     "crates/parrot-node",
+    "crates/parrot-wasm",
     "apps/crawler-lab",
     "tools/federation-lab"
 ]

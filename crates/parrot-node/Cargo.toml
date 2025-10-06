@@ -12,12 +12,19 @@ license = "MIT"
 parrot = { path = "../parrot" }
 parrot-api = { path = "../parrot-api", features = ["remote"] }
 parrot-remote = { path = "../parrot-remote" }
+parrot-wasm = { path = "../parrot-wasm", optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
 futures = "0.3"
 sha2 = "0.10"
 hex = "0.4"
+
+[features]
+# C 阶段（DEV_09 §3.3）：WasmActor 接线——wasmtime 重编译成本高（R1），
+# 默认关；开启后 executor_v2 支持 AdminArtifactRef::Wasm 部署。
+default = []
+wasm = ["dep:parrot-wasm", "parrot-wasm/runtime"]
 
 [lib]
 name = "parrot_node"
