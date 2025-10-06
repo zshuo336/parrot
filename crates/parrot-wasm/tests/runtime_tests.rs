@@ -18,8 +18,7 @@ use parrot_wasm::runtime::WasmRuntime;
 use parrot_wasm::{wit_include, ComponentError, HostCtx, WasmConfig, WasmMetrics};
 
 fn fixture_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/fixture-component.wasm")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fixture-component.wasm")
 }
 
 fn rt(fuel: u64) -> WasmRuntime {
@@ -96,10 +95,16 @@ fn metrics_default_zero() {
 #[test]
 fn error_display_forms() {
     assert_eq!(ComponentError::OutOfFuel.to_string(), "out of fuel");
-    assert!(ComponentError::Trap("x".into()).to_string().contains("trap"));
+    assert!(ComponentError::Trap("x".into())
+        .to_string()
+        .contains("trap"));
     assert!(ComponentError::EpochDeadline.to_string().contains("epoch"));
-    assert!(ComponentError::AbiVersion("v".into()).to_string().contains("contract"));
-    assert!(ComponentError::Panic("p".into()).to_string().contains("panic"));
+    assert!(ComponentError::AbiVersion("v".into())
+        .to_string()
+        .contains("contract"));
+    assert!(ComponentError::Panic("p".into())
+        .to_string()
+        .contains("panic"));
 }
 
 // ════════════════════════════════════════════════════════════
@@ -155,7 +160,9 @@ fn instantiate_fixture_and_start() {
 #[test]
 fn instantiate_missing_file() {
     let r = rt(100_000);
-    let e = r.instantiate(std::path::Path::new("/no/such.wasm"), host()).unwrap_err();
+    let e = r
+        .instantiate(std::path::Path::new("/no/such.wasm"), host())
+        .unwrap_err();
     match e {
         ComponentError::AbiVersion(m) => assert!(m.contains("read")),
         other => panic!("unexpected: {other:?}"),

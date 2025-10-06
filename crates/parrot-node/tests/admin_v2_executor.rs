@@ -14,16 +14,14 @@
 
 use std::sync::Arc;
 
-
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::types::BoxedMessage;
 use parrot_node::{
-    exec_command_v2, exec_deploy_v2, ArtifactChannel, NEcho, NInc, NTotal,
-    NodeComponentExecutor,
+    exec_command_v2, exec_deploy_v2, ArtifactChannel, NEcho, NInc, NTotal, NodeComponentExecutor,
 };
 use parrot_remote::admin_v2::{
-    AdminArtifactRef, AdminCommandV2, AdminInstancePolicy, AdminReplyV2, ComponentDeploy,
-    ComponentExecutor as _, v2_err,
+    v2_err, AdminArtifactRef, AdminCommandV2, AdminInstancePolicy, AdminReplyV2, ComponentDeploy,
+    ComponentExecutor as _,
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -121,7 +119,10 @@ fn cache_dir_default_and_env() {
     assert!(out.status.success(), "probe child failed");
     // 本进程：缺省路径形态正确（不依赖具体值是否被其它测试污染）
     let d = ArtifactChannel::cache_dir();
-    assert!(d.is_absolute() || d.starts_with("/tmp"), "absolute cache dir");
+    assert!(
+        d.is_absolute() || d.starts_with("/tmp"),
+        "absolute cache dir"
+    );
 }
 
 // 子进程探针（cache_dir env 覆盖验证——由上一个测试驱动）
@@ -130,7 +131,10 @@ fn cache_dir_env_probe() {
     if std::env::var("PARROT_ARTIFACT_DIR").as_deref() != Ok("/custom/art-dir") {
         return; // 直接跑（非探针模式）——无断言
     }
-    assert_eq!(ArtifactChannel::cache_dir(), std::path::PathBuf::from("/custom/art-dir"));
+    assert_eq!(
+        ArtifactChannel::cache_dir(),
+        std::path::PathBuf::from("/custom/art-dir")
+    );
 }
 
 #[test]
@@ -203,10 +207,15 @@ fn fetch_props_passthrough_and_cross_dialect_rejected() {
     let art = AdminArtifactRef::Props {
         factory: "deploy.echo".into(),
     };
-    assert_eq!(ArtifactChannel.fetch(&art).unwrap(), std::path::PathBuf::new());
+    assert_eq!(
+        ArtifactChannel.fetch(&art).unwrap(),
+        std::path::PathBuf::new()
+    );
     // Beam/PyModule/Jvm：parrot 方言不认 → DIALECT_MISMATCH
     for art in [
-        AdminArtifactRef::Beam { app: "frontier".into() },
+        AdminArtifactRef::Beam {
+            app: "frontier".into(),
+        },
         AdminArtifactRef::PyModule {
             module: "m".into(),
             runtime_env: None,
@@ -237,13 +246,19 @@ async fn deploy_singleton_path_and_real_behavior() {
     let ts = engine();
     // 名字唯一化（并行测试不撞 registry）
     let name = format!("b2echo{}", line!());
-    let paths = exec_deploy_v2(&ts, deploy_cmd(&name, "deploy.echo", AdminInstancePolicy::Singleton))
-        .await
-        .expect("deploy");
+    let paths = exec_deploy_v2(
+        &ts,
+        deploy_cmd(&name, "deploy.echo", AdminInstancePolicy::Singleton),
+    )
+    .await
+    .expect("deploy");
     assert_eq!(paths, vec![format!("/user/{name}")]);
     // 真实行为：NEcho(v) → NEchoed(v)（引擎层 ask）
     let r = ts.get_actor_ref(&paths[0]).expect("in registry");
-    let reply = r.send(Box::new(NEcho(7)) as BoxedMessage).await.expect("ask");
+    let reply = r
+        .send(Box::new(NEcho(7)) as BoxedMessage)
+        .await
+        .expect("ask");
     assert_eq!(reply.downcast_ref::<parrot_node::NEchoed>().unwrap().0, 7);
     // 清理
     let _ = ts.stop_actor(&paths[0]).await;
@@ -255,7 +270,11 @@ async fn deploy_pool_multi_instance_paths() {
     let name = format!("b2cnt{}", line!());
     let paths = exec_deploy_v2(
         &ts,
-        deploy_cmd(&name, "deploy.counter", AdminInstancePolicy::Pool { count: 3 }),
+        deploy_cmd(
+            &name,
+            "deploy.counter",
+            AdminInstancePolicy::Pool { count: 3 },
+        ),
     )
     .await
     .expect("deploy");
@@ -284,7 +303,11 @@ async fn deploy_sharded_paths_and_kv_behavior() {
     let name = format!("b2kv{}", line!());
     let paths = exec_deploy_v2(
         &ts,
-        deploy_cmd(&name, "deploy.kv", AdminInstancePolicy::Sharded { count: 2 }),
+        deploy_cmd(
+            &name,
+            "deploy.kv",
+            AdminInstancePolicy::Sharded { count: 2 },
+        ),
     )
     .await
     .expect("deploy");
@@ -310,9 +333,12 @@ async fn deploy_sharded_paths_and_kv_behavior() {
 #[tokio::test]
 async fn deploy_unknown_factory() {
     let ts = engine();
-    let err = exec_deploy_v2(&ts, deploy_cmd("x", "deploy.nope", AdminInstancePolicy::Singleton))
-        .await
-        .unwrap_err();
+    let err = exec_deploy_v2(
+        &ts,
+        deploy_cmd("x", "deploy.nope", AdminInstancePolicy::Singleton),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.0, v2_err::FACTORY_NOT_FOUND);
     assert!(err.1.contains("deploy.nope"));
 }
@@ -323,7 +349,9 @@ async fn deploy_non_props_dialect_mismatch() {
     let cmd = ComponentDeploy {
         name: "beamc".into(),
         version: "1".into(),
-        artifact: AdminArtifactRef::Beam { app: "frontier".into() },
+        artifact: AdminArtifactRef::Beam {
+            app: "frontier".into(),
+        },
         instances: AdminInstancePolicy::Singleton,
         config: None,
     };
@@ -376,10 +404,20 @@ async fn executor_status_reports_version_and_paths() {
     let ex = NodeComponentExecutor::new(ts.clone());
     let name = format!("b2st{}", line!());
     let r = ex
-        .deploy(1, &deploy_cmd(&name, "deploy.counter", AdminInstancePolicy::Pool { count: 2 }))
+        .deploy(
+            1,
+            &deploy_cmd(
+                &name,
+                "deploy.counter",
+                AdminInstancePolicy::Pool { count: 2 },
+            ),
+        )
         .await;
     match r {
-        AdminReplyV2::Deployed { instances, req_id: _ } => assert_eq!(instances.len(), 2),
+        AdminReplyV2::Deployed {
+            instances,
+            req_id: _,
+        } => assert_eq!(instances.len(), 2),
         other => panic!("deploy: {other:?}"),
     }
     let st = ex.status(2, &format!("/user/{name}")).await;
@@ -402,8 +440,16 @@ async fn executor_stop_prefix_no_false_match() {
     // 近名对：n1 与 n1x——前缀 /user/n1 不得误吞 /user/n1x
     let n1 = format!("b2a{}", line!());
     let n1x = format!("{n1}x");
-    ex.deploy(1, &deploy_cmd(&n1, "deploy.echo", AdminInstancePolicy::Singleton)).await;
-    ex.deploy(2, &deploy_cmd(&n1x, "deploy.echo", AdminInstancePolicy::Singleton)).await;
+    ex.deploy(
+        1,
+        &deploy_cmd(&n1, "deploy.echo", AdminInstancePolicy::Singleton),
+    )
+    .await;
+    ex.deploy(
+        2,
+        &deploy_cmd(&n1x, "deploy.echo", AdminInstancePolicy::Singleton),
+    )
+    .await;
     let r = ex.stop(3, &format!("/user/{n1}")).await;
     assert!(matches!(r, AdminReplyV2::Stopped { .. }));
     // n1 停了；n1x 仍在
@@ -428,11 +474,17 @@ async fn executor_drain_empty_mailbox_succeeds() {
     let ts = engine();
     let ex = NodeComponentExecutor::new(ts.clone());
     let name = format!("b2dr{}", line!());
-    ex.deploy(1, &deploy_cmd(&name, "deploy.counter", AdminInstancePolicy::Singleton)).await;
+    ex.deploy(
+        1,
+        &deploy_cmd(&name, "deploy.counter", AdminInstancePolicy::Singleton),
+    )
+    .await;
     // 邮箱空 → drain 立即成功 + 实例移除
     let r = ex.drain(2, &format!("/user/{name}"), 3000).await;
     match r {
-        AdminReplyV2::Drained { drained, aborted, .. } => {
+        AdminReplyV2::Drained {
+            drained, aborted, ..
+        } => {
             assert_eq!((drained, aborted), (1, 0));
         }
         other => panic!("{other:?}"),
@@ -445,7 +497,11 @@ async fn executor_drain_inflight_then_settles() {
     let ts = engine();
     let ex = NodeComponentExecutor::new(ts.clone());
     let name = format!("b2slow{}", line!());
-    ex.deploy(1, &deploy_cmd(&name, "deploy.slow", AdminInstancePolicy::Singleton)).await;
+    ex.deploy(
+        1,
+        &deploy_cmd(&name, "deploy.slow", AdminInstancePolicy::Singleton),
+    )
+    .await;
     // 投一条慢消息（100ms 处理）→ drain 等它处理完（在途消息不被丢）
     let r0 = ts.get_actor_ref(&format!("/user/{name}")).unwrap();
     let r = r0.clone_boxed();
@@ -457,7 +513,9 @@ async fn executor_drain_inflight_then_settles() {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await; // 消息入箱
     let rr = ex.drain(2, &format!("/user/{name}"), 3000).await;
     match rr {
-        AdminReplyV2::Drained { drained, aborted, .. } => {
+        AdminReplyV2::Drained {
+            drained, aborted, ..
+        } => {
             assert_eq!((drained, aborted), (1, 0), "slow message settled in time");
         }
         other => panic!("{other:?}"),
@@ -471,7 +529,11 @@ async fn executor_drain_timeout_aborts() {
     let ts = engine();
     let ex = NodeComponentExecutor::new(ts.clone());
     let name = format!("b2to{}", line!());
-    ex.deploy(1, &deploy_cmd(&name, "deploy.slow", AdminInstancePolicy::Singleton)).await;
+    ex.deploy(
+        1,
+        &deploy_cmd(&name, "deploy.slow", AdminInstancePolicy::Singleton),
+    )
+    .await;
     // 三条慢消息（1.2s each）：首条处理中，后两条积压邮箱 →
     // drain 预算 80ms 内邮箱不可能清空 → 超时中止（实例保留）
     let r0 = ts.get_actor_ref(&format!("/user/{name}")).unwrap();
@@ -486,7 +548,9 @@ async fn executor_drain_timeout_aborts() {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await; // 首条已 pop 处理中
     let rr = ex.drain(2, &format!("/user/{name}"), 80).await;
     match rr {
-        AdminReplyV2::Drained { drained, aborted, .. } => {
+        AdminReplyV2::Drained {
+            drained, aborted, ..
+        } => {
             assert_eq!((drained, aborted), (0, 1), "backlog exceeds budget");
         }
         other => panic!("{other:?}"),
@@ -510,7 +574,11 @@ async fn command_v2_full_lifecycle() {
         &ts,
         AdminCommandV2::DeployComponent {
             req_id: 1,
-            component: deploy_cmd(&name, "deploy.counter", AdminInstancePolicy::Pool { count: 2 }),
+            component: deploy_cmd(
+                &name,
+                "deploy.counter",
+                AdminInstancePolicy::Pool { count: 2 },
+            ),
         },
     )
     .await;
@@ -521,12 +589,33 @@ async fn command_v2_full_lifecycle() {
         }
         other => panic!("{other:?}"),
     }
-    let s = exec_command_v2(&ts, AdminCommandV2::ComponentStatus { req_id: 2, path_prefix: format!("/user/{name}") }).await;
+    let s = exec_command_v2(
+        &ts,
+        AdminCommandV2::ComponentStatus {
+            req_id: 2,
+            path_prefix: format!("/user/{name}"),
+        },
+    )
+    .await;
     assert!(matches!(s, AdminReplyV2::Status { .. }));
-    let st = exec_command_v2(&ts, AdminCommandV2::StopComponent { req_id: 3, path_prefix: format!("/user/{name}") }).await;
+    let st = exec_command_v2(
+        &ts,
+        AdminCommandV2::StopComponent {
+            req_id: 3,
+            path_prefix: format!("/user/{name}"),
+        },
+    )
+    .await;
     assert!(matches!(st, AdminReplyV2::Stopped { req_id: 3, .. }));
     // 停后 status → NOT_FOUND
-    let s2 = exec_command_v2(&ts, AdminCommandV2::ComponentStatus { req_id: 4, path_prefix: format!("/user/{name}") }).await;
+    let s2 = exec_command_v2(
+        &ts,
+        AdminCommandV2::ComponentStatus {
+            req_id: 4,
+            path_prefix: format!("/user/{name}"),
+        },
+    )
+    .await;
     match s2 {
         AdminReplyV2::Failed { code, .. } => assert_eq!(code, v2_err::COMPONENT_NOT_FOUND),
         other => panic!("{other:?}"),
@@ -541,7 +630,10 @@ fn caps_artifacts_bit_wire_shape() {
     assert_eq!(parrot_remote::handshake::caps::DYLIB, 1 << 7);
     let a = parrot_remote::handshake::caps::BIN | parrot_remote::handshake::caps::ARTIFACTS;
     let b = parrot_remote::handshake::caps::BIN;
-    assert_eq!(parrot_remote::handshake::negotiate_caps(a, b).unwrap() & 1 << 5, 0);
+    assert_eq!(
+        parrot_remote::handshake::negotiate_caps(a, b).unwrap() & 1 << 5,
+        0
+    );
 }
 
 #[test]

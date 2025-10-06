@@ -11,9 +11,7 @@ pub mod rollout;
 pub mod supervisor;
 
 pub use health::{HealthWatch, LinkDiff};
-pub use rollout::{
-    RolloutAction, RolloutError, RolloutEvent, RolloutPhase, RolloutTracker,
-};
+pub use rollout::{RolloutAction, RolloutError, RolloutEvent, RolloutPhase, RolloutTracker};
 pub use supervisor::{
     default_node, desired_instances, AppSupervisor, Clock, DesiredStateStore, FakeClock,
     MemStateStore, ObservedState, ReconcileAction, ReconcileReport, SystemClock,

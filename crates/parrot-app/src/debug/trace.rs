@@ -37,7 +37,11 @@ impl SpanNode {
     /// 子树帧数（含自身）。
     pub fn total_events(&self) -> usize {
         self.events.len()
-            + self.children.values().map(SpanNode::total_events).sum::<usize>()
+            + self
+                .children
+                .values()
+                .map(SpanNode::total_events)
+                .sum::<usize>()
     }
 }
 
@@ -73,12 +77,7 @@ pub fn parse_trace_line(line: &str) -> Option<SpanEvent> {
     // 仅 TRACING 帧（有 trace_id 字段）参与聚合
     let trace_id: u64 = fields.get("trace_id")?.parse().ok()?;
     let frame_type = u8::from_str_radix(fields.get("ft")?.trim_start_matches("0x"), 16).ok()?;
-    let hop_count = fields
-        .get("hop")?
-        .split('/')
-        .next()?
-        .parse()
-        .ok()?;
+    let hop_count = fields.get("hop")?.split('/').next()?.parse().ok()?;
     let path = fields.get("path")?.trim_matches('"').to_string();
     let type_key = fields.get("key")?.trim_matches('"').to_string();
     let len: usize = fields.get("len")?.parse().ok()?;
@@ -98,12 +97,10 @@ pub fn aggregate(lines: impl Iterator<Item = String>) -> BTreeMap<u64, SpanTree>
     let mut trees: BTreeMap<u64, SpanTree> = BTreeMap::new();
     for line in lines {
         if let Some(e) = parse_trace_line(&line) {
-            let tree = trees
-                .entry(e.trace_id)
-                .or_insert_with(|| SpanTree {
-                    trace_id: e.trace_id,
-                    root: SpanNode::default(),
-                });
+            let tree = trees.entry(e.trace_id).or_insert_with(|| SpanTree {
+                trace_id: e.trace_id,
+                root: SpanNode::default(),
+            });
             // 根 path 空时以首事件 path 立
             if tree.root.path.is_empty() {
                 tree.root.path = e.path.clone();
@@ -121,28 +118,31 @@ fn insert_event(root: &mut SpanNode, e: SpanEvent) {
         root.events.push(e);
         return;
     }
-    let child = root.children.entry(e.path.clone()).or_insert_with(|| SpanNode {
-        path: e.path.clone(),
-        ..Default::default()
-    });
+    let child = root
+        .children
+        .entry(e.path.clone())
+        .or_insert_with(|| SpanNode {
+            path: e.path.clone(),
+            ..Default::default()
+        });
     child.events.push(e);
 }
 
 /// `parrot app trace <app>` 渲染（人类可读树——CLI 数据面）。
 pub fn render_tree(tree: &SpanTree) -> String {
     let mut out = String::new();
-    out.push_str(&format!("trace {} ({} frames)\n", tree.trace_id, tree.total_events()));
+    out.push_str(&format!(
+        "trace {} ({} frames)\n",
+        tree.trace_id,
+        tree.total_events()
+    ));
     render_node(&tree.root, &mut out, 0);
     out
 }
 
 fn render_node(n: &SpanNode, out: &mut String, depth: usize) {
     let pad = "  ".repeat(depth);
-    out.push_str(&format!(
-        "{pad}{} ×{} frames\n",
-        n.path,
-        n.event_count()
-    ));
+    out.push_str(&format!("{pad}{} ×{} frames\n", n.path, n.event_count()));
     for c in n.children.values() {
         render_node(c, out, depth + 1);
     }

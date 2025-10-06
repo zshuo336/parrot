@@ -62,7 +62,9 @@ impl Actor for EchoActor {
             if let Some(p) = msg.downcast_ref::<CPing>() {
                 return Ok(Box::new(CPong(p.0)) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError("unhandled".into()))
+            Err(parrot_api::errors::ActorError::MessageHandlingError(
+                "unhandled".into(),
+            ))
         })
     }
     fn state(&self) -> ActorState {
@@ -130,7 +132,10 @@ outbound_queue = 2048
         .unwrap()
         .build()
         .unwrap();
-    assert_eq!(hub_resolved.remote.node.topology_role, TopologyRoleValue::Hub);
+    assert_eq!(
+        hub_resolved.remote.node.topology_role,
+        TopologyRoleValue::Hub
+    );
 
     let hub = RemoteActorSystem::new(
         RCfg::from_resolved(&hub_resolved),
@@ -164,9 +169,8 @@ bind = "127.0.0.1:0"
     unsafe { std::env::remove_var("CFG_TEST_HUB_PORT") };
 
     // spoke 本地引擎：thread 参数也全部来自文件
-    let spoke_ts = ThreadActorSystem::shared(ThreadActorSystemConfig::from_resolved(
-        &spoke_resolved,
-    ));
+    let spoke_ts =
+        ThreadActorSystem::shared(ThreadActorSystemConfig::from_resolved(&spoke_resolved));
     spoke_ts
         .spawn_at(EchoActor, "/user/echo", None, ThreadActorConfig::default())
         .await
@@ -206,20 +210,14 @@ bind = "127.0.0.1:0"
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        !spoke.links_snapshot().await.is_empty(),
-        "hub 连接未建立"
-    );
+    assert!(!spoke.links_snapshot().await.is_empty(), "hub 连接未建立");
 
     // 远程 ask 全链路（文件驱动配置下的真实通信：spoke 本地 actor 回环）
     let echo = spoke.remote_ref("parrot://cfg-spoke/user/echo").unwrap();
-    let reply = tokio::time::timeout(
-        Duration::from_secs(5),
-        echo.send(Box::new(CPing(42))),
-    )
-    .await
-    .expect("cfg ask timeout")
-    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), echo.send(Box::new(CPing(42))))
+        .await
+        .expect("cfg ask timeout")
+        .unwrap();
     let pong = reply.downcast::<CPong>().unwrap();
     assert_eq!(pong.0, 42);
 
@@ -339,7 +337,11 @@ shutdown_timeout_ms = 2345
 "#,
         "thread",
     );
-    let res = ParrotConfig::builder().load_file(toml.path()).unwrap().build().unwrap();
+    let res = ParrotConfig::builder()
+        .load_file(toml.path())
+        .unwrap()
+        .build()
+        .unwrap();
     let tc = ThreadActorSystemConfig::from_resolved(&res);
     assert_eq!(tc.shared_pool_size, 2);
     assert_eq!(tc.shared_queue_capacity, 777);
@@ -367,16 +369,11 @@ async fn cfg5_facade_from_config() {
         .await
         .unwrap();
     // 本地 ask 走通（配置驱动的引擎）
-    let r = ts
-        .get_actor_ref("/user/echo")
-        .expect("actor not found");
-    let reply = tokio::time::timeout(
-        Duration::from_secs(2),
-        r.send(Box::new(CPing(7))),
-    )
-    .await
-    .expect("local ask timeout")
-    .unwrap();
+    let r = ts.get_actor_ref("/user/echo").expect("actor not found");
+    let reply = tokio::time::timeout(Duration::from_secs(2), r.send(Box::new(CPing(7))))
+        .await
+        .expect("local ask timeout")
+        .unwrap();
     assert_eq!(reply.downcast::<CPong>().unwrap().0, 7);
 }
 
@@ -391,7 +388,11 @@ fn cfg6_example_file_parses() {
         .find(|p| p.join("parrot.toml.example").exists())
         .map(|p| p.join("parrot.toml.example"))
         .expect("repo root not found from test binary");
-    let res = ParrotConfig::builder().load_file(&root).unwrap().build().unwrap();
+    let res = ParrotConfig::builder()
+        .load_file(&root)
+        .unwrap()
+        .build()
+        .unwrap();
     // 全注释文件 → 全默认（示例即文档：默认值展示必须与真实默认一致）
     assert_eq!(res.remote.transport.heartbeat_interval_ms, 2000);
     assert_eq!(res.remote.transport.heartbeat_max_loss, 5);

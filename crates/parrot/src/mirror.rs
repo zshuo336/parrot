@@ -72,10 +72,7 @@ impl MirrorRef {
 
 #[async_trait::async_trait]
 impl ActorRef for MirrorRef {
-    fn send<'a>(
-        &'a self,
-        msg: BoxedMessage,
-    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         self.mirror_tell(&msg);
         self.inner.send(msg)
     }
@@ -137,10 +134,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ActorRef for CountingRef {
-        fn send<'a>(
-            &'a self,
-            msg: BoxedMessage,
-        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(msg) })
         }
@@ -187,10 +181,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             delivers: AtomicUsize::new(0),
         });
-        let m = MirrorRef::new(
-            inner.clone(),
-            MirrorPolicy::new("/user/", "/user/mirror"),
-        );
+        let m = MirrorRef::new(inner.clone(), MirrorPolicy::new("/user/", "/user/mirror"));
         let r = m.send(msg()).await.unwrap();
         // 回执透传（原消息体）
         assert!(r.downcast::<u32>().is_ok());
@@ -204,10 +195,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             delivers: AtomicUsize::new(0),
         });
-        let m = MirrorRef::new(
-            inner.clone(),
-            MirrorPolicy::new("/user/", "/user/mirror"),
-        );
+        let m = MirrorRef::new(inner.clone(), MirrorPolicy::new("/user/", "/user/mirror"));
         m.deliver(msg()).await.unwrap();
         assert_eq!(inner.delivers.load(Ordering::SeqCst), 1);
     }

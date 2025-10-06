@@ -69,7 +69,8 @@ fn scan_compliant_dylib_clean() {
 fn scan_violating_tls_detected() {
     let v = DylibLoader::scan_violations(&common::violating());
     assert!(
-        v.iter().any(|x| matches!(x, Violation::TlsDestructor { .. })),
+        v.iter()
+            .any(|x| matches!(x, Violation::TlsDestructor { .. })),
         "TLS violation expected: {v:?}"
     );
 }
@@ -92,9 +93,15 @@ fn scan_missing_file_empty() {
 
 #[test]
 fn violation_display() {
-    assert!(Violation::TlsDestructor { symbol: "s".into() }.to_string().contains("tls"));
-    assert!(Violation::ThreadSpawn { symbol: "s".into() }.to_string().contains("thread"));
-    assert!(Violation::SignalHandler { symbol: "s".into() }.to_string().contains("signal"));
+    assert!(Violation::TlsDestructor { symbol: "s".into() }
+        .to_string()
+        .contains("tls"));
+    assert!(Violation::ThreadSpawn { symbol: "s".into() }
+        .to_string()
+        .contains("thread"));
+    assert!(Violation::SignalHandler { symbol: "s".into() }
+        .to_string()
+        .contains("signal"));
 }
 
 // ════════════════════════════════════════════════════════════
@@ -153,7 +160,10 @@ fn load_not_a_dylib_symbol_err() {
     let p = std::env::temp_dir().join("parrot-abi-not-dylib.bin");
     std::fs::write(&p, b"garbage").unwrap();
     let e = DylibLoader::load(&p, "").unwrap_err();
-    assert!(matches!(e, LoadError::Open(_) | LoadError::Symbol(_)), "{e:?}");
+    assert!(
+        matches!(e, LoadError::Open(_) | LoadError::Symbol(_)),
+        "{e:?}"
+    );
     std::fs::remove_file(&p).ok();
 }
 
@@ -168,9 +178,19 @@ fn construct_ok_and_cnt() {
     let (_g, h) = load_good();
     let c1 = construct_good(&h);
     unsafe {
-        let n1 = u64::from_le_bytes(ask(&loader(), &h, c1, "cnt", &[]).unwrap().try_into().unwrap());
+        let n1 = u64::from_le_bytes(
+            ask(&loader(), &h, c1, "cnt", &[])
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         let c2 = construct_good(&h);
-        let n2 = u64::from_le_bytes(ask(&loader(), &h, c2, "cnt", &[]).unwrap().try_into().unwrap());
+        let n2 = u64::from_le_bytes(
+            ask(&loader(), &h, c2, "cnt", &[])
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         assert!(n2 > n1, "construct count must increase: {n1} → {n2}");
     }
 }
@@ -182,7 +202,9 @@ fn handle_unregistered_pointer_rejected() {
     unsafe {
         let mut buf = [0u8; 64];
         let mut rb = AbiReplyBuf::new(&mut buf);
-        let e = loader().handle_msg(&h, bogus, AbiMsg::new("echo", b"x"), &mut rb).unwrap_err();
+        let e = loader()
+            .handle_msg(&h, bogus, AbiMsg::new("echo", b"x"), &mut rb)
+            .unwrap_err();
         assert_eq!(e.0, ABI_ERR_STATE);
     }
 }
@@ -240,8 +262,18 @@ fn handle_msgs_counter_per_instance() {
         let _ = ask(&loader(), &h, a, "echo", b"1").unwrap();
         let _ = ask(&loader(), &h, a, "echo", b"2").unwrap();
         let _ = ask(&loader(), &h, b, "echo", b"3").unwrap();
-        let ma = u64::from_le_bytes(ask(&loader(), &h, a, "msgs", &[]).unwrap().try_into().unwrap());
-        let mb = u64::from_le_bytes(ask(&loader(), &h, b, "msgs", &[]).unwrap().try_into().unwrap());
+        let ma = u64::from_le_bytes(
+            ask(&loader(), &h, a, "msgs", &[])
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let mb = u64::from_le_bytes(
+            ask(&loader(), &h, b, "msgs", &[])
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!((ma, mb), (3, 2), "per-instance state isolated");
     }
 }
@@ -266,7 +298,10 @@ fn dylib_panic_caught_as_err_code() {
     let c = construct_good(&h);
     unsafe {
         let e = ask(&loader(), &h, c, "panic", &[]).unwrap_err();
-        assert_eq!(e.0, ABI_ERR_PANIC, "panic → ABI_ERR_PANIC via host catch_unwind");
+        assert_eq!(
+            e.0, ABI_ERR_PANIC,
+            "panic → ABI_ERR_PANIC via host catch_unwind"
+        );
     }
 }
 
@@ -290,7 +325,10 @@ async fn unload_happy_path_report() {
     let (_g, h) = load_good();
     let _c1 = construct_good(&h);
     let _c2 = construct_good(&h);
-    let r = loader().unload(h, Duration::from_millis(500)).await.unwrap();
+    let r = loader()
+        .unload(h, Duration::from_millis(500))
+        .await
+        .unwrap();
     assert_eq!(r.drained, 2);
     assert_eq!(r.aborted, 0);
     assert!(!r.force_closed);
@@ -299,7 +337,10 @@ async fn unload_happy_path_report() {
 #[tokio::test]
 async fn unload_no_instances() {
     let (_g, h) = load_good();
-    let r = loader().unload(h, Duration::from_millis(100)).await.unwrap();
+    let r = loader()
+        .unload(h, Duration::from_millis(100))
+        .await
+        .unwrap();
     assert_eq!(r.drained, 0);
 }
 
@@ -322,7 +363,9 @@ fn quarantine_blocks_new_messages() {
     unsafe {
         let mut buf = [0u8; 64];
         let mut rb = AbiReplyBuf::new(&mut buf);
-        let e = loader().handle_msg(&h, c, AbiMsg::new("echo", b"x"), &mut rb).unwrap_err();
+        let e = loader()
+            .handle_msg(&h, c, AbiMsg::new("echo", b"x"), &mut rb)
+            .unwrap_err();
         assert_eq!(e.0, ABI_ERR_STATE);
         assert!(e.1.contains("quarantined"));
     }
@@ -346,11 +389,17 @@ async fn unload_then_reload_fresh_state() {
         unsafe {
             let _ = ask(&loader(), &h, c, "echo", b"warm").unwrap();
             let m1 = u64::from_le_bytes(
-                ask(&loader(), &h, c, "msgs", &[]).unwrap().try_into().unwrap(),
+                ask(&loader(), &h, c, "msgs", &[])
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
             );
             assert_eq!(m1, 2);
         }
-        let r = loader().unload(h, Duration::from_millis(500)).await.unwrap();
+        let r = loader()
+            .unload(h, Duration::from_millis(500))
+            .await
+            .unwrap();
         assert_eq!(r.drained, 1);
     }
     // 立即重载（同名"新版本"路径）
@@ -360,12 +409,18 @@ async fn unload_then_reload_fresh_state() {
         // 注：fixture 的 msgs 在每次 handle_msg 前自增——首问即 1
         let out = ask(&loader(), &h2, c2, "msgs", &[]).unwrap();
         let n = u64::from_le_bytes(out.try_into().unwrap());
-        assert_eq!(n, 1, "fresh instance counter starts at first touch; got {n}");
+        assert_eq!(
+            n, 1,
+            "fresh instance counter starts at first touch; got {n}"
+        );
         // 功能照常（dlopen 后 meta/hooks 全可用）
         let echo = ask(&loader(), &h2, c2, "echo", b"reloaded").unwrap();
         assert_eq!(echo, b"reloaded");
     }
-    loader().unload(h2, Duration::from_millis(500)).await.unwrap();
+    loader()
+        .unload(h2, Duration::from_millis(500))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -376,7 +431,10 @@ async fn unload_destroy_runs_for_instances() {
     unsafe {
         let _ = ask(&loader(), &h, c, "echo", b"x").unwrap();
     }
-    let r = loader().unload(h, Duration::from_millis(300)).await.unwrap();
+    let r = loader()
+        .unload(h, Duration::from_millis(300))
+        .await
+        .unwrap();
     assert_eq!(r.drained, 1);
 }
 
@@ -384,9 +442,21 @@ async fn unload_destroy_runs_for_instances() {
 fn load_error_display_forms() {
     assert!(LoadError::Open("x".into()).to_string().contains("open"));
     assert!(format!("{}", LoadError::AbiVersion { dylib: 2, host: 1 }).contains("mismatch"));
-    assert!(LoadError::Digest { want: "a".into(), got: "b".into() }.to_string().contains("sha256"));
-    assert!(LoadError::Forbidden(vec![]).to_string().contains("forbidden"));
-    assert!(LoadError::Construct { code: 1, detail: "d".into() }.to_string().contains("construct"));
+    assert!(LoadError::Digest {
+        want: "a".into(),
+        got: "b".into()
+    }
+    .to_string()
+    .contains("sha256"));
+    assert!(LoadError::Forbidden(vec![])
+        .to_string()
+        .contains("forbidden"));
+    assert!(LoadError::Construct {
+        code: 1,
+        detail: "d".into()
+    }
+    .to_string()
+    .contains("construct"));
 }
 
 // ════════════════════════════════════════════════════════════

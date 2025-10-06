@@ -14,8 +14,9 @@ fn fixture() -> std::path::PathBuf {
         "linux" => "so",
         _ => "dll",
     };
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("tests/fixtures/target/release/libparrot_abi_testcomp.{ext}"))
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "tests/fixtures/target/release/libparrot_abi_testcomp.{ext}"
+    ))
 }
 
 fn bench_dylib_call(c: &mut Criterion) {
@@ -28,14 +29,8 @@ fn bench_dylib_call(c: &mut Criterion) {
             let mut buf = [0u8; 4096];
             let mut rb = AbiReplyBuf::new(&mut buf);
             unsafe {
-                DylibLoader::handle_msg(
-                    &DylibLoader,
-                    &h,
-                    comp,
-                    AbiMsg::new("echo", b"x"),
-                    &mut rb,
-                )
-                .unwrap();
+                DylibLoader::handle_msg(&DylibLoader, &h, comp, AbiMsg::new("echo", b"x"), &mut rb)
+                    .unwrap();
             }
         })
     });

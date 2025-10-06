@@ -175,10 +175,14 @@ impl PlacementConstraint {
     /// 节点名粗匹配（role/realm/label 出现在节点 id 即可——E1 首版
     /// 规则；空约束恒真）。
     pub fn matches(&self, node: &str) -> bool {
-        [self.role.as_deref(), self.realm.as_deref(), self.label.as_deref()]
-            .into_iter()
-            .flatten()
-            .all(|k| node.contains(k))
+        [
+            self.role.as_deref(),
+            self.realm.as_deref(),
+            self.label.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|k| node.contains(k))
     }
 }
 

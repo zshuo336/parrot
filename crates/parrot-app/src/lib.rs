@@ -16,7 +16,10 @@ pub mod debug {
     pub mod trace;
 
     pub use replay::{record_sink, JsonlRecord, ReplayError, ReplayLog};
-    pub use trace::{parse_trace_line as parse_trace, aggregate as aggregate_traces, SpanEvent, SpanNode, SpanTree};
+    pub use trace::{
+        aggregate as aggregate_traces, parse_trace_line as parse_trace, SpanEvent, SpanNode,
+        SpanTree,
+    };
 }
 
 pub mod assemble;

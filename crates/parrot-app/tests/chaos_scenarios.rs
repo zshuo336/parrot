@@ -45,7 +45,11 @@ fn manifest(comps: Vec<ComponentSpec>) -> AppManifest {
 }
 
 fn sup(m: AppManifest) -> AppSupervisor {
-    AppSupervisor::new(m, Arc::new(MemStateStore::new()), Arc::new(parrot_app::orchestrator::SystemClock))
+    AppSupervisor::new(
+        m,
+        Arc::new(MemStateStore::new()),
+        Arc::new(parrot_app::orchestrator::SystemClock),
+    )
 }
 
 /// 场景 1：升级中 kill -9 目标 Executor → RolloutTracker 自动回滚 →
@@ -58,7 +62,9 @@ fn chaos_upgrade_kill9_autorollback() {
     t.advance(RolloutEvent::Drained { aborted: 0 }).unwrap();
     assert!(t.in_phase(RolloutPhase::Deploying));
     // kill -9：节点消失
-    let a = t.advance(RolloutEvent::NodeLost("erl-gw-1".into())).unwrap();
+    let a = t
+        .advance(RolloutEvent::NodeLost("erl-gw-1".into()))
+        .unwrap();
     assert!(matches!(a, RolloutAction::Rollback { .. }));
     // 回滚完成 → Done；旧版本恢复（App 回到 Running 由 supervisor 下轮确认）
     t.advance(RolloutEvent::Drained { aborted: 0 }).unwrap();
@@ -86,7 +92,9 @@ fn chaos_partition_minority_no_deploys() {
     // 多数派：经 submit 提交新 desired（升级入口——登记在途）
     let mut majority = sup(manifest(vec![spec("frontier")]));
     let mut v2 = spec("frontier");
-    v2.artifact = ArtifactRef::Beam { app: "frontier-v2".into() };
+    v2.artifact = ArtifactRef::Beam {
+        app: "frontier-v2".into(),
+    };
     majority.submit(manifest(vec![v2])).unwrap();
     // 少数派：旧 desired（分区——Raft 提交未达其 store）
     let minority = sup(manifest(vec![spec("frontier")]));
@@ -111,7 +119,11 @@ fn chaos_partition_minority_no_deploys() {
     // 多数派：v2 在途 → Wait（升级由 RolloutTracker 驱动——非盲 Deploy）
     let rm = majority.reconcile_once(&o);
     assert!(
-        !rm.converged && rm.actions.iter().all(|a| matches!(a, ReconcileAction::Wait { .. })),
+        !rm.converged
+            && rm
+                .actions
+                .iter()
+                .all(|a| matches!(a, ReconcileAction::Wait { .. })),
         "多数派升级在途: {:?}",
         rm.actions
     );
@@ -129,13 +141,19 @@ fn chaos_dual_gateway_kill_degrades_then_recovers() {
     let d = h.apply_links(vec![]);
     assert_eq!(d.left.len(), 2, "双网关同时离线");
     let o = h.observed();
-    assert!(!o.any_running("search") && !o.any_running("parse"), "降级清单含全部受影响组件");
+    assert!(
+        !o.any_running("search") && !o.any_running("parse"),
+        "降级清单含全部受影响组件"
+    );
     // 恢复（网关重启 + 轮询回执）
     h.apply_links(vec!["akka-gw-1".into(), "ray-gw-1".into()]);
     h.apply_status("search", vec![rep("/user/search", "running")]);
     h.apply_status("parse", vec![rep("/user/parse", "running")]);
     let o2 = h.observed();
-    assert!(o2.any_running("search") && o2.any_running("parse"), "恢复后自动 reconcile 数据面就绪");
+    assert!(
+        o2.any_running("search") && o2.any_running("parse"),
+        "恢复后自动 reconcile 数据面就绪"
+    );
 }
 
 /// 场景 4：drain 半程消息风暴——超时兜底触发，DRAIN_ABORTED 计数=预期。
@@ -147,7 +165,9 @@ fn chaos_drain_storm_timeout_abort_counted() {
     let a = t.advance(RolloutEvent::Drained { aborted: 42 }).unwrap();
     assert_eq!(
         a,
-        RolloutAction::StartDeploy { comp: "index".into() }
+        RolloutAction::StartDeploy {
+            comp: "index".into()
+        }
     );
     assert_eq!(t.aborted_total, 42, "DRAIN_ABORTED 计数必须准确");
     // 前进不受阻（兜底语义）
@@ -164,7 +184,10 @@ fn chaos_anchors_dylib_and_wasm_gates_exist() {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../parrot-abi/tests/loader_tests.rs");
     let t = std::fs::read_to_string(&p).unwrap();
-    assert!(t.contains("fn unload_then_reload_fresh_state"), "dylib 重载门禁锚点缺失");
+    assert!(
+        t.contains("fn unload_then_reload_fresh_state"),
+        "dylib 重载门禁锚点缺失"
+    );
     // parrot-wasm：fuel 风暴
     let p2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../parrot-wasm/tests/runtime_tests.rs");
@@ -183,10 +206,10 @@ fn rep(path: &str, state: &str) -> ComponentStateReport {
 /// 补：diff_links 双杀形态直测（场景 3 的纯函数面）。
 #[test]
 fn chaos_diff_dual_kill() {
-    let d = diff_links(
-        &["akka-gw-1".into(), "ray-gw-1".into()],
-        &[],
-    );
+    let d = diff_links(&["akka-gw-1".into(), "ray-gw-1".into()], &[]);
     assert_eq!(d.joined.len(), 0);
-    assert_eq!(d.left, vec!["akka-gw-1".to_string(), "ray-gw-1".to_string()]);
+    assert_eq!(
+        d.left,
+        vec!["akka-gw-1".to_string(), "ray-gw-1".to_string()]
+    );
 }

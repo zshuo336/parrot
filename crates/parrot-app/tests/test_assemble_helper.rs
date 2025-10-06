@@ -10,11 +10,11 @@ use parrot::thread::config::ThreadActorConfig;
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture};
 use parrot_app::host::ThreadPropsSpawner;
 use parrot_app::manifest::{AppManifest, ArtifactRef, ComponentSpec, EngineKind, InstancePolicy};
 use parrot_app::planner::LocalTopology;
 use parrot_app::test_support::test_assemble_default_cfg;
-use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture};
 use std::sync::Arc;
 
 // ── 测试组件（PropsFactory——app.m5 命名空间）──
@@ -95,7 +95,9 @@ fn spec(name: &str) -> ComponentSpec {
     ComponentSpec {
         name: name.into(),
         engine: EngineKind::Parrot,
-        artifact: ArtifactRef::Props { factory: "app.m5.echo".into() },
+        artifact: ArtifactRef::Props {
+            factory: "app.m5.echo".into(),
+        },
         instances: InstancePolicy::Singleton,
         placement: Default::default(),
         upgrade: Default::default(),
@@ -149,7 +151,7 @@ async fn dependency_order_in_started() {
     let mut c = spec("c");
     c.deps = vec!["b".into()];
     let a = assemble(vec![c, b, spec("a")]).await; // 乱序声明
-    // 装配序 = 依赖序（a → b → c——与声明序无关）
+                                                   // 装配序 = 依赖序（a → b → c——与声明序无关）
     assert_eq!(
         a.started(),
         &["a".to_string(), "b".to_string(), "c".to_string()]
@@ -168,7 +170,9 @@ async fn paths_default_singleton() {
 async fn missing_factory_rolls_back_atomic() {
     // 未注册工厂 → 装配失败（fine 先成功——ctx 内部回卷后返回 Err）
     let mut bad = spec("bad");
-    bad.artifact = ArtifactRef::Props { factory: "app.m5.noexist".into() };
+    bad.artifact = ArtifactRef::Props {
+        factory: "app.m5.noexist".into(),
+    };
     let mut never = spec("never");
     never.deps = vec!["bad".into()];
     let r = test_assemble_default_cfg(
@@ -193,8 +197,7 @@ async fn teardown_stops_actors() {
     // 停用后 mailbox 已关闭——消息必失败（stop 语义：close + drain）
     let mut dead = false;
     for _ in 0..50 {
-        if r
-            .send(Box::new("hi".to_string()) as parrot_api::types::BoxedMessage)
+        if r.send(Box::new("hi".to_string()) as parrot_api::types::BoxedMessage)
             .await
             .is_err()
         {
