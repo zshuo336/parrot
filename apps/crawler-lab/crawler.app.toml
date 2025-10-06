@@ -1,0 +1,63 @@
+# crawler.app.toml —— M1 迁移（DEV_09 G1）：crawler-lab 四运行时应用声明
+#
+# 与 apps/crawler-lab/src/main.rs 手写装配行为等价：
+#   frontier(erl) ← frontier:/user/*   爬取调度（URL frontier，ETS）
+#   index(ray)    ← index:/user/*      索引构建（词频——CPU 密集）
+#   search(jvm)   ← search:/user/*     倒排 + top-k 检索
+#   crawler(parrot) —— 本体爬取 worker + 编排 hub（PropsFactory 编译期）
+#
+# G1 验收：cid 轨迹 hash 与 golden/pre_migration_output.txt 一致
+#（deploy/crawler-lab/run-lab.sh --pages 60 --skip-ts 输出比对）。
+
+name = "crawler-lab"
+version = "1.0.0"
+
+# ── 组件（依赖序即装配序：deps 声明 → Kahn 拓扑）──────────────────────
+
+[[components]]
+name = "frontier"
+engine = "erlang"
+artifact = { Beam = { app = "frontier" } }
+
+[[components]]
+name = "index"
+engine = "ray"
+artifact = { PyModule = { module = "index_builder" } }
+deps = ["frontier"]
+
+[[components]]
+name = "search"
+engine = "akka"
+artifact = { Jvm = { main_class = "parrot.protocol.crawler.SearchGateway" } }
+deps = ["index"]
+
+[[components]]
+name = "crawler"
+engine = "parrot"
+artifact = { Props = { factory = "crawler.lab.hub" } }
+deps = ["frontier", "index", "search"]
+
+# ── 连接（WireSpec——组件间静态路由）─────────────────────────────────
+
+[[wiring]]
+from = "crawler:/user/frontier"
+to = "frontier:/user/frontier"
+qos = "lan"
+
+[[wiring]]
+from = "crawler:/user/index"
+to = "index:/user/index"
+qos = "lan"
+
+[[wiring]]
+from = "crawler:/user/search"
+to = "search:/user/search"
+qos = "lan"
+
+# ── 配置（overlay——运行期 CLI 参数注入位：pages/depth/fanout/batch）──
+
+[config_overlay]
+pages = 60
+depth = 2
+fanout = 3
+batch = 32

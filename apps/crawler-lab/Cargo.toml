@@ -17,3 +17,7 @@ async-trait = { workspace = true }
 
 # 消息 codec 注册（inventory submit）走 parrot-api 公共面——应用自有键空间
 # bin:crawl/*（与框架注册表同进程合并，键不冲突）
+
+# G1 迁移门禁测试专用（应用本体仍零 parrot-app 依赖——框架/应用分离不破）
+[dev-dependencies]
+parrot-app = { path = "../../crates/parrot-app" }
