@@ -1,0 +1,39 @@
+[package]
+name = "parrot-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Parrot wasm component runtime: wasmtime + WIT parrot:component@0.1.0 + fuel/epoch sandbox"
+license = "MIT"
+
+# C 阶段（DEV_09 §3.3）：wasmtime 集成。
+# 默认零依赖（仅错误类型）——wasmtime 重编译成本高（R1 风险），feature gate：
+#   default = []            —— 纯类型/错误码（parrot-node 等引用不拉 wasmtime）
+#   runtime = ["wasmtime"]  —— WasmRuntime/WasmComponent 完整实现
+# parrot-node 侧：wasm = ["parrot-wasm/runtime"]（默认关）
+
+[features]
+default = []
+runtime = ["dep:wasmtime"]
+
+[dependencies]
+wasmtime = { version = "49", features = ["component-model", "cranelift", "runtime", "std"], optional = true }
+thiserror = "2.0"
+tracing = "0.1"
+
+[dev-dependencies]
+# wasm 工具链独立于 runtime feature——单测只在 runtime 档编译（同 feature）
+wasmtime = { version = "49", features = ["component-model", "cranelift", "runtime", "std"] }
+tokio = { version = "1", features = ["full"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[dev-dependencies.parrot-wasm]
+path = "."
+features = ["runtime"]
+
+[[bench]]
+name = "wasm_bench"
+harness = false
+
+[lib]
+name = "parrot_wasm"
+path = "src/lib.rs"

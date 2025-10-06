@@ -1,0 +1,52 @@
+// parrot-actor WIT world —— C2（DEV_09 §3.3 / 09 §4.2）冻结件。
+//
+// 冻结纪律：本文件一旦合入即视为公共 API（semver 管理）；修改 = 破坏性
+// 变更，须走 protocol break 评审（与 docs/vectors/admin_v2.json 同规）。
+//
+// 包名裁定：TECH_DESIGN_09 §4.2 原文 `parrot:component@0.1.0`（DEV_09
+// 施工文档 §3.3 写 parrot:actor——以设计文档为准，包名 component）。
+// world 名 `parrot-actor`（组件形态 = actor）。
+//
+// 宿主能力（能力制——最小权限）：
+//   self-ref      自身路径（/user/{name}）
+//   log           日志（tracing 汇入宿主 log_sink）
+//   config-get    只读 parrot-config 投影（overlay 合成后视图）
+//   clock-now-ms  单调时钟（测试可注入）
+// 1.0 不给网络/文件（P2 再议——09 §4.2 诚实声明）。
+
+package parrot:component@0.1.0;
+
+interface ctx {
+    /// 组件消息（与 Wire 帧同构：type_key + bytes——组件内部序列化自由）。
+    record msg {
+        type-key: string,
+        payload: list<u8>,
+    }
+
+    /// 组件自身 actor 路径。
+    self-ref: func() -> string;
+    /// 日志（level: 0=error 1=warn 2=info 3=debug 4=trace）。
+    log: func(level: u8, msg: string);
+    /// 只读配置投影（key 不存在 → none）。
+    config-get: func(key: string) -> option<string>;
+    /// 单调时钟（毫秒）。
+    clock-now-ms: func() -> u64;
+}
+
+interface handler {
+    use ctx.{msg};
+
+    /// ask：处理消息并回载荷（err = 组件自述错误串）。
+    handle: func(m: msg) -> result<list<u8>, string>;
+    /// tell：单向（无返回）。
+    tell: func(m: msg);
+    /// 实例启动钩子（spawn 后一次）。
+    on-start: func();
+    /// 升级 drain 钩子（§7——排空语义交组件自述）。
+    on-drain: func();
+}
+
+world parrot-actor {
+    import ctx;
+    export handler;
+}
