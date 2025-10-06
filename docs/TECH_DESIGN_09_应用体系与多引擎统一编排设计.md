@@ -1,4 +1,4 @@
-# TECH_DESIGN_08 · 应用体系与多引擎统一编排设计（App / Extension / Job / Debug）
+# TECH_DESIGN_09 · 应用体系与多引擎统一编排设计（App / Extension / Job / Debug）
 
 > 状态：**设计定稿（评审输入）** · 2026-10-06
 > 上游：[01 架构原则](./TECH_DESIGN_01_架构与设计原则.md)（双引擎+facade）· [04 远程集群](./TECH_DESIGN_04_远程与集群架构.md)（六层模型）· [07 联邦协议 1.0](./TECH_DESIGN_07_异构联邦协议设计.md)（Wire/拓扑/Directory/X12 自举裁定）· 配置切面（`parrot-config`，2026-10-05 交付）
@@ -415,9 +415,9 @@ Pending → Planning → Draining → Deploying → Verifying(健康探针+回�
 | **D. dylib** | `parrot-abi` + 加载器 + 卸载四步协议 + 禁止清单 CI 扫描 | `DeployComponent{Dylib}` 全链 | B（与 C 并行） |
 | **E. orchestrator** | AppSupervisor/HealthWatch/RolloutTracker + 调和循环 + desired 持久化(Raft) | `parrot app deploy/status/rollout` | B |
 | **F. debug 套件** | trace span 树 / 镜像 actor / record-replay / 孪生门禁接入 | 五能力 CLI + CI 门禁 | E（D3/D5 部分可提前） |
-| **G. 验收** | crawler-lab 改造为 App（跨四引擎）+ 全量回归 + 性能门禁 | DEV_08 DoD 核销 | 全部 |
+| **G. 验收** | crawler-lab 改造为 App（跨四引擎）+ 全量回归 + 性能门禁 | DEV_09 DoD 核销 | 全部 |
 
-### 11.2 测试计划（全量——按既有五引擎矩阵标准制定；DEV_08 展开为逐函数测试义务）
+### 11.2 测试计划（全量——按既有五引擎矩阵标准制定；DEV_09 展开为逐函数测试义务）
 
 #### 11.2.0 覆盖率铁律（100% 承诺的实现机制）
 
