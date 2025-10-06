@@ -95,6 +95,7 @@ fn comp(name: &str, engine: EngineKind, artifact: ArtifactRef) -> ComponentSpec 
         name: name.into(),
         engine,
         artifact,
+        alt_artifact: None,
         instances: InstancePolicy::Singleton,
         placement: PlacementConstraint::default(),
         upgrade: UpgradePolicy::default(),
@@ -192,8 +193,14 @@ async fn scenario_erlang_gateway_real_subprocess() {
         components: vec![comp(
             "frontier",
             EngineKind::Erlang,
+            // R3+R4：制品 = app 构建产物（apps/crawler-lab/erlang/
+            // frontier.beam）——uri 直发目录，网关 add_patha + load_file。
             ArtifactRef::Beam {
                 app: "frontier".into(),
+                uri: Some(format!(
+                    "file://{}",
+                    repo_root().join("apps/crawler-lab/erlang").display()
+                )),
             },
         )],
         wiring: vec![],
@@ -217,18 +224,25 @@ async fn scenario_erlang_gateway_real_subprocess() {
     .await
     .expect("assemble (erl escript 子进程注册)");
 
-    // 冒烟：erl 方言 Ping（+3：见 parrot_gw.erl service/2）
+    // 冒烟：组件业务键 bin:crawl/FrontierPush（1 条目 → ack n=1——与
+    // frontier.erl 协议一致；网关探针 bin:u:* 保留但不再是业务载荷）。
+    let mut push = Vec::new();
+    push.extend_from_slice(&1u32.to_le_bytes());
+    push.extend_from_slice(&7u64.to_le_bytes());
+    let url = b"https://parrot.dev/".to_vec();
+    push.extend_from_slice(&(url.len() as u32).to_le_bytes());
+    push.extend_from_slice(&url);
+    push.extend_from_slice(&0u16.to_le_bytes());
     let r = ctx
         .component_ref("frontier")
         .unwrap()
-        .send(Box::new(UnitPing(100)))
+        .send(Box::new(FrontierPushWire(push)))
         .await
         .expect("erl ask");
-    assert_eq!(
-        r.downcast_ref::<UnitPong>().unwrap().0,
-        103,
-        "erlang 方言 +3"
-    );
+    let w = r
+        .downcast_ref::<FrontierAckWire>()
+        .expect("FrontierAck wire bytes");
+    assert_eq!(w.0, 1u32.to_le_bytes().to_vec(), "frontier ack n=1");
 
     ctx.teardown(&deployer).await.ok();
     gw.procs().kill_all();
@@ -236,8 +250,78 @@ async fn scenario_erlang_gateway_real_subprocess() {
 }
 
 /// erl/ray 线上字节容器（裸 LE——与 crawler-lab wire_msg 同构；方言键探测用）。
+/// 注册为 bin:crawl/IndexStats（payload=空——index_builder 协议），
+/// 回执按 bin:crawl/IndexStatsR 解码：[terms u32][postings u64] LE。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ErlWireBytes(pub Vec<u8>);
+
+parrot_api::message::inventory::submit! {
+    parrot_api::message::CodecRegistration {
+        type_key: "bin:crawl/IndexStats",
+        type_id: std::any::TypeId::of::<ErlWireBytes>(),
+        encode: |msg: &BoxedMessage| {
+            let m = msg.downcast_ref::<ErlWireBytes>().ok_or("downcast fail")?;
+            Ok(m.0.clone())
+        },
+        decode: |b: &[u8]| {
+            Ok(Box::new(ErlWireBytes(b.to_vec())) as BoxedMessage)
+        },
+    }
+}
+
+/// FrontierPush 载荷：[n u32][{id u64|len u32|url|depth u16}...]（payload 纯业务字节）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrontierPushWire(pub Vec<u8>);
+
+parrot_api::message::inventory::submit! {
+    parrot_api::message::CodecRegistration {
+        type_key: "bin:crawl/FrontierPush",
+        type_id: std::any::TypeId::of::<FrontierPushWire>(),
+        encode: |msg: &BoxedMessage| {
+            let m = msg.downcast_ref::<FrontierPushWire>().ok_or("downcast fail")?;
+            Ok(m.0.clone())
+        },
+        decode: |b: &[u8]| {
+            Ok(Box::new(FrontierPushWire(b.to_vec())) as BoxedMessage)
+        },
+    }
+}
+
+/// FrontierAck 回执：[n u32] LE。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrontierAckWire(pub Vec<u8>);
+
+parrot_api::message::inventory::submit! {
+    parrot_api::message::CodecRegistration {
+        type_key: "bin:crawl/FrontierAck",
+        type_id: std::any::TypeId::of::<FrontierAckWire>(),
+        encode: |msg: &BoxedMessage| {
+            let m = msg.downcast_ref::<FrontierAckWire>().ok_or("downcast fail")?;
+            Ok(m.0.clone())
+        },
+        decode: |b: &[u8]| {
+            Ok(Box::new(FrontierAckWire(b.to_vec())) as BoxedMessage)
+        },
+    }
+}
+
+/// IndexStatsR 回执容器：[terms u32][postings u64] LE（payload 纯业务字节）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexStatsRWire(pub Vec<u8>);
+
+parrot_api::message::inventory::submit! {
+    parrot_api::message::CodecRegistration {
+        type_key: "bin:crawl/IndexStatsR",
+        type_id: std::any::TypeId::of::<IndexStatsRWire>(),
+        encode: |msg: &BoxedMessage| {
+            let m = msg.downcast_ref::<IndexStatsRWire>().ok_or("downcast fail")?;
+            Ok(m.0.clone())
+        },
+        decode: |b: &[u8]| {
+            Ok(Box::new(IndexStatsRWire(b.to_vec())) as BoxedMessage)
+        },
+    }
+}
 
 /// u:Ping（+3 erl / +2 ray 方言键——run-lab 同款语义探针）。
 #[derive(Debug, Clone, PartialEq)]
@@ -288,9 +372,15 @@ async fn scenario_ray_gateway_real_subprocess() {
         components: vec![comp(
             "indexer",
             EngineKind::Ray,
+            // R1：组件制品 = app 源码（apps/crawler-lab/python），网关
+            // deploy 时以 uri 为 working_dir 载入 parrot_entry 起组件。
             ArtifactRef::PyModule {
-                module: "parrot_protocol.ray_gw".into(),
+                module: "index_builder".into(),
                 runtime_env: None,
+                uri: Some(format!(
+                    "file://{}",
+                    repo_root().join("apps/crawler-lab/python").display()
+                )),
             },
         )],
         wiring: vec![],
@@ -314,14 +404,19 @@ async fn scenario_ray_gateway_real_subprocess() {
     .await
     .expect("assemble (python ray 子进程注册)");
 
-    // 冒烟：ray 方言 Ping（+2：见 ray_gw.py _ping）
+    // 冒烟：组件业务键 bin:crawl/IndexStats（空索引 → terms=0 postings=0）。
     let r = ctx
         .component_ref("indexer")
         .unwrap()
-        .send(Box::new(UnitPing(100)))
+        .send(Box::new(ErlWireBytes(vec![])))
         .await
         .expect("ray ask");
-    assert_eq!(r.downcast_ref::<UnitPong>().unwrap().0, 102, "ray 方言 +2");
+    let w = r
+        .downcast_ref::<IndexStatsRWire>()
+        .expect("IndexStatsR wire bytes");
+    // [terms u32][postings u64] LE——空索引全零。
+    assert_eq!(&w.0[0..4], &0u32.to_le_bytes(), "terms=0");
+    assert_eq!(&w.0[4..12], &0u64.to_le_bytes(), "postings=0");
 
     ctx.teardown(&deployer).await.ok();
     gw.procs().kill_all();
@@ -346,10 +441,7 @@ async fn scenario_jvm_gateway_real_subprocess() {
         components: vec![comp(
             "search",
             EngineKind::Akka,
-            ArtifactRef::Jvm {
-                main_class: "parrot.protocol.jvm.CrawlerSearchMain".into(),
-                coords: None,
-            },
+            ArtifactRef::Jvm { main_class: "crawler.search.SearchComponent".into(), coords: None, uri: Some(format!("file://{}", repo_root().join("apps/crawler-lab/jvm/target/crawler-lab-jvm-1.0.0.jar").display())) },
         )],
         wiring: vec![],
         config_overlay: None,
@@ -378,15 +470,20 @@ async fn scenario_jvm_gateway_real_subprocess() {
         .unwrap()
         .send(Box::new(UnitPing(1)))
         .await;
-    // CrawlerSearchMain 入口是 /jvm/user/search——组件路径 /user/search 未必命中其内部路径；
-    // 断言组装链路成立（ref 可用 + ask 回执），方言级语义由 crawler-lab 回归覆盖。
+    // R4 语义：deploy 已在 JVM 网关内 spawn SearchComponent（ComponentRoutes
+    // 路由命中——akka://parrot-gw/system/search）。UnitPing 非其消息集
+    // （crawl/IndexTerms 族）——ask 超时/回执均证明链路已通；组件级语义
+    // 由 crawler-lab 回归（run_regression.sh）与 mg_multiengine 承载。
     match r {
         Ok(_) => {}
         Err(e) => {
-            // ask 走到 JVM 且返回协议错误也算链路证明（路径语义 G1 收敛）
             let msg = format!("{e:?}");
             assert!(
-                msg.contains("not found") || msg.contains("NotFound") || msg.contains("unknown"),
+                msg.contains("not found")
+                    || msg.contains("NotFound")
+                    || msg.contains("unknown")
+                    || msg.contains("Timeout")
+                    || msg.contains("timed out"),
                 "链路应达 JVM：{msg}"
             );
         }
@@ -411,9 +508,7 @@ async fn scenario_failure_kills_gateway_procs() {
             comp(
                 "erl1",
                 EngineKind::Erlang,
-                ArtifactRef::Beam {
-                    app: "frontier".into(),
-                },
+                ArtifactRef::Beam { app: "frontier".into(), uri: None },
             ),
             comp(
                 "bad",

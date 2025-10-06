@@ -29,9 +29,9 @@ object AdminV2Codec {
   sealed trait ArtifactRef extends Product with Serializable
   object ArtifactRef {
     final case class Props(factory: String) extends ArtifactRef
-    final case class Beam(app: String) extends ArtifactRef
-    final case class PyModule(module: String, runtimeEnv: Option[String]) extends ArtifactRef
-    final case class Jvm(mainClass: String, coords: Option[String]) extends ArtifactRef
+  final case class Beam(app: String, uri: Option[String] = None) extends ArtifactRef
+  final case class PyModule(module: String, runtimeEnv: Option[String], uri: Option[String] = None) extends ArtifactRef
+  final case class Jvm(mainClass: String, coords: Option[String], uri: Option[String] = None) extends ArtifactRef
     final case class Wasm(digest: String, uri: String) extends ArtifactRef
     final case class Dylib(digest: String, uri: String, abi: Long) extends ArtifactRef
   }
@@ -150,12 +150,12 @@ object AdminV2Codec {
   private def putArtifact(w: W, a: ArtifactRef): Unit = a match {
     case ArtifactRef.Props(factory) =>
       w.varint(0); w.str(factory)
-    case ArtifactRef.Beam(app) =>
-      w.varint(1); w.str(app)
-    case ArtifactRef.PyModule(module, runtimeEnv) =>
-      w.varint(2); w.str(module); w.optStr(runtimeEnv)
-    case ArtifactRef.Jvm(mainClass, coords) =>
-      w.varint(3); w.str(mainClass); w.optStr(coords)
+    case ArtifactRef.Beam(app, uri) =>
+      w.varint(1); w.str(app); w.optStr(uri)
+    case ArtifactRef.PyModule(module, runtimeEnv, uri) =>
+      w.varint(2); w.str(module); w.optStr(runtimeEnv); w.optStr(uri)
+    case ArtifactRef.Jvm(mainClass, coords, uri) =>
+      w.varint(3); w.str(mainClass); w.optStr(coords); w.optStr(uri)
     case ArtifactRef.Wasm(digest, uri) =>
       w.varint(4); w.str(digest); w.str(uri)
     case ArtifactRef.Dylib(digest, uri, abi) =>
@@ -164,9 +164,9 @@ object AdminV2Codec {
 
   private def readArtifact(r: R): ArtifactRef = r.varint() match {
     case 0 => ArtifactRef.Props(r.str())
-    case 1 => ArtifactRef.Beam(r.str())
-    case 2 => val m = r.str(); ArtifactRef.PyModule(m, r.optStr())
-    case 3 => val mc = r.str(); ArtifactRef.Jvm(mc, r.optStr())
+    case 1 => val a = r.str(); ArtifactRef.Beam(a, r.optStr())
+    case 2 => val m = r.str(); val e = r.optStr(); ArtifactRef.PyModule(m, e, r.optStr())
+    case 3 => val mc = r.str(); val c = r.optStr(); ArtifactRef.Jvm(mc, c, r.optStr())
     case 4 => val d = r.str(); ArtifactRef.Wasm(d, r.str())
     case 5 =>
       val d = r.str(); val u = r.str()

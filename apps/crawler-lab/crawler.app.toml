@@ -1,40 +1,50 @@
-# crawler.app.toml —— M1 迁移（DEV_09 G1）：crawler-lab 四运行时应用声明
+# crawler.app.toml —— R5 新形态（应用体系架构纠正）：
+# crawler-lab 是自含多语言应用——所有业务代码在 apps/crawler-lab/ 下，
+# 按语言分模块构建（erl→beam / py→working_dir / jvm→jar / parrot→dylib+wasm），
+# 打成 parrot 标准包分发；运行时网关是通用宿主，deploy 时动态加载组件。
 #
-# 与 apps/crawler-lab/src/main.rs 手写装配行为等价：
-#   frontier(erl) ← frontier:/user/*   爬取调度（URL frontier，ETS）
-#   index(ray)    ← index:/user/*      索引构建（词频——CPU 密集）
-#   search(jvm)   ← search:/user/*     倒排 + top-k 检索
-#   crawler(parrot) —— 本体爬取 worker + 编排 hub（PropsFactory 编译期）
+# 组件源码位置（source of truth 均在 app 内）：
+#   frontier(erl)  apps/crawler-lab/erlang/frontier.erl
+#                  → erlc → beam → erl 网关 code:load_abs
+#   index(ray)     apps/crawler-lab/python/index_builder.py
+#                  → 源码目录 = working_dir → ray 网关 parrot_entry
+#   search(jvm)    apps/crawler-lab/jvm/src/.../SearchComponent.scala
+#                  → thin jar → jvm 网关 child-first loader
+#   crawler(parrot) apps/crawler-lab/dylib + apps/crawler-lab/wasm
+#                  → cdylib + wasm 双形态 → parrot 网关 loader/runtime
 #
-# G1 验收：cid 轨迹 hash 与 golden/pre_migration_output.txt 一致
-#（deploy/crawler-lab/run-lab.sh --pages 60 --skip-ts 输出比对）。
+# R5 验收：cid 轨迹 hash 与 golden/pre_migration_output.txt 一致
+#（run_regression.sh 输出比对——行为等价门禁）。
 
 name = "crawler-lab"
-version = "1.0.0"
+version = "2.0.0"
 
 # ── 组件（依赖序即装配序：deps 声明 → Kahn 拓扑）──────────────────────
 
 [[components]]
 name = "frontier"
 engine = "erlang"
-artifact = { Beam = { app = "frontier" } }
+artifact = { Beam = { app = "frontier", uri = "file://erlang/" } }
 
 [[components]]
 name = "index"
 engine = "ray"
-artifact = { PyModule = { module = "index_builder" } }
+artifact = { PyModule = { module = "index_builder", uri = "file://python/" } }
 deps = ["frontier"]
 
 [[components]]
 name = "search"
 engine = "akka"
-artifact = { Jvm = { main_class = "parrot.protocol.crawler.SearchGateway" } }
+artifact = { Jvm = { main_class = "crawler.search.SearchComponent", uri = "file://jvm/target/crawler-lab-jvm-1.0.0.jar" } }
 deps = ["index"]
 
 [[components]]
 name = "crawler"
 engine = "parrot"
-artifact = { Props = { factory = "crawler.lab.hub" } }
+# 双形态（R2）：Dylib 主形态（性能门禁 <1µs）+ Wasm 沙箱形态。
+# 部署系统按节点能力选择；两形态同键同行为（crawl/Echo|Stat|Tick）。
+artifact = { Dylib = { uri = "file://dylib/libcrawler_lab_dylib.dylib", digest = "sha256:__BUILD__", abi = 1 } }
+alt_artifact = { Wasm = { uri = "file://wasm/crawler-hub.wasm", digest = "sha256:__BUILD__" } }
 deps = ["frontier", "index", "search"]
 
 # ── 连接（WireSpec——组件间静态路由）─────────────────────────────────

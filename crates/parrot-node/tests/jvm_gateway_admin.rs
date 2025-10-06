@@ -316,6 +316,7 @@ async fn jvm_gateway_admin_v2_full_chain() {
             artifact: AdminArtifactRef::Jvm {
                 main_class: "parrot.no.SuchClass".into(),
                 coords: None,
+                uri: None,
             },
             instances: AdminInstancePolicy::Singleton,
             config: None,

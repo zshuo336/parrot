@@ -51,6 +51,31 @@ object AdminV2Executor {
       stopper: () => Unit
   )
 
+  /** R4（应用体系架构纠正）：deploy 实例 → Bridge 路由注册表。
+    *
+    * AdminPort spawn 实例后登记（path → ask 中转 actor）；stop/drain
+    * 清除。网关 BridgeActor resolve 先查本表——已部署组件优先于内置
+    * 探针 targets（业务代码已迁各 app 的 jvm 目录，网关只留协议骨架）。
+    *
+    * ask 中转：BridgeAsk/BridgeReplyOk 的类型身份在网关 classloader——
+    * child loader 里的组件 Behavior[Any] 无法直接消费，故经适配 actor
+    * 转发（payload 透传——协议键与字节双方言无身份耦合）。
+    */
+  object ComponentRoutes {
+    private val routes = new java.util.concurrent.ConcurrentHashMap[String, akka.actor.typed.ActorRef[Any]]()
+
+    def put(path: String, ref: akka.actor.typed.ActorRef[Any]): Unit = {
+      routes.put(path, ref)
+    }
+
+    def remove(path: String): Unit = {
+      routes.remove(path)
+    }
+
+    def get(path: String): Option[akka.actor.typed.ActorRef[Any]] =
+      Option(routes.get(path))
+  }
+
   final class AdminException(val code: Int, msg: String) extends RuntimeException(msg)
 
   // ---------------- child-first loader ----------------
@@ -85,8 +110,8 @@ object AdminV2Executor {
   def buildLoader(
       artifact: AdminV2Codec.ArtifactRef
   ): Option[URLClassLoader] = artifact match {
-    case AdminV2Codec.ArtifactRef.Jvm(_, coords) =>
-      val uri = artifactUri(coords)
+    case jv @ AdminV2Codec.ArtifactRef.Jvm(_, _, _) =>
+      val uri = artifactUri(jv)
       if (uri.isEmpty) None
       else {
         val urls = resolveJarUrls(uri.get)
@@ -102,18 +127,22 @@ object AdminV2Executor {
   /** artifact 种族名（Failed 回执 detail 用）。 */
   def kindOf(a: AdminV2Codec.ArtifactRef): String = a match {
     case AdminV2Codec.ArtifactRef.Props(_)       => "props"
-    case AdminV2Codec.ArtifactRef.Beam(_)        => "beam"
-    case AdminV2Codec.ArtifactRef.PyModule(_, _) => "pymodule"
-    case AdminV2Codec.ArtifactRef.Jvm(_, _)      => "jvm"
+    case AdminV2Codec.ArtifactRef.Beam(_, _)       => "beam"
+    case AdminV2Codec.ArtifactRef.PyModule(_, _, _) => "pymodule"
+    case AdminV2Codec.ArtifactRef.Jvm(_, _, _)     => "jvm"
     case AdminV2Codec.ArtifactRef.Wasm(_, _)     => "wasm"
     case AdminV2Codec.ArtifactRef.Dylib(_, _, _) => "dylib"
   }
 
-  /** uri 来源：coords 字段承载 uri（file:// 形态）——B1 协议 Jvm{coords}
-    * 未带独立 uri，Rust 侧约定 coords 即 "file://..." 数据源。
+  /** uri 来源（R3）：uri 字段（app 构建产物直发——file:// 形态）优先；
+    * 缺省时 coords 承载 uri（file:// 前缀形态——B1 兼容）。
     */
-  private def artifactUri(coords: Option[String]): Option[String] =
-    coords.filter(_.startsWith("file:"))
+  private def artifactUri(a: AdminV2Codec.ArtifactRef): Option[String] = a match {
+    case AdminV2Codec.ArtifactRef.Jvm(_, coords, uri) =>
+      uri.filter(_.startsWith("file:"))
+        .orElse(coords.filter(_.startsWith("file:")))
+    case _ => None
+  }
 
   private def resolveJarUrls(uri: String): Seq[URL] = {
     val path = uri.stripPrefix("file://").stripPrefix("file:")

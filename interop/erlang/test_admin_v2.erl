@@ -118,11 +118,11 @@ t_varint() ->
 t_cmd_roundtrip() ->
     Cmds = [
         {deploy_component, 7, {<<"crawler">>, <<"1.2.0">>,
-                               {beam, <<"frontier">>}, {sharded, 3}, <<"[w]\nc=4">>}},
+                               {beam, <<"frontier">>, undefined}, {sharded, 3}, <<"[w]\nc=4">>}},
         {deploy_component, 8, {<<"x">>, <<"1">>,
-                               {pymodule, <<"m">>, undefined}, singleton, undefined}},
+                               {pymodule, <<"m">>, undefined, undefined}, singleton, undefined}},
         {deploy_component, 9, {<<"x">>, <<"1">>,
-                               {jvm, <<"parrot.C">>, <<"file:///a.jar">>}, {pool, 2}, undefined}},
+                               {jvm, <<"parrot.C">>, <<"file:///a.jar">>, undefined}, {pool, 2}, undefined}},
         {deploy_component, 10, {<<"x">>, <<"1">>,
                                 {wasm, <<"sha256:aa">>, <<"file:///a.wasm">>}, singleton, undefined}},
         {deploy_component, 11, {<<"x">>, <<"1">>,
@@ -162,7 +162,7 @@ t_deploy_logic() ->
     parrot_gw:admin_init(),
     %% 用已在 code path 的模块（parrot_gw 自身——热加载逻辑走 load_abs 已载路径）
     {deployed, [<<"/user/logt">>]} =
-        parrot_gw:admin_deploy({<<"logt">>, <<"9.9">>, {beam, <<"parrot_gw">>}, singleton, undefined}),
+        parrot_gw:admin_deploy({<<"logt">>, <<"9.9">>, {beam, <<"parrot_gw">>, undefined}, singleton, undefined}),
     %% 登记表就位 → status 可见
     {status_reply, [{<<"/user/logt">>, <<"running">>, <<"9.9">>}]} =
         parrot_gw:admin_status(<<"/user/logt">>),
@@ -177,9 +177,9 @@ t_deploy_mismatch() ->
 t_stop_prefix() ->
     parrot_gw:admin_init(),
     {deployed, _} = parrot_gw:admin_deploy(
-        {<<"n1">>, <<"1">>, {beam, <<"parrot_gw">>}, singleton, undefined}),
+        {<<"n1">>, <<"1">>, {beam, <<"parrot_gw">>, undefined}, singleton, undefined}),
     {deployed, _} = parrot_gw:admin_deploy(
-        {<<"n1x">>, <<"1">>, {beam, <<"parrot_gw">>}, singleton, undefined}),
+        {<<"n1x">>, <<"1">>, {beam, <<"parrot_gw">>, undefined}, singleton, undefined}),
     stopped = parrot_gw:admin_stop(<<"/user/n1">>),
     %% /user/n1x 未被误停（status 仍可见）
     {status_reply, [_]} = parrot_gw:admin_status(<<"/user/n1x">>),

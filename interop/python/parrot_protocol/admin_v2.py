@@ -98,16 +98,25 @@ def put_artifact(a: dict) -> bytes:
     if kind == "props":
         return b"\x00" + put_str(a["factory"])
     if kind == "beam":
-        return b"\x01" + put_str(a["app"])
+        uri = a.get("uri")
+        return b"\x01" + put_str(a["app"]) + (
+            b"\x00" if uri is None else b"\x01" + put_str(uri)
+        )
     if kind == "pymodule":
         env = a.get("runtime_env")
+        uri = a.get("uri")
         return b"\x02" + put_str(a["module"]) + (
             b"\x00" if env is None else b"\x01" + put_str(env)
+        ) + (
+            b"\x00" if uri is None else b"\x01" + put_str(uri)
         )
     if kind == "jvm":
         coords = a.get("coords")
+        uri = a.get("uri")
         return b"\x03" + put_str(a["main_class"]) + (
             b"\x00" if coords is None else b"\x01" + put_str(coords)
+        ) + (
+            b"\x00" if uri is None else b"\x01" + put_str(uri)
         )
     if kind == "wasm":
         return b"\x04" + put_str(a["digest"]) + put_str(a["uri"])
@@ -123,7 +132,12 @@ def read_artifact(buf: memoryview, off: int) -> tuple[dict, int]:
         return {"kind": "props", "factory": f}, off
     if v == 1:
         app, off = read_str(buf, off)
-        return {"kind": "beam", "app": app}, off
+        uri = None
+        if buf[off] == 1:
+            uri, off = read_str(buf, off + 1)
+        else:
+            off += 1
+        return {"kind": "beam", "app": app, "uri": uri}, off
     if v == 2:
         m, off = read_str(buf, off)
         env = None
@@ -131,7 +145,12 @@ def read_artifact(buf: memoryview, off: int) -> tuple[dict, int]:
             env, off = read_str(buf, off + 1)
         else:
             off += 1
-        return {"kind": "pymodule", "module": m, "runtime_env": env}, off
+        uri = None
+        if buf[off] == 1:
+            uri, off = read_str(buf, off + 1)
+        else:
+            off += 1
+        return {"kind": "pymodule", "module": m, "runtime_env": env, "uri": uri}, off
     if v == 3:
         mc, off = read_str(buf, off)
         coords = None
@@ -139,7 +158,12 @@ def read_artifact(buf: memoryview, off: int) -> tuple[dict, int]:
             coords, off = read_str(buf, off + 1)
         else:
             off += 1
-        return {"kind": "jvm", "main_class": mc, "coords": coords}, off
+        uri = None
+        if buf[off] == 1:
+            uri, off = read_str(buf, off + 1)
+        else:
+            off += 1
+        return {"kind": "jvm", "main_class": mc, "coords": coords, "uri": uri}, off
     if v == 4:
         d, off = read_str(buf, off)
         u, off = read_str(buf, off)

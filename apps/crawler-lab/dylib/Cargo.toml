@@ -1,0 +1,13 @@
+[package]
+name = "crawler-lab-dylib"
+version = "1.0.0"
+edition = "2021"
+description = "crawler-lab parrot 组件（cdylib 形态——R2 双形态之一）"
+
+[lib]
+name = "crawler_lab_dylib"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+parrot-abi = { path = "../../../crates/parrot-abi", default-features = false }

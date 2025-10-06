@@ -1,25 +1,27 @@
-package parrot.protocol.jvm
-
-import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.{ActorSystem, Behavior}
-import BridgeActor._
-import scala.concurrent.duration._
-
-/** crawler-lab JVM 入口：搜索 API actor（倒排接收 + top-k 打分 + JSON 响应）。
+/** crawler-lab 搜索组件（jvm 方言——app 内 source of truth）。
   *
-  * 场景角色：面向用户 Web 访问的检索层（akka 承接——高并发短查询强项）。
+  * R1（应用体系架构纠正）：本类是 apps/crawler-lab 的业务代码，经 parrot
+  * 标准包分发：crawler.app.toml 声明 artifact = { Jvm = { main_class =
+  * "crawler.search.SearchComponent", coords = "file://...jar" } }，jvm 网关
+  * deploy 时经 child-first loader 载入本类（ComponentSpi）并 spawn。
   *
-  * actor：search（三协议分支：IndexTerms 入库 / Search 查询 / Healthz 探针）
-  *        echo/cpu（与 ParrotGatewayMain 同语义——回归兼容）
-  *
-  * 载荷布局（与 Rust 侧 parrot-crawler-lab.rs 逐字节对齐）：
-  *   IndexTerms: [n u32][{len u32|term utf8|doc u64|tf u32}...]
-  *   Search:     [k u32][{len u32|term utf8}...]
-  *   Healthz:    空 → JSON {"terms","postings","queries"}
+  * 协议（与 Rust hub 逐字节对齐——run_regression golden 锚定）：
+  *   bin:crawl/IndexTerms → IndexAck [n u32]
+  *   bin:crawl/Search     → SearchResult json
+  *   bin:crawl/Healthz    → HealthzR json
   */
-object CrawlerSearchMain {
+package crawler.search
 
-  // LE 读助手（payload 小端整数）
+import akka.actor.typed.Behavior
+import akka.actor.typed.scaladsl.Behaviors
+import parrot.protocol.jvm.{ComponentContext, ComponentSpi}
+import parrot.protocol.jvm.BridgeActor.{BridgeAsk, BridgeReplyOk}
+
+class SearchComponent extends ComponentSpi {
+  override def behavior(ctx: ComponentContext): Behavior[Any] = SearchBehavior.searchActor(ctx, 5)
+}
+
+object SearchBehavior {
   private def u32(p: Array[Byte], off: Int): Int =
     (p(off).toInt & 0xFF) | ((p(off + 1).toInt & 0xFF) << 8) |
       ((p(off + 2).toInt & 0xFF) << 16) | ((p(off + 3).toInt & 0xFF) << 24)
@@ -30,12 +32,7 @@ object CrawlerSearchMain {
     v
   }
 
-  case class SearchState(
-      inverted: scala.collection.mutable.Map[String, Array[(Long, Int)]],
-      queries: Long
-  )
-
-  def searchActor(k: Int): Behavior[Any] = {
+  def searchActor(ctx: ComponentContext, k: Int): Behavior[Any] = {
     var inverted = scala.collection.mutable.Map[String, Array[(Long, Int)]]()
     var queries  = 0L
 
@@ -94,45 +91,5 @@ object CrawlerSearchMain {
         Behaviors.same
       case _ => Behaviors.same
     }
-  }
-
-  def main(args: Array[String]): Unit = {
-    // 双模式组网：
-    //   [port]              —— 被动模式（listen 等 parrot 拨入）
-    //   [port, parrot=h:p]  —— 注册模式（主动拨号 parrot 应用并驻留）
-    //   [port, idle]        —— 被动 + idle 秒超时
-    val port = if (args.length > 0) args(0).toInt else 0
-    val parrotReg = args.find(_.startsWith("parrot=")).map(_.stripPrefix("parrot="))
-    val idle = args
-      .drop(1)
-      .find(_.forall(_.isDigit))
-      .map(_.toInt)
-      .getOrElse(3600)
-
-    val guardian = Behaviors.setup[BridgeMsg] { ctx =>
-      val search = ctx.spawn(searchActor(5), "search")
-      val targets: Map[String, akka.actor.typed.ActorRef[Any]] =
-        Map("search" -> search)
-      val bridge = ctx.spawn(BridgeActor(path => targets.get(path)), "bridge")
-      val ext = new ParrotTransportExtension(ctx.system, bridge, "jvm-search-1")
-      ParrotServerHandler.initSystem(ctx.system)
-      parrotReg match {
-        case Some(target) =>
-          // 注册模式：注册到 parrot 后驻留（registerTo 内部 sync 等待连接关闭）
-          val Array(host, p) = target.split(":")
-          System.out.println(s"PARROT_JVM_REGISTERING=$target")
-          System.out.flush()
-          ctx.executionContext.execute(() =>
-            ext.registerTo(host, p.toInt)
-          )
-        case None =>
-          ext.listen(port)
-          System.out.println(s"PARROT_JVM_PORT=${ext.port}")
-          System.out.flush()
-      }
-      Behaviors.empty
-    }
-    val sys = ActorSystem(guardian, "parrot-crawler")
-    sys.scheduler.scheduleOnce(idle.seconds, () => sys.terminate())(sys.executionContext)
   }
 }

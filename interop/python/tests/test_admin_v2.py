@@ -346,7 +346,15 @@ def gw(monkeypatch):
                     self._inst = inst
 
                 def __getattr__(self, name):
-                    return getattr(self._inst, name)
+                    attr = getattr(self._inst, name)
+                    if callable(attr):
+                        # 方法级 remote 桩：handle.method.remote(*args) →
+                        # callable ref（stub_ray.get 直接执行）
+                        class _M:
+                            def remote(self, *a, **kw):
+                                return lambda: attr(*a, **kw)
+                        return _M()
+                    return attr
 
             return _H(inst)
 

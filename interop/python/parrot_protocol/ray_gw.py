@@ -61,11 +61,17 @@ class RayAdminExecutor:
     path_prefix 匹配规则与 Rust 侧一致（整段相等或后随 '-'）。
     """
 
-    def __init__(self, out_queue, ray_module=None) -> None:
+    def __init__(self, out_queue, ray_module=None, gateway_dispatcher=None,
+                 worker_ref=None) -> None:
         self._out = out_queue          # 回帧队列（writer 线程消费）
         self._ray = ray_module         # 可注入（测试桩）；None → import ray
         self._components: dict[str, dict] = {}
         self._lock = threading.Lock()
+        # R4：网关 dispatcher（deploy 组件挂载点；None = 测试桩形态）
+        self._gw_dispatcher = gateway_dispatcher
+        # R4：ray actor 引用（组件 dispatcher 送进 actor 进程挂载——
+        # 本地 mount 对 actor 内深拷贝副本无效）
+        self._worker = worker_ref
 
     # ---- ray 句柄（惰性导入；测试注入桩）----
     @property
@@ -147,7 +153,13 @@ class RayAdminExecutor:
                 "code": ERR_DIALECT_MISMATCH,
                 "detail": f"ray executor expects PyModule, got {art['kind']}",
             }
-        module_dir = os.path.dirname(art["module"].replace(".", "/")) or "."
+        # R3：uri（file:// 目录形态）= app 源码 working_dir——优先于
+        # module 相对发现（app 标准包直发形态）
+        uri = art.get("uri")
+        if uri and uri.startswith("file://"):
+            module_dir = uri[len("file://"):]
+        else:
+            module_dir = os.path.dirname(art["module"].replace(".", "/")) or "."
         # runtime_env：TOML 文本 → dict（py3.11+ tomllib；旧版容错降级）
         env_dict: dict = {}
         re_text = art.get("runtime_env")
@@ -184,21 +196,53 @@ class RayAdminExecutor:
         真 ray 集群：JobSubmissionClient().submit(working_dir, entrypoint)。
         本地 ray.init（测试/单机形态）：importlib 直载 + parrot_entry 本地起
         命名 actor（ray.get 强制落位——与 serve 的 worker 就绪等待同式）。
-        """
-        import importlib
 
+        R4：parrot_entry 返回 ParrotDispatcher（app 组件形态——apps/*/python）
+        时额外挂载到网关 dispatcher（组件 handler 优先于内置探针）；
+        返回 ray actor 句柄时保持 B3 句柄形态（兼容旧 fixture）。
+        """
+        # dispatcher 形态：组件送入 ray actor 进程构建+挂载（ask 路由到
+        # 组件 handler）；网关本地 dispatcher 同挂（测试桩/本地直连形态）
+        handles: list = []
+        mounted = None
         module_name = comp["artifact"]["module"]
-        mod = importlib.import_module(module_name)
-        entry = getattr(mod, "parrot_entry", None)
-        if entry is None:
-            raise RuntimeError(f"{module_name} has no parrot_entry(ctx)")
-        ray = self.ray
-        # parrot_entry(ctx) → dispatcher 工厂；ctx 含 instances/env
-        handles = []
-        for path in instances:
-            h = entry({"path": path, "env": env_dict, "ray": ray})
-            handles.append(h)
+        if self._worker is not None:
+            self.ray.get(self._worker.mount_module.remote(
+                comp["name"], module_name, module_dir, env_dict, instances))
+            mounted = True
+        else:
+            import importlib
+            import os
+            import sys
+
+            # working_dir 语义：module 目录入 sys.path（app 标准包解包位）
+            if module_dir and module_dir not in sys.path:
+                sys.path.insert(0, os.path.abspath(module_dir))
+            mod = importlib.import_module(module_name)
+            entry = getattr(mod, "parrot_entry", None)
+            if entry is None:
+                raise RuntimeError(f"{module_name} has no parrot_entry(ctx)")
+            # parrot_entry(ctx) → dispatcher 工厂；ctx 含 instances/env
+            for path in instances:
+                h = entry({"path": path, "env": env_dict, "ray": self.ray})
+                handles.append(h)
+                if _is_dispatcher(h):
+                    mounted = h
+            if mounted is not None and self._gw_dispatcher is not None:
+                self._gw_dispatcher.mount(mounted)
         return handles
+
+    def _unmount(self, info: dict, comp_name: str | None = None) -> None:
+        """卸载组件 dispatcher（drain/stop——句柄形态无操作）。"""
+        if self._worker is not None and comp_name is not None:
+            try:
+                self._worker.unmount_name.remote(comp_name)
+            except Exception:  # noqa: BLE001
+                pass
+        for h in info.get("handles", []):
+            if _is_dispatcher(h):
+                if self._gw_dispatcher is not None:
+                    self._gw_dispatcher.unmount(h)
 
     # ---- Drain：排空（命名 actor 优雅停——ray 无 drain 原语，
     #      语义映射为 drain 钩子调用 + ray.kill(no_restart=True)）----
@@ -219,6 +263,7 @@ class RayAdminExecutor:
                     ok = False
             if ok and time.monotonic() < deadline:
                 self._kill_handles(info["handles"])
+                self._unmount(info, name)
                 drained += len(info["paths"])
             else:
                 aborted += len(info["paths"])
@@ -233,6 +278,7 @@ class RayAdminExecutor:
             raise _NotFound(prefix)
         for name, info in comps:
             self._kill_handles(info["handles"])
+            self._unmount(info, name)
             with self._lock:
                 self._components.pop(name, None)
         return {"kind": "stopped"}
@@ -276,6 +322,21 @@ class RayAdminExecutor:
                 pass
 
 
+def _is_dispatcher(h) -> bool:
+    """组件句柄是否为 dispatcher 形态（鸭子判定）。
+
+    网关以 `python3 -m parrot_protocol.ray_gw` 启动时运行模块为
+    `__main__`，而 app 组件 `from parrot_protocol.ray_gw import
+    ParrotDispatcher` 会二次导入同名模块——两份类对象 isinstance
+    恒 False。改按结构判定（dispatch/mount/_handlers）。
+    """
+    return (
+        hasattr(h, "dispatch")
+        and callable(getattr(h, "dispatch", None))
+        and hasattr(h, "_handlers")
+    )
+
+
 class _NotFound(Exception):
     """组件未部署（Stop/Status/Drain 找不到实例 → 0x0A03）。"""
 
@@ -293,10 +354,16 @@ class ParrotDispatcher:
     """TYPE_KEY → handler 分发（ray 侧单例形态）。
 
     子类注册 handler：`@dispatcher.handler("pb:demo/Echo")`。
+
+    R4（应用体系架构纠正）：`mount` 支持挂载已部署组件的子 dispatcher
+    （deploy 时网关调用）——组件 handler 与网关内置探针同键时组件优先
+    （业务键唯一——冲突视为部署错误抛 KeyError）。网关自身不再内置
+    业务 handler（业务已迁 apps/*/python/）。
     """
 
     def __init__(self) -> None:
         self._handlers: dict[str, object] = {}
+        self._mounted: list["ParrotDispatcher"] = []
 
     def handler(self, type_key: str):
         def deco(fn):
@@ -305,7 +372,22 @@ class ParrotDispatcher:
 
         return deco
 
+    def mount(self, sub: "ParrotDispatcher") -> None:
+        """挂载组件 dispatcher（deploy）——重复挂载幂等跳过。"""
+        if sub not in self._mounted:
+            self._mounted.append(sub)
+
+    def unmount(self, sub: "ParrotDispatcher") -> None:
+        """卸载组件 dispatcher（drain/stop）。"""
+        if sub in self._mounted:
+            self._mounted.remove(sub)
+
     def dispatch(self, type_key: str, payload: bytes) -> tuple[str, bytes]:
+        # 已部署组件优先（业务键）——网关内置探针兜底
+        for sub in reversed(self._mounted):
+            fn = sub._handlers.get(type_key)
+            if fn is not None:
+                return fn(type_key, payload)
         fn = self._handlers.get(type_key)
         if fn is None:
             raise KeyError(f"unknown type key {type_key}")
@@ -333,16 +415,52 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
 
     @ray.remote
     class RayWorker:
-        """ParrotDispatcher 的 ray actor 化（ask=ray.get / deliver=fire-and-forget）。"""
+        """ParrotDispatcher 的 ray actor 化（ask=ray.get / deliver=fire-and-forget）。
+
+        R4：mount_module/unmount_name 远程方法——deploy 的 PyModule 组件
+        在 actor 进程内 importlib 载入 + parrot_entry 实例化 + 挂载
+        （dispatcher 含闭包状态，跨进程序列化会因 actor 侧无模块而
+        失败——组件必须在目标进程内构建）。ask 路由：组件 handler
+        优先（后挂载优先），网关探针兜底。
+        """
 
         def __init__(self, d: ParrotDispatcher) -> None:
             self._d = d
+            self._mounted: dict[str, object] = {}  # comp_name → dispatcher
 
         def ask(self, type_key: str, payload: bytes) -> tuple[str, bytes]:
+            for sub in reversed(list(self._mounted.values())):
+                fn = getattr(sub, "_handlers", {}).get(type_key)
+                if fn is not None:
+                    return fn(type_key, payload)
             return self._d.dispatch(type_key, payload)
 
         def deliver(self, type_key: str, payload: bytes) -> None:
-            self._d.dispatch(type_key, payload)  # 不 get（非取消语义）
+            self.ask(type_key, payload)  # 不 get（非取消语义）
+
+        def mount_module(self, comp_name: str, module_name: str, module_dir: str,
+                         env_dict: dict, paths: list[str]) -> list[str]:
+            """actor 进程内载入 app 组件模块并挂载其 dispatcher。"""
+            import importlib
+            import os
+            import sys
+
+            if module_dir and module_dir not in sys.path:
+                sys.path.insert(0, os.path.abspath(module_dir))
+            mod = importlib.import_module(module_name)
+            entry = getattr(mod, "parrot_entry", None)
+            if entry is None:
+                raise RuntimeError(f"{module_name} has no parrot_entry(ctx)")
+            import ray as _ray
+
+            for p in paths:
+                h = entry({"path": p, "env": env_dict, "ray": _ray})
+                if _is_dispatcher(h):
+                    self._mounted[comp_name] = h
+            return paths
+
+        def unmount_name(self, comp_name: str) -> None:
+            self._mounted.pop(comp_name, None)
 
     worker = RayWorker.remote(dispatch)
 
@@ -402,7 +520,8 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
             pool_local = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
 
             # B3（DEV_09）：admin-v2 执行器（回帧经 out_local——writer 线程）
-            admin_local = RayAdminExecutor(out_local)
+            admin_local = RayAdminExecutor(out_local, gateway_dispatcher=dispatch,
+                                           worker_ref=worker)
 
             def reply(cid: int, key: str, payload: bytes) -> None:
                 out_local.put(build_frame(FT_REPLY, cid, "", key, payload))
@@ -547,7 +666,8 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
             reply_err(cid, ERR_UNKNOWN_TYPE_KEY, str(e))
 
     # B3（DEV_09）：admin-v2 执行器（回帧经 out 队列——writer 线程）
-    admin_exec = RayAdminExecutor(out)
+    # R4：dispatcher + worker 传入——deploy 组件挂载路由（actor 进程内）
+    admin_exec = RayAdminExecutor(out, gateway_dispatcher=dispatch, worker_ref=worker)
 
     dec = FrameDecoder()
     handshake_done = False
@@ -611,49 +731,10 @@ def main(argv: list[str]) -> None:
         a, b = struct.unpack("<QQ", p)
         return ("bin:u:AddR", struct.pack("<Q", a + b + 1000))  # ray 方言 +1000
 
-    # ---- 爬虫场景：索引构建（crawler-lab；CPU 密集——分词/词频/合并）----
-    # 索引分片：dict[term -> dict[doc_id -> tf]]（进程内 ray worker 共享字典，
-    # deliver/ask 均可写——网关单 worker actor 串行化保证无锁一致）
-    _index: dict[str, dict[int, int]] = {}
+    # R4（应用体系架构纠正）：网关不再内置业务 handler——业务组件经
+    # Deploy{PyModule} 载入（ray 网关 _launch importlib 载入 app 模块，
+    # dispatcher 融合：已部署组件 handler 优先，网关探针兜底）。
 
-    def _decode_pages(p: bytes) -> list[tuple[int, bytes]]:
-        """[n u32][{doc u64|len u32|html}...]"""
-        (n,) = struct.unpack_from("<I", p, 0)
-        off, pages = 4, []
-        for _ in range(n):
-            doc, ln = struct.unpack_from("<QI", p, off)
-            off += 12
-            pages.append((doc, p[off : off + ln]))
-            off += ln
-        return pages
-
-    _STOP = set(
-        "the a an of to in and or for on with at by is it as be html head title page body".split()
-    )
-
-    def _tokenize(html: bytes) -> list[str]:
-        text = html.decode("utf-8", errors="replace").lower()
-        for ch in "<>=/\"'!?,.:;()[]{}":
-            text = text.replace(ch, " ")
-        return [t for t in text.split() if t and t not in _STOP and len(t) > 1]
-
-    @d.handler("bin:crawl/IndexPage")
-    def _index_page(_k: str, p: bytes) -> tuple[str, bytes]:
-        pages = _decode_pages(p)
-        terms = 0
-        for doc, html in pages:
-            for t in _tokenize(html):
-                slot = _index.setdefault(t, {})
-                slot[doc] = slot.get(doc, 0) + 1
-                terms += 1
-        return ("bin:crawl/IndexAck", struct.pack("<II", len(pages), terms))
-
-    @d.handler("bin:crawl/IndexStats")
-    def _index_stats(_k: str, _p: bytes) -> tuple[str, bytes]:
-        # [docs u32][terms u32][postings u64]（docs 由调用侧对账——此处
-        # 索引视角：去重词数 + 总 posting 数）
-        postings = sum(len(v) for v in _index.values())
-        return ("bin:crawl/IndexStatsR", struct.pack("<IQ", len(_index), postings))
 
     serve(port, d, parrot_addr=parrot_addr)
 

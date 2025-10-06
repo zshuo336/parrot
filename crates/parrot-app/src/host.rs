@@ -182,7 +182,7 @@ impl ProcessGatewayFactory {
     /// erl=erl-gw-1 / ray=ray-gw-1 / jvm=jvm-search-1）。
     fn node_id_for(comp: &ComponentSpec) -> String {
         match (&comp.engine, &comp.artifact) {
-            (EngineKind::Erlang, ArtifactRef::Beam { app }) => {
+            (EngineKind::Erlang, ArtifactRef::Beam { app, .. }) => {
                 if app == "frontier" {
                     "erl-gw-1".into()
                 } else {
@@ -190,13 +190,8 @@ impl ProcessGatewayFactory {
                 }
             }
             (EngineKind::Ray, _) => "ray-gw-1".into(),
-            (EngineKind::Akka, ArtifactRef::Jvm { main_class, .. }) => {
-                if main_class.contains("Crawler") {
-                    "jvm-search-1".into()
-                } else {
-                    "jvm-gw-1".into()
-                }
-            }
+            // R1：业务网关已删——jvm 引擎统一走通用网关（jvm-gw-1）
+            (EngineKind::Akka, _) => "jvm-gw-1".into(),
             _ => format!("{}-gw-1", comp.engine.as_str()),
         }
     }
@@ -226,12 +221,11 @@ impl ProcessGatewayFactory {
                 ));
             }
             EngineKind::Akka => {
-                let main_class = match &comp.artifact {
-                    ArtifactRef::Jvm { main_class, .. } => main_class.clone(),
-                    _ => "parrot.protocol.jvm.ParrotGatewayMain".into(),
-                };
+                // R1（应用体系架构纠正）：jvm 引擎一律启动通用网关
+                // （ParrotGatewayMain）——组件经 admin-v2 DeployComponent
+                // 动态载入（main_class 是组件类，不是网关入口）。
                 cmd.arg(format!(
-                    "cd interop/jvm/target && exec java -cp \"parrot-protocol-jvm-0.1.0.jar:$(cat cp.txt)\" {main_class} 0 parrot={app_addr} 7200"
+                    "cd interop/jvm/target && exec java -cp \"parrot-protocol-jvm-0.1.0.jar:$(cat cp.txt)\" parrot.protocol.jvm.ParrotGatewayMain 0 parrot={app_addr} 7200"
                 ));
             }
             other => {
@@ -292,6 +286,34 @@ impl GatewayFactory for ProcessGatewayFactory {
             tokio::runtime::Handle::current()
                 .block_on(async { self.spawn_gateway_process(comp).await })
         })?;
+
+        // R4（应用体系架构纠正）：网关注册后立即 DeployComponent——
+        // 组件制品（beam/jar/pymodule）动态载入网关，业务 handler 就位。
+        // 失败即整体部署失败（assemble 回滚杀网关）。
+        if let Err(e) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let artifact: parrot_remote::admin_v2::AdminArtifactRef =
+                    comp.artifact.clone().into();
+                self.remote
+                    .deploy_component(
+                        &node_id,
+                        parrot_remote::admin_v2::ComponentDeploy {
+                            name: comp.name.clone(),
+                            version: "1.0.0".into(),
+                            artifact,
+                            instances: parrot_remote::admin_v2::AdminInstancePolicy::Singleton,
+                            config: None,
+                        },
+                    )
+                    .await
+            })
+        }) {
+            return Err(DeployError::Engine(format!(
+                "deploy_component {node_id}/{}: {e:?}",
+                comp.name
+            )));
+        }
+
         let mut refs = Vec::with_capacity(paths.len());
         for p in paths {
             let full = format!("parrot://{node_id}{p}");

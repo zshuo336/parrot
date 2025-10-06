@@ -94,6 +94,7 @@ object AdminPort {
   ): (Map[String, ComponentEntry], AdminReplyV2) = {
     val base = components.get(comp.name).map { old =>
       old.instances.foreach(h => Try(h.stopper()))
+      old.paths.foreach(p => ComponentRoutes.remove(actorNameOf(p)))
       old.loader.foreach(l => Try(l.close()))
       components - comp.name
     }.getOrElse(components)
@@ -102,7 +103,7 @@ object AdminPort {
 
     val cl = loader.getOrElse(getClass.getClassLoader)
     val mainClass = comp.artifact match {
-      case AdminV2Codec.ArtifactRef.Jvm(mc, _) => mc
+      case AdminV2Codec.ArtifactRef.Jvm(mc, _, _) => mc
       case other => throw new AdminException(ErrDialectMismatch, s"not jvm artifact: ${kindOf(other)}")
     }
 
@@ -122,6 +123,10 @@ object AdminPort {
         // PoisonPill，ask 语义经 wrapper 转发 impl
         val ref = system.systemActorOf(wrappingBehavior(spi, ctx), actorNameOf(path))
         handles += InstanceHandle(path, spi, () => tellStop(ref))
+        // R4：Bridge 路由登记（deploy 组件可 ask）。键 = akkaPath 形态
+        // （剥 /user/ 前缀——与 wire 地址 jvm/user/{akkaPath} 的提取、
+        // 内置探针 targets 的 echo/cpu 同键空间）。
+        ComponentRoutes.put(actorNameOf(path), ref.unsafeUpcast[Any])
       }
     } catch {
       case e: AdminException => throw e
@@ -176,6 +181,7 @@ object AdminPort {
     var next = components
     matched.foreach { entry =>
       entry.instances.foreach(h => Try(h.stopper()))
+      entry.paths.foreach(p => ComponentRoutes.remove(actorNameOf(p)))
       entry.loader.foreach(l => Try(l.close()))
       next = next - entry.name
     }

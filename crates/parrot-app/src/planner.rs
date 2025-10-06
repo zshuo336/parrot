@@ -204,6 +204,7 @@ mod tests {
             artifact: ArtifactRef::Props {
                 factory: format!("app.{name}"),
             },
+            alt_artifact: None,
             instances: InstancePolicy::Singleton,
             placement: PlacementConstraint::default(),
             upgrade: UpgradePolicy::default(),

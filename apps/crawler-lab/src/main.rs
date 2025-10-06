@@ -482,6 +482,65 @@ async fn run_scenario(
         .remote_ref("parrot://jvm-search-1/jvm/user/search")
         .unwrap();
 
+    // ── 阶段 -1：组件部署（R1——业务已迁 apps/crawler-lab，网关为纯宿主；
+    //    应用连网后经 admin-v2 deploy 动态载入三组件制品）──────────────
+    use parrot_remote::admin_v2::{AdminArtifactRef, AdminInstancePolicy, ComponentDeploy};
+    let app_root = {
+        // 制品根 = 仓库内 apps/crawler-lab（cargo run 相对路径稳定锚）
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop(); // apps/
+        p.pop(); // 仓库根
+        p.join("apps/crawler-lab")
+    };
+    let deploys = [
+        (
+            "erl-gw-1",
+            "frontier",
+            AdminArtifactRef::Beam {
+                app: "frontier".into(),
+                uri: Some(format!("file://{}", app_root.join("erlang").display())),
+            },
+        ),
+        (
+            "ray-gw-1",
+            "index",
+            AdminArtifactRef::PyModule {
+                module: "index_builder".into(),
+                runtime_env: None,
+                uri: Some(format!("file://{}", app_root.join("python").display())),
+            },
+        ),
+        (
+            "jvm-search-1",
+            "search",
+            AdminArtifactRef::Jvm {
+                main_class: "crawler.search.SearchComponent".into(),
+                coords: None,
+                uri: Some(format!(
+                    "file://{}",
+                    app_root.join("jvm/target/crawler-lab-jvm-1.0.0.jar").display()
+                )),
+            },
+        ),
+    ];
+    for (node, name, artifact) in deploys {
+        let t0 = Instant::now();
+        let instances = client
+            .deploy_component(
+                node,
+                ComponentDeploy {
+                    name: name.into(),
+                    version: "1.0.0".into(),
+                    artifact,
+                    instances: AdminInstancePolicy::Singleton,
+                    config: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("deploy {node}/{name} 失败: {e:?}"));
+        println!("[lab] 组件部署 {node}/{name} → {instances:?}（{}ms）", t0.elapsed().as_millis());
+    }
+
     let m = Arc::new(Metrics::new());
 
     // ── 阶段 0：三网关方言 sanity（爬虫前的 wire 通路证明）────────────

@@ -12,6 +12,7 @@ members = [
     "crates/parrot-wasm",
     "crates/parrot-abi",
     "apps/crawler-lab",
+    "apps/crawler-lab/dylib",
     "tools/federation-lab"
 ]
 
