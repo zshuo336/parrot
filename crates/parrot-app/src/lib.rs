@@ -10,6 +10,15 @@
 //! 分层铁律（09 §2.2）：不依赖 `parrot` 主 crate——应用包只依赖
 //! parrot-api + parrot-app；引擎访问经 parrot-remote 协议面。
 
+pub mod debug {
+    //! F 阶段（DEV_09 §3.6）调试五件套。
+    pub mod replay;
+    pub mod trace;
+
+    pub use replay::{record_sink, JsonlRecord, ReplayError, ReplayLog};
+    pub use trace::{parse_trace_line as parse_trace, aggregate as aggregate_traces, SpanEvent, SpanNode, SpanTree};
+}
+
 pub mod assemble;
 #[cfg(feature = "host")]
 pub mod host;

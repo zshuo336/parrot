@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 parrot-remote = { path = "../../crates/parrot-remote" }
+parrot-app = { path = "../../crates/parrot-app" }
 
 [[bin]]
 name = "federation-lab"

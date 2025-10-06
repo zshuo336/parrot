@@ -67,10 +67,41 @@ fn main() {
             }
             println!("G5 门禁通过：路由正确性 100%");
         }
+        "twin-app" => {
+            // F4（DEV_09 §3.6）：App 孪生门禁——Manifest 输入
+            let path = args
+                .iter()
+                .position(|a| a == "--manifest")
+                .and_then(|p| args.get(p + 1))
+                .cloned()
+                .unwrap_or_else(|| "crawler.app.toml".into());
+            let m = match parrot_app::manifest::AppManifest::from_file(std::path::Path::new(&path)) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("manifest 读取失败（{path}）：{e}");
+                    std::process::exit(1);
+                }
+            };
+            let r = federation_lab::twin_app::twin_app(&m);
+            println!(
+                "App 孪生门禁 [{}]：components={} wires={} topo={:?}",
+                r.app, r.components, r.wires, r.topo_order
+            );
+            println!("  节点映射：{:?}", r.node_map);
+            println!("  升级矩阵：{:?}", r.upgrade_matrix);
+            if !r.passed {
+                for f in &r.failures {
+                    eprintln!("门禁失败：{f}");
+                }
+                std::process::exit(1);
+            }
+            println!("App 孪生门禁通过（≤100 组件 / DAG / 全分支枚举）");
+        }
         "help" | "--help" | "-h" => {
-            println!("federation-lab：S4 仿真基建（composegen / twin / report）");
+            println!("federation-lab：S4 仿真基建（composegen / twin / report / twin-app）");
             println!("  composegen [--clusters N] [--nodes-per-cluster N] [--fold K] [--out FILE]");
             println!("  twin [--clusters N] [--nodes N] [--sample N]");
+            println!("  twin-app [--manifest FILE]");
         }
         other => {
             eprintln!("未知子命令：{other}（federation-lab help 查看）");

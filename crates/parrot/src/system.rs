@@ -165,6 +165,9 @@ pub struct ParrotActorSystem {
     // 前缀通配处理器（DEV_04 §7.1——ShardRouter 的 `/user/entity-*` 注册面；
     // 本地 registry 特例：命中即拦截，位于本地默认系统查找之前）
     prefix_handlers: RwLock<Vec<(String, std::sync::Arc<dyn ActorRef>)>>,
+    // 镜像策略（F2 DEV_09 §3.6）：src_prefix 命中的目标引用被包成双写
+    // MirrorRef——tell/ask 原路 + 镜像副本（fire-and-forget，失败不回传）
+    mirror_policies: RwLock<Vec<crate::mirror::MirrorPolicy>>,
 }
 
 impl ParrotActorSystem {
@@ -177,6 +180,7 @@ impl ParrotActorSystem {
             remote: RwLock::new(None),
             receptionist: RwLock::new(None),
             prefix_handlers: RwLock::new(Vec::new()),
+            mirror_policies: RwLock::new(Vec::new()),
         })
     }
 
@@ -439,6 +443,21 @@ impl ParrotActorSystem {
         None
     }
 
+    /// get_actor 镜像包装出口（F2）：命中策略的引用包 MirrorRef 双写。
+    pub(crate) async fn get_actor_mirrored(
+        &self,
+        path: &parrot_api::address::ActorPath,
+    ) -> Option<Box<dyn ActorRef>> {
+        let actor = self.internal_get_actor(path).await?;
+        if let Some(policy) = self.mirror_policy_for(&path.path) {
+            return Some(Box::new(crate::mirror::MirrorRef::new(
+                std::sync::Arc::from(actor),
+                policy,
+            )));
+        }
+        Some(actor)
+    }
+
     /// Get the default system name
     fn get_default_system_name(&self) -> Result<String, SystemError> {
         let guard = self
@@ -640,6 +659,36 @@ impl ParrotActorSystem {
         Ok(())
     }
 
+    /// 注册镜像策略（F2 DEV_09 §3.6）：`src_prefix` 命中的目标引用
+    /// 被 [`crate::mirror::MirrorRef`] 包装——原投递 + mirror_path 副本。
+    ///
+    /// 镜像副本 fire-and-forget：投递失败仅记日志（不回传错误——
+    /// 调试面不得影响业务路径）。
+    pub fn register_mirror_policy(&self, policy: crate::mirror::MirrorPolicy) {
+        let mut g = self.mirror_policies.write().unwrap();
+        // 同 src_prefix 幂等替换
+        g.retain(|p| p.src_prefix != policy.src_prefix);
+        g.push(policy);
+    }
+
+    /// 移除镜像策略。
+    pub fn remove_mirror_policy(&self, src_prefix: &str) {
+        self.mirror_policies
+            .write()
+            .unwrap()
+            .retain(|p| p.src_prefix != src_prefix);
+    }
+
+    /// 命中策略查找（MirrorRef 包装用——path 前缀匹配首条）。
+    pub fn mirror_policy_for(&self, path: &str) -> Option<crate::mirror::MirrorPolicy> {
+        self.mirror_policies
+            .read()
+            .unwrap()
+            .iter()
+            .find(|p| path.starts_with(p.src_prefix.as_str()))
+            .cloned()
+    }
+
     /// Get a thread engine system by name
     pub fn get_thread_system(&self, name: &str) -> Result<Arc<ThreadActorSystem>, SystemError> {
         match self.get_system_impl(name)? {
@@ -662,6 +711,7 @@ impl ActorSystem for ParrotActorSystem {
             remote: RwLock::new(None),
             receptionist: RwLock::new(None),
             prefix_handlers: RwLock::new(Vec::new()),
+            mirror_policies: RwLock::new(Vec::new()),
         })
     }
 
@@ -694,7 +744,7 @@ impl ActorSystem for ParrotActorSystem {
             target: path.target.clone(),
         };
 
-        async move { self.internal_get_actor(&path_copy).await }.await
+        async move { self.get_actor_mirrored(&path_copy).await }.await
     }
 
     /// Sends a message to all actors in the system.
