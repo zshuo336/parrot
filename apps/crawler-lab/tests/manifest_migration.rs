@@ -26,7 +26,7 @@ fn manifest() -> AppManifest {
 fn manifest_parses_and_validates() {
     let m = manifest();
     assert_eq!(m.name, "crawler-lab");
-    assert_eq!(m.version, "1.0.0");
+    assert_eq!(m.version, "2.0.0"); // R5 新形态（uri/alt_artifact 制品直发）
     parrot_app::manifest::validate(&m).expect("manifest 合法");
 }
 
