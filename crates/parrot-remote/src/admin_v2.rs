@@ -194,6 +194,10 @@ pub mod v2_err {
     pub const COMPONENT_NOT_FOUND: u16 = 0x0A03;
     /// drain 超时中止。
     pub const DRAIN_TIMEOUT: u16 = 0x0A04;
+    /// B2：Props 工厂名未注册（find_factory 未命中）。
+    pub const FACTORY_NOT_FOUND: u16 = 0x0A05;
+    /// B2：实例 spawn 失败（路径冲突 / 调度器拒绝等）。
+    pub const SPAWN_FAILED: u16 = 0x0A06;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -709,6 +713,8 @@ mod tests {
         const _: () = assert!(v2_err::DIALECT_MISMATCH >= 0x0A00);
         const _: () = assert!(v2_err::COMPONENT_NOT_FOUND >= 0x0A00);
         const _: () = assert!(v2_err::DRAIN_TIMEOUT >= 0x0A00);
+        const _: () = assert!(v2_err::FACTORY_NOT_FOUND >= 0x0A00);
+        const _: () = assert!(v2_err::SPAWN_FAILED >= 0x0A00);
         // 与 v1 段隔离（运行时值断言——依赖 ErrCode 数值）
         assert!(v2_err::ARTIFACT_FETCH > ErrCode::Forbidden as u16);
     }

@@ -11,7 +11,8 @@ use parrot_api::system::ActorSystemConfig;
 use parrot_remote::system::{RemoteActorSystem, RemoteConfig};
 
 use parrot_node::{
-    spawn_builtin, wait_for_shutdown, FacadeLookup, GatewayAdapter, NodeState, NODE,
+    spawn_builtin, wait_for_shutdown, FacadeLookup, GatewayAdapter, NodeComponentExecutor,
+    NodeState, NODE,
 };
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -54,9 +55,11 @@ async fn main() {
         spawn_builtin(&ts, name).await;
     }
 
-    // 3. 远程系统（TCP listen）
-    let cfg = RemoteConfig::tcp(&node_id, Some(bind.parse().expect("PARROT_BIND parse")));
+    // 3. 远程系统（TCP listen）；B2：caps 置位 ARTIFACTS + 安装组件执行器
+    let mut cfg = RemoteConfig::tcp(&node_id, Some(bind.parse().expect("PARROT_BIND parse")));
+    cfg.extra_caps |= parrot_remote::handshake::caps::ARTIFACTS;
     let remote = RemoteActorSystem::new(cfg, Arc::new(FacadeLookup)).expect("remote system");
+    remote.set_component_executor(Some(Arc::new(NodeComponentExecutor::new(ts.clone()))));
     facade
         .register_remote_gateway(Arc::new(GatewayAdapter(remote.gateway())))
         .await

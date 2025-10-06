@@ -309,6 +309,387 @@ impl RemoteGateway for GatewayAdapter {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// B2（DEV_09 §5.1）：admin-v2 parrot Executor
+//   ArtifactChannel（uri→本地 + sha256）+ exec_deploy_v2（Props→工厂）+
+//   NodeComponentExecutor（四命令接线）+ caps ARTIFACTS。
+// ══════════════════════════════════════════════════════════════════════════
+
+pub mod executor_v2 {
+    //! admin-v2 组件执行器（parrot 方言）。
+    //!
+    //! 职责边界：
+    //! - `ArtifactChannel`：artifact uri → 本地缓存（file:// 首期；http 后续）
+    //!   + sha256 校验。Wasm/Dylib 形态走同一条通道（C/D 阶段消费）。
+    //! - `exec_deploy_v2`：Props artifact → `find_factory` 按名 spawn
+    //!   （复用 K0 inventory 机制）；多实例按 `/user/{name}[-{i}]` 展开。
+    //! - `NodeComponentExecutor`：impl `ComponentExecutor`——Deploy/Drain/
+    //!   Stop/Status 四命令落到 thread 引擎 registry。
+
+    use std::sync::Arc;
+
+    use parrot::thread::system::ThreadActorSystem;
+    use parrot_remote::admin::find_factory;
+    use parrot_remote::admin_v2::{
+        failed_v2, v2_err, AdminArtifactRef, AdminCommandV2, AdminInstancePolicy, AdminReplyV2,
+        AdminReplyV2 as R, ComponentDeploy, ComponentExecutor, ComponentStateReport,
+    };
+
+    // ─────────────────────────────────────────────────────────────
+    // ArtifactChannel
+    // ─────────────────────────────────────────────────────────────
+
+    /// artifact 获取/校验通道（目标节点侧）。
+    ///
+    /// 首期仅 `file://` 与裸路径（同机/挂载卷语义）；http(s) 后续阶段接入。
+    /// Props 形态无 artifact 传输需求（工厂已在进程内注册），直接放行。
+    #[derive(Debug, Clone, Default)]
+    pub struct ArtifactChannel;
+
+    impl ArtifactChannel {
+        /// 缓存根目录：`$PARROT_ARTIFACT_DIR` 或 `/tmp/parrot-artifacts`。
+        pub fn cache_dir() -> std::path::PathBuf {
+            std::env::var_os("PARROT_ARTIFACT_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/parrot-artifacts"))
+        }
+
+        /// uri → 本地路径（含校验）。`file://` / 裸路径 / `Props` 直通。
+        ///
+        /// Wasm/Dylib 带 digest → fetch 后 `verify`；不匹配按
+        /// `v2_err::ARTIFACT_DIGEST` 拒收（调用方映射回执码）。
+        pub fn fetch(
+            &self,
+            artifact: &AdminArtifactRef,
+        ) -> Result<std::path::PathBuf, (u16, String)> {
+            match artifact {
+                // Props 工厂已在进程内注册（inventory）——无 artifact 传输
+                AdminArtifactRef::Props { .. } => Ok(std::path::PathBuf::new()),
+                AdminArtifactRef::Wasm { digest, uri }
+                | AdminArtifactRef::Dylib { digest, uri, .. } => {
+                    let local = Self::materialize(uri).map_err(|e| (v2_err::ARTIFACT_FETCH, e))?;
+                    Self::verify(&local, digest)
+                        .map_err(|e| (v2_err::ARTIFACT_DIGEST, e))?;
+                    Ok(local)
+                }
+                // 非本方言 artifact：Executor 侧应在路由前拒绝（DIALECT_MISMATCH）
+                AdminArtifactRef::Beam { .. }
+                | AdminArtifactRef::PyModule { .. }
+                | AdminArtifactRef::Jvm { .. } => Err((
+                    v2_err::DIALECT_MISMATCH,
+                    format!("parrot executor cannot fetch {artifact:?}"),
+                )),
+            }
+        }
+
+        /// uri → 本地路径。`file://host/path` 与 `file:///path` 均取 path 段；
+        /// 裸路径直取。非 file 协议首期报错（http 阶段接入）。
+        fn materialize(uri: &str) -> Result<std::path::PathBuf, String> {
+            if let Some(rest) = uri.strip_prefix("file://") {
+                // file://host/path → 跳过 host 段（localhost 语义）；空 host
+                // （file:///path）rest 首字符即 '/'
+                let p = if rest.starts_with('/') {
+                    rest
+                } else {
+                    rest.split_once('/')
+                        .map(|(_, path)| path)
+                        .unwrap_or(rest)
+                };
+                let path = std::path::PathBuf::from(format!("/{p}"));
+                if path.is_file() {
+                    return Ok(path);
+                }
+                return Err(format!("file uri not found: {uri}"));
+            }
+            // 裸路径（同机语义）
+            let path = std::path::PathBuf::from(uri);
+            if uri.starts_with('/') && path.is_file() {
+                return Ok(path);
+            }
+            Err(format!("unsupported or missing artifact uri: {uri}"))
+        }
+
+        /// sha256 校验：`sha256:<hex64>` 或裸 hex64；空 digest 跳过（测试便利）。
+        pub fn verify(path: &std::path::Path, digest: &str) -> Result<(), String> {
+            if digest.is_empty() {
+                return Ok(());
+            }
+            use sha2::{Digest, Sha256};
+            let bytes = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
+            let actual = hex::encode(Sha256::digest(&bytes));
+            let expect = digest.strip_prefix("sha256:").unwrap_or(digest).to_ascii_lowercase();
+            if actual != expect {
+                return Err(format!(
+                    "sha256 mismatch: want {expect}, got {actual} ({path:?})"
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // deploy 核心（Props → find_factory）
+    // ─────────────────────────────────────────────────────────────
+
+    /// 实例路径展开（与 parrot-app assemble 同规）：
+    /// Singleton → `/user/{name}`；Pool/Sharded(n) → `/user/{name}-{i}`。
+    pub fn instance_paths(name: &str, policy: AdminInstancePolicy) -> Vec<String> {
+        match policy {
+            AdminInstancePolicy::Singleton => vec![format!("/user/{name}")],
+            AdminInstancePolicy::Pool { count } | AdminInstancePolicy::Sharded { count } => {
+                (0..count).map(|i| format!("/user/{name}-{i}")).collect()
+            }
+        }
+    }
+
+    /// DeployComponent 执行（Props 方言核心）。
+    ///
+    /// 非 Props artifact → DIALECT_MISMATCH（ray/erl/jvm 网关各自处理）；
+    /// 工厂未注册 → FACTORY_NOT_FOUND；任一实例 spawn 失败 → SPAWN_FAILED
+    /// （已 spawn 的实例保留——StopComponent 按前缀清理，语义为"尽力而为"）。
+    ///
+    /// `ts` 必须是进程单例 `NODE` 的引擎（PropsFactory fn 指针经静态取
+    /// 引擎 spawn——K0 机制既定形态；不一致说明装配错误，按 SPAWN_FAILED 拒）。
+    pub async fn exec_deploy_v2(
+        ts: &Arc<ThreadActorSystem>,
+        cmd: ComponentDeploy,
+    ) -> Result<Vec<String>, (u16, String)> {
+        let factory_name = match &cmd.artifact {
+            AdminArtifactRef::Props { factory } => factory.clone(),
+            other => {
+                return Err((
+                    v2_err::DIALECT_MISMATCH,
+                    format!("parrot executor expects Props artifact, got {other:?}"),
+                ))
+            }
+        };
+        // artifact 通道统一过（Props 形态零成本直通——为 Wasm/Dylib 预留同路）
+        ArtifactChannel.fetch(&cmd.artifact)?;
+        // 装配一致性：PropsFactory 经 NODE 单例取引擎——ts 必须同源
+        let node_ts_ok = crate::NODE
+            .get()
+            .map(|n| Arc::<ThreadActorSystem>::ptr_eq(&n.ts, ts))
+            .unwrap_or(false);
+        if !node_ts_ok {
+            return Err((
+                v2_err::SPAWN_FAILED,
+                "engine mismatch: PropsFactory spawns on NODE singleton".into(),
+            ));
+        }
+        let factory = find_factory(&factory_name).ok_or_else(|| {
+            (
+                v2_err::FACTORY_NOT_FOUND,
+                format!("PropsFactory '{factory_name}' not registered"),
+            )
+        })?;
+        let paths = instance_paths(&cmd.name, cmd.instances);
+        let mut spawned = Vec::with_capacity(paths.len());
+        for p in &paths {
+            match (factory.spawn)(p).await {
+                Ok(_) => spawned.push(p.clone()),
+                Err(e) => {
+                    return Err((
+                        v2_err::SPAWN_FAILED,
+                        format!("spawn {p} failed: {e:?} (spawned {})", spawned.len()),
+                    ))
+                }
+            }
+        }
+        Ok(spawned)
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // NodeComponentExecutor（ComponentExecutor 实现）
+    // ─────────────────────────────────────────────────────────────
+
+    /// parrot 节点组件执行器：Deploy/Drain/Stop/Status → thread 引擎。
+    pub struct NodeComponentExecutor {
+        /// thread 引擎（spawn/stop/registry 查询）。
+        ts: Arc<ThreadActorSystem>,
+        /// 组件版本登记（Deploy 写入 / Status 报告 / Stop 清除）。
+        versions: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    }
+
+    impl NodeComponentExecutor {
+        pub fn new(ts: Arc<ThreadActorSystem>) -> Self {
+            Self {
+                ts,
+                versions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        /// 前缀匹配 registry 存活实例（`/user/comp` 前缀不误吞
+        /// `/user/comp2`——要求整段相等或后随 `-`）。
+        fn matching_paths(&self, prefix: &str) -> Vec<String> {
+            self.ts
+                .actor_paths()
+                .into_iter()
+                .filter(|p| {
+                    p == prefix
+                        || (p.starts_with(prefix)
+                            && p.as_bytes().get(prefix.len()) == Some(&b'-'))
+                })
+                .collect()
+        }
+
+        /// 路径 → 组件名（`/user/{name}` 或 `/user/{name}-{i}`）。
+        fn path_to_component(path: &str) -> String {
+            let rest = path.strip_prefix("/user/").unwrap_or(path);
+            // `-` 也可能是组件名自带字符：优先按已知版本表反查（status
+            // 已有路径集合；此处统一取最长匹配）。首版规则：rsplitonce
+            // 取 `-` 前段（多实例命名约定优先），无 `-` 整段即名。
+            match rest.rsplit_once('-') {
+                Some((name, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+                    name.to_string()
+                }
+                _ => rest.to_string(),
+            }
+        }
+
+        /// 清除路径集合覆盖的组件版本登记（实例全停后版本未知）。
+        fn forget_versions(&self, paths: &[String]) {
+            let comps: std::collections::HashSet<String> =
+                paths.iter().map(|p| Self::path_to_component(p)).collect();
+            self.versions.lock().unwrap().retain(|k, _| !comps.contains(k));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComponentExecutor for NodeComponentExecutor {
+        async fn deploy(&self, req_id: u64, c: &ComponentDeploy) -> AdminReplyV2 {
+            match exec_deploy_v2(&self.ts, c.clone()).await {
+                Ok(instances) => {
+                    self.versions
+                        .lock()
+                        .unwrap()
+                        .insert(c.name.clone(), c.version.clone());
+                    R::Deployed { req_id, instances }
+                }
+                Err((code, detail)) => failed_v2(req_id, code, detail),
+            }
+        }
+
+        async fn drain(
+            &self,
+            req_id: u64,
+            prefix: &str,
+            timeout_ms: u64,
+        ) -> AdminReplyV2 {
+            let paths = self.matching_paths(prefix);
+            if paths.is_empty() {
+                return failed_v2(
+                    req_id,
+                    v2_err::COMPONENT_NOT_FOUND,
+                    format!("no instances under prefix {prefix}"),
+                );
+            }
+            // 排空语义：逐实例等邮箱清空（在途消息处理完）再优雅停；
+            // deadline 共享（总预算 = timeout_ms，单实例不独占）。
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(timeout_ms.min(60_000));
+            let mut drained = 0usize;
+            let mut aborted = 0usize;
+            for p in &paths {
+                let mb_empty = match self.ts.get_mailbox(p) {
+                    Some(mb) => loop {
+                        if mb.is_empty().await {
+                            break true;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            break false;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    },
+                    None => false,
+                };
+                if mb_empty && self.ts.stop_actor(p).await.is_ok() {
+                    drained += 1;
+                } else {
+                    // 超时/邮箱无法排空 → 中止（保留实例——发起方决定 Stop 强停）
+                    aborted += 1;
+                }
+            }
+            if aborted == 0 {
+                self.forget_versions(&paths);
+            }
+            R::Drained {
+                req_id,
+                drained,
+                aborted,
+            }
+        }
+
+        async fn stop(&self, req_id: u64, prefix: &str) -> AdminReplyV2 {
+            let paths = self.matching_paths(prefix);
+            if paths.is_empty() {
+                return failed_v2(
+                    req_id,
+                    v2_err::COMPONENT_NOT_FOUND,
+                    format!("no instances under prefix {prefix}"),
+                );
+            }
+            for p in &paths {
+                let _ = self.ts.stop_actor(p).await;
+            }
+            self.forget_versions(&paths);
+            R::Stopped { req_id }
+        }
+
+        async fn status(&self, req_id: u64, prefix: &str) -> AdminReplyV2 {
+            let paths = self.matching_paths(prefix);
+            if paths.is_empty() {
+                return failed_v2(
+                    req_id,
+                    v2_err::COMPONENT_NOT_FOUND,
+                    format!("no instances under prefix {prefix}"),
+                );
+            }
+            let versions = self.versions.lock().unwrap().clone();
+            let states: Vec<ComponentStateReport> = paths
+                .into_iter()
+                .map(|p| {
+                    let name = Self::path_to_component(&p);
+                    ComponentStateReport {
+                        version: versions.get(&name).cloned().unwrap_or_default(),
+                        state: "running".into(),
+                        path: p,
+                    }
+                })
+                .collect();
+            R::Status { req_id, states }
+        }
+    }
+
+    /// 命令直通辅助（handle_admin_command_v2 之外的进程内入口——
+    /// 测试与 bin 安装共用；回包已含 req_id）。
+    pub async fn exec_command_v2(
+        ts: &Arc<ThreadActorSystem>,
+        cmd: AdminCommandV2,
+    ) -> AdminReplyV2 {
+        let ex = NodeComponentExecutor::new(ts.clone());
+        match cmd {
+            AdminCommandV2::DeployComponent { req_id, component } => {
+                ex.deploy(req_id, &component).await
+            }
+            AdminCommandV2::DrainComponent {
+                req_id,
+                path_prefix,
+                timeout_ms,
+            } => ex.drain(req_id, &path_prefix, timeout_ms).await,
+            AdminCommandV2::StopComponent {
+                req_id,
+                path_prefix,
+            } => ex.stop(req_id, &path_prefix).await,
+            AdminCommandV2::ComponentStatus {
+                req_id,
+                path_prefix,
+            } => ex.status(req_id, &path_prefix).await,
+        }
+    }
+}
+
+pub use executor_v2::{exec_command_v2, exec_deploy_v2, ArtifactChannel, NodeComponentExecutor};
+
+// ══════════════════════════════════════════════════════════════════════════
 // bin 辅助
 // ══════════════════════════════════════════════════════════════════════════
 
