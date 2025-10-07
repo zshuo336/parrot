@@ -172,13 +172,26 @@ class ParrotServerHandler(
 )
     extends SimpleChannelInboundHandler[WireFrame.Frame] {
   /** 子类（注册模式 client handler）可见——客户端握手完成后置位复用分发。 */
+
+  override def channelActive(ctx: ChannelHandlerContext): Unit = {
+    GatewayMetrics.counters.connections.incrementAndGet()
+    super.channelActive(ctx)
+  }
+
+  override def channelInactive(ctx: ChannelHandlerContext): Unit = {
+    GatewayMetrics.counters.connections.decrementAndGet()
+    super.channelInactive(ctx)
+  }
   protected var handshaken = false
 
   override def channelRead0(ctx: ChannelHandlerContext, msg: WireFrame.Frame): Unit = {
     import WireFrame.FrameType
+    import GatewayMetrics.counters
+    counters.bytesRx.addAndGet(msg.payload.length.toLong)
     if (!handshaken) {
       msg.frameType match {
         case FrameType.HANDSHAKE =>
+          counters.handshakesOk.incrementAndGet()
           ctx.writeAndFlush(
             WireFrame.Frame(1, FrameType.HANDSHAKE_ACK, 0, 0, 0, 8, "", "", WireFrame.handshakeAckBody(nodeId))
           )
@@ -189,6 +202,7 @@ class ParrotServerHandler(
     }
     msg.frameType match {
       case FrameType.ASK =>
+        counters.asksRx.incrementAndGet()
         // path（两种形态）：parrot://{gw}/jvm/user/{akkaPath} 或 /jvm/user/{akkaPath}
         val p0    = msg.path.stripPrefix("parrot://")
         val after = if (p0 != msg.path) { // 有前缀：剥节点段
@@ -209,12 +223,18 @@ class ParrotServerHandler(
         )(askTimeout, askScheduler)
         fut.onComplete {
           case Success(Replied(cid, key, payload)) =>
+            counters.repliesTx.incrementAndGet()
+            counters.bytesTx.addAndGet(payload.length.toLong)
             ctx.writeAndFlush(WireFrame.Frame(1, FrameType.REPLY, 0, cid, 0, 8, replyTo, key, payload))
           case Success(ReplyErr(cid, code, detail)) =>
+            counters.repliesTx.incrementAndGet()
+            counters.replyErrs.incrementAndGet()
             ctx.writeAndFlush(
               WireFrame.Frame(1, FrameType.REPLY_ERR, 0, cid, 0, 8, replyTo, "", WireFrame.encodeErrPayload(code, detail))
             )
           case Failure(ex) =>
+            counters.repliesTx.incrementAndGet()
+            counters.replyErrs.incrementAndGet()
             ctx.writeAndFlush(
               WireFrame.Frame(
                 1, FrameType.REPLY_ERR, 0, msg.correlationId, 0, 8, replyTo, "",
@@ -223,6 +243,7 @@ class ParrotServerHandler(
             )
         }(scala.concurrent.ExecutionContext.parasitic)
       case FrameType.TELL =>
+        counters.tellsRx.incrementAndGet()
         val p0    = msg.path.stripPrefix("parrot://")
         val after = if (p0 != msg.path) {
           val idx = p0.indexOf('/')
@@ -240,6 +261,7 @@ class ParrotServerHandler(
           )
         )
       case FrameType.HEARTBEAT =>
+        counters.heartbeatsRx.incrementAndGet()
         ctx.writeAndFlush(WireFrame.Frame(1, FrameType.HEARTBEAT_ACK, 0, 0, 0, 8, "", "", Array.emptyByteArray))
       case FrameType.SYSTEM_EVENT =>
         // B5（DEV_09）：admin-v2（tag 0x03）→ AdminPort 执行回 0x04 回执帧；

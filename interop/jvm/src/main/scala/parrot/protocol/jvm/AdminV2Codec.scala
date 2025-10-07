@@ -57,9 +57,22 @@ object AdminV2Codec {
     final case class Drain(reqId: Long, pathPrefix: String, timeoutMs: Long) extends AdminCommandV2
     final case class Stop(reqId: Long, pathPrefix: String) extends AdminCommandV2
     final case class Status(reqId: Long, pathPrefix: String) extends AdminCommandV2
+    final case class MetricsReport(reqId: Long) extends AdminCommandV2
   }
 
   final case class ComponentState(path: String, state: String, version: String)
+
+  /** 指标快照（观测五件套——Rust MetricsSnapshot 同形，字段序一致）。 */
+  final case class MetricsSnapshot(
+      tsMs: Long, runtime: String,
+      connections: Long, handshakesOk: Long, handshakesFailed: Long,
+      asksRx: Long, tellsRx: Long, repliesTx: Long, replyErrs: Long,
+      bytesRx: Long, bytesTx: Long, heartbeatsRx: Long,
+      components: Long, componentStates: Vector[ComponentState],
+      processes: Long, memoryRss: Long, uptimeStartMs: Long
+  ) {
+    def uptimeSecs: Long = if (uptimeStartMs == 0) 0 else (tsMs - uptimeStartMs) / 1000
+  }
 
   sealed trait AdminReplyV2 { def reqId: Long }
   object AdminReplyV2 {
@@ -68,6 +81,7 @@ object AdminV2Codec {
     final case class Stopped(reqId: Long) extends AdminReplyV2
     final case class StatusReply(reqId: Long, states: Vector[ComponentState]) extends AdminReplyV2
     final case class Failed(reqId: Long, code: Int, detail: String) extends AdminReplyV2
+    final case class Metrics(reqId: Long, snapshot: MetricsSnapshot) extends AdminReplyV2
   }
 
   // ---------------- varint writer ----------------
@@ -214,6 +228,8 @@ object AdminV2Codec {
         w.varint(2); w.varint(reqId); w.str(pathPrefix)
       case AdminCommandV2.Status(reqId, pathPrefix) =>
         w.varint(3); w.varint(reqId); w.str(pathPrefix)
+      case AdminCommandV2.MetricsReport(reqId) =>
+        w.varint(4); w.varint(reqId)
     }
     w.out()
   }
@@ -236,6 +252,8 @@ object AdminV2Codec {
       case 3 =>
         val reqId = r.varint()
         AdminCommandV2.Status(reqId, r.str())
+      case 4 =>
+        AdminCommandV2.MetricsReport(r.varint())
       case v => throw new CodecException(s"unknown cmd variant $v")
     }
     r.done()
@@ -262,8 +280,36 @@ object AdminV2Codec {
         states.foreach { s => w.str(s.path); w.str(s.state); w.str(s.version) }
       case AdminReplyV2.Failed(reqId, code, detail) =>
         w.varint(4); w.varint(reqId); w.varint(code.toLong); w.str(detail)
+      case AdminReplyV2.Metrics(reqId, s) =>
+        w.varint(5); w.varint(reqId); putSnapshot(w, s)
     }
     w.out()
+  }
+
+  private def putSnapshot(w: W, s: MetricsSnapshot): Unit = {
+    w.varint(s.tsMs); w.str(s.runtime)
+    w.varint(s.connections); w.varint(s.handshakesOk); w.varint(s.handshakesFailed)
+    w.varint(s.asksRx); w.varint(s.tellsRx); w.varint(s.repliesTx); w.varint(s.replyErrs)
+    w.varint(s.bytesRx); w.varint(s.bytesTx); w.varint(s.heartbeatsRx)
+    w.varint(s.components)               // u64 计数
+    w.varint(s.componentStates.length)   // Vec len（serde 双字段——与 erl/py 同构）
+    s.componentStates.foreach { st => w.str(st.path); w.str(st.state); w.str(st.version) }
+    w.varint(s.processes); w.varint(s.memoryRss); w.varint(s.uptimeStartMs)
+  }
+
+  private def readSnapshot(r: R): MetricsSnapshot = {
+    val ts = r.varint(); val rt = r.str()
+    val conn = r.varint(); val hsOk = r.varint(); val hsFail = r.varint()
+    val asks = r.varint(); val tells = r.varint(); val rep = r.varint(); val rerr = r.varint()
+    val brx = r.varint(); val btx = r.varint(); val hb = r.varint()
+    val comps = r.varint()
+    val n = r.varint().toInt
+    val states = (0 until n).map { _ =>
+      val p = r.str(); val s = r.str()
+      ComponentState(p, s, r.str())
+    }.toVector
+    MetricsSnapshot(ts, rt, conn, hsOk, hsFail, asks, tells, rep, rerr,
+      brx, btx, hb, comps, states, r.varint(), r.varint(), r.varint())
   }
 
   def decodeReply(payload: Array[Byte]): AdminReplyV2 = {
@@ -293,6 +339,8 @@ object AdminV2Codec {
       case 4 =>
         val reqId = r.varint(); val code = r.varint()
         AdminReplyV2.Failed(reqId, code.toInt, r.str())
+      case 5 =>
+        AdminReplyV2.Metrics(r.varint(), readSnapshot(r))
       case v => throw new CodecException(s"unknown reply variant $v")
     }
     r.done()

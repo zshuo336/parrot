@@ -822,6 +822,28 @@ impl RemoteActorSystem {
         }
     }
 
+    /// 采集目标节点指标快照（观测五件套——探针拉取）。
+    pub async fn metrics_report(
+        self: &Arc<Self>,
+        node: &str,
+    ) -> Result<crate::admin_v2::MetricsSnapshot, RemoteError> {
+        let reply = self
+            .admin_roundtrip_v2(
+                node,
+                crate::admin_v2::AdminCommandV2::MetricsReport { req_id: 0 },
+            )
+            .await?;
+        match reply {
+            crate::admin_v2::AdminReplyV2::Metrics { snapshot, .. } => Ok(snapshot),
+            crate::admin_v2::AdminReplyV2::Failed { code, detail, .. } => Err(
+                RemoteError::Transport(format!("metrics failed: {code:#06x} {detail}")),
+            ),
+            other => Err(RemoteError::Transport(format!(
+                "unexpected admin v2 reply: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<(), RemoteError> {
         let _ = self.shutdown_tx.send(true); // ConnectionTask 全部退出 → closed 信号 → links 清
         self.links.lock().await.clear();

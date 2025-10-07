@@ -252,6 +252,8 @@ def encode_admin_cmd_v2(cmd: dict) -> bytes:
         body = b"\x02" + put_varint(cmd["req_id"]) + put_str(cmd["path_prefix"])
     elif kind == "status":
         body = b"\x03" + put_varint(cmd["req_id"]) + put_str(cmd["path_prefix"])
+    elif kind == "metrics":
+        body = b"\x04" + put_varint(cmd["req_id"])
     else:
         raise ValueError(f"unknown cmd kind {kind}")
     return bytes([TAG_ADMIN_CMD_V2]) + body
@@ -279,6 +281,9 @@ def decode_admin_cmd_v2(payload: bytes) -> dict:
         req_id, off = read_varint(buf, off)
         prefix, off = read_str(buf, off)
         return {"kind": "status", "req_id": req_id, "path_prefix": prefix}
+    if v == 4:
+        req_id, off = read_varint(buf, off)
+        return {"kind": "metrics", "req_id": req_id}
     raise ValueError(f"unknown cmd variant {v}")
 
 
@@ -315,9 +320,62 @@ def encode_admin_reply_v2(r: dict) -> bytes:
             + put_varint(r["code"])
             + put_str(r["detail"])
         )
+    elif kind == "metrics":
+        body = b"\x05" + put_varint(r["req_id"]) + _put_snapshot(r["snapshot"])
     else:
         raise ValueError(f"unknown reply kind {kind}")
     return bytes([TAG_ADMIN_REPLY_V2]) + body
+
+
+# ---- 观测五件套：MetricsSnapshot 编解码（字段序 = Rust 声明序）----
+# ts_ms, runtime, connections, handshakes_ok, handshakes_failed,
+# asks_rx, tells_rx, replies_tx, reply_errs, bytes_rx, bytes_tx,
+# heartbeats_rx, components, [n, {path,state,version}...],
+# processes, memory_rss, uptime_start_ms
+
+
+def _put_snapshot(s: dict) -> bytes:
+    out = put_varint(int(s.get("ts_ms", 0)))
+    out += put_str(str(s.get("runtime", "")))
+    for f in (
+        "connections", "handshakes_ok", "handshakes_failed",
+        "asks_rx", "tells_rx", "replies_tx", "reply_errs",
+        "bytes_rx", "bytes_tx", "heartbeats_rx",
+    ):
+        out += put_varint(int(s.get(f, 0)))
+    states = list(s.get("component_states", []))
+    out += put_varint(len(states))  # components: u64 计数
+    out += put_varint(len(states))  # component_states: Vec len（serde 双字段）
+    for st in states:
+        out += put_str(st["path"]) + put_str(st["state"]) + put_str(st["version"])
+    for f in ("processes", "memory_rss", "uptime_start_ms"):
+        out += put_varint(int(s.get(f, 0)))
+    return out
+
+
+def _read_snapshot(buf: memoryview, off: int) -> tuple[dict, int]:
+    snap: dict = {}
+    snap["ts_ms"], off = read_varint(buf, off)
+    snap["runtime"], off = read_str(buf, off)
+    for f in (
+        "connections", "handshakes_ok", "handshakes_failed",
+        "asks_rx", "tells_rx", "replies_tx", "reply_errs",
+        "bytes_rx", "bytes_tx", "heartbeats_rx",
+    ):
+        snap[f], off = read_varint(buf, off)
+    comps, off = read_varint(buf, off)
+    n, off = read_varint(buf, off)
+    states = []
+    for _ in range(n):
+        path, off = read_str(buf, off)
+        state, off = read_str(buf, off)
+        version, off = read_str(buf, off)
+        states.append({"path": path, "state": state, "version": version})
+    snap["components"] = comps
+    snap["component_states"] = states
+    for f in ("processes", "memory_rss", "uptime_start_ms"):
+        snap[f], off = read_varint(buf, off)
+    return snap, off
 
 
 def decode_admin_reply_v2(payload: bytes) -> dict:
@@ -356,6 +414,10 @@ def decode_admin_reply_v2(payload: bytes) -> dict:
         code, off = read_varint(buf, off)
         detail, off = read_str(buf, off)
         return {"kind": "failed", "req_id": req_id, "code": code, "detail": detail}
+    if v == 5:
+        req_id, off = read_varint(buf, off)
+        snap, off = _read_snapshot(buf, off)
+        return {"kind": "metrics", "req_id": req_id, "snapshot": snap}
     raise ValueError(f"unknown reply variant {v}")
 
 

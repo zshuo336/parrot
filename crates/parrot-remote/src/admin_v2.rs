@@ -129,6 +129,8 @@ pub enum AdminCommandV2 {
     StopComponent { req_id: u64, path_prefix: String },
     /// 查组件状态（路径前缀匹配全部实例）。
     ComponentStatus { req_id: u64, path_prefix: String },
+    /// 采集运行时指标（观测五件套 P1——探针拉取全量快照）。
+    MetricsReport { req_id: u64 },
 }
 
 impl AdminCommandV2 {
@@ -137,7 +139,8 @@ impl AdminCommandV2 {
             Self::DeployComponent { req_id, .. }
             | Self::DrainComponent { req_id, .. }
             | Self::StopComponent { req_id, .. }
-            | Self::ComponentStatus { req_id, .. } => *req_id,
+            | Self::ComponentStatus { req_id, .. }
+            | Self::MetricsReport { req_id } => *req_id,
         }
     }
 
@@ -146,7 +149,8 @@ impl AdminCommandV2 {
             Self::DeployComponent { req_id, .. }
             | Self::DrainComponent { req_id, .. }
             | Self::StopComponent { req_id, .. }
-            | Self::ComponentStatus { req_id, .. } => *req_id = id,
+            | Self::ComponentStatus { req_id, .. }
+            | Self::MetricsReport { req_id } => *req_id = id,
         }
     }
 }
@@ -187,6 +191,91 @@ pub enum AdminReplyV2 {
         code: u16,
         detail: String,
     },
+    /// 指标快照回执（MetricsReport 命令的应答——观测五件套）。
+    Metrics {
+        req_id: u64,
+        snapshot: MetricsSnapshot,
+    },
+}
+
+/// 单节点指标快照（四方言网关同构产出——观测五件套 P1）。
+///
+/// 计数器全为「进程启动以来累计」；速率由探针侧两次采样差分计算。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MetricsSnapshot {
+    /// 采集时刻（unix 毫秒——网关侧时钟）。
+    pub ts_ms: u64,
+    /// 网关自报运行时（如 "erl/OTP-27"、"python/3.11.4+ray/2.9"、"jvm/21.0.3"）。
+    pub runtime: String,
+    // ── 连接 ──
+    /// 当前活跃 TCP 连接数（已握手）。
+    pub connections: u64,
+    /// 累计握手成功次数。
+    pub handshakes_ok: u64,
+    /// 累计握手失败/断连次数。
+    pub handshakes_failed: u64,
+    // ── 消息 ──
+    /// 累计接收 ASK 数。
+    pub asks_rx: u64,
+    /// 累计接收 TELL 数。
+    pub tells_rx: u64,
+    /// 累计发送 REPLY 数（含 REPLY_ERR）。
+    pub replies_tx: u64,
+    /// 累计 REPLY_ERR 数（业务错误）。
+    pub reply_errs: u64,
+    /// 累计接收字节数（帧体不含 TCP/IP 头）。
+    pub bytes_rx: u64,
+    /// 累计发送字节数。
+    pub bytes_tx: u64,
+    /// 累计接收 HEARTBEAT 数。
+    pub heartbeats_rx: u64,
+    // ── 组件（admin-v2 部署的业务组件）──
+    /// 在位组件数（Deployed 未 Stop）。
+    pub components: u64,
+    /// 组件实例明细（path + state + version）。
+    pub component_states: Vec<ComponentStateReport>,
+    // ── 资源（方言相关——尽力而为）──
+    /// 进程/线程/actor 数（erl=processes、jvm=actors、python=threads+ray actors）。
+    pub processes: u64,
+    /// 常驻内存字节（RSS——0=方言不支持）。
+    pub memory_rss: u64,
+    /// 网关启动时刻（unix 毫秒——0=未知）。
+    pub uptime_start_ms: u64,
+}
+
+impl Default for MetricsSnapshot {
+    fn default() -> Self {
+        Self {
+            ts_ms: 0,
+            runtime: String::new(),
+            connections: 0,
+            handshakes_ok: 0,
+            handshakes_failed: 0,
+            asks_rx: 0,
+            tells_rx: 0,
+            replies_tx: 0,
+            reply_errs: 0,
+            bytes_rx: 0,
+            bytes_tx: 0,
+            heartbeats_rx: 0,
+            components: 0,
+            component_states: Vec::new(),
+            processes: 0,
+            memory_rss: 0,
+            uptime_start_ms: 0,
+        }
+    }
+}
+
+impl MetricsSnapshot {
+    /// 运行时长（秒）——以采集时刻与启动时刻差分。
+    pub fn uptime_secs(&self) -> u64 {
+        if self.uptime_start_ms == 0 {
+            0
+        } else {
+            self.ts_ms.saturating_sub(self.uptime_start_ms) / 1000
+        }
+    }
 }
 
 impl AdminReplyV2 {
@@ -196,6 +285,7 @@ impl AdminReplyV2 {
             | Self::Drained { req_id, .. }
             | Self::Stopped { req_id }
             | Self::Status { req_id, .. }
+            | Self::Metrics { req_id, .. }
             | Self::Failed { req_id, .. } => *req_id,
         }
     }
@@ -288,6 +378,13 @@ pub trait ComponentExecutor: Send + Sync {
     async fn drain(&self, req_id: u64, prefix: &str, timeout_ms: u64) -> AdminReplyV2;
     async fn stop(&self, req_id: u64, prefix: &str) -> AdminReplyV2;
     async fn status(&self, req_id: u64, prefix: &str) -> AdminReplyV2;
+    /// 指标快照（观测五件套——默认实现给空快照，方言网关各自覆写）。
+    async fn metrics(&self, req_id: u64) -> AdminReplyV2 {
+        AdminReplyV2::Metrics {
+            req_id,
+            snapshot: MetricsSnapshot::default(),
+        }
+    }
 }
 
 /// 目标节点侧：处理入站 AdminCommandV2（无执行器 → Failed DIALECT_MISMATCH）。
@@ -324,6 +421,7 @@ pub async fn handle_admin_command_v2(
                 path_prefix,
             },
         ) => ex.status(req_id, &path_prefix).await,
+        (Some(ex), AdminCommandV2::MetricsReport { req_id }) => ex.metrics(req_id).await,
         (None, _) => failed_v2(
             req_id,
             v2_err::DIALECT_MISMATCH,
@@ -874,5 +972,70 @@ mod tests {
             }
             other => panic!("wrong: {other:?}"),
         }
+    }
+
+    // ── 观测五件套：MetricsReport 命令 + Metrics 回执往返 ──────────
+
+    #[test]
+    fn metrics_cmd_roundtrip() {
+        let cmd = AdminCommandV2::MetricsReport { req_id: 42 };
+        let bytes = encode_admin_cmd_v2(&cmd);
+        assert_eq!(bytes[0], sys_event_tag::ADMIN_CMD_V2);
+        assert_eq!(bytes[1], 0x04); // 变体索引 4（第五命令）
+        match crate::admin::decode_sys_event(&bytes).unwrap() {
+            crate::admin::SysEvent::AdminCommandV2(AdminCommandV2::MetricsReport {
+                req_id,
+            }) => assert_eq!(req_id, 42),
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metrics_reply_roundtrip_full_snapshot() {
+        let snap = MetricsSnapshot {
+            ts_ms: 1_760_000_000_000,
+            runtime: "erl/OTP-27".into(),
+            connections: 3,
+            handshakes_ok: 5,
+            handshakes_failed: 1,
+            asks_rx: 100,
+            tells_rx: 7,
+            replies_tx: 98,
+            reply_errs: 2,
+            bytes_rx: 123_456,
+            bytes_tx: 234_567,
+            heartbeats_rx: 89,
+            components: 2,
+            component_states: vec![ComponentStateReport {
+                path: "/user/frontier".into(),
+                state: "running".into(),
+                version: "1.0.0".into(),
+            }],
+            processes: 42,
+            memory_rss: 68_000_000,
+            uptime_start_ms: 1_759_999_000_000,
+        };
+        let r = AdminReplyV2::Metrics {
+            req_id: 7,
+            snapshot: snap.clone(),
+        };
+        let bytes = encode_admin_reply_v2(&r);
+        assert_eq!(bytes[0], sys_event_tag::ADMIN_REPLY_V2);
+        assert_eq!(bytes[1], 0x05); // Metrics 变体（Failed 之后）
+        match crate::admin::decode_sys_event(&bytes).unwrap() {
+            crate::admin::SysEvent::AdminReplyV2(AdminReplyV2::Metrics { req_id, snapshot }) => {
+                assert_eq!(req_id, 7);
+                assert_eq!(snapshot, snap);
+                assert_eq!(snapshot.uptime_secs(), 1000);
+            }
+            other => panic!("wrong: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metrics_default_snapshot_is_all_zero() {
+        let s = MetricsSnapshot::default();
+        assert_eq!(s.uptime_secs(), 0); // uptime_start_ms=0 → 未知
+        assert_eq!((s.connections, s.asks_rx, s.bytes_rx), (0, 0, 0));
     }
 }

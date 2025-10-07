@@ -46,6 +46,68 @@ ERR_UNKNOWN_TYPE_KEY = 6
 # PARROT_RAY_GW_WORKERS=1 即退化为旧行为做 A/B 对照）
 RAY_GW_ASK_WORKERS = int(os.environ.get("PARROT_RAY_GW_WORKERS", "8"))
 
+# ---------------- 观测五件套：网关级指标注册表 ----------------
+# 全部链路（listen + 反拨）共用的线程安全计数器；进程启动时刻固定。
+_START_MS = int(time.time() * 1000)
+
+
+class _GatewayMetrics:
+    """逐帧计数（feed）+ 快照（snapshot）——探针经 admin-v2 MetricsReport 拉取。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._c = {
+            "connections": 0,
+            "handshakes_ok": 0, "handshakes_failed": 0,
+            "asks_rx": 0, "tells_rx": 0,
+            "replies_tx": 0, "reply_errs": 0,
+            "bytes_rx": 0, "bytes_tx": 0, "heartbeats_rx": 0,
+        }
+
+    def bump(self, key: str, n: int = 1) -> None:
+        with self._lock:
+            self._c[key] = self._c.get(key, 0) + n
+
+    def snapshot(self) -> dict:
+        import platform
+
+        with self._lock:
+            base = dict(self._c)
+        # RSS 尽力而为：/proc/self/status（Linux）；macOS 无 procfs → 0
+        rss = 0
+        try:
+            with open("/proc/self/status", encoding="ascii") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        rss = int(line.split()[1]) * 1024
+                        break
+        except OSError:
+            pass
+        procs = threading.active_count()
+        try:
+            import warnings
+
+            import ray as _ray  # noqa: PLC0415
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # ray.state.actors 弃用告警
+                procs += len(_ray.state.actors().keys())
+        except Exception:  # noqa: BLE001 —— ray 未起/桩形态
+            pass
+        base.update({
+            "ts_ms": int(time.time() * 1000),
+            "runtime": f"python/{platform.python_version()}",
+            "processes": procs,
+            "memory_rss": rss,
+            "uptime_start_ms": _START_MS,
+        })
+        # connections：活跃连接计数（可暂负于竞态——clamp 0）
+        base["connections"] = max(base.get("connections", 0), 0)
+        return base
+
+
+METRICS = _GatewayMetrics()
+
 
 # ---------------- B3（DEV_09）：admin-v2 ray 方言执行器 ----------------
 # DeployComponent{PyModule} → ray job API submit(working_dir=module 目录,
@@ -131,6 +193,8 @@ class RayAdminExecutor:
                 reply = self.stop(cmd["path_prefix"])
             elif kind == "status":
                 reply = self.status(cmd["path_prefix"])
+            elif kind == "metrics":
+                reply = {"kind": "metrics", "snapshot": self.collect_metrics()}
             else:  # pragma: no cover —— 解码层已限四形态
                 reply = {"kind": "failed", "code": ERR_DIALECT_MISMATCH,
                          "detail": f"unknown kind {kind}"}
@@ -141,6 +205,20 @@ class RayAdminExecutor:
             reply = {"kind": "failed", "code": ERR_ARTIFACT_FETCH, "detail": str(e)}
         reply["req_id"] = cmd["req_id"]
         self._send_reply(cmd["req_id"], reply, reply_to)
+
+    # ---- 观测五件套：指标采集（admin-v2 MetricsReport）----
+    def collect_metrics(self) -> dict:
+        snap = METRICS.snapshot()
+        with self._lock:
+            comps = list(self._components.items())
+        states = []
+        for name, info in comps:
+            for p in info.get("paths", []):
+                states.append({"path": p, "state": "running",
+                               "version": info.get("version", "?")})
+        snap["components"] = len(comps)
+        snap["component_states"] = states
+        return snap
 
     # ---- Deploy：PyModule → ray job → parrot_entry(ctx) 命名 actor ----
     def deploy(self, comp: dict) -> dict:
@@ -524,9 +602,13 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
                                            worker_ref=worker)
 
             def reply(cid: int, key: str, payload: bytes) -> None:
+                METRICS.bump("replies_tx")
+                METRICS.bump("bytes_tx", len(payload) + len(key))
                 out_local.put(build_frame(FT_REPLY, cid, "", key, payload))
 
             def reply_err(cid: int, code: int, detail: str) -> None:
+                METRICS.bump("replies_tx")
+                METRICS.bump("reply_errs")
                 out_local.put(build_frame(FT_REPLY_ERR, cid, "", "", encode_err_payload(code, detail)))
 
             def run_ask(cid: int, type_key: str, payload: bytes) -> None:
@@ -602,14 +684,20 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
                                     print(f"[ray-gw] parrot {parrot_addr} handshake ok",
                                           file=sys.stderr, flush=True)
                                     handshake_done = True
+                                    METRICS.bump("handshakes_ok")
                                 continue
                             if f.ft == FT_ASK:
+                                METRICS.bump("asks_rx")
+                                METRICS.bump("bytes_rx", len(f.payload))
                                 reply_to, real_payload = split_reply_to(f.payload) or ("", f.payload)
                                 _ = reply_to
                                 pool_local.submit(run_ask, f.cid, f.type_key, real_payload)
                             elif f.ft == FT_TELL:
+                                METRICS.bump("tells_rx")
+                                METRICS.bump("bytes_rx", len(f.payload))
                                 worker.deliver.remote(f.type_key, f.payload)
                             elif f.ft == FT_HEARTBEAT:
+                                METRICS.bump("heartbeats_rx")
                                 out_local.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
                             elif f.ft == FT_ROUTE_HINT:
                                 on_route_hint(f.payload)
@@ -634,11 +722,38 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
     srv.listen(128)
     print(f"RAY_GW_PORT={srv.getsockname()[1]}", flush=True)
 
-    sock, _addr = srv.accept()
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    srv.close()
+    # 多连接生命周期：每连接独立线程（探针/应用/压测可并发连接；
+    # METRICS 模块级跨连接累计——uptime/进程数全局一致）
+    while True:
+        sock, _addr = srv.accept()
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        threading.Thread(
+            target=_serve_connection_guarded,
+            args=(sock, dispatch, worker, ray),
+            daemon=True,
+        ).start()
 
-    out: queue.Queue[bytes] = queue.Queue()
+
+def _serve_connection_guarded(sock, dispatch, worker, ray) -> None:
+    METRICS.bump("connections", 1)
+    try:
+        _serve_connection(sock, dispatch, worker, ray)
+    except OSError:
+        pass  # 对端异常断开
+    finally:
+        METRICS.bump("connections", -1)
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _serve_connection(sock, dispatch, worker, ray) -> None:
+    """单连接服务（serve 的 listen 循环逐连接调用）。"""
+    import queue as _queue
+    from concurrent.futures import ThreadPoolExecutor
+
+    out: _queue.Queue[bytes] = _queue.Queue()
 
     def writer() -> None:
         while True:
@@ -647,15 +762,16 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
     threading.Thread(target=writer, daemon=True).start()
 
     # DEV_08：ASK 执行池——ray.get 阻塞调用移出收包线程（头阻塞消除）。
-    # max_workers 可注入性保留在模块级（测试/生产分别调优）。
-    from concurrent.futures import ThreadPoolExecutor
-
     pool = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
 
     def reply(cid: int, key: str, payload: bytes) -> None:
+        METRICS.bump("replies_tx")
+        METRICS.bump("bytes_tx", len(payload) + len(key))
         out.put(build_frame(FT_REPLY, cid, "", key, payload))
 
     def reply_err(cid: int, code: int, detail: str) -> None:
+        METRICS.bump("replies_tx")
+        METRICS.bump("reply_errs")
         out.put(build_frame(FT_REPLY_ERR, cid, "", "", encode_err_payload(code, detail)))
 
     def run_ask(cid: int, type_key: str, payload: bytes) -> None:
@@ -672,10 +788,7 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
     dec = FrameDecoder()
     handshake_done = False
     while True:
-        try:
-            chunk = sock.recv(65536)
-        except OSError:
-            break
+        chunk = sock.recv(65536)
         if not chunk:
             break
         dec.feed(chunk)
@@ -686,6 +799,7 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
                         fields = dict(parse_tlv(f.payload))
                         peer = fields.get(1, b"?").decode()
                         print(f"[ray-gw] handshake from {peer}", file=sys.stderr, flush=True)
+                        METRICS.bump("handshakes_ok")
                         out.put(
                             build_frame(
                                 FT_HANDSHAKE_ACK,
@@ -698,12 +812,17 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
                         handshake_done = True
                     continue
                 if f.ft == FT_ASK:
+                    METRICS.bump("asks_rx")
+                    METRICS.bump("bytes_rx", len(f.payload))
                     reply_to, real_payload = split_reply_to(f.payload) or ("", f.payload)
                     _ = reply_to  # 回程经 cid 配对（reply_to 仅诊断）
                     pool.submit(run_ask, f.cid, f.type_key, real_payload)
                 elif f.ft == FT_TELL:
+                    METRICS.bump("tells_rx")
+                    METRICS.bump("bytes_rx", len(f.payload))
                     worker.deliver.remote(f.type_key, f.payload)
                 elif f.ft == FT_HEARTBEAT:
+                    METRICS.bump("heartbeats_rx")
                     out.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
                 elif f.ft == FT_SYSTEM_EVENT:
                     # B3（DEV_09）：admin-v2（0x03 命令）——执行器消费；其余忽略

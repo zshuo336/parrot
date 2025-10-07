@@ -14,7 +14,8 @@ members = [
     "apps/crawler-lab",
     "apps/crawler-lab/dylib",
     "apps/websearch",
-    "tools/federation-lab"
+    "tools/federation-lab",
+    "tools/parrot-obs"
 ]
 
 [workspace.dependencies]

@@ -65,7 +65,7 @@ SHELL := /bin/bash
         test test-fast test-full test-stress test-polyglot test-full-polyglot test-lab \
         lint fmt clippy bench matrix clean distclean \
         ts py jvm erl cpp check-ts check-py check-jvm check-erl check-cpp \
-        build-release-bins twin-app
+        build-release-bins twin-app build-probe probe
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────
 help: ## 显示本帮助
@@ -119,6 +119,14 @@ build-jvm: ## 打包 JVM 网关 jar（mvn -q package）
 
 build-python: ## Python 语法预热（compileall；依赖见 pyproject.toml）
 	cd $(PY_DIR) && python3 -m compileall -q parrot_protocol tests
+
+# ── 观测五件套（docs/OBSERVABILITY.md）──────────────────────────────────────
+build-probe: ## 编译 parrot-obs 观测 CLI+Web（tools/parrot-obs）
+	$(CARGO) build -p parrot-obs $(CARGO_REL)
+
+probe: build-probe ## 观测探针速用（NODES='erl=… ray=… jvm=…'；CMD=metrics|status|…）
+	@test -n "$(CMD)" || (echo '用法：make probe CMD=status|metrics|ping|ask|load|watch|trace|web NODES="erl=127.0.0.1:19871 …" [ARGS="--seconds 10"]'; exit 2)
+	$(CARGO) run -q -p parrot-obs -- $(CMD) $(NODES) $(ARGS)
 
 # ══════════════════════════════════════════════════════════════════════════
 # 测试（MODE 分发 → 具体 recipe）
