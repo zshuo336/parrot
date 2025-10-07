@@ -1,0 +1,137 @@
+# ============================================================================
+#  websearch 多节点模拟（docker compose——单机模拟真实多物理机）
+#
+#  4 个"物理机"（bridge 网络 ws-net 172.30.0.0/16——容器间真实 TCP）：
+#    app    172.30.0.2  Rust 应用（registry 监听 :19870 + Web :8080→宿主 8188）
+#    erl    172.30.0.3  Erlang frontier 网关（容器内编译 beam + 反拨注册）
+#    ray    172.30.0.4  Ray jieba 分词网关（反拨注册）
+#    jvm    172.30.0.5  JVM akka 检索网关（JDK21 + 反拨注册；索引卷）
+#
+#  实测验证形态：跨容器 admin-v2 Deploy（beam/jar/py 制品经 volume 挂载 +
+#  file:// uri 指容器内路径）→ registry 反拨 → 漫爬 → /docs /terms 实时可见。
+#
+#  框架镜像引用（不侵入框架——context 仓库根 + framework Dockerfile）：
+#    erl/ray → deploy/images/gw-{erl,ray}.Dockerfile（含 parrot_gw/parrot_protocol）
+#    app    → 本目录 Dockerfile（FROM deploy/images/gw-app.Dockerfile 语义——
+#              直接 build context 指仓库根 + framework Dockerfile + BIN=websearch）
+#  app 制品全部 volume 挂载（beam/py/jar/二进制）——重建 app 不重建镜像。
+#
+#  用法：
+#    apps/websearch/deploy/compose.sh up [--sites 100 --maxdepth 10 ...]
+#    apps/websearch/deploy/compose.sh logs / ps / down
+#
+#  基镜像加速（国内网络）：缺省经 REGISTRY_PREFIX build-arg 走加速器前缀；
+#  环境变量 WS_REGISTRY_PREFIX 空则直连官方源。
+# ============================================================================
+name: ws-mesh
+
+x-gw-common: &gw-common
+  restart: unless-stopped
+  networks: [ws-net]
+
+x-registry-prefix: &registry_prefix "${WS_REGISTRY_PREFIX:-docker.1ms.run/}"
+
+services:
+  # ── 应用主程序（编排器 + Web）────────────────────────────────────
+  app:
+    build:
+      context: ../../..
+      dockerfile: deploy/images/gw-app.Dockerfile
+      args:
+        BIN: websearch
+        TRIPLE: aarch64-unknown-linux-musl
+        REGISTRY_PREFIX: *registry_prefix
+    container_name: ws-app
+    <<: *gw-common
+    networks:
+      ws-net: { ipv4_address: 172.30.0.2 }
+    ports: [ "8188:8080" ]           # 宿主访问 Web
+    volumes:
+      - ws-app-data:/data            # 去重表
+    # registry 模式：等三网关反拨注册；制品根=容器内挂载点（file:// 指此）
+    command:
+      - --bind
+      - 0.0.0.0:19870
+      - --wait
+      - "180"
+      - --node-root
+      - /app-root                    # ← 三网关侧同一路径约定（各自挂载同构制品）
+      - --port
+      - "8080"
+      - --data
+      - /data
+
+  # ── Erlang frontier 网关 ────────────────────────────────────────
+  erl:
+    build:
+      context: ../../..
+      dockerfile: deploy/images/gw-erl.Dockerfile
+      args:
+        REGISTRY_PREFIX: *registry_prefix
+    container_name: ws-erl
+    <<: *gw-common
+    networks:
+      ws-net: { ipv4_address: 172.30.0.3 }
+    depends_on: [ app ]
+    volumes:
+      - ../../../apps/websearch/erlang:/app-root/erlang-src:ro
+      - ws-erl-beams:/app-root/erlang
+    # OTP 版本对齐：容器内 erlc 编译（宿主 OTP29 beam 与镜像 OTP27 不兼容——
+    # badfile）；编进 /app-root/erlang（deploy uri file:///app-root/erlang 同路径）
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        erlc -o /app-root/erlang /app-root/erlang-src/frontier.erl
+        && exec erl -noshell -pa /gw -pa /app-root/erlang
+        -eval "parrot_gw:main([0, \"parrot=172.30.0.2:19870\"])"
+
+  # ── Ray jieba 分词网关 ──────────────────────────────────────────
+  ray:
+    build:
+      context: ../../..
+      dockerfile: deploy/images/gw-ray.Dockerfile
+      args:
+        REGISTRY_PREFIX: *registry_prefix
+    container_name: ws-ray
+    <<: *gw-common
+    networks:
+      ws-net: { ipv4_address: 172.30.0.4 }
+    depends_on: [ app ]
+    volumes:
+      - ../../../apps/websearch/python:/app-root/python:ro
+    environment:
+      PYTHONPATH: /gw:/app-root/python
+    command: >-
+      python3 -m parrot_protocol.ray_gw 0 "parrot=172.30.0.2:19870"
+
+  # ── JVM akka 检索网关 ───────────────────────────────────────────
+  jvm:
+    build:
+      context: ../../..
+      dockerfile: deploy/images/gw-jvm.Dockerfile
+      args:
+        REGISTRY_PREFIX: *registry_prefix
+    container_name: ws-jvm
+    <<: *gw-common
+    networks:
+      ws-net: { ipv4_address: 172.30.0.5 }
+    depends_on: [ app ]
+    volumes:
+      - ../../../apps/websearch/jvm/target/websearch-jvm-1.0.0.jar:/app-root/jvm/target/websearch-jvm-1.0.0.jar:ro
+      - ws-jvm-data:/app-root/data
+    environment:
+      WS_DATA: /app-root/data
+    command: >-
+      java -cp "/gw/parrot-protocol-jvm-0.1.0.jar:/gw/libs/*:/app-root/jvm/target/websearch-jvm-1.0.0.jar"
+      parrot.protocol.jvm.ParrotGatewayMain 0 "parrot=172.30.0.2:19870" "node=jvm-search-1" 7200
+
+networks:
+  ws-net:
+    driver: bridge
+    ipam:
+      config: [ { subnet: 172.30.0.0/16 } ]
+
+volumes:
+  ws-app-data:
+  ws-jvm-data:
+  ws-erl-beams:

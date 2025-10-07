@@ -10,7 +10,7 @@
 #  依赖：ssh/scp（免密或 agent）；目标机无需 rust 工具链——只传产物
 # ============================================================================
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."   # 仓库根（apps/websearch/deploy → 上三级）
 ROOT="$PWD"
 
 HOSTS="${1:?用法：$0 user@host1[,user@host2,...] [--root DIR]}"

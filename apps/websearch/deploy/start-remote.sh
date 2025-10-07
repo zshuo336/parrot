@@ -34,8 +34,11 @@ case "$ROLE" in
   erl)
     command -v erl >/dev/null || { echo "缺 erl"; exit 1; }
     echo "==> erl frontier 网关 → 注册 $APP_TARGET"
-    # parrot_gw 参数形态：[端口0, "parrot=host:port"] —— 0=随机监听 + 反拨注册
-    cd "$NODE_ROOT/gw_erl" 2>/dev/null || cd "$NODE_ROOT"
+    # 宿主网关源码编译（distribute.sh 分发的是 .erl——目标机 OTP 版本自洽）
+    (cd "$NODE_ROOT/gw_erl" && erlc parrot_gw.erl) 2>/dev/null \
+      || erlc "$NODE_ROOT/gw_erl/parrot_gw.erl" -o "$NODE_ROOT/gw_erl"
+    # 业务 beam 同理（OTP 版本对齐——容器形态踩过 badfile）
+    erlc "$NODE_ROOT/erlang/frontier.erl" -o "$NODE_ROOT/erlang" 2>/dev/null || true
     exec erl -noshell -pa "$NODE_ROOT/erlang" "$NODE_ROOT/gw_erl" \
       -eval 'parrot_gw:main([0, "parrot='"$APP_TARGET"'"])'
     ;;
