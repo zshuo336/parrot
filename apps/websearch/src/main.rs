@@ -739,7 +739,7 @@ async fn main() {
         let mut linked = false;
         for attempt in 1..=15 {
             match client
-                .connect(&NodeAddr::tcp("jvm-search-1", sa.clone()))
+                .connect(&NodeAddr::tcp("jvm-search-1", sa))
                 .await
             {
                 Ok(()) => {
@@ -1026,10 +1026,8 @@ async fn main() {
             }
             let host = host_of(&url);
             let now = Instant::now();
-            let ok_to_go = match host_last.get(&host) {
-                Some(t) if now.duration_since(*t) < Duration::from_millis(200) => false,
-                _ => true,
-            };
+            let ok_to_go = !matches!(host_last.get(&host),
+                Some(t) if now.duration_since(*t) < Duration::from_millis(200));
             if !ok_to_go {
                 pending.push((url, depth)); // 队尾重试
                 throttled += 1;
@@ -1232,8 +1230,7 @@ fn gw_addr(addrs: &[(&str, String)], tag: &str, default: &str) -> String {
 }
 
 fn app_root_dir() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 // ═══════════════════════════ Web 查询服务（百度式页面）════════════════════
