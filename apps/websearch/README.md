@@ -40,6 +40,15 @@ apps/websearch/run.sh https://www.runoob.com --sites 100 --maxdepth 10
 ./target/release/websearch --serve-only --port 8080 --data apps/websearch/data
 ```
 
+## 运行模式总表（四模式）
+
+| 模式 | 入口 | 形态 | 适用 |
+|---|---|---|---|
+| ① 单机调试 | `run.sh` | 本机三网关进程 + direct 拨号 | 开发调试 |
+| ② 单机 registry | `deploy/run-registry.sh` | 网关反拨注册（生产组网形态） | 组网演练 |
+| ③ 多节点模拟 | `deploy/compose.sh up` | docker 4 容器真实跨网（172.30.0.0/16） | 单机模拟多物理机 |
+| ④ 真实多机 | `deploy/distribute.sh` + `deploy/start-remote.sh` | ssh 分发 + 物理机网关 | 生产部署 |
+
 ## 跨网络部署（多节点形态）
 
 parrot 组网与部署命令（admin-v2 Deploy）本就是跨网络的——`erl=/ray=/jvm=`
@@ -53,10 +62,10 @@ parrot 组网与部署命令（admin-v2 Deploy）本就是跨网络的——`erl
 # 应用侧（本机或任意机器）
 ./target/release/websearch --bind 0.0.0.0:19870 --wait 60 --port 8080
 
-# 各网关节点（制品先经 deploy/websearch/distribute.sh 分发）
-deploy/websearch/start-remote.sh erl  <应用IP>:19870   # Erlang 机器
-deploy/websearch/start-remote.sh ray  <应用IP>:19870   # Python 机器
-deploy/websearch/start-remote.sh jvm  <应用IP>:19870 --data /var/lib/websearch
+# 各网关节点（制品先经 apps/websearch/deploy/distribute.sh 分发）
+apps/websearch/deploy/start-remote.sh erl  <应用IP>:19870   # Erlang 机器
+apps/websearch/deploy/start-remote.sh ray  <应用IP>:19870   # Python 机器
+apps/websearch/deploy/start-remote.sh jvm  <应用IP>:19870 --data /var/lib/websearch
 ```
 
 ### 形态 2：direct 显式跨机地址
@@ -70,13 +79,21 @@ deploy/websearch/start-remote.sh jvm  <应用IP>:19870 --data /var/lib/websearch
 `--node-root` = 各节点上制品目录（file:// uri 指向目标网关本地路径——
 节点侧预置同构制品即可，与运行机解耦）。
 
-### 形态 3：docker 多容器跨网模拟
+### 形态 3：docker 多容器跨网模拟（apps/websearch/deploy 自包含）
 
 ```bash
-deploy/websearch/run-mesh.sh          # 4 容器真实 TCP 跨"机"（bridge 网络）
+apps/websearch/deploy/compose.sh up        # 4 容器真实 TCP 跨"机"（bridge 网）
+apps/websearch/deploy/compose.sh logs      # 跟踪应用日志
+apps/websearch/deploy/compose.sh stats     # /stats 快照
+apps/websearch/deploy/compose.sh down      # 销毁（down -v 连数据卷）
 ```
 
-制品分发（三形态通用第一步）：`deploy/websearch/distribute.sh user@host1[,host2...]`
+app 的 compose 在 `apps/websearch/deploy/docker-compose.yml` **完备自包含**；
+镜像引用框架通用运行时（`deploy/images/gw-{erl,jvm,ray,app}.Dockerfile`——
+单一真源不复制）；app 制品（beam/jar/py/二进制）volume 挂载进容器，
+重建 app 不重建镜像。基镜像经 `WS_REGISTRY_PREFIX` 走加速器（国内网络）。
+
+制品分发（形态 4 用）：`deploy/distribute.sh user@host1[,host2...]`
 ——jar/beam/py + 三方言网关宿主打包推送 + 远端校验。
 
 分词三语言同族：Python `jieba`（原版）/ JVM `jieba-analysis`（huaban 移植）/ Rust 侧经

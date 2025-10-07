@@ -8,6 +8,12 @@
 #   Akka(JVM)         搜索 API+落盘     —— BM25·倒排·段文件持久化
 #   TS Lite           用户终端           —— 查询 CLI（run.sh 自动跑）
 #
+#  ── 四种运行模式（apps/websearch/README「跨网络部署」节详表）────────
+#   ① 单机调试     run.sh                     direct：应用拨号本机三网关
+#   ② 单机 registry deploy/run-registry.sh    生产组网形态：网关反拨注册
+#   ③ 多节点模拟   deploy/compose.sh up       docker 4 容器真实跨网（本机）
+#   ④ 真实多机     deploy/distribute.sh + start-remote.sh   ssh 分发物理机
+#
 #  用法：./run.sh [seed-url]... [--sites N] [--maxdepth D] [--pages P] [--port P] [--keep]
 #        不给种子时自动启用内置 47 条多样化种子集（中文门户/技术/高校/文档站）
 #  示例：./run.sh --sites 100 --maxdepth 10 --port 8080

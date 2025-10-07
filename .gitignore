@@ -35,3 +35,4 @@ _build/
 interop/cpp-lite/bin/
 *.dump
 erl_crash.dump
+gw-jvm-libs.tar
