@@ -13,6 +13,7 @@ members = [
     "crates/parrot-abi",
     "apps/crawler-lab",
     "apps/crawler-lab/dylib",
+    "apps/websearch",
     "tools/federation-lab"
 ]
 

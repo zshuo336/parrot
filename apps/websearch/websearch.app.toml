@@ -1,0 +1,65 @@
+# websearch.app.toml —— 真实搜索引擎应用（五运行时全分工）
+#
+# 与 crawler-lab（合成测试）同族架构，但面向真实互联网：
+#   frontier(erl)  真实 URL 去重 + BFS 调度（ETS 有序表）
+#   tokenizer(ray) jieba 中文分词 + 词频（开源分词——Python 原版）
+#   search(jvm)    jieba-analysis 查询切词 + BM25 + 段文件落盘
+#   crawler(parrot) reqwest 真实 HTTPS 漫爬 + 编排 + 百度式 Web 页
+#
+# 四服务独立运行（用户裁定）：
+#   全链：run.sh <seed> —— 爬取→分词→索引→Web 服务
+#   仅检索：websearch --serve-only —— 回放段文件独立服务（重启不丢）
+
+name = "websearch"
+version = "1.0.0"
+
+# ── 组件（依赖序即装配序）──────────────────────────────────────────
+
+[[components]]
+name = "frontier"
+engine = "erlang"
+artifact = { Beam = { app = "frontier", uri = "file://erlang/" } }
+
+[[components]]
+name = "tokenizer"
+engine = "ray"
+artifact = { PyModule = { module = "tokenizer", uri = "file://python/" } }
+deps = ["frontier"]
+
+[[components]]
+name = "search"
+engine = "akka"
+artifact = { Jvm = { main_class = "websearch.search.SearchComponent", uri = "file://jvm/target/websearch-jvm-1.0.0.jar" } }
+deps = ["tokenizer"]
+
+[[components]]
+name = "crawler"
+engine = "parrot"
+# 主进程直跑形态（tokio 编排器）——非 dylib/wasm（需网络栈与 reqwest）
+artifact = { Dylib = { uri = "file://bin/websearch", digest = "sha256:__BUILD__", abi = 1 } }
+deps = ["frontier", "tokenizer", "search"]
+
+# ── 连接（WireSpec——组件间静态路由）─────────────────────────────────
+
+[[wiring]]
+from = "crawler:/user/frontier"
+to = "frontier:/user/frontier"
+qos = "wan"   # 真实外网爬取——wan 语义
+
+[[wiring]]
+from = "crawler:/user/tokenizer"
+to = "tokenizer:/user/tokenizer"
+qos = "lan"
+
+[[wiring]]
+from = "crawler:/user/search"
+to = "search:/user/search"
+qos = "lan"
+
+# ── 配置（overlay——CLI 注入位）─────────────────────────────────────
+
+[config_overlay]
+pages = 200
+maxdepth = 2
+port = 8080
+data = "./data"

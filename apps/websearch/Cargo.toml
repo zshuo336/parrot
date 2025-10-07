@@ -1,0 +1,20 @@
+[package]
+name = "websearch"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "真实搜索引擎应用：五运行时分工（erl frontier / rust 漫爬 / ray 中文分词索引 / akka 检索 / TS 查询页）"
+
+[[bin]]
+name = "websearch"
+path = "src/main.rs"
+
+[dependencies]
+parrot-api = { path = "../../crates/parrot-api" }
+parrot-remote = { path = "../../crates/parrot-remote" }
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+# 真实 HTTPS 爬取（rustls 纯 Rust TLS——无系统依赖）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+# docId 派生（URL sha256）
+sha2 = "0.10"
