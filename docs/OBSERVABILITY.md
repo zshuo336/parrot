@@ -101,6 +101,12 @@ cargo build -p parrot-obs          # ./target/debug/parrot-obs
 ### 3.2 起被测网关
 
 ```bash
+tools/parrot-obs/gw.sh up     # 一键守护化起三网关（erl/jvm/ray），就绪后打印 NODES 行
+```
+
+或手工起（等价——gw.sh 内部即这些命令 + 双 fork 守护化）：
+
+```bash
 # erl
 cd interop/erlang && erl -noinput -noshell -pa . -eval 'parrot_gw:main(["19871"])'
 # jvm（先 mvn -q package -DskipTests）
@@ -112,36 +118,57 @@ cd interop/python && PYTHONPATH=. python3 -m parrot_protocol.ray_gw 19873
 
 ### 3.3 七个子命令
 
-节点参数三形态：`erl=<addr> ray=<addr> jvm=<addr>`（任意子集）。
+节点参数三形态（`erl=<addr> ray=<addr> jvm=<addr>` 任意子集），**支持三种传参写法**——多参数、单串空格分隔、单串逗号分隔均可：
 
 ```bash
 NODES="erl=127.0.0.1:19871 ray=127.0.0.1:19873 jvm=127.0.0.1:19872"
 
+# zsh 注意：标量 $NODES 不会按空格分词——单串整包传也认（CLI 内部已兼容）。
+# 三种写法等价：
+parrot-obs status $NODES                                  # bash（自动分词）
+parrot-obs status "$NODES"                                # zsh 单串（推荐——复制即用）
+parrot-obs status "erl=127.0.0.1:19871,ray=127.0.0.1:19873,jvm=127.0.0.1:19872"   # 逗号分隔
+
 # 1) 连通性 + 一行摘要
-parrot-obs status $NODES
+parrot-obs status "$NODES"
 # ✓ erl-gw-1  erl/OTP-29  up 0h01m02s conn=1 asks=30 replies=30 err=0 io=3.8K/1.5K rss=47.7M
+# ✗ ray-gw-1  不可达：…（离线节点逐行标注——不中断其余节点输出）
 
 # 2) admin 通道 RTT
-parrot-obs ping $NODES --rounds 5
+parrot-obs ping "$NODES" --rounds 5
 
 # 3) 业务通道 ASK 探测（echo 探针 Ping→Pong，按方言路径自动路由）
-parrot-obs ask $NODES --rounds 3
+parrot-obs ask "$NODES" --rounds 3
 
-# 4) 全宽指标表 + 组件明细
-parrot-obs metrics $NODES
+# 4) 全宽指标表 + 组件明细（离线节点表后列出 ✗ 行）
+parrot-obs metrics "$NODES"
 
 # 5) 持续采样差分（Ctrl-C 停）
-parrot-obs watch $NODES --interval 2
+parrot-obs watch "$NODES" --interval 2
 
 # 6) 窗口差分速率（期间跑负载即见吞吐）
-parrot-obs trace $NODES --seconds 10
+parrot-obs trace "$NODES" --seconds 10
 
 # 7) 压测（吞吐 + P50/P95/P99 延迟）
-parrot-obs load $NODES --seconds 10 --conc 4
+parrot-obs load "$NODES" --seconds 10 --conc 4
 # 完成 ok=6020 err=1 吞吐=1003.3/s  延迟 P50=0.22ms P95=12.47ms P99=13.14ms
 ```
 
-### 3.4 排障开关
+**离线容错**：任一/全部网关未启动时工具不崩溃——连接失败仅告警（提示 `gw.sh up`），可达节点照常出表，不可达节点标 `✗ 不可达`。
+
+### 3.4 一键起停三网关
+
+```bash
+tools/parrot-obs/gw.sh up      # 守护化起 erl/jvm/ray 三网关（默认 19871/19872/19873）→ 打印 NODES 行
+tools/parrot-obs/gw.sh status  # 端口监听 + parrot-obs status 一行摘要
+tools/parrot-obs/gw.sh log erl # 看网关日志（erl|jvm|ray|all）
+tools/parrot-obs/gw.sh down    # 全部停掉
+```
+
+前置：`make build-probe`（编 parrot-obs）、jvm 网关需先 `make build-jvm`（mvn package）。
+环境变量可换端口：`GW_ERL_PORT / GW_JVM_PORT / GW_RAY_PORT / GW_JVM_NODE`。
+
+### 3.5 排障开关
 
 ```bash
 RUST_LOG=parrot_remote=debug parrot-obs status ray=…   # 协议层 warn/debug（解码失败可见）
@@ -150,7 +177,7 @@ RUST_LOG=parrot_remote=debug parrot-obs status ray=…   # 协议层 warn/debug�
 ## 4. Web 控制台
 
 ```bash
-parrot-obs web $NODES --web-port 8190
+parrot-obs web "$NODES" --web-port 8190
 # → 浏览器打开 http://localhost:8190
 ```
 
