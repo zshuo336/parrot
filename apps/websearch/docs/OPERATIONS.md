@@ -353,6 +353,8 @@ ls -la apps/websearch/data/index/
 
 | 症状 | 根因 | 处置 |
 |---|---|---|
+| 浏览器 404（`http://127.0.0.1:8080/`） | 8080 被其他程序占用——404 是**占用者**的应答；websearch 绑定失败 panic（旧版行为），run.sh 退出时带走三网关 | `lsof -nP -iTCP:8080 -sTCP:LISTEN` 找占用者；或 `--port 8081` 换端口。新版已改：启动预检警告 + 自动顺延端口 + serve-only 网关重试 |
+| `bind web port: AddrInUse` 后 serve-only 又 `Connection refused` | 同上连锁：panic 退出 → run.sh trap 杀网关 → 再起应用连不上 | 先 `pkill -f "parrot_gw:main|ParrotGatewayMain|ray_gw"` 清残，再走 run.sh 全流程 |
 | `connect … Connection refused` | 对应网关没起/端口错 | 查 `lsof -i:1987x`；看网关日志尾部 |
 | deploy panic `SPAWN_FAILED load_file` | erlang/ 无 .beam | `cd apps/websearch/erlang && erlc frontier.erl` |
 | deploy panic `ClassNotFoundException: …JiebaSegmenter` | thin jar（旧构建） | 重跑 `jvm/build.sh`（fat 打包） |

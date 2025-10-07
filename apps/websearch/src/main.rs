@@ -73,6 +73,10 @@ wire_msg!(WsFlush, "bin:ws/Flush");
 wire_msg!(WsFlushAck, "bin:ws/FlushAck");
 wire_msg!(WsHealthz, "bin:ws/Healthz");
 wire_msg!(WsHealthzR, "bin:ws/HealthzR");
+wire_msg!(WsListDocs, "bin:ws/ListDocs");
+wire_msg!(WsListDocsR, "bin:ws/ListDocsR");
+wire_msg!(WsListTerms, "bin:ws/ListTerms");
+wire_msg!(WsListTermsR, "bin:ws/ListTermsR");
 
 // ═══════════════════════════ 编解码（裸 LE）══════════════════════════════
 
@@ -219,7 +223,10 @@ fn extract_html(html: &str) -> Extracted {
             let quote = a.chars().next();
             let link = match quote {
                 Some(q @ ('"' | '\'')) => a[1..].split(q).next().unwrap_or(""),
-                _ => a.split(|c: char| c.is_whitespace() || c == '>').next().unwrap_or(""),
+                _ => a
+                    .split(|c: char| c.is_whitespace() || c == '>')
+                    .next()
+                    .unwrap_or(""),
             };
             if !link.is_empty()
                 && !link.starts_with("javascript")
@@ -337,7 +344,13 @@ fn normalize_url(base: &str, link: &str) -> Option<String> {
             format!("?{}", kept.join("&"))
         }
     });
-    Some(format!("{}://{}{}{}", scheme, host, path, query.unwrap_or_default()))
+    Some(format!(
+        "{}://{}{}{}",
+        scheme,
+        host,
+        path,
+        query.unwrap_or_default()
+    ))
 }
 
 fn host_of(url: &str) -> String {
@@ -355,17 +368,20 @@ struct Fetcher {
 
 impl Fetcher {
     fn new() -> Self {
-    let client = reqwest::Client::builder()
-        .user_agent(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+        let client = reqwest::Client::builder()
+            .user_agent(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        )
-        .timeout(Duration::from_secs(12))
+            )
+            .timeout(Duration::from_secs(12))
             .connect_timeout(Duration::from_secs(6))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .expect("reqwest client");
-        Self { client, robots: Default::default() }
+        Self {
+            client,
+            robots: Default::default(),
+        }
     }
 
     async fn robots_allowed(&self, url: &str) -> bool {
@@ -458,7 +474,9 @@ fn decode_gbk(bytes: &[u8]) -> String {
                 let _ = si.write_all(bytes);
             }
             match c.wait_with_output() {
-                Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+                Ok(out) if out.status.success() => {
+                    String::from_utf8_lossy(&out.stdout).into_owned()
+                }
                 _ => String::from_utf8_lossy(bytes).into_owned(),
             }
         }
@@ -500,7 +518,8 @@ impl LocalLookup for NoopLookup {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut seeds: Vec<String> = Vec::new();
-    let (mut pages, mut max_depth, mut web_port) = (200u64, 2u16, 8080u16);
+    let (mut pages, mut max_depth, mut web_port) = (50000u64, 10u16, 8080u16);
+    let mut sites_target = 100usize; // 站点目标制：爬够 N 个不同 host 才允许停
     let mut data_dir = PathBuf::from("./data");
     let mut gw_addrs: Vec<(&str, String)> = Vec::new(); // (tag, host:port)
     let mut serve_only = false; // 只起检索服务（不爬——重启后回放索引的独立运行形态）
@@ -510,6 +529,10 @@ async fn main() {
         match args[i].as_str() {
             "--pages" => {
                 pages = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--sites" => {
+                sites_target = args[i + 1].parse().unwrap();
                 i += 2;
             }
             "--maxdepth" => {
@@ -531,7 +554,10 @@ async fn main() {
             "--spawn-gateways" => {
                 i += 1;
             }
-            s if s.split_once('=').is_some_and(|(t, _)| matches!(t, "erl" | "ray" | "jvm")) => {
+            s if s
+                .split_once('=')
+                .is_some_and(|(t, _)| matches!(t, "erl" | "ray" | "jvm")) =>
+            {
                 let (tag, addr) = s.split_once('=').unwrap();
                 gw_addrs.push((tag, addr.to_string()));
                 i += 1;
@@ -547,17 +573,84 @@ async fn main() {
         }
     }
     if seeds.is_empty() && !serve_only {
-        eprintln!(
-            "用法：websearch <seed-url>... [--pages N] [--maxdepth D] [--port P] [--data DIR] [--serve-only]\n\
-             示例：websearch https://www.runoob.com --pages 200\n\
-                   websearch --serve-only --port 8080（只起检索——回放已落盘索引）"
+        // 内置多样化种子（站点目标制 ≥100 站——用户未给种子时自动启用）
+        seeds = vec![
+            // 中文技术/科普/社区
+            "https://www.runoob.com",
+            "https://developer.mozilla.org/zh-CN/",
+            "https://www.zhihu.com",
+            "https://www.cnblogs.com",
+            "https://juejin.cn",
+            "https://segmentfault.com",
+            "https://www.oschina.net",
+            "https://www.infoq.cn",
+            "https://www.imooc.com",
+            "https://www.liaoxuefeng.com",
+            // 门户/百科（出链丰富——快速扩散 host 多样性）
+            "https://www.wikipedia.org",
+            "https://zh.wikipedia.org",
+            "https://baike.baidu.com",
+            "https://www.hao123.com",
+            "https://www.qq.com",
+            "https://www.sina.com.cn",
+            "https://www.sohu.com",
+            "https://www.163.com",
+            "https://www.ifeng.com",
+            "https://www.people.com.cn",
+            // 开发者/文档站
+            "https://github.com",
+            "https://stackoverflow.com",
+            "https://docs.python.org",
+            "https://www.rust-lang.org",
+            "https://go.dev",
+            "https://nodejs.org",
+            "https://www.erlang.org",
+            "https://akka.io",
+            "https://ray.io",
+            "https://redis.io",
+            "https://www.postgresql.org",
+            "https://nginx.org",
+            "https://httpd.apache.org",
+            "https://maven.apache.org",
+            "https://gradle.org",
+            "https://www.docker.com",
+            "https://kubernetes.io",
+            // 高校/机构（外链丰富）
+            "https://www.tsinghua.edu.cn",
+            "https://www.pku.edu.cn",
+            "https://www.ustc.edu.cn",
+            "https://www.fudan.edu.cn",
+            "https://www.sjtu.edu.cn",
+            "https://www.nju.edu.cn",
+            "https://www.zju.edu.cn",
+            "https://www.cas.cn",
+            "https://www.cctv.com",
+            "https://www.gov.cn",
+        ]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+        println!(
+            "[ws] 未指定种子——启用内置多样化种子集（{} 条）",
+            seeds.len()
         );
-        std::process::exit(2);
     }
     // 网关缺省（run.sh 前置拉起——同 crawler-lab direct 模式端口）
     let erl_addr = gw_addr(&gw_addrs, "erl", "127.0.0.1:19871");
     let ray_addr = gw_addr(&gw_addrs, "ray", "127.0.0.1:19873");
     let jvm_addr = gw_addr(&gw_addrs, "jvm", "127.0.0.1:19872");
+
+    // Web 端口预检（启动即报——不爬 60s 后才发现端口冲突）。
+    // 预检=瞬时 bind+drop；serve_web 内仍有顺延兜底（预检与真绑间窗口极小）。
+    {
+        use tokio::net::TcpListener;
+        match TcpListener::bind(("0.0.0.0", web_port)).await {
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "[ws] ⚠ Web 端口 {web_port} 当前被占用（{e}）——启动后将自动顺延至下一个可用端口"
+            ),
+        }
+    }
 
     std::fs::create_dir_all(&data_dir).unwrap();
     let dedupe_path = data_dir.join("dedupe.tsv");
@@ -573,18 +666,37 @@ async fn main() {
     }
 
     // ── 组网：连三网关 ─────────────────────────────────────────────
-    let client = RemoteActorSystem::new(
-        RemoteConfig::tcp("websearch", None),
-        Arc::new(NoopLookup),
-    )
-    .unwrap();
+    let client =
+        RemoteActorSystem::new(RemoteConfig::tcp("websearch", None), Arc::new(NoopLookup)).unwrap();
     client.start().await.unwrap();
     if serve_only {
-        let sa = jvm_addr.parse().unwrap();
-        client
-            .connect(&NodeAddr::tcp("jvm-search-1", sa))
-            .await
-            .expect("connect jvm-search-1");
+        let sa: std::net::SocketAddr = jvm_addr.parse().unwrap();
+        // serve-only 重试连（网关可能比应用晚起——30s 窗口）
+        let mut linked = false;
+        for attempt in 1..=15 {
+            match client
+                .connect(&NodeAddr::tcp("jvm-search-1", sa.clone()))
+                .await
+            {
+                Ok(()) => {
+                    linked = true;
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 1 {
+                        eprintln!("[ws] jvm 网关未就绪（{e}）——重试中（需先起网关，见 run.sh 或运维文档 §3.2）");
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+        if !linked {
+            eprintln!(
+                "[ws] ✗ 30s 内未连上 jvm 网关 {jvm_addr}——请先起网关：\n  \
+                 (cd interop/jvm/target && env WS_DATA=$PWD/apps/websearch/data java -cp \"parrot-protocol-jvm-0.1.0.jar:$(cat cp.txt)\" parrot.protocol.jvm.ParrotGatewayMain 19872 node=jvm-search-1 7200)"
+            );
+            std::process::exit(3);
+        }
         println!("[ws] connected: jvm-search-1（serve-only）");
     } else {
         for (id, addr) in [
@@ -593,7 +705,10 @@ async fn main() {
             ("jvm-search-1", &jvm_addr),
         ] {
             let sa = addr.parse().unwrap();
-            client.connect(&NodeAddr::tcp(id, sa)).await.expect("connect");
+            client
+                .connect(&NodeAddr::tcp(id, sa))
+                .await
+                .expect("connect");
             println!("[ws] connected: {id}");
         }
     }
@@ -628,7 +743,9 @@ async fn main() {
                 coords: None,
                 uri: Some(format!(
                     "file://{}",
-                    app_root.join("jvm/target/websearch-jvm-1.0.0.jar").display()
+                    app_root
+                        .join("jvm/target/websearch-jvm-1.0.0.jar")
+                        .display()
                 )),
             },
         )]
@@ -656,7 +773,9 @@ async fn main() {
                     coords: None,
                     uri: Some(format!(
                         "file://{}",
-                        app_root.join("jvm/target/websearch-jvm-1.0.0.jar").display()
+                        app_root
+                            .join("jvm/target/websearch-jvm-1.0.0.jar")
+                            .display()
                     )),
                 },
             ),
@@ -673,7 +792,9 @@ async fn main() {
         println!("[ws] deploy {node}/{name} → {r:?}");
     }
 
-    let searcher = client.remote_ref("parrot://jvm-search-1/jvm/user/search").unwrap();
+    let searcher = client
+        .remote_ref("parrot://jvm-search-1/jvm/user/search")
+        .unwrap();
     if serve_only {
         // 只起检索：回放段文件后直接开 Web 服务（搜集/索引/检索各自独立——用户裁定 3）
         if let Ok(r) = searcher.send(Box::new(WsHealthz(vec![]))).await {
@@ -684,8 +805,12 @@ async fn main() {
         serve_web(web_port, client.clone(), searcher).await;
         return;
     }
-    let frontier = client.remote_ref("parrot://erl-gw-1/user/frontier").unwrap();
-    let tokenizer = client.remote_ref("parrot://ray-gw-1/user/tokenizer").unwrap();
+    let frontier = client
+        .remote_ref("parrot://erl-gw-1/user/frontier")
+        .unwrap();
+    let tokenizer = client
+        .remote_ref("parrot://ray-gw-1/user/tokenizer")
+        .unwrap();
 
     // ── 种子注入（去重表前置过滤）─────────────────────────────────
     let seed_pairs: Vec<(String, u16)> = seeds
@@ -712,37 +837,71 @@ async fn main() {
     println!("[ws] 种子 {} 条已注入", seed_pairs.len());
 
     // ── 漫爬主循环（并发抓取 + 双路索引 + 出链回注）──────────────────
+    // Web 服务先行启动（站点目标制耗时较长——边爬边查）
+    {
+        let port = web_port;
+        let client2 = client.clone();
+        let searcher2 = searcher.clone();
+        tokio::spawn(async move {
+            serve_web(port, client2, searcher2).await;
+        });
+    }
+    println!("[ws] 浏览器打开 http://localhost:{web_port} 开始搜索（爬取后台持续——站点/分词表页实时可见）");
     let fetcher = Arc::new(Fetcher::new());
     let fetched = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
     let mut pending: Vec<(String, u16)> = Vec::new();
     let mut in_flight: usize = 0;
+    let mut frontier_drained_just_now = false; // 最近一次取批为空（队列耗尽信号）
     let concurrency = 8usize;
     let mut host_last: HashMap<String, Instant> = HashMap::new();
     let mut terms_buf: Vec<(String, u64, u32)> = Vec::new();
     let mut pages_buf: Vec<(u64, String)> = Vec::new();
+    // 站点目标制（用户裁定 3）：已成功抓取的 host 集 + 每 host 已达最大深度
+    let mut hosts_done: HashSet<String> = HashSet::new();
+    let mut host_max_depth: HashMap<String, u16> = HashMap::new();
     let t0 = Instant::now();
     let mut last_log = Instant::now();
+
+    println!(
+        "[ws] 爬取目标：≥{sites_target} 个站点 · 每站深度 ≥{max_depth}（安全页数上限 {pages}）"
+    );
 
     loop {
         // 进度打点
         if last_log.elapsed() >= Duration::from_secs(3) {
+            let deep_enough = host_max_depth.values().filter(|d| **d >= max_depth).count();
             println!(
-                "[ws {:>4}s] fetched={} fail={} pending={} inflight={}",
+                "[ws {:>4}s] fetched={} fail={} sites={}/{} 深度达标={} pending={} inflight={}",
                 t0.elapsed().as_secs(),
                 fetched.load(Ordering::Relaxed),
                 failed.load(Ordering::Relaxed),
+                hosts_done.len(),
+                sites_target,
+                deep_enough,
                 pending.len(),
                 in_flight
             );
             last_log = Instant::now();
         }
-        // 预算完成 → 终局
+        // 站点目标制终局（用户裁定 3）：≥sites_target 个站点且每站深度已达 max_depth
+        // ——或安全上限/队列耗尽（无法达成目标时自然收尾，避免死循环）
         let done = fetched.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-        if done >= pages && in_flight == 0 {
+        let goal_hit = hosts_done.len() >= sites_target
+            && host_max_depth.values().filter(|d| **d >= max_depth).count() >= sites_target;
+        if in_flight == 0
+            && (goal_hit || done >= pages || (pending.is_empty() && frontier_drained_just_now))
+        {
+            if goal_hit {
+                println!(
+                    "[ws] 站点目标达成：{} 站 × 深度≥{} —— 收尾",
+                    hosts_done.len(),
+                    max_depth
+                );
+            }
             break;
         }
-        // 补批（frontier 取批 + pending 汇流）
+        // 补批（frontier 取批 + pending 汇流）——目标达成前持续为 frontier 泵入新 URL
         if pending.len() < concurrency * 2
             && (done + in_flight as u64 + pending.len() as u64) < pages * 2
         {
@@ -756,6 +915,7 @@ async fn main() {
             {
                 Ok(r) => {
                     let batch = dec_batch(&r.downcast_ref::<WsBatch>().unwrap().0);
+                    frontier_drained_just_now = batch.is_empty();
                     pending.extend(batch);
                 }
                 Err(e) => {
@@ -829,6 +989,15 @@ async fn main() {
                 let (url, depth, body) = res;
                 let ex = extract_html(&body);
                 let doc_id = doc_id_of(&url);
+                // 站点目标制记账（用户裁定 3）：host 集合 + 每 host 已探最深深度
+                {
+                    let h = host_of(&url);
+                    hosts_done.insert(h.clone());
+                    host_max_depth
+                        .entry(h)
+                        .and_modify(|d| *d = (*d).max(depth))
+                        .or_insert(depth);
+                }
                 // 出链（规范化 + 深度限 + 去重表）
                 let mut new_links = Vec::new();
                 {
@@ -860,10 +1029,8 @@ async fn main() {
                 let _ = searcher.send(Box::new(WsDocMeta(meta))).await;
                 // 缓冲满批量分词
                 if pages_buf.len() >= 8 {
-                    let texts: Vec<(u64, &str)> = pages_buf
-                        .iter()
-                        .map(|(id, t)| (*id, t.as_str()))
-                        .collect();
+                    let texts: Vec<(u64, &str)> =
+                        pages_buf.iter().map(|(id, t)| (*id, t.as_str())).collect();
                     match tokenizer
                         .send(Box::new(WsTokenize(enc_texts(&texts))))
                         .await
@@ -901,9 +1068,11 @@ async fn main() {
         }
     }
     println!(
-        "[ws] 爬取完成：fetched={} fail={} 耗时 {:?}",
+        "[ws] 爬取完成：fetched={} fail={} 站点={}（最深达 {} 层）耗时 {:?}",
         fetched.load(Ordering::Relaxed),
         failed.load(Ordering::Relaxed),
+        hosts_done.len(),
+        host_max_depth.values().copied().max().unwrap_or(0),
         t0.elapsed()
     );
 
@@ -933,15 +1102,21 @@ async fn main() {
     }
 
     // ── Web 查询服务（百度式——浏览器 http://localhost:port）─────────
-    println!("[ws] 浏览器打开 http://localhost:{web_port} 开始搜索");
-    serve_web(web_port, client.clone(), searcher).await;
+    // 站点目标制爬取耗时较长——Web 服务已随爬取启动（spawn），此处常驻不退出
+    println!(
+        "[ws] 爬取收尾完成——Web 服务常驻：浏览器打开 http://localhost:{web_port}（Ctrl-C 退出）"
+    );
+    std::future::pending::<()>().await;
 }
 
 /// 简易并发 join：等全部完成取首个 Some（简化——批量小）。
 #[allow(dead_code)]
 async fn futures_buffered(
     tasks: Vec<tokio::task::JoinHandle<Option<(String, u16, String)>>>,
-) -> (Option<(String, u16, String)>, Vec<tokio::task::JoinHandle<Option<(String, u16, String)>>>) {
+) -> (
+    Option<(String, u16, String)>,
+    Vec<tokio::task::JoinHandle<Option<(String, u16, String)>>>,
+) {
     // 顺序 join（批量 ≤8——顺序足够；返回剩余空）
     let mut first = None;
     for t in tasks {
@@ -977,7 +1152,25 @@ async fn serve_web(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    let listener = TcpListener::bind(("0.0.0.0", port)).await.expect("bind web port");
+    // 端口被占不 panic——顺延探测（8080 被常见代理/开发服务占用是常态）
+    let (listener, actual) = {
+        let mut p = port;
+        loop {
+            match TcpListener::bind(("0.0.0.0", p)).await {
+                Ok(l) => break (l, p),
+                Err(e) if p < port + 20 => {
+                    eprintln!("[ws] 端口 {p} 被占用（{e}）——尝试 {}", p + 1);
+                    p += 1;
+                }
+                Err(e) => panic!("web 端口 {port}~{} 全部不可用：{e}", port + 20),
+            }
+        }
+    };
+    if actual != port {
+        println!(
+            "[ws] ⚠ Web 服务改用端口 {actual}（{port} 被占）——浏览器打开 http://localhost:{actual}"
+        );
+    }
     let query_count = Arc::new(AtomicU64::new(0));
     loop {
         let (mut sock, _) = match listener.accept().await {
@@ -1002,7 +1195,10 @@ async fn serve_web(
                 .unwrap_or_else(|| (target.to_string(), String::new()));
             let params: HashMap<String, String> = query
                 .split('&')
-                .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), url_decode(v))))
+                .filter_map(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_string(), url_decode(v)))
+                })
                 .collect();
             match path.as_str() {
                 "/search" => {
@@ -1015,10 +1211,7 @@ async fn serve_web(
                     qc.fetch_add(1, Ordering::Relaxed);
                     let per_page = 10usize;
                     let k = (p * per_page) as u32;
-                    let r = match searcher
-                        .send(Box::new(WsSearch(enc_search(k, &q))))
-                        .await
-                    {
+                    let r = match searcher.send(Box::new(WsSearch(enc_search(k, &q)))).await {
                         Ok(r) => r,
                         Err(e) => {
                             let body = format!("search error: {e:?}");
@@ -1046,15 +1239,56 @@ async fn serve_web(
                     let r = searcher.send(Box::new(WsHealthz(vec![]))).await.ok();
                     let json = r
                         .map(|r| {
-                            String::from_utf8_lossy(
-                                &r.downcast_ref::<WsHealthzR>().unwrap().0,
-                            )
-                            .into_owned()
+                            String::from_utf8_lossy(&r.downcast_ref::<WsHealthzR>().unwrap().0)
+                                .into_owned()
                         })
                         .unwrap_or_else(|| "{}".into());
                     let _ = sock
                         .write_all(&http_resp(200, "application/json", &json))
                         .await;
+                }
+                "/docs" | "/terms" => {
+                    // 浏览页：站点清单（host 聚合）/ 分词表（df 降序）——分页
+                    let is_docs = path == "/docs";
+                    let off: u32 = params.get("p").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let limit: u32 = if is_docs { 100 } else { 300 };
+                    let mut req = vec![];
+                    put_u32(&mut req, off * limit);
+                    put_u32(&mut req, limit);
+                    let r = if is_docs {
+                        searcher.send(Box::new(WsListDocs(req))).await
+                    } else {
+                        searcher.send(Box::new(WsListTerms(req))).await
+                    };
+                    match r {
+                        Ok(rep) => {
+                            let json = if is_docs {
+                                String::from_utf8_lossy(
+                                    &rep.downcast_ref::<WsListDocsR>().unwrap().0,
+                                )
+                                .into_owned()
+                            } else {
+                                String::from_utf8_lossy(
+                                    &rep.downcast_ref::<WsListTermsR>().unwrap().0,
+                                )
+                                .into_owned()
+                            };
+                            let html = if is_docs {
+                                render_docs_page(&json, off)
+                            } else {
+                                render_terms_page(&json, off)
+                            };
+                            let _ = sock
+                                .write_all(&http_resp(200, "text/html; charset=utf-8", &html))
+                                .await;
+                        }
+                        Err(e) => {
+                            let body = format!("list error: {e:?}");
+                            let _ = sock
+                                .write_all(&http_resp(500, "text/plain; charset=utf-8", &body))
+                                .await;
+                        }
+                    }
                 }
                 _ => {
                     let html = render_home();
@@ -1232,10 +1466,10 @@ fn page_shell(q: &str, body: &str) -> String {
     };
     format!(
         r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>{}</title><style>{PAGE_CSS}</style></head><body>
-<div class="hd"><span class="logo">🔍 WebSearch</span>
+<div class="hd"><a href="/" class="logo" style="text-decoration:none">🔍 WebSearch</a>
 <form action="/search" method="get">
 <input type="text" name="q" value="{}" placeholder="输入关键词，回车搜索…" autofocus>
-<button>搜一下</button></form><span class="stats" id="st"></span></div>
+<button>搜一下</button></form><a href="/docs" style="font-size:13px;color:#2932E1;white-space:nowrap">站点</a><a href="/terms" style="font-size:13px;color:#2932E1;white-space:nowrap">分词表</a><span class="stats" id="st"></span></div>
 <div class="bd">{}</div>
 <script>setInterval(async()=>{{try{{const r=await fetch('/stats');const j=await r.json();
 const e=document.getElementById('st');
@@ -1251,11 +1485,159 @@ fn render_home() -> String {
     page_shell(
         "",
         r#"<div class="empty" style="margin-top:120px;font-size:17px">五运行时真实搜索引擎<br>
-<span style="font-size:13px;color:#9195A3">Erlang Frontier · Rust Crawler · Ray jieba 分词 · Akka BM25 检索</span></div>"#,
+<span style="font-size:13px;color:#9195A3">Erlang Frontier · Rust Crawler · Ray jieba 分词 · Akka BM25 检索</span></div>
+<div style="text-align:center;margin-top:28px;font-size:14px">
+<a href="/docs" style="color:#2932E1">📋 已索引站点</a> ·
+<a href="/terms" style="color:#2932E1">📖 分词表</a></div>"#,
     )
 }
 
-fn render_results(q: &str, items: &[(f64, String, String, String)], page: usize, per_page: usize) -> String {
+/// /docs 页：站点清单（JSON → 表格——host 聚合 + 页数 + 样例 URL）。
+fn render_docs_page(json: &str, page: u32) -> String {
+    let hosts_total = json_f64(json, "hosts").unwrap_or(0.0) as u64;
+    let docs_total = json_f64(json, "total_docs").unwrap_or(0.0) as u64;
+    let per = 100u64;
+    let last_page = hosts_total.div_ceil(per).saturating_sub(1) as u32;
+    let page = page.min(last_page); // 越界页号钳制
+    let mut rows = String::new();
+    // items 数组逐对象取（复用 parse_search_json 的对象切分器）
+    for (i, obj) in json_objects(json_array_of(json, "items"))
+        .iter()
+        .enumerate()
+    {
+        let host = json_str(obj, "host");
+        let pages = json_f64(obj, "pages").unwrap_or(0.0) as u64;
+        let sample = json_str(obj, "sample");
+        rows.push_str(&format!(
+            r#"<tr><td class="n">{}</td><td><b>{}</b></td><td class="n">{pages}</td>
+<td><a href="{sample}" target="_blank" style="color:#2440B3;font-size:12px;word-break:break-all">{}</a></td></tr>"#,
+            page * 100 + i as u32 + 1,
+            esc(&host),
+            esc(&sample)
+        ));
+    }
+    if rows.is_empty() {
+        rows = r#"<tr><td colspan="4" style="text-align:center;color:#999;padding:40px">暂无索引——先跑一次爬取（run.sh）</td></tr>"#.into();
+    }
+    let nav = pager_nav("/docs", page, last_page);
+    page_shell(
+        "",
+        &format!(
+            r#"<h2 style="font-size:20px;margin:10px 0 4px">已索引站点</h2>
+<div class="meta">共 {hosts_total} 个站点 · {docs_total} 个页面（按页面数降序）</div>
+<table style="width:100%;border-collapse:collapse;font-size:14px">
+<tr style="color:#9195A3;text-align:left"><th style="padding:8px">#</th><th>站点</th><th>页面数</th><th>样例 URL</th></tr>
+{rows}</table>{nav}"#
+        ),
+    )
+}
+
+/// /terms 页：分词表（df 降序——jieba 切出的全部词条）。
+fn render_terms_page(json: &str, page: u32) -> String {
+    let total = json_f64(json, "total").unwrap_or(0.0) as u64;
+    let per = 300u64;
+    let last_page = total.div_ceil(per).saturating_sub(1) as u32;
+    let page = page.min(last_page); // 越界页号钳制
+    let mut rows = String::new();
+    for (i, obj) in json_objects(json_array_of(json, "items"))
+        .iter()
+        .enumerate()
+    {
+        let term = json_str(obj, "term");
+        let df = json_f64(obj, "df").unwrap_or(0.0) as u64;
+        let q = urlencode(&term);
+        rows.push_str(&format!(
+            r#"<tr><td class="n">{}</td><td style="font-size:15px">{}</td>
+<td class="n">{df}</td><td><a href="/search?q={q}" style="color:#2932E1;font-size:12px">搜索 →</a></td></tr>"#,
+            page * 300 + i as u32 + 1,
+            esc(&term)
+        ));
+    }
+    if rows.is_empty() {
+        rows = r#"<tr><td colspan="4" style="text-align:center;color:#999;padding:40px">暂无词条——先跑一次爬取</td></tr>"#.into();
+    }
+    let nav = pager_nav("/terms", page, last_page);
+    page_shell(
+        "",
+        &format!(
+            r#"<h2 style="font-size:20px;margin:10px 0 4px">分词表</h2>
+<div class="meta">共 {total} 个词条（jieba 切出 · 按文档频率 df 降序——点词条直接搜索）</div>
+<table style="width:100%;border-collapse:collapse;font-size:14px">
+<tr style="color:#9195A3;text-align:left"><th style="padding:8px">#</th><th>词条</th><th>df</th><th></th></tr>
+{rows}</table>{nav}"#
+        ),
+    )
+}
+
+/// JSON 里取 "items":[...] 子串（浅找——值本身是数组）。
+fn json_array_of<'a>(json: &'a str, key: &str) -> &'a str {
+    let pat = format!("\"{key}\":");
+    if let Some(i) = json.find(&pat) {
+        let rest = &json[i + pat.len()..];
+        if let Some(s) = rest.strip_prefix('[') {
+            if let Some(e) = s.rfind(']') {
+                return &s[..e];
+            }
+        }
+    }
+    ""
+}
+
+/// 顶层对象数组切分（花括号深度计数——复用于 docs/terms items）。
+fn json_objects(arr: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, c) in arr.char_indices() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push(&arr[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 分页导航（首页/上一页/下一页/末页）。
+fn pager_nav(base: &str, page: u32, last: u32) -> String {
+    let page = page.min(last); // 越界页号钳制（末页对齐）
+    if last == 0 && page == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if page > 0 {
+        parts.push(format!(r#"<a href="{base}?p={}">‹ 上一页</a>"#, page - 1));
+    }
+    parts.push(format!(
+        r#"<span style="color:#9195A3">第 {} / {} 页</span>"#,
+        page + 1,
+        last + 1
+    ));
+    if page < last {
+        parts.push(format!(r#"<a href="{base}?p={}">下一页 ›</a>"#, page + 1));
+    }
+    format!(
+        r#"<div style="margin:26px 0 60px;text-align:center;font-size:14px">{}</div>"#,
+        parts.join("&nbsp;&nbsp;&nbsp;")
+    )
+}
+
+fn render_results(
+    q: &str,
+    items: &[(f64, String, String, String)],
+    page: usize,
+    per_page: usize,
+) -> String {
     let terms: Vec<&str> = q
         .split_whitespace()
         .flat_map(|w| {

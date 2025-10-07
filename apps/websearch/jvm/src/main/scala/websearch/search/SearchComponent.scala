@@ -31,6 +31,13 @@ class SearchComponent extends ComponentSpi {
 
 object SearchBehavior {
   private val seg = new JiebaSegmenter
+
+  /** URL → host（与 Rust host_of 同规：小写）。 */
+  private def hostOf(url: String): String = {
+    val rest = url.split("://", 2) match { case Array(_, r) => r; case _ => url }
+    rest.split('/').headOption.getOrElse("").toLowerCase
+  }
+
   private val stop = Set(
     "的","了","和","是","在","也","有","就","不","人","都","一","一个",
     "我们","你们","他们","这","那","这个","那个","什么","没有","还有",
@@ -225,6 +232,38 @@ object SearchBehavior {
             val p = postings.values.map(_.size).sum
             val json = s"""{"terms":${postings.size},"postings":$p,"queries":$queries,"docs":${docs.size},"segments":$nextSeg}"""
             replyTo ! BridgeReplyOk("bin:ws/HealthzR", json.getBytes("UTF-8"))
+
+          case "bin:ws/ListDocs" =>
+            // 站点浏览：[offset u32|limit u32] → JSON（按 host 聚合 + URL 明细）
+            var off = 0
+            val pageOff = u32(payload, off); off += 4
+            val limit = math.max(1, math.min(u32(payload, off), 200)); off += 4
+            // host 聚合
+            val byHost = mutable.Map.empty[String, mutable.ArrayBuffer[String]]
+            docs.values.foreach { d =>
+              val h = hostOf(d.url)
+              byHost.getOrElseUpdate(h, mutable.ArrayBuffer.empty[String]) += d.url
+            }
+            val hosts = byHost.toVector.sortBy(-_._2.size)
+            val slice = hosts.slice(pageOff, pageOff + limit)
+            val hostsJson = slice.map { case (h, urls) =>
+              s"""{"host":"${esc(h)}","pages":${urls.size},"sample":"${esc(urls.sorted.head)}"}"""
+            }.mkString("[", ",", "]")
+            val json = s"""{"hosts":${hosts.size},"total_docs":${docs.size},"offset":$pageOff,"items":$hostsJson}"""
+            replyTo ! BridgeReplyOk("bin:ws/ListDocsR", json.getBytes("UTF-8"))
+
+          case "bin:ws/ListTerms" =>
+            // 分词表浏览：[offset u32|limit u32] → JSON（按 df 降序）
+            var off = 0
+            val pageOff = u32(payload, off); off += 4
+            val limit = math.max(1, math.min(u32(payload, off), 500)); off += 4
+            val sorted = postings.toVector.map { case (t, ds) => (t, ds.size) }.sortBy(-_._2)
+            val slice = sorted.slice(pageOff, pageOff + limit)
+            val items = slice.map { case (t, df) =>
+              s"""{"term":"${esc(t)}","df":$df}"""
+            }.mkString("[", ",", "]")
+            val json = s"""{"total":${postings.size},"offset":$pageOff,"items":$items}"""
+            replyTo ! BridgeReplyOk("bin:ws/ListTermsR", json.getBytes("UTF-8"))
 
           case _ =>
         }

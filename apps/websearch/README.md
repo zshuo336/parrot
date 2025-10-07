@@ -27,8 +27,11 @@
 apps/websearch/build.sh
 
 # 一键全链（起三网关 + 漫爬 + Web 服务）
-apps/websearch/run.sh https://www.runoob.com --pages 100 --port 8080
-# 浏览器打开 http://localhost:8080 —— 中文搜索即用
+# 不给种子自动启用内置 50 条多样化种子集；默认目标 100 站 × 每站深度 10
+apps/websearch/run.sh --port 8080
+
+# 也可以指定种子与目标
+apps/websearch/run.sh https://www.runoob.com --sites 100 --maxdepth 10
 
 # 仅检索（独立运行——回放已落盘索引）
 ./target/release/websearch --serve-only --port 8080 --data apps/websearch/data
@@ -36,6 +39,20 @@ apps/websearch/run.sh https://www.runoob.com --pages 100 --port 8080
 
 分词三语言同族：Python `jieba`（原版）/ JVM `jieba-analysis`（huaban 移植）/ Rust 侧经
 Ray 通道复用 Python 分词（词条布局 `len|term|docid|tf` 四方言同构）。
+
+## 站点目标制爬取（用户裁定 3）
+
+- `--sites N`（默认 **100**）：爬够 N 个**不同 host** 且每站深度达标才允许停
+- `--maxdepth D`（默认 **10**）：每站爬取深度 ≥ D（链接逐层展开，depth+1，D+1 截断）
+- `--pages P`（默认 50000）：安全页数上限（防死循环兜底——队列耗尽自然收尾）
+- 内置 50 条多样化种子（中文门户/技术社区/高校/国际文档站）——不给种子自动启用
+- Web 服务**边爬边开**（爬取启动即监听）——站点/分词表页实时可见爬取进度
+
+## 站点与分词表浏览（用户裁定 1/2）
+
+- **站点页 `/docs`**：全部已索引站点（host 聚合、页面数降序、样例 URL）——分页 100/页
+- **分词表页 `/terms`**：jieba 切出的全部词条（df 降序，点词条直接搜索）——分页 300/页
+- 入口：页头导航「站点」「分词表」+ 首页快捷链接
 
 ## 真实化四诉求对照
 
@@ -46,7 +63,7 @@ Ray 通道复用 Python 分词（词条布局 `len|term|docid|tf` 四方言同�
 3. **四服务独立**：搜集（rust crawler）/ 调度（erl frontier）/ 分词索引（ray）/
    检索查询（akka）各为独立 actor 服务；`--serve-only` 单独跑检索。
 4. **浏览器访问**：内置 HTTP 服务——百度式首页 + 结果页（标题/URL/摘要/score +
-   关键词高亮 + 分页 + 5s 轮询 `/stats` 索引规模）。
+   关键词高亮 + 分页 + 5s 轮询 `/stats` 索引规模）+ 站点页 `/docs` + 分词表页 `/terms`。
 
 ## 中文支持
 
