@@ -73,6 +73,8 @@ wire_msg!(WsFlush, "bin:ws/Flush");
 wire_msg!(WsFlushAck, "bin:ws/FlushAck");
 wire_msg!(WsHealthz, "bin:ws/Healthz");
 wire_msg!(WsHealthzR, "bin:ws/HealthzR");
+wire_msg!(WsClear, "bin:ws/Clear");
+wire_msg!(WsClearAck, "bin:ws/ClearAck");
 wire_msg!(WsListDocs, "bin:ws/ListDocs");
 wire_msg!(WsListDocsR, "bin:ws/ListDocsR");
 wire_msg!(WsListTerms, "bin:ws/ListTerms");
@@ -572,68 +574,93 @@ async fn main() {
             }
         }
     }
-    if seeds.is_empty() && !serve_only {
-        // 内置多样化种子（站点目标制 ≥100 站——用户未给种子时自动启用）
-        seeds = vec![
-            // 中文技术/科普/社区
-            "https://www.runoob.com",
-            "https://developer.mozilla.org/zh-CN/",
-            "https://www.zhihu.com",
-            "https://www.cnblogs.com",
-            "https://juejin.cn",
-            "https://segmentfault.com",
-            "https://www.oschina.net",
-            "https://www.infoq.cn",
-            "https://www.imooc.com",
-            "https://www.liaoxuefeng.com",
-            // 门户/百科（出链丰富——快速扩散 host 多样性）
-            "https://www.wikipedia.org",
-            "https://zh.wikipedia.org",
-            "https://baike.baidu.com",
-            "https://www.hao123.com",
-            "https://www.qq.com",
-            "https://www.sina.com.cn",
-            "https://www.sohu.com",
-            "https://www.163.com",
-            "https://www.ifeng.com",
-            "https://www.people.com.cn",
-            // 开发者/文档站
-            "https://github.com",
-            "https://stackoverflow.com",
-            "https://docs.python.org",
-            "https://www.rust-lang.org",
-            "https://go.dev",
-            "https://nodejs.org",
-            "https://www.erlang.org",
-            "https://akka.io",
-            "https://ray.io",
-            "https://redis.io",
-            "https://www.postgresql.org",
-            "https://nginx.org",
-            "https://httpd.apache.org",
-            "https://maven.apache.org",
-            "https://gradle.org",
-            "https://www.docker.com",
-            "https://kubernetes.io",
-            // 高校/机构（外链丰富）
-            "https://www.tsinghua.edu.cn",
-            "https://www.pku.edu.cn",
-            "https://www.ustc.edu.cn",
-            "https://www.fudan.edu.cn",
-            "https://www.sjtu.edu.cn",
-            "https://www.nju.edu.cn",
-            "https://www.zju.edu.cn",
-            "https://www.cas.cn",
-            "https://www.cctv.com",
-            "https://www.gov.cn",
-        ]
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-        println!(
-            "[ws] 未指定种子——启用内置多样化种子集（{} 条）",
-            seeds.len()
-        );
+    /// 内置多样化种子（站点目标制 ≥100 站——队列耗尽/无种子时自动回填）。
+    const BUILTIN_SEEDS: &[&str] = &[
+        // 中文技术/科普/社区
+        "https://www.runoob.com",
+        "https://developer.mozilla.org/zh-CN/",
+        "https://www.zhihu.com",
+        "https://www.cnblogs.com",
+        "https://juejin.cn",
+        "https://segmentfault.com",
+        "https://www.oschina.net",
+        "https://www.infoq.cn",
+        "https://www.imooc.com",
+        "https://www.liaoxuefeng.com",
+        // 门户/百科（出链丰富——快速扩散 host 多样性）
+        "https://www.wikipedia.org",
+        "https://zh.wikipedia.org",
+        "https://baike.baidu.com",
+        "https://www.hao123.com",
+        "https://www.qq.com",
+        "https://www.sina.com.cn",
+        "https://www.sohu.com",
+        "https://www.163.com",
+        "https://www.ifeng.com",
+        "https://www.people.com.cn",
+        // 开发者/文档站
+        "https://github.com",
+        "https://stackoverflow.com",
+        "https://docs.python.org",
+        "https://www.rust-lang.org",
+        "https://go.dev",
+        "https://nodejs.org",
+        "https://www.erlang.org",
+        "https://akka.io",
+        "https://ray.io",
+        "https://redis.io",
+        "https://www.postgresql.org",
+        "https://nginx.org",
+        "https://httpd.apache.org",
+        "https://maven.apache.org",
+        "https://gradle.org",
+        "https://www.docker.com",
+        "https://kubernetes.io",
+        // 高校/机构（外链丰富）
+        "https://www.tsinghua.edu.cn",
+        "https://www.pku.edu.cn",
+        "https://www.ustc.edu.cn",
+        "https://www.fudan.edu.cn",
+        "https://www.sjtu.edu.cn",
+        "https://www.nju.edu.cn",
+        "https://www.zju.edu.cn",
+        "https://www.cas.cn",
+        "https://www.cctv.com",
+        "https://www.gov.cn",
+    ];
+
+    /// 种子注入公用：过滤 → 去重表 → frontier（返回实际入队条数）。
+    async fn inject_seeds(
+        raw: &[String],
+        dedupe: &mut HashSet<String>,
+        dedupe_path: &std::path::Path,
+        frontier: &parrot_remote::RemoteActorRef,
+    ) -> usize {
+        let pairs: Vec<(String, u16)> = raw
+            .iter()
+            .filter_map(|s| normalize_url(s, s))
+            .map(|u| (u, 0u16))
+            .collect();
+        let fresh: Vec<(String, u16)> = pairs
+            .into_iter()
+            .filter(|(u, _)| dedupe.insert(u.clone()))
+            .collect();
+        if fresh.is_empty() {
+            return 0;
+        }
+        {
+            let mut out = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dedupe_path)
+                .unwrap();
+            for (u, _) in &fresh {
+                let _ = writeln!(out, "{u}");
+            }
+        }
+        let n = fresh.len();
+        frontier.send(Box::new(WsPush(enc_push(&fresh)))).await.ok();
+        n
     }
     // 网关缺省（run.sh 前置拉起——同 crawler-lab direct 模式端口）
     let erl_addr = gw_addr(&gw_addrs, "erl", "127.0.0.1:19871");
@@ -652,17 +679,54 @@ async fn main() {
         }
     }
 
+    // 数据目录策略：--keep 续爬（回放旧段+去重表）；默认全新爬取清空旧数据
+    // （否则历次残留索引混入 /docs 页面统计——用户实测 docs=175 即此因）
+    let mut keep_data = false;
+    {
+        let mut j = 0;
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        while j < argv.len() {
+            if argv[j] == "--keep" {
+                keep_data = true;
+            }
+            j += 1;
+        }
+    }
+    if serve_only {
+        keep_data = true; // serve-only 永远回放既有索引
+    }
     std::fs::create_dir_all(&data_dir).unwrap();
     let dedupe_path = data_dir.join("dedupe.tsv");
     let mut dedupe: HashSet<String> = HashSet::new();
-    if dedupe_path.exists() {
-        let txt = std::fs::read_to_string(&dedupe_path).unwrap_or_default();
-        for l in txt.lines() {
-            if !l.trim().is_empty() {
-                dedupe.insert(l.trim().to_string());
+    if keep_data {
+        if dedupe_path.exists() {
+            let txt = std::fs::read_to_string(&dedupe_path).unwrap_or_default();
+            for l in txt.lines() {
+                if !l.trim().is_empty() {
+                    dedupe.insert(l.trim().to_string());
+                }
+            }
+            println!("[ws] 续爬模式（--keep）：恢复去重表 {} URLs", dedupe.len());
+        }
+    } else {
+        // 全新爬取：清旧去重表 + 旧索引段（JVM 回放时即为空库）
+        if dedupe_path.exists() {
+            let _ = std::fs::remove_file(&dedupe_path);
+        }
+        let index_dir = data_dir.join("index");
+        if index_dir.exists() {
+            let n = std::fs::read_dir(&index_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "segment"))
+                        .count()
+                })
+                .unwrap_or(0);
+            if n > 0 {
+                let _ = std::fs::remove_dir_all(&index_dir);
+                println!("[ws] 全新爬取：清除旧索引 {n} 段（--keep 可保留续爬）");
             }
         }
-        println!("[ws] 恢复去重表：{} URLs", dedupe.len());
     }
 
     // ── 组网：连三网关 ─────────────────────────────────────────────
@@ -795,6 +859,16 @@ async fn main() {
     let searcher = client
         .remote_ref("parrot://jvm-search-1/jvm/user/search")
         .unwrap();
+    // 全新爬取：同步清 JVM 内存索引（网关早于应用启动已回放旧段——内存有残留）
+    if !serve_only && !keep_data {
+        match searcher.send(Box::new(WsClear(vec![]))).await {
+            Ok(r) => {
+                let n = get_u32(&r.downcast_ref::<WsClearAck>().unwrap().0, &mut 0);
+                println!("[ws] 已清空检索端内存索引（{n} 段残留）");
+            }
+            Err(e) => eprintln!("[ws] ⚠ 清索引失败（/docs 可能有旧数据）：{e:?}"),
+        }
+    }
     if serve_only {
         // 只起检索：回放段文件后直接开 Web 服务（搜集/索引/检索各自独立——用户裁定 3）
         if let Ok(r) = searcher.send(Box::new(WsHealthz(vec![]))).await {
@@ -812,29 +886,23 @@ async fn main() {
         .remote_ref("parrot://ray-gw-1/user/tokenizer")
         .unwrap();
 
-    // ── 种子注入（去重表前置过滤）─────────────────────────────────
-    let seed_pairs: Vec<(String, u16)> = seeds
-        .iter()
-        .filter_map(|s| normalize_url(s, s))
-        .map(|u| (u, 0u16))
-        .collect();
-    {
-        let mut dedupe_out = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&dedupe_path)
-            .unwrap();
-        for (u, _) in &seed_pairs {
-            if dedupe.insert(u.clone()) {
-                let _ = writeln!(dedupe_out, "{u}");
-            }
-        }
+    // ── 种子注入（去重表前置过滤——用户种子 + 内置集合并注入）────────
+    let builtin: Vec<String> = BUILTIN_SEEDS.iter().map(|s| s.to_string()).collect();
+    if seeds.is_empty() {
+        println!(
+            "[ws] 未指定种子——启用内置多样化种子集（{} 条）",
+            builtin.len()
+        );
     }
-    frontier
-        .send(Box::new(WsPush(enc_push(&seed_pairs))))
-        .await
-        .unwrap();
-    println!("[ws] 种子 {} 条已注入", seed_pairs.len());
+    let n_user = inject_seeds(&seeds, &mut dedupe, &dedupe_path, &frontier).await;
+    let n_builtin = if seeds.is_empty() {
+        inject_seeds(&builtin, &mut dedupe, &dedupe_path, &frontier).await
+    } else {
+        0
+    };
+    // 内置种子游标：队列耗尽且目标未达时回填下一条（单种子死路自愈）
+    let mut builtin_cursor = 0usize;
+    println!("[ws] 种子注入：用户 {n_user} 条 + 内置 {n_builtin} 条");
 
     // ── 漫爬主循环（并发抓取 + 双路索引 + 出链回注）──────────────────
     // Web 服务先行启动（站点目标制耗时较长——边爬边查）
@@ -884,14 +952,14 @@ async fn main() {
             );
             last_log = Instant::now();
         }
-        // 站点目标制终局（用户裁定 3）：≥sites_target 个站点且每站深度已达 max_depth
-        // ——或安全上限/队列耗尽（无法达成目标时自然收尾，避免死循环）
+        // 站点目标制终局（用户裁定 3）：
+        //   达标 = ≥sites_target 站 且 其中 ≥sites_target 站深度 ≥max_depth
+        //   ——用户要求“至少 100 站 × 每站至少 10 深”，按已爬站全达标实现；
+        //   队列耗尽且未达标 → 自动回填内置种子续爬；回填源也尽 → 收尾
         let done = fetched.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-        let goal_hit = hosts_done.len() >= sites_target
-            && host_max_depth.values().filter(|d| **d >= max_depth).count() >= sites_target;
-        if in_flight == 0
-            && (goal_hit || done >= pages || (pending.is_empty() && frontier_drained_just_now))
-        {
+        let deep_enough = host_max_depth.values().filter(|d| **d >= max_depth).count();
+        let goal_hit = hosts_done.len() >= sites_target && deep_enough >= sites_target;
+        if in_flight == 0 && pending.is_empty() && (goal_hit || done >= pages) {
             if goal_hit {
                 println!(
                     "[ws] 站点目标达成：{} 站 × 深度≥{} —— 收尾",
@@ -899,6 +967,30 @@ async fn main() {
                     max_depth
                 );
             }
+            break;
+        }
+        // 队列耗尽但目标未达 → 回填内置种子（单种子死路/JS 渲染页自愈）
+        if in_flight == 0 && pending.is_empty() && frontier_drained_just_now {
+            if builtin_cursor < builtin.len() {
+                let batch: Vec<String> =
+                    builtin[builtin_cursor..(builtin_cursor + 8).min(builtin.len())].to_vec();
+                builtin_cursor += batch.len();
+                let n = inject_seeds(&batch, &mut dedupe, &dedupe_path, &frontier).await;
+                println!(
+                    "[ws] 队列耗尽（sites={}/{}）——回填内置种子 +{n}（游标 {}/{}）",
+                    hosts_done.len(),
+                    sites_target,
+                    builtin_cursor,
+                    builtin.len()
+                );
+                frontier_drained_just_now = false; // 新种子已入队——重新等取批
+                continue;
+            }
+            println!(
+                "[ws] 内置种子全部耗尽仍 sites={}/{} —— 自然收尾",
+                hosts_done.len(),
+                sites_target
+            );
             break;
         }
         // 补批（frontier 取批 + pending 汇流）——目标达成前持续为 frontier 泵入新 URL
@@ -970,7 +1062,9 @@ async fn main() {
         }
         if launched.is_empty() && in_flight == 0 {
             if pending.is_empty() {
-                break; // 队列耗尽
+                // 队列耗尽——不在此 break：留给上方回填/收尾分支处理
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
             // 全队同域节流中——等窗口
             tokio::time::sleep(Duration::from_millis(100)).await;

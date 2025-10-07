@@ -228,6 +228,15 @@ object SearchBehavior {
             val n = flushSegs()
             replyTo ! BridgeReplyOk("bin:ws/FlushAck", put32(n))
 
+          case "bin:ws/Clear" =>
+            // 全新爬取：清内存索引 + 删磁盘段（Rust 主程序数据目录清理后调用）
+            val segs = segFiles(indexDir)
+            segs.foreach(_.delete())
+            nextSeg = 0
+            postings.clear(); docs.clear(); docLen.clear(); queries = 0L
+            println(s"[ws-search] 索引已清空（删除 ${segs.length} 段）")
+            replyTo ! BridgeReplyOk("bin:ws/ClearAck", put32(segs.length))
+
           case "bin:ws/Healthz" =>
             val p = postings.values.map(_.size).sum
             val json = s"""{"terms":${postings.size},"postings":$p,"queries":$queries,"docs":${docs.size},"segments":$nextSeg}"""
