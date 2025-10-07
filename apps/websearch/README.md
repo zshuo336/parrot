@@ -10,10 +10,17 @@
 | Akka/JVM | `search` | **jieba-analysis 查询切词** + 倒排 + BM25 + 段文件落盘（重启回放） |
 | TS Lite | 浏览器 | 零依赖访问 `http://localhost:8080` |
 
-分词三语言同族：Python `jieba`（原版）/ JVM `jieba-analysis`（huaban 移植）/ Rust 侧经
-Ray 通道复用 Python 分词（词条布局 `len|term|docid|tf` 四方言同构）。
+## 📚 文档
 
-## 用法
+| 文档 | 内容 |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 技术详细设计——架构图/模块图/数据流/全部时序图/wire 协议/设计决策 |
+| [docs/PARROT_USAGE.md](docs/PARROT_USAGE.md) | parrot 能力全景——用了什么/为什么用/引擎内部原理（组网·握手·codec·RPC·部署·心跳·寻址） |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 运维手册——编译/部署/parrot 部署机制沙盘推演/监控/故障排查 |
+
+本 README 只保留快速上手；技术细节见上述三文档。
+
+## 快速上手
 
 ```bash
 # 构建（rust + jvm fat jar + erl beam + 依赖自检）
@@ -26,6 +33,9 @@ apps/websearch/run.sh https://www.runoob.com --pages 100 --port 8080
 # 仅检索（独立运行——回放已落盘索引）
 ./target/release/websearch --serve-only --port 8080 --data apps/websearch/data
 ```
+
+分词三语言同族：Python `jieba`（原版）/ JVM `jieba-analysis`（huaban 移植）/ Rust 侧经
+Ray 通道复用 Python 分词（词条布局 `len|term|docid|tf` 四方言同构）。
 
 ## 真实化四诉求对照
 
