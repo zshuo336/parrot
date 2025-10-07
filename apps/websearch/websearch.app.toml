@@ -59,7 +59,9 @@ qos = "lan"
 # ── 配置（overlay——CLI 注入位）─────────────────────────────────────
 
 [config_overlay]
-pages = 200
-maxdepth = 2
+# 站点目标制（用户裁定 3）：≥sites 个不同 host 且每站深度 ≥maxdepth 才停
+sites = 100      # 站点目标（不同 host 数）
+maxdepth = 10    # 每站爬取深度
+pages = 50000    # 安全页数上限（兜底——队列耗尽自然收尾）
 port = 8080
 data = "./data"
