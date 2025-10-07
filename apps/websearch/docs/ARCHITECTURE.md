@@ -127,6 +127,38 @@ flowchart LR
     WEB2 --> R([结果页])
 ```
 
+### 2.4 部署拓扑四形态（测试与运维共用）
+
+同一份应用制品（rust 二进制 + beam + jar + py）可在四种拓扑运行——
+组网层（parrot 传输）与部署层（admin-v2）完全无差异，只是「网关进程放哪」不同：
+
+```mermaid
+flowchart TB
+    subgraph M1["① 单机 direct（run.sh）——开发调试"]
+        A1[websearch 二进制] -->|127.0.0.1:19871/2/3| G1[本机三网关进程]
+    end
+    subgraph M2["② 单机 registry（deploy/run-registry.sh）——组网演练"]
+        A2[websearch --bind :19870] <-->|反拨注册| G2[三网关 parrot=127.0.0.1:19870]
+    end
+    subgraph M3["③ compose 4 容器（deploy/compose.sh）——单机模拟多物理机"]
+        A3[ws-app 容器] <-->|bridge 172.30.0.0/16 真实跨网 TCP| G3[ws-erl / ws-ray / ws-jvm 容器]
+    end
+    subgraph M4["④ 真实多机（distribute.sh + start-remote.sh）——生产"]
+        A4[应用机] <-->|ssh 分发制品 + 公网/内网 TCP| G4[各物理机网关守护]
+    end
+```
+
+| 拓扑 | 网络边界验证 | 主要用途 |
+|---|---|---|
+| ① direct | 无（本机回环） | 日常开发、CI |
+| ② registry | 本机回环 + 反拨控制面 | 组网协议演练（生产形态的单机预演） |
+| ③ compose | **bridge 网段真实跨容器 TCP** | 单机模拟多物理机——admin-v2 Deploy 跨网真验 |
+| ④ 多机 | 真实跨物理机网络 | 生产部署 |
+
+镜像分层：框架 `deploy/images/gw-{erl,jvm,ray,app}.Dockerfile`（通用运行时——
+Erlang 27 / JDK 21 / Python 3.11+Ray / musl 静态二进制）；app 的
+`deploy/docker-compose.yml` 引用镜像 + volume 挂载 app 制品——重建 app 不重建镜像。
+
 ---
 
 ## 3. 模块详细设计
@@ -500,6 +532,12 @@ graph TB
 - `seg-*.segment`（Akka 侧）：倒排段——检索服务的全部状态。段化（而非单文件）为后续
   多段合并/增量爬留扩展位。
 
+**段落盘时机**（两处触发，都调 `bin:ws/Flush`）：
+
+1. **周期触发**（爬取循环内每 60s）：崩溃/中断后 `--serve-only` 仍可回放已爬部分——
+   代价仅是段文件增多（快照式全量写，回放幂等：同 docid 覆盖）。
+2. **收尾触发**（爬取循环退出后）：最终一致快照。
+
 ---
 
 ## 7. 设计决策记录
@@ -516,6 +554,8 @@ graph TB
 | 8 | Web 服务在 Rust 进程内 | Akka HTTP / nginx | 单二进制交付；检索高并发由 akka 承担，页面渲染轻 |
 | 9 | `--serve-only` 独立形态 | 只保留全链 | 检索服务独立运行=用户四分离诉求的直接呈现 |
 | 10 | frontier ETS 不持久化 | dets | 去重真源在 Rust tsv——ETS 是会话级快路径 |
+| 11 | deploy 幂等（drain+redeploy） | 失败即 panic | 网关长存、应用可反复重启——运维常态 |
+| 12 | 周期段落盘 60s | 仅收尾 flush | 中断恢复可达；快照式回放幂等（docid 覆盖） |
 
 ---
 

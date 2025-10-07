@@ -861,7 +861,7 @@ async fn main() {
                     },
                 )
                 .await
-                .unwrap_or_else(|e| panic!("deploy {node}: {e:?}"))
+            // 调用方决定 panic/幂等重试——闭包不再吞错
         }
     };
     let deploys: Vec<(String, AdminArtifactRef)> = if serve_only {
@@ -912,12 +912,28 @@ async fn main() {
     };
     // akka 组件的数据目录经环境变量（WS_DATA）——网关进程继承
     for (node, artifact) in deploys {
+        let artifact_retry = artifact.clone();
         let name = match &artifact {
             AdminArtifactRef::Beam { .. } => "frontier",
             AdminArtifactRef::PyModule { .. } => "tokenizer",
             _ => "search",
         };
-        let r = deploy(&node, name, artifact).await;
+        // deploy 幂等：网关进程长存（重启应用不重启网关）——同名组件已
+        // 在位时先 Drain 再 Deploy（serve-only/应用重启场景否则 name 冲突）
+        let r = match deploy(&node, name, artifact).await {
+            Ok(r) => r,
+            Err(e) if format!("{e:?}").contains("not unique") => {
+                println!("[ws] {node}/{name} 已在位——drain 后重部署");
+                let _ = client
+                    .drain_component(&node, name, Duration::from_secs(30))
+                    .await
+                    .map_err(|e| eprintln!("[ws] drain {node}/{name}: {e:?}"));
+                deploy(&node, name, artifact_retry)
+                    .await
+                    .unwrap_or_else(|e2| panic!("redeploy {node}: {e2:?}"))
+            }
+            Err(e) => panic!("deploy {node}: {e:?}"),
+        };
         println!("[ws] deploy {node}/{name} → {r:?}");
     }
 
@@ -995,6 +1011,7 @@ async fn main() {
     let mut host_max_depth: HashMap<String, u16> = HashMap::new();
     let t0 = Instant::now();
     let mut last_log = Instant::now();
+    let mut last_flush = Instant::now();
 
     println!(
         "[ws] 爬取目标：≥{sites_target} 个站点 · 每站深度 ≥{max_depth}（安全页数上限 {pages}）"
@@ -1016,6 +1033,17 @@ async fn main() {
                 in_flight
             );
             last_log = Instant::now();
+        }
+        // 周期段落盘（60s 一次）：崩溃/中断后 serve-only 可回放已爬部分——
+        // JVM 侧 flushSegs 全量快照式写段（非增量），周期做不丢数据只多段文件
+        if last_flush.elapsed() >= Duration::from_secs(60) {
+            if let Ok(r) = searcher.send(Box::new(WsFlush(vec![]))).await {
+                let segs = get_u32(&r.downcast_ref::<WsFlushAck>().unwrap().0, &mut 0);
+                if segs > 0 {
+                    println!("[ws] 周期段落盘：累计 {segs} 段");
+                }
+            }
+            last_flush = Instant::now();
         }
         // 站点目标制终局（用户裁定 3）：
         //   达标 = ≥sites_target 站 且 其中 ≥sites_target 站深度 ≥max_depth
