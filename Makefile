@@ -65,7 +65,7 @@ SHELL := /bin/bash
         test test-fast test-full test-stress test-polyglot test-full-polyglot test-lab \
         lint fmt clippy bench matrix clean distclean \
         ts py jvm erl cpp check-ts check-py check-jvm check-erl check-cpp \
-        build-release-bins twin-app build-probe probe
+        build-release-bins twin-app build-probe probe obs-up obs-down
 
 # ── 帮助 ──────────────────────────────────────────────────────────────────
 help: ## 显示本帮助
@@ -124,9 +124,15 @@ build-python: ## Python 语法预热（compileall；依赖见 pyproject.toml）
 build-probe: ## 编译 parrot-obs 观测 CLI+Web（tools/parrot-obs）
 	$(CARGO) build -p parrot-obs $(CARGO_REL)
 
+obs-up: ## 一键起三网关（守护化——erl/jvm/ray；就绪后打印 NODES 行）
+	bash tools/parrot-obs/gw.sh up
+
+obs-down: ## 停三网关
+	bash tools/parrot-obs/gw.sh down
+
 probe: build-probe ## 观测探针速用（NODES='erl=… ray=… jvm=…'；CMD=metrics|status|…）
-	@test -n "$(CMD)" || (echo '用法：make probe CMD=status|metrics|ping|ask|load|watch|trace|web NODES="erl=127.0.0.1:19871 …" [ARGS="--seconds 10"]'; exit 2)
-	$(CARGO) run -q -p parrot-obs -- $(CMD) $(NODES) $(ARGS)
+	@test -n "$(CMD)" || (echo '用法：make probe CMD=status|metrics|ping|ask|load|watch|trace|web NODES="erl=127.0.0.1:19871 …" [ARGS="--seconds 10"]  （或先 make obs-up 一键起网关）'; exit 2)
+	$(CARGO) run -q -p parrot-obs -- $(CMD) "$(NODES)" $(ARGS)
 
 # ══════════════════════════════════════════════════════════════════════════
 # 测试（MODE 分发 → 具体 recipe）

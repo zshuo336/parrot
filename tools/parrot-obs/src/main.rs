@@ -119,19 +119,29 @@ struct NodeSpec {
 
 /// 解析 `erl=… ray=… jvm=…` 参数（任意子集）。
 fn parse_nodes(args: &[String]) -> Vec<NodeSpec> {
-    args.iter()
-        .filter_map(|a| a.split_once('='))
-        .filter(|(k, _)| ["erl", "ray", "jvm"].contains(k))
-        .map(|(k, v)| NodeSpec {
-            name: match k {
-                "erl" => "erl-gw-1".to_string(),
-                "ray" => "ray-gw-1".to_string(),
-                "jvm" => "jvm-search-1".to_string(),
-                _ => k.to_string(),
-            },
-            addr: v.to_string(),
-        })
-        .collect()
+    // 兼容三种传参形态（zsh 标量 $NODES 不分词——单串整包也认）：
+    //   erl=1.2.3.4:1 ray=... jvm=...     （多参数——bash/显式）
+    //   "erl=1.2.3.4:1 ray=... jvm=..."   （单串空格分隔——zsh $NODES）
+    //   "erl=...,ray=...,jvm=..."         （单串逗号分隔）
+    let mut out = Vec::new();
+    for a in args {
+        for token in a.split(|c: char| c == ',' || c.is_whitespace()) {
+            let Some((k, v)) = token.split_once('=') else { continue };
+            if !["erl", "ray", "jvm"].contains(&k) {
+                continue;
+            }
+            out.push(NodeSpec {
+                name: match k {
+                    "erl" => "erl-gw-1".to_string(),
+                    "ray" => "ray-gw-1".to_string(),
+                    "jvm" => "jvm-search-1".to_string(),
+                    _ => k.to_string(),
+                },
+                addr: v.to_string(),
+            });
+        }
+    }
+    out
 }
 
 async fn connect(nodes: &[NodeSpec]) -> anyhow::Result<Arc<RemoteActorSystem>> {
@@ -140,10 +150,25 @@ async fn connect(nodes: &[NodeSpec]) -> anyhow::Result<Arc<RemoteActorSystem>> {
     cfg.extra_caps = parrot_remote::handshake::caps::PB;
     let client = RemoteActorSystem::new(cfg, Arc::new(NoopLookup))?;
     client.start().await?;
+    let mut ok = 0;
     for n in nodes {
-        client
-            .connect(&NodeAddr::tcp(n.name.clone(), n.addr.parse()?))
-            .await?;
+        let addr = match n.addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("⚠ 节点 {}={} 地址非法（期望 host:port）：{e}——跳过", n.name, n.addr);
+                continue;
+            }
+        };
+        match client.connect(&NodeAddr::tcp(n.name.clone(), addr)).await {
+            Ok(_) => ok += 1,
+            Err(e) => eprintln!(
+                "⚠ 节点 {}({}) 连接失败：{e}\n  该节点将显示为不可达；先起网关：tools/parrot-obs/gw.sh up",
+                n.name, n.addr
+            ),
+        }
+    }
+    if ok == 0 {
+        eprintln!("（全部节点不可达——仍继续运行以便给出明确诊断）");
     }
     Ok(client)
 }
@@ -440,12 +465,17 @@ async fn main() -> anyhow::Result<()> {
         }
         "metrics" => {
             let mut rows = Vec::new();
+            let mut down = Vec::new();
             for (name, r) in collect_all(&client, &nodes).await {
-                if let Ok(m) = r {
-                    rows.push((name, m));
+                match r {
+                    Ok(m) => rows.push((name, m)),
+                    Err(e) => down.push((name, e)),
                 }
             }
             print!("{}", metrics_table(&rows));
+            for (name, e) in down {
+                println!("✗ {name:<14} 不可达：{e}");
+            }
         }
         "ping" => {
             let rounds = flag_num(&args, "--rounds", 5);
