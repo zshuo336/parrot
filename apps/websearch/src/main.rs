@@ -525,6 +525,16 @@ async fn main() {
     let mut data_dir = PathBuf::from("./data");
     let mut gw_addrs: Vec<(&str, String)> = Vec::new(); // (tag, host:port)
     let mut serve_only = false; // 只起检索服务（不爬——重启后回放索引的独立运行形态）
+                                // 远程部署形态（跨网络）：
+                                //   --bind 0.0.0.0:19870  应用监听，三网关主动反拨注册（registry——
+                                //                         应用零网关地址知识，网关可分布任意机器）
+                                //   --node-root <dir>     制品根目录（file:// uri 指此处——远程节点上
+                                //                         该目录须存在同构制品：erlang/ python/ jvm/target/…）
+                                //   --artifacts http://…  制品源（预分发形态：节点侧已就位，deploy 只传
+                                //                         uri 引用不依赖本机路径）
+    let mut bind_addr: Option<std::net::SocketAddr> = None;
+    let mut wait_secs: u64 = 60;
+    let mut node_root: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -547,6 +557,18 @@ async fn main() {
             }
             "--data" => {
                 data_dir = PathBuf::from(&args[i + 1]);
+                i += 2;
+            }
+            "--bind" => {
+                bind_addr = Some(args[i + 1].parse().unwrap());
+                i += 2;
+            }
+            "--wait" => {
+                wait_secs = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--node-root" => {
+                node_root = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--serve-only" => {
@@ -729,19 +751,60 @@ async fn main() {
         }
     }
 
-    // ── 组网：连三网关 ─────────────────────────────────────────────
-    let client =
-        RemoteActorSystem::new(RemoteConfig::tcp("websearch", None), Arc::new(NoopLookup)).unwrap();
+    // ── 组网：双模式 ───────────────────────────────────────────────
+    //   direct   ——应用主动拨号三网关（erl=/ray=/jvm= host:port，可跨机器）
+    //   registry ——--bind 监听，三网关主动反拨注册（生产形态：应用零网关
+    //              地址知识；网关可分布任意机器——跨网络部署）
+    let client = RemoteActorSystem::new(
+        RemoteConfig::tcp("websearch", bind_addr),
+        Arc::new(NoopLookup),
+    )
+    .unwrap();
     client.start().await.unwrap();
-    if serve_only {
+    if bind_addr.is_some() {
+        let local = client.local_addr().expect("bound");
+        println!("[ws] 组网模式：registry（应用监听 {local}，等待三网关反拨注册… ≤{wait_secs}s）");
+        let need: &[&str] = if serve_only {
+            &["jvm-search-1"]
+        } else {
+            &["erl-gw-1", "ray-gw-1", "jvm-search-1"]
+        };
+        let deadline = Instant::now() + Duration::from_secs(wait_secs);
+        loop {
+            let ready = need
+                .iter()
+                .filter(|n| client.nodes.get(n).is_some())
+                .count();
+            if ready == need.len() {
+                println!("[ws] 网关已全部注册：{need:?}");
+                break;
+            }
+            if Instant::now() > deadline {
+                eprintln!(
+                    "[ws] 等待网关注册超时（{wait_secs}s，就绪 {ready}/{}）",
+                    need.len()
+                );
+                std::process::exit(3);
+            }
+            if ready > 0 {
+                println!("[ws]   已注册 {ready}/{} …", need.len());
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        // register_link 完成窗口（sender 就绪）
+        let need_links = need.len();
+        for _ in 0..50 {
+            if client.links_snapshot().await.len() >= need_links {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    } else if serve_only {
         let sa: std::net::SocketAddr = jvm_addr.parse().unwrap();
         // serve-only 重试连（网关可能比应用晚起——30s 窗口）
         let mut linked = false;
         for attempt in 1..=15 {
-            match client
-                .connect(&NodeAddr::tcp("jvm-search-1", sa))
-                .await
-            {
+            match client.connect(&NodeAddr::tcp("jvm-search-1", sa)).await {
                 Ok(()) => {
                     linked = true;
                     break;
@@ -778,7 +841,9 @@ async fn main() {
     }
 
     // ── 组件部署（R4 闭环——app 制品动态载入三网关）────────────────
-    let app_root = app_root_dir();
+    // 制品根：--node-root 显式指定（远程节点上的制品目录）> 本机构建根
+    // （file:// uri 语义 = 目标网关节点本地路径——跨机部署时各节点预置同构制品）
+    let app_root = node_root.unwrap_or_else(app_root_dir);
     let deploy = |node: &str, name: &str, artifact: AdminArtifactRef| {
         let client = client.clone();
         let node = node.to_string();
