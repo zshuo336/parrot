@@ -1,0 +1,19 @@
+[package]
+name = "parrot-obs"
+version = "0.1.0"
+edition = "2021"
+description = "parrot 框架观测套件——CLI 探针 + Web 控制台（trace/debug/metric）"
+
+[dependencies]
+parrot-remote = { path = "../../crates/parrot-remote" }
+parrot-api = { path = "../../crates/parrot-api" }
+parrot = { path = "../../crates/parrot" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+anyhow = "1.0"
+
+[[bin]]
+name = "parrot-obs"
+path = "src/main.rs"

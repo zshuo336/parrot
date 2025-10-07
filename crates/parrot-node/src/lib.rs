@@ -332,6 +332,7 @@ pub mod executor_v2 {
     use parrot_remote::admin_v2::{
         failed_v2, v2_err, AdminArtifactRef, AdminCommandV2, AdminInstancePolicy, AdminReplyV2,
         AdminReplyV2 as R, ComponentDeploy, ComponentExecutor, ComponentStateReport,
+        MetricsSnapshot,
     };
 
     // ─────────────────────────────────────────────────────────────
@@ -656,6 +657,43 @@ pub mod executor_v2 {
                 .collect();
             R::Status { req_id, states }
         }
+
+        /// 观测五件套：本地引擎指标快照（组件登记表 + actor 计数）。
+        async fn metrics(&self, req_id: u64) -> AdminReplyV2 {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let versions = self.versions.lock().unwrap().clone();
+            let states: Vec<ComponentStateReport> = versions
+                .iter()
+                .flat_map(|(name, ver)| {
+                    let prefix = format!("/user/{name}");
+                    self.matching_paths(&prefix)
+                        .into_iter()
+                        .map(move |p| ComponentStateReport {
+                            version: ver.clone(),
+                            state: "running".into(),
+                            path: p,
+                        })
+                })
+                .collect();
+            let snap = MetricsSnapshot {
+                ts_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                runtime: format!("parrot/{}", env!("CARGO_PKG_VERSION")),
+                connections: 1, // 进程内 executor——单一宿主
+                handshakes_ok: 1,
+                components: versions.len() as u64,
+                component_states: states,
+                processes: self.ts.actor_count() as u64,
+                uptime_start_ms: 0,
+                ..Default::default()
+            };
+            R::Metrics {
+                req_id,
+                snapshot: snap,
+            }
+        }
     }
 
     /// 命令直通辅助（handle_admin_command_v2 之外的进程内入口——
@@ -679,6 +717,8 @@ pub mod executor_v2 {
                 req_id,
                 path_prefix,
             } => ex.status(req_id, &path_prefix).await,
+            // 观测五件套：指标快照（ThreadActorSystem 方言——本地引擎状态）
+            AdminCommandV2::MetricsReport { req_id } => ex.metrics(req_id).await,
         }
     }
 }

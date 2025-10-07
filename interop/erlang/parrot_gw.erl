@@ -19,6 +19,7 @@
          encode_admin_reply_v2/1, decode_admin_reply_v2/1,
          admin_init/0, admin_deploy/1, admin_stop/1, admin_drain/2,
          admin_status/1, admin_instance_paths/2, instance_count/1,
+         admin_metrics/0,
          bc_put_varint/1, bc_get_varint/1]).
 
 -define(VER, 1).
@@ -117,6 +118,8 @@ handshake_ack_body(NodeId) ->
 -define(V2_SPAWN_FAILED, 16#0A06).
 %% 组件登记表（admin-v2 Deploy 写入 / Status 报告 / Stop 清除）
 -define(ADMIN_TAB, parrot_admin_components).
+%% 观测五件套：跨连接指标计数表（key → 累计整数）
+-define(METRICS_TAB, parrot_gw_metrics).
 
 %% ---- varint ----
 
@@ -254,7 +257,9 @@ enc_cmd_body({drain_component, ReqId, Prefix, TimeoutMs}) ->
 enc_cmd_body({stop_component, ReqId, Prefix}) ->
     <<2:8, (bc_put_varint(ReqId))/binary, (bc_put_str(Prefix))/binary>>;
 enc_cmd_body({component_status, ReqId, Prefix}) ->
-    <<3:8, (bc_put_varint(ReqId))/binary, (bc_put_str(Prefix))/binary>>.
+    <<3:8, (bc_put_varint(ReqId))/binary, (bc_put_str(Prefix))/binary>>;
+enc_cmd_body({metrics_report, ReqId}) ->
+    <<4:8, (bc_put_varint(ReqId))/binary>>.
 
 decode_admin_cmd_v2(<<?TAG_ADMIN_CMD_V2:8, Body/binary>>) ->
     {Cmd, <<>>} = dec_cmd_body(Body),
@@ -276,7 +281,10 @@ dec_cmd_body(<<2:8, Bin0/binary>>) ->
 dec_cmd_body(<<3:8, Bin0/binary>>) ->
     {ReqId, Bin1} = bc_get_varint(Bin0),
     {Prefix, Rest} = bc_get_str(Bin1),
-    {{component_status, ReqId, Prefix}, Rest}.
+    {{component_status, ReqId, Prefix}, Rest};
+dec_cmd_body(<<4:8, Bin0/binary>>) ->
+    {ReqId, Rest} = bc_get_varint(Bin0),
+    {{metrics_report, ReqId}, Rest}.
 
 %% ---- AdminReplyV2 ----
 %% {deployed, ReqId, [Path]}
@@ -304,7 +312,41 @@ enc_reply_body({status, ReqId, States}) ->
     <<3:8, (bc_put_varint(ReqId))/binary, (bc_put_varint(N))/binary, List/binary>>;
 enc_reply_body({failed, ReqId, Code, Detail}) ->
     <<4:8, (bc_put_varint(ReqId))/binary, (bc_put_varint(Code))/binary,
-      (bc_put_str(Detail))/binary>>.
+      (bc_put_str(Detail))/binary>>;
+%% {metrics, ReqId, Snapshot}——观测五件套（字段序 = Rust MetricsSnapshot 声明序）
+enc_reply_body({metrics, ReqId, Snap}) ->
+    <<5:8, (bc_put_varint(ReqId))/binary, (bc_put_snapshot(Snap))/binary>>.
+
+bc_put_snapshot(Snap) ->
+    TsMs       = maps:get(ts_ms, Snap, 0),
+    Runtime    = maps:get(runtime, Snap, <<>>),
+    Conn       = maps:get(connections, Snap, 0),
+    HsOk       = maps:get(handshakes_ok, Snap, 0),
+    HsFail     = maps:get(handshakes_failed, Snap, 0),
+    Asks       = maps:get(asks_rx, Snap, 0),
+    Tells      = maps:get(tells_rx, Snap, 0),
+    Replies    = maps:get(replies_tx, Snap, 0),
+    RErrs      = maps:get(reply_errs, Snap, 0),
+    BRx        = maps:get(bytes_rx, Snap, 0),
+    BTx        = maps:get(bytes_tx, Snap, 0),
+    HbRx       = maps:get(heartbeats_rx, Snap, 0),
+    Comps      = maps:get(components, Snap, 0),
+    States     = maps:get(component_states, Snap, []),
+    Procs      = maps:get(processes, Snap, 0),
+    Rss        = maps:get(memory_rss, Snap, 0),
+    Uptime     = maps:get(uptime_start_ms, Snap, 0),
+    N = length(States),
+    StateBin = << <<(bc_put_str(P))/binary, (bc_put_str(S))/binary,
+                    (bc_put_str(V))/binary>> || {P, S, V} <- States >>,
+    <<(bc_put_varint(TsMs))/binary, (bc_put_str(Runtime))/binary,
+      (bc_put_varint(Conn))/binary, (bc_put_varint(HsOk))/binary,
+      (bc_put_varint(HsFail))/binary, (bc_put_varint(Asks))/binary,
+      (bc_put_varint(Tells))/binary, (bc_put_varint(Replies))/binary,
+      (bc_put_varint(RErrs))/binary, (bc_put_varint(BRx))/binary,
+      (bc_put_varint(BTx))/binary, (bc_put_varint(HbRx))/binary,
+      (bc_put_varint(Comps))/binary, (bc_put_varint(N))/binary, StateBin/binary,
+      (bc_put_varint(Procs))/binary, (bc_put_varint(Rss))/binary,
+      (bc_put_varint(Uptime))/binary>>.
 
 decode_admin_reply_v2(<<?TAG_ADMIN_REPLY_V2:8, Body/binary>>) ->
     {Reply, <<>>} = dec_reply_body(Body),
@@ -332,7 +374,39 @@ dec_reply_body(<<4:8, Bin0/binary>>) ->
     {ReqId, Bin1} = bc_get_varint(Bin0),
     {Code, Bin2} = bc_get_varint(Bin1),
     {Detail, Rest} = bc_get_str(Bin2),
-    {{failed, ReqId, Code, Detail}, Rest}.
+    {{failed, ReqId, Code, Detail}, Rest};
+dec_reply_body(<<5:8, Bin0/binary>>) ->
+    {ReqId, Bin1} = bc_get_varint(Bin0),
+    {Snap, Rest} = bc_get_snapshot(Bin1),
+    {{metrics, ReqId, Snap}, Rest}.
+
+bc_get_snapshot(Bin0) ->
+    {TsMs,    B1} = bc_get_varint(Bin0),
+    {Runtime, B2} = bc_get_str(B1),
+    {Conn,    B3} = bc_get_varint(B2),
+    {HsOk,    B4} = bc_get_varint(B3),
+    {HsFail,  B5} = bc_get_varint(B4),
+    {Asks,    B6} = bc_get_varint(B5),
+    {Tells,   B7} = bc_get_varint(B6),
+    {Replies, B8} = bc_get_varint(B7),
+    {RErrs,   B9} = bc_get_varint(B8),
+    {BRx,     B10} = bc_get_varint(B9),
+    {BTx,     B11} = bc_get_varint(B10),
+    {HbRx,    B12} = bc_get_varint(B11),
+    {Comps,   B13} = bc_get_varint(B12),
+    {N,       B14} = bc_get_varint(B13),
+    {States,  B15} = bc_get_states(N, B14),
+    {Procs,   B16} = bc_get_varint(B15),
+    {Rss,     B17} = bc_get_varint(B16),
+    {Uptime,  Rest} = bc_get_varint(B17),
+    Snap = #{ts_ms => TsMs, runtime => Runtime, connections => Conn,
+             handshakes_ok => HsOk, handshakes_failed => HsFail,
+             asks_rx => Asks, tells_rx => Tells, replies_tx => Replies,
+             reply_errs => RErrs, bytes_rx => BRx, bytes_tx => BTx,
+             heartbeats_rx => HbRx, components => Comps,
+             component_states => States, processes => Procs,
+             memory_rss => Rss, uptime_start_ms => Uptime},
+    {Snap, Rest}.
 
 bc_get_str_list(0, Bin) -> {[], Bin};
 bc_get_str_list(N, Bin0) ->
@@ -469,9 +543,71 @@ admin_status(Prefix) ->
             {status_reply, States}
     end.
 
+%% ============ 观测五件套：指标采集（admin-v2 MetricsReport） ============
+%% 计数器存 ETS（跨连接累计——accept_loop 多连接生命周期）；快照时读出。
+
+mbump(Key, N) ->
+    try ets:update_counter(?METRICS_TAB, Key, N)
+    catch _:_ -> ets:insert_new(?METRICS_TAB, {Key, N}), N
+    end.
+
+mget(Key) ->
+    case ets:lookup(?METRICS_TAB, Key) of
+        [{_, V}] -> V;
+        [] -> 0
+    end.
+
+%% 当前活跃连接数（连接进程注册表——admin_metrics 从任意进程可读）
+conn_incr(D) ->
+    try ets:update_counter(?METRICS_TAB, connections, D)
+    catch _:_ -> ets:insert_new(?METRICS_TAB, {connections, D})
+    end.
+
+metrics_count(Ft, Payload) ->
+    mbump(bytes_rx, byte_size(Payload)),
+    case Ft of
+        ?ASK  -> mbump(asks, 1);
+        ?TELL -> mbump(tells, 1);
+        ?HEARTBEAT -> mbump(hb, 1);
+        _ -> ok
+    end.
+
+metrics_reply_tx(Bytes) ->
+    mbump(replies, 1),
+    mbump(bytes_tx, Bytes).
+
+%% 计数器读（兼容旧进程字典路径——ETS 为主）
+mget_pd(K) -> case get(K) of undefined -> 0; V -> V end.
+
+%% 采集全量快照（components 表 + 进程/内存 + 计数器）
+admin_metrics() ->
+    Comps = case ets:info(?ADMIN_TAB) of
+                undefined -> [];
+                _ -> ets:tab2list(?ADMIN_TAB)
+            end,
+    States = [{P, <<"running">>, V} || {_, V, Paths, _} <- Comps, P <- Paths],
+    %% 常驻内存：erlang:memory(total) 近似 RSS（VM 层合计）
+    Mem = try erlang:memory(total) catch _:_ -> 0 end,
+    #{ts_ms => os:system_time(millisecond),
+      runtime => iolist_to_binary(io_lib:format("erl/OTP-~s", [erlang:system_info(otp_release)])),
+      connections => max(mget(connections), 0),  %% 当前活跃连接（连接进程注册表）
+      handshakes_ok => mget(hs_ok) + mget_pd(metrics_hs_ok),
+      handshakes_failed => mget(hs_failed),
+      asks_rx => mget(asks) + mget_pd(metrics_asks),
+      tells_rx => mget(tells) + mget_pd(metrics_tells),
+      replies_tx => mget(replies) + mget_pd(metrics_replies),
+      reply_errs => mget(r_errs) + mget_pd(metrics_r_errs),
+      bytes_rx => mget(bytes_rx) + mget_pd(metrics_bytes_rx),
+      bytes_tx => mget(bytes_tx) + mget_pd(metrics_bytes_tx),
+      heartbeats_rx => mget(hb) + mget_pd(metrics_hb),
+      components => length(Comps),
+      component_states => States,
+      processes => erlang:system_info(process_count),
+      memory_rss => Mem,
+      uptime_start_ms => persistent_term:get(parrot_gw_start_ms, 0)}.
+
 %% 前缀匹配（Rust/Python 同规：整段相等或后随 '-'）
-admin_match(Prefix) ->
-    ets:foldl(fun({_Name, _V, Paths, _M} = E, Acc) ->
+admin_match(Prefix) ->    ets:foldl(fun({_Name, _V, Paths, _M} = E, Acc) ->
                   Match = fun(P) ->
                                   P =:= Prefix orelse
                                     (binary:match(P, Prefix) =:= {0, byte_size(Prefix)}
@@ -496,7 +632,9 @@ admin_handle_frame(Sock, Cid, Path, <<?TAG_ADMIN_CMD_V2:8, _/binary>> = Payload)
                 {stop_component, ReqId, Prefix} ->
                     admin_reply(ReqId, admin_stop(Prefix));
                 {component_status, ReqId, Prefix} ->
-                    admin_reply(ReqId, admin_status(Prefix))
+                    admin_reply(ReqId, admin_status(Prefix));
+                {metrics_report, ReqId} ->
+                    admin_reply(ReqId, {metrics, admin_metrics()})
             end,
     gen_tcp:send(Sock, build_frame(?FT_SYSTEM_EVENT, Cid, Path, <<>>,
                                    encode_admin_reply_v2(Reply))),
@@ -509,7 +647,8 @@ admin_reply(ReqId, {deployed, Paths}) -> {deployed, ReqId, Paths};
 admin_reply(ReqId, {drained_reply, D, A}) -> {drained, ReqId, D, A};
 admin_reply(ReqId, stopped) -> {stopped, ReqId};
 admin_reply(ReqId, {status_reply, States}) -> {status, ReqId, States};
-admin_reply(ReqId, {failed, Code, Detail}) -> {failed, ReqId, Code, Detail}.
+admin_reply(ReqId, {failed, Code, Detail}) -> {failed, ReqId, Code, Detail};
+admin_reply(ReqId, {metrics, Snap}) -> {metrics, ReqId, Snap}.
 
 %% ============ Erlang actor 服务（方言可辨识） ============
 %% R4（应用体系架构纠正）：已部署组件优先——service/2 先查 ADMIN_TAB
@@ -692,10 +831,16 @@ recv_frame(Sock, Buf) ->
 %% ServiceFun 可注入（默认 ?MODULE:service/2——测试注入慢实现验证并发结构）。
 start(Port) -> start(Port, fun ?MODULE:service/2).
 start(Port, ServiceFun) ->
+    try persistent_term:put(parrot_gw_start_ms, os:system_time(millisecond))
+    catch _:_ -> ok end,   %% 观测五件套：uptime 基准（幂等）
     try ets:info(?DIRECT_TAB) =:= undefined andalso
         ets:new(?DIRECT_TAB, [named_table, public, {read_concurrency, true}])
     catch _:_ -> ok end,   %% 网关直连表（幂等——业务表已迁 app 组件）
     try admin_init() catch _:_ -> ok end,   %% B4：admin-v2 登记表（同幂等语义）
+    try ets:info(?METRICS_TAB) =:= undefined andalso
+        ets:new(?METRICS_TAB, [named_table, public, set,
+                               {write_concurrency, true}])
+    catch _:_ -> ok end,   %% 观测五件套：跨连接累计计数器（loop 进程字典改为 ETS——连接断不清零）
     Self = self(),
     _Gw = spawn(fun() ->
                         {ok, LSock} = gen_tcp:listen(Port, [binary, {packet, raw},
@@ -706,13 +851,29 @@ start(Port, ServiceFun) ->
                                                             {send_timeout_close, true}]),
                         {ok, RealPort} = inet:port(LSock),
                         Self ! {gw_port, RealPort},
-                        {ok, Sock} = gen_tcp:accept(LSock),
-                        gen_tcp:close(LSock),
-                        put(service_fun, ServiceFun),
-                        log("rust node connected: ~p~n", [inet:peername(Sock)]),
-                        loop(Sock, <<>>)
+                        accept_loop(LSock, ServiceFun)
                 end),
     receive {gw_port, P} -> {ok, P} after 5000 -> {error, gw_start_timeout} end.
+
+%% 多连接生命周期：每连接独立进程服务（Erlang 原生形态——轻量进程隔离；
+%% 连接断只影响自身；listener 持续 accept）
+accept_loop(LSock, ServiceFun) ->
+    case gen_tcp:accept(LSock) of
+        {ok, Sock} ->
+            conn_incr(1),
+            Pid = spawn(fun() ->
+                                put(service_fun, ServiceFun),
+                                log("node connected: ~p~n", [inet:peername(Sock)]),
+                                try loop(Sock, <<>>)
+                                catch _:R -> log("loop exit ~p~n", [R])
+                                end,
+                                conn_incr(-1)
+                        end),
+            gen_tcp:controlling_process(Sock, Pid),
+            accept_loop(LSock, ServiceFun);
+        {error, closed} -> ok;
+        {error, R} -> log("accept ~p~n", [R]), accept_loop(LSock, ServiceFun)
+    end.
 
 log(Fmt, Args) ->
     %% 网关日志走 stderr（stdout 契约只留端口行）
@@ -736,9 +897,11 @@ loop(Sock, Buf0) ->
     end.
 
 handle(Sock, Ft, _Flags, Cid, Path, Key, Payload) ->
+    metrics_count(Ft, Payload),  %% 观测五件套：逐帧计数（进程字典——连接进程内）
     case Ft of
         ?HANDSHAKE ->
             log("handshake received~n", []),
+            mbump(hs_ok, 1),
             AckBody = iolist_to_binary(handshake_ack_body("erl-gw-1")),
             gen_tcp:send(Sock, build_frame(?HANDSHAKE_ACK, Cid, <<"">>,
                                             <<"__handshake__">>,
@@ -776,12 +939,17 @@ handle(Sock, Ft, _Flags, Cid, Path, Key, Payload) ->
                                 catch _:R -> {error, R} end,
                           case Res of
                               {ok, {RK, RP}} ->
-                                  gen_tcp:send(Sock, build_frame(?REPLY, Cid, <<"">>, RK, RP));
+                                  B = build_frame(?REPLY, Cid, <<"">>, RK, RP),
+                                  metrics_reply_tx(iolist_size(B)),
+                                  gen_tcp:send(Sock, B);
                               {error, Reason} ->
                                   Err = unicode:characters_to_binary(
                                           io_lib:format("~p", [Reason])),
-                                  gen_tcp:send(Sock, build_frame(?REPLY_ERR, Cid, <<"">>, <<"">>,
-                                                                 err_payload(6, Err)))
+                                  B = build_frame(?REPLY_ERR, Cid, <<"">>, <<"">>,
+                                                  err_payload(6, Err)),
+                                  metrics_reply_tx(iolist_size(B)),
+                                  mbump(r_errs, 1),
+                                  gen_tcp:send(Sock, B)
                           end
                   end);
         ?TELL ->

@@ -80,7 +80,52 @@ object AdminPort {
         stop(components, reqId, prefix)
       case Status(reqId, prefix) =>
         (components, status(components, reqId, prefix))
+      case AdminCommandV2.MetricsReport(reqId) =>
+        (components, metricsReply(system, components, reqId))
     }
+
+  /** 观测五件套：指标快照（transport 计数 + akka 系统态 + 登记表）。 */
+  private def metricsReply(
+      system: ActorSystem[_],
+      components: Map[String, ComponentEntry],
+      reqId: Long
+  ): AdminReplyV2 = {
+    val c = GatewayMetrics.snapshot()
+    val states = components.values.flatMap { entry =>
+      entry.paths.map(p => ComponentState(p, "running", entry.version))
+    }.toVector
+    val rt = System.getProperty("java.vm.name", "jvm") + "/" +
+      System.getProperty("java.version", "?")
+    val rss = Try {
+      val pid = java.lang.management.ManagementFactory.getRuntimeMXBean.getName.split("@")(0)
+      // RSS 尽力而为：/proc（Linux）；macOS 无 → 0
+      val f = new java.io.File(s"/proc/$pid/status")
+      if (f.exists()) {
+        scala.io.Source.fromFile(f).getLines()
+          .find(_.startsWith("VmRSS:"))
+          .map(l => l.split("\\s+")(1).toLong * 1024).getOrElse(0L)
+      } else 0L
+    }.getOrElse(0L)
+    AdminReplyV2.Metrics(
+      reqId,
+      MetricsSnapshot(
+        tsMs = System.currentTimeMillis(),
+        runtime = rt,
+        connections = c.connections,
+        handshakesOk = c.handshakesOk,
+        handshakesFailed = c.handshakesFailed,
+        asksRx = c.asksRx, tellsRx = c.tellsRx,
+        repliesTx = c.repliesTx, replyErrs = c.replyErrs,
+        bytesRx = c.bytesRx, bytesTx = c.bytesTx,
+        heartbeatsRx = c.heartbeatsRx,
+        components = components.size,
+        componentStates = states,
+        processes = 0, // actor 计数不可移植——0=方言未提供（RSS 已覆盖资源维度）
+        memoryRss = rss,
+        uptimeStartMs = GatewayMetrics.startedAtMs
+      )
+    )
+  }
 
   /** Deploy：child loader → 反射 main_class → ComponentSpi.behavior → spawn。
     * 返回（新登记表, 回执）。同名组件已存在 → 先 Stop（原子替换语义——

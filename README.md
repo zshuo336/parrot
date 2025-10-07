@@ -97,8 +97,23 @@ The framework is organized into these primary components:
 4. `crates/parrot-remote`: Remote / cluster / federation stack (Wire 1.0, SWIM, Raft, sharding)
 5. `interop/`: Cross-language Wire 1.0 implementations and SDKs
    - `cpp-lite/` (C ABI), `typescript-lite/`, `jvm/` (Scala/Akka), `python/`, `erlang/`
-6. `tools/`: Simulation infra (`federation-lab` — composegen + digital twin)
+6. `tools/`: Simulation infra (`federation-lab` — composegen + digital twin) and observability (`parrot-obs` — CLI + Web console, see `docs/OBSERVABILITY.md`)
 7. `docs/`: Design docs, frozen wire vectors, and acceptance reports
+
+## Observability
+
+`parrot-obs` provides framework-level trace / debug / metric tooling across all polyglot gateways (erl / ray / jvm):
+
+```bash
+make build-probe
+NODES="erl=127.0.0.1:19871 ray=127.0.0.1:19873 jvm=127.0.0.1:19872"
+./target/debug/parrot-obs status $NODES    # connectivity + one-line summary
+./target/debug/parrot-obs metrics $NODES   # full metrics table + components
+./target/debug/parrot-obs load $NODES --seconds 10 --conc 4   # throughput + P50/95/99
+./target/debug/parrot-obs web $NODES --web-port 8190          # Web console
+```
+
+See `docs/OBSERVABILITY.md` for the admin-v2 `MetricsReport` protocol, gateway collectors, and the full CLI/Web reference.
 
 ## Contributing
 
