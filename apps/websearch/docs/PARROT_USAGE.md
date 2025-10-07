@@ -19,6 +19,9 @@
 | 8 | 心跳保活 + 半开检测 | 链路健康 | §7 |
 | 9 | 远程引用 remote_ref 寻址 | parrot://node/path | §8 |
 | 10 | 应用清单 websearch.app.toml | 声明式拓扑 | §9 |
+| 11 | registry 反拨注册（网关 → 应用回连） | `--bind :19870` 组网形态 | §1.1 |
+| 12 | Drain 幂等重部署 | 应用重启/serve-only | §5.5 |
+| 13 | 段落盘 Flush 命令通道 | 周期 + 收尾持久化 | §4 |
 
 ---
 
@@ -67,6 +70,24 @@ graph TB
   node 的等待者（其他链路的在途请求不受影响），这是 parrot 的精准故障隔离。
 - **NoopLookup**：websearch 是纯客户端（不接收外部 actor 寻址），LocalLookup 返回
   None 即可——parrot 允许「只出不进」的节点形态。
+
+### 1.1 反拨注册形态（registry——`--bind :19870`）
+
+direct 形态应用主动拨网关；registry 形态反转——应用监听 `--bind` 端口，网关带
+`parrot=应用IP:19870` 参数启动，**主动反拨**注册：
+
+```rust
+// 应用侧（main.rs 组网分支）：监听 + 等三网关注册（≤ --wait 秒）
+let client = RemoteActorSystem::new(
+    RemoteConfig::tcp("websearch", bind_addr),  // 监听形态——ingress 接受入连
+    Arc::new(NoopLookup),
+).unwrap();
+// 网关侧：parrot=IP:19870 → 拨号 + HANDSHAKE → 应用 links 表登记该节点
+```
+
+为什么生产推荐反拨：① 应用零网关地址知识（网关增减不改应用参数）；② 网关在内网
+NAT 后也可组网（只需应用侧一个公网口）；③ 网关重启自动重拨——应用不感知地址变化。
+compose 多容器形态（`deploy/compose.sh`）跑的就是这形态——容器间跨 bridge 网真实验证。
 
 ---
 
@@ -392,6 +413,28 @@ graph LR
 `/jvm/user/` 前缀得 `search` → BridgeActor resolve `ComponentRoutes.get("search")` →
 AskPattern 问 search actor。deploy 与 ask 的键空间对齐是 R4 阶段修的对偶 bug（曾因
 注册 `/user/search` 查 `search` 不中）。
+
+### 5.5 Drain 幂等重部署（应用重启场景）
+
+网关进程长存、应用可反复重启——但 admin-v2 Deploy 对同名组件会报
+`actor name [search] is not unique!`（组件还在网关里活着）。websearch 的 deploy
+包装层做了幂等：
+
+```rust
+// main.rs deploy 闭包调用点（伪码）
+match deploy(&node, name, artifact).await {
+    Ok(r) => r,
+    Err(e) if e.contains("not unique") => {
+        client.drain_component(&node, name, 30s).await;  // 优雅排空 + 停组件
+        deploy(&node, name, artifact_retry).await        // 重部署
+    }
+    Err(e) => panic!(…),
+}
+```
+
+parrot 侧链路：`DeployComponent → 0x0a06 失败（not unique）→ DrainComponent`
+（drain 语义 = 停止接收新 ask + 排空在途 + stop actor）`→ 再次 Deploy`。
+serve-only 形态每次启动都走这条路——「网关不动、应用随便重启」的运维常态由此成立。
 
 ---
 

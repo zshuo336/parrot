@@ -109,6 +109,26 @@ Ray 通道复用 Python 分词（词条布局 `len|term|docid|tf` 四方言同�
 - Web 服务**边爬边开**（爬取启动即监听）——站点/分词表页实时可见爬取进度
 - 数据目录：默认**全新爬取**（清旧索引段+去重表——历次残留不混入 /docs 统计）；
   `--keep` 续爬（保留旧索引与去重表——增量模式）
+- **周期段落盘**（60s 一次）：爬取中途崩溃/中断后 `--serve-only` 可回放已爬部分——
+  段为全量快照式（回放幂等，docid 覆盖）
+- **deploy 幂等**：网关进程长存（重启应用不重启网关）——同名组件已在位时自动
+  drain + 重部署（serve-only/应用重启不再 name 冲突 panic）
+
+## 全场景测试（tests/run_all.sh）
+
+```bash
+apps/websearch/tests/run_all.sh          # 全量（含 docker compose 多容器）
+apps/websearch/tests/run_all.sh --fast   # 快速（跳过 compose——本机四进程形态）
+```
+
+| 组 | 场景 | 覆盖点 |
+|---|---|---|
+| A 组网 | A1 direct 拨号 / A2 registry 反拨 / A3 compose 4 容器 | 三种组网拓扑真实 TCP 全链 |
+| B 生命周期 | B1 冷启动 / B2 `--keep` 续爬 / B3 serve-only 回放 | 数据目录三策略 + 段回放 |
+| C 协议 | `/` 搜索 / `/docs` / `/terms` / `/stats` | 四 HTTP 端点 + BM25 高亮 |
+| D 健壮性 | D1 死种子自愈 / D2 残留清空 / D3 端口顺延 / D4 网关迟到 | 回填种子 / 8330 占用顺延 / 30s 重试窗 |
+| E 边界 | E1 分页越界钳制 / E2 空库浏览 | p=999 渲染末页 / 空索引不 panic |
+
 
 ## 站点与分词表浏览（用户裁定 1/2）
 

@@ -134,6 +134,58 @@ flowchart TB
 直接再次运行全链命令——`data/dedupe.tsv` 持久去重保证已爬 URL 不重复入队；新发现的
 URL 入 frontier；akka 侧 docId（sha256(url)）幂等 upsert。`--data` 指向同一目录即可。
 
+### 3.5 四种部署拓扑（debug → 演练 → 模拟多机 → 真实多机）
+
+| 拓扑 | 命令 | 网关位置 | 网络边界 |
+|---|---|---|---|
+| ① direct 单机调试 | `apps/websearch/run.sh [seed]` | 本机三进程 127.0.0.1:1987x | 回环 |
+| ② registry 单机反拨 | `apps/websearch/deploy/run-registry.sh` | 本机三进程 → 反拨 :19870 | 回环+控制面 |
+| ③ compose 4 容器 | `apps/websearch/deploy/compose.sh up [-- --sites N …]` | ws-erl/ws-ray/ws-jvm 容器 | bridge 172.30.0.0/16 |
+| ④ 真实多机 | `deploy/distribute.sh` + `start-remote.sh` | 各物理机守护 | 真实跨机 |
+
+**② registry（生产组网形态预演）**——应用零网关地址知识，网关反拨注册：
+
+```bash
+# 应用侧（任意机器）
+./target/release/websearch --bind 0.0.0.0:19870 --wait 60 --port 8080
+# 网关侧（任意机器，制品先 distribute.sh 分发）
+apps/websearch/deploy/start-remote.sh erl <应用IP>:19870
+```
+
+**③ compose（单机模拟多物理机）**——4 容器真实跨网 TCP + 容器化 admin-v2 Deploy：
+
+```bash
+apps/websearch/deploy/compose.sh up -- --sites 20 --maxdepth 3
+apps/websearch/deploy/compose.sh stats    # /stats 快照
+apps/websearch/deploy/compose.sh logs     # 跟 ws-app 日志
+apps/websearch/deploy/compose.sh down     # 销毁（down -v 连数据卷）
+```
+
+镜像来自框架 `deploy/images/gw-*.Dockerfile`（erl 27 / jdk 21 / py3.11+ray /
+musl 静态二进制——cargo-zigbuild 交叉编译）；app 制品 volume 挂载，改 app 代码
+只需 `build.sh` + `compose.sh up`（不重建镜像）。国内网络经 `WS_REGISTRY_PREFIX`
+走镜像加速器。
+
+**④ 真实多机**：`deploy/distribute.sh user@host1,host2` 打包推送三方言制品与依赖，
+远端 `start-remote.sh <方言> <应用IP>:19870 [--data /var/lib/websearch]` 守护启动。
+
+### 3.6 全场景测试套件
+
+```bash
+apps/websearch/tests/run_all.sh          # 全量（约 10 分钟——含 compose）
+apps/websearch/tests/run_all.sh --fast   # 快速（跳过 compose）
+```
+
+矩阵（A 组网 × B 生命周期 × C 协议 × D 健壮性 × E 边界——共 20+ 断言）：
+
+| 组 | 场景 |
+|---|---|
+| A | direct 连三网关 / registry 反拨全注册 / compose 4 容器跨网 |
+| B | 冷启动清残留 / `--keep` 续爬 / serve-only 段回放 + deploy 幂等 |
+| C | `/stats` `/docs` `/terms` `/` 四端点 |
+| D | 死种子自动回填 / 端口占用顺延 / 网关迟到 30s 重试窗 |
+| E | 分页越界钳制（p=999 渲染末页）/ 空库浏览 |
+
 ---
 
 ## 4. 部署过程的 parrot 机制沙盘推演
@@ -345,6 +397,9 @@ grep "ray 分词统计" app.log; grep "akka 索引" app.log
 
 # 段文件在长
 ls -la apps/websearch/data/index/
+
+# 周期落盘在跑（60s 一次——崩溃后 serve-only 可回放的最后一致点）
+grep "周期段落盘" app.log | tail -2
 ```
 
 ---
@@ -359,6 +414,10 @@ ls -la apps/websearch/data/index/
 | deploy panic `SPAWN_FAILED load_file` | erlang/ 无 .beam | `cd apps/websearch/erlang && erlc frontier.erl` |
 | deploy panic `ClassNotFoundException: …JiebaSegmenter` | thin jar（旧构建） | 重跑 `jvm/build.sh`（fat 打包） |
 | search actor 起后连接断 + `prob_emit` NPE | fat jar 缺 viterbi 资源 | 确认 build.sh 含 `prob_emit.txt` 解包 |
+| deploy panic `actor name [search] is not unique` | 网关长存已部署过 search——旧版无幂等 | 新版已改：自动 drain + 重部署；若旧版遇此，重启 jvm 网关即可 |
+| 容器 `exec format error` | 在 amd64 容器跑 arm 二进制（或反之） | `build.sh` 走 cargo-zigbuild 交叉编译 musl；确认 `deploy/images/gw-app.Dockerfile` 与宿主架构一致 |
+| 容器 jvm `UnsupportedClassVersionError 65.0` | jdk 17 容器跑 jdk 21 字节码 | 框架镜像已升级 jdk 21（`gw-jvm.Dockerfile`）；`docker compose build --no-cache ws-jvm` 重建 |
+| 容器 erl `badfile` | 宿主 OTP 版本 ≠ 容器（beam 不兼容） | 容器启动时 `erlc` 现编译（源码分发）——确认 volume 挂的是 `.erl` 源 |
 | 词条乱码 / terms 异常少 | Terms 布局方言不一致（回归） | 校验 tokenizer.py `len+term+docid+tf` 序 |
 | 爬取全 403 | 目标站反爬（如 baike.baidu.com） | 换种子（runoob/MDN 中文/w3school） |
 | 爬取卡住 inflight 不降 | 旧版并发计数 bug（已修） | 确认二进制为修复后构建 |
