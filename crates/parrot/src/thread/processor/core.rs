@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{debug, error};
 
 use parrot_api::actor::Actor;
 use parrot_api::errors::ActorError;
-use parrot_api::types::{ActorResult, BoxedActorRef, BoxedMessage};
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 
 use crate::thread::actor::ThreadActor;
 use crate::thread::config::ThreadActorConfig;
@@ -109,6 +109,21 @@ pub trait ProcessorInterface: ProcessorStatsTrait + Any + Send + Sync + 'static 
     fn as_any_ref(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
+    /// Cancel suspended execution without cancelling unrelated actors.
+    fn cancel_processing(&self) {}
+
+    /// Stop actor-owned timers independently of the actor/context lock.
+    fn cancel_context_tasks(&self) {}
+    fn join_context_tasks(&self) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Resolves once cancellation has been requested. Implementations that
+    /// cannot be cancelled retain the default pending future.
+    fn processing_cancelled(&self) -> parrot_api::types::BoxedFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+
     /// M2 reduction accounting: consecutive messages processed since the
     /// last empty-mailbox drain. Workers consult this for fairness yields.
     fn consecutive_reductions(&self) -> usize {
@@ -150,6 +165,12 @@ where
     /// Actor path (plain string copy, avoids borrow of self-referential ActorPath)
     path: String,
 
+    /// Captured independently of the context lock; failure callbacks must
+    /// identify their original generation even after a replacement exists.
+    system: crate::thread::context::WeakSystemRef,
+    mailbox: Option<crate::thread::mailbox::WeakMailboxRef>,
+    tasks: Arc<crate::context_tasks::ContextTasks>,
+
     /// Actor config
     config: ThreadActorConfig,
 
@@ -164,6 +185,8 @@ where
     /// monopolization count). Used to force a fairness yield so one slow
     /// actor with a permanent backlog cannot starve others.
     consecutive_reductions: AtomicUsize,
+    cancelled: AtomicBool,
+    cancel_notify: tokio::sync::Notify,
 }
 
 impl<A> ActorProcessor<A>
@@ -178,6 +201,9 @@ where
         config: ThreadActorConfig,
     ) -> Self {
         Self {
+            system: context.system_weak_ref(),
+            mailbox: context.generation_mailbox(),
+            tasks: context.tasks(),
             actor: AsyncMutex::new(actor),
             context: AsyncMutex::new(context),
             path,
@@ -185,6 +211,8 @@ where
             status: Arc::new(AtomicUsize::new(ProcessorStatus::Initializing as usize)),
             stats: Arc::new(ProcessorStats::new()),
             consecutive_reductions: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            cancel_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -233,6 +261,8 @@ where
         self.status
             .store(ProcessorStatus::Stopping as usize, Ordering::SeqCst);
 
+        self.tasks.close();
+        let tasks_result = self.tasks.join().await;
         let stop_msg = Box::new(ControlMessage::Stop);
         let mut actor = self.actor.lock().await;
         let mut context = self.context.lock().await;
@@ -248,7 +278,7 @@ where
         }
         self.status
             .store(ProcessorStatus::Stopped as usize, Ordering::SeqCst);
-        Ok(())
+        tasks_result.map_err(|error| SystemError::ShutdownError(error.to_string()))
     }
 
     /// Initialize and start the actor
@@ -367,7 +397,7 @@ where
         let _ = budget_exhausted_hint; // worker consults consecutive_reductions() directly
 
         for _ in 0..effective_max {
-            if self.get_status() != ProcessorStatus::Running {
+            if self.get_status() != ProcessorStatus::Running || mailbox.is_closed().await {
                 break;
             }
 
@@ -455,13 +485,8 @@ where
     /// executor (restart / stop / escalate) runs detached on the system
     /// runtime so the worker loop never blocks on the decision.
     pub(crate) fn notify_system_panic(&self, panic_msg: String) {
-        let weak = self
-            .context
-            .try_lock()
-            .ok()
-            .map(|guard| guard.system_weak_ref());
-        if let Some(system) = weak.and_then(|w| w.upgrade()) {
-            system.runtime_spawn_supervision(self.path.clone(), panic_msg);
+        if let (Some(system), Some(mailbox)) = (self.system.upgrade(), self.mailbox.clone()) {
+            system.runtime_spawn_supervision(self.path.clone(), mailbox, panic_msg);
         }
     }
 
@@ -525,6 +550,31 @@ impl<A> ProcessorInterface for ActorProcessor<A>
 where
     A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
+    fn cancel_context_tasks(&self) {
+        self.tasks.close();
+    }
+
+    fn join_context_tasks(&self) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async move { self.tasks.join().await })
+    }
+
+    fn cancel_processing(&self) {
+        self.tasks.close();
+        self.cancelled.store(true, Ordering::Release);
+        self.cancel_notify.notify_waiters();
+    }
+
+    fn processing_cancelled(&self) -> parrot_api::types::BoxedFuture<'_, ()> {
+        Box::pin(async move {
+            let notified = self.cancel_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.cancelled.load(Ordering::Acquire) {
+                notified.await;
+            }
+        })
+    }
+
     fn is_initialized(&self) -> bool {
         let status = self.get_status();
         status != ProcessorStatus::Initializing && status != ProcessorStatus::Failed

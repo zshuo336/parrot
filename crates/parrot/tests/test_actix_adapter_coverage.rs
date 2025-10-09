@@ -142,8 +142,8 @@ fn actix_actor_nested_parrot_impl() {
 
         // -- receive_message_with_engine: forwards to inner → Some(101) --
         {
-            let data = 0u32;
-            let raw: NonNull<dyn Any> = NonNull::from(&data);
+            let mut data = 0u32;
+            let raw: NonNull<dyn Any> = NonNull::from(&mut data);
             let h = unsafe { EngineContextHandle::from_raw(raw) };
             // M6: 同步快路径经扩展 trait；适配层转发到 inner（Inner 实现了
             // ActixEngineExt），默认 None 时走 async 错误臂。
@@ -351,21 +351,13 @@ fn dispatch_before_started_reports_diagnostic() {
         let addr = raw_ctx.run(unstarted);
         let _ = &addr; // run() returns the actor's Addr; drive it implicitly
         tokio::time::sleep(Duration::from_millis(20)).await;
-        match rx.await {
-            Ok(v) => {
-                let err = v.expect("Some(_)").expect_err("diagnostic error");
-                assert!(
-                    err.to_string().contains("context not initialized"),
-                    "{}",
-                    err
-                );
-            }
-            Err(_) => {
-                // Channel dropped when the actor context finishes without
-                // sending — the branch executed and the actor stopped; the
-                // critical property (no panic / no hang) still held.
-            }
-        }
+        let err = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("diagnostic must resolve")
+            .expect("reply channel must remain live")
+            .expect("Some error reply")
+            .expect_err("diagnostic error");
+        assert!(err.to_string().contains("context not initialized"), "{err}");
     });
 }
 
@@ -384,7 +376,13 @@ fn actix_context_full_surface() {
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
         let mut pctx = ActixContext::new(
             addr.clone(),
-            parrot_api::address::ActorPath::placeholder("surf"),
+            parrot_api::address::ActorPath::new(
+                std::sync::Arc::new(parrot::actix::ActixActorRef::new(
+                    addr.clone(),
+                    "surf".into(),
+                )),
+                "surf".into(),
+            ),
         );
 
         // accessors
@@ -424,9 +422,6 @@ fn actix_context_full_surface() {
         assert!(pctx.watch(parent_ref.clone_boxed()).await.is_err());
         assert!(pctx.unwatch(parent_ref.clone_boxed()).await.is_err());
 
-        // stop future resolves Ok.
-        assert!(pctx.stop().await.is_ok());
-
         // send/ask through the context to a live target.
         let target: BoxedActorRef = Box::new(parrot::actix::reference::ActixActorRef::new(
             addr.clone(),
@@ -445,12 +440,16 @@ fn actix_context_full_surface() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         // The target received Add(5) — observable via its state.
         let r: u64 = target.ask(Add(0)).await.unwrap();
-        assert!(r >= 5);
+        assert_eq!(r, 5);
+        pctx.stop().await.unwrap();
+        assert!(
+            !addr.connected(),
+            "context stop must close its actual actor"
+        );
     });
 }
 
-// schedule_periodic spawns an infinite loop — verify one tick fires, then
-// let the System teardown cancel the task (it must not block shutdown).
+// Registration returns promptly; dropping the standalone context cancels ticks.
 #[test]
 fn actix_context_schedule_periodic_one_tick() {
     use parrot::actix::context::ActixContext;
@@ -466,27 +465,38 @@ fn actix_context_schedule_periodic_one_tick() {
             addr.clone(),
             "test://per".into(),
         ));
-        let target_for_task = target.clone_boxed();
         // Cloneable Add ticks: each delivery increments the actor's value.
         let cm = parrot_api::message::CloneableMessage::from_message(Add(1));
-        // Drive the periodic future concurrently and abandon it after one
-        // interval — the spawned sends keep going on the runtime; System
-        // teardown cancels them.
-        // The periodic future only returns via cancellation; own the
-        // context inside the spawned task and abandon it there.
-        actix::spawn(async move {
-            let _ = pctx
-                .schedule_periodic(
-                    target_for_task.clone_boxed(),
-                    cm,
-                    Duration::from_millis(5),
-                    Duration::from_millis(5),
-                )
-                .await;
-        });
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        let r: u64 = target.ask(Add(0)).await.unwrap();
-        assert!(r >= 1, "at least one periodic tick delivered: {}", r);
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            pctx.schedule_periodic(
+                target.clone_boxed(),
+                cm,
+                Duration::from_millis(5),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let count: u64 = target.ask(Add(0)).await.unwrap();
+                if count > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(pctx);
+        // Allow an already admitted tick to drain, then verify no publisher remains.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let stopped: u64 = target.ask(Add(0)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let later: u64 = target.ask(Add(0)).await.unwrap();
+        assert_eq!(later, stopped);
     });
 }
 
@@ -687,10 +697,10 @@ fn actix_system_inspection_surface() {
         let dbg = format!("{:?}", pool);
         assert!(dbg.contains("ArbiterPool"));
 
-        // Shared-pool caching path: new() returns the cached instance.
+        // Distinct systems own independent pools within the same Actix host.
         let sys2 = ActixActorSystem::new()
             .await
-            .expect("second system shares pool");
+            .expect("second independent system");
         assert!(sys2.arbiter_size() >= 1);
         assert!(sys.arbiter_size() >= 1);
 

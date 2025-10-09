@@ -99,6 +99,9 @@ pub struct ThreadActorSystemConfig {
     /// The default capacity for actor mailboxes if not specified.
     pub default_mailbox_capacity: usize,
 
+    /// Maximum outstanding timer tasks per actor. Zero disables scheduling.
+    pub max_context_tasks: usize,
+
     /// The default timeout duration for `ask` operations.
     pub default_ask_timeout: Duration,
 
@@ -128,6 +131,7 @@ impl Default for ThreadActorSystemConfig {
                 max_messages_per_run: 10,
             },
             default_mailbox_capacity: 1024,
+            max_context_tasks: crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS,
             default_ask_timeout: Duration::from_secs(5),
             default_supervisor_strategy: SupervisorStrategy::Restart {
                 max_retries: 3,
@@ -155,6 +159,7 @@ impl ThreadActorSystemConfig {
             shared_queue_capacity: r.thread.shared_queue_capacity,
             max_dedicated_threads: r.thread.max_dedicated_threads,
             default_mailbox_capacity: r.thread.default_mailbox_capacity,
+            max_context_tasks: r.thread.max_context_tasks,
             default_ask_timeout: std::time::Duration::from_millis(r.thread.default_ask_timeout_ms),
             shutdown_timeout: std::time::Duration::from_millis(r.thread.shutdown_timeout_ms),
             ..d

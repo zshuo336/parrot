@@ -33,6 +33,8 @@ where
 {
     /// The underlying Actix address
     addr: Arc<Addr<A>>,
+    stop_control: Option<Arc<crate::actix::lifecycle::ActorControl>>,
+    tasks: Arc<crate::context_tasks::ContextTasks>,
     /// Actor path in the system
     path: ActorPath,
     /// The actor's parent reference
@@ -67,10 +69,23 @@ where
     pub fn new(addr: Addr<A>, path: ActorPath) -> Self {
         Self {
             addr: Arc::new(addr),
+            stop_control: None,
+            tasks: crate::context_tasks::ContextTasks::new(
+                crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS,
+            ),
             path,
             parent: None,
             children: None,
         }
+    }
+
+    pub(crate) fn with_control(
+        mut self,
+        control: Arc<crate::actix::lifecycle::ActorControl>,
+    ) -> Self {
+        self.tasks = control.tasks.clone();
+        self.stop_control = Some(control);
+        self
     }
 
     /// Create a new ActixContext with a parent reference
@@ -105,16 +120,18 @@ where
 
     /// Stop the actor execution
     ///
-    /// This will terminate the actor after any in-progress
-    /// message handling completes.
+    /// Requests cancellation of the current dispatch and starts owned cleanup.
+    /// Self-stop returns after requesting it; external managed references can join completion.
     fn stop<'a>(&'a mut self) -> BoxedFuture<'a, ActorResult<()>> {
-        // Use a local reference to the inner context
-        let _addr = self.addr.clone();
         Box::pin(async move {
-            // Send stop message to the actor
-            // Actix doesn't expose stop method directly on Addr
-            // This will be implemented in actor system
-            Ok(())
+            self.tasks.close();
+            if let Some(control) = &self.stop_control {
+                // Self-stop requests cancellation; awaiting own disposal would deadlock.
+                control.request_stop(tokio::time::Instant::now() + control.timeout);
+                Ok(())
+            } else {
+                self.path.target.stop().await
+            }
         })
     }
 
@@ -124,13 +141,7 @@ where
         target: BoxedActorRef,
         msg: parrot_api::types::BoxedMessage,
     ) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
-            target
-                .send(msg)
-                .await
-                .map_err(|e| ActorError::Other(anyhow!("Failed to send message: {}", e)))?;
-            Ok(())
-        })
+        Box::pin(async move { target.deliver(msg).await })
     }
 
     /// Send a message to another actor and wait for a response
@@ -139,13 +150,7 @@ where
         target: BoxedActorRef,
         msg: parrot_api::types::BoxedMessage,
     ) -> BoxedFuture<'a, ActorResult<parrot_api::types::BoxedMessage>> {
-        Box::pin(async move {
-            let result = target
-                .send(msg)
-                .await
-                .map_err(|e| ActorError::Other(anyhow!("Failed to send message: {}", e)))?;
-            Ok(result)
-        })
+        Box::pin(async move { target.send(msg).await })
     }
 
     /// Schedule a one-time delayed message
@@ -155,24 +160,14 @@ where
         msg: parrot_api::types::BoxedMessage,
         delay: std::time::Duration,
     ) -> BoxedFuture<'a, ActorResult<()>> {
-        // Use a local reference to the inner context
-        let _addr = self.addr.clone();
-
         Box::pin(async move {
-            // Create a delayed task using actix runtime
-            actix::spawn(async move {
-                // Wait for the specified delay
-                actix::clock::sleep(delay).await;
-
-                // Send the message after delay
-                target.send(msg).await.ok(); // Ignore send errors for scheduled messages
-            });
-
+            let task = self.tasks.once(target, msg, delay)?;
+            actix::spawn(task);
             Ok(())
         })
     }
 
-    /// Schedule a recurring message
+    /// Register a fixed-delay timer owned by this actor generation.
     fn schedule_periodic<'a>(
         &'a self,
         target: BoxedActorRef,
@@ -180,23 +175,10 @@ where
         initial_delay: std::time::Duration,
         interval: std::time::Duration,
     ) -> BoxedFuture<'a, ActorResult<()>> {
-        // Use a local reference to the inner context
-        let _addr = self.addr.clone();
-
         Box::pin(async move {
-            // Wait for the initial delay
-            actix::clock::sleep(initial_delay).await;
-            // Send the message after initial delay
-            target.send(msg.clone().into_boxed()).await.ok();
-
-            // Create a periodic task
-            loop {
-                // Wait for the interval
-                actix::clock::sleep(interval).await;
-
-                // Send the message after interval
-                target.send(msg.clone().into_boxed()).await.ok();
-            }
+            let task = self.tasks.periodic(target, msg, initial_delay, interval)?;
+            actix::spawn(task);
+            Ok(())
         })
     }
 

@@ -1,5 +1,6 @@
 use crate::actix::actor::ActixActor;
 use crate::actix::context::ActixContext;
+use crate::actix::lifecycle::ActorControl;
 use crate::actix::message::ActixMessageWrapper;
 use actix::Addr;
 use actix::prelude::SendError;
@@ -9,6 +10,7 @@ use parrot_api::actor::Actor as ParrotActor;
 use parrot_api::address::ActorRef;
 use parrot_api::errors::ActorError;
 use parrot_api::message::{MessageEnvelope, MessageOptions};
+use parrot_api::typed_channel::TypedActorLifecycle;
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use std::any::Any;
 use std::sync::Arc;
@@ -47,6 +49,8 @@ where
     addr: Arc<Addr<ActixActor<A>>>,
     /// Path to the actor in the system
     path: String,
+    control: Option<Arc<ActorControl>>,
+    default_timeout: Option<Duration>,
 }
 
 impl<A> ActixActorRef<A>
@@ -61,7 +65,19 @@ where
         Self {
             addr: Arc::new(addr),
             path,
+            control: None,
+            default_timeout: None,
         }
+    }
+
+    pub(crate) fn with_control(
+        mut self,
+        control: Arc<ActorControl>,
+        ask_timeout: Duration,
+    ) -> Self {
+        self.control = Some(control);
+        self.default_timeout = Some(ask_timeout);
+        self
     }
 
     pub fn get_addr(&self) -> &Addr<ActixActor<A>> {
@@ -165,20 +181,22 @@ where
 
     /// Fire-and-forget delivery: enqueue and return immediately.
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        let addr = self.addr.clone();
         Box::pin(async move {
-            // do_send never blocks: actix mailboxes are unbounded; closed
-            // mailboxes silently drop (documented actix semantics). We
-            // surface closure via connected() for observability.
-            if !addr.connected() {
-                return Err(ActorError::InternalError(
-                    "Actor mailbox closed (actor stopped)".to_string(),
-                ));
+            if self
+                .control
+                .as_ref()
+                .is_some_and(|control| control.channel.is_sealed())
+            {
+                return Err(ActorError::Stopped);
             }
             let wrapper =
                 Self::create_envelope_static(msg, None, MessageOptions::default(), "tell");
-            addr.do_send(wrapper);
-            Ok(())
+            self.addr.try_send(wrapper).map_err(|error| match error {
+                SendError::Closed(_) => ActorError::Stopped,
+                SendError::Full(_) => {
+                    ActorError::MessageHandlingError("Actix mailbox is full".into())
+                }
+            })
         })
     }
 
@@ -200,42 +218,57 @@ where
         let wrapper = self.create_envelope(msg, None, MessageOptions::default(), "unknown");
         let addr = self.addr.clone();
 
-        // Send the message via Actix
+        let timeout = timeout.or(self.default_timeout);
         Box::pin(async move {
-            let mut result_fut = addr.send(wrapper);
-            if let Some(timeout) = timeout {
-                result_fut = result_fut.timeout(timeout);
-            }
-            match result_fut.await {
-                Ok(Some(result)) => result,
-                Ok(None) => Err(ActorError::MessageHandlingError(
-                    "No response from actor".to_string(),
-                )),
-                Err(e) => Err(ActorError::Other(anyhow!(
-                    "Failed to deliver message: {}",
-                    e
-                ))),
+            let request = async {
+                let request = addr.send(wrapper);
+                let result = match timeout {
+                    Some(duration) => {
+                        tokio::time::timeout(duration, request).await.map_err(|_| {
+                            ActorError::TimeoutDetail(format!(
+                                "Request to actor {} timed out after {}ms",
+                                self.path,
+                                duration.as_millis()
+                            ))
+                        })?
+                    }
+                    None => request.await,
+                };
+                match result {
+                    Ok(Some(result)) => result,
+                    Ok(None) => Err(ActorError::MessageHandlingError(
+                        "No response from actor".into(),
+                    )),
+                    Err(e) => Err(ActorError::Other(anyhow!(
+                        "Failed to deliver message: {}",
+                        e
+                    ))),
+                }
+            };
+            if let Some(control) = &self.control {
+                tokio::select! { biased; _ = control.channel.closed() => Err(ActorError::Stopped), result = request => result }
+            } else {
+                request.await
             }
         })
     }
 
     /// Stop the actor
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        let addr = self.addr.clone();
-
         Box::pin(async move {
-            // Wrap StopMessage in an ActixMessageWrapper
-            let msg = Box::new(StopMessage) as BoxedMessage;
-            let envelope = MessageEnvelope {
-                id: uuid::Uuid::new_v4(),
-                payload: msg,
-                sender: None,
-                options: Default::default(),
-                message_type: "stop",
-            };
-            let wrapper = ActixMessageWrapper { envelope };
-            addr.do_send(wrapper);
-            Ok(())
+            if let Some(control) = &self.control {
+                return control.stop().await;
+            }
+            // Raw Actix addresses have no system owner. At least wait for actual
+            // closure, rather than returning success after merely queuing stop.
+            self.addr.do_send(StopMessage);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.addr.connected() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .map_err(|_| ActorError::TimeoutDetail("raw Actix actor did not stop".into()))
         })
     }
 
@@ -250,7 +283,11 @@ where
 
         Box::pin(async move {
             // In Actix, we can check if the address is connected
-            addr.connected()
+            !self
+                .control
+                .as_ref()
+                .is_some_and(|control| control.channel.is_sealed())
+                && addr.connected()
         })
     }
 
@@ -259,6 +296,8 @@ where
         Box::new(Self {
             addr: self.addr.clone(),
             path: self.path.clone(),
+            control: self.control.clone(),
+            default_timeout: self.default_timeout,
         })
     }
 

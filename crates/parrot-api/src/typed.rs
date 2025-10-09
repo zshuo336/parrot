@@ -77,6 +77,17 @@ pub trait ParrotTypedDispatch: Send + 'static {
     /// 回复枚举：每个协议回复一个变体（`<M as Message>::Result`）。
     type Reply: Send + 'static;
 
+    /// Initialize before the first dispatch. Managed engines run this once.
+    fn init(&mut self) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Release actor-owned resources after dispatch is cancelled on stop.
+    /// The owning system's deadline also bounds this hook.
+    fn before_stop(&mut self) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// 分派一条枚举消息到 actor 的对应 `TypedReceive<M>` impl。
     fn dispatch<'a>(&'a mut self, msg: Self::Msg) -> BoxedFuture<'a, ActorResult<Self::Reply>>;
 }

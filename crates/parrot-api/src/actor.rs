@@ -101,86 +101,75 @@ pub trait ActorFactory<A: Actor>: Send + 'static {
     fn create(&self, config: A::Config) -> A;
 }
 
-/// Safe wrapper around the raw engine context pointer passed to
-/// [`Actor::receive_message_with_engine`] (ADR-2 mitigation).
+/// Exclusive, lifetime-bound access to the native engine context used by
+/// [`ActixEngineExt::receive_message_with_engine`].
 ///
-/// # Overview
-/// The engine (currently only the Actix adapter) constructs this handle
-/// from the live native context pointer for the duration of the synchronous
-/// dispatch call. The pointer is guaranteed by the engine to be:
+/// Engines construct this handle with [`Self::new`] from their live mutable
+/// context borrow. Safe handlers can downcast it but cannot retain it beyond
+/// that borrow or alias the context while it is in use.
 ///
-/// - **dereferenceable** for the whole call (the native context outlives
-///   the handler invocation), and
-/// - **not written concurrently** (actor dispatch is serial within one
-///   actor).
-///
-/// The only `unsafe` involved is a single [`EngineContextHandle::from_raw`]
-/// call inside the engine adapter, carrying the contract documented on that
-/// method. User code receives the handle and only uses the safe
-/// `downcast_ref` / `downcast_mut` borrows — no raw pointers, no lifetime
-/// escape.
-///
-/// # Usage
-/// Replace raw-pointer boilerplate in engine handlers:
-///
-/// ```ignore
-/// // before
-/// let engine_ctx_ref = unsafe { engine_ctx.as_ref() };
-/// if let Some(ctx) = engine_ctx_ref.downcast_ref::<MyEngineCtx>() { ... }
-///
-/// // after
-/// if let Some(ctx) = engine_ctx.downcast_ref::<MyEngineCtx>() { ... }
+/// A borrowed context cannot escape into static storage:
+/// ```compile_fail
+/// use parrot_api::actor::EngineContextHandle;
+/// fn escape(handle: EngineContextHandle<'_>) -> EngineContextHandle<'static> {
+///     handle
+/// }
 /// ```
 ///
-/// # Engine support
-/// - **actix**: the handle wraps `&mut ActixActor<...>::Context` (the
-///   native actix context). Downcasting to that type grants access to
-///   timers, spawning, address book, and stream registration.
-/// - **thread**: the engine never calls `receive_message_with_engine`, so
-///   no handle is ever produced.
-pub struct EngineContextHandle {
-    ptr: NonNull<dyn Any>,
+/// The original context cannot be accessed while the handle still uses it:
+/// ```compile_fail
+/// use parrot_api::actor::EngineContextHandle;
+/// let mut value = 42_u32;
+/// let handle = EngineContextHandle::new(&mut value);
+/// value = 7;
+/// assert_eq!(handle.downcast_ref::<u32>(), Some(&42));
+/// ```
+///
+/// Nor can a handle to a local context be returned:
+/// ```compile_fail
+/// use parrot_api::actor::EngineContextHandle;
+/// fn invalid<'a>() -> EngineContextHandle<'a> {
+///     let mut value = 42_u32;
+///     EngineContextHandle::new(&mut value)
+/// }
+/// ```
+pub struct EngineContextHandle<'ctx> {
+    context: &'ctx mut dyn Any,
 }
 
-impl std::fmt::Debug for EngineContextHandle {
+impl std::fmt::Debug for EngineContextHandle<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineContextHandle")
             .finish_non_exhaustive()
     }
 }
 
-impl EngineContextHandle {
-    /// Create a handle from a raw engine context pointer.
-    ///
-    /// This is the single `unsafe` boundary of the ADR-2 mitigation and is
-    /// meant to be called once by the engine adapter, not by user code.
+impl<'ctx> EngineContextHandle<'ctx> {
+    /// Borrow the native context exclusively for the lifetime of this handle.
+    pub fn new(context: &'ctx mut dyn Any) -> Self {
+        Self { context }
+    }
+
+    /// Construct from a foreign engine's raw pointer. Prefer [`Self::new`]
+    /// whenever a Rust reference is available.
     ///
     /// # Safety
-    /// The caller must uphold:
-    /// 1. `ptr` is dereferenceable for the duration of the synchronous
-    ///    `receive_message_with_engine` call this handle is passed into.
-    /// 2. No other thread accesses the pointee mutably while the handle
-    ///    is alive (actor dispatch is serial).
-    /// 3. The handle must not outlive the call it was created for.
-    pub unsafe fn from_raw(ptr: NonNull<dyn Any>) -> Self {
-        Self { ptr }
+    /// The pointee must be initialized, aligned, and valid for all of `'ctx`.
+    /// The caller must guarantee exclusive access for that entire lifetime,
+    /// including preventing other references or raw pointers from accessing it.
+    pub unsafe fn from_raw(mut ptr: NonNull<dyn Any>) -> Self {
+        // SAFETY: the caller grants a valid exclusive borrow for `'ctx`.
+        Self::new(unsafe { ptr.as_mut() })
     }
 
-    /// Try to borrow the engine context as `&T`.
+    /// Try to borrow the native context as `&T`.
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        // SAFETY: `from_raw` contract guarantees dereferenceability for the
-        // dispatch call scope, within which this handle lives.
-        unsafe { self.ptr.as_ref() }.downcast_ref::<T>()
+        self.context.downcast_ref::<T>()
     }
 
-    /// Try to borrow the engine context as `&mut T`.
-    ///
-    /// The engine guarantees exclusive access during the synchronous
-    /// dispatch, so a mutable borrow is sound as long as the handler does
-    /// not stash the reference beyond the call.
+    /// Try to borrow the native context as `&mut T`.
     pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
-        // SAFETY: see `from_raw`; dispatch is exclusive within the actor.
-        unsafe { self.ptr.as_mut() }.downcast_mut::<T>()
+        self.context.downcast_mut::<T>()
     }
 }
 
@@ -392,7 +381,7 @@ pub trait ActixEngineExt: Actor {
         &'a mut self,
         msg: BoxedMessage,
         ctx: &'a mut Self::Context,
-        engine_ctx: EngineContextHandle,
+        engine_ctx: EngineContextHandle<'_>,
     ) -> Option<ActorResult<BoxedMessage>> {
         let _ = (msg, ctx, engine_ctx);
         None
@@ -410,11 +399,8 @@ mod engine_context_handle_tests {
         label: String,
     }
 
-    fn mint(data: &mut FakeEngineCtx) -> EngineContextHandle {
-        let raw: NonNull<dyn Any> = NonNull::from(data);
-        // SAFETY (test-side engine simulation): `data` outlives this scope's
-        // use; single-threaded access; handle not stored beyond calls.
-        unsafe { EngineContextHandle::from_raw(raw) }
+    fn mint(data: &mut FakeEngineCtx) -> EngineContextHandle<'_> {
+        EngineContextHandle::new(data)
     }
 
     #[test]

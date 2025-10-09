@@ -170,9 +170,10 @@ pub trait ActorRef: Send + Sync + Debug {
     /// timeout.
     ///
     /// **Unified semantics**: `timeout == None` behaves exactly like
-    /// [`ActorRef::send`] (unbounded ask). `Some(d)` bounds the wait; on
-    /// expiry the *caller* gives up — the message stays enqueued and the
-    /// actor may still process it later.
+    /// [`ActorRef::send`] (unbounded ask). `Some(d)` bounds the whole exchange,
+    /// including waiting for mailbox capacity. Expiry cancels the caller's wait;
+    /// it does not roll back business processing. An already accepted message
+    /// may still be processed, depending on the engine's cancellation semantics.
     fn send_with_timeout<'a>(
         &'a self,
         msg: BoxedMessage,

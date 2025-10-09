@@ -23,6 +23,9 @@
 #max_dedicated_threads = 32
 # actor 默认邮箱容量（默认 1024）
 #default_mailbox_capacity = 1024
+# 每个 actor 同时存活的 Context 定时任务上限（默认 1024；0 禁用）
+# 已完成的一次性任务释放名额；周期任务占一个名额直至停止或投递失败
+#max_context_tasks = 1024
 # ask 默认超时，毫秒（默认 5000）
 #default_ask_timeout_ms = 5000
 # 系统关闭超时，毫秒（默认 10000）

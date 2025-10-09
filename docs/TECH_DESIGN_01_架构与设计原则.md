@@ -55,7 +55,7 @@ Actix 的 `Context<A>` 不是 `Send`，无法跨 await 保存 → Parrot 折衷�
 
 **③ 双路径调度 vs actor 串行语义（2026-10 修复轮新增）**
 
-actix 适配层的 `Handler` 需要同时满足"同步 handler 零开销"与"异步 handler 可表达"。解法是 `AtomicResponse` 双路径：默认走 `receive_message_with_engine` 同步快路径；`use_async_handler() == true` 时改走 `receive_message` 异步路径，future 经 `AsyncDispatchFuture` 挂到 actix `ctx.wait`——**await 期间释放 arbiter 线程给其他 actor，但本 actor 的后续消息排队等待**（与 thread 引擎的 per-actor 串行语义一致）。actor 内串行性与跨 actor 并行性由两个正交机制分别保证。
+actix 适配层的 `Handler` 需要同时满足"同步 handler 零开销"与"异步 handler 可表达"。解法是 `AtomicResponse` 双路径：默认走 `receive_message_with_engine` 同步快路径；`use_async_handler() == true` 时改走 `receive_message` 异步路径，future 拥有处理期间的 actor/context，经 `AtomicResponse` 挂到 actix `ctx.wait`——**await 期间释放 arbiter 线程给其他 actor，但本 actor 的后续消息排队等待**（与 thread 引擎的 per-actor 串行语义一致）。actor 内串行性与跨 actor 并行性由两个正交机制分别保证。
 
 ---
 
@@ -134,16 +134,16 @@ actix 适配层的 `Handler` 需要同时满足"同步 handler 零开销"与"异
 | # | 决策 | 动机 | 代价/后果 |
 |---|------|------|-----------|
 | ADR-1 | 消息统一类型擦除 `Box<dyn Any + Send>` | 后端无关 + 注册表统一 | 每 msg 2 次装箱+2 次 downcast；丢失编译期穷尽匹配。**复审（2026-10）**：擦除是注册表/跨后端的根基，压测非瓶颈，保持 |
-| ADR-2 | 双消息入口 `receive_message` / `receive_message_with_engine(EngineContextHandle)` | 规避 actix Context 非 Send，同时保留引擎能力直通 | ~~API 出现 unsafe 语义泄漏（裸指针进公共 trait）~~ **已缓解（2026-10）**：第三参数改为安全包装 `EngineContextHandle`（仅暴露 `downcast_ref/downcast_mut` 借用），unsafe 收敛到引擎侧唯一铸造点 `ActixActor::handle`；用户代码零裸指针 |
+| ADR-2 | 引擎同步入口接收 `EngineContextHandle<'ctx>`，内部持真实 `&'ctx mut dyn Any`；适配器以 `new(&mut context)` 构造 | 保留原生引擎能力，同时用借用检查约束上下文访问 | 2026-10-09：移除生产 dispatch 的 raw pointer 铸造；三个 compile-fail doctest 覆盖句柄逃逸、重叠访问、返回局部借用。`from_raw` 仅保留给显式 unsafe 的外部引擎互操作，调用者须满足完整生命周期与独占访问契约 |
 | ADR-3 | ~~derive 宏在 `#[cfg(not(test))]` 下让 `receive_message` 直接报错~~ **已修复（2026-10）**：`receive_message` 无条件转发用户 `handle_message` | ~~防止用户在 actix 后端误用异步通道~~ 该防护实际令 derive+thread 引擎生产全断（thread 主路径即 `receive_message`），且阻断 ADR-8/9 的异步能力 | 测试语义 = 生产语义；derive actor 可用 thread 引擎与异步路径；新增 `#[ParrotActor(async_handler = true)]` 生成 `use_async_handler() == true`（ADR-9 的 derive 属性支持，原为宏缺口）。**注意**：`handle_message_engine` 返回 `None` 时 actix 侧现在返回可诊断错误（提示补 handler 或改 async 路径），不再静默丢消息 |
 | ADR-4 | thread 后端双调度模型（SharedPool+DedicatedThread） | IO 密集 vs 计算密集 workload 分治 | 系统复杂度陡增（曾引发 38 错重构阵痛，已清零，见 03 §1）。**实验复审（2026-10）**：单 actor 场景 batch_size 不放大 HOL（batch=1 反而慢 ~2×，见 `worker.rs::batch_size_hol_experiment`）；knob 的真实杠杆是跨 actor 公平性，模型保留 |
 | ADR-5 | 弱引用治理循环依赖 | system↔scheduler↔context 成环 | 运行期可能"目标已死"需到处 upgrade+报错。**复审（2026-10）**：防御性设计的合理代价，保持 |
 | ADR-6 | `ParrotActorSystem` 只聚合、不执行 | 多后端对等、可并行注册 | 泛型 `spawn_root_typed` 无法转发到具体后端（类型约束不同），被迫暴露后端特化方法。**复审（2026-10）**：stable Rust 无 specialization，编译期统一不可行；运行时擦除 spawn 需给 thread 引擎加 dyn Actor 路径、破坏面大收益低，保持现状（`spawn_root_actix` / `spawn_root_thread` 特化入口） |
 | ADR-7 | actix 适配层内置 Arbiter 池（round-robin 分配 spawn） | 单 arbiter 无跨 actor 并行、队头阻塞传染 | 每 arbiter 一个 OS 线程；线程资源与系统生命周期绑定；`System::current()` 上下文外不可用（池懒构建时 panic 转错误路径） |
-| ADR-8 | actix Handler 返回 `AtomicResponse`（同步快路径 + `ctx.wait` 异步路径） | 异步 handler 可表达且同步路径零开销 | 生命周期扩展需 unsafe transmute（安全性论证见 02 §3.1a）；ask 回复经 actix oneshot，`M::Result` 保持 Send |
+| ADR-8 | actix Handler 返回 `AtomicResponse`；异步 future 拥有 actor 与 Parrot context，完成后归还适配器 | 等待期间保持 actor 串行，同时让出 arbiter 给其它 actor；以所有权保障取消安全 | 2026-10-09：删除 lifetime transmute 和自定义 AsyncDispatchFuture。原实现 arbiter 取消时先析构 actor 后析构借用它的 handler，回归测试已复现；新实现先析构 handler 再析构 actor，成功和业务错误均归还真实状态 |
 | ADR-9 | `use_async_handler()` 作为 actor 侧调度路径开关（默认 false） | 存量 actor 行为逐字节兼容；新能力 opt-in | 同一 actor 内不能混用两种路径；~~derive 宏尚未生成该开关的属性支持~~ **已补齐（2026-10）**：`#[ParrotActor(async_handler = true)]` |
 | ADR-10 | **消息原语语义统一（2026-10-02）**：`send`/`send_with_timeout(None)` = 无界 ask（无隐式引擎默认超时）；新增 `deliver` = 纯投递（显式 tell 路径）；`ActorRefExt::tell` 改走 `deliver` | 消除跨引擎语义漂移（压测报告 §九：thread `send` 曾是 5s 默认超时 ask，actix 是无界 ask；`send_with_timeout(None)` 在 thread 是纯投递、在 actix 是无界 ask） | 长等待场景必须显式 `send_with_timeout(Some(d))`；fire-and-forget 必须显式 `deliver`/`tell`——`send` 后不再丢弃返回值即"忘掉" |
-| ADR-11 | **thread 引擎双层饥饿治理（2026-10-02，release 验证）**：①`worker.rs` handler future 改经 `spawn_blocking`（阻塞池默认上限 512）——CPU handler 不再占 runtime 线程，调度器自身永不饿死（第一层根因：12 个 CPU future 曾占满 8 runtime 线程，弹性巡检全部停摆，M1 probe max 67.5s）②SharedThreadPool 内置 `ElasticController` burst worker：backlog 持续 ≥threshold 且无 idle core worker 时 +1（`compare_exchange` 锁定首时刻——首版 `swap` 会每 probe 重置窗口的 bug 已修；wake_hook + 周期巡检双探测，解决"caller 等回复不再发消息→probe 断流"的鸡生蛋死锁）；空闲 ≥idle_timeout 由 reaper 置专属 shutdown flag 优雅收割（不 mid-batch abort）；全局上限 `pool_size + burst_workers_max`；配置经 `ThreadActorSystemConfig::shared_burst_*` 暴露，`SchedulerMetrics.burst_workers_alive` 可观测 | M1 压测发现：全部 core worker 被分钟级 CPU 任务占满时，短任务可在调度队列中饿死秒级~分钟级（debug 轮"通过"系 E 核调度巧合，release 复测暴露双层真根因） | 修复后 M1 probe max **0.9ms**（原 67492ms）；专项测试 `test_elastic_scaling.rs`（饱和保护 149ms / 收缩后复救 128ms / 线程上限不爆炸）全过 |
+| ADR-11 | **thread 调度隔离（2026-10-09 修订）**：SharedThreadPool 同时持有多个等待中的 actor future，但每个 worker 同时只执行一次阻塞线程上的 `poll`；`Pending` 释放阻塞线程和执行许可，唤醒后重新申请许可。mailbox 的调度所有权跨等待保留，保证单 actor 串行。执行许可在 dequeue 之前预留，CPU backlog 仍可触发 burst；burst 仅在无在途 actor 且持续空闲时退出，并纳入池的统一 shutdown | 旧实现等待整批 `block_on`，单 worker 的 A→B ask 已可死锁；仅增加阻塞线程数不能修复。新路径同时保留 CPU 隔离与异步进度 | `test_async_scheduler_progress.rs` 覆盖 1 worker、2 blocking threads、8 actor 调用链、init 等待、FIFO 与实际 CPU 并发上限；旧压测数字属于旧实现，当前吞吐需另测 |
 | ADR-12 | **actor 级背压配置必须贯通到 ref（2026-10-02，第五轮实证发现）**：`ThreadActorConfig.backpressure_strategy/mailbox_capacity/ask_timeout` 若只在邮箱构造时生效、而 `ThreadActorRef::new`（spawn 返回值与注册表 BoxedActorRef 两处）仍取系统默认策略，则用户经 `deliver`/`send` 触发的 push 实际走 `Block`——有界邮箱形同虚设（A3 首跑 200k 全收、push 被拖 23s、无界积压）。规则：**凡从 actor config 派生的行为，注入 ref 时必须 `thread_config.X.clone().unwrap_or_else(system_default)`**，杜绝"配置半路断线"。 | 优势专项验证 A2/A3：bounded(8)+Error 应拒收而 0 拒收；修复后 12/20 拒收、A3 199,744/200,000 拒收、RSS 稳定 | `tests/test_thread_advantages.rs`（A1 独占线程 4×4.5s 并行 4.95s / A2 四策略矩阵 / A3 内存防护 / A4 宿主嵌入 / A5 海量 spawn 593k actors/s）全过；workspace 457/457 |
 | ADR-13 | **ask 消息路径分配最小化（2026-10-02 第七轮）**：优化前一次 ask = 3 次堆分配（payload 装箱 + `Box<dyn ReplyChannel>` + envelope 二次装箱）。优化：`AskEnvelope.reply` 内联 `oneshot::Sender`（消除 trait 对象装箱）、新增 `new_typed` 构造器（未装箱消息直移入 envelope）、回复改同步 send（消除 async 虚调用）。优化后 = **1 次分配**。收益：c64 并发 ask +12%（494k/s）、herd +4.6%（825k/s）、allocator 压力降 2/3。对照：actix 侧 `MessageEnvelope` 每条消息含 `uuid::new_v4()`（CSPRNG 读取），是待优化点 | S6 压测核对 ask 路径源码发现三重分配；分配次数直接决定高并发下的 malloc 争用与缓存污染 | `envelope.rs` 单测 + 全量 457 回归 + 压测复验（c64/herd 提升，驱动侧瓶颈场景持平） |
 | ADR-14 | **Sharded 亲和性调度器（2026-10-02 第七轮）**：`SchedulingMode::Sharded { affinity_key }` → N 固定线程 × 每线程独占 MPSC 分片队列（FNV-1a+splitmix64 哈希，actor 永不迁移）。消息经 wake-hook 直推分片，**绕过中央 SegQueue**：零全局 CAS 争用、零 Notify 唤醒延迟（稳态线程自旋在私有队列）、同域消息享 L1/L2 局部性、分片间尾延迟硬隔离。代价：无 work-stealing（亲和域须大致均衡）。适用：会话粘滞、分片状态、分区 topic（Kafka partition 语义的 actor 化） | 用户提案"固定线程池+亲缘性标志匹配"；理论预期"少一层等待"被证实且量化 | S1：8 actor×20k ask **380k/s vs 共享池 216k/s（1.76×）**；S2：邻域 4×9s 重载下探针 p99=45µs max=48µs（硬隔离）；`tests/test_sharded_scheduler.rs` |
@@ -522,7 +522,7 @@ flowchart TD
 1. **thread 后端是"框架内框架"**：自带 system/actor/context/address/mailbox/scheduler/processor/error 全套，规模 11,709 行（含随重构增长的调度器实现与测试内联模块），远超 actix 适配层（1,302 行）——因为 actix 层只做适配，thread 层要从零造调度与执行。
 2. **三处 Weak 回指 ThreadActorSystem**（scheduler worker ×2、context ×1）+ system 持 scheduler 的 Arc——形成"强指针向下、弱指针向上"的 DAG，是本项目打破循环引用的标准手法。
 3. **`ActorProcessor` 是执行核心**：被 mailbox（`set_processor`）与两类 worker 共同持有，承担"初始化→批量取消息→panic 捕获→统计"的消息执行循环。
-4. **actix 适配层 2026-10 修复轮引入 `ArbiterPool`**（system.rs）与双路径 Handler（actor.rs 的 `AsyncDispatchFuture`）——适配层从"纯转发"升级为"自带并行调度与异步执行桥"的自研组件。
+4. **actix 适配层 2026-10 修复轮引入 `ArbiterPool`**（system.rs）与双路径 Handler（actor.rs 的 `AtomicResponse`）——适配层从"纯转发"升级为"自带并行调度与异步执行桥"的自研组件。
 
 ---
 
@@ -532,7 +532,7 @@ flowchart TD
 |------|------|------|
 | `parrot-api/src` | 3,433 | ✅ 可编译；文档完备；stream/spawner 等部分接口仅声明；**新增 `use_async_handler()` 调度开关（默认 false）** |
 | `parrot-api-derive/src` | 780 | ✅ 可编译；仅支持 actix 引擎 |
-| `parrot/src/actix` | 1,302 | ✅ 完整可用：**Arbiter 池 + 双路径 Handler（AtomicResponse）+ stop 拦截 + 唯一路径**；watch/stream_registry/spawner 仍未实现 |
+| `parrot/src/actix` | 1,302 | 部分接线：**独立 arbiter 池、动态/静态注册、init/before_stop、带截止时间的 stop/shutdown** 已实现；timer/watch/stream_registry/spawner 与父子监督仍未完整实现 |
 | `parrot/src/thread` | 11,709 | ✅ 可编译可运行：shared pool + dedicated 双调度、async handler 原生支持、ask 语义已对齐（send 桥接真 ask）；监督/watch 通知未落地 |
 | `parrot/src/system.rs + logging.rs + lib.rs` | 1,510 | ✅ 聚合层可用；泛型 spawn 受限 |
 | 测试 | ~25 文件 · 339 用例 | ✅ 全绿；**新增双引擎压测套件（engine_stress_thread/actix，13 场景对齐）** |

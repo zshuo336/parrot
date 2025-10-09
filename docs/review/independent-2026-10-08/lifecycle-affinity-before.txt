@@ -1,0 +1,73 @@
+Stop hooks executed on blocking-pool threads instead of their dedicated/shard owners. Six old-behavior failures.
+
+   Compiling parrot-config v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot-config)
+   Compiling parrot v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot)
+   Compiling parrot-remote v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.31s
+     Running tests/test_lifecycle_thread_affinity.rs (target/debug/deps/test_lifecycle_thread_affinity-feb710fc80091929)
+
+running 6 tests
+test shard_shutdown_hook_keeps_thread_affinity ... FAILED
+test dedicated_shutdown_hook_keeps_thread_affinity ... FAILED
+test inherited_shard_mode_keeps_lifecycle_affinity ... FAILED
+test shard_stop_hook_keeps_thread_affinity ... FAILED
+test dedicated_stop_hook_keeps_thread_affinity ... FAILED
+test inherited_dedicated_mode_keeps_lifecycle_affinity ... FAILED
+
+failures:
+
+---- shard_shutdown_hook_keeps_thread_affinity stdout ----
+
+thread 'shard_shutdown_hook_keeps_thread_affinity' (2314635) panicked at crates/parrot/tests/test_lifecycle_thread_affinity.rs:112:9:
+assertion `left == right` failed: stop construction migrated away from the assigned actor thread
+  left: ThreadId(61)
+ right: ThreadId(39)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- dedicated_shutdown_hook_keeps_thread_affinity stdout ----
+
+thread 'dedicated_shutdown_hook_keeps_thread_affinity' (2314631) panicked at crates/parrot/tests/test_lifecycle_thread_affinity.rs:112:9:
+assertion `left == right` failed: stop construction migrated away from the assigned actor thread
+  left: ThreadId(60)
+ right: ThreadId(10)
+
+---- inherited_shard_mode_keeps_lifecycle_affinity stdout ----
+
+thread 'inherited_shard_mode_keeps_lifecycle_affinity' (2314634) panicked at crates/parrot/tests/test_lifecycle_thread_affinity.rs:112:9:
+assertion `left == right` failed: stop construction migrated away from the assigned actor thread
+  left: ThreadId(57)
+ right: ThreadId(30)
+
+---- shard_stop_hook_keeps_thread_affinity stdout ----
+
+thread 'shard_stop_hook_keeps_thread_affinity' (2314636) panicked at crates/parrot/tests/test_lifecycle_thread_affinity.rs:112:9:
+assertion `left == right` failed: stop construction migrated away from the assigned actor thread
+  left: ThreadId(58)
+ right: ThreadId(50)
+
+---- dedicated_stop_hook_keeps_thread_affinity stdout ----
+
+thread 'dedicated_stop_hook_keeps_thread_affinity' (2314632) panicked at crates/parrot/tests/test_lifecycle_thread_affinity.rs:112:9:
+assertion `left == right` failed: stop construction migrated away from the assigned actor thread
+  left: ThreadId(59)
+ right: ThreadId(14)
+
+---- inherited_dedicated_mode_keeps_lifecycle_affinity stdout ----
+
+thread 'inherited_dedicated_mode_keeps_lifecycle_affinity' (2314633) panicked at crates/parrot/tests/test_lifecycle_thread_affinity.rs:112:9:
+assertion `left == right` failed: stop construction migrated away from the assigned actor thread
+  left: ThreadId(56)
+ right: ThreadId(13)
+
+
+failures:
+    dedicated_shutdown_hook_keeps_thread_affinity
+    dedicated_stop_hook_keeps_thread_affinity
+    inherited_dedicated_mode_keeps_lifecycle_affinity
+    inherited_shard_mode_keeps_lifecycle_affinity
+    shard_shutdown_hook_keeps_thread_affinity
+    shard_stop_hook_keeps_thread_affinity
+
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p parrot --test test_lifecycle_thread_affinity`

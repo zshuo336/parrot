@@ -51,7 +51,7 @@
 | ~~F2~~ | ThreadActorSystem::new | ✅ **已修复**：调度器经 Weak 引用回指系统 | panic 上报/重启链路可用 |
 | F3 | spawn_root_boxed（两后端+聚合层） | 全部返回错误/未实现 | 类型擦除 spawn 通道形同虚设 |
 | ~~F4~~ | ThreadContext::ask / ThreadActorRef::send | ✅ **已修复**：`send` 桥接 `ask_with_strategy_and_timeout`（AskEnvelope + oneshot），统一 API 的 ask 在 thread 路径拿到真回复 | 双引擎 ask 语义等价（压测验证） |
-| F5 | ActixContext::stop | 空 Ok（注释"由系统实现"但系统也未实现） | 优雅停止不可用（注：`ActorRef::stop()` 经 StopMessage 拦截已可用，缺的是 handler 内 self-stop） |
+| F5 | ActixContext::stop | 托管路径已改为带外取消，外部 stop 等待实际析构 | 第九批回归覆盖 Context 自停、挂起 handler、hook 错误与系统隔离；raw 地址停止仍受原生队列限制 |
 | F6 | watch/unwatch（actix 侧 Err / thread 侧 Ok 空操作） | 两种语义都不完整；thread 侧 watchers 登记后 `notify_watchers_of_termination` 是 TODO | 死亡通知链断裂 |
 | F7 | SystemRef::spawn_actor（thread） | "Not implemented yet" | 经 context spawner 的子 actor 派生不可用 |
 
@@ -107,7 +107,7 @@
 | D10 | **`A::Config` 未接线**：传入的 config 参数被系统默认覆盖 | thread/system.rs | actor 自身配置不生效 | 增加转换协议 | 🔴 未变 |
 | D11 | **注释与实现漂移** | 多处 | 误导新用户 | 随重构统一修订 | 🟡 部分（压测报告/技术文档已更新） |
 | D12 | **测试语义分叉**（cfg(test) 双路径） | derive/actor.rs | 单测路径 ≠ 生产路径 | 长期取消双路径 | 🔴 未变 |
-| D13（新） | **双路径 Handler 的 unsafe 边界**：lifetime transmute 依赖三条文档化不变式（地址稳定/wait 门控/不越界存活），非类型系统保证 | actix/actor.rs §3.1a | 未来 actix 升级若改变 ContextFut 布局或 wait 语义，将无声破坏 | 补集成测试固化三不变式（herd + starvation + io-async 场景已有）；关注 actix 版本升级 | 🟡 已文档化+压测覆盖 |
+| D13 | **异步 Handler 的 lifetime transmute 与上下文句柄逃逸** | actix/actor.rs、api/actor.rs | 旧取消路径实际先销毁 actor 再销毁借用 handler，原不变式不成立 | 已改拥有状态的 future 和带生命周期的真实上下文借用；取消、错误恢复及 compile-fail 回归通过 | ✅ 2026-10-09 修复；全套能力验收仍见独立修复台账 |
 | D14（新） | **Arbiter 池线程生命周期**：池懒构建于首次 spawn，线程随 System 存活；shutdown 不 join arbiter 线程 | actix/system.rs | 粗粒度关闭可能留悬挂线程（进程退出场景无害） | shutdown 时逐 arbiter stop + join | 🟡 已知限制 |
 | D15（新） | **panic 隔离粒度差异**：actix 一个 handler panic 击穿整个 arbiter 线程上的 actor；thread 引擎 processor 级捕获后 actor 可继续 | 跨引擎 | 监督语义落地时需拉平 | actix 侧补 actor 级 panic 恢复（Supervisor 机制内做） | 🟡 待监督落地时一并处理 |
 
@@ -119,7 +119,7 @@
 |------|------|------|
 | ~~不可编译主 crate~~ | ~~🔴 高~~ → 🟢 已消除 | workspace 0 错误、339 测试全绿 |
 | 类型擦除性能税 | 🟡 中 | 每 ask 两次堆分配+downcast；高吞吐场景可考虑对象池 |
-| `NonNull<dyn Any>` 引擎指针 | 🟡 中 | unsafe 语义进公共 trait；actix 侧新增的 lifetime transmute 同属此类（D13，已文档化+压测覆盖） |
+| 引擎上下文与异步借用 | 已移除这两处生产 unsafe 路径 | `EngineContextHandle<'ctx>` 绑定真实借用；Actix future 拥有 actor/context。外部 `unsafe from_raw` 调用者仍须满足其明确安全契约 |
 | 循环引用治理 | 🟢 低 | Weak 升级失败路径多为报错而非降级 |
 | 双 SystemError 混用 | 🟡 中 | thread 内 `?` 自动选择就近类型 |
 | 监督缺口 | 🟡 中 | panic 只被记录（ProcessorStats）/actix 侧击穿 arbiter（D15），无自动恢复 |

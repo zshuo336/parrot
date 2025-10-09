@@ -1,11 +1,20 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::task::{Context, Poll};
+
+use futures::{
+    StreamExt,
+    stream::FuturesUnordered,
+    task::{ArcWake, waker_ref},
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, warn};
@@ -27,6 +36,9 @@ pub enum WorkerStatus {
 
     /// Worker has encountered an error
     Error = 3,
+
+    /// Owns suspended actor work but has capacity to poll another actor.
+    Waiting = 4,
 }
 
 impl WorkerStatus {
@@ -35,6 +47,7 @@ impl WorkerStatus {
             0 => WorkerStatus::Idle,
             1 => WorkerStatus::Processing,
             2 => WorkerStatus::ShuttingDown,
+            4 => WorkerStatus::Waiting,
             _ => WorkerStatus::Error,
         }
     }
@@ -139,54 +152,99 @@ impl Worker {
         }
     }
 
-    /// Launches the worker's main loop as a Tokio task
+    /// Launches a core worker on the runtime.
     pub fn spawn(self) -> JoinHandle<()> {
+        self.spawn_inner(None, None)
+    }
+
+    pub(super) fn spawn_burst(
+        self,
+        idle_timeout: Duration,
+        alive: Arc<AtomicUsize>,
+    ) -> JoinHandle<()> {
+        self.spawn_inner(Some(idle_timeout), Some(BurstGuard(alive)))
+    }
+
+    fn spawn_inner(
+        self,
+        idle_timeout: Option<Duration>,
+        guard: Option<BurstGuard>,
+    ) -> JoinHandle<()> {
         let runtime_handle = self.runtime_handle.clone();
         runtime_handle.spawn(async move {
-            self.run_loop().await;
+            let _guard = guard;
+            Arc::new(self).run_loop(idle_timeout).await;
         })
     }
 
-    /// Main worker loop
-    async fn run_loop(&self) {
-        let worker_name = format!("worker-{}", self.id);
-
-        while !self.shutdown_flag.load(Ordering::Relaxed) {
-            match self.scheduling_queue.try_pop() {
-                Some(mailbox) => {
-                    self.status
-                        .store(WorkerStatus::Processing as usize, Ordering::Relaxed);
-                    if let Err(e) = self.process_mailbox(mailbox, self.batch_size).await {
-                        error!("[{}] {}", worker_name, e);
+    /// Multiplex suspended mailboxes, allowing one blocking poll at a time.
+    async fn run_loop(self: &Arc<Self>, idle_timeout: Option<Duration>) {
+        let mut idle_since = time::Instant::now();
+        let slots = Arc::new(Semaphore::new(1));
+        let poll_finished = Arc::new(Notify::new());
+        let queue_notify = self.scheduling_queue.notify_handle();
+        let mut running = FuturesUnordered::new();
+        while !self.shutdown_flag.load(Ordering::Acquire) {
+            if !running.is_empty() || !self.scheduling_queue.is_empty() {
+                idle_since = time::Instant::now();
+            } else if idle_timeout.is_some_and(|timeout| idle_since.elapsed() >= timeout) {
+                break;
+            }
+            let status = if slots.available_permits() == 0 {
+                WorkerStatus::Processing
+            } else if running.is_empty() {
+                WorkerStatus::Idle
+            } else {
+                WorkerStatus::Waiting
+            };
+            self.status.store(status as usize, Ordering::Relaxed);
+            tokio::select! {
+                // Reserve capacity BEFORE dequeuing, keeping CPU backlog visible
+                // to priority selection, other workers and the elastic controller.
+                permit = slots.clone().acquire_owned(), if !self.scheduling_queue.is_empty() => {
+                    let permit = permit.expect("worker semaphore stays open");
+                    if let Some(mailbox) = self.scheduling_queue.try_pop() {
+                        let worker = self.clone();
+                        let slots = slots.clone();
+                        let poll_finished = poll_finished.clone();
+                        running.push(async move {
+                            let owned_mailbox = mailbox.clone();
+                            let processor = mailbox.get_processor();
+                            let work = poll_isolated(async move {
+                                worker.process_mailbox(owned_mailbox, worker.batch_size).await
+                            }, permit, slots, poll_finished);
+                            let result = if let Some(processor) = &processor {
+                                tokio::select! {
+                                    biased;
+                                    _ = processor.processing_cancelled() => {
+                                        mailbox.schedule_state().force_release();
+                                        return;
+                                    }
+                                    result = work => result,
+                                }
+                            } else {
+                                work.await
+                            };
+                            if let Err(error) = result {
+                                mailbox.schedule_state().force_release();
+                                if let Some(processor) = mailbox.get_processor() {
+                                    processor.notify_system_panic(error.to_string());
+                                }
+                                error!(path = %mailbox.path().path, %error, "worker actor failed");
+                            }
+                        });
                     }
-                    self.status
-                        .store(WorkerStatus::Idle as usize, Ordering::Relaxed);
                 }
-                None => {
-                    self.status
-                        .store(WorkerStatus::Idle as usize, Ordering::Relaxed);
-
-                    // Wait for notification or periodic shutdown check.
-                    // Enable the notify permit before selecting so a push
-                    // that happens between try_pop and notified() is not missed.
-                    let notify = self.scheduling_queue.notify_handle();
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-
-                    tokio::select! {
-                        _ = &mut notified => {
-                            // Work may be available
-                        },
-                        _ = time::sleep(self.config.idle_sleep_duration) => {
-                            // Periodic check for shutdown
-                        }
-                    }
-                }
+                _ = running.next(), if !running.is_empty() => {}
+                _ = poll_finished.notified() => {}
+                _ = queue_notify.notified() => {}
+                _ = time::sleep(self.config.idle_sleep_duration) => {}
             }
         }
-
         self.status
             .store(WorkerStatus::ShuttingDown as usize, Ordering::Relaxed);
+        // Dropping running cancels suspended futures; an executing synchronous
+        // poll cannot be preempted and releases its owned future when it returns.
     }
 
     /// Process a batch of messages from a mailbox using its attached processor.
@@ -203,6 +261,7 @@ impl Worker {
         let processor = match mailbox.get_processor() {
             Some(p) => p,
             None => {
+                mailbox.schedule_state().force_release();
                 warn!(
                     "[{}] Mailbox for actor {} has no processor attached; skipping",
                     worker_name, actor_path
@@ -219,6 +278,7 @@ impl Worker {
                     "[{}] Failed to initialize actor {}: {}",
                     worker_name, actor_path, e
                 );
+                mailbox.schedule_state().force_release();
                 return Err(anyhow::anyhow!(e.to_string()));
             }
         }
@@ -245,32 +305,14 @@ impl Worker {
                 // Only the future *creation* happens here; actual actor code
                 // runs when awaited below. Panics inside the future are caught
                 // by the JoinHandle of the spawned inner task.
-                processor.process_batch_erased(mailbox_for_panics.clone(), max_for_run, false)
+                processor.process_batch_erased(
+                    mailbox_for_panics.clone(),
+                    max_for_run,
+                    self.config.yield_after_each_message,
+                )
             }));
             match result {
-                Ok(fut) => {
-                    // Execute on the *blocking* pool so long CPU-bound
-                    // handlers cannot monopolize tokio runtime worker
-                    // threads. This is critical: engine machinery (elastic
-                    // patrol, burst spawn, mailbox wake paths) is itself
-                    // tokio-driven; a batch of minute-level CPU handlers on
-                    // runtime threads would starve the scheduler itself
-                    // (stress report M1: probe starvation observed when 12
-                    // CPU futures occupied all 8 runtime threads).
-                    // Panics still surface as JoinError.
-                    let rt = self.runtime_handle.clone();
-                    let task = tokio::task::spawn_blocking(move || {
-                        // block_on a dedicated blocking thread: the future
-                        // (and any synchronous handler inside) runs here.
-                        rt.block_on(fut)
-                    });
-                    match task.await {
-                        Ok(inner) => inner,
-                        Err(join_err) => Err(crate::thread::error::SystemError::WorkerStateError(
-                            format!("Panic in actor {}: {}", path_for_panics, join_err),
-                        )),
-                    }
-                }
+                Ok(fut) => fut.await,
                 Err(panic_err) => Err(crate::thread::error::SystemError::WorkerStateError(
                     panic_message(panic_err, &path_for_panics),
                 )),
@@ -307,6 +349,10 @@ impl Worker {
         //
         // M2: mailboxes that still hold high-priority messages re-enter the
         // scheduler's High lane, jumping over any normal-lane backlog.
+        if self.shutdown_flag.load(Ordering::Acquire) || mailbox.is_closed().await {
+            mailbox.schedule_state().force_release();
+            return Ok(());
+        }
         let has_more = mailbox.has_more_messages().await;
         if mailbox.schedule_state().release(has_more) {
             let lane = if mailbox.has_high_priority_messages() {
@@ -337,6 +383,70 @@ impl Worker {
     }
 }
 
+struct BurstGuard(Arc<AtomicUsize>);
+impl Drop for BurstGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A retained notification covers wakeups before, during and after a poll.
+struct PollWake(Notify);
+impl ArcWake for PollWake {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.notify_one();
+    }
+}
+
+/// Cancels a blocking job that has not started when its async owner is dropped.
+/// Tokio cannot preempt a synchronous poll that is already executing.
+struct AbortQueuedPoll(tokio::task::AbortHandle);
+impl Drop for AbortQueuedPoll {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Isolate CPU-bound user code without retaining a blocking thread across
+/// Pending. Each worker owns one permit, bounding simultaneous CPU polls.
+pub(crate) async fn poll_isolated<F, T>(
+    future: F,
+    first_permit: OwnedSemaphorePermit,
+    slots: Arc<Semaphore>,
+    poll_finished: Arc<Notify>,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut future = Box::pin(future);
+    let wake = Arc::new(PollWake(Notify::new()));
+    let mut permit = Some(first_permit);
+    loop {
+        let slot = match permit.take() {
+            Some(slot) => slot,
+            None => slots.clone().acquire_owned().await?,
+        };
+        let poll_wake = wake.clone();
+        let finished = poll_finished.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let waker = waker_ref(&poll_wake);
+            let result = future.as_mut().poll(&mut Context::from_waker(&waker));
+            drop(slot);
+            finished.notify_one();
+            (future, result)
+        });
+        let cancel_on_drop = AbortQueuedPoll(task.abort_handle());
+        let (returned_future, result) = task.await?;
+        drop(cancel_on_drop);
+        future = returned_future;
+        match result {
+            Poll::Ready(result) => return result,
+            Poll::Pending => wake.0.notified().await,
+        }
+    }
+}
+
 /// Format a caught panic payload into a stable error string.
 fn panic_message(payload: Box<dyn Any + Send>, path: &str) -> String {
     match payload.downcast::<String>() {
@@ -364,6 +474,62 @@ mod tests {
         ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage, WeakActorTarget,
     };
     use std::time::Duration;
+
+    #[test]
+    fn cancelled_isolated_poll_does_not_run_later_from_the_blocking_queue() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            entered_rx.await.unwrap();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            struct Guard(Arc<AtomicUsize>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let guard = Guard(dropped.clone());
+            let observed_polls = polls.clone();
+            let work = async move {
+                let _guard = guard;
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            };
+            let slots = Arc::new(Semaphore::new(1));
+            let permit = slots.clone().acquire_owned().await.unwrap();
+            let mut isolated =
+                Box::pin(poll_isolated(work, permit, slots, Arc::new(Notify::new())));
+            assert!(futures::poll!(&mut isolated).is_pending());
+            drop(isolated);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            // Observe disposal directly; do not rely on executor queue order.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while dropped.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                0,
+                "cancelled work must never begin"
+            );
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        });
+    }
 
     #[derive(Debug)]
     struct EchoActor;

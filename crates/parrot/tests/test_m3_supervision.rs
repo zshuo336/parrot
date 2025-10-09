@@ -58,7 +58,7 @@ impl Actor for FlakyActor {
 /// 收集 Terminated 通知的 watcher。
 struct WatcherActor {
     deaths: Arc<AtomicU64>,
-    last_reason_panic: std::sync::Mutex<Option<bool>>,
+    last_reason: Arc<std::sync::Mutex<Option<DeathReason>>>,
 }
 
 impl Actor for WatcherActor {
@@ -76,9 +76,8 @@ impl Actor for WatcherActor {
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(term) = msg.downcast_ref::<Terminated>() {
+                *self.last_reason.lock().unwrap() = Some(term.reason.clone());
                 self.deaths.fetch_add(1, Ordering::SeqCst);
-                let is_panic = matches!(term.reason, DeathReason::Panic(_));
-                *self.last_reason_panic.lock().unwrap() = Some(is_panic);
             }
             Ok(Box::new(()) as BoxedMessage)
         })
@@ -143,35 +142,29 @@ fn m3_panic_restart_recovers_service() {
         // 触发 panic（tell，fire-and-forget）
         r.send_msg(Box::new("boom")).await.unwrap();
 
-        // 等待监督决策执行（panic → 通知 → 决策 → 重启）
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // 重启后 mailbox 是新实例：经系统注册表重新解析 ref
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let reply = loop {
-            if let Some(entry_ref) = ts.get_actor_ref("/m3/flaky")
-                && let Ok(v) = entry_ref
-                    .send_with_timeout(Box::new(100u64), Some(Duration::from_secs(2)))
+        // Reuse the original reference; require the exact next generation.
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(reply) = r
+                    .ask_with_timeout(Box::new(100u64), Duration::from_millis(50))
                     .await
-            {
-                break v;
+                    && reply.downcast_ref::<u64>() == Some(&101)
+                {
+                    break reply;
+                }
+                tokio::task::yield_now().await;
             }
-            if tokio::time::Instant::now() > deadline {
-                panic!("重启后的 actor 5s 内未恢复服务");
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
+        })
+        .await
+        .expect("supervised reference did not recover");
         assert_eq!(
             *reply.downcast::<u64>().unwrap(),
             101,
             "重启后应使用新实例（generation 递增）"
         );
 
-        // 重启发生
-        assert!(
-            generation.load(Ordering::SeqCst) >= 2,
-            "工厂至少被调用 2 次（初始+重启）"
-        );
+        assert_eq!(generation.load(Ordering::SeqCst), 2);
+        ts.shutdown_internal().await.unwrap();
     });
 }
 
@@ -187,11 +180,12 @@ fn m3_watch_carries_death_reason() {
         let ts = setup("m3-watch").await;
 
         let deaths = Arc::new(AtomicU64::new(0));
+        let reason = Arc::new(std::sync::Mutex::new(None));
         let _watcher = ts
             .spawn_at::<WatcherActor>(
                 WatcherActor {
                     deaths: deaths.clone(),
-                    last_reason_panic: std::sync::Mutex::new(None),
+                    last_reason: reason.clone(),
                 },
                 "/m3/watcher",
                 None,
@@ -232,13 +226,12 @@ fn m3_watch_carries_death_reason() {
             "watcher 必须收到 Terminated"
         );
 
-        // 死因为 Panic（语义变更 #2 验证点）
-        // （actor 内部状态无法直接读；用第二次 ask 失败验证 victim 已死：
-        //  Stop 策略下 mailbox 已关闭）
+        assert!(matches!(reason.lock().unwrap().as_ref(), Some(DeathReason::Panic(message)) if message.contains("boom requested")));
         let gone = victim
             .ask_with_timeout(Box::new(1u64), Duration::from_millis(500))
             .await;
-        assert!(gone.is_err(), "Stop 策略下 victim 不应复活");
+        assert!(gone.is_err(), "Stop strategy must not revive the actor");
+        ts.shutdown_internal().await.unwrap();
     });
 }
 
@@ -255,7 +248,7 @@ fn m3_window_exhaustion_escalates() {
 
         let generation = Arc::new(AtomicU64::new(0));
         let g = generation.clone();
-        let _r = ts
+        let r = ts
             .spawn_supervised(
                 move || FlakyActor {
                     generation: g.fetch_add(1, Ordering::SeqCst),
@@ -269,30 +262,31 @@ fn m3_window_exhaustion_escalates() {
             .await
             .unwrap();
 
-        // 连续触发 panic 3 次（初始死亡 + 2 次重启后死亡 → 预算耗尽）。
-        // 经注册表解析当前 ref（重启产生新 mailbox；旧 ref 失效时跳过本轮）。
-        for _ in 0..3 {
-            if let Some(entry_ref) = ts.get_actor_ref("/m3/crashloop") {
-                let _ = entry_ref
-                    .send_with_timeout(Box::new("boom"), Some(Duration::from_millis(500)))
-                    .await;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        for expected in 0..3u64 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(reply) = r
+                        .ask_with_timeout(Box::new(0u64), Duration::from_millis(50))
+                        .await
+                        && reply.downcast_ref::<u64>() == Some(&expected)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("restart budget consumed too early");
+            r.send_msg(Box::new("boom")).await.unwrap();
         }
-
-        // 预算耗尽：actor 被 Escalate 处理（停止），不再重启
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let final_generations = generation.load(Ordering::SeqCst);
-        assert!(
-            final_generations <= 3,
-            "重启预算 2 耗尽后必须停止（Escalate），实际 generation={}",
-            final_generations
-        );
-
-        // actor 已从系统移除（注册表查无此路径）
-        assert!(
-            ts.get_actor_ref("/m3/crashloop").is_none(),
-            "Escalate 后 actor 应从注册表移除"
-        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ts.get_actor_ref("/m3/crashloop").is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("budget exhaustion must remove actor");
+        assert_eq!(generation.load(Ordering::SeqCst), 3);
+        ts.shutdown_internal().await.unwrap();
     });
 }

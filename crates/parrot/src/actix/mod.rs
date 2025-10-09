@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod context;
+mod lifecycle;
 pub mod message;
 pub mod reference;
 pub mod system;
@@ -16,7 +17,7 @@ pub use actor::{ActorBase, IntoActorBase};
 pub use context::ActixContext;
 pub use message::*;
 pub use reference::ActixActorRef;
-pub use system::{ActixActorSystem, ArbiterPool};
+pub use system::{ActixActorSystem, ActixSystemSettings, ArbiterPool};
 pub use typed::{DEFAULT_ASK_TIMEOUT as TYPED_ASK_TIMEOUT, TypedActorRef as ActixTypedActorRef};
 pub use types::*;
 

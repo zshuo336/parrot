@@ -1483,8 +1483,8 @@ mod adr3_regression {
         }
 
         let mut a = HandleProbeActor { seen: None };
-        let data = 42u32;
-        let raw: NonNull<dyn Any> = NonNull::from(&data);
+        let mut data = 42u32;
+        let raw: NonNull<dyn Any> = NonNull::from(&mut data);
         let h = unsafe { EngineContextHandle::from_raw(raw) };
         let mut ctx =
             __parrot_engine::ActixContext::<__parrot_engine::ActixActor<HandleProbeActor>>::default(

@@ -2,16 +2,16 @@
 //!
 //! 把 thread 引擎侧验证过的类型化通道机制（`flume` 信封 + dispatch
 //! 消费循环 + `TypedActorRef` 面）提炼为**引擎无关**的核心，供各引擎
-//! 一行接线复用：
+//! 按各引擎的生命周期策略接线：
 //!
-//! - thread 引擎：消费任务 `tokio::spawn` 在系统 runtime 上
+//! - thread 引擎：注册到系统，用户 poll 与析构隔离执行，支持有截止时间的停止
 //!   （`parrot::thread::typed::spawn_typed`）。
 //! - actix 引擎：消费任务 `Arbiter::spawn` 在 arbiter 池上
 //!   （`parrot::actix::typed::spawn_typed`）——多 arbiter 并行与
 //!   零 Any 快路径兼得。
 //!
-//! 引擎差异只在"消费循环跑在哪个执行器上"；通道、信封、ref 面、
-//! 超时与错误语义全部共享——双引擎行为一致由同一份代码保证。
+//! 消息通道、信封和超时语义共享；注册、关闭与生命周期由引擎接线，
+//! 不能由共享通道推断两个引擎具备相同的生命周期能力。
 
 use std::marker::PhantomData;
 use std::time::Duration;
@@ -60,6 +60,66 @@ pub fn reply_channel<A: ParrotTypedDispatch>() -> (ReplyTx<A>, ReplyRx<A>) {
     flume::bounded::<ActorResult<A::Reply>>(1)
 }
 
+/// Admission and wake state shared by all protocol views of a managed actor.
+/// Engines call `notify_capacity` after dequeuing, and `seal` before disposal.
+#[derive(Default)]
+pub struct TypedChannelState {
+    sealed: std::sync::Mutex<bool>,
+    available: tokio::sync::Notify,
+    closed: tokio::sync::Notify,
+}
+impl TypedChannelState {
+    pub fn is_sealed(&self) -> bool {
+        *self.sealed.lock().unwrap()
+    }
+    pub fn seal(&self) {
+        *self.sealed.lock().unwrap() = true;
+        self.available.notify_waiters();
+        self.closed.notify_waiters();
+    }
+    pub fn notify_capacity(&self) {
+        self.available.notify_waiters();
+    }
+    pub async fn closed(&self) {
+        let closed = self.closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if !self.is_sealed() {
+            closed.await;
+        }
+    }
+    async fn enqueue<T: Send>(&self, tx: &flume::Sender<T>, mut message: T) -> ActorResult<()> {
+        loop {
+            let available = self.available.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            {
+                let sealed = self.sealed.lock().unwrap();
+                if *sealed {
+                    return Err(ActorError::Stopped);
+                }
+                match tx.try_send(message) {
+                    Ok(()) => return Ok(()),
+                    Err(flume::TrySendError::Disconnected(returned)) => {
+                        drop(sealed);
+                        drop(returned);
+                        return Err(ActorError::Stopped);
+                    }
+                    Err(flume::TrySendError::Full(returned)) => message = returned,
+                }
+            }
+            available.await;
+        }
+    }
+}
+
+/// Engine-owned lifecycle of a managed typed channel. The callback must join
+/// owned cleanup; dropping a stop caller must not cancel the operation.
+pub trait TypedActorLifecycle: Send + Sync {
+    fn channel(&self) -> &TypedChannelState;
+    fn stop(&self) -> BoxedFuture<'_, ActorResult<()>>;
+}
+
 /// 静态轨 actor ref：actor 类型 A 与**入口协议** M 编译期固定。
 ///
 /// 引擎中立：持有 flume 类型化 Sender 的克隆，不感知消费方跑在哪个
@@ -73,6 +133,8 @@ where
 {
     tx: flume::Sender<TypedEnvelope<A>>,
     path: String,
+    lifecycle: Option<std::sync::Arc<dyn TypedActorLifecycle>>,
+    default_timeout: Duration,
     _marker: PhantomData<fn(&A, M)>,
 }
 
@@ -85,6 +147,8 @@ where
         Self {
             tx: self.tx.clone(),
             path: self.path.clone(),
+            lifecycle: self.lifecycle.clone(),
+            default_timeout: self.default_timeout,
             _marker: PhantomData,
         }
     }
@@ -100,7 +164,42 @@ where
         Self {
             tx,
             path,
+            lifecycle: None,
+            default_timeout: DEFAULT_ASK_TIMEOUT,
             _marker: PhantomData,
+        }
+    }
+
+    /// Bind a channel to its engine's registered lifecycle.
+    pub fn with_lifecycle(
+        mut self,
+        lifecycle: std::sync::Arc<dyn TypedActorLifecycle>,
+        default_timeout: Duration,
+    ) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self.default_timeout = default_timeout;
+        self
+    }
+
+    /// Stop the managed actor and await cleanup. Raw channels constructed with
+    /// `new` have no lifecycle owner and report an error instead of false success.
+    pub async fn stop(&self) -> ActorResult<()> {
+        match &self.lifecycle {
+            Some(lifecycle) => lifecycle.stop().await,
+            None => Err(ActorError::InternalError(
+                "typed channel has no lifecycle owner".into(),
+            )),
+        }
+    }
+
+    async fn enqueue(&self, envelope: TypedEnvelope<A>) -> ActorResult<()> {
+        match &self.lifecycle {
+            Some(lifecycle) => lifecycle.channel().enqueue(&self.tx, envelope).await,
+            None => self
+                .tx
+                .send_async(envelope)
+                .await
+                .map_err(|_| ActorError::Stopped),
         }
     }
 
@@ -112,6 +211,10 @@ where
     /// actor 是否仍在接收（接收端未被 drop）。
     pub fn is_alive(&self) -> bool {
         !self.tx.is_disconnected()
+            && self
+                .lifecycle
+                .as_ref()
+                .is_none_or(|lifecycle| !lifecycle.channel().is_sealed())
     }
 
     /// 同一 actor 的另一协议视图：零成本类型改写（共享通道与路径）。
@@ -122,6 +225,8 @@ where
         TypedActorRef {
             tx: self.tx.clone(),
             path: self.path.clone(),
+            lifecycle: self.lifecycle.clone(),
+            default_timeout: self.default_timeout,
             _marker: PhantomData,
         }
     }
@@ -143,9 +248,9 @@ where
     A: ParrotTypedDispatch,
     M: ParrotMsgVariant<A> + Message,
 {
-    /// 静态 ask（默认 5s 超时；无界用 [`TypedActorRef::ask_unbounded`]）。
+    /// 静态 ask（托管引用采用系统配置；原始通道默认 5s；无界用 [`TypedActorRef::ask_unbounded`]）。
     pub async fn ask(&self, msg: M) -> ActorResult<M::Result> {
-        self.ask_inner(msg, Some(DEFAULT_ASK_TIMEOUT)).await
+        self.ask_inner(msg, Some(self.default_timeout)).await
     }
 
     /// 无界静态 ask：不设超时，actor 处理完才返回。
@@ -168,29 +273,30 @@ where
             msg: M::inject(msg),
             reply: Some(rtx),
         };
-        if let Err(e) = self.tx.send_async(env).await {
-            return Err(ActorError::InternalError(format!(
-                "typed channel closed for {}: {}",
-                self.path, e
-            )));
-        }
-        let reply: A::Reply = match timeout {
-            Some(d) => match tokio::time::timeout(d, rrx.recv_async()).await {
-                Ok(Ok(r)) => r?,
-                Ok(Err(e)) => {
-                    return Err(ActorError::ReplyChannelError(format!("typed reply: {}", e)));
+        // A single deadline covers capacity backpressure and the reply.
+        // Dropping this future also cancels a send that has not entered the queue.
+        let exchange = async {
+            self.enqueue(env).await?;
+            let response = async {
+                rrx.recv_async()
+                    .await
+                    .map_err(|e| ActorError::ReplyChannelError(format!("typed reply: {}", e)))?
+            };
+            if let Some(lifecycle) = &self.lifecycle {
+                tokio::select! {
+                    biased;
+                    _ = lifecycle.channel().closed() => Err(ActorError::Stopped),
+                    reply = response => reply,
                 }
-                Err(_) => {
-                    return Err(ActorError::TimeoutDetail(format!(
-                        "typed ask {} timed out",
-                        self.path
-                    )));
-                }
-            },
-            None => match rrx.recv_async().await {
-                Ok(r) => r?,
-                Err(e) => return Err(ActorError::ReplyChannelError(format!("typed reply: {}", e))),
-            },
+            } else {
+                response.await
+            }
+        };
+        let reply = match timeout {
+            Some(d) => tokio::time::timeout(d, exchange).await.map_err(|_| {
+                ActorError::TimeoutDetail(format!("typed ask {} timed out", self.path))
+            })??,
+            None => exchange.await?,
         };
         M::extract(reply)
     }
@@ -201,10 +307,7 @@ where
             msg: M::inject(msg),
             reply: None,
         };
-        self.tx
-            .send_async(env)
-            .await
-            .map_err(|e| ActorError::InternalError(format!("typed tell {}: {}", self.path, e)))
+        self.enqueue(env).await
     }
 }
 
@@ -298,10 +401,7 @@ where
     }
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        // 静态轨停止：actor 任务随通道关闭（所有 ref drop）或系统
-        // shutdown 退出；发送端无独立 stop 信号（keep-alive 语义同
-        // 动态轨弱引用——不阻止也不强制死亡）。
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move { self.inner.stop().await })
     }
 
     fn path(&self) -> String {
@@ -329,6 +429,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_admission_releases_payload_outside_gate_on_rejection() {
+        struct Reentrant(std::sync::Arc<TypedChannelState>);
+        impl Drop for Reentrant {
+            fn drop(&mut self) {
+                assert!(
+                    self.0.sealed.try_lock().is_ok(),
+                    "payload destructor ran under admission lock"
+                );
+            }
+        }
+        for sealed in [false, true] {
+            let state = std::sync::Arc::new(TypedChannelState::default());
+            let (tx, rx) = flume::bounded(1);
+            drop(rx);
+            if sealed {
+                state.seal();
+            }
+            assert!(state.enqueue(&tx, Reentrant(state.clone())).await.is_err());
+        }
+    }
 
     // ---- 测试用枚举信封 actor（手写 dispatch，覆盖 inject/extract 对偶）----
 
@@ -454,6 +576,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_timeout_cancels_wait_for_mailbox_capacity() {
+        let (tx, rx) = typed_channel::<BenchActor>(1);
+        let actor: TypedActorRef<BenchActor, BenchMsg> = TypedActorRef::new(tx, "/full".into());
+        actor.tell(BenchMsg::Echo(1)).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            actor.ask_with_timeout(BenchMsg::Echo(2), Duration::from_millis(20)),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Err(ActorError::TimeoutDetail(_)))),
+            "{result:?}"
+        );
+        assert!(matches!(rx.try_recv().unwrap().msg, BenchMsg::Echo(1)));
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled enqueue must not publish later"
+        );
+    }
+
+    #[tokio::test]
     async fn ask_unbounded_waits_for_slow_handler() {
         let (r, _) = spawn_bench(4).await;
         let t0 = std::time::Instant::now();
@@ -477,23 +620,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_after_channel_close_returns_internal_error() {
-        // drop 接收端（消费任务退出）后 ask 必须报 InternalError
+    async fn ask_after_channel_close_returns_stopped() {
+        // drop 接收端（消费任务退出）后 ask 必须报 Stopped
         let (tx, rx) = typed_channel::<BenchActor>(2);
         let r: TypedActorRef<BenchActor, BenchMsg> = TypedActorRef::new(tx, "/test/closed".into());
         drop(rx);
         let e = r.ask(BenchMsg::Echo(1)).await.unwrap_err();
-        assert!(matches!(e, ActorError::InternalError(_)));
+        assert!(matches!(e, ActorError::Stopped));
         assert!(!r.is_alive());
     }
 
     #[tokio::test]
-    async fn tell_after_channel_close_returns_internal_error() {
+    async fn tell_after_channel_close_returns_stopped() {
         let (tx, rx) = typed_channel::<BenchActor>(2);
         let r: TypedActorRef<BenchActor, BenchMsg> = TypedActorRef::new(tx, "/test/closed2".into());
         drop(rx);
         let e = r.tell(BenchMsg::Echo(1)).await.unwrap_err();
-        assert!(matches!(e, ActorError::InternalError(_)));
+        assert!(matches!(e, ActorError::Stopped));
     }
 
     #[tokio::test]
@@ -579,10 +722,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn into_dyn_stop_is_noop_and_alive_reflects_channel() {
+    async fn unmanaged_dynamic_bridge_stop_reports_missing_lifecycle() {
         let (r, _) = spawn_bench(4).await;
         let dynref = r.into_dyn();
-        assert!(dynref.stop().await.is_ok());
+        assert!(dynref.stop().await.is_err());
         assert!(dynref.is_alive().await);
         // clone_boxed 语义
         let c = dynref.clone_boxed();

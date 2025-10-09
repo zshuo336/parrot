@@ -83,6 +83,16 @@ pub enum SystemError {
     Other(#[from] anyhow::Error),
 }
 
+impl From<SystemError> for parrot_api::errors::ActorError {
+    fn from(error: SystemError) -> Self {
+        match error {
+            SystemError::Timeout(message) => Self::TimeoutDetail(message),
+            SystemError::ActorNotFound(path) => Self::ActorNotFound(path),
+            error => Self::Other(anyhow::Error::new(error)),
+        }
+    }
+}
+
 /// Errors related to Supervision.
 #[derive(Error, Debug, Clone)]
 pub enum SupervisorError {

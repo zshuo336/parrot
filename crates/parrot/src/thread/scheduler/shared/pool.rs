@@ -157,6 +157,8 @@ pub struct ElasticController {
 
     /// Runtime handle for spawning burst workers
     runtime: Handle,
+
+    workers: std::sync::Weak<std::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl ElasticController {
@@ -220,9 +222,12 @@ impl ElasticController {
         // Serialize spawn decisions (cheap: only on the spawn path).
         let _gate = self.spawn_gate.lock().unwrap();
         let alive = self.burst_alive.load(O::Relaxed);
-        if alive >= self.config.burst_workers_max {
+        if alive >= self.config.burst_workers_max || self.shutting_down.load(O::Acquire) {
             return;
         }
+        let Some(workers) = self.workers.upgrade() else {
+            return;
+        };
         self.burst_alive.fetch_add(1, O::Relaxed);
 
         let queue = queue as Arc<SchedulingQueue>;
@@ -231,47 +236,24 @@ impl ElasticController {
         let batch_size = self.config.max_messages_per_batch;
         let idle_sleep = self.config.idle_sleep_duration;
 
-        // Burst worker = Worker with a *dedicated* shutdown flag the reaper
-        // controls. Setting it makes the worker exit at the next loop check
-        // (after finishing its current batch) — no mid-batch abort.
-        let worker_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker = crate::thread::scheduler::shared::worker::Worker::new(
-            usize::MAX, // marker id: burst worker
+        let worker = Worker::new(
+            usize::MAX,
             self.runtime.clone(),
-            queue.clone(),
-            worker_shutdown.clone(),
-            crate::thread::scheduler::shared::worker::WorkerConfig {
+            queue,
+            self.shutting_down.clone(),
+            WorkerConfig {
                 batch_size,
                 idle_sleep_duration: idle_sleep,
                 yield_after_each_message: false,
                 enable_detailed_logging: false,
             },
         );
-        let status = worker.status();
-        let handle = worker.spawn();
-
-        // Reaper: set the dedicated flag after idle_timeout of continuous
-        // idleness, then await the worker's natural exit.
-        self.runtime.spawn(async move {
-            let mut idle_since: Option<tokio::time::Instant> = None;
-            loop {
-                let is_processing = status.load(std::sync::atomic::Ordering::Relaxed) == 1;
-                if is_processing {
-                    idle_since = None;
-                } else {
-                    let started = *idle_since.get_or_insert_with(tokio::time::Instant::now);
-                    if started.elapsed() >= idle_timeout {
-                        break; // reap
-                    }
-                }
-                tokio::time::sleep((idle_timeout / 10).max(Duration::from_millis(10))).await;
-            }
-            // Graceful: worker finishes its current batch, then observes the
-            // flag at the top of the loop and exits.
-            worker_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = handle.await;
-            burst_alive.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        });
+        // Burst workers share the pool shutdown flag and are joined/aborted
+        // with core workers. Idle retirement must not cancel suspended actors.
+        let handle = worker.spawn_burst(idle_timeout, burst_alive);
+        let mut workers = workers.lock().unwrap();
+        workers.retain(|handle| !handle.is_finished());
+        workers.push(handle);
     }
 }
 
@@ -308,7 +290,7 @@ pub struct SharedThreadPool {
     pool_size: usize,
 
     /// Collection of worker task JoinHandles
-    workers: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    workers: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
 
     /// Central scheduling queue for ready mailboxes
     scheduling_queue: Arc<SchedulingQueue>,
@@ -362,7 +344,7 @@ impl SharedThreadPool {
 
         let mut pool = Self {
             pool_size: config.pool_size,
-            workers: std::sync::Mutex::new(Vec::with_capacity(config.pool_size)),
+            workers: Arc::new(std::sync::Mutex::new(Vec::with_capacity(config.pool_size))),
             scheduling_queue,
             runtime_handle,
             is_shutting_down,
@@ -444,6 +426,15 @@ impl SharedThreadPool {
         mailbox: Arc<dyn Mailbox>,
         _config: Option<ThreadActorConfig>,
     ) -> Result<(), SystemError> {
+        self.schedule_now(path, mailbox, _config)
+    }
+
+    pub(crate) fn schedule_now(
+        &self,
+        path: &str,
+        mailbox: Arc<dyn Mailbox>,
+        _config: Option<ThreadActorConfig>,
+    ) -> Result<(), SystemError> {
         if self.is_shutting_down.load(Ordering::Relaxed) {
             return Err(SystemError::ShuttingDown);
         }
@@ -457,7 +448,11 @@ impl SharedThreadPool {
 
         {
             let mut paths = self.scheduled_paths.lock().unwrap();
-            paths.insert(path.to_string());
+            if !paths.insert(path.to_string()) {
+                return Err(SystemError::RegistrationError(format!(
+                    "actor {path} is already scheduled"
+                )));
+            }
         }
 
         // Install the wake hook: whenever a push succeeds after this actor is
@@ -490,8 +485,9 @@ impl SharedThreadPool {
             }));
         }
 
-        mailbox.schedule_state().try_enqueue();
-        self.scheduling_queue.push(mailbox.clone());
+        if mailbox.schedule_state().try_enqueue() {
+            self.scheduling_queue.push(mailbox.clone());
+        }
 
         Ok(())
     }
@@ -522,7 +518,10 @@ impl SharedThreadPool {
     pub async fn shutdown(&self, timeout_ms: u64) -> Result<(), SystemError> {
         self.status
             .store(SchedulerStatus::ShuttingDown as usize, Ordering::SeqCst);
-        self.is_shutting_down.store(true, Ordering::SeqCst);
+        {
+            let _gate = self.burst_spawn_gate.lock().unwrap();
+            self.is_shutting_down.store(true, Ordering::SeqCst);
+        }
 
         // Wake all idle workers so they observe the shutdown flag.
         for _ in 0..self.pool_size {
@@ -535,12 +534,13 @@ impl SharedThreadPool {
             // Take one handle out of the lock scope before awaiting so the
             // MutexGuard is not held across the await point.
             let next = { self.workers.lock().unwrap().pop() };
-            let Some(handle) = next else { break };
+            let Some(mut handle) = next else { break };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
+            if tokio::time::timeout(remaining, &mut handle).await.is_err() {
+                // Dropping a JoinHandle detaches it. Abort explicitly so all
+                // suspended actor futures are reclaimed instead.
+                handle.abort();
             }
-            let _ = tokio::time::timeout(remaining, handle).await;
         }
         self.status
             .store(SchedulerStatus::Shutdown as usize, Ordering::SeqCst);
@@ -586,6 +586,7 @@ impl SharedThreadPool {
             spawn_gate: self.burst_spawn_gate.clone(),
             config: self.config.clone(),
             runtime: self.runtime_handle.clone(),
+            workers: Arc::downgrade(&self.workers),
         })
     }
 
@@ -603,6 +604,15 @@ impl SharedThreadPool {
             is_shutting_down: self.is_shutting_down.load(Ordering::Relaxed),
             status: self.status(),
             active_processors: self.worker_manager.tracked_worker_count(),
+        }
+    }
+}
+
+impl Drop for SharedThreadPool {
+    fn drop(&mut self) {
+        self.is_shutting_down.store(true, Ordering::Release);
+        for handle in self.workers.lock().unwrap().drain(..) {
+            handle.abort();
         }
     }
 }

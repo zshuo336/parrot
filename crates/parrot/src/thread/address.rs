@@ -21,13 +21,17 @@ use crate::thread::scheduler::ThreadScheduler;
 ///
 /// Holds only a *weak* reference to the actor's mailbox so the reference
 /// never keeps a stopped actor's mailbox alive. The weak pointer sits in an
-/// `Arc<Mutex<..>>` so it can be installed after construction (the mailbox
+/// `Arc<Mutex<..>>` so supervised generations share one logical address.
+/// It can be installed after construction (the mailbox
 /// is created after the ref during spawn) while the ref itself is shared
 /// through `Arc`.
 ///
-/// `send` performs a tell (fire-and-forget) while `ask` performs a
-/// request-response round trip using an oneshot channel embedded in an
-/// [`AskEnvelope`].
+/// `send_msg` and [`ActorRef::deliver`] enqueue without waiting for a reply.
+/// [`ActorRef::send`] and `ask` await a response carried by an [`AskEnvelope`].
+/// For system-registered references, [`ActorRef::stop`] waits for the owning
+/// system's lifecycle operation under its configured shutdown deadline.
+/// A stopped logical reference cannot stop an unrelated actor manually spawned
+/// later at the same path. A supervised reference follows its replacements.
 pub struct ThreadActorRef<A>
 where
     A: parrot_api::actor::Actor<Context = crate::thread::context::ThreadContext<A>>
@@ -40,6 +44,9 @@ where
 
     /// Weak reference to the actor's mailbox (interior mutability for late install)
     mailbox: Arc<Mutex<WeakMailboxRef>>,
+
+    /// Owning system for registered actor lifecycle operations.
+    system: crate::thread::context::WeakSystemRef,
 
     /// Default backpressure strategy for sends
     default_strategy: BackpressureStrategy,
@@ -72,11 +79,17 @@ where
         Self {
             path: path.path,
             mailbox: Arc::new(Mutex::new(mailbox)),
+            system: Weak::new(),
             default_strategy,
             default_timeout,
             scheduler,
             _marker: PhantomData,
         }
+    }
+
+    pub(crate) fn with_system(mut self, system: crate::thread::context::WeakSystemRef) -> Self {
+        self.system = system;
+        self
     }
 
     /// Get the actor path string.
@@ -92,6 +105,16 @@ where
     /// Get the default backpressure strategy.
     pub fn default_strategy(&self) -> &BackpressureStrategy {
         &self.default_strategy
+    }
+
+    /// Share the logical address across supervised generations.
+    pub(crate) fn with_mailbox_cell(mut self, mailbox: Arc<Mutex<WeakMailboxRef>>) -> Self {
+        self.mailbox = mailbox;
+        self
+    }
+
+    pub(crate) fn mailbox_cell(&self) -> Arc<Mutex<WeakMailboxRef>> {
+        self.mailbox.clone()
     }
 
     /// Set (or fix up) the weak mailbox reference.
@@ -179,64 +202,58 @@ where
         strategy: BackpressureStrategy,
         timeout_duration: Duration,
     ) -> ActorResult<BoxedMessage> {
-        let mailbox = self.mailbox()?;
-
         let (envelope, reply_rx) = AskEnvelope::with_boxed(msg);
-
-        mailbox.push_ask(envelope, strategy).await.map_err(|e| {
-            ActorError::InternalError(format!("Failed to enqueue ask for {}: {:?}", self.path, e))
-        })?;
-
-        match tokio::time::timeout(timeout_duration, reply_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ActorError::ReplyChannelError(format!(
-                "Reply channel closed for ask to {}",
-                self.path
-            ))),
-            Err(_) => Err(ActorError::TimeoutDetail(format!(
-                "Request to actor {} timed out after {}ms",
-                self.path,
-                timeout_duration.as_millis()
-            ))),
-        }
+        self.ask_envelope_with_timeout(envelope, reply_rx, strategy, timeout_duration)
+            .await
     }
 
-    /// M5: inline-payload ask (SSO lane, ≤16B messages).    ///
-    /// Ask with a small message that implements `InlineMsg`: the payload
-    /// lives inline in the envelope (zero payload allocations), the
-    /// envelope flows by value (zero envelope allocation). Total asker-side
-    /// allocations: exactly one (the oneshot cell).
+    /// Ask with an inline payload, with one deadline for enqueue and reply.
     pub async fn ask_inline<P: crate::thread::envelope::InlineMsg>(
         &self,
         msg: P,
         timeout_duration: Duration,
     ) -> ActorResult<BoxedMessage> {
-        let mailbox = self.mailbox()?;
-
         let (envelope, reply_rx) = AskEnvelope::new_inline(msg);
+        self.ask_envelope_with_timeout(
+            envelope,
+            reply_rx,
+            self.default_strategy.clone(),
+            timeout_duration,
+        )
+        .await
+    }
 
-        mailbox
-            .push_ask(envelope, self.default_strategy.clone())
-            .await
-            .map_err(|e| {
+    async fn ask_envelope_with_timeout(
+        &self,
+        envelope: AskEnvelope,
+        reply_rx: tokio::sync::oneshot::Receiver<ActorResult<BoxedMessage>>,
+        strategy: BackpressureStrategy,
+        timeout_duration: Duration,
+    ) -> ActorResult<BoxedMessage> {
+        let exchange = async {
+            let mailbox = self.mailbox()?;
+            mailbox.push_ask(envelope, strategy).await.map_err(|e| {
                 ActorError::InternalError(format!(
                     "Failed to enqueue ask for {}: {:?}",
                     self.path, e
                 ))
             })?;
-
-        match tokio::time::timeout(timeout_duration, reply_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ActorError::ReplyChannelError(format!(
-                "Reply channel closed for ask to {}",
-                self.path
-            ))),
-            Err(_) => Err(ActorError::TimeoutDetail(format!(
-                "Request to actor {} timed out after {}ms",
-                self.path,
-                timeout_duration.as_millis()
-            ))),
-        }
+            reply_rx.await.map_err(|_| {
+                ActorError::ReplyChannelError(format!(
+                    "Reply channel closed for ask to {}",
+                    self.path
+                ))
+            })?
+        };
+        tokio::time::timeout(timeout_duration, exchange)
+            .await
+            .map_err(|_| {
+                ActorError::TimeoutDetail(format!(
+                    "Request to actor {} timed out after {}ms",
+                    self.path,
+                    timeout_duration.as_millis()
+                ))
+            })?
     }
 
     /// Ask with default strategy and timeout.
@@ -327,8 +344,15 @@ where
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
-            let mailbox = self.mailbox()?;
-            mailbox.close().await;
+            if let Some(system) = self.system.upgrade() {
+                let completion = system.request_stop_ref(&self.path, &self.mailbox)?;
+                return crate::thread::system::await_stop(completion)
+                    .await
+                    .map_err(ActorError::from);
+            }
+            // Explicitly constructed, unregistered adapters have no registry
+            // operation to join; retain their mailbox-only close behavior.
+            self.mailbox()?.close().await;
             Ok(())
         })
     }
@@ -338,7 +362,12 @@ where
     }
 
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-        Box::pin(async move { self.weak_mailbox().upgrade().is_some() })
+        Box::pin(async move {
+            match self.weak_mailbox().upgrade() {
+                Some(mailbox) => !mailbox.is_closed().await,
+                None => false,
+            }
+        })
     }
 
     fn clone_boxed(&self) -> BoxedActorRef {
@@ -361,6 +390,7 @@ where
         Self {
             path: self.path.clone(),
             mailbox: self.mailbox.clone(),
+            system: self.system.clone(),
             default_strategy: self.default_strategy.clone(),
             default_timeout: self.default_timeout,
             scheduler: self.scheduler.clone(),

@@ -8,7 +8,7 @@ use ringbuf::{
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use crate::thread::config::BackpressureStrategy;
@@ -32,8 +32,8 @@ pub struct SpscRingbufMailbox {
     capacity: usize,
     /// Notify mechanism to wake up processors when new messages arrive
     notify: Arc<Notify>,
-    /// Counter for current messages in the mailbox
-    message_count: Arc<AtomicUsize>,
+    /// Wakes producers when a pop or close changes available capacity.
+    capacity_notify: Notify,
     /// Flag indicating if this mailbox has been closed
     is_closed: Arc<AtomicBool>,
     /// Associated processor (interior mutability)
@@ -52,7 +52,6 @@ impl Debug for SpscRingbufMailbox {
         f.debug_struct("SpscRingbufMailbox")
             .field("path", &self.path)
             .field("capacity", &self.capacity)
-            .field("message_count", &self.message_count.load(Ordering::SeqCst))
             .field("is_closed", &self.is_closed.load(Ordering::SeqCst))
             .finish()
     }
@@ -61,6 +60,7 @@ impl Debug for SpscRingbufMailbox {
 impl SpscRingbufMailbox {
     /// Create a new SPSC ring buffer mailbox.
     pub fn new(capacity: usize, path: ActorPath) -> Self {
+        let capacity = capacity.max(1);
         let rb = HeapRb::<BoxedMessage>::new(capacity);
         let (prod, cons) = rb.split();
 
@@ -70,7 +70,7 @@ impl SpscRingbufMailbox {
             path,
             capacity,
             notify: Arc::new(Notify::new()),
-            message_count: Arc::new(AtomicUsize::new(0)),
+            capacity_notify: Notify::new(),
             is_closed: Arc::new(AtomicBool::new(false)),
             processor: StdMutex::new(None),
             wake_hook: StdMutex::new(None),
@@ -81,16 +81,6 @@ impl SpscRingbufMailbox {
     /// Returns a reference to the notify mechanism
     pub fn notify_ref(&self) -> Arc<Notify> {
         self.notify.clone()
-    }
-
-    /// Increment the message count
-    fn increment_count(&self) {
-        self.message_count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Decrement the message count
-    fn decrement_count(&self) {
-        self.message_count.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Check if this mailbox is closed
@@ -116,142 +106,56 @@ impl Mailbox for SpscRingbufMailbox {
         msg: BoxedMessage,
         strategy: BackpressureStrategy,
     ) -> Result<(), MailboxError> {
-        if self.closed() {
-            return Err(MailboxError::Closed);
-        }
-
-        let mut producer = self.producer.lock().await;
-
-        match strategy {
-            BackpressureStrategy::DropNewest => {
-                if producer.is_full() {
-                    return Ok(()); // Drop newest silently
-                }
-                match Self::try_push_msg(&mut producer, msg) {
-                    Ok(()) => {
-                        self.increment_count();
-                        self.notify_ready();
-                        Ok(())
-                    }
-                    Err(()) => Err(MailboxError::PushError(
-                        "Failed to push message (ringbuf error)".to_string(),
-                    )),
-                }
+        loop {
+            let mut evicted = None;
+            let available = self.capacity_notify.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            if self.closed() {
+                return Err(MailboxError::Closed);
             }
-            BackpressureStrategy::Block => {
-                if producer.is_full() {
-                    drop(producer);
-                    let mut attempts = 0;
-                    while attempts < 100 {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        if self.closed() {
-                            return Err(MailboxError::Closed);
-                        }
-                        let mut p = self.producer.lock().await;
-                        if !p.is_full() {
-                            match Self::try_push_msg(&mut p, msg) {
-                                Ok(()) => {
-                                    self.increment_count();
-                                    self.notify_ready();
-                                    return Ok(());
-                                }
-                                Err(()) => {
-                                    return Err(MailboxError::PushError(
-                                        "Failed to push message (ringbuf error)".to_string(),
-                                    ));
-                                }
-                            }
-                        }
-                        drop(p);
-                        attempts += 1;
+            let mut producer = self.producer.lock().await;
+            // Close also owns this lock, so no producer can publish after drain.
+            if self.closed() {
+                return Err(MailboxError::Closed);
+            }
+            if producer.is_full() {
+                match strategy {
+                    BackpressureStrategy::DropNewest => return Ok(()),
+                    BackpressureStrategy::Error => {
+                        return Err(MailboxError::Full {
+                            capacity: self.capacity,
+                        });
                     }
-                    Err(MailboxError::PushError(
-                        "Failed to push message after multiple attempts (ringbuf error)"
-                            .to_string(),
-                    ))
-                } else {
-                    match Self::try_push_msg(&mut producer, msg) {
-                        Ok(()) => {
-                            self.increment_count();
-                            self.notify_ready();
-                            Ok(())
-                        }
-                        Err(()) => Err(MailboxError::PushError(
-                            "Failed to push message (ringbuf error)".to_string(),
-                        )),
+                    BackpressureStrategy::DropOldest => {
+                        evicted = self.consumer.lock().await.try_pop();
+                    }
+                    BackpressureStrategy::Block => {
+                        drop(producer);
+                        available.await;
+                        continue;
                     }
                 }
             }
-            BackpressureStrategy::Error => {
-                if producer.is_full() {
-                    return Err(MailboxError::Full {
-                        capacity: self.capacity,
-                    });
-                }
-                match Self::try_push_msg(&mut producer, msg) {
-                    Ok(()) => {
-                        self.increment_count();
-                        self.notify_ready();
-                        Ok(())
-                    }
-                    Err(()) => Err(MailboxError::PushError(
-                        "Failed to push message (ringbuf error)".to_string(),
-                    )),
-                }
-            }
-            BackpressureStrategy::DropOldest => {
-                if producer.is_full() {
-                    drop(producer);
-                    let mut consumer = self.consumer.lock().await;
-                    if !consumer.is_empty() {
-                        let _ = consumer.try_pop();
-                        self.decrement_count();
-                    }
-                    drop(consumer);
-                    let mut producer = self.producer.lock().await;
-                    match Self::try_push_msg(&mut producer, msg) {
-                        Ok(()) => {
-                            self.increment_count();
-                            self.notify_ready();
-                            Ok(())
-                        }
-                        Err(()) => Err(MailboxError::PushError(
-                            "Failed to push message after dropping oldest (ringbuf error)"
-                                .to_string(),
-                        )),
-                    }
-                } else {
-                    match Self::try_push_msg(&mut producer, msg) {
-                        Ok(()) => {
-                            self.increment_count();
-                            self.notify_ready();
-                            Ok(())
-                        }
-                        Err(()) => Err(MailboxError::PushError(
-                            "Failed to push message (ringbuf error)".to_string(),
-                        )),
-                    }
-                }
-            }
+            Self::try_push_msg(&mut producer, msg)
+                .map_err(|()| MailboxError::PushError("ring buffer push failed".into()))?;
+            drop(producer);
+            drop(evicted);
+            self.notify_ready();
+            return Ok(());
         }
     }
 
     async fn pop(&self) -> Option<BoxedMessage> {
-        let mut consumer = self.consumer.lock().await;
-        if consumer.is_empty() {
-            return None;
+        let item = self.consumer.lock().await.try_pop();
+        if item.is_some() {
+            self.capacity_notify.notify_waiters();
         }
-        match consumer.try_pop() {
-            Some(msg) => {
-                self.decrement_count();
-                Some(msg)
-            }
-            None => None,
-        }
+        item
     }
 
     async fn is_empty(&self) -> bool {
-        self.message_count.load(Ordering::SeqCst) == 0
+        self.consumer.lock().await.is_empty()
     }
 
     async fn signal_ready(&self) {
@@ -267,17 +171,27 @@ impl Mailbox for SpscRingbufMailbox {
     }
 
     async fn len(&self) -> usize {
-        self.message_count.load(Ordering::SeqCst)
+        self.consumer.lock().await.occupied_len()
+    }
+
+    fn seal(&self) {
+        self.is_closed.store(true, Ordering::SeqCst);
+        self.capacity_notify.notify_waiters();
+        self.notify.notify_waiters();
     }
 
     async fn close(&self) {
-        self.is_closed.store(true, Ordering::SeqCst);
-        let mut consumer = self.consumer.lock().await;
-        while consumer.try_pop().is_some() {
-            self.decrement_count();
-        }
-        drop(consumer);
-        self.notify.notify_waiters();
+        self.seal();
+        let drained = {
+            let _producer = self.producer.lock().await;
+            let mut consumer = self.consumer.lock().await;
+            let mut drained = Vec::new();
+            while let Some(message) = consumer.try_pop() {
+                drained.push(message);
+            }
+            drained
+        };
+        drop(drained);
     }
 
     async fn is_closed(&self) -> bool {

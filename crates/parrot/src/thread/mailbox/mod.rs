@@ -2,7 +2,7 @@
 
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
@@ -59,76 +59,70 @@ pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
 /// owning worker) per mailbox.
 ///
 /// The state machine is:
-/// - `queued_or_owned == false`: idle; anyone may acquire the slot and push
+/// - `OWNED` bit clear: idle; anyone may acquire the slot and push
 ///   the mailbox into the scheduling queue.
-/// - `queued_or_owned == true`: the mailbox is either sitting in the
+/// - `OWNED` bit set: the mailbox is either sitting in the
 ///   scheduling queue or is being processed by a worker. Concurrent enqueue
-///   attempts are rejected and recorded in `pending_wake` so the owning
+///   attempts are rejected and recorded in the `WAKE` bit so the owning
 ///   worker takes over the re-queue on release instead of losing the wakeup.
 ///
 /// This preserves actor semantics: a single actor's mailbox is processed by
 /// exactly one worker at a time.
 #[derive(Debug, Default)]
 pub struct ScheduleState {
-    queued_or_owned: AtomicBool,
-    pending_wake: AtomicBool,
+    // Ownership and pending wake must change atomically. Two separate bools
+    // allow a releasing worker to reclaim a slot already taken by a producer.
+    state: AtomicU8,
 }
 
 impl ScheduleState {
-    /// Attempt to acquire the scheduling slot.
-    ///
-    /// Returns `true` when the caller should push the mailbox into the
-    /// scheduling queue (the slot was acquired). Returns `false` when the
-    /// mailbox is already queued or owned; the attempt is recorded in
-    /// `pending_wake` so the current owner re-queues on release.
+    const OWNED: u8 = 1;
+    const WAKE: u8 = 2;
+
+    /// Acquire a free slot, or record a wake for its current owner.
     pub fn try_enqueue(&self) -> bool {
-        if !self.queued_or_owned.swap(true, Ordering::AcqRel) {
-            return true;
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let free = current & Self::OWNED == 0;
+            let next = if free {
+                Self::OWNED
+            } else {
+                current | Self::WAKE
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return free,
+                Err(observed) => current = observed,
+            }
         }
-        self.pending_wake.store(true, Ordering::Release);
-        // Close the lost-wakeup window: the owner's `release` may have
-        // completed its final `pending_wake` check *before* the store above
-        // became visible and freed the slot (`queued_or_owned == false`),
-        // in which case nobody re-queues this mailbox. Re-check the slot
-        // with an RMW: if the owner fully released, this caller takes over
-        // the enqueue responsibility itself. If the slot is still held
-        // (owner mid-batch or a concurrent re-queue in flight), the flag
-        // stays set and the owner's release path observes it.
-        if !self.queued_or_owned.swap(true, Ordering::AcqRel) {
-            self.pending_wake.store(false, Ordering::Release);
-            return true;
-        }
-        false
     }
 
-    /// Worker-side release after finishing a batch.
-    ///
-    /// Returns `true` when the mailbox must be re-queued (more messages are
-    /// pending, or a push raced with this release). Returns `false` when the
-    /// slot was freed and no re-queue is needed.
+    /// Release ownership, or retain it for exactly one re-enqueue. The CAS
+    /// makes producer takeover and worker re-enqueue mutually exclusive.
     pub fn release(&self, has_more: bool) -> bool {
-        if has_more {
-            return true; // still owns the slot; caller re-queues directly.
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let requeue = has_more || current & Self::WAKE != 0;
+            let next = if requeue { Self::OWNED } else { 0 };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return requeue,
+                Err(observed) => current = observed,
+            }
         }
-        if self.pending_wake.swap(false, Ordering::AcqRel) {
-            return true; // a push raced us; keep the slot and re-queue.
-        }
-        self.queued_or_owned.store(false, Ordering::Release);
-        // A hook may have landed between the pending_wake swap above and the
-        // store: its slot CAS failed (we still owned it) and it set
-        // pending_wake. Take the slot back and re-queue on its behalf.
-        if self.pending_wake.swap(false, Ordering::AcqRel) {
-            self.queued_or_owned.store(true, Ordering::Release);
-            return true;
-        }
-        false
     }
 
-    /// Drop the slot unconditionally (error paths). Any pending wakeup is
-    /// discarded; the next successful push re-enqueues the mailbox.
+    /// Discard ownership and pending wakes after terminal processing failure.
     pub fn force_release(&self) {
-        self.pending_wake.store(false, Ordering::Release);
-        self.queued_or_owned.store(false, Ordering::Release);
+        self.state.store(0, Ordering::Release);
     }
 }
 
@@ -234,7 +228,12 @@ pub trait Mailbox: Debug + Send + Sync + 'static {
     /// Current number of buffered messages.
     async fn len(&self) -> usize;
 
-    /// Close the mailbox: further pushes fail, buffered messages are drained.
+    /// Reject new mailbox delivery without running message destructors.
+    /// This must be synchronous and must wake producers waiting for capacity.
+    fn seal(&self);
+
+    /// Seal and drain the mailbox. Dropping user messages can execute user code;
+    /// lifecycle callers isolate this operation from their deadline timers.
     async fn close(&self);
 
     /// Whether the mailbox is closed.
@@ -272,6 +271,37 @@ pub trait Mailbox: Debug + Send + Sync + 'static {
 #[cfg(test)]
 mod schedule_state_tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn concurrent_wake_and_release_have_exactly_one_enqueue_owner() {
+        let state = ScheduleState::default();
+        let barrier = std::sync::Barrier::new(2);
+        let producer_owns = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..100_000 {
+                    barrier.wait();
+                    producer_owns.store(state.try_enqueue(), Ordering::Relaxed);
+                    barrier.wait();
+                }
+            });
+            let mut violations = 0;
+            for _ in 0..100_000 {
+                state.force_release();
+                assert!(state.try_enqueue());
+                barrier.wait();
+                let owner_requeues = state.release(false);
+                barrier.wait();
+                // A wake races the final release. Exactly one side must enqueue;
+                // both true creates duplicate concurrent mailbox owners.
+                if owner_requeues == producer_owns.load(Ordering::Relaxed) {
+                    violations += 1;
+                }
+            }
+            assert_eq!(violations, 0, "lost or duplicated scheduling ownership");
+        });
+    }
 
     #[test]
     fn test_initial_state_allows_enqueue() {

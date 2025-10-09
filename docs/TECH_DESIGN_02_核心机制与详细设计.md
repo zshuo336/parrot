@@ -237,14 +237,14 @@ flowchart TD
         ├─ StopMessage 拦截 → ctx.stop()，立即 Ready
         ├─ ctx 未初始化 → Ready(Err("context not initialized"))
         ├─ use_async_handler() == false（默认）
-        │    → ctx_ptr = NonNull(actix_ctx)
-        │    → inner.receive_message_with_engine(payload, &mut self.ctx, ctx_ptr)
+        │    → handle = EngineContextHandle::new(actix_ctx)
+        │    → inner.receive_message_with_engine(payload, &mut self.ctx, handle)
         │    → Some(result) → Ready(Some(result))     ← 同步快路径，零额外分配
-        │    → None       → Ready(None)               ← 保留旧版"未处理即丢弃"语义
+        │    → None       → Ready(Some(Err(...)))     ← 明确报告未处理消息
         └─ use_async_handler() == true
-             → 在 handle 内创建 inner.receive_message(payload, ctx) 的自引用 future
-             → unsafe lifetime 扩展为 'static（安全性论证见 §3.1a）
-             → AsyncDispatchFuture{fut} 作为 ActorFuture 返回
+             → take actor 与 Parrot context，移入拥有它们的 async future
+             → future 内部安全借用二者调用 receive_message
+             → into_actor().map(...) 在完成时归还 actor/context 与回复
              → AtomicResponse 内部 ctx.wait(fut.map(|res,_,_| tx.send(res)))
              → await 期间：arbiter 线程释放（跑其他 actor/timer）；
                本 actor 邮箱被 waiting() 门控（后续消息排队）← actor 串行语义
@@ -257,80 +257,50 @@ spawn 通路（arbiter 池）：
 ```
 ActixActorSystem::spawn_root_typed(actor, config)
   → path = "actix://{type_name}/{uuid::simple()}"        ← 唯一路径，消除同名覆盖
-  → arbiter_pool()（懒构建：ArbiterPool::new(arbiter_count)，默认 num_cpus）
-  → actix::Actor::start_in_arbiter(&pool.next_arbiter(), |_ctx| ActixActor::new(actor))
-      ← round-robin 分配；每个 arbiter = 独立 OS 线程 + 单线程 tokio runtime(enable_all)
-  → ActixActorRef 包装 addr → 注册表登记 → 返回
+  → 在注册锁内检查 shutdown 准入，建立同一代生命周期控制
+  → 使用创建系统时已建立的 arbiter 池，round-robin 分配
+      ← 每个 arbiter = 独立 OS 线程 + 单线程 tokio runtime(enable_all)
+  → Actix dev channel + Context::with_receiver，完整 ContextFut 由所属 arbiter 的任务拥有
+  → 注册带生命周期的 ActixActorRef → 返回；init 完成后才处理消息
+  → 监视任务在宿主 runtime 等待完整 ContextFut 析构或停止截止时间
 ```
 
-### 3.1a 双路径调度的正确性论证（unsafe 边界文档）
+Actix 动态托管 actor 会在处理首条消息之前完成 `Actor::init`，正常停止取消当前异步处理，再在所属 arbiter 上执行 `before_stop`。初始化未完成或 panic 后跳过停止钩子；业务消息返回普通错误仍保留 actor。Context 自停只发起取消，不等待自身析构；外部托管 ActorRef::stop 与系统关闭则共享真实完成回执。回执成功发生在整个 Actix ContextFut（包括排队邮箱）析构之后。Actix 多次进入 stopping 时不能提前跳过尚未完成的停止钩子。
 
-`receive_message` 返回的 future 借用 `&'a mut A` 与 `&'a mut A::Context`（自引用），而 actix 的
-`ActorFuture` 要求 `'static`。桥接处的 lifetime transmute 依赖三条不变式：
+托管 `deliver` 使用有界 `try_send`：邮箱满时返回错误，关闭返回 Stopped；显式原生 `Addr` / `do_send` 仍属于 Actix 逃生接口，会绕过此准入策略。通过 `ActixActorRef::new` 包装的原始地址没有系统生命周期 owner，stop 只投递原生停止消息并限时等待地址断开，不能提供托管引用的带外取消和钩子错误回执。完整的 watch、stream、spawn、计时器生命周期与父子监督仍须继续实现，不能将本次修复视为 Actix 全能力完成。
 
-1. **地址稳定**：`ActixActor` 存在于堆上 boxed 的 `ContextFut`（actix spawn 产物），字段地址在
-   actor 生命周期内不变。
-2. **无别名访问**：future 挂在 `ctx.wait` 队列期间，actix 的 `waiting()` 门控使邮箱不被 poll
-   ——不会有第二个 handler 并发触碰被借用字段（`AtomicResponse` 相比 `ResponseActFuture` 的
-   区别正在于此：后者用 `ctx.spawn`，邮箱继续取消息，actor 语义变成并发）。
-3. **不越界存活**：future 的生命周期被 `AtomicResponse` 内的 wait item 包裹，后者存于
-   `ContextFut.wait: SmallVec`——ContextFut drop 时先 poll 一轮再释放 wait item（actix Drop
-   实现），不存在 future 越过 actor 存活期被 poll 的路径。
+### 3.1a 异步处理与取消的所有权边界（2026-10-09）
+
+`receive_message` 可以在等待期间借用 actor 与 Parrot context。适配器将这两个值移入 `async move` future，由 Rust 生成的 future 拥有它们；调用 `receive_message` 的借用只存在于该 future 内部。外层 `ActixActor` 在此期间不持有它们，也没有经过 lifetime transmute 的借用。
+
+完成时，`ActorFutureExt::map` 先归还 actor/context，再返回回复。业务错误同样归还状态，因此下一条消息能看到此前合法的状态修改。`AtomicResponse` 的 wait 门控保持同一 actor 的串行语义。若 arbiter 被取消，拥有状态的 future 被析构，借用型 handler 先释放，actor/context 随后释放。
+
+旧版本“ContextFut 销毁时 handler 不会越过 actor 存活期”的论证不成立：以 `31f7b2c` 的旧适配器运行取消回归，实际析构顺序为 `actor → handler`。当前实现通过 `handler → actor` 的断言，并且生产适配器已没有 `transmute` 或手写 `unsafe` poll。
 
 ```mermaid
-flowchart TB
-    subgraph handle["ActixActor::handle(wrapper, ctx)"]
-        STOP{"payload 是<br/>StopMessage?"}
-        INIT{"self.ctx<br/>已初始化?"}
-        ASYNC{"use_async_handler()?"}
-        SYNC["同步快路径<br/>receive_message_with_engine<br/>→ Some(result) / None"]
-        CREATE["创建自引用 future<br/>inner.receive_message(payload, parrot_ctx)"]
-        TRANS["unsafe lifetime 扩展 → 'static<br/>（地址稳定 + wait 门控 + 不越界）"]
-    end
-
-    AR["AtomicResponse&lt;Option&lt;ActorResult&gt;&gt;"]
-    WAIT["ctx.wait(fut.map(tx.send))<br/>actix wait 队列"]
-
-    subgraph during["await 期间（可能多次 poll）"]
-        RELEASE["arbiter 线程释放<br/>→ 轮询其他 actor / timer"]
-        GATE["本 actor 邮箱门控<br/>（waiting() == true）<br/>后续消息排队"]
-    end
-
-    DONE["future Ready(Some(result))<br/>→ actix OneshotSender 发送<br/>→ ask 端 resolve"]
-
-    STOP -->|是| STOPH["ctx.stop() + Ready"]
-    STOP -->|否| INIT
-    INIT -->|否| ERRH["Ready(Err)"]
-    INIT -->|是| ASYNC
-    ASYNC -->|false 默认| SYNC --> AR
-    ASYNC -->|true| CREATE --> TRANS --> AR
-    AR --> WAIT
-    WAIT --> RELEASE
-    WAIT --> GATE
-    RELEASE & GATE --> DONE
-
-    style TRANS fill:#fef3c7
-    style GATE fill:#dcfce7
+flowchart TD
+    HANDLE[收到消息] --> MODE{异步 handler?}
+    MODE -->|否| SYNC[带生命周期的上下文句柄调用同步入口]
+    MODE -->|是| OWN[actor 与 Parrot context 移入 async future]
+    OWN --> WAIT[AtomicResponse 等待，后续消息排队]
+    WAIT -->|成功或业务错误| RESTORE[归还 actor/context，再发送回复]
+    WAIT -->|arbiter 取消| DROP[先释放 handler，再释放 actor/context]
 ```
 
-语义保证总结：
-- **actor 内串行**：一条消息的 handler 未完成前，下一条消息不会被该 actor 处理（wait 门控）。
-- **跨 actor 并行**：不同 actor（尤其不同 arbiter 上的）互不阻塞；同步重 handler 只冻结所在
-  arbiter 的线程。
-- **ask 语义不变**：回复在 future 完成后才发送；`Addr::send`/`do_send`/`send_with_timeout`
-  的错误语义（mailbox closed / delivery timeout）保持。
-- **兼容性**：默认路径与旧版行为一致（同步 probe + None 丢弃），存量 actor 无感。
+原生引擎上下文由 `EngineContextHandle<'ctx>` 的真实可变借用约束，不会交给异步 handler。三个 compile-fail doctest 验证句柄不能逃逸、不能与原上下文重叠访问、不能返回局部引用。运行时回归位于 `crates/parrot/tests/test_actix_owned_dispatch.rs`，覆盖顺序、错误恢复和实际 arbiter 取消。
+
+`inner_mut()` 仅可在没有在途异步 handler 时调用；可能处于处理中的适配器应使用 `try_inner_mut()`，此时返回 `None`。这些所有权修复不表示 Actix 的全部生命周期钩子、监督、timer/watch/stream 能力已补齐。
 
 ### 3.2 各组件职责与缺口
 
 | 组件 | 实现要点 | 缺口 |
 |------|----------|------|
-| `ActixContext<A>` | 持 `Arc<Addr<A>>`+path+parent+children；实现 ActorContext 全方法 | `stop` 是空 Ok；`watch/unwatch` 返回 Err 未实现；`stream_registry/spawner` unimplemented!；`schedule_periodic` 是**无限 loop 不会返回的 future**（调度即卡死调用方，见 03 §3-D7）；`set_receive_timeout/set_supervisor_strategy` 空操作 |
+| `ActixContext<A>` | 持 `Arc<Addr<A>>`+path+parent+children；实现 ActorContext 接口 | 托管 `stop` 发起带外取消；Context 定时任务有界且随创建者停止回收；`watch/unwatch` 返回 Err 未实现；`stream_registry/spawner` unimplemented!；`set_receive_timeout/set_supervisor_strategy` 仍为空操作 |
 | `ActixActorRef<A>` | 包装 `Arc<Addr<ActixActor<A>>>`；`send_with_timeout` 用 actix `Request::timeout`；`stop` 发 StopMessage 信封（**handle 内已拦截并真正 ctx.stop()**）；`is_alive` 用 `addr.connected()`；另提供 `do_send/try_send` 便捷法 | `create_envelope` 的 message_type 恒 "unknown"（元数据丢失）；`stop` 走 do_send 不等待确认 |
 | `ActixActorSystem` | 包装 `Arc<actix::System::current()>`；actors 注册表；**内置 ArbiterPool（懒构建，round-robin spawn，`with_arbiter_count(n)` 可调）**；spawn path 唯一化（uuid 后缀） | `broadcast` fire-and-forget；`shutdown` 停 actor 仅 sleep 100ms 后 `System::current().stop()`（粗粒度，不 join arbiter 线程）；registry 字段与 actors 重复（冗余债） |
 | `types.rs` | 本地 `MessageEnvelope`（与 api 层**同名不同构**）、`StopMessage`、`ActorId` | ActorContextData 空占位；与 reference.rs 里的 StopMessage **重复定义**（编译靠 mod 隔离，语义靠约定） |
 | `message.rs` | `ActixMessageWrapper`（孤儿规则适配：外部 trait × 外部类型不可 impl，故包一层）；`MessageDowncast` 扩展 trait（BoxedMessage 的 downcast 人体工学） | — |
-| `actor.rs`（双路径 Handler） | `Handler::Result = AtomicResponse`；同步快路径 + `AsyncDispatchFuture` 异步桥；StopMessage 拦截 | lifetime transmute 依赖 §3.1a 三不变式（文档化契约，非类型系统保证）；`use_async_handler` 尚无 derive 属性入口 |
+| `actor.rs`（双路径 Handler） | `AtomicResponse`；带生命周期的同步上下文句柄；拥有状态的异步 future；StopMessage 拦截 | 生命周期钩子、监督与 Context 能力仍需补齐；derive 已支持 `async_handler = true` |
 
 ### 3.3 双通道设计与 `#[cfg(test)]` 的语义分叉
 
@@ -379,7 +349,7 @@ spawn_internal 流程：
 三枚举：
 - `SchedulingMode{SharedPool{max_messages_per_run}, DedicatedThread}`
 - `BackpressureStrategy{Block, Error, DropOldest, DropNewest}`（邮箱满时行为，语义完备）
-- `SupervisorStrategy{Restart{max_retries,within}, Stop, Escalate}`（**与 api 层不同型**：无 Resume；独立枚举）
+- `SupervisorStrategy{Restart{max_retries,within}, Stop, Escalate, Resume}`（与 api 层不同型；当前 panic 路径将 Resume 视为 Stop，完整业务错误恢复仍待接线）
 
 ### 4.3 邮箱体系
 
@@ -387,9 +357,25 @@ spawn_internal 流程：
 
 | 实现 | 底层 | 结构 | 特点 |
 |------|------|------|------|
-| `MpscMailbox` | flume bounded | Sender/Receiver + is_ready(AtomicBool) + Notify + is_closed + processor:Option | 多生产者；push 按 strategy 分派（DropNewest=try_send 失败即丢 / Block=async send 等待 / Error=返回 Full / DropOldest=先弹再塞） |
-| `SpscRingbufMailbox` | ringbuf HeapRb split + **TokioMutex 包裹** prod/cons + Notify + message_count(AtomicUsize) | 单生产者单消费者 | 注释自述：因 Mailbox trait 是 `&self` 异步方法，无法真锁自由，用 async Mutex 是"性能妥协"（真 lock-free 需 &mut self 签名） |
-| `spsc.rs` | （旧实现，被 ringbuf 版替代演进中） | — | — |
+| `MpscMailbox` | flume bounded + priority deque | 两条 lane 共用 enqueue gate；receiver 可取出关闭；Notify 唤醒生产者 | capacity 判定与发布在同一临界区；优先级决定消费顺序，DropOldest 按跨 lane 到达次序淘汰；close 拒绝等待发送并断开底层通道 |
+| `SpscRingbufMailbox` | ringbuf HeapRb split + TokioMutex | producer/consumer 锁；capacity Notify | Block 等待空位或关闭，无隐式重试 deadline；close 持 producer 锁后清空 consumer；计数读取 ring 实际占用 |
+| `SpscMailbox` | Tokio mpsc | receiver 锁；reserve permit | reserve 后在 receiver 锁内复查关闭再发布；close 关闭 receiver 并清空；长度读取实际队列 |
+
+上述背压和关闭契约针对 `Mailbox` API；保留的低层 `sender()` 是 adapter escape hatch，直接写入不触发调度 hook，MPSC 的低层 sender 也绕过跨 lane 容量策略。业务投递应使用 ActorRef/Mailbox。零容量规范化为 1，避免不可消费的 rendezvous 邮箱或 constructor panic。热路径新增同步带来的性能变化需要单独测量。
+
+`ActorContext::send` 使用 `deliver`，只等待入队，不等待业务回复；邮箱已满时仍遵循背压，不能承诺满邮箱的 self-send 自动解除循环等待。thread 的 Context::ask 通过目标 ActorRef 封装，不添加 thread 私有信封。thread boxed/inline ask、typed ask、Actix ActorRef 显式超时均覆盖整个请求；超时不撤销已发生的业务副作用。Actix 的超时错误统一为 TimeoutDetail，Context::ask 保留目标错误类型。
+
+### 4.3a 停止操作的所有权
+
+`ThreadActorSystem::stop_actor` 创建系统持有的停止操作，并在 registry 保留该实例的占位。并发调用者等待同一回执，取消调用者不会取消资源清理；清理结束比较 mailbox 身份后才移除登记。单个配置 deadline 覆盖 before_stop、独占线程回收和死亡通知。暂停的 handler 在 deadline 后由 processor 取消信号释放，其他 actor 继续运行。
+
+`shutdown_internal` 同样共享一次操作与完成结果，并加入已经运行的 stop。重复 shutdown 返回缓存的真实结果，不能通过重试把未完成或超时关闭解释成成功。同步用户代码无法被强制抢占，deadline 限制等待时间，不代表运行中的同步代码已退出。专用线程真实退出前继续计入线程配额。
+
+`ThreadActorRef::stop` 加入系统停止操作并等待回执，核对本代 mailbox 身份，不能停止同路径的新实例。`ThreadContext::stop` 发起停止后允许当前 handler 返回，避免在持有 actor/context 锁时等待自身 before_stop；封口后不再处理下一条排队消息。
+
+before_stop 按实际调度模式执行：共享模式使用受限的隔离 poll；dedicated/sharded 通过所属线程的控制通道执行。未来的每次 poll 和取消析构保持该执行策略。接收回执被取消或 deadline 已过时，尚未启动的请求不进入 actor；钩子 panic 被捕获并返回错误，不击穿分片线程。此处保证的是生命周期 future 的执行位置，普通 actor/消息值最终析构的线程归属仍需进一步完善。
+
+邮箱先 `seal` 关闭业务入口，再由独立清理任务 `close` 清空缓冲，用户消息析构不持内部记账锁；淘汰和拒绝消息也释放内部锁后再析构。停止超时不会放弃已开始的清理任务。上述关闭不等于处理完全部业务消息。
 
 ### 4.4 处理器（ActorProcessor）
 
@@ -479,7 +465,7 @@ DedicatedThreadScheduler：
 | ActixActorRef<A> | addr: Arc<Addr<ActixActor<A>>>, path: String | actix |
 | ArbiterPool | workers: Arc<Vec<ArbiterHandle>>, next: Arc<AtomicUsize> | actix |
 | ActixActorSystem | system: Arc<ActixSystem>, actors/registry: RwLock<HashMap>, default_dispatcher, arbiters: RwLock<Option<ArbiterPool>>, arbiter_count: usize | actix |
-| AsyncDispatchFuture<A> | fut: Option<BoxedFuture<'static, ActorResult<BoxedMessage>>>, _marker | actix（双路径 Handler 的异步桥） |
+| 拥有状态的 async future | 内部拥有 A 与 ActixContext；完成时归还状态 | actix（AtomicResponse；不再延长借用生命周期） |
 | ThreadActor<A> | inner: A, state, path: ActorPath, watchers: Option<HashSet<ActorPath>> | thread |
 | ThreadContext<A> | system: WeakSystemRef, runtime_handle, self_ref: Option<BoxedActorRef>, parent_ref, children_refs: Option<Arc<RwLock<HashMap<String, BoxedActorRef>>>>, path, supervisor_strategy, receive_timeout, backpressure_strategy | thread |
 | ThreadActorRef<A> | path, mailbox: WeakMailboxRef, default_strategy, default_timeout, scheduler: WeakSchedulerRef, _marker: PhantomData<A> | thread |
@@ -488,7 +474,7 @@ DedicatedThreadScheduler：
 | ActorProcessor<A> | actor: Mutex<ThreadActor<A>>, context: Mutex<ThreadContext<A>>, mailbox: Arc<Mutex<dyn Mailbox>>, path, config, status: Arc<AtomicUsize>, stats | thread |
 | ThreadActorSystem | config, registry, scheduler_group, runtime_handle, shutdown_signal, is_shutting_down | thread |
 | ThreadActorSystemConfig | 9 默认值字段（§4.2） | thread |
-| ActorRegistryEntry | actor_ref, mailbox, config, supervisor | thread（私有） |
+| ActorRegistryEntry | Dynamic(DynamicActorEntry) / Typed(TypedRegistration)，共享同一命名空间 | thread（私有） |
 | ParrotActorSystem | config, systems: RwLock<HashMap<String, ActorSystemImpl>>, default_system | system |
 
 ---
@@ -1018,9 +1004,19 @@ flowchart TB
     style ESC fill:#fef3c7
 ```
 
-> ⚠️ 现状：此流程图描述的是**规范层已定义的决策语义**；实现层尚无 `handle_failure` 的调用方（thread 后端 `handle_actor_termination` 仅做"通知父级 ChildFailure + 移除注册表"，Restart/Resume/Escalate 执行器未落地）。`within` 时间窗参数未参与熔断判断。
+当前 thread 动态 actor 已通过 `spawn_supervised` / `spawn_supervised_with_config` 接通工厂重启和滑动窗口预算。故障回调携带原 mailbox 身份，拒绝旧代或重复回调；每次尝试只扣一次预算。监督信息与首次注册一同发布，因此初始化 panic 也能恢复。重启保留完整配置、原 typed/erased 引用与 watch 订阅，成功恢复不发终止通知；最终停止携带实际 panic 文本。
+
+清理、重启工厂和发布共用配置的截止时间。同步工厂在阻塞池隔离执行；stop/shutdown 可取消等待，并在注册锁下阻止晚到结果发布。失败路径保持注册占位，调度失败回滚原占位及引用；排队消息被丢弃，未完成 ask 返回错误，不会自动重放。同步用户代码无法强行中断，超时后可能仍在后台完成析构或工厂计算。
+
+上图仍是完整监督体系的规范示意，不能据此推断全部落地：`Resume` 对 panic 仍按 Stop 处理；完整父子树、OneForAll，以及 Escalate 的父级策略执行仍待实现。现有 Escalate 仅按路径向直接父级投递 ChildFailure。静态 typed actor 路径也尚未并入上述监督。
+
+Thread 静态 typed actor 的消息仍经类型化 flume 通道，注册表保存入口协议的动态桥引用，`ref_for` 扩展到其它协议。`TypedChannelState` 在同一个锁下完成入队与封闭判定，消费后通知空位，关闭唤醒背压等待者；closed 对外返回 Stopped。系统持有 actor，丢弃用户引用本身不结束托管 actor。停止取消当前 dispatch 后运行 `ParrotTypedDispatch::before_stop`，共享 deadline 并确认析构；初始化未完成或 panic 的 actor 不调用该钩子。同步执行和析构在有界许可的阻塞池隔离，Pending 释放执行容量，超时不能强行杀死已运行的同步代码。
+
+`ParrotTypedDispatch` 新增默认 `init` / `before_stop`；手写分派实现可覆盖它们，已有 derive 使用默认钩子。仅通过 `TypedActorRef::new` 创建的原始通道没有系统生命周期，stop 返回错误而非假成功。Actix 静态路径也已安装托管控制，并在同一 arbiter 上执行 init、dispatch、before_stop 与析构；指定路径不会追加 UUID，同名注册被拒绝。ActixSystemSettings 提供邮箱容量、默认 ask 超时、停止截止时间和 arbiter 数量。typed 自动重启、全部协议的注册表动态分派、完整 drain/调度配置整合与性能重测也未声明完成。
 
 ### 7.11 系统关停时序图（双后端对比）
+
+双后端分支按 2026-10-09 的托管 actor 路径更新。关闭会拒绝新投递并取消排队请求，不承诺处理完所有未读消息；需要 drain 的应用必须先停止入口并自行确认业务完成。同步用户代码无法安全强制终止，超时会返回错误，已运行的同步 poll 可能稍后才退出。动态 actor 的单 actor stop 与并发 shutdown 已共享有截止时间的系统操作；监督重启已使用代际隔离和可取消的发布；两个后端的静态 typed actor 都已纳入各自注册表、单 actor stop 和系统关闭；完整父子生命周期仍待补齐。
 
 ```mermaid
 sequenceDiagram
@@ -1033,26 +1029,30 @@ sequenceDiagram
     participant TC as 各 Actor(thread)
     participant SS as SharedThreadPool
     participant DS as DedicatedThreadScheduler
+    participant SH as ShardedScheduler
 
     U->>P: shutdown()
     P->>P: systems.into_inner()
 
     par Actix 分支
         P->>A: shutdown()
-        A->>AC: tokio spawn 逐个 stop
-        Note over A: sleep 100ms（不等待确认）
-        A->>A: actix System current stop
-        A-->>P: Ok
+        A->>A: 关闭注册准入、创建共享完成回执与统一 deadline
+        A->>AC: 封闭入口，取消挂起 init/dispatch
+        AC->>AC: 在所属 arbiter 上运行 before_stop 并析构 actor 与邮箱
+        A->>A: 等待回执，仅停止并 join 所属 arbiter 池
+        Note over A: 超时返回错误，已开始的同步用户代码由退休任务继续拥有
+        A-->>P: Ok 或错误；宿主 Actix System 不受影响
     and Thread 分支
         P->>T: shutdown()
-        T->>T: is_shutting_down 置真 并 Notify 唤醒等待者
-        T->>TC: 广播 ControlMessage SystemShutdown
-        Note over T: sleep 100ms 后逐个 stop_by_path
-        T->>T: stop_by_path 逐个<br/>(Stop 消息 加 deschedule 加移除注册表)
-        T->>SS: shutdown()（async task）
-        T->>DS: shutdown()（async task）
-        T->>T: timeout(shutdown_timeout) 等待两调度器
-        T-->>P: Ok 或 Timeout 错误
+        T->>T: is_shutting_down 置真、取出 registry、建立统一 deadline
+        T->>TC: close mailbox，拒绝新消息、取消排队请求
+        T->>TC: 按所属调度器并发运行 before_stop（受同一 deadline 限制）
+        T->>SS: shutdown(剩余时间)，包括 burst worker
+        T->>DS: shutdown_until(deadline)
+        T->>SH: shutdown_until(deadline)
+        Note over SS,SH: 取消 Pending future；无法强制抢占同步用户代码
+        T->>T: 清理 watch registry，通知关闭等待者
+        T-->>P: Ok、Timeout 或 ShutdownError
     end
 
     P-->>U: 聚合错误（任一失败则 Other 包 join 的 errs）

@@ -5,7 +5,7 @@ use parrot_api::address::{ActorPath, ActorRef};
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage, WeakActorTarget};
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, Notify};
 
@@ -31,10 +31,9 @@ pub struct SpscMailbox {
     capacity: usize,
     /// Notify mechanism to wake up processors when new messages arrive
     notify: Arc<Notify>,
-    /// Counter for current messages in the mailbox
-    message_count: Arc<AtomicUsize>,
     /// Flag indicating if this mailbox has been closed
     is_closed: Arc<AtomicBool>,
+    closed_notify: Notify,
     /// Associated processor
     processor: StdMutex<Option<Arc<dyn ProcessorInterface>>>,
     /// Wake hook fired after a successful push (re-enqueue scheduling).
@@ -56,6 +55,7 @@ impl Debug for SpscMailbox {
 impl SpscMailbox {
     /// Creates a new SpscMailbox with the specified capacity and actor path.
     pub fn new(capacity: usize, path: ActorPath) -> Self {
+        let capacity = capacity.max(1);
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         let notify = Arc::new(Notify::new());
         let processor = StdMutex::new(None);
@@ -67,15 +67,17 @@ impl SpscMailbox {
             path,
             capacity,
             notify,
-            message_count: Arc::new(AtomicUsize::new(0)),
             is_closed: Arc::new(AtomicBool::new(false)),
+            closed_notify: Notify::new(),
             processor,
             wake_hook,
             schedule_state: crate::thread::mailbox::ScheduleState::default(),
         }
     }
 
-    /// Creates a clone of the sender that can be used to send messages to this mailbox.
+    /// Low-level sender for adapters managing their own scheduler wake hooks.
+    /// Actor delivery should use the `Mailbox` methods. Close also closes this
+    /// channel; callers using raw reserved permits inherit Tokio's semantics.
     pub fn sender(&self) -> Sender<BoxedMessage> {
         self.sender.clone()
     }
@@ -83,16 +85,6 @@ impl SpscMailbox {
     /// Returns a reference to the notify mechanism
     pub fn notify_ref(&self) -> Arc<Notify> {
         self.notify.clone()
-    }
-
-    /// Increment the message count
-    fn increment_count(&self) {
-        self.message_count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Decrement the message count
-    fn decrement_count(&self) {
-        self.message_count.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Check if this mailbox is closed
@@ -108,129 +100,64 @@ impl Mailbox for SpscMailbox {
         msg: BoxedMessage,
         strategy: BackpressureStrategy,
     ) -> Result<(), MailboxError> {
-        // Check if mailbox is already closed
+        use tokio::sync::mpsc::error::TrySendError;
+        let closed = self.closed_notify.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
         if self.closed() {
             return Err(MailboxError::Closed);
         }
-
-        match strategy {
-            BackpressureStrategy::DropNewest => {
-                // Try to send without waiting. If the mailbox is full, drop the message.
-                match self.sender.try_send(msg) {
-                    Ok(_) => {
-                        self.increment_count();
-                        self.notify.notify_one();
-                        self.fire_wake_hook();
-                        Ok(())
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        // Mailbox is full, drop the message as per strategy
-                        Ok(())
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        Err(MailboxError::Closed)
-                    }
-                }
+        if matches!(strategy, BackpressureStrategy::Block) {
+            let permit = tokio::select! {
+                biased;
+                _ = closed => return Err(MailboxError::Closed),
+                permit = self.sender.reserve() => permit.map_err(|_| MailboxError::Closed)?,
+            };
+            // Commit under the same receiver lock as close/drain. A pending
+            // reservation must not publish after close has already returned.
+            let receiver = self.receiver.lock().await;
+            if self.closed() {
+                return Err(MailboxError::Closed);
             }
-            BackpressureStrategy::Block => {
-                // Block until the message can be sent
-                match self.sender.send(msg).await {
-                    Ok(_) => {
-                        self.increment_count();
-                        self.notify.notify_one();
-                        self.fire_wake_hook();
-                        Ok(())
-                    }
-                    Err(_) => Err(MailboxError::Closed),
-                }
+            permit.send(msg);
+            drop(receiver);
+        } else {
+            let mut evicted = None;
+            let mut receiver = self.receiver.lock().await;
+            if self.closed() {
+                return Err(MailboxError::Closed);
             }
-            BackpressureStrategy::Error => {
-                // Try to send without waiting. If the mailbox is full, return an error.
-                match self.sender.try_send(msg) {
-                    Ok(_) => {
-                        self.increment_count();
-                        self.notify.notify_one();
-                        self.fire_wake_hook();
-                        Ok(())
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        Err(MailboxError::Full {
-                            capacity: self.capacity,
-                        })
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        Err(MailboxError::Closed)
-                    }
+            let result = match self.sender.try_send(msg) {
+                Err(TrySendError::Full(msg))
+                    if matches!(strategy, BackpressureStrategy::DropOldest) =>
+                {
+                    evicted = receiver.try_recv().ok();
+                    self.sender.try_send(msg)
                 }
-            }
-            BackpressureStrategy::DropOldest => {
-                // Tokio's mpsc doesn't directly support dropping oldest messages
-                // For a real implementation, we would need a custom data structure
-                // This implementation handles the drop oldest pattern more carefully:
-
-                // Try to send first, in case there's room
-                match self.sender.try_send(msg) {
-                    Ok(_) => {
-                        self.increment_count();
-                        self.notify.notify_one();
-                        self.fire_wake_hook();
-                        Ok(())
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                        // Mailbox is full, get exclusive access to the receiver
-                        let mut receiver_guard = match self.receiver.try_lock() {
-                            Ok(guard) => guard,
-                            Err(_) => {
-                                // Another thread has the lock, we can't safely drop the oldest message
-                                // Consider this case as if the mailbox is full and return error
-                                return Err(MailboxError::PushError(
-                                    "Cannot acquire lock to drop oldest message".to_string(),
-                                ));
-                            }
-                        };
-
-                        // Discard one message
-                        match receiver_guard.try_recv() {
-                            Ok(_) => {
-                                // Successfully removed one message, decrement count
-                                self.decrement_count();
-                            }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                // Mailbox is empty (race condition), no need to drop
-                            }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                return Err(MailboxError::Closed);
-                            }
-                        }
-
-                        // Drop the guard to release the mutex
-                        drop(receiver_guard);
-
-                        // Now try to send again
-                        match self.sender.try_send(msg) {
-                            Ok(_) => {
-                                self.increment_count();
-                                self.notify.notify_one();
-                                self.fire_wake_hook();
-                                Ok(())
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                // Still full, this is unusual but possible with concurrent access
-                                Err(MailboxError::PushError(
-                                    "Failed to push after dropping oldest message".to_string(),
-                                ))
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                Err(MailboxError::Closed)
-                            }
-                        }
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        Err(MailboxError::Closed)
-                    }
+                other => other,
+            };
+            drop(receiver);
+            // Evicted and rejected values may run arbitrary destructors.
+            // Release the receiver before disposing either kind of value.
+            drop(evicted);
+            match result {
+                Ok(()) => {}
+                Err(TrySendError::Full(_))
+                    if matches!(strategy, BackpressureStrategy::DropNewest) =>
+                {
+                    return Ok(());
                 }
+                Err(TrySendError::Full(_)) => {
+                    return Err(MailboxError::Full {
+                        capacity: self.capacity,
+                    });
+                }
+                Err(TrySendError::Closed(_)) => return Err(MailboxError::Closed),
             }
         }
+        self.notify.notify_one();
+        self.fire_wake_hook();
+        Ok(())
     }
 
     async fn pop(&self) -> Option<BoxedMessage> {
@@ -240,14 +167,11 @@ impl Mailbox for SpscMailbox {
         // Try to receive a message without blocking: the `Mailbox` contract
         // requires `pop` to return `None` immediately when empty. Waiting for
         // new messages is the scheduling queue's responsibility (`Notify`).
-        receiver.try_recv().ok().inspect(|_msg| {
-            self.decrement_count();
-        })
+        receiver.try_recv().ok()
     }
 
     async fn is_empty(&self) -> bool {
-        // Use atomic counter for thread-safe check without blocking
-        self.message_count.load(Ordering::SeqCst) == 0
+        self.receiver.lock().await.is_empty()
     }
 
     async fn signal_ready(&self) {
@@ -264,28 +188,27 @@ impl Mailbox for SpscMailbox {
     }
 
     async fn len(&self) -> usize {
-        // Use atomic counter for thread-safe length check without blocking
-        self.message_count.load(Ordering::SeqCst)
+        self.receiver.lock().await.len()
+    }
+
+    fn seal(&self) {
+        self.is_closed.store(true, Ordering::SeqCst);
+        self.closed_notify.notify_waiters();
+        self.notify.notify_waiters();
     }
 
     async fn close(&self) {
-        // Mark the mailbox as closed
-        self.is_closed.store(true, Ordering::SeqCst);
-
-        // Close the sender to prevent further message sends
-        // This will cause any future attempts to send to fail
-        // The original sender is dropped here
-        drop(self.sender.clone());
-
-        // Drain any remaining messages to ensure proper cleanup
-        if let Ok(mut receiver) = self.receiver.try_lock() {
-            while receiver.try_recv().is_ok() {
-                self.decrement_count();
+        self.seal();
+        let drained = {
+            let mut receiver = self.receiver.lock().await;
+            receiver.close();
+            let mut drained = Vec::new();
+            while let Ok(message) = receiver.try_recv() {
+                drained.push(message);
             }
-        }
-
-        // Notify anyone waiting on this mailbox that it's now closed
-        self.notify.notify_waiters();
+            drained
+        };
+        drop(drained);
     }
 
     /// associate a processor with this mailbox
@@ -495,6 +418,5 @@ mod tests {
     }
 }
 
-// Note: This implementation has the following limitation:
-// The DropOldest strategy has potential race conditions when multiple producers attempt
-// to concurrently send messages to the same mailbox, despite this being a SPSC mailbox.
+// Direct users of sender() bypass Mailbox's commit lock and wake hook.
+// Mailbox API producers serialize eviction/publication with close and pop.

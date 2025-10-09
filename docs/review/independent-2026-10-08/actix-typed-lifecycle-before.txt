@@ -1,0 +1,51 @@
+   Compiling parrot v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.04s
+     Running tests/test_actix_typed_lifecycle.rs (target/debug/deps/test_actix_typed_lifecycle-106bf2b6bf926620)
+
+running 5 tests
+ActixActorSystem: Starting shutdown sequence
+ActixActorSystem: Stopping 0 actors
+ActixActorSystem: Waiting for actors to stop
+
+thread 'duplicate_typed_path_is_rejected' (2478223) panicked at crates/parrot/tests/test_actix_typed_lifecycle.rs:73:5:
+one logical path must identify one actor
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ActixActorSystem: Starting shutdown sequence
+ActixActorSystem: Stopping 0 actors
+ActixActorSystem: Waiting for actors to stop
+
+thread 'dynamic_bridge_stop_stops_all_typed_views' (2478224) panicked at crates/parrot/tests/test_actix_typed_lifecycle.rs:109:25:
+called `Result::unwrap()` on an `Err` value: InternalError("typed channel has no lifecycle owner")
+
+thread 'typed_actor_is_registered_and_resolvable' (2478226) panicked at crates/parrot/tests/test_actix_typed_lifecycle.rs:50:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+test duplicate_typed_path_is_rejected ... FAILED
+test dynamic_bridge_stop_stops_all_typed_views ... FAILED
+test typed_actor_is_registered_and_resolvable ... FAILED
+ActixActorSystem: Stopping the Actix system
+ActixActorSystem: System shutdown initiated
+ActixActorSystem: Stopping the Actix system
+ActixActorSystem: System shutdown initiated
+
+thread 'shutdown_stops_typed_actor_even_when_references_survive' (2478225) panicked at crates/parrot/tests/test_actix_typed_lifecycle.rs:92:5:
+shutdown must revoke typed references
+
+thread 'typed_spawn_after_shutdown_is_rejected' (2478227) panicked at crates/parrot/tests/test_actix_typed_lifecycle.rs:120:5:
+assertion failed: system.spawn_typed::<Counter, Read>(counter(42), "/typed").await.is_err()
+test shutdown_stops_typed_actor_even_when_references_survive ... FAILED
+test typed_spawn_after_shutdown_is_rejected ... FAILED
+
+failures:
+
+failures:
+    duplicate_typed_path_is_rejected
+    dynamic_bridge_stop_stops_all_typed_views
+    shutdown_stops_typed_actor_even_when_references_survive
+    typed_actor_is_registered_and_resolvable
+    typed_spawn_after_shutdown_is_rejected
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p parrot --test test_actix_typed_lifecycle`

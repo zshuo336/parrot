@@ -1,0 +1,38 @@
+   Compiling parrot v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.38s
+     Running tests/test_supervision_contract.rs (target/debug/deps/test_supervision_contract-6df1ae9575207a35)
+
+running 3 tests
+
+thread 'tokio-rt-worker' (2395817) panicked at crates/parrot/tests/test_supervision_contract.rs:17:13:
+generation crash
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'tokio-rt-worker' (2395818) panicked at crates/parrot/tests/test_supervision_contract.rs:17:13:
+generation crash
+
+thread 'tokio-rt-worker' (2395817) panicked at crates/parrot/tests/test_supervision_contract.rs:17:13:
+generation crash
+
+thread 'two_retries_produce_exactly_three_generations' (2395810) panicked at crates/parrot/tests/test_supervision_contract.rs:78:18:
+restart budget was consumed too early: Elapsed(())
+test two_retries_produce_exactly_three_generations ... FAILED
+
+thread 'original_typed_and_erased_references_survive_restart' (2395809) panicked at crates/parrot/tests/test_supervision_contract.rs:33:14:
+expected generation did not become responsive: Elapsed(())
+
+thread 'obsolete_processor_cannot_stop_manual_replacement' (2395808) panicked at crates/parrot/tests/test_supervision_contract.rs:33:14:
+expected generation did not become responsive: Elapsed(())
+test original_typed_and_erased_references_survive_restart ... FAILED
+test obsolete_processor_cannot_stop_manual_replacement ... FAILED
+
+failures:
+
+failures:
+    obsolete_processor_cannot_stop_manual_replacement
+    original_typed_and_erased_references_survive_restart
+    two_retries_produce_exactly_three_generations
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.01s
+
+error: test failed, to rerun pass `-p parrot --test test_supervision_contract`

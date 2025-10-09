@@ -1,195 +1,198 @@
-use crate::actix::actor::ActixActor;
-use crate::actix::context::ActixContext;
-use crate::actix::reference::ActixActorRef;
-use actix::System as ActixSystem;
+use crate::actix::lifecycle::{ActorControl, Completion, Outcome, await_completion};
+use crate::actix::{actor::ActixActor, context::ActixContext, reference::ActixActorRef};
 use actix::prelude::ArbiterHandle;
-use anyhow::anyhow;
-use parrot_api::actor::Actor as ParrotActor;
-use parrot_api::address::ActorRef;
-use parrot_api::message::Message;
-use parrot_api::system::{
-    ActorSystemConfig, SystemError, SystemResources, SystemState, SystemStatus,
+use futures::FutureExt;
+use parrot_api::{
+    actor::Actor as ParrotActor,
+    address::ActorRef,
+    errors::ActorError,
+    message::Message,
+    system::{SystemError, SystemResources, SystemState, SystemStatus},
+    types::{ActorResult, BoxedActorRef},
 };
-use parrot_api::types::BoxedActorRef;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
-/// Arbiter pool for spreading actors across multiple actix arbiters.
-///
-/// # Overview
-/// A single actix `System` runs one main arbiter by default; all actors
-/// spawned via `Actor::start` share it and execute strictly serially, so
-/// CPU-bound handlers block every other actor (head-of-line blocking) and
-/// multi-core CPUs stay idle. This pool holds one `ArbiterHandle` per worker
-/// thread and hands them out round-robin at spawn time.
-///
-/// # Implementation Details
-/// - Each arbiter is an OS thread running its own single-threaded tokio
-///   runtime (`enable_all`, timers available), hosting any number of actors.
-/// - Actors on different arbiters run fully in parallel; actors sharing an
-///   arbiter serialize, matching actix semantics.
-/// - Handles are kept for the lifetime of the pool: threads stay parked and
-///   are only torn down at system shutdown.
-#[derive(Clone)]
-pub struct ArbiterPool {
-    /// Worker arbiter handles (never empty after construction).
-    workers: Arc<Vec<ArbiterHandle>>,
-    /// Round-robin cursor.
-    next: Arc<std::sync::atomic::AtomicUsize>,
+struct ArbiterOwners {
+    workers: Vec<ArbiterHandle>,
+    owners: Mutex<Option<Vec<actix::Arbiter>>>,
 }
-
-impl ArbiterPool {
-    /// Build a pool with `size` worker arbiters. `size == 0` is upgraded to 1.
-    ///
-    /// # Panics
-    /// Panics if called outside an actix `System` context (arbiter threads
-    /// must register with the current system).
-    pub fn new(size: usize) -> Self {
-        let size = size.max(1);
-        let workers = (0..size)
-            .map(|_| actix::prelude::Arbiter::new().handle())
-            .collect::<Vec<_>>();
-        Self {
-            workers: Arc::new(workers),
-            next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+impl Drop for ArbiterOwners {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            worker.stop();
+        }
+        // Dropping the last pool must not join on an arbiter or async worker.
+        // Explicit shutdown joins these owners before reporting success.
+        if let Some(owners) = self.owners.get_mut().unwrap().take() {
+            let _ = std::thread::Builder::new()
+                .name("parrot-actix-retire".into())
+                .spawn(move || {
+                    for owner in owners {
+                        let _ = owner.join();
+                    }
+                });
         }
     }
-
-    /// Number of worker arbiters in the pool.
-    pub fn size(&self) -> usize {
-        self.workers.len()
-    }
-
-    /// Pick the next arbiter (round-robin).
-    pub(crate) fn next_arbiter(&self) -> ArbiterHandle {
-        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.workers.len();
-        self.workers[idx].clone()
-    }
 }
 
+/// An owned group of Actix arbiters, shared by clones of one Parrot system.
+#[derive(Clone)]
+pub struct ArbiterPool {
+    inner: Arc<ArbiterOwners>,
+    next: Arc<AtomicUsize>,
+}
+impl ArbiterPool {
+    /// Build workers within the current Actix System. Zero selects one worker.
+    pub fn new(size: usize) -> Self {
+        let owners: Vec<_> = (0..size.max(1)).map(|_| actix::Arbiter::new()).collect();
+        Self {
+            inner: Arc::new(ArbiterOwners {
+                workers: owners.iter().map(actix::Arbiter::handle).collect(),
+                owners: Mutex::new(Some(owners)),
+            }),
+            next: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    pub fn size(&self) -> usize {
+        self.inner.workers.len()
+    }
+    pub(crate) fn next_arbiter(&self) -> ArbiterHandle {
+        self.inner.workers[self.next.fetch_add(1, Ordering::Relaxed) % self.size()].clone()
+    }
+    async fn stop_and_join(&self) -> ActorResult<()> {
+        for worker in &self.inner.workers {
+            worker.stop();
+        }
+        let owners = self.inner.owners.lock().unwrap().take();
+        if let Some(owners) = owners {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("parrot-actix-retire".into())
+                .spawn(move || {
+                    let mut failed = false;
+                    for owner in owners {
+                        failed |= owner.join().is_err();
+                    }
+                    let _ = send.send(failed);
+                })
+                .map_err(|e| {
+                    ActorError::InternalError(format!("cannot join Actix workers: {e}"))
+                })?;
+            if receive.await.unwrap_or(true) {
+                return Err(ActorError::InternalError(
+                    "Actix worker failed during shutdown".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 impl std::fmt::Debug for ArbiterPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArbiterPool")
-            .field("workers", &self.workers.len())
+            .field("workers", &self.size())
             .finish()
     }
 }
 
-/// ActixActorSystem implements the actor system for Actix
-///
-/// # Overview
-/// Core system for managing actors in the Actix backend
-///
-/// # Key Responsibilities
-/// - Create and manage actors
-/// - Track actor references
-/// - Handle system-wide operations
-/// - Mediate broadcast messages
-///
-/// # Implementation Details
-/// - Wraps an actix::System instance
-/// - Manages actor address mappings
-/// - Handles actor lifecycle
-/// - Provides supervision capabilities
-pub struct ActixActorSystem {
-    /// Underlying Actix system
-    system: Arc<ActixSystem>,
-    /// Registry of active actors by path
-    actors: Arc<RwLock<HashMap<String, BoxedActorRef>>>,
-    /// System configuration
-    config: ActorSystemConfig,
-    /// Registry of active actors by path
-    registry: Arc<RwLock<HashMap<String, BoxedActorRef>>>,
-    /// Default dispatcher
-    default_dispatcher: Arc<RwLock<Option<String>>>,
-    /// Arbiter pool for parallel actor execution (multi-arbiter support).
-    /// Lazily built on first use; size configured via `arbiter_count`.
-    arbiters: Arc<RwLock<Option<ArbiterPool>>>,
-    /// Number of worker arbiters to create (default: number of CPUs).
-    arbiter_count: usize,
+/// Resource and deadline settings for managed Actix actors.
+#[derive(Debug, Clone)]
+pub struct ActixSystemSettings {
+    pub arbiter_count: usize,
+    pub mailbox_capacity: usize,
+    /// Maximum outstanding timer tasks per actor. Zero disables scheduling.
+    pub max_context_tasks: usize,
+    pub ask_timeout: Duration,
+    pub shutdown_timeout: Duration,
 }
-
-// Manually implement Clone, sharing certain locked data
-impl Clone for ActixActorSystem {
-    fn clone(&self) -> Self {
+impl Default for ActixSystemSettings {
+    fn default() -> Self {
         Self {
-            system: self.system.clone(),
-            actors: self.actors.clone(), // Share actors collection instead of creating a new empty map
-            config: self.config.clone(),
-            registry: self.registry.clone(), // Share registry data
-            default_dispatcher: self.default_dispatcher.clone(), // Share dispatcher settings
-            arbiters: self.arbiters.clone(), // Share the arbiter pool
-            arbiter_count: self.arbiter_count,
+            arbiter_count: num_cpus::get(),
+            mailbox_capacity: 1024,
+            max_context_tasks: crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS,
+            ask_timeout: Duration::from_secs(5),
+            shutdown_timeout: Duration::from_secs(5),
         }
     }
 }
 
-impl ActixActorSystem {
-    /// Create a new ActixActorSystem
-    ///
-    /// # Parameters
-    /// - `config`: System configuration parameters
-    ///
-    /// # Returns
-    /// A new ActixActorSystem instance or error
-    pub async fn new() -> Result<Self, SystemError> {
-        Self::with_arbiter_count(num_cpus::get()).await
+pub(crate) struct Registration {
+    pub actor_ref: Arc<dyn ActorRef>,
+    pub control: Arc<ActorControl>,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.control
+            .request_stop(tokio::time::Instant::now() + self.control.timeout);
     }
+}
+#[derive(Default)]
+pub(crate) struct Registry {
+    pub actors: HashMap<String, Registration>,
+    pub shutting_down: bool,
+    stopped: bool,
+    shutdown: Option<Completion>,
+}
 
-    /// Create a new ActixActorSystem with an explicit arbiter count.
-    ///
-    /// # Parameters
-    /// - `arbiter_count`: number of worker arbiters; actors are spread
-    ///   round-robin across them at spawn time. Values < 1 are upgraded to 1.
+/// A Parrot system owns its registry and arbiter pool, never the host Actix System.
+#[derive(Clone)]
+pub struct ActixActorSystem {
+    pub(crate) registry: Arc<RwLock<Registry>>,
+    pub(crate) settings: ActixSystemSettings,
+    arbiters: ArbiterPool,
+    runtime: tokio::runtime::Handle,
+    started: Instant,
+}
+impl ActixActorSystem {
+    pub async fn new() -> Result<Self, SystemError> {
+        Self::with_settings(Default::default()).await
+    }
     pub async fn with_arbiter_count(arbiter_count: usize) -> Result<Self, SystemError> {
+        Self::with_settings(ActixSystemSettings {
+            arbiter_count,
+            ..Default::default()
+        })
+        .await
+    }
+    pub async fn with_settings(mut settings: ActixSystemSettings) -> Result<Self, SystemError> {
+        if settings.mailbox_capacity == 0 {
+            return Err(SystemError::Other(anyhow::anyhow!(
+                "Actix mailbox capacity must be positive"
+            )));
+        }
+        if actix::System::try_current().is_none() {
+            return Err(SystemError::Other(anyhow::anyhow!(
+                "ActixActorSystem requires a running Actix System"
+            )));
+        }
+        settings.arbiter_count = settings.arbiter_count.max(1);
+        // Construct on the host thread; later spawns may originate on foreign
+        // Tokio threads where Actix's thread-local System is absent.
+        let arbiters = ArbiterPool::new(settings.arbiter_count);
         Ok(Self {
-            // Use Tokio runtime's spawn method instead of creating a new system
-            system: Arc::new(ActixSystem::current()),
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            config: ActorSystemConfig::default(),
-            registry: Arc::new(RwLock::new(HashMap::new())),
-            default_dispatcher: Arc::new(RwLock::new(None)),
-            arbiters: Arc::new(RwLock::new(None)),
-            arbiter_count: arbiter_count.max(1),
+            registry: Arc::new(RwLock::new(Registry::default())),
+            settings,
+            arbiters,
+            runtime: tokio::runtime::Handle::current(),
+            started: Instant::now(),
         })
     }
-
-    /// Number of worker arbiters (threads) backing this system.
     pub fn arbiter_size(&self) -> usize {
-        self.arbiter_count
+        self.settings.arbiter_count
+    }
+    pub(crate) fn arbiter_pool(&self) -> ArbiterPool {
+        self.arbiters.clone()
     }
 
-    /// Get (lazily constructing) the shared arbiter pool.
-    pub(crate) fn arbiter_pool(&self) -> Result<ArbiterPool, SystemError> {
-        // Fast path: read without constructing.
-        if let Some(pool) = self.arbiters.read().ok().and_then(|g| g.clone()) {
-            return Ok(pool);
-        }
-        let mut guard = self
-            .arbiters
-            .write()
-            .map_err(|_| SystemError::Other(anyhow!("Failed to acquire write lock")))?;
-        if let Some(pool) = guard.as_ref() {
-            return Ok(pool.clone());
-        }
-        let pool = ArbiterPool::new(self.arbiter_count);
-        *guard = Some(pool.clone());
-        Ok(pool)
-    }
-
-    /// Spawn a root-level actor
-    ///
-    /// # Type Parameters
-    /// - `A`: Actor type implementing ParrotActor
-    ///
-    /// # Parameters
-    /// - `actor`: Actor instance to spawn
-    /// - `config`: Actor configuration
-    ///
-    /// # Returns
-    /// Reference to the created actor or error
     pub async fn spawn_root_typed<A>(
         &self,
         actor: A,
@@ -201,144 +204,219 @@ impl ActixActorSystem {
             + Unpin
             + 'static,
     {
-        // Get type name as actor name
-        let type_name = std::any::type_name::<A>();
-        let actor_name = type_name.rsplit("::").next().unwrap_or("unknown");
-
-        // Unique path per actor instance: spawning the same actor type twice
-        // used to overwrite the registry entry (both stress suites noted this
-        // limitation). A short uuid suffix keeps paths collision-free while
-        // staying readable.
-        let path = format!("actix://{}/{}", actor_name, Uuid::new_v4().simple());
-
-        // Create ActixActor wrapper
-        let actor_base = ActixActor::new(actor);
-
-        // Start the actor on a pooled worker arbiter (round-robin). This is
-        // the multi-arbiter support: actors land on different OS threads and
-        // execute in parallel; a blocking handler on one arbiter no longer
-        // freezes actors on the others. Falls back to the main arbiter only
-        // if the pool is unavailable.
-        let addr = match self.arbiter_pool() {
-            Ok(pool) => actix::Actor::start_in_arbiter(&pool.next_arbiter(), |_ctx| actor_base),
-            Err(_) => actix::Actor::start(actor_base),
-        };
-
-        // Create actor reference
-        let actor_ref = Box::new(ActixActorRef::new(addr, path.clone())) as Box<dyn ActorRef>;
-
-        // Register actor
-        let mut actors = self
-            .actors
-            .write()
-            .map_err(|_| SystemError::Other(anyhow!("Failed to acquire write lock")))?;
-
-        actors.insert(path, actor_ref.clone_boxed());
-
+        let mut registry = self.registry.write().unwrap();
+        if registry.shutting_down {
+            return Err(SystemError::ShuttingDown);
+        }
+        let name = std::any::type_name::<A>()
+            .rsplit("::")
+            .next()
+            .unwrap_or("unknown");
+        let path = format!("actix://{name}/{}", Uuid::new_v4().simple());
+        let (control, finished) = ActorControl::with_task_limit(
+            self.settings.shutdown_timeout,
+            self.settings.max_context_tasks,
+        );
+        let outcome: crate::actix::actor::ActorOutcome = Default::default();
+        let actor_base = ActixActor::managed(
+            actor,
+            path.clone(),
+            control.clone(),
+            outcome.clone(),
+            self.settings.mailbox_capacity,
+            self.settings.ask_timeout,
+        );
+        let (sender, receiver) = actix::dev::channel::channel(self.settings.mailbox_capacity);
+        let addr = actix::Addr::new(sender);
+        let actor_ref = Box::new(
+            ActixActorRef::new(addr, path.clone())
+                .with_control(control.clone(), self.settings.ask_timeout),
+        ) as BoxedActorRef;
+        let (send, result) = tokio::sync::oneshot::channel();
+        let tasks = control.tasks.clone();
+        if !self.arbiter_pool().next_arbiter().spawn_fn(move || {
+            actix::spawn(async move {
+                // Construct the !Send Actix context only after arriving on its owner.
+                // Await and dispose the complete context future, including its mailbox,
+                // before acknowledging stop to the system monitor.
+                let execution = std::panic::AssertUnwindSafe(async move {
+                    actix::Context::with_receiver(receiver)
+                        .into_future(actor_base)
+                        .await;
+                })
+                .catch_unwind()
+                .await;
+                let result = match execution {
+                    Ok(()) => outcome.lock().unwrap().take().unwrap_or_else(|| {
+                        Err(ActorError::InternalError(
+                            "Actix actor ended without lifecycle completion".into(),
+                        ))
+                    }),
+                    Err(payload) => Err(ActorError::Panic(crate::actix::lifecycle::panic_message(
+                        payload,
+                    ))),
+                };
+                tasks.close();
+                let tasks_result = tasks.join().await;
+                let _ = send.send(result.and(tasks_result));
+            });
+        }) {
+            return Err(SystemError::ActorError(ActorError::InternalError(
+                "Actix arbiter rejected actor execution".into(),
+            )));
+        }
+        registry.actors.insert(
+            path.clone(),
+            Registration {
+                actor_ref: Arc::from(actor_ref.clone_boxed()),
+                control: control.clone(),
+            },
+        );
+        self.monitor_actor(path, control, finished, result);
         Ok(actor_ref)
     }
 
-    /// Get an actor by its path
-    ///
-    /// # Parameters
-    /// - `path`: The actor's path
-    ///
-    /// # Returns
-    /// Reference to the actor if found
-    pub async fn get_actor(&self, path: &String) -> Option<BoxedActorRef> {
-        let actors = match self.actors.read() {
-            Ok(actors) => actors,
-            Err(_) => return None,
-        };
-
-        actors.get(path).map(|actor_ref| actor_ref.clone_boxed())
-    }
-
-    /// Broadcast a message to all actors
-    ///
-    /// # Type Parameters
-    /// - `M`: Message type implementing Message
-    ///
-    /// # Parameters
-    /// - `msg`: Message to broadcast
-    ///
-    /// # Returns
-    /// Success or error
-    pub async fn broadcast<M: Message + Clone + 'static>(&self, msg: M) -> Result<(), SystemError> {
-        let actors = match self.actors.read() {
-            Ok(actors) => actors,
-            Err(_) => return Err(SystemError::Other(anyhow!("Failed to acquire read lock"))),
-        };
-
-        for actor_ref in actors.values() {
-            // Use the ActorRefExt::tell method to send the message without waiting for a response
-            // Clone the message for each actor
-            let actor_ref_clone = actor_ref.clone_boxed();
-            let msg_clone = msg.clone();
-
-            // Spawn a task to send the message
-            tokio::spawn(async move {
-                let boxed_msg = Box::new(msg_clone) as Box<dyn std::any::Any + Send>;
-                let _ = actor_ref_clone.send(boxed_msg).await;
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Shutdown the actor system
-    ///
-    /// # Returns
-    /// Success or error
-    pub async fn shutdown(self) -> Result<(), SystemError> {
-        println!("ActixActorSystem: Starting shutdown sequence");
-
-        // Stop all actors
-        {
-            let actors = match self.actors.read() {
-                Ok(actors) => actors,
-                Err(_) => return Err(SystemError::Other(anyhow!("Failed to acquire read lock"))),
+    pub(crate) fn monitor_actor(
+        &self,
+        path: String,
+        control: Arc<ActorControl>,
+        finished: tokio::sync::watch::Sender<Option<Outcome>>,
+        result: tokio::sync::oneshot::Receiver<ActorResult<()>>,
+    ) {
+        let registry = Arc::downgrade(&self.registry);
+        let pool = self.arbiters.clone();
+        self.runtime.spawn(async move {
+            let _pool_owner = pool;
+            let outcome = tokio::select! {
+                biased;
+                _ = control.expired() => Err(ActorError::TimeoutDetail(format!("Actix actor {path} stop exceeded configured deadline"))),
+                result = result => result.unwrap_or_else(|_| Err(ActorError::InternalError(format!("Actix actor {path} execution was cancelled")))),
             };
-
-            println!("ActixActorSystem: Stopping {} actors", actors.len());
-
-            for actor_ref in actors.values() {
-                // Spawn a task to stop the actor
-                let actor_ref_clone = actor_ref.clone_boxed();
-                tokio::spawn(async move {
-                    let _ = actor_ref_clone.stop().await;
-                });
+            control.request_stop(tokio::time::Instant::now() + control.timeout);
+            if let Some(registry) = registry.upgrade() {
+                let mut registry = registry.write().unwrap();
+                if registry.actors.get(&path).is_some_and(|entry| Arc::ptr_eq(&entry.control, &control)) {
+                    registry.actors.remove(&path);
+                }
             }
+            finished.send_replace(Some(Outcome::from_result(outcome)));
+        });
+    }
+    pub async fn get_actor(&self, path: &String) -> Option<BoxedActorRef> {
+        self.registry
+            .read()
+            .unwrap()
+            .actors
+            .get(path)
+            .map(|entry| entry.actor_ref.clone_boxed())
+    }
+    pub async fn stop_actor(&self, path: &str) -> ActorResult<()> {
+        let actor = self
+            .registry
+            .read()
+            .unwrap()
+            .actors
+            .get(path)
+            .map(|entry| entry.actor_ref.clone())
+            .ok_or_else(|| ActorError::ActorNotFound(path.into()))?;
+        actor.stop().await
+    }
+    /// Complete mailbox admission for each recipient and propagate any delivery failure.
+    pub async fn broadcast<M: Message + Clone + 'static>(&self, msg: M) -> Result<(), SystemError> {
+        let actors: Vec<_> = {
+            let registry = self.registry.read().unwrap();
+            if registry.shutting_down {
+                return Err(SystemError::ShuttingDown);
+            }
+            registry
+                .actors
+                .values()
+                .map(|entry| entry.actor_ref.clone())
+                .collect()
+        };
+        let results = futures::future::join_all(actors.into_iter().map(|actor| {
+            let msg = msg.clone();
+            async move { actor.deliver(Box::new(msg)).await }
+        }))
+        .await;
+        for result in results {
+            result?;
         }
-
-        // Wait for actors to stop (could add a timeout here)
-        println!("ActixActorSystem: Waiting for actors to stop");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Stop the Actix system
-        println!("ActixActorSystem: Stopping the Actix system");
-        actix::System::current().stop();
-        println!("ActixActorSystem: System shutdown initiated");
-        tracing::info!("ActixActorSystem: System shutdown initiated");
-
         Ok(())
     }
-
-    /// Get status of the actor system
-    ///
-    /// # Returns
-    /// Current system status
+    /// Close admission, stop all actors, and join only this system's workers.
+    /// Concurrent callers share one owned operation; cancelling a caller does not cancel cleanup.
+    pub async fn shutdown(self) -> Result<(), SystemError> {
+        let completion = {
+            let mut registry = self.registry.write().unwrap();
+            if let Some(completion) = &registry.shutdown {
+                completion.clone()
+            } else {
+                registry.shutting_down = true;
+                let deadline = tokio::time::Instant::now() + self.settings.shutdown_timeout;
+                let (finished, completion) = tokio::sync::watch::channel(None);
+                registry.shutdown = Some(completion.clone());
+                let actors: Vec<_> = registry
+                    .actors
+                    .values()
+                    .map(|entry| {
+                        entry.control.request_stop(deadline);
+                        entry.actor_ref.clone()
+                    })
+                    .collect();
+                let state = self.registry.clone();
+                let pool = self.arbiters.clone();
+                let mut execution = self.runtime.spawn(async move {
+                    let results =
+                        futures::future::join_all(actors.iter().map(|actor| actor.stop())).await;
+                    let joined = pool.stop_and_join().await;
+                    {
+                        let mut state = state.write().unwrap();
+                        state.actors.clear();
+                        state.stopped = true;
+                    }
+                    joined?;
+                    for result in results {
+                        result?;
+                    }
+                    Ok(())
+                });
+                self.runtime.spawn(async move {
+                    let result = tokio::select! {
+                        biased;
+                        result = &mut execution => result.unwrap_or_else(|e| Err(ActorError::InternalError(format!("Actix shutdown task failed: {e}")))),
+                        _ = tokio::time::sleep_until(deadline) => Err(ActorError::TimeoutDetail("Actix system shutdown exceeded configured deadline".into())),
+                    };
+                    // A timed-out join continues owning its workers and actor cleanup.
+                    finished.send_replace(Some(Outcome::from_result(result)));
+                });
+                completion
+            }
+        };
+        await_completion(completion)
+            .await
+            .map_err(SystemError::from)
+    }
     pub fn status(&self) -> SystemStatus {
+        let registry = self.registry.read().unwrap();
         SystemStatus {
-            state: SystemState::Running,
-            active_actors: self.actors.read().map(|actors| actors.len()).unwrap_or(0),
-            // TODO: calculate actual uptime based on system start timestamp
-            uptime: Duration::from_secs(0),
+            state: if registry.stopped {
+                SystemState::Stopped
+            } else if registry.shutting_down {
+                SystemState::ShuttingDown
+            } else {
+                SystemState::Running
+            },
+            active_actors: registry.actors.len(),
+            uptime: self.started.elapsed(),
             resources: SystemResources {
-                // Placeholder resource metrics; integrate real data as needed
                 cpu_usage: 0.0,
                 memory_usage: 0,
-                thread_count: 1,
+                thread_count: if registry.stopped {
+                    0
+                } else {
+                    self.arbiters.size()
+                },
             },
         }
     }

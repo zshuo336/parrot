@@ -1,0 +1,1973 @@
+{
+  "base_commit": "31f7b2ce2d03ebf8c5a7e0f930fba3efdd9fe7af",
+  "created_utc": "2026-10-09T09:03:43.744728+00:00",
+  "deleted": [],
+  "files": {
+    ".dockerignore": {
+      "executable": false,
+      "sha256": "20f9c83088ade1a0a9d591ae7d59894ec2e8d1a3fc0d7187288a5abb274c8b51"
+    },
+    ".github/workflows/ci.yml": {
+      "executable": false,
+      "sha256": "bc88aab45aaeac72ef0bb4da05c662470b034ebe98cb526f0e794d34b3061590"
+    },
+    ".gitignore": {
+      "executable": false,
+      "sha256": "6df70a2218543f3f975562f382a73cad3800ec31d86e20422e2f6d7f4b55c643"
+    },
+    ".vscode/settings.json": {
+      "executable": false,
+      "sha256": "ab74ce74e59e8921ffb67098bfefd536b0283086c54b1031f90e633d1ca945b8"
+    },
+    "Cargo.lock": {
+      "executable": false,
+      "sha256": "06c55ab3b174e895ef34a61917fb6ae3b6f7b5045e121b40e98b10684f179926"
+    },
+    "Cargo.toml": {
+      "executable": false,
+      "sha256": "a10d1e5b142ffb8a92107c2e6f19d7dc64ff12a082b8a64c05eba57be85f0df2"
+    },
+    "Makefile": {
+      "executable": false,
+      "sha256": "4b5dc3a174947d38690002708ec6bb857f311f330bdd57e7e0accfd53e7e34e2"
+    },
+    "README.md": {
+      "executable": false,
+      "sha256": "70ab43b0eba9d20096bc9d8ec86b0c78a75dec27ca86221f09b8c87194dca366"
+    },
+    "apps/crawler-lab/Cargo.toml": {
+      "executable": false,
+      "sha256": "507dd38da0b4f13f2c842794f98244360f2541c0058e9c9534a55bf5b92c84a1"
+    },
+    "apps/crawler-lab/crawler.app.toml": {
+      "executable": false,
+      "sha256": "0cf90c6e032ff51551d83d63b070768cf32b9b3cb88c41046ec7e68cf8d3f002"
+    },
+    "apps/crawler-lab/deploy/run-lab.sh": {
+      "executable": true,
+      "sha256": "0a2392e8bf7dbf7b616264ad3359c27a401a6a3895fea6f585aeebe281b5d889"
+    },
+    "apps/crawler-lab/dylib/Cargo.toml": {
+      "executable": false,
+      "sha256": "161dffb369eb65512523258d3e6a045b21089b2eb4e107d4a9192488e343dda9"
+    },
+    "apps/crawler-lab/dylib/src/lib.rs": {
+      "executable": false,
+      "sha256": "9c0259c039b91e71deb29f3a0718c630fdc0b3de8b0acda03fa766bc1cc9228a"
+    },
+    "apps/crawler-lab/erlang/frontier.erl": {
+      "executable": false,
+      "sha256": "520ea0597c3b1d7b2e6e30ca4bdba8ec427221c54f73b816af68a5ab0781ebfd"
+    },
+    "apps/crawler-lab/golden/README.md": {
+      "executable": false,
+      "sha256": "1811d292d1584012004cbb8691c66348462ee6820af9b28f56ae6cdff330684d"
+    },
+    "apps/crawler-lab/golden/pre_migration_output.txt": {
+      "executable": false,
+      "sha256": "1537c00a3d93cb787b36e3c6abc3e00f55916f0197edbd3841fcaf0545dbe67c"
+    },
+    "apps/crawler-lab/jvm/build-app-jvm.sh": {
+      "executable": true,
+      "sha256": "cebb024fc74505ade8164317b19ae08e98d1781dd52fb6ff0ec2fe8367e57911"
+    },
+    "apps/crawler-lab/jvm/pom.xml": {
+      "executable": false,
+      "sha256": "357862bd900212a7a198c4f847598651a97d441eab2a2344b2d2238eb9788768"
+    },
+    "apps/crawler-lab/jvm/src/main/scala/crawler/search/SearchComponent.scala": {
+      "executable": false,
+      "sha256": "c6ee293fb3b5398305bb7a80432cc0eddceccb97ce1880564c3accf1918a5fa4"
+    },
+    "apps/crawler-lab/python/index_builder.py": {
+      "executable": false,
+      "sha256": "d83a1b9f8c9eae5f13fb6643688cfff563d59c22d6bc8d91aafe962408270999"
+    },
+    "apps/crawler-lab/run_regression.sh": {
+      "executable": true,
+      "sha256": "1c1dd8edadbfb22306b89f105615e58a36021264194addf1cb33da65d0408edc"
+    },
+    "apps/crawler-lab/src/main.rs": {
+      "executable": false,
+      "sha256": "398973f2fe62806e3dbe0a26ae47619b2fccbda93bdfae4140f00fe79f76b4bc"
+    },
+    "apps/crawler-lab/tests/manifest_migration.rs": {
+      "executable": false,
+      "sha256": "180597b972084fbff2c01594d8776bec6cdf2d8bc08cd7b0c8673b22856a2c8a"
+    },
+    "apps/crawler-lab/wasm/Cargo.toml": {
+      "executable": false,
+      "sha256": "5a6c4f6054ed9b9b5e22bb83b0f1834ff59602df50a4fb974b9fb19bdb70ac54"
+    },
+    "apps/crawler-lab/wasm/crawler-hub.wasm": {
+      "executable": false,
+      "sha256": "f9d4d4fbb3cda0d7d3d5a84bc4db8539ebac33bb61f718cd12ba9510703d9230"
+    },
+    "apps/crawler-lab/wasm/src/lib.rs": {
+      "executable": false,
+      "sha256": "308fe83ec18828d14b81762b411a4be5cb8898a66726f0c98525c1a7db47a14a"
+    },
+    "apps/websearch/.gitignore": {
+      "executable": false,
+      "sha256": "e8e4091abd262ff598dfb38f4ccae0ca394bf9b370844d89eb38e1f8da3ae964"
+    },
+    "apps/websearch/Cargo.toml": {
+      "executable": false,
+      "sha256": "5649d7554c4efb6e2765ebb5b7ad64503669cf920b8c0b81e541461e5bd9764c"
+    },
+    "apps/websearch/README.md": {
+      "executable": false,
+      "sha256": "334e5cc8b82572b5dd5b55e91788fbf1f2caeff31cb3cc60c190a7bcc2f70cfd"
+    },
+    "apps/websearch/build.sh": {
+      "executable": true,
+      "sha256": "33d340c811d57245fbba4bbdfc2123e981aaa1ba9ef7f685521c72d541bfc896"
+    },
+    "apps/websearch/deploy/compose.sh": {
+      "executable": true,
+      "sha256": "f348fc5c8373c66ef8e658b2dadb2ea9471b4acc10ad57839a89cef4ed32a585"
+    },
+    "apps/websearch/deploy/distribute.sh": {
+      "executable": true,
+      "sha256": "2d67a865b44ea569125d85edf2165f8d28e98a28b4257782612cbcdef99f2274"
+    },
+    "apps/websearch/deploy/docker-compose.yml": {
+      "executable": false,
+      "sha256": "d45451ac3c0b89c15689a30b7ed264bb5d5e2e21aa3b2a1021f43b0b1f4f6cd2"
+    },
+    "apps/websearch/deploy/run-registry.sh": {
+      "executable": true,
+      "sha256": "16fba192efcd8ecb2824824a65421bc0becff19c7d9ba40ff627eb399d573fab"
+    },
+    "apps/websearch/deploy/start-remote.sh": {
+      "executable": true,
+      "sha256": "e6a6094fd7f34c9e654c93c180ea909d32cb889ddb8c2597797cef15bced03bf"
+    },
+    "apps/websearch/docs/ARCHITECTURE.md": {
+      "executable": false,
+      "sha256": "02424b067e732b23d585d44e393964f19560ffb3894293c7dda896ef80841d76"
+    },
+    "apps/websearch/docs/OPERATIONS.md": {
+      "executable": false,
+      "sha256": "9c39d75de3ee0f5ea0a913a234fb83091cadd94e5d939b0ee648895f9abd4129"
+    },
+    "apps/websearch/docs/PARROT_USAGE.md": {
+      "executable": false,
+      "sha256": "9ac90449a4e0e2705e7a75a87fc02d90006eae9d3244d68afa4ebc54fcd0a833"
+    },
+    "apps/websearch/docs/check_mermaid.py": {
+      "executable": true,
+      "sha256": "a0cd1d5374aed5e3ddfd12543b1c66079803fea5fc1216e2f80cdcf6b95238d0"
+    },
+    "apps/websearch/erlang/frontier.erl": {
+      "executable": false,
+      "sha256": "c43a6069aae5f920262a78677b7adc49621b62c90423fde077a33736b84fc5a7"
+    },
+    "apps/websearch/jvm/build.sh": {
+      "executable": true,
+      "sha256": "dff0c61551b8b51c50521b91987cf46bb38e654f3c6eb833ce15ea224dd2939a"
+    },
+    "apps/websearch/jvm/lib/jieba-analysis-1.0.2.jar": {
+      "executable": false,
+      "sha256": "3f784d6c6af0135a8035d607845e7165bcbcd5ccec69e98239fd779a59ec87ea"
+    },
+    "apps/websearch/jvm/src/main/scala/websearch/search/SearchComponent.scala": {
+      "executable": false,
+      "sha256": "dd13e0aaf186896ae34c49d5373e6cb2f583723f4ead1f0c65e71f7111fc94a8"
+    },
+    "apps/websearch/python/tokenizer.py": {
+      "executable": false,
+      "sha256": "81d8388933f3c612abfcdab09348721e89ef4cd4340ba7e20d3d94653fe2afa2"
+    },
+    "apps/websearch/run.sh": {
+      "executable": true,
+      "sha256": "350ba20f94b80093959539359c02e68a300639412d4e95dc9bc02335f1bfa2b0"
+    },
+    "apps/websearch/src/main.rs": {
+      "executable": false,
+      "sha256": "d2d3435cbdc4f652771f7336a173731ba6f9fe2f48be9bd166215e6f4daa33bf"
+    },
+    "apps/websearch/tests/run_all.sh": {
+      "executable": true,
+      "sha256": "82dec1b1da77b0431fcfcce5a759a3561ed360cdf472c78b2d9ed887563ccf7b"
+    },
+    "apps/websearch/websearch.app.toml": {
+      "executable": false,
+      "sha256": "277f7a8a8906c50ed8c52ebe3df017d259c3ccc1f1b39991a17f12e7ee97a327"
+    },
+    "bench/actix-bench/Cargo.toml": {
+      "executable": false,
+      "sha256": "f0e18fa592da0a45a0ef4d3d7f573f33de97f5c48244602ea60cf5421a558549"
+    },
+    "bench/actix-bench/run.sh": {
+      "executable": true,
+      "sha256": "af6539933c81b22d3f381099f8647cd9b494626ef50fc1b9278354b483c894e6"
+    },
+    "bench/actix-bench/src/main.rs": {
+      "executable": false,
+      "sha256": "66b519c7e28cfdba7a49d4c4c8709ba1d9dd8295b45ae3d3d06665f2868233c3"
+    },
+    "bench/akka-bench/lib/akka-actor-typed_2.13-2.6.20.jar": {
+      "executable": false,
+      "sha256": "b1587c577a8f244aff37bc1418443e01ffbf4291536483de6ecd0054aa460679"
+    },
+    "bench/akka-bench/lib/akka-actor_2.13-2.6.20.jar": {
+      "executable": false,
+      "sha256": "9a8273601fbeb2fd822bcd1df06e0ddb9d76e6e884b0f96a00567f6a2e5d5c0f"
+    },
+    "bench/akka-bench/lib/config-1.4.2.jar": {
+      "executable": false,
+      "sha256": "0076c249b4387d8369146528fd5dacb3efba098dc02ecf9ac81debdfc2e12fd5"
+    },
+    "bench/akka-bench/lib/scala-java8-compat_2.13-1.0.2.jar": {
+      "executable": false,
+      "sha256": "90d5b13656be93fb779b8d7c723efa2498a34af06273bb5204afb65f85a20c1b"
+    },
+    "bench/akka-bench/lib/scala-library-2.13.10.jar": {
+      "executable": false,
+      "sha256": "e6ca607c3fce03e8fa38af3374ce1f8bb098e316e8bf6f6d27331360feddb1c1"
+    },
+    "bench/akka-bench/lib/slf4j-api-1.7.36.jar": {
+      "executable": false,
+      "sha256": "d3ef575e3e4979678dc01bf1dcce51021493b4d11fb7f1be8ad982877c16a1c0"
+    },
+    "bench/akka-bench/run.sh": {
+      "executable": true,
+      "sha256": "7cf1a44d4006f54575af8d31f00f6c6035efc7240d8b03ed46ac14f037ab01ac"
+    },
+    "bench/akka-bench/src/AkkaBench.java": {
+      "executable": false,
+      "sha256": "8e4c82fece9875d0a1a1acea7ab2d26a0c38e8aea6ecdd5b3e36c8be585aea3b"
+    },
+    "bench/erlang-bench/out/erl_debug.beam": {
+      "executable": false,
+      "sha256": "4e7177e615680486624eab28057b466778982c96afd60810956f09f701a40200"
+    },
+    "bench/erlang-bench/out/parrot_bench.beam": {
+      "executable": false,
+      "sha256": "d747dc52fbbf6145f324e1b6927922000c55bc8c296d5be954ec75e3e386bd64"
+    },
+    "bench/erlang-bench/out/smoke.beam": {
+      "executable": false,
+      "sha256": "78404da583f211f226e3a3ba11eb3982c258e03e38b1bde657b8259cd7df1e89"
+    },
+    "bench/erlang-bench/parrot_bench.erl": {
+      "executable": false,
+      "sha256": "409f1766268810e29e305526e9aa6da31d8baece5e6ee4dde50b8a46954fbd96"
+    },
+    "bench/erlang-bench/run.sh": {
+      "executable": true,
+      "sha256": "bba6055b7aebc1bc4eba111a71e92ee87f38cd57088034b821f0b37b202d1ba4"
+    },
+    "bench/erlang-bench/run_bench.escript": {
+      "executable": false,
+      "sha256": "b89018cc9811c7f932fbe62378f1a30d9b2b627193850372bb67fcc134f02c60"
+    },
+    "bench/ray-bench/ray_bench.py": {
+      "executable": false,
+      "sha256": "7218df871d55ccf2a5050654b0ef0ce6abf41dca5e713280e099fb76aa916d31"
+    },
+    "bench/ray-bench/run.sh": {
+      "executable": true,
+      "sha256": "c376ac9ce20c77d162899e0d79742ebce64cdaff0725d134f2ed1d9ef9918195"
+    },
+    "crates/parrot-abi/Cargo.toml": {
+      "executable": false,
+      "sha256": "63f5066ce5f7f19fa63a3be14de267b93d6c7c69f383e58cfa2ad4692b796229"
+    },
+    "crates/parrot-abi/benches/abi_bench.rs": {
+      "executable": false,
+      "sha256": "8910cbdb2d23d543c32b4145a5cd91f0f917c8b8ab6aa063895de67a818f7c4d"
+    },
+    "crates/parrot-abi/src/lib.rs": {
+      "executable": false,
+      "sha256": "016d40c2daee5d7427da1369adfb877020c12e161a30760cc9672fb59972ec91"
+    },
+    "crates/parrot-abi/src/loader.rs": {
+      "executable": false,
+      "sha256": "1a01fcff46045691d17bd10222a4278ed1108342065c3ac21bad607481372e38"
+    },
+    "crates/parrot-abi/tests/common/mod.rs": {
+      "executable": false,
+      "sha256": "dc841111dd6f136081e4f6c5687acdd02b8896edefd60cc20b7f30d4c4ae7ff6"
+    },
+    "crates/parrot-abi/tests/fixtures/Cargo.toml": {
+      "executable": false,
+      "sha256": "413df55a114322ccad227c698c15144b9ec9a2ad54b54e5e4002812751d4fef4"
+    },
+    "crates/parrot-abi/tests/fixtures/testcomp/Cargo.toml": {
+      "executable": false,
+      "sha256": "d1916b0d702ba82fe762a2a4ec58056d859c22bfd37069db4f64dfff3dcbae83"
+    },
+    "crates/parrot-abi/tests/fixtures/testcomp/src/lib.rs": {
+      "executable": false,
+      "sha256": "8f6fffd010c48abe031b08e34ca987f0c51f665e6da41afa7af24aaad1e9aea6"
+    },
+    "crates/parrot-abi/tests/fixtures/violating/Cargo.toml": {
+      "executable": false,
+      "sha256": "9f036c7e66ebb90158e0c01ad97746b2ed15a5a1268459ff6ed956bd4b505f9e"
+    },
+    "crates/parrot-abi/tests/fixtures/violating/src/lib.rs": {
+      "executable": false,
+      "sha256": "078786444f93eeaeeedfb77c21435d4483dcb043f5c2a95915ee719ba895eea3"
+    },
+    "crates/parrot-abi/tests/lifecycle_scenario.rs": {
+      "executable": false,
+      "sha256": "335b044e255b58f91ddacb6ea0196d19edbf16662c6733c3e03c181c17db0ee3"
+    },
+    "crates/parrot-abi/tests/loader_tests.rs": {
+      "executable": false,
+      "sha256": "8eb9cfd4dc280c24d7b652c22272eff51a22fbb8deb762ad4251479ba7df5ff3"
+    },
+    "crates/parrot-api-derive-tests/Cargo.toml": {
+      "executable": false,
+      "sha256": "894813537aa09ba4da84540ee67716cf9c44fc7914b963ab611cfca2965d1783"
+    },
+    "crates/parrot-api-derive-tests/src/lib.rs": {
+      "executable": false,
+      "sha256": "7330874fcea9959faa89be42f7e90d10d9603883a0954ee683bf2c5a0949b383"
+    },
+    "crates/parrot-api-derive-tests/tests/actor_test.rs": {
+      "executable": false,
+      "sha256": "a9876141368d10a199a4bc2d4abfc0a702e849052272f1497f9dd47117fa0506"
+    },
+    "crates/parrot-api-derive-tests/tests/message_tests.rs": {
+      "executable": false,
+      "sha256": "66abfef8b3e1df50205c21933c85987636f067a10d767899cc0eb3e1c451f6e8"
+    },
+    "crates/parrot-api-derive-tests/tests/thread_engine_test.rs": {
+      "executable": false,
+      "sha256": "26aeb6cadec6185c560dab009d3dca06701c73b4ee51b62cac985c94d6de359f"
+    },
+    "crates/parrot-api-derive/Cargo.toml": {
+      "executable": false,
+      "sha256": "1de87982aeba9a23faf2c1434f6a0e15e0232f4e1cda37183baede46ccf8b6aa"
+    },
+    "crates/parrot-api-derive/src/actor.rs": {
+      "executable": false,
+      "sha256": "ed472a5ed36d039230a4db29c2f69fe37bc92b180e9546ae838fae4949ad4d8e"
+    },
+    "crates/parrot-api-derive/src/common.rs": {
+      "executable": false,
+      "sha256": "980e438d2f23ce79d75972fa8dada5c7fb3f08b79ce2a086b3f261b7d233ddb6"
+    },
+    "crates/parrot-api-derive/src/lib.rs": {
+      "executable": false,
+      "sha256": "46dafa5562d693556e5d3bad9427c9ad3eba37813a573d633cb805ec4537f7c9"
+    },
+    "crates/parrot-api-derive/src/message.rs": {
+      "executable": false,
+      "sha256": "e5a284fc56c1666205cb873e03c3644f210cda5cca8fb49988da2eb2060eeb9d"
+    },
+    "crates/parrot-api-derive/src/remote.rs": {
+      "executable": false,
+      "sha256": "866eac04624d1d7a48cf64966db54979edabcb52a54fc3a8065936af8721d8c5"
+    },
+    "crates/parrot-api-derive/src/typed.rs": {
+      "executable": false,
+      "sha256": "1b9c713ebc6c27b662d8863f107aa501fd3b7de4cd7883062971202c0e8fb496"
+    },
+    "crates/parrot-api/Cargo.toml": {
+      "executable": false,
+      "sha256": "04a44c81b8c1f24c7263e39af799190da6b7fd35b1e861bda3b2edb1f9687fd7"
+    },
+    "crates/parrot-api/src/actor.rs": {
+      "executable": false,
+      "sha256": "4d63482649c63939334ea51501ed92117226dbf2110b6fc2a7bf21f9b5f99438"
+    },
+    "crates/parrot-api/src/address.rs": {
+      "executable": false,
+      "sha256": "77adb3661e790fd16792735434222def1a61f346baccdf901f80e85316a8ff36"
+    },
+    "crates/parrot-api/src/context.rs": {
+      "executable": false,
+      "sha256": "3ad746f1ada7fde945e88cb7d28ea7ddb4cc2d4182a86cfbe0cf56894c717e72"
+    },
+    "crates/parrot-api/src/engine.rs": {
+      "executable": false,
+      "sha256": "b08e75f99f15c087572706e21d6a5cc3641ee768a2b64a0608cd7342797f6d0f"
+    },
+    "crates/parrot-api/src/errors.rs": {
+      "executable": false,
+      "sha256": "0f563ddf8b84bcef82c80b6f00551c4ca8e8d72b965ea3146d3e5f2d4e3b3d6f"
+    },
+    "crates/parrot-api/src/lib.rs": {
+      "executable": false,
+      "sha256": "ed4c12c8129ff7463ac2ce0e6aa9cb40c99f052cefd741b7ac70534bb52f6990"
+    },
+    "crates/parrot-api/src/macros.rs": {
+      "executable": false,
+      "sha256": "399783dd17574e18157f5c9fdeb294829458cf29b858fbabeb7d25658961103a"
+    },
+    "crates/parrot-api/src/message.rs": {
+      "executable": false,
+      "sha256": "4d91f47c6b1d814e3c580a1502d17b50a5c933b4e9ff365c4158791691b131ad"
+    },
+    "crates/parrot-api/src/priority.rs": {
+      "executable": false,
+      "sha256": "e64d8e13e4eaa4120eefec690317ef24065d8464562bd5d3b66475c503f1e924"
+    },
+    "crates/parrot-api/src/receptionist.rs": {
+      "executable": false,
+      "sha256": "91f01414a217b63b3e644727a9f937832486a5550220595bf55cb2644e442379"
+    },
+    "crates/parrot-api/src/runtime.rs": {
+      "executable": false,
+      "sha256": "65e6e1ccd3b8e180d0b34131c8dc7af75b6d2788dc99561826c4fcdc1f443f2a"
+    },
+    "crates/parrot-api/src/stream.rs": {
+      "executable": false,
+      "sha256": "d02de2d37bb56f15dc1f95c8d3a14229864cf8fb868435056c8195b3f5baa9da"
+    },
+    "crates/parrot-api/src/supervisor.rs": {
+      "executable": false,
+      "sha256": "9b67782d07d05ed9ad0c9915bfbe3360d91f0365db0c9593541565f6c013f1fa"
+    },
+    "crates/parrot-api/src/system.rs": {
+      "executable": false,
+      "sha256": "9e159ff55de04abd1c74fbe51f4004ba3739dc3fd28039ad52c114d41525270a"
+    },
+    "crates/parrot-api/src/typed.rs": {
+      "executable": false,
+      "sha256": "6693c5d60b0a56db781844c553a9bdca67040665e54fd45c46e5c7b0e46a6052"
+    },
+    "crates/parrot-api/src/typed_channel.rs": {
+      "executable": false,
+      "sha256": "0f3aa8e7fab4a72d7f0c7540b914eb06c1ef94f9e85bed38e6d2a791c0dd8373"
+    },
+    "crates/parrot-api/src/types.rs": {
+      "executable": false,
+      "sha256": "9821fe43437f379961a54ae505dbe4159a613ca66ea769af5dbaae898473a986"
+    },
+    "crates/parrot-api/tests/README.md": {
+      "executable": false,
+      "sha256": "ab708ce0de652761fe8085b98e4000fafae2c978adcde4d924c3061bb0ba5054"
+    },
+    "crates/parrot-api/tests/actor_config_test.rs": {
+      "executable": false,
+      "sha256": "f55264c9a6fa20235ba68f03ceda86f4999cf7bfc2601d69009a7e5ac5fbc85a"
+    },
+    "crates/parrot-api/tests/actor_factory_test.rs": {
+      "executable": false,
+      "sha256": "f2e0bc6c1a1d35861fe923e9d9b1368c4fa79f14ed22d93656a13ec11119f4f5"
+    },
+    "crates/parrot-api/tests/actor_test.rs": {
+      "executable": false,
+      "sha256": "e14c81d9cc4275f7abf0e24e86946f823c1729d019cf7c3ddc148258cedb3442"
+    },
+    "crates/parrot-api/tests/address_test.rs": {
+      "executable": false,
+      "sha256": "02af1c1146eb4abffc912f18ec28a3215026e4814eb647bc0b3b33e7a3ecdd53"
+    },
+    "crates/parrot-api/tests/config_test.rs": {
+      "executable": false,
+      "sha256": "e5c6adba22154e99ff2328a7e8a1d8ba63736952c053b9d448c88414375344ff"
+    },
+    "crates/parrot-api/tests/context_test.rs": {
+      "executable": false,
+      "sha256": "2a2fc4be0525cebde8e2d7f39306021cb10d864387811d69a0823d4249c852ff"
+    },
+    "crates/parrot-api/tests/errors_test.rs": {
+      "executable": false,
+      "sha256": "17822e6cbc33ced4e91e9a1bd5dc955911baea2afa319fd1817690b47f57de85"
+    },
+    "crates/parrot-api/tests/integration_test.rs": {
+      "executable": false,
+      "sha256": "af340c6dc23b3effc9e6ad8404792c802deb413c47f673ef5eb10efbced1e7d1"
+    },
+    "crates/parrot-api/tests/message_test.rs": {
+      "executable": false,
+      "sha256": "18f9062c85631f0f18f2f6fa602acdd205f43cba774f6c7bd1fb8b2a0ea0a9eb"
+    },
+    "crates/parrot-api/tests/runtime_test.rs": {
+      "executable": false,
+      "sha256": "83a471e8354a4e474638f3aecaefabc964e667ed964f23072a3e17e750f30fdf"
+    },
+    "crates/parrot-api/tests/system_test.rs": {
+      "executable": false,
+      "sha256": "4de94d4f85aa76f022945e67d3aff7fb6e9d7387d557e4aef8799b89eaf97f0f"
+    },
+    "crates/parrot-app/Cargo.toml": {
+      "executable": false,
+      "sha256": "784378212b2df060cc266da80b189cd299d097ddde1f1b7c18c8b6ba170069a3"
+    },
+    "crates/parrot-app/src/assemble.rs": {
+      "executable": false,
+      "sha256": "132fa0364088c46b7d19fd8e17ec985a7a6410dfa5c8bd4ff5e39fd8f780265c"
+    },
+    "crates/parrot-app/src/bin/cli.rs": {
+      "executable": false,
+      "sha256": "99e940f1f1a397bdf6576afd45699e3b8191bcee953b7a41ca4ea572d7eb0658"
+    },
+    "crates/parrot-app/src/debug/mod.rs": {
+      "executable": false,
+      "sha256": "dbc4e66ea013bb6bb821ac86da231a6f0dac403876c5c2b196639ac61ee16dae"
+    },
+    "crates/parrot-app/src/debug/replay.rs": {
+      "executable": false,
+      "sha256": "640880eabb042bf7f405cf16782d6484256633e47bc8c0f9d35088d31aab5463"
+    },
+    "crates/parrot-app/src/debug/trace.rs": {
+      "executable": false,
+      "sha256": "221ecdd40f864ea5716bac39aa0f39abe8a1b17c7be710dcf95469c75692a21c"
+    },
+    "crates/parrot-app/src/host.rs": {
+      "executable": false,
+      "sha256": "2dbcb45133c478f395043207d42e96accb196ec798f28e959304b8e6b9adf32d"
+    },
+    "crates/parrot-app/src/lib.rs": {
+      "executable": false,
+      "sha256": "a69ed16fb317ef69656f7fa08c9e87335e3f79c7d9bf82fc121027d541b32d68"
+    },
+    "crates/parrot-app/src/manifest.rs": {
+      "executable": false,
+      "sha256": "de9cf2ba74f04f70e3b897fa3d17a4376de7556b7a9138b3c3e4e2305e038075"
+    },
+    "crates/parrot-app/src/orchestrator/health.rs": {
+      "executable": false,
+      "sha256": "64dd233d267906f9666e077cb086e9e1a3b9d646e49d255c774435af8c677f6b"
+    },
+    "crates/parrot-app/src/orchestrator/mod.rs": {
+      "executable": false,
+      "sha256": "37927981b8ae44937f415508ff19bc21c8adff088af41606cb91e02036b9147c"
+    },
+    "crates/parrot-app/src/orchestrator/rollout.rs": {
+      "executable": false,
+      "sha256": "8310686d26bf59f07d3f5eafae6674471aea1af7eac78eea6c95d956b53f3916"
+    },
+    "crates/parrot-app/src/orchestrator/supervisor.rs": {
+      "executable": false,
+      "sha256": "d255c2bc04b43f162893039c8fe8a07e21c0f3a9baa18163f4d3cecc3a58fd9f"
+    },
+    "crates/parrot-app/src/planner.rs": {
+      "executable": false,
+      "sha256": "437f6d4b9374b9ff2dc5443baad9966a0da6228767d1da1860ea6bd1c564e600"
+    },
+    "crates/parrot-app/src/test_support.rs": {
+      "executable": false,
+      "sha256": "1f9b021f63216e32a1ceb909fc796d970a7b982d872c66bb19015940dab208b8"
+    },
+    "crates/parrot-app/tests/app_run_scenarios.rs": {
+      "executable": false,
+      "sha256": "6cae84adff0be5e15040758469825f2ac5c05dbba539a369b79d7ee58f83e9a2"
+    },
+    "crates/parrot-app/tests/chaos_scenarios.rs": {
+      "executable": false,
+      "sha256": "6d8666553fdb1fec51e63cd8389e44581552f55eafbd24076f4facc20ba415a5"
+    },
+    "crates/parrot-app/tests/diag_remote_accept.rs": {
+      "executable": false,
+      "sha256": "6944eaf1e186780670df97e3addaa687dc12e3f106dabc09968bee2833773b75"
+    },
+    "crates/parrot-app/tests/mg_multiengine.rs": {
+      "executable": false,
+      "sha256": "11ba149f1cec291e97d5fe93c8ede7da055b22ec9b912713c7988c1c80c46e5a"
+    },
+    "crates/parrot-app/tests/test_assemble_helper.rs": {
+      "executable": false,
+      "sha256": "68c55147e59507568384bc3a5512bebc5fc19b40f21391e07c3d53dab0f6bf86"
+    },
+    "crates/parrot-config/Cargo.toml": {
+      "executable": false,
+      "sha256": "939b84835a57191127d0e5e85d864df6fd8ae941198c22bd2e4b467f6b595e42"
+    },
+    "crates/parrot-config/src/lib.rs": {
+      "executable": false,
+      "sha256": "d41535bb47b90581f1e837c853a580c180d47fb3aa4ce45813eff7d8f5678893"
+    },
+    "crates/parrot-node/Cargo.toml": {
+      "executable": false,
+      "sha256": "475bfa9cc8aff81e1d7d567a711bf57dfe749153071cf4c85fef7b1a0bbf8c07"
+    },
+    "crates/parrot-node/builtin_app.toml": {
+      "executable": false,
+      "sha256": "d6380861b6b184c445b4d1bcbaf3242d679de618af8ae3e8d3b20be0d3a89dcc"
+    },
+    "crates/parrot-node/src/bin/parrot-probe.rs": {
+      "executable": false,
+      "sha256": "995107ba8847558dbf7a687aa2a51a292c0186887d3ea95f93c22dab9f20a43c"
+    },
+    "crates/parrot-node/src/lib.rs": {
+      "executable": false,
+      "sha256": "9423ebd0a0f9b836cebce03ee210579f80819779284d0c4cd32fb1b65e0fbf0a"
+    },
+    "crates/parrot-node/src/main.rs": {
+      "executable": false,
+      "sha256": "ab0aee717ac9b9dd3869cc2e6c76994b9b3a4ae937486d26515419a7664b470b"
+    },
+    "crates/parrot-node/tests/admin_v2_executor.rs": {
+      "executable": false,
+      "sha256": "26c3a30acaa6ac5bdbffb4b0183d312b40ecc904541367f1314d012882aa7247"
+    },
+    "crates/parrot-node/tests/builtin_manifest.rs": {
+      "executable": false,
+      "sha256": "43dfe36391091da14531432c609805736878e01b4d35d565e331c39e1c06b48e"
+    },
+    "crates/parrot-node/tests/jvm_gateway_admin.rs": {
+      "executable": false,
+      "sha256": "18feb04e6a74fd6ac230b32272f366805a1c888295c39fee2e5add9fbf29a4f5"
+    },
+    "crates/parrot-node/tests/wasm_actor_tests.rs": {
+      "executable": false,
+      "sha256": "cc665d7581d19bd60d2cac9158a1078e9ca6f4c26ef2442dc7470e38c6b32db1"
+    },
+    "crates/parrot-remote/Cargo.toml": {
+      "executable": false,
+      "sha256": "d2fe237ba4fd953f9bb993dad992d98a759e735805cdda520235b75d2f6e217a"
+    },
+    "crates/parrot-remote/src/acl.rs": {
+      "executable": false,
+      "sha256": "4d6c707b48449954fcfde70affd2a0c10e27353746123104535570cb42340402"
+    },
+    "crates/parrot-remote/src/admin.rs": {
+      "executable": false,
+      "sha256": "247064a58d526990222ad126b1d81e1098c59a08ed9c3ded8baea093ddc05094"
+    },
+    "crates/parrot-remote/src/admin_v2.rs": {
+      "executable": false,
+      "sha256": "c91190f093043e5236cf4eaa7c9b7adca7136979f71612865ee94b719fd58593"
+    },
+    "crates/parrot-remote/src/bin/dump_vectors.rs": {
+      "executable": false,
+      "sha256": "3906d298c0116898e944967293232031be4dc5abf273a66b9443678d45228559"
+    },
+    "crates/parrot-remote/src/bin/interop_erl.rs": {
+      "executable": false,
+      "sha256": "f66b81bba825a448c6113674e11fc79c84edfd79da9dcb2fe0f557a6a0d13e88"
+    },
+    "crates/parrot-remote/src/bin/interop_matrix.rs": {
+      "executable": false,
+      "sha256": "4a432361c9bdd06784ea499882f38b26b78c3f949da2d92251c333172e0b041c"
+    },
+    "crates/parrot-remote/src/bin/interop_ray.rs": {
+      "executable": false,
+      "sha256": "333979299decaadc790743689202622561b15d10df931006bc196ea2e6a10e2b"
+    },
+    "crates/parrot-remote/src/bin/remote_bench.rs": {
+      "executable": false,
+      "sha256": "e7f5041416d2537141a9bc15da0eea21b484af66f47afbb962e5ab7ad2a78116"
+    },
+    "crates/parrot-remote/src/cache.rs": {
+      "executable": false,
+      "sha256": "92a5515fef469bc385baf7315495ab6647735f4c1009fe4b1207d8db0e2f156e"
+    },
+    "crates/parrot-remote/src/codec.rs": {
+      "executable": false,
+      "sha256": "28e6faeaaf2d0f72cd1cc4e3f68784df0116c3e481346578ae9154e23adffcf8"
+    },
+    "crates/parrot-remote/src/codec_registry.rs": {
+      "executable": false,
+      "sha256": "18772bb0d61aecba59ba50d6fdf786375e276f115e49c5152ce45d8cea86283a"
+    },
+    "crates/parrot-remote/src/durable.rs": {
+      "executable": false,
+      "sha256": "14150766ab73dd0b03b53994a2270c031cca980062a9b1fd2bf905f04e6e8521"
+    },
+    "crates/parrot-remote/src/envelope.rs": {
+      "executable": false,
+      "sha256": "e20f217f7cb7036800472ea387f8f426a2b58578ec886eb185cb69d1f5f4e7b3"
+    },
+    "crates/parrot-remote/src/error.rs": {
+      "executable": false,
+      "sha256": "db5565de3c419b56571c08ddfe6b16552ab31a5554b1536cf5f12f0021e1cba7"
+    },
+    "crates/parrot-remote/src/frame.rs": {
+      "executable": false,
+      "sha256": "63999d712a415678e3722b3f31a90dbabb49d42eff517809477bc1509f6bc82b"
+    },
+    "crates/parrot-remote/src/handshake.rs": {
+      "executable": false,
+      "sha256": "64ea36bcb00e28da2e29c97dab112eac13f368fb7e7a88a1f20c47eca31de409"
+    },
+    "crates/parrot-remote/src/ingress.rs": {
+      "executable": false,
+      "sha256": "00b4c0c294b41ed02f95ae6763a5392ca25841c56e8dbc8bd5e991593c6d36fa"
+    },
+    "crates/parrot-remote/src/lib.rs": {
+      "executable": false,
+      "sha256": "3ef59dfb15d585386f33249a82e8013f114092528b27081b3e0217dc082ec365"
+    },
+    "crates/parrot-remote/src/livekit.rs": {
+      "executable": false,
+      "sha256": "f0863abaf90e4f07e9c8cd2f97ca985b0045017a6b940989ded9fbfae8726071"
+    },
+    "crates/parrot-remote/src/mqtt.rs": {
+      "executable": false,
+      "sha256": "96cfbd17bbbce87b9234deba8c1041d8ed870e9a84ddaa988fb01941bceafad9"
+    },
+    "crates/parrot-remote/src/node.rs": {
+      "executable": false,
+      "sha256": "ba86c1cfd9dba653cf0293ccce5cf9bc1390a8a18b8975aa1856e33977e5f316"
+    },
+    "crates/parrot-remote/src/pb.rs": {
+      "executable": false,
+      "sha256": "4a0fc0ecded7d8f40314924850f287ae110a7311c2a7dfd672e0669623d6537b"
+    },
+    "crates/parrot-remote/src/raft/mod.rs": {
+      "executable": false,
+      "sha256": "cb2174f147b3ab0692b1b4fead34fbac0413101195eda1cdc8540b4a9a9c89a0"
+    },
+    "crates/parrot-remote/src/receptionist.rs": {
+      "executable": false,
+      "sha256": "9359390d532348c7fc9896739a1ca6373998e9584015aa25e8dde7381b77a490"
+    },
+    "crates/parrot-remote/src/ref_.rs": {
+      "executable": false,
+      "sha256": "dfc962012d8a1b6ec0e5631e8aa6dac14e3d60bdb02a8aa643db1051cb928d7a"
+    },
+    "crates/parrot-remote/src/registry.rs": {
+      "executable": false,
+      "sha256": "b02c968ddfbd49dc6cda06af95792d4d0e02d700e4019a772d9d29165b6c51a4"
+    },
+    "crates/parrot-remote/src/roles/directory.rs": {
+      "executable": false,
+      "sha256": "2825b785453e511ab461ca2bb0725540f5a225edf0a47df3cbe80f2ca5de8513"
+    },
+    "crates/parrot-remote/src/roles/hub.rs": {
+      "executable": false,
+      "sha256": "31e0037450cf0a4c66553a713afa12aca1cd687b4209b75a611cde82ab546b22"
+    },
+    "crates/parrot-remote/src/roles/mod.rs": {
+      "executable": false,
+      "sha256": "3cd5a2c432e33ac94d1eb1acd219e3d0416301cefd1cf40f84a91eebeccf7a1a"
+    },
+    "crates/parrot-remote/src/roles/route_reflector.rs": {
+      "executable": false,
+      "sha256": "97331784a8f9ad96fa73668567a311ff3ce863564be974510014d1b3945d7b7e"
+    },
+    "crates/parrot-remote/src/sharding.rs": {
+      "executable": false,
+      "sha256": "2ae18588c82e96ceeaa46569a74ae6bc331a1a555c388b2a3020da3199d05960"
+    },
+    "crates/parrot-remote/src/singleton.rs": {
+      "executable": false,
+      "sha256": "b13aa1ddb7948cf756c6c38881855d6cf0aa0f1c491ce814327c7cf94415f97e"
+    },
+    "crates/parrot-remote/src/swim.rs": {
+      "executable": false,
+      "sha256": "3fa7f4090f2e8fb8e40eba1fd470f90b56c4f9d985e677a73ade5beaa571a2e5"
+    },
+    "crates/parrot-remote/src/system.rs": {
+      "executable": false,
+      "sha256": "38a5b53d383f552d1cf3c3e5ccd1dca56145689ef1f1dc1f5102cb16a423cc48"
+    },
+    "crates/parrot-remote/src/tls.rs": {
+      "executable": false,
+      "sha256": "bb388c06b830baa9f5210dc1b544f2b9e25bfa3beea4b3fd0981e63cc7845824"
+    },
+    "crates/parrot-remote/src/topology.rs": {
+      "executable": false,
+      "sha256": "dfb12e682f944b1da288e3f8b4f5440f69145c6d0de997e37eb74a5b74a6930f"
+    },
+    "crates/parrot-remote/src/transport.rs": {
+      "executable": false,
+      "sha256": "f3a2af6b1bf2f766bf05353f58de7cba657354d370b140e5202618e043cecf3f"
+    },
+    "crates/parrot-remote/src/transport/memory.rs": {
+      "executable": false,
+      "sha256": "7285b5bb8dca8c9472935461f53077c857d5e3f441d6d6188fc749ba64a8664d"
+    },
+    "crates/parrot-remote/src/transport/quic.rs": {
+      "executable": false,
+      "sha256": "79e01926055faf4d205762fdb744dad46a3dda9d90381cd6eb10f852f112fa92"
+    },
+    "crates/parrot-remote/src/transport/tcp.rs": {
+      "executable": false,
+      "sha256": "e2bc03317a1db79d54484598711c4c811bc6dd1bacac1cc5bf8d5a819439d261"
+    },
+    "crates/parrot-remote/tests/remote_lifecycle_regressions.rs": {
+      "executable": false,
+      "sha256": "c89a0e0904f48da0e100fd3136c720dc76bc7c1a69c0e5b96a51d0204a95abba"
+    },
+    "crates/parrot-wasm/Cargo.toml": {
+      "executable": false,
+      "sha256": "84fa70176533ef8ffb46430690b7a7fd351cc4767f1b255159a96d5f27dd588c"
+    },
+    "crates/parrot-wasm/benches/wasm_bench.rs": {
+      "executable": false,
+      "sha256": "a3077c172a4de0ca0b75afccb13588ec852700888ca786a2bbb041cebe5179f3"
+    },
+    "crates/parrot-wasm/src/lib.rs": {
+      "executable": false,
+      "sha256": "13080372fd0b2d767f823ba4818eb1ea90ed0d546ea1b9d023c5ee2959d461d8"
+    },
+    "crates/parrot-wasm/tests/bench_gate.rs": {
+      "executable": false,
+      "sha256": "8cae9d2fddf2ca1fc570ac94d0f0a655eb6ee3268c1115e6ecd83b8e5efdcf63"
+    },
+    "crates/parrot-wasm/tests/fixture/Cargo.toml": {
+      "executable": false,
+      "sha256": "9b1715861192bdc6d0d4889d5c083b6eef2d0d7b65308a0fa66acc05584c93b2"
+    },
+    "crates/parrot-wasm/tests/fixture/src/lib.rs": {
+      "executable": false,
+      "sha256": "c4b380c82f8d677e9bba42baee7966f3c9181d5137d5b81ec14a826738d5f6a0"
+    },
+    "crates/parrot-wasm/tests/fixtures/README.md": {
+      "executable": false,
+      "sha256": "171512f373cee70e0e54e74d96e5e93c43d5f4e63c1363597ef8c4fbedb64829"
+    },
+    "crates/parrot-wasm/tests/fixtures/fixture-component.wasm": {
+      "executable": false,
+      "sha256": "a726a21deeaeb88f532d244ce33cfb41769a74e16ae1845beb87ba4802d6cdfa"
+    },
+    "crates/parrot-wasm/tests/runtime_tests.rs": {
+      "executable": false,
+      "sha256": "5925da2ffbfdfd61869e72a4785fa308301eccc7fe3e6d6e6da79694fd751d57"
+    },
+    "crates/parrot-wasm/wit/parrot-actor.wit": {
+      "executable": false,
+      "sha256": "863335078b18757fcec514d106d791c6d7853a712acd8615d5523001fb7eec53"
+    },
+    "crates/parrot/Cargo.toml": {
+      "executable": false,
+      "sha256": "8767a1dfc43cc2cb6b52f34ca46bc7b2dd395d4e8f0501853d2d5df2e4ced705"
+    },
+    "crates/parrot/examples/actix_basic.rs": {
+      "executable": false,
+      "sha256": "fe52a4bdc0c959c6eaac8bb6afb54f6f303dc67e5482e142da0e8e8e068e1e7d"
+    },
+    "crates/parrot/examples/actix_basic_no_tokio.rs": {
+      "executable": false,
+      "sha256": "50e21f9a1ad8041f30305207b9ea87da6901b202147701bd0a09672d7f0dcea8"
+    },
+    "crates/parrot/examples/actor/simple.rs": {
+      "executable": false,
+      "sha256": "bee28eb34b29800db5319e59d59db1fa41cf59dd96a991afcf98178dfd6cdacd"
+    },
+    "crates/parrot/examples/actor_ring.rs": {
+      "executable": false,
+      "sha256": "8f77dc1c3d4e51047df239d33ed355559920ebd11151453ae1af456c93d8584e"
+    },
+    "crates/parrot/examples/actor_system_usage.rs": {
+      "executable": false,
+      "sha256": "c93ae2f55ed9b1b99d1aec95f91e31417b7a4dd91b1f4f1a0065d7d3b023c01e"
+    },
+    "crates/parrot/examples/async_message_handling.rs": {
+      "executable": false,
+      "sha256": "cceadb7c182d449d96e48b4b83dbea6781461a58270bd5356552d696f9ca033c"
+    },
+    "crates/parrot/examples/dedicated_thread_example.rs": {
+      "executable": false,
+      "sha256": "d0d8b5f68e432535b55e6d4436559cedb7d75bb77e63f12c616c5e8bdd4b964b"
+    },
+    "crates/parrot/examples/message_cloning.rs": {
+      "executable": false,
+      "sha256": "14c4bb0df33557c8f929742ff35ca5dd1c30d6f8c667ad0a80df715a448bcb18"
+    },
+    "crates/parrot/examples/ping_pong.rs": {
+      "executable": false,
+      "sha256": "6bfb12e6cb98cd155e13e98744a99c71a06d340de2706dec9715c5e055d8311f"
+    },
+    "crates/parrot/src/actix/actor.rs": {
+      "executable": false,
+      "sha256": "9d6382b91ebfc994dc4d3fe1a52c97bb7623c33b49feff813130c634e16c9d3e"
+    },
+    "crates/parrot/src/actix/context.rs": {
+      "executable": false,
+      "sha256": "e2fec224f2a1594b179fd0143e68fe18e42f13179a41f139cc371abd1755653c"
+    },
+    "crates/parrot/src/actix/message.rs": {
+      "executable": false,
+      "sha256": "0b3548c6a6cffd75f2ea97cccf8925a4d1cb400d3fcbe7f8ad64ad6284844f90"
+    },
+    "crates/parrot/src/actix/mod.rs": {
+      "executable": false,
+      "sha256": "b3eee302b8b3f20a937b391a39a7697c26d3d325cfadb046f8f14dc163c23020"
+    },
+    "crates/parrot/src/actix/reference.rs": {
+      "executable": false,
+      "sha256": "35379b11e681b914ac1071fc325207b06cd5aa7532d345b80d3a1517327dfafa"
+    },
+    "crates/parrot/src/actix/system.rs": {
+      "executable": false,
+      "sha256": "8122ab6ec3dc6a312df960d5ad828ee88d15d74369c14b6861a83830ad4f07c8"
+    },
+    "crates/parrot/src/actix/typed.rs": {
+      "executable": false,
+      "sha256": "7cb754d7d62133122ad08059279660b80f6f7d9bdf18853dc63f95c2e32d0be6"
+    },
+    "crates/parrot/src/actix/types.rs": {
+      "executable": false,
+      "sha256": "76d2d390444d3cc0f51eb0097e137e313a04c636811c3e8b5f8266ddff13c7ae"
+    },
+    "crates/parrot/src/lib.rs": {
+      "executable": false,
+      "sha256": "643cf69023458da2bbfab4cfe4ba5dec0704b2f3a1a46596711e11c7c556e30f"
+    },
+    "crates/parrot/src/logging.rs": {
+      "executable": false,
+      "sha256": "08a5a540f48674a4d8bf44da2d6ef12e25015f6b9b7640cd4d40fac03fd4a144"
+    },
+    "crates/parrot/src/mirror.rs": {
+      "executable": false,
+      "sha256": "8246815a930d61851ebc2277a000de305e62b074a95133f46992fb1f38e39e36"
+    },
+    "crates/parrot/src/system.rs": {
+      "executable": false,
+      "sha256": "db1b1e99be289a17f2ae442711f9c402fed1921c4e38cc2abfc0e4f53c2a7940"
+    },
+    "crates/parrot/src/thread/actor.rs": {
+      "executable": false,
+      "sha256": "1a7a337bbe2a9bc160bd44262e0e074c4a8d0b1c7933c7dad85aa5a8095c1718"
+    },
+    "crates/parrot/src/thread/address.rs": {
+      "executable": false,
+      "sha256": "38e036018825703bc63050fc6ad16ab23ea82547e9f624abd809c176f3d9eaf3"
+    },
+    "crates/parrot/src/thread/common.rs": {
+      "executable": false,
+      "sha256": "7c5c14327e4dd0df4bf85a07277444c8351a504fd01f0073a6e008da7da47f5b"
+    },
+    "crates/parrot/src/thread/config.rs": {
+      "executable": false,
+      "sha256": "9b6807387b7fad3d1b505395761f792b7ee99779ccd6623b95278ba263555090"
+    },
+    "crates/parrot/src/thread/context.rs": {
+      "executable": false,
+      "sha256": "f1e25d01a578c0680f8775ce70be43d8fd25f15bc28d1a1fcb26d55b282bf28e"
+    },
+    "crates/parrot/src/thread/envelope.rs": {
+      "executable": false,
+      "sha256": "27cdcae6c8689fc7e657d40bb4d0ae3d3ed0b58e6fd6c2725ae31f3f3b09aff7"
+    },
+    "crates/parrot/src/thread/error.rs": {
+      "executable": false,
+      "sha256": "4e7e975c821a5256754437c3eedbe4ef5e2f5f7a7bb5e6855708fd88e60e46a5"
+    },
+    "crates/parrot/src/thread/mailbox/mod.rs": {
+      "executable": false,
+      "sha256": "5f1dbc55ec90a490a4063677e99ac0686b2733fe7b030ca2e109178b686e30cd"
+    },
+    "crates/parrot/src/thread/mailbox/mpsc.rs": {
+      "executable": false,
+      "sha256": "a0152c46bc7e8a7182a034871ab09583c0b1df328d39ccb98fe1518ea1f5c7af"
+    },
+    "crates/parrot/src/thread/mailbox/spsc.rs": {
+      "executable": false,
+      "sha256": "f6b64fd89f5c243bd7627b63000fb4d7c7e83a93808b24db81ceb8dd266cd3f8"
+    },
+    "crates/parrot/src/thread/mailbox/spsc_ringbuf.rs": {
+      "executable": false,
+      "sha256": "e20b7452efee7abf8d5a5b00b38fe081e126eec866feb42acdbe32058e8dedc6"
+    },
+    "crates/parrot/src/thread/message.rs": {
+      "executable": false,
+      "sha256": "357f78f8c4661a7c9a35bf81bd1673d20b0d8b6fda490d282058fd3e0071832c"
+    },
+    "crates/parrot/src/thread/message_pool.rs": {
+      "executable": false,
+      "sha256": "a42fad52a22794f70aa634a0466242dae9b8349ffb0144825888710ea3876fff"
+    },
+    "crates/parrot/src/thread/mod.rs": {
+      "executable": false,
+      "sha256": "8f3f29182bd95ef0975dc1458aa605f48491c8fe15f613da05c58a714c3d80f0"
+    },
+    "crates/parrot/src/thread/processor/core.rs": {
+      "executable": false,
+      "sha256": "15cf0fc4b8cf123626b14909f88c0ab9f146bf50e38c854bb545b95343db8564"
+    },
+    "crates/parrot/src/thread/processor/manager.rs": {
+      "executable": false,
+      "sha256": "a034b2f4b60aafeb3cc23925e3d0f992b58a84bbd187399205eda8a4e27fea3d"
+    },
+    "crates/parrot/src/thread/processor/mod.rs": {
+      "executable": false,
+      "sha256": "c496893d84840d2fe3d0edf9b00e7d4715d1f9bed5185d42f6b41d3affcbaf7c"
+    },
+    "crates/parrot/src/thread/reply.rs": {
+      "executable": false,
+      "sha256": "73ed50a8acf5ddd9514e6949fd0b82653ebe74f77e743b2c4c33814b4be48727"
+    },
+    "crates/parrot/src/thread/scheduler/dedicated_thread/mod.rs": {
+      "executable": false,
+      "sha256": "f2846ebffd841fca30f92ff6f5cf6ee7bd6d64c9fd1c6a221ebe1508537186ab"
+    },
+    "crates/parrot/src/thread/scheduler/mod.rs": {
+      "executable": false,
+      "sha256": "7e0aed23476680692866ce641c904a65ca36a142b788b9ab21fcb7cf80b67204"
+    },
+    "crates/parrot/src/thread/scheduler/queue.rs": {
+      "executable": false,
+      "sha256": "d128dd71ba16893ac4e2091e3d00773902f105bdb7f2458fd32d042d7773602b"
+    },
+    "crates/parrot/src/thread/scheduler/sharded.rs": {
+      "executable": false,
+      "sha256": "ec379e4896a1ed646834dc8bd8e02a3711730893af2856ef67f289df04497d02"
+    },
+    "crates/parrot/src/thread/scheduler/shared/mod.rs": {
+      "executable": false,
+      "sha256": "26f49a25be765ef0ee305ac9bfbac14793b4eea7a1ce90fb555fbe24d4919892"
+    },
+    "crates/parrot/src/thread/scheduler/shared/pool.rs": {
+      "executable": false,
+      "sha256": "64b3d9160c65b1f028d37aa2ab7bc7dde88245d8dd06d8b67701e4c35046acd7"
+    },
+    "crates/parrot/src/thread/scheduler/shared/worker.rs": {
+      "executable": false,
+      "sha256": "dc918f7102686272256147f1cf000456ed2b71a4fccaf1db42b8704da99bc4a5"
+    },
+    "crates/parrot/src/thread/scheduler/shared/worker_manager.rs": {
+      "executable": false,
+      "sha256": "e0d95a4abd0374bcb6488ab6405f915f7a3b382b0a8926a3dc888772d4373707"
+    },
+    "crates/parrot/src/thread/scheduler/steal.rs": {
+      "executable": false,
+      "sha256": "eae388683b273ffd7b87f617870eb9d38eb144b7297033241b95aadecd5bee09"
+    },
+    "crates/parrot/src/thread/single_alloc.rs": {
+      "executable": false,
+      "sha256": "387664aec29a2d635d4ebb014e69dfef870fb64ca1e79f912f301d7f6618eed6"
+    },
+    "crates/parrot/src/thread/supervisor_exec.rs": {
+      "executable": false,
+      "sha256": "c5af90fb7da70f90c33e1c63ddc370ffd3eaffe6ac54e6bc301794c5c881390e"
+    },
+    "crates/parrot/src/thread/system.rs": {
+      "executable": false,
+      "sha256": "5104e2d89ce299d55a12501be6cca1b001c49c6d753428d47a3b7e028006ea25"
+    },
+    "crates/parrot/src/thread/typed.rs": {
+      "executable": false,
+      "sha256": "979026a4cbe836eabb3e70740683674459a80087e3e24d5dad32692a8a6644f8"
+    },
+    "crates/parrot/tests/README.md": {
+      "executable": false,
+      "sha256": "69fdfe7cd54f983940235bee61f75e057f90ef54b774d09b42d52f2b3c8f0a44"
+    },
+    "crates/parrot/tests/bench_m4_actix_parity.rs": {
+      "executable": false,
+      "sha256": "bef782497c148b3762fedea41f01a46fd6446bf7b3990a38c2848bfe5a6bdf57"
+    },
+    "crates/parrot/tests/bench_msg_matrix.rs": {
+      "executable": false,
+      "sha256": "9314810a0fa38830ce0a81d526217df73da13378aea51403e35f164134baa546"
+    },
+    "crates/parrot/tests/common/mod.rs": {
+      "executable": false,
+      "sha256": "a35a78acac3c547eeb21fd44ec31e2b262e4f5bfe8c072203f5a516a15b3ed40"
+    },
+    "crates/parrot/tests/dedicated_thread_test.rs": {
+      "executable": false,
+      "sha256": "0ae0ca9df3d6a1b2e3e62c08b81a3de9857560063e61bd241c46403956733bd9"
+    },
+    "crates/parrot/tests/engine_stress_actix.rs": {
+      "executable": false,
+      "sha256": "a44a7574c68910dc5a259a2b5cc2256e4fbea56d2840d83cba76c1210446e1bd"
+    },
+    "crates/parrot/tests/engine_stress_common/mod.rs": {
+      "executable": false,
+      "sha256": "af054b5ab97b7f3d3d1a6b0d6ef97a4d05c0302d0a55b56dca2d01f08af121b0"
+    },
+    "crates/parrot/tests/engine_stress_thread.rs": {
+      "executable": false,
+      "sha256": "f45a4d894face826c022acc858c17285e26b554abbfed2a9805caaa0d36efa63"
+    },
+    "crates/parrot/tests/multi_thread_scheduler_test.rs": {
+      "executable": false,
+      "sha256": "29846c3bc46263f3613442f547b608cc2046f26e52c01af29b886b714d941ab4"
+    },
+    "crates/parrot/tests/stress_baseline.rs": {
+      "executable": false,
+      "sha256": "84387739f08f6a51deb8eb4f5147e6e1231175ba997b9d7355676d66fccd448e"
+    },
+    "crates/parrot/tests/test_actix_adapter_coverage.rs": {
+      "executable": false,
+      "sha256": "b51b63bb93bd26aa8ac8085f7b5a376357068607e85a310019ff3966443f9dea"
+    },
+    "crates/parrot/tests/test_actix_owned_dispatch.rs": {
+      "executable": false,
+      "sha256": "74f65164a11d6facda18fe4de57adff51a8289448d5e6d376b9e64a691535122"
+    },
+    "crates/parrot/tests/test_actor_basics.rs": {
+      "executable": false,
+      "sha256": "6f4abcc0d7a2548ec878dcc2aad08c6b394a93b87a2a6fc4e8cd61a3b4603939"
+    },
+    "crates/parrot/tests/test_actor_macro.rs": {
+      "executable": false,
+      "sha256": "277403ff39bb492e8b5a16f41653ed32df1557561ac639aaae261fb4981e66e2"
+    },
+    "crates/parrot/tests/test_actor_registration.rs": {
+      "executable": false,
+      "sha256": "e70c389404b9794541892892c34ae9f5d80316f95bb3b12824bed454660b90c6"
+    },
+    "crates/parrot/tests/test_admin.rs": {
+      "executable": false,
+      "sha256": "ec00925da43dd47c58ac47b2d1cc1f2e1d865d6f85283d0b708119f89c38ba94"
+    },
+    "crates/parrot/tests/test_adr_stress_suite.rs": {
+      "executable": false,
+      "sha256": "4aabcc1240a5759869a7e1c87869800000de1dc1d3d90ec3872eff2bddfaa25c"
+    },
+    "crates/parrot/tests/test_advanced_choreography.rs": {
+      "executable": false,
+      "sha256": "0ad528c28ce2c5a56d9c8e11f6516ea7b4212ece5a58700dc6bf8a92c3d29c7c"
+    },
+    "crates/parrot/tests/test_akka_parity_suite.rs": {
+      "executable": false,
+      "sha256": "6794846e8672e4039ba82a5e3ba5e3ec9ba7dcb50cf2754fabf02f3bc09d4608"
+    },
+    "crates/parrot/tests/test_async_message.rs": {
+      "executable": false,
+      "sha256": "b26a7fe84c35a67dbdb7f41788bdd4e5d1a9827a28c0cc02e8a3e6d5bde22165"
+    },
+    "crates/parrot/tests/test_async_scheduler_progress.rs": {
+      "executable": false,
+      "sha256": "02a417fb9e967e0bf8dc65071865bdc02dd0638d1acfcc9650e7aa2b1dec2e2e"
+    },
+    "crates/parrot/tests/test_backpressure_e2e.rs": {
+      "executable": false,
+      "sha256": "2dbca16d649f8ec2e5e4968143e2a4f9e5f94c8c2bd7a00062c0c99bbcdaffd3"
+    },
+    "crates/parrot/tests/test_business_logic.rs": {
+      "executable": false,
+      "sha256": "49b06f61a7fdff39315310c559f1d54cc8443ccc190d1b5964d995cb682bd4f2"
+    },
+    "crates/parrot/tests/test_cluster_k6.rs": {
+      "executable": false,
+      "sha256": "a6eb34e6029ff3055fcdde23951a27178633679ea54254dd55c18d8472129121"
+    },
+    "crates/parrot/tests/test_config_aspect.rs": {
+      "executable": false,
+      "sha256": "776c406a87c49ca230e00eb80d58c7c8a04a03dd7b97c0322552b3da949520eb"
+    },
+    "crates/parrot/tests/test_context_messaging_contract.rs": {
+      "executable": false,
+      "sha256": "94c801600b8d1ec56a45a1b087c76fc1540bbde8df24238b690ab66126c1e27a"
+    },
+    "crates/parrot/tests/test_correctness_suite.rs": {
+      "executable": false,
+      "sha256": "075a2e65c716e41c0b2337830ee47954500f76fd52c554c9fc133d8e80ca0db3"
+    },
+    "crates/parrot/tests/test_cpp_interop.rs": {
+      "executable": false,
+      "sha256": "99502cda7c81128ac0eb5256e2d9c67258e543252b4b564140ab1cba3b01ae35"
+    },
+    "crates/parrot/tests/test_cross_engine_poc.rs": {
+      "executable": false,
+      "sha256": "5e3a586fda291af6c1ebc33fbbf1aa5c1bb6e9bdeb964a245ac45c8fd4181c0d"
+    },
+    "crates/parrot/tests/test_derive_dispatch_paths.rs": {
+      "executable": false,
+      "sha256": "253f0b04988816b228e4a0fea316c477baae06faa5dc3e2c50f8610580d504c7"
+    },
+    "crates/parrot/tests/test_dispatch_matrix.rs": {
+      "executable": false,
+      "sha256": "26f8d4bbd3d72c6c77575d7fa7ec385a979aef074365422a227a121338b1c9c2"
+    },
+    "crates/parrot/tests/test_durable_tell.rs": {
+      "executable": false,
+      "sha256": "b34e2bb5f44efcc2b70a100477efdbcdc0f546ae044a15a930bcc8b657a3112c"
+    },
+    "crates/parrot/tests/test_elastic_scaling.rs": {
+      "executable": false,
+      "sha256": "1ec8d95b83dc37e307cef10c790ba3d7458a7bf94b5874290c344517d9bafcc0"
+    },
+    "crates/parrot/tests/test_federation_p5.rs": {
+      "executable": false,
+      "sha256": "a7cdc5ee817dd170ad3bdd834fc0db5afae3dd6a396f6ea0c4d128a227f24245"
+    },
+    "crates/parrot/tests/test_gossip_integration.rs": {
+      "executable": false,
+      "sha256": "741dbdd6a8ecf440c0b16af4f471e9cb28e88a6f47f7f89c8b21f490896bee44"
+    },
+    "crates/parrot/tests/test_helpers.rs": {
+      "executable": false,
+      "sha256": "24a728a97bca4cb48328a896214c56ec1293e0f2a0e775f8af22c5cb179ac2f1"
+    },
+    "crates/parrot/tests/test_hub_relay.rs": {
+      "executable": false,
+      "sha256": "5bfb0b64dfbe49f9a659a3b01f7a124f46c8fd44fb0ef2a426c6aac971b4dab5"
+    },
+    "crates/parrot/tests/test_individual_stop_deadline.rs": {
+      "executable": false,
+      "sha256": "06751e4d46429c838eb52b9a03dbd1c583528c62bf7ab1b5ac298a8b05e043f5"
+    },
+    "crates/parrot/tests/test_lifecycle_thread_affinity.rs": {
+      "executable": false,
+      "sha256": "8a219804742f65a1a89291d7d847e93ceccbd00cd1f2a9954e19551748ef5200"
+    },
+    "crates/parrot/tests/test_lite_interop.rs": {
+      "executable": false,
+      "sha256": "6f48ce86bc73d7283714761fa83bb379c1a3cd8e6bf441ac1423c043dac6a2bf"
+    },
+    "crates/parrot/tests/test_m2_scheduling.rs": {
+      "executable": false,
+      "sha256": "6361ea27b4c21bfd9794e552b3358a74af700dab786709eb71c2bc841138d459"
+    },
+    "crates/parrot/tests/test_m3_supervision.rs": {
+      "executable": false,
+      "sha256": "206b4e51d15bb55d1132c62303f845b6ee9a0205a505c12fe5a536fe616c4e07"
+    },
+    "crates/parrot/tests/test_m4_typed.rs": {
+      "executable": false,
+      "sha256": "c5b0f5fce1c23a28aeadec969e7ef6c87c9e925d17f060631b08297c229251c7"
+    },
+    "crates/parrot/tests/test_m4_typed_actix.rs": {
+      "executable": false,
+      "sha256": "c8b5e9ed86f67696ff539e1f5d558bf43f9e276d87694b73a286ae27dae327c7"
+    },
+    "crates/parrot/tests/test_m5_single_alloc.rs": {
+      "executable": false,
+      "sha256": "3bf9c4caad204e822574ea0f45e8966205a45654491aa78cad0d49fd7bb6a4a4"
+    },
+    "crates/parrot/tests/test_mailbox_close_contract.rs": {
+      "executable": false,
+      "sha256": "4dd1e73029348560ccb0d7c5eb619f5d87ddbf099d53245484c31cc300d2df67"
+    },
+    "crates/parrot/tests/test_message_pool.rs": {
+      "executable": false,
+      "sha256": "6b3012a407cb2bba4c87a73d16bdc278c17a8190b7d661c436e8ea5c4ca5c9af"
+    },
+    "crates/parrot/tests/test_mqtt_bridge.rs": {
+      "executable": false,
+      "sha256": "4b719d8c39fc6b81c80fe06824de9db5db6934e6f07e29d7b641901a8d847b74"
+    },
+    "crates/parrot/tests/test_receptionist_context.rs": {
+      "executable": false,
+      "sha256": "43f94ac11280705f95555030eb6b0e22dcc1f2727603c6793575d6d66efbf5da"
+    },
+    "crates/parrot/tests/test_remote_semantics.rs": {
+      "executable": false,
+      "sha256": "69b1e934a8192d87097c8db1672c0a0f186d0cd0944ec8249195afaf8c449db8"
+    },
+    "crates/parrot/tests/test_semantic_regression_m1_m6.rs": {
+      "executable": false,
+      "sha256": "9b9487434bcf59a30c973a5b265678ccb3ce5184a68ff2a9b1381085d6e5e761"
+    },
+    "crates/parrot/tests/test_sharded_lost_wakeup.rs": {
+      "executable": false,
+      "sha256": "194eb85f130004861d2d1d95cff615b9db8a643120b4dc02c4da2534b12c64f1"
+    },
+    "crates/parrot/tests/test_sharded_scheduler.rs": {
+      "executable": false,
+      "sha256": "077ffae30cb1bc6aac59fdae3dfcf2a1d3b317353183c528afceaf1339edf16e"
+    },
+    "crates/parrot/tests/test_sharding_integration.rs": {
+      "executable": false,
+      "sha256": "792e53be5540090a241c0895f0d41a63578f7be962f487d20f72c1497cdb2739"
+    },
+    "crates/parrot/tests/test_shutdown_deadline.rs": {
+      "executable": false,
+      "sha256": "db6eb3d661bbb9909ffbbf73364628074744a68f4fb852eb6b20886169006f92"
+    },
+    "crates/parrot/tests/test_steal_bench.rs": {
+      "executable": false,
+      "sha256": "443e0274c252ebfdb37c427f2c0ae2d2c5890f22857387aff83421c0e92104f7"
+    },
+    "crates/parrot/tests/test_stop_entrypoints.rs": {
+      "executable": false,
+      "sha256": "831f31b741348bc2d02cf763de459375e3c18064daac611fd660662df478cc80"
+    },
+    "crates/parrot/tests/test_swim_cluster.rs": {
+      "executable": false,
+      "sha256": "e2e65f33c241f2083c566b29c6e674df4892fe0d6524c346d5b348f271b2a3bc"
+    },
+    "crates/parrot/tests/test_sync_message.rs": {
+      "executable": false,
+      "sha256": "39aa7266edc26f7692b9c7c92a33b20a8325bff7c80b7381e3cfe16afa6b4ad4"
+    },
+    "crates/parrot/tests/test_system.rs": {
+      "executable": false,
+      "sha256": "62b084f6ac6b00147c77fbe69e573b677e0ee0dbbf90776031cbb14083ddbd66"
+    },
+    "crates/parrot/tests/test_thread_advantages.rs": {
+      "executable": false,
+      "sha256": "ccc0f7938be1f46533dbe720346d26495cffc66f1b383ef398accc923226c36f"
+    },
+    "crates/parrot/tests/test_thread_engine_scenarios.rs": {
+      "executable": false,
+      "sha256": "d9f3ca060a4c1eb43d79d75fc7b751fe9f7354241c9c059d84b806631f4fedcc"
+    },
+    "crates/parrot/tests/test_usage_scenario_catalog.rs": {
+      "executable": false,
+      "sha256": "841aaad7b8db0567cc441274bb2f41a3aec66cc824a517020d8263afa089b345"
+    },
+    "crates/parrot/tests/test_watch_delivery_deadline.rs": {
+      "executable": false,
+      "sha256": "551df788c73cefcfb957b76c1ed7a56432bb511cd2a381925f39162d6cf98bf3"
+    },
+    "crates/parrot/tests/thread_config_test.rs": {
+      "executable": false,
+      "sha256": "83b1a9b8f7ce272035607197dc110dd97ac693500257d7ccda408cc2ea45d9b2"
+    },
+    "crates/parrot/tests/thread_error_test.rs": {
+      "executable": false,
+      "sha256": "6e9f7fa601843fc4cd89204510fe795d71397bfba2016572488dee8c7b7603eb"
+    },
+    "deploy/Dockerfile": {
+      "executable": false,
+      "sha256": "31e145b0bf5c344140ceeb348be0a621b81a418af4970858a83702fef8dd6248"
+    },
+    "deploy/images/README.md": {
+      "executable": false,
+      "sha256": "0c2d370797e9a9bebc8eb540226d7131dc1258f754db0bb7880016dfbe5c7b56"
+    },
+    "deploy/images/gw-app.Dockerfile": {
+      "executable": false,
+      "sha256": "6f16a4ac6aede6c37eb8d7ce91bd9b973bbe2590514bb820e9c89995d844c9a2"
+    },
+    "deploy/images/gw-erl.Dockerfile": {
+      "executable": false,
+      "sha256": "ad8963be66d241c1905213464cf813d61204d5a9e04e96000173ad8f72b47c85"
+    },
+    "deploy/images/gw-jvm.Dockerfile": {
+      "executable": false,
+      "sha256": "42f86c07c525af8148810e625bbccb7be03b0f33dbf44ff36fcb43a20e6d56e9"
+    },
+    "deploy/images/gw-ray.Dockerfile": {
+      "executable": false,
+      "sha256": "d2e7ea4a2ff82369325a303bd591c7f36d71f33133cb4a6974c04af9d3291f5c"
+    },
+    "deploy/images/prep-jvm-libs.sh": {
+      "executable": true,
+      "sha256": "14cc70feffc3ecdeacd4b6382b02befd3ff79900180cf3c39c36fbd8095f83df"
+    },
+    "deploy/parrot-mesh/docker-compose.mesh.yml": {
+      "executable": false,
+      "sha256": "392d5ca8737e0a6f287bd8b0da5c1a02370ce243ed00b69de8423f807baab50f"
+    },
+    "deploy/parrot-mesh/gen-mesh.sh": {
+      "executable": true,
+      "sha256": "ab63f205b41eb9e10fc733627a48a1f27d0b960f10d00d3d29c8bfa36bff6195"
+    },
+    "deploy/parrot-stack/docker-compose.yml": {
+      "executable": false,
+      "sha256": "51acebbeee32026662dd797f4f71db0c91b95854de2fa8092d843a9689c3bc7c"
+    },
+    "docs/CRAWLER_LAB.md": {
+      "executable": false,
+      "sha256": "860f82662ff3870236fd022ce398fd5cf60573b7ae75cf8da4660848813b5704"
+    },
+    "docs/DECISIONS_DEPENDENCIES.md": {
+      "executable": false,
+      "sha256": "2befb5c275e3a18d21cd0e65893ef1dab36b182f07b0905327204665a83ae9dd"
+    },
+    "docs/DEV_00_总体测试与验收计划.md": {
+      "executable": false,
+      "sha256": "4c2f918b7aa5f75cca67cac6558618dae5007cf1043468b181aec3d26b939312"
+    },
+    "docs/DEV_01_P1_远程实现开发文档.md": {
+      "executable": false,
+      "sha256": "865ac13af444f022314cd928c6bdcfdb0d13ec9770b4efec4a092f32a945ece3"
+    },
+    "docs/DEV_02_P2_集群核心开发文档.md": {
+      "executable": false,
+      "sha256": "001ba537f2e493623782db087aa32f6edfcabd6ebd29de9ed2fba8d4b688f306"
+    },
+    "docs/DEV_03_P3_边缘与桥开发文档.md": {
+      "executable": false,
+      "sha256": "28ec10828252253a0bd10a7561ef525d2bfe691f6d9fccaddf7a714ba3ef159a"
+    },
+    "docs/DEV_04_P4_集群深化开发文档.md": {
+      "executable": false,
+      "sha256": "970a1831f6446da45aaf1e6660f940296612e721a89cd7ced06a51cb691b39c5"
+    },
+    "docs/DEV_05_P5_联邦控制面开发文档.md": {
+      "executable": false,
+      "sha256": "df120343b4c1b710531d7dcd93adc51c0cf9888ce218295b04069bfc14541927"
+    },
+    "docs/DEV_06_P6_规模化开发文档.md": {
+      "executable": false,
+      "sha256": "45861999ad4d5a4fbfdb6e0e71e85b471ca967695fa773aca6713dec06fbfad8"
+    },
+    "docs/DEV_09_应用体系与多引擎统一编排开发文档.md": {
+      "executable": false,
+      "sha256": "378f175a02e0966cbf33b1c6a860ac92a567c18f15ca35d26adec7f4f687a6cc"
+    },
+    "docs/DEV_README.md": {
+      "executable": false,
+      "sha256": "f169981fcf912921e3aca9412af4fbb5ccf7c0f337315ca34a4bcb8298d7b5b8"
+    },
+    "docs/ENGINE_MIGRATION_GUIDE.md": {
+      "executable": false,
+      "sha256": "75a597b6a30f35d86991d979292c8c228b099999450e2736ff0f316a46764621"
+    },
+    "docs/ENGINE_STRESS_REPORT.md": {
+      "executable": false,
+      "sha256": "0ca054c365fbbc4c7b662c981b207f194563d85ed91165f9a9888d5578107def"
+    },
+    "docs/OBSERVABILITY.md": {
+      "executable": false,
+      "sha256": "a8882a620165fb23066b78aad535588ebba3bc9436437d7e5342e8954a839ede"
+    },
+    "docs/PERF_BASELINE.md": {
+      "executable": false,
+      "sha256": "5d6d5974359967b1912013d882d853395eeba6fbaca442e43d4951dc2b1c3294"
+    },
+    "docs/README.md": {
+      "executable": false,
+      "sha256": "bae717c1a05e9653fbbf421e11e922fdfd7479ab00c7b6efe0d63bf42cd20c69"
+    },
+    "docs/ROOT_CAUSE_远程层缺陷根因记录.md": {
+      "executable": false,
+      "sha256": "7ae04d093422ca186003c7bd3156ef5db09f29bde71e1b23762c57ae3a09b6b4"
+    },
+    "docs/SCALE_REPORT.md": {
+      "executable": false,
+      "sha256": "dc751aa627e49299fc346ea83369b145788f5986cf089247fd8c240f86fc16a1"
+    },
+    "docs/SEMANTIC_CHANGES.md": {
+      "executable": false,
+      "sha256": "946015feb0ec46c5e801f2f3ed4133aae5d99a2bf3d720ab2aacaca9f77ac45e"
+    },
+    "docs/TECH_DESIGN_01_架构与设计原则.md": {
+      "executable": false,
+      "sha256": "d63b0c365cbaac0900328ea2b435133525141f9af0f8e4ed84d2665abb0d9e55"
+    },
+    "docs/TECH_DESIGN_02_核心机制与详细设计.md": {
+      "executable": false,
+      "sha256": "456c74770cae757ca6746c6eb149645d2892f6dd51de103225952feff7402228"
+    },
+    "docs/TECH_DESIGN_03_质量分析与改进路线.md": {
+      "executable": false,
+      "sha256": "18517d5817fe237464cfa972026b54e3d5015ccf370673dc6b2dee141e2a5795"
+    },
+    "docs/TECH_DESIGN_04_远程与集群架构.md": {
+      "executable": false,
+      "sha256": "acd69321cc246efac35f37fc482f3ea7931d97d0a69c61bb0ec48d2e96afb664"
+    },
+    "docs/TECH_DESIGN_05_P1远程实现详细设计.md": {
+      "executable": false,
+      "sha256": "3590f3b577090ed3f26d937919fbed477591d421e393be5c532ad497df614cf0"
+    },
+    "docs/TECH_DESIGN_06_P2-P4集群与联邦详细设计.md": {
+      "executable": false,
+      "sha256": "70aba69b34ce7850b93f5d7ad05185ed4676b3181c6fcc530e873420f39e3867"
+    },
+    "docs/TECH_DESIGN_07_异构联邦协议设计.md": {
+      "executable": false,
+      "sha256": "bc85b22f95c590219c3e44c8d63984bcfd49a93e3727253f017e906a1afa5fc1"
+    },
+    "docs/TECH_DESIGN_08_配置切面设计.md": {
+      "executable": false,
+      "sha256": "7ad71f12a556e8a5e88b5430605a457126525d28915d0e2560dcbc5d5e3ef467"
+    },
+    "docs/TECH_DESIGN_09_应用体系与多引擎统一编排设计.md": {
+      "executable": false,
+      "sha256": "60140604bb321619485367b9cf4df385bee13e6ae82ccd9ae2682525324a2199"
+    },
+    "docs/coverage-waiver.md": {
+      "executable": false,
+      "sha256": "58f4a4f9730e22b774ae00e4f5d12960b2fc16d73f1cfad81c8118f5acebcaaf"
+    },
+    "docs/coverage/dev09.txt": {
+      "executable": false,
+      "sha256": "3669ac213b8d11c9ae6752ed2bcf9a9f4bfa074e3759b1c551de37f8d1c57669"
+    },
+    "docs/review/ClaudeFable5.1的review.md": {
+      "executable": false,
+      "sha256": "12fbd4a2d22ece1d29d5c71e9a10c2ea13c796c452f5a84eaac1ec4dbc3c2278"
+    },
+    "docs/review/PROJECT_COMPREHENSIVE_REVIEW_2026-10-08.md": {
+      "executable": false,
+      "sha256": "a491fb2a47d81088b1337d6bd04b55105f5833b36c58797f512b08546894d902"
+    },
+    "docs/review/independent-2026-10-08/REVIEW_AND_REPAIR.md": {
+      "executable": false,
+      "sha256": "931d9997d4b82ad4518dcf7c27f9e32496ebfa26b2a0bff1ac36ecaf9177bc8c"
+    },
+    "docs/review/independent-2026-10-08/actix-cancellation-before.txt": {
+      "executable": false,
+      "sha256": "bf3d3cc9f9587bdd6642628bba71aecae590d032c01cea146ea92fdab89a3d5f"
+    },
+    "docs/review/independent-2026-10-08/context-mailbox-before.txt": {
+      "executable": false,
+      "sha256": "3ad8ffbc1fe6bd895ec876f811cb5c3e4fd32cff0154ba7825679c534283962d"
+    },
+    "docs/review/independent-2026-10-08/individual-stop-before.txt": {
+      "executable": false,
+      "sha256": "5654ade6caa6d7105093b75a3271ebb8b986e620f35d598c8ce080e7243d175b"
+    },
+    "docs/review/independent-2026-10-08/lifecycle-affinity-before.txt": {
+      "executable": false,
+      "sha256": "61aa2cb2711b68313bc83fb0689fa88f2c3e53a0adb7fde138d32d8f1a6057e2"
+    },
+    "docs/review/independent-2026-10-08/mailbox-destructor-before.txt": {
+      "executable": false,
+      "sha256": "fb88f5a12855b2811c368a6035a725ba5a9d02f315497251e5f7e4f32aca4e9b"
+    },
+    "docs/review/independent-2026-10-08/mailbox-reentrant-drop-before.txt": {
+      "executable": false,
+      "sha256": "30e4244544c994d8aecbcb6460f1ffc21b41009127ec13ff32587f7a8707e8f3"
+    },
+    "docs/review/independent-2026-10-08/original-state-probes.rs": {
+      "executable": false,
+      "sha256": "22cdb8715432eb517b7003ca12ce32f011a54bc470fa33255346f8a94b8d7f9b"
+    },
+    "docs/review/independent-2026-10-08/probes-baseline.txt": {
+      "executable": false,
+      "sha256": "69c9d38a1ac6f0604751d9b31f61dfa7508c2d5307889e6ce0be3f2c39b43e01"
+    },
+    "docs/review/independent-2026-10-08/stop-entrypoints-before.txt": {
+      "executable": false,
+      "sha256": "7279cfe28c5d0764584efb0234148f4b723ce98144f1d4fe599f640484f00755"
+    },
+    "docs/review/independent-2026-10-08/typescript-baseline.txt": {
+      "executable": false,
+      "sha256": "3dc3345ae90c5d8ac8dca4b59621cc4db01707be2b83a1a040bc77852a850823"
+    },
+    "docs/vectors/admin_v2.json": {
+      "executable": false,
+      "sha256": "a8f8ac1eccca0ece4a21995fb0f758e1bf446cf30219bbf29cc3bfcd895062f1"
+    },
+    "docs/vectors/wire1.json": {
+      "executable": false,
+      "sha256": "ea5e1faa7dc35d66bb1fccfc9aab9b1110023f2485d96561d794c0a41063d334"
+    },
+    "idea/proposal.md": {
+      "executable": false,
+      "sha256": "7acb62aa3bd6fd89007d4f9e012a21f0a0a23aa9a0690e0fe23e526a5d5125d5"
+    },
+    "interop/cpp-lite/assert_t.h": {
+      "executable": false,
+      "sha256": "40085db074cbc91273f765c82b644b784ff8b34644d776d44f0c6c9662a65fd3"
+    },
+    "interop/cpp-lite/bin/test_interop": {
+      "executable": true,
+      "sha256": "8747f08dc71a9ed9c3c97e96070ae7f08926236d3ca14813864150d1f54f7fe0"
+    },
+    "interop/cpp-lite/bin/test_vectors": {
+      "executable": true,
+      "sha256": "8f943e4be1982eacb18242bdb3d9d82e7208ba4fe7d37f622913244f3fa5d1d6"
+    },
+    "interop/cpp-lite/parrot_lite.cpp": {
+      "executable": false,
+      "sha256": "f8d682732ebd4cb273505a391def5038a2a01ad09509e1db928708e2ef758f6f"
+    },
+    "interop/cpp-lite/parrot_lite.h": {
+      "executable": false,
+      "sha256": "beb64669a7c39007bb9afd20d759e8559c451a23f5ca591b0705fc29b88229a3"
+    },
+    "interop/cpp-lite/parrot_poll.cpp": {
+      "executable": false,
+      "sha256": "c0b5e1efc486fe1c1209b987f7b2dae738810732608c5cd70952f42012923c2b"
+    },
+    "interop/cpp-lite/parrot_poll.h": {
+      "executable": false,
+      "sha256": "cb860d3c5385f9656e12e155b63f4eb78e4e3f13d493352bd2d836146961e98a"
+    },
+    "interop/cpp-lite/test_interop.cpp": {
+      "executable": false,
+      "sha256": "e4a83c1b010ba88a72f094057f81ff12a4b881cdb19e26213588c450de200304"
+    },
+    "interop/cpp-lite/test_perf.cpp": {
+      "executable": false,
+      "sha256": "ab5206575b2c3e6bf828fa552d86c1a4c154aea245b530318beb1152fd543a02"
+    },
+    "interop/cpp-lite/test_vectors.cpp": {
+      "executable": false,
+      "sha256": "a79e72c740dd4d6ddd05b5f5a1c0621cdea86f141123782511c0b28096985b1a"
+    },
+    "interop/erlang/parrot_gw.erl": {
+      "executable": false,
+      "sha256": "1c4cb908cfdd9b51c78e00c85a0b511ad138cfb3417e0f07ddd9da9b9683510b"
+    },
+    "interop/erlang/parrot_gw.es": {
+      "executable": false,
+      "sha256": "95199132833cee59dbeb208bdb91003e471cb928a69e11b9046c6878fe901178"
+    },
+    "interop/erlang/test_admin_v2.erl": {
+      "executable": false,
+      "sha256": "747cee09296c500ba05a010632cb10dd4a3988779d2b8b397363fe1d760f4916"
+    },
+    "interop/erlang/test_wire.erl": {
+      "executable": false,
+      "sha256": "5683139e7ef9255ef8ab3ccdb3e1fcca14bb2563580f86ba9cb439925b5abeb9"
+    },
+    "interop/jvm/pom.xml": {
+      "executable": false,
+      "sha256": "b504dfa209513318f14826f37e4fbb4080f0b1c4497ad854605c2d4ba3ec3817"
+    },
+    "interop/jvm/settings-central.xml": {
+      "executable": false,
+      "sha256": "40a0e4e73fadbf14d64027a752b856a2f1372eeb3da4f000a43a0e3d554e00df"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/AdminPort.scala": {
+      "executable": false,
+      "sha256": "9b5aaca35a7322b3f442637f85d614d782e946d2dd82f57ff8b8a0510bb5c4f2"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/AdminV2Codec.scala": {
+      "executable": false,
+      "sha256": "df91e9b487d95a2f98f2c6665361dc4abaa656c8db539073ca62f415e33b6509"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/AdminV2Executor.scala": {
+      "executable": false,
+      "sha256": "0ea8010d61d2eb2388d5306ce6d27c0b745d293186b8bab7c10fa4bec9c09ad5"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/BridgeActor.scala": {
+      "executable": false,
+      "sha256": "c09be211a7f0746dd52e40ae59025a25ce7b3e097ad7557a48a02b24b5eb478f"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/Codec.scala": {
+      "executable": false,
+      "sha256": "b51e07db80d47bb2dbd64a1ee974b5cfe6e249a69ec96f7e758483451ce8c2bc"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/ComponentSpi.scala": {
+      "executable": false,
+      "sha256": "517b38089d3df2dcb63e2bbb1629087d9a3a80b9803d40e969f5fb09528e02e1"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/GatewayMetrics.scala": {
+      "executable": false,
+      "sha256": "72a2922da00cab22ca7496bed4c0a8a065e2478f90bb4e7912eab1b4fee88acc"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/ParrotGatewayMain.scala": {
+      "executable": false,
+      "sha256": "5f10f883268f0ac97060060aa3c92981d69916fba25af9dd6c526a945ecea529"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/ParrotTransportExtension.scala": {
+      "executable": false,
+      "sha256": "0a710ea3f65c1d78748f39645da1870a2a4bfc7b547c580be783a21700d713ee"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/ReceptionistBridge.scala": {
+      "executable": false,
+      "sha256": "3f90fc0ef2ed18f09e9611fb889150c88992b88c35b7ca31ae7ee4eecaf4f325"
+    },
+    "interop/jvm/src/main/scala/parrot/protocol/jvm/WireFrame.scala": {
+      "executable": false,
+      "sha256": "1ef2185abc6d36a6db7f0d730d0332c07815a4bc5290ac997307656eb8661a6b"
+    },
+    "interop/jvm/src/test/scala/parrot/protocol/jvm/BridgeAdminV2Spec.scala": {
+      "executable": false,
+      "sha256": "e56a577f7bfdee860ac70bf496ce6c6df095af109fd93ba4a1a21be7b18ba987"
+    },
+    "interop/jvm/src/test/scala/parrot/protocol/jvm/BridgeEchoSpec.scala": {
+      "executable": false,
+      "sha256": "541137aa248382b302b6749d6ad0265872082e9b8a4f1b0dff70e6eb9efd386d"
+    },
+    "interop/jvm/src/test/scala/parrot/protocol/jvm/ReceptionistBridgeSpec.scala": {
+      "executable": false,
+      "sha256": "21e8df26bf31d5bad3a5590ed6fe4dbaaefa51f13511a03fd5013089f9f59f78"
+    },
+    "interop/jvm/src/test/scala/parrot/protocol/jvm/WireFrameSpec.scala": {
+      "executable": false,
+      "sha256": "4234ccdebca0a4799a385a65be14ce81b72775327d5a498d607dd1e329003dd4"
+    },
+    "interop/python/parrot_protocol/__init__.py": {
+      "executable": false,
+      "sha256": "a5b23004a44a91e2416dd5c6d6da44d417467351b188fa6df3ceec3c65adda20"
+    },
+    "interop/python/parrot_protocol/admin_v2.py": {
+      "executable": false,
+      "sha256": "69090e72ad8830cb4acb2d23277cbe8d148c6ddf898d5634e8fc0d56fc461be6"
+    },
+    "interop/python/parrot_protocol/ray_gw.py": {
+      "executable": false,
+      "sha256": "cbdc416cd8aafddbafc1e5712f7524e9786add164c95b3e9a9d4ac529c79b05f"
+    },
+    "interop/python/parrot_protocol/wire.py": {
+      "executable": false,
+      "sha256": "6098461934ee214c75da0e82221e49877b7d4dc8d715293954286bf67a8e1b6c"
+    },
+    "interop/python/pyproject.toml": {
+      "executable": false,
+      "sha256": "a48181b01d661c447545fa5b049344cdf464136f3fa2a9bf48701e03fc60c904"
+    },
+    "interop/python/tests/test_admin_v2.py": {
+      "executable": false,
+      "sha256": "2ed6817a2805cb6378d45af2c4e02afd01b87d654843521e043db360aad770f6"
+    },
+    "interop/python/tests/test_gw_concurrency.py": {
+      "executable": false,
+      "sha256": "82a4aa67da1a9fc9aa9f753fcfe8fe946041d1b09bf7d45ab68498315e860d91"
+    },
+    "interop/python/tests/test_ray_adapter.py": {
+      "executable": false,
+      "sha256": "16b3f54a8898479c57a1d44d9ac6f71054c9bce33a56c3c77b31383f183df78a"
+    },
+    "interop/python/tests/test_wire_vectors.py": {
+      "executable": false,
+      "sha256": "02d75eb85841f3cf807f5cfc0980d9ba3cbd71cab00bb97fd9d4a55e249298a9"
+    },
+    "interop/typescript-lite/package-lock.json": {
+      "executable": false,
+      "sha256": "7f6386c1a98c8c65f9ad0135e79a0f98f679f3ec45cef27f79a795aa95ccf02f"
+    },
+    "interop/typescript-lite/package.json": {
+      "executable": false,
+      "sha256": "4d42159eea0880c72c12a1f4139ee39b209c3dcf10bb9e655e837f3563d0c53a"
+    },
+    "interop/typescript-lite/scripts/size-gate.mjs": {
+      "executable": false,
+      "sha256": "e0c6bd62637e73fbd755f86bac799f3c74608630405b479f39f72b0373fb60e6"
+    },
+    "interop/typescript-lite/src/index.ts": {
+      "executable": false,
+      "sha256": "7fcd561ce8525b1d1bb23238fb235df047f0ea1333c6ddc1c706b84b4ec1a8dc"
+    },
+    "interop/typescript-lite/src/lite.ts": {
+      "executable": false,
+      "sha256": "5abe5732f4a1aacf1fe88f42c61ced4aacb6e9e501ae38415a33f4d3c8dea88c"
+    },
+    "interop/typescript-lite/src/wire.ts": {
+      "executable": false,
+      "sha256": "01c852889ea6391c741d3220501d62b80cf878b0a53ceae7080dad1815067815"
+    },
+    "interop/typescript-lite/tests/crawler_client.test.mjs": {
+      "executable": false,
+      "sha256": "8063be290f18c2d5b1eb89f2fc10bc61092763d5cf65319c8adaedc7b5383a1d"
+    },
+    "interop/typescript-lite/tests/decoder_perf.test.mjs": {
+      "executable": false,
+      "sha256": "7a95e01c96128405c89d6d1c5b6f619369365ac3c2ea358430d3ece2a743a9d4"
+    },
+    "interop/typescript-lite/tests/frame_vectors.test.mjs": {
+      "executable": false,
+      "sha256": "4b16c253fcbb7f58dc9c2a762a050676f34a97d75d52c701bb0b3c3742499281"
+    },
+    "interop/typescript-lite/tests/interop_with_rust.mjs": {
+      "executable": false,
+      "sha256": "a447f0b592e214324083db8aaf5e95ddc1215443e0d054aed8dd64bfd861e5df"
+    },
+    "interop/typescript-lite/tests/reconnect_idempotent.test.mjs": {
+      "executable": false,
+      "sha256": "3b627afc66ce300b0596dbea52c5682ff7d3c40376994f57a136899bdc71425a"
+    },
+    "interop/typescript-lite/tsconfig.json": {
+      "executable": false,
+      "sha256": "083659e3edea0001c52171b2f84d961ae150db20232ea0cc973b4ce1e6376300"
+    },
+    "parrot.toml.example": {
+      "executable": false,
+      "sha256": "eaf4b3b1458721b3c97a0fb238bd0694a9d1012b9d6549fd6ff377a287c9d317"
+    },
+    "poc/Mx-poc/Cargo.toml": {
+      "executable": false,
+      "sha256": "ed5916edba4071545e94a251b77703bcd5de0578657b52d5932599ddf48efa06"
+    },
+    "poc/Mx-poc/core-lab/Cargo.toml": {
+      "executable": false,
+      "sha256": "5b8ceddd6a5b4f6b63608ae31c202c4ee314dfa2f94e7e5592f34397884cb603"
+    },
+    "poc/Mx-poc/core-lab/api-neutral/Cargo.toml": {
+      "executable": false,
+      "sha256": "8b4d002e4fcc33ca2480ba5f838e50dcf2c3a1a4aa114b8a29b8a2838d244f4a"
+    },
+    "poc/Mx-poc/core-lab/api-neutral/src/engine.rs": {
+      "executable": false,
+      "sha256": "4555a220f622507993d436e3ca3e7bbb4b75378302da77bdd955d84a6650647a"
+    },
+    "poc/Mx-poc/core-lab/api-neutral/src/lib.rs": {
+      "executable": false,
+      "sha256": "52e9717eb315bb579b3b285ab06b41251ba5c000e85f333ab2d44350673ba5d3"
+    },
+    "poc/Mx-poc/core-lab/beam-sched/Cargo.toml": {
+      "executable": false,
+      "sha256": "87b3b2c2c2b550a17a8c0f4c3a5a9418706a3f015296ee80f613f77b2b46d114"
+    },
+    "poc/Mx-poc/core-lab/beam-sched/src/lib.rs": {
+      "executable": false,
+      "sha256": "309c804f6ec61e0952e38176c62a03d03fcbb9ad939ac5920e7dd8b04b8cd72e"
+    },
+    "poc/Mx-poc/core-lab/derive-decouple/Cargo.toml": {
+      "executable": false,
+      "sha256": "bac607341a38b5bf9767d8293c63c1ec2e0e62c2eec0f6970b10b9f6736a04af"
+    },
+    "poc/Mx-poc/core-lab/derive-decouple/src/lib.rs": {
+      "executable": false,
+      "sha256": "4b6b804e4011adf2d36f94d902310948f145f694356abe4fadf41854de15953e"
+    },
+    "poc/Mx-poc/core-lab/derive-decouple/tests/poc1_test.rs": {
+      "executable": false,
+      "sha256": "4a89303f7ab13cf99ca9f58866e24ccf7aa1439143f9a5b8a3c980dafade6681"
+    },
+    "poc/Mx-poc/core-lab/erased-alloc/Cargo.toml": {
+      "executable": false,
+      "sha256": "ab64c79b0333f5d92914eb42da05db512ebb39fd611602503d2cc873a3f2cfd5"
+    },
+    "poc/Mx-poc/core-lab/erased-alloc/src/lib.rs": {
+      "executable": false,
+      "sha256": "1c9c55ee366af1d20a8ea6aa8d938093362e90df62a28f3cf8daf6b9644aa504"
+    },
+    "poc/Mx-poc/core-lab/erased-alloc/tests/alloc_count.rs": {
+      "executable": false,
+      "sha256": "1adab9a894d7d73d13815c021eafabe254945c9958a0884666095fad5865054a"
+    },
+    "poc/Mx-poc/core-lab/supervision/Cargo.toml": {
+      "executable": false,
+      "sha256": "a1ff74115683cb844ffea2d667af6cfc992d9fe9ba1cb094636c8e152841be33"
+    },
+    "poc/Mx-poc/core-lab/supervision/src/lib.rs": {
+      "executable": false,
+      "sha256": "12818d77740616d97d4d1267f93af0500b8bd86df1c54400a6e54510da2693f6"
+    },
+    "poc/Mx-poc/core-lab/typed-static/Cargo.toml": {
+      "executable": false,
+      "sha256": "ced350af040c4a57624532b454e7c5627498db7d5ec262c9d37d384467a1c2ae"
+    },
+    "poc/Mx-poc/core-lab/typed-static/src/lib.rs": {
+      "executable": false,
+      "sha256": "9decfeb9720fdcbeeecc074e543b74085ce282ebd6870057eb2034db17bda0a8"
+    },
+    "poc/Mx-poc/core-lab/typed-static/tests/poc5_test.rs": {
+      "executable": false,
+      "sha256": "d2115d1a93d0661b3a3ca99115b81bd3b077190e09c5894baf8cc4dc4291a58d"
+    },
+    "poc/Mx-poc/src/codec.rs": {
+      "executable": false,
+      "sha256": "41651b37469d0caff44991f1c9566eb38adb0f9678181135af7c3cd1690cfa82"
+    },
+    "poc/Mx-poc/src/frame.rs": {
+      "executable": false,
+      "sha256": "c11bd7136e8e318fdeba83eb6cd5ce99094530845ee62c1d6fe2e30b0e7c324b"
+    },
+    "poc/Mx-poc/src/ingress.rs": {
+      "executable": false,
+      "sha256": "2b16c97f6fe460cb3ca9ada74bc4c5d6e731e92058039886723d109c89fcf668"
+    },
+    "poc/Mx-poc/src/lib.rs": {
+      "executable": false,
+      "sha256": "cf1aa6052417e636ae83d1ae84dd2d1ea6cdc2c1996af5fbee47756e48308bd4"
+    },
+    "poc/Mx-poc/src/messages.rs": {
+      "executable": false,
+      "sha256": "09d6e26dacaf7d46c93215785443fdf557d8c8b708175710c46e1cf8185d48ac"
+    },
+    "poc/Mx-poc/src/node.rs": {
+      "executable": false,
+      "sha256": "104907f4813291c0b08e8e2ff17509fe299234be3b5f8d226eb6cdb5a46c8588"
+    },
+    "poc/Mx-poc/src/remote_ref.rs": {
+      "executable": false,
+      "sha256": "3dd1ffdf031dbc19f30bb7b3b454ca25f389c27e839e38349edf0a1298c09d5c"
+    },
+    "poc/Mx-poc/src/swim.rs": {
+      "executable": false,
+      "sha256": "febb489e0f28f044e9a752c76b32996a7fa7b5883e16de10877ce94b336f63aa"
+    },
+    "poc/Mx-poc/src/transport.rs": {
+      "executable": false,
+      "sha256": "8fe046347b852ec9bab172741f5d2ba17adc486037283e715a493463aef87488"
+    },
+    "poc/Mx-poc/tests/p1_remote_poc.rs": {
+      "executable": false,
+      "sha256": "d0ae5d5cb25d573c0b0be8fb15e462269c6239e67215c56bc55a91c429f5aaa8"
+    },
+    "poc/Mx-poc/tests/p2_cluster_poc.rs": {
+      "executable": false,
+      "sha256": "3209aaf4306300e56558cf6a1621e9fa96f1817140f137ce59102091a977f5f5"
+    },
+    "poc/Mx-poc/tests/p3_akka_interop.rs": {
+      "executable": false,
+      "sha256": "5fe4baac9de97dd5419eca409de5d9ee9008da81c5c799e06aa77cc395ef810f"
+    },
+    "poc/Mx-poc/tests/p3b_ray_interop.rs": {
+      "executable": false,
+      "sha256": "5eca289574c921830b43406ead6ac5ba5646dbc13eed05ec83ec893d7f72a0c8"
+    },
+    "poc/Mx-poc/tests/p3c_erlang_interop.rs": {
+      "executable": false,
+      "sha256": "145059688071ce70ef2df3bb55ba98107a74dbb1644e85c81c9ac688cc5698f1"
+    },
+    "poc/Mx-poc/tests/p4a_dual_engine.rs": {
+      "executable": false,
+      "sha256": "5b4df12081924ecc2a3b2db3f13d23827f3db8661a37d14c8311dbd2502a16db"
+    },
+    "poc/Mx-poc/tests/p4b_gateway_relay.rs": {
+      "executable": false,
+      "sha256": "992f861672ad9b62c7bdf059b2f72ffe5af00ce2e658237d5a57a3510986fad3"
+    },
+    "poc/docs/TECH_DESIGN_CORE_UPGRADE_POC.md": {
+      "executable": false,
+      "sha256": "f6a7554c923146556fcd824645a572ee1968374babb7c41ace845329c2ed6e2a"
+    },
+    "poc/docs/TECH_DESIGN_REMOTE_CLUSTER_FEDERATION_POC.md": {
+      "executable": false,
+      "sha256": "2f5b7538ca7b3f0a7f248d9a9931a53811c7ba1e4b93a9542b1f93ff01610823"
+    },
+    "poc/remote-poc/README.md": {
+      "executable": false,
+      "sha256": "0b2ea01567b9ac683b56d0b6a7c8f9ef7c46386aa08a315419adead4fe9703dd"
+    },
+    "poc/remote-poc/akka-gw/AkkaGw.java": {
+      "executable": false,
+      "sha256": "1d729eb8afc7a19699f7780ab9e75047821a90c89585692b7167d57ac7f24563"
+    },
+    "poc/remote-poc/erlang-gw/erlang_gw.beam": {
+      "executable": false,
+      "sha256": "40758c292a79022ef3c9d18d085f9637a4a05037042411bc05e393934ab7c885"
+    },
+    "poc/remote-poc/erlang-gw/erlang_gw.erl": {
+      "executable": false,
+      "sha256": "9bd290a0ff19759a1505dde97606ced90bd841b3b3b2e2e32353e81d99e4a6db"
+    },
+    "poc/remote-poc/ray-adapter/ray_gw.py": {
+      "executable": false,
+      "sha256": "d67e03f6f75debb45059086704dcb1744a20e79bf3e6420a4e53a43d2508c615"
+    },
+    "scripts/lint_sweep.py": {
+      "executable": false,
+      "sha256": "24c554fd2419b406b0ba6500142dcfd9b4c11d323e6fe6b8699973520811fa64"
+    },
+    "scripts/lint_sweep2.py": {
+      "executable": false,
+      "sha256": "ecb5863f0252bc44f2b7a6d2f836e29c8235b9e2f79197fbbbce47da6b77e0de"
+    },
+    "scripts/macro_lint.sh": {
+      "executable": true,
+      "sha256": "2979a15265b19394121fbeeb2b672727fbeef1d8f1af799c90211b05e24e7866"
+    },
+    "scripts/miri.sh": {
+      "executable": true,
+      "sha256": "d2474ae09913d3f23acf1b6b9dfbaa979c9cceb82d9ec6a75f4b66c9f3dd3aed"
+    },
+    "scripts/restore_test_imports.py": {
+      "executable": false,
+      "sha256": "25126af2aa7d186b7b63b06b86be81cac0b450b5724b167b5675947869f2ddcc"
+    },
+    "scripts/run_tests.sh": {
+      "executable": true,
+      "sha256": "9a6fde93c142f2bd4d41772f954dacf3db91ae2fc081f6235d6dfc63fe3de3af"
+    },
+    "scripts/with_timeout.sh": {
+      "executable": true,
+      "sha256": "bb381030664c239ef82cfba8293a742c010661e0c21d24876445d2d1b0355af9"
+    },
+    "tarpaulin-report.html": {
+      "executable": false,
+      "sha256": "21aec950126d31bcdf4e7bcf8d641712e6e68a54052ea695fb618bcdb04f4cd2"
+    },
+    "tools/federation-lab/Cargo.toml": {
+      "executable": false,
+      "sha256": "653a97171a5108f8c86dccbec4774f37f7de0a19c44191b9e2e386259887aa51"
+    },
+    "tools/federation-lab/src/composegen.rs": {
+      "executable": false,
+      "sha256": "3ba59ab8dff60d668a85efafafd8248a1f4d4efc22145893e13ffe15ce2daae7"
+    },
+    "tools/federation-lab/src/lib.rs": {
+      "executable": false,
+      "sha256": "33958b8177a078c1cdb9665048d2821c2090b0b5e2eac0fac79664bb34fd0bef"
+    },
+    "tools/federation-lab/src/main.rs": {
+      "executable": false,
+      "sha256": "4a6224ecf799ea338a8f04488b5357fd055429675d417aab4042f063c97d2f5d"
+    },
+    "tools/federation-lab/src/twin.rs": {
+      "executable": false,
+      "sha256": "470d8f2a9452f37655da1d3306ee3a4514e8b0d698221b22bb5d3c81ea8a1273"
+    },
+    "tools/federation-lab/src/twin_app.rs": {
+      "executable": false,
+      "sha256": "67ecabff85d32fb90f3f6030f1e7aa77d61a25e379ef3ce580eefc7baa4be28d"
+    },
+    "tools/parrot-obs/Cargo.toml": {
+      "executable": false,
+      "sha256": "b31b6b1668fc1f227628ea8072f23c6a714ca936a48cc86e701f1d16a8c4bd54"
+    },
+    "tools/parrot-obs/gw.sh": {
+      "executable": true,
+      "sha256": "18bedf9a4db78aaf9851181eb0b4da4721eb1a46303384d2f71afa983cc28a03"
+    },
+    "tools/parrot-obs/src/main.rs": {
+      "executable": false,
+      "sha256": "5fc66b35b8ae7a6e591cabe7e9ee8939e9169646c6fd57fe40e4a95e7c7c47df"
+    },
+    "tools/parrot-obs/tests/e2e.sh": {
+      "executable": true,
+      "sha256": "d455e7007f7278b00c13a01706e04a69c4e03b8796c588ab6bd208181e5b25ff"
+    }
+  },
+  "snapshot": "/Users/biluochun/.codex/worktrees/parrot-validation/parrot",
+  "source": "/Users/biluochun/work/error.d/library/parrot"
+}

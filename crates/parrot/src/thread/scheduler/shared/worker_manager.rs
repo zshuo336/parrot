@@ -89,13 +89,13 @@ impl WorkerManager {
         self.worker_statuses.lock().unwrap().len()
     }
 
-    /// Number of workers currently idle (by status code 0)
+    /// Workers with poll capacity (idle or owning only suspended futures).
     pub fn idle_worker_count(&self) -> usize {
         self.worker_statuses
             .lock()
             .unwrap()
             .iter()
-            .filter(|s| s.load(Ordering::Relaxed) == 0)
+            .filter(|s| matches!(s.load(Ordering::Relaxed), 0 | 4))
             .count()
     }
 }

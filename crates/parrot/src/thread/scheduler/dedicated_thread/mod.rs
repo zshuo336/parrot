@@ -8,6 +8,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::runtime::Handle;
 use tracing::{debug, error};
 
@@ -18,6 +19,7 @@ use crate::thread::context::ThreadContext;
 use crate::thread::error::SystemError;
 use crate::thread::mailbox::Mailbox;
 use crate::thread::processor::ProcessorInterface;
+use crate::thread::scheduler::StopHookRequest;
 use crate::thread::scheduler::ThreadScheduler;
 
 /// Configuration for the dedicated thread scheduler.
@@ -132,9 +134,21 @@ impl DedicatedThreadScheduler {
             return Err(SystemError::ShuttingDown);
         }
 
-        let mut workers = self.workers.lock().unwrap();
+        self.reap_stopped();
 
-        if workers.contains_key(path) {
+        let mut workers = self.workers.lock().unwrap();
+        // Shutdown snapshots this same map after setting the flag. Recheck
+        // under its lock so a concurrent admission cannot escape that snapshot.
+        if self.is_shutting_down.load(Ordering::Acquire) {
+            return Err(SystemError::ShuttingDown);
+        }
+
+        if let Some(worker) = workers.get(path) {
+            if worker.shutdown_flag.load(Ordering::Acquire) {
+                return Err(SystemError::WorkerStateError(format!(
+                    "dedicated actor {path} is still exiting"
+                )));
+            }
             return Ok(()); // already scheduled (idempotent)
         }
 
@@ -166,44 +180,128 @@ impl DedicatedThreadScheduler {
 
     /// Deschedule an actor from its dedicated thread (stops the thread).
     pub async fn deschedule(&self, path: &str) -> Result<(), SystemError> {
-        let worker = {
-            let mut workers = self.workers.lock().unwrap();
-            workers.remove(path)
-        };
+        self.deschedule_until(path, tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    }
+
+    pub(crate) async fn deschedule_until(
+        &self,
+        path: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SystemError> {
+        let worker = self.workers.lock().unwrap().get(path).cloned();
 
         match worker {
-            Some(w) => w.stop().await,
+            Some(worker) => {
+                worker.stop_until(deadline).await?;
+                self.remove_finished(path, &worker);
+                Ok(())
+            }
             None => Err(SystemError::ActorNotFound(path.to_string())),
+        }
+    }
+
+    pub(crate) fn enqueue_stop_hook(&self, request: StopHookRequest) -> Result<(), SystemError> {
+        let worker = self
+            .workers
+            .lock()
+            .unwrap()
+            .get(&request.path)
+            .cloned()
+            .ok_or_else(|| SystemError::ActorNotFound(request.path.clone()))?;
+        if !Arc::ptr_eq(&worker.processor, &request.processor) {
+            return Err(SystemError::ActorNotFound(request.path));
+        }
+        if worker.shutdown_flag.load(Ordering::Acquire) {
+            return Err(SystemError::ShuttingDown);
+        }
+        worker
+            .stop_tx
+            .send(request)
+            .map_err(|_| SystemError::ShutdownError("dedicated control channel closed".into()))
+    }
+
+    fn remove_finished(&self, path: &str, worker: &Arc<DedicatedWorker>) {
+        let removed = {
+            let mut workers = self.workers.lock().unwrap();
+            if workers
+                .get(path)
+                .is_some_and(|current| Arc::ptr_eq(current, worker))
+            {
+                workers.remove(path)
+            } else {
+                None
+            }
+        };
+        // Releasing actor resources must not hold the scheduler registry lock.
+        drop(removed);
+    }
+
+    /// Timed-out threads still consume capacity until the OS thread exits.
+    /// Retain their join handles so later admission/shutdown can reap them.
+    fn reap_stopped(&self) {
+        let stopping: Vec<_> = self
+            .workers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, worker)| worker.shutdown_flag.load(Ordering::Acquire))
+            .map(|(path, worker)| (path.clone(), worker.clone()))
+            .collect();
+        for (path, worker) in stopping {
+            if worker.join_if_finished() {
+                self.remove_finished(&path, &worker);
+            }
         }
     }
 
     /// Check if an actor is scheduled.
     pub fn is_scheduled(&self, path: &str) -> bool {
-        self.workers.lock().unwrap().contains_key(path)
+        self.workers
+            .lock()
+            .unwrap()
+            .get(path)
+            .is_some_and(|worker| !worker.shutdown_flag.load(Ordering::Acquire))
     }
 
     /// Shutdown the scheduler and all dedicated threads.
     pub async fn shutdown(&self) -> Result<(), SystemError> {
+        self.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    }
+
+    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> Result<(), SystemError> {
         self.status.store(2, Ordering::SeqCst); // ShuttingDown
         self.is_shutting_down.store(true, Ordering::SeqCst);
 
         let workers: Vec<Arc<DedicatedWorker>> = {
-            let mut workers = self.workers.lock().unwrap();
-            workers.drain().map(|(_, w)| w).collect()
+            let workers = self.workers.lock().unwrap();
+            workers.values().cloned().collect()
         };
 
+        for worker in &workers {
+            worker.request_stop();
+        }
+        let mut failure = None;
         for worker in workers {
-            if let Err(e) = worker.stop().await {
-                error!("Failed to stop dedicated worker {}: {}", worker.path, e);
+            if let Err(error) = worker.stop_until(deadline).await {
+                failure = Some(error);
+            } else {
+                self.remove_finished(&worker.path, &worker);
             }
         }
-
-        self.status.store(3, Ordering::SeqCst); // Shutdown
-        Ok(())
+        if failure.is_none() {
+            self.status.store(3, Ordering::SeqCst); // Shutdown
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Current number of dedicated workers.
     pub fn worker_count(&self) -> usize {
+        self.reap_stopped();
         self.workers.lock().unwrap().len()
     }
 
@@ -314,12 +412,15 @@ struct DedicatedWorker {
 
     /// Shutdown flag
     shutdown_flag: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 
     /// Worker state
     state: Arc<AtomicUsize>,
 
     /// Join slot for the OS thread
     join_slot: Mutex<Option<std::thread::JoinHandle<()>>>,
+    stop_tx: flume::Sender<StopHookRequest>,
+    stop_rx: Mutex<Option<flume::Receiver<StopHookRequest>>>,
 }
 
 impl std::fmt::Debug for DedicatedWorker {
@@ -342,6 +443,7 @@ impl DedicatedWorker {
         config: ThreadActorConfig,
         batch_size: usize,
     ) -> Self {
+        let (stop_tx, stop_rx) = flume::unbounded();
         Self {
             path,
             mailbox,
@@ -349,17 +451,27 @@ impl DedicatedWorker {
             config,
             batch_size,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             state: Arc::new(AtomicUsize::new(WorkerState::Initializing as usize)),
             join_slot: Mutex::new(None),
+            stop_tx,
+            stop_rx: Mutex::new(Some(stop_rx)),
         }
     }
 
     /// Spawn the dedicated OS thread.
     fn start(&self) -> Result<(), String> {
+        let stop_rx = self
+            .stop_rx
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| "dedicated worker already started".to_owned())?;
         let path = self.path.clone();
         let mailbox = self.mailbox.clone();
         let processor = self.processor.clone();
         let shutdown_flag = self.shutdown_flag.clone();
+        let shutdown_notify = self.shutdown_notify.clone();
         let state = self.state.clone();
         let batch_size = self.batch_size;
         let idle_sleep = self
@@ -390,58 +502,84 @@ impl DedicatedWorker {
                 state.store(WorkerState::Idle as usize, Ordering::Relaxed);
 
                 rt.block_on(async move {
-                    // Initialize the actor before processing messages.
-                    if let Err(e) = processor.clone().initialize_and_start_erased().await {
-                        error!("Failed to initialize actor {}: {}", path, e);
-                        state.store(WorkerState::Error as usize, Ordering::Relaxed);
-                        return;
-                    }
-
-                    while !shutdown_flag.load(Ordering::Relaxed) {
-                        if mailbox.is_empty().await {
-                            tokio::time::sleep(idle_sleep).await;
-                            continue;
+                    if shutdown_flag.load(Ordering::Acquire) { return; }
+                    let work = async {
+                        // Initialize the actor before processing messages.
+                        if let Err(e) = processor.clone().initialize_and_start_erased().await {
+                            error!("Failed to initialize actor {}: {}", path, e);
+                            state.store(WorkerState::Error as usize, Ordering::Relaxed);
+                            processor.notify_system_panic(e.to_string());
+                            return;
                         }
 
-                        state.store(WorkerState::Processing as usize, Ordering::Relaxed);
-
-                        // Batch under panic isolation (spawned task catches panics).
-                        let task = tokio::spawn({
-                            let processor = processor.clone();
-                            let mailbox = mailbox.clone();
-                            async move {
-                                processor
-                                    .process_batch_erased(mailbox, batch_size, yield_each)
-                                    .await
+                        while !shutdown_flag.load(Ordering::Relaxed) {
+                            if mailbox.is_empty().await {
+                                tokio::time::sleep(idle_sleep).await;
+                                continue;
                             }
-                        });
 
-                        match task.await {
-                            Ok(Ok((processed, errors))) => {
-                                if errors > 0 {
-                                    debug!(
-                                        "Dedicated worker {}: processed {} messages with {} errors",
-                                        path, processed, errors
-                                    );
+                            state.store(WorkerState::Processing as usize, Ordering::Relaxed);
+
+                            // Batch under panic isolation (spawned task catches panics).
+                            let task = tokio::spawn({
+                                let processor = processor.clone();
+                                let mailbox = mailbox.clone();
+                                async move {
+                                    processor
+                                        .process_batch_erased(mailbox, batch_size, yield_each)
+                                        .await
+                                }
+                            });
+
+                            match task.await {
+                                Ok(Ok((processed, errors))) => {
+                                    if errors > 0 {
+                                        debug!(
+                                            "Dedicated worker {}: processed {} messages with {} errors",
+                                            path, processed, errors
+                                        );
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    error!("Dedicated worker {} batch failed: {}", path, e);
+                                    processor.notify_system_panic(e.to_string());
+                                    break;
+                                }
+                                Err(join_err) => {
+                                    error!("Dedicated worker {} actor panicked: {}", path, join_err);
+                                    state.store(WorkerState::Error as usize, Ordering::Relaxed);
+                                    shutdown_flag.store(true, Ordering::Relaxed);
+                                    processor.notify_system_panic(join_err.to_string());
                                 }
                             }
-                            Ok(Err(e)) => {
-                                error!("Dedicated worker {} batch failed: {}", path, e);
-                            }
-                            Err(join_err) => {
-                                error!("Dedicated worker {} actor panicked: {}", path, join_err);
-                                state.store(WorkerState::Error as usize, Ordering::Relaxed);
-                                shutdown_flag.store(true, Ordering::Relaxed);
+
+                            if state.load(Ordering::Relaxed) != WorkerState::Error as usize {
+                                state.store(WorkerState::Idle as usize, Ordering::Relaxed);
                             }
                         }
-
-                        if state.load(Ordering::Relaxed) != WorkerState::Error as usize {
-                            state.store(WorkerState::Idle as usize, Ordering::Relaxed);
+                    };
+                    let work = std::panic::AssertUnwindSafe(work).catch_unwind();
+                    tokio::pin!(work);
+                    let mut stopping = FuturesUnordered::new();
+                    loop {
+                        if shutdown_flag.load(Ordering::Acquire) { break; }
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_notify.notified() => break,
+                            _ = processor.processing_cancelled() => break,
+                            request = stop_rx.recv_async() => {
+                                let Ok(request) = request else { break };
+                                stopping.push(request.run());
+                            }
+                            _ = stopping.next(), if !stopping.is_empty() => {}
+                            result = &mut work => {
+                                if result.is_err() {
+                                    processor.notify_system_panic("dedicated actor initialization panicked".into());
+                                }
+                                break;
+                            }
                         }
                     }
-
-                    // Graceful stop.
-                    let _ = processor.clone().stop_erased().await;
                     state.store(WorkerState::ShuttingDown as usize, Ordering::Relaxed);
                 });
             })
@@ -451,19 +589,40 @@ impl DedicatedWorker {
         Ok(())
     }
 
-    /// Stop the worker and join the thread.
-    async fn stop(&self) -> Result<(), SystemError> {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
+    fn request_stop(&self) {
+        self.shutdown_flag.store(true, Ordering::Release);
+        self.shutdown_notify.notify_one();
+    }
 
-        let handle = self.join_slot.lock().unwrap().take();
-        if let Some(handle) = handle {
-            // The dedicated thread runs its own runtime; join from blocking pool.
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = handle.join();
-            })
+    async fn stop_until(&self, deadline: tokio::time::Instant) -> Result<(), SystemError> {
+        self.request_stop();
+        loop {
+            if self.join_if_finished() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SystemError::Timeout(format!(
+                    "dedicated actor {} did not exit before the shutdown deadline",
+                    self.path
+                )));
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(1)),
+            )
             .await;
         }
-        Ok(())
+    }
+
+    fn join_if_finished(&self) -> bool {
+        let mut slot = self.join_slot.lock().unwrap();
+        match slot.as_ref() {
+            None => true,
+            Some(handle) if handle.is_finished() => {
+                let _ = slot.take().unwrap().join();
+                true
+            }
+            _ => false,
+        }
     }
 }
 

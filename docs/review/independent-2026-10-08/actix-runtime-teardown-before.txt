@@ -1,0 +1,38 @@
+   Compiling parrot v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.85s
+     Running tests/test_actix_dynamic_lifecycle.rs (target/debug/deps/test_actix_dynamic_lifecycle-85d53ca71e78e9e6)
+
+running 1 test
+
+thread 'host_runtime_teardown_does_not_construct_hook_without_a_reactor' (2517065) panicked at crates/parrot/tests/test_actix_dynamic_lifecycle.rs:527:9:
+isolated teardown regression failed:
+
+running 1 test
+test host_runtime_teardown_does_not_construct_hook_without_a_reactor ... FAILED
+
+failures:
+
+failures:
+    host_runtime_teardown_does_not_construct_hook_without_a_reactor
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+
+
+
+thread 'host_runtime_teardown_does_not_construct_hook_without_a_reactor' (2517067) panicked at crates/parrot/tests/test_actix_dynamic_lifecycle.rs:562:5:
+assertion `left == right` failed: teardown must not hide timer-construction panic behind catch_unwind
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test host_runtime_teardown_does_not_construct_hook_without_a_reactor ... FAILED
+
+failures:
+
+failures:
+    host_runtime_teardown_does_not_construct_hook_without_a_reactor
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p parrot --test test_actix_dynamic_lifecycle`

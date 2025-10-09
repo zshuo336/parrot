@@ -69,6 +69,7 @@ pub struct ThreadSection {
     pub shared_queue_capacity: Option<usize>,
     pub max_dedicated_threads: Option<usize>,
     pub default_mailbox_capacity: Option<usize>,
+    pub max_context_tasks: Option<usize>,
     pub default_ask_timeout_ms: Option<u64>,
     pub shutdown_timeout_ms: Option<u64>,
 }
@@ -151,6 +152,9 @@ impl Defaults {
     pub fn shared_queue_capacity() -> usize {
         10000
     }
+    pub const fn max_context_tasks() -> usize {
+        1024
+    }
     pub fn default_mailbox_capacity() -> usize {
         1024
     }
@@ -200,6 +204,7 @@ pub struct ThreadResolved {
     pub shared_queue_capacity: usize,
     pub max_dedicated_threads: usize,
     pub default_mailbox_capacity: usize,
+    pub max_context_tasks: usize,
     pub default_ask_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
 }
@@ -342,6 +347,11 @@ impl ParrotConfig {
                 th,
             );
             merge_opt(
+                &mut self.thread.max_context_tasks,
+                "thread.max_context_tasks",
+                th,
+            );
+            merge_opt(
                 &mut self.thread.default_ask_timeout_ms,
                 "thread.default_ask_timeout_ms",
                 th,
@@ -362,6 +372,7 @@ impl ParrotConfig {
                     "shared_queue_capacity",
                     "max_dedicated_threads",
                     "default_mailbox_capacity",
+                    "max_context_tasks",
                     "default_ask_timeout_ms",
                     "shutdown_timeout_ms",
                 ],
@@ -548,6 +559,10 @@ impl ParrotConfig {
                     .thread
                     .default_mailbox_capacity
                     .unwrap_or_else(Defaults::default_mailbox_capacity),
+                max_context_tasks: self
+                    .thread
+                    .max_context_tasks
+                    .unwrap_or_else(Defaults::max_context_tasks),
                 default_ask_timeout_ms: self
                     .thread
                     .default_ask_timeout_ms
@@ -617,6 +632,10 @@ impl ParrotConfig {
         m.insert(
             "thread.shared_queue_capacity",
             "共享调度队列容量（默认 10000）",
+        );
+        m.insert(
+            "thread.max_context_tasks",
+            "每个 actor 的待完成定时任务上限（默认 1024；0 禁用）",
         );
         m.insert("thread.max_dedicated_threads", "专用线程上限（默认 32）");
         m.insert(
@@ -688,6 +707,10 @@ impl ParrotConfig {
     }
     pub fn thread_default_mailbox_capacity(mut self, v: usize) -> Self {
         self.thread.default_mailbox_capacity = Some(v);
+        self
+    }
+    pub fn thread_max_context_tasks(mut self, v: usize) -> Self {
+        self.thread.max_context_tasks = Some(v);
         self
     }
     pub fn thread_default_ask_timeout_ms(mut self, v: u64) -> Self {
@@ -769,26 +792,34 @@ pub enum ConfigError {
 // ============================================================================
 
 /// 环境变量展开：`${VAR}` / `${VAR:-default}`（K8s ConfigMap 风格注入）。
+/// 只扫描原始配置；变量值和默认值按字面量插入，不递归解释。
 fn expand_env(raw: &str) -> String {
-    let mut out = raw.to_string();
-    // 简单扫描——配置文件规模小，重复扫描可接受；无 '}' 收尾的残缺
-    // `${` 保持原样（提示配置书写错误，不静默吞）
-    while let Some(start) = out.find("${") {
-        let Some(end_rel) = out[start..].find('}') else {
+    expand_env_with(raw, |name| std::env::var(name).ok())
+}
+
+fn expand_env_with(raw: &str, mut lookup: impl FnMut(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut remaining = raw;
+    while let Some(start) = remaining.find("${") {
+        out.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+        let Some(end) = remaining.find('}') else {
             break;
         };
-        let end = start + end_rel;
-        let inner = &out[start + 2..end];
+        let inner = &remaining[2..end];
         let (name, default) = match inner.split_once(":-") {
             Some((n, d)) => (n, Some(d)),
             None => (inner, None),
         };
-        let val = std::env::var(name)
-            .ok()
+        let val = lookup(name)
+            .filter(|value| !value.is_empty())
             .or_else(|| default.map(String::from));
-        let replacement = val.unwrap_or_default();
-        out.replace_range(start..=end, &replacement);
+        if let Some(value) = val {
+            out.push_str(&value);
+        }
+        remaining = &remaining[end + 1..];
     }
+    out.push_str(remaining);
     out
 }
 
@@ -836,6 +867,63 @@ fn warn_unknown(table: &toml::map::Map<String, toml::Value>, section: &str, know
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_values_are_literal_even_when_self_referential() {
+        let mut lookups = Vec::new();
+        let expanded = expand_env_with("前:${SELF}|${A}|${B}:后", |name| {
+            lookups.push(name.to_owned());
+            assert!(
+                lookups.len() <= 3,
+                "replacement values must not be rescanned"
+            );
+            Some(
+                match name {
+                    "SELF" => "${SELF}",
+                    "A" => "${B}",
+                    "B" => "${A}",
+                    _ => unreachable!(),
+                }
+                .into(),
+            )
+        });
+        assert_eq!(expanded, "前:${SELF}|${B}|${A}:后");
+        assert_eq!(lookups, ["SELF", "A", "B"]);
+    }
+
+    #[test]
+    fn env_defaults_cover_missing_and_empty_but_preserve_nonempty_values() {
+        let expanded = expand_env_with(
+            "${MISSING:-后备}:${EMPTY:-empty}:${SET:-unused}:${MISSING}:${SET}:${MISSING:-a:-b}",
+            |name| match name {
+                "SET" => Some("零".into()),
+                "EMPTY" => Some(String::new()),
+                _ => None,
+            },
+        );
+        assert_eq!(expanded, "后备:empty:零::零:a:-b");
+    }
+
+    #[test]
+    fn env_expansion_preserves_incomplete_tokens_and_literal_dollars() {
+        assert_eq!(
+            expand_env_with("前 $x ${OK} 后 ${unfinished", |_| Some("值".into())),
+            "前 $x 值 后 ${unfinished"
+        );
+        assert_eq!(
+            expand_env_with("no placeholders", |_| unreachable!()),
+            "no placeholders"
+        );
+        let mut lookups = 0;
+        assert_eq!(
+            expand_env_with("${X}", |_| {
+                lookups += 1;
+                assert_eq!(lookups, 1, "replacement values must not be rescanned");
+                Some("$${unfinished}".into())
+            }),
+            "$${unfinished}"
+        );
+    }
 
     // =========================================================================
     // 三层优先级（用户契约——每个用例锁定一行契约）
@@ -975,7 +1063,37 @@ mod tests {
 
     #[test]
     fn e1_env_expansion() {
-        std::env::set_var("PCFG_TEST_NODE", "env-node-42");
+        // Set the environment before the child test harness starts. Mutating
+        // process-global environment in a parallel test harness is unsound on
+        // platforms whose environment APIs are not thread-safe.
+        const CHILD: &str = "PCFG_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::e1_env_expansion", "--nocapture"])
+                .env(CHILD, "1")
+                .env("PCFG_TEST_NODE", "env-node-42")
+                .env("PCFG_TEST_EMPTY", "")
+                .env("PCFG_TEST_LOOP", "${PCFG_TEST_LOOP}")
+                .env_remove("PCFG_TEST_UNSET")
+                .spawn()
+                .unwrap();
+            // Guard an accidental return of the original infinite loop.
+            // Include process startup allowance for instrumented/debug hosts.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("configuration expansion subprocess did not terminate");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            return;
+        }
         let tmp = std::env::temp_dir().join(format!("pcfg_e1_{}.toml", std::process::id()));
         std::fs::write(
             &tmp,
@@ -987,10 +1105,20 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        std::fs::remove_file(&tmp).ok();
-        std::env::remove_var("PCFG_TEST_NODE");
         assert_eq!(r.remote.node.node_id.as_deref(), Some("env-node-42"));
         assert_eq!(r.remote.node.bind.as_deref(), Some("127.0.0.1:9801"));
+
+        std::fs::write(&tmp,
+            "[remote.node]\nnode_id = \"${PCFG_TEST_LOOP}\"\nbind = \"${PCFG_TEST_EMPTY:-127.0.0.1:9802}\"\n",
+        ).unwrap();
+        let r = ParrotConfig::builder()
+            .load_file(&tmp)
+            .unwrap()
+            .build()
+            .unwrap();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(r.remote.node.node_id.as_deref(), Some("${PCFG_TEST_LOOP}"));
+        assert_eq!(r.remote.node.bind.as_deref(), Some("127.0.0.1:9802"));
     }
 
     // =========================================================================

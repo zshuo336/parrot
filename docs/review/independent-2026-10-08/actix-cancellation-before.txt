@@ -1,0 +1,25 @@
+   Compiling parrot-api-derive v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot-api-derive)
+   Compiling parrot-api v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot-api)
+   Compiling parrot-config v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot-config)
+   Compiling parrot v0.1.0 (/var/folders/wj/nnsm280s4975xmwl27_nv75r0000gn/T/parrot-actix-before-fb78jbm7)
+   Compiling parrot-remote v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.18s
+     Running tests/test_actix_owned_dispatch.rs (target/debug/deps/test_actix_owned_dispatch-bd25424ea378c7ae)
+
+running 1 test
+
+thread 'arbiter_cancellation_drops_handler_before_its_actor_storage' (2114129) panicked at tests/test_actix_owned_dispatch.rs:101:9:
+assertion `left == right` failed
+  left: ["actor", "handler"]
+ right: ["handler", "actor"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test arbiter_cancellation_drops_handler_before_its_actor_storage ... FAILED
+
+failures:
+
+failures:
+    arbiter_cancellation_drops_handler_before_its_actor_storage
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test test_actix_owned_dispatch`

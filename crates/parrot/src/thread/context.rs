@@ -30,6 +30,10 @@ pub type WeakSystemRef = Weak<crate::thread::system::ThreadActorSystem>;
 /// - The actor system
 /// - Actor configuration and lifecycle management
 /// - Methods for spawning child actors
+///
+/// `ActorContext::stop` initiates this actor's shutdown. Its own cleanup hook
+/// runs after the current handler releases the actor; callers outside the
+/// actor can await `ActorRef::stop` to observe lifecycle completion.
 #[derive(Debug)]
 pub struct ThreadContext<A: Actor + Send + Sync + 'static> {
     /// Weak reference to the actor system
@@ -37,9 +41,13 @@ pub struct ThreadContext<A: Actor + Send + Sync + 'static> {
 
     /// Handle to the Tokio runtime
     runtime_handle: Handle,
+    tasks: Arc<crate::context_tasks::ContextTasks>,
 
     /// Actor's own reference
     self_ref: Option<BoxedActorRef>,
+
+    /// This generation's mailbox, used by non-blocking self-stop requests.
+    mailbox: Option<crate::thread::mailbox::WeakMailboxRef>,
 
     /// Reference to parent actor
     parent_ref: Option<BoxedActorRef>,
@@ -85,10 +93,17 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         parent_ref: Option<BoxedActorRef>,
         supervisor_strategy: SupervisorStrategy,
     ) -> Self {
+        let limit = system
+            .upgrade()
+            .map_or(crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS, |system| {
+                system.config().max_context_tasks
+            });
         Self {
+            tasks: crate::context_tasks::ContextTasks::new(limit),
             system,
             runtime_handle,
             self_ref: None,
+            mailbox: None,
             parent_ref,
             children_refs: None,
             path,
@@ -106,10 +121,17 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
 
     /// Creates a test context bound to a specific system weak reference.
     pub fn new_for_test_with(path: &str, system: WeakSystemRef) -> Self {
+        let limit = system
+            .upgrade()
+            .map_or(crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS, |system| {
+                system.config().max_context_tasks
+            });
         Self {
+            tasks: crate::context_tasks::ContextTasks::new(limit),
             system,
             runtime_handle: Handle::current(),
             self_ref: None,
+            mailbox: None,
             parent_ref: None,
             children_refs: None,
             path: ActorPath::for_test(path),
@@ -120,9 +142,39 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         }
     }
 
+    pub(crate) fn tasks(&self) -> Arc<crate::context_tasks::ContextTasks> {
+        self.tasks.clone()
+    }
+
+    fn spawn_context_task(&self, task: crate::context_tasks::OwnedTask) {
+        let slots = self
+            .system()
+            .map(|system| system.typed_slots.clone())
+            .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(1)));
+        self.runtime_handle.spawn(async move {
+            if let Ok(permit) = slots.clone().acquire_owned().await {
+                let _ = crate::thread::scheduler::shared::poll_isolated(
+                    task,
+                    permit,
+                    slots,
+                    Arc::new(tokio::sync::Notify::new()),
+                )
+                .await;
+            }
+        });
+    }
+
     /// Sets the self reference.
     pub fn set_self_ref(&mut self, actor_ref: BoxedActorRef) {
         self.self_ref = Some(actor_ref);
+    }
+
+    pub(crate) fn set_mailbox(&mut self, mailbox: crate::thread::mailbox::WeakMailboxRef) {
+        self.mailbox = Some(mailbox);
+    }
+
+    pub(crate) fn generation_mailbox(&self) -> Option<crate::thread::mailbox::WeakMailboxRef> {
+        self.mailbox.clone()
     }
 
     /// get self reference.
@@ -248,8 +300,20 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
 
     fn stop<'a>(&'a mut self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
+            self.tasks.close();
             if let Some(self_ref) = &self.self_ref {
-                self_ref.stop().await?;
+                if let Some(system) = self.system() {
+                    let mailbox: Arc<dyn crate::thread::mailbox::Mailbox> = self
+                        .mailbox
+                        .as_ref()
+                        .and_then(|mailbox| mailbox.upgrade())
+                        .ok_or(ActorError::Stopped)?;
+                    // The actor/context lock is held by this handler. Accept
+                    // the stop now and let the hook run after it returns.
+                    system.request_stop(&self.path.path, Some(&mailbox))?;
+                } else {
+                    self_ref.stop().await?;
+                }
 
                 // Stop all children
                 if let Some(children) = &self.children_refs {
@@ -282,13 +346,10 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         target: BoxedActorRef,
         msg: BoxedMessage,
     ) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
-            target.send(msg).await?;
-            Ok(())
-        })
+        Box::pin(async move { target.deliver(msg).await })
     }
 
-    /// Ask a target actor for a response using the universal ask envelope.
+    /// Ask through the target reference, which owns engine-specific framing.
     fn ask<'a>(
         &'a self,
         target: BoxedActorRef,
@@ -300,21 +361,7 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
                 .unwrap_or_else(|| Duration::from_secs(5))
         });
 
-        Box::pin(async move {
-            let (envelope, reply_rx) = crate::thread::envelope::AskEnvelope::new(msg);
-            target.send(Box::new(envelope) as BoxedMessage).await?;
-
-            match tokio::time::timeout(timeout_duration, reply_rx).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(ActorError::ReplyChannelError(
-                    "Reply channel closed for ask".to_string(),
-                )),
-                Err(_) => Err(ActorError::TimeoutDetail(format!(
-                    "Ask timed out after {}ms",
-                    timeout_duration.as_millis()
-                ))),
-            }
-        })
+        Box::pin(async move { target.send_with_timeout(msg, Some(timeout_duration)).await })
     }
 
     fn schedule_once<'a>(
@@ -323,16 +370,9 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         msg: BoxedMessage,
         delay: Duration,
     ) -> BoxedFuture<'a, ActorResult<()>> {
-        let runtime = self.runtime_handle.clone();
-
         Box::pin(async move {
-            let target_clone = target.clone_boxed();
-
-            runtime.spawn(async move {
-                tokio::time::sleep(delay).await;
-                let _ = target_clone.send(msg).await;
-            });
-
+            let task = self.tasks.once(target, msg, delay)?;
+            self.spawn_context_task(task);
             Ok(())
         })
     }
@@ -344,29 +384,9 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         initial_delay: Duration,
         interval: Duration,
     ) -> BoxedFuture<'a, ActorResult<()>> {
-        let runtime = self.runtime_handle.clone();
-
         Box::pin(async move {
-            let target_clone = target.clone_boxed();
-
-            runtime.spawn(async move {
-                tokio::time::sleep(initial_delay).await;
-
-                let _ = target_clone.send(msg.clone().into_boxed()).await;
-
-                let mut interval_timer = tokio::time::interval(interval);
-                interval_timer.tick().await; // first tick fires immediately; skip duplicate
-
-                loop {
-                    interval_timer.tick().await;
-
-                    let target_copy = target_clone.clone_boxed();
-                    if target_copy.send(msg.clone().into_boxed()).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
+            let task = self.tasks.periodic(target, msg, initial_delay, interval)?;
+            self.spawn_context_task(task);
             Ok(())
         })
     }

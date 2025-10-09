@@ -38,6 +38,8 @@
 
 ## 3. 配置模式全表（键 / 类型 / 默认 / 作用点）
 
+2026-10-09 新增 `thread.max_context_tasks`（usize，默认 1024；0 禁止注册定时任务），经 `ThreadActorSystemConfig::from_resolved` 限制每个 actor 的 Context 一次性和周期任务总数。代码层可用 `thread_max_context_tasks` 覆盖文件；超限注册返回错误，任务完成释放名额。Actix 对应 `ActixSystemSettings.max_context_tasks`，默认值与语义相同；此 Actix 设置当前由构造参数传入，不声称已接入 TOML。`test_context_timer_contract` 验证文件与 builder 值对实际 actor 准入的影响。
+
 | 键 | 类型 | 默认 | 作用点（最终消费处） |
 |---|---|---|---|
 | `thread.shared_pool_size` | usize | CPU 核数 | ThreadActorSystem 共享调度池 |
@@ -77,7 +79,7 @@ ParrotConfig::builder()
   .build()?                    # 校验（Invalid 带键名）→ Resolved 折叠
 ```
 
-**环境变量展开**：`${VAR}` / `${VAR:-default}`（K8s ConfigMap 注入风格）；残缺 `${`（无 `}` 收尾）保持原样提示书写错误，不静默吞。
+**环境变量展开**：`${VAR}` / `${VAR:-default}`（K8s ConfigMap 注入风格）。只扫描原始配置一次，变量值按字面量插入，不递归展开其中的 `${...}`，因此自引用或相互引用不会导致死循环。变量缺失或为空时使用 `:-default`，没有默认值时替换为空字符串。残缺 `${`（无 `}` 收尾）保持原样。展开发生在 TOML 解析前，插入内容仍必须符合所在位置的 TOML 语法；默认值采用简单的首个 `}` 终止语法，不支持嵌套表达式。
 
 ## 5. 数据模型与 crate 边界（依赖倒置）
 

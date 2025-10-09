@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::info;
 
 use parrot_api::actor::Actor;
 use parrot_api::address::{ActorPath, ActorRef};
@@ -56,23 +56,109 @@ use crate::thread::scheduler::ThreadSchedulerFactory;
 use crate::thread::scheduler::dedicated_thread::TypedThreadSchedulerExt;
 use parrot_api::message::Message;
 
+/// Cloneable outcome shared by concurrent stop callers.
+#[derive(Clone)]
+pub(crate) enum StopOutcome {
+    Stopped,
+    TimedOut(String),
+    Failed(String),
+}
+impl StopOutcome {
+    pub(crate) fn from_result(result: Result<(), SystemError>) -> Self {
+        match result {
+            Ok(()) => Self::Stopped,
+            Err(SystemError::Timeout(message)) => Self::TimedOut(message),
+            Err(error) => Self::Failed(error.to_string()),
+        }
+    }
+    fn into_result(self) -> Result<(), SystemError> {
+        match self {
+            Self::Stopped => Ok(()),
+            Self::TimedOut(message) => Err(SystemError::Timeout(message)),
+            Self::Failed(message) => Err(SystemError::ShutdownError(message)),
+        }
+    }
+}
+pub(crate) type StopCompletion = tokio::sync::watch::Receiver<Option<StopOutcome>>;
+
+pub(crate) async fn await_stop(mut completion: StopCompletion) -> Result<(), SystemError> {
+    loop {
+        if let Some(outcome) = completion.borrow_and_update().clone() {
+            return outcome.into_result();
+        }
+        completion.changed().await.map_err(|_| {
+            SystemError::ShutdownError("stop task ended without reporting completion".into())
+        })?;
+    }
+}
+
+/// Draining may invoke arbitrary user destructors. Keep cleanup owned even if
+/// its caller reaches a deadline; do not run a late before_stop along with it.
+pub(crate) fn drain_mailbox(
+    mailbox: Arc<dyn Mailbox>,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        let permit = slots.clone().acquire_owned().await?;
+        crate::thread::scheduler::shared::poll_isolated(
+            async move {
+                mailbox.close().await;
+                Ok(())
+            },
+            permit,
+            slots,
+            Arc::new(Notify::new()),
+        )
+        .await
+    })
+}
+
 /// Entry in the actor registry
-pub(crate) struct ActorRegistryEntry {
+pub(crate) struct DynamicActorEntry {
     /// Reference to the actor for sending messages
     actor_ref: Arc<dyn ActorRef>,
+    /// Logical identity; reused only by supervised replacements.
+    address_cell: Arc<Mutex<WeakMailboxRef>>,
 
     /// Reference to the actor's mailbox
     pub(crate) mailbox: Arc<dyn Mailbox>,
 
     /// Actor configuration
-    #[allow(dead_code)] // spawn 路径已内联消费；保留配置快照
-    config: ThreadActorConfig,
+    pub(crate) config: ThreadActorConfig,
+    pub(crate) supervision: Option<Arc<crate::thread::supervisor_exec::SupervisionEntry>>,
+    pub(crate) restart_cancel: Option<Arc<crate::thread::supervisor_exec::RestartControl>>,
+    /// Kept while stopping so duplicate spawns cannot reuse this generation.
+    pub(crate) stop_completion: Option<StopCompletion>,
 }
 
+pub(crate) enum ActorRegistryEntry {
+    Dynamic(DynamicActorEntry),
+    Typed(crate::thread::typed::TypedRegistration),
+}
+impl ActorRegistryEntry {
+    pub(crate) fn dynamic(&self) -> Option<&DynamicActorEntry> {
+        match self {
+            Self::Dynamic(entry) => Some(entry),
+            Self::Typed(_) => None,
+        }
+    }
+    pub(crate) fn dynamic_mut(&mut self) -> Option<&mut DynamicActorEntry> {
+        match self {
+            Self::Dynamic(entry) => Some(entry),
+            Self::Typed(_) => None,
+        }
+    }
+    fn actor_ref(&self) -> Arc<dyn ActorRef> {
+        match self {
+            Self::Dynamic(entry) => entry.actor_ref.clone(),
+            Self::Typed(entry) => entry.actor_ref.clone(),
+        }
+    }
+}
 impl fmt::Debug for ActorRegistryEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ActorRegistryEntry")
-            .field("path", &self.actor_ref.path())
+            .field("path", &self.actor_ref().path())
             .finish()
     }
 }
@@ -103,6 +189,9 @@ pub struct Terminated {
     pub path: String,
     pub reason: parrot_api::supervisor::DeathReason,
 }
+impl Message for Terminated {
+    type Result = ();
+}
 
 /// Thread-based implementation of the Parrot actor system.
 ///
@@ -119,21 +208,20 @@ pub struct ThreadActorSystem {
     /// Scheduler group (shared pool + dedicated threads)
     pub(crate) scheduler_group: Arc<SchedulerGroup>,
 
+    pub(crate) typed_slots: Arc<tokio::sync::Semaphore>,
+
     /// Runtime handle for spawning async tasks
     pub(crate) runtime_handle: Handle,
 
     /// Signal for system shutdown
     shutdown_signal: Arc<Notify>,
+    shutdown_completion: Mutex<Option<StopCompletion>>,
 
     /// Flag indicating if the system is shutting down
     is_shutting_down: Arc<AtomicBool>,
 
     /// Watch registry: watched path -> watcher paths
     watch_registry: Arc<Mutex<HashMap<String, Vec<String>>>>,
-
-    /// M3 supervision registry: supervised children (strategy + windowed
-    /// restart history + typed respawn factories).
-    pub(crate) supervision_registry: Arc<crate::thread::supervisor_exec::SupervisionRegistry>,
 
     /// System start time for uptime reporting
     started_at: Instant,
@@ -185,19 +273,23 @@ impl ThreadActorSystem {
             ),
             ..Default::default()
         };
-        let scheduler_group = Arc::new(factory.create_scheduler_group(Some(pool_config), None));
+        let dedicated_config = crate::thread::scheduler::dedicated_thread::DedicatedThreadConfig {
+            max_threads: config.max_dedicated_threads,
+            ..Default::default()
+        };
+        let scheduler_group =
+            Arc::new(factory.create_scheduler_group(Some(pool_config), Some(dedicated_config)));
 
         Self {
+            typed_slots: Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1))),
             config,
             registry: Arc::new(RwLock::new(HashMap::new())),
             scheduler_group,
             runtime_handle,
             shutdown_signal: Arc::new(Notify::new()),
+            shutdown_completion: Mutex::new(None),
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             watch_registry: Arc::new(Mutex::new(HashMap::new())),
-            supervision_registry: Arc::new(
-                crate::thread::supervisor_exec::SupervisionRegistry::new(),
-            ),
             started_at: Instant::now(),
             self_weak: Mutex::new(None),
             receptionist: RwLock::new(None),
@@ -273,10 +365,15 @@ impl ThreadActorSystem {
 
     /// M3 supervision plumbing: spawn the supervision decision for a
     /// panicked actor as a detached task on the system runtime.
-    pub(crate) fn runtime_spawn_supervision(self: &Arc<Self>, path: String, panic_msg: String) {
+    pub(crate) fn runtime_spawn_supervision(
+        self: &Arc<Self>,
+        path: String,
+        mailbox: WeakMailboxRef,
+        panic_msg: String,
+    ) {
         let system = self.clone();
         self.runtime_handle.spawn(async move {
-            system.on_child_panic(&path, panic_msg).await;
+            system.on_child_panic(&path, mailbox, panic_msg).await;
         });
     }
 
@@ -314,43 +411,65 @@ impl ThreadActorSystem {
         Ok(())
     }
 
-    /// Notify all watchers of an actor's termination and clean up the entry.
-    pub(crate) async fn notify_termination(
+    /// Notify all watchers under the caller's operation deadline.
+    pub(crate) async fn notify_termination_until(
         &self,
         path: &str,
         reason: parrot_api::supervisor::DeathReason,
-    ) {
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SystemError> {
         let watchers = {
             let mut registry = self.watch_registry.lock().unwrap();
             registry.remove(path).unwrap_or_default()
         };
 
         if watchers.is_empty() {
-            return;
+            return Ok(());
         }
 
-        // Collect mailboxes first: std RwLock guards are not Send, so they
-        // must not be held across the await below.
-        let mailboxes: Vec<Arc<dyn Mailbox>> = {
+        let targets = {
             let registry = self.registry.read().unwrap();
             watchers
                 .iter()
-                .filter_map(|watcher_path| registry.get(watcher_path).map(|e| e.mailbox.clone()))
-                .collect()
+                .filter_map(|path| registry.get(path))
+                .map(|entry| {
+                    (
+                        entry.actor_ref(),
+                        entry.dynamic().map(|entry| entry.mailbox.clone()),
+                    )
+                })
+                .collect::<Vec<_>>()
         };
-
-        for mailbox in mailboxes {
+        let deliveries = targets.into_iter().map(|(actor_ref, mailbox)| {
             let notification = Box::new(Terminated {
                 path: path.to_string(),
                 reason: reason.clone(),
             }) as BoxedMessage;
-            // M2 semantic change #3: death notifications are system signals
-            // and MUST NOT be dropped. Route through the high-priority lane
-            // with Block backpressure (bounded wait, wedged-consumer safe).
-            let _ = mailbox
-                .push_with_priority(notification, BackpressureStrategy::Block, true)
-                .await;
-        }
+            async move {
+                tokio::time::timeout_at(deadline, async {
+                    match mailbox {
+                        Some(mailbox) => mailbox
+                            .push_with_priority(notification, BackpressureStrategy::Block, true)
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| SystemError::ShutdownError(error.to_string())),
+                        None => actor_ref
+                            .deliver(notification)
+                            .await
+                            .map_err(|error| SystemError::ShutdownError(error.to_string())),
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    SystemError::Timeout(format!(
+                        "termination notification to {} exceeded configured deadline",
+                        actor_ref.path()
+                    ))
+                })?
+            }
+        });
+        let results: Vec<Result<(), SystemError>> = futures::future::join_all(deliveries).await;
+        results.into_iter().collect()
     }
 
     /// Spawn a typed root actor on this system (returns a typed ThreadActorRef).
@@ -404,21 +523,36 @@ impl ThreadActorSystem {
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
+        self.spawn_at_internal(actor, path, parent, thread_config, None, None)
+    }
+
+    pub(crate) fn spawn_at_internal<A>(
+        self: &Arc<Self>,
+        actor: A,
+        path: &str,
+        parent: Option<BoxedActorRef>,
+        thread_config: ThreadActorConfig,
+        supervision: Option<Arc<crate::thread::supervisor_exec::SupervisionEntry>>,
+        replacing: Option<&Arc<dyn Mailbox>>,
+    ) -> Result<ThreadActorRef<A>, SpawnError>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
         if self.is_shutting_down() {
             return Err(SpawnError::SchedulerError("System is shutting down".into()));
         }
 
-        // Fast existence check; the authoritative insert happens after the
-        // async scheduling steps (guards must not be held across awaits).
+        // Fast existence check; registration and scheduling are committed
+        // together below, before a worker can observe an unregistered actor.
         {
             let registry = self.registry.read().unwrap();
-            if registry.contains_key(path) {
+            if replacing.is_none() && registry.contains_key(path) {
                 return Err(SpawnError::ActorPathAlreadyExists(path.to_string()));
             }
         }
 
         // 1. Create mailbox + typed actor ref first (ref holds only weak mailbox).
-        let actor_ref = Arc::new(ThreadActorRef::<A>::new(
+        let actor_ref = ThreadActorRef::<A>::new(
             ActorPath::for_test(path),
             Weak::<MpscMailbox>::new() as WeakMailboxRef,
             thread_config
@@ -429,7 +563,12 @@ impl ThreadActorSystem {
                 .ask_timeout
                 .unwrap_or(self.config.default_ask_timeout),
             None,
-        ));
+        )
+        .with_system(Arc::downgrade(self));
+        let actor_ref = Arc::new(match &supervision {
+            Some(entry) => actor_ref.with_mailbox_cell(entry.mailbox.clone()),
+            None => actor_ref,
+        });
 
         let actor_path = ActorPath {
             target: actor_ref.clone() as parrot_api::types::WeakActorTarget,
@@ -440,15 +579,21 @@ impl ThreadActorSystem {
         let capacity = thread_config
             .mailbox_capacity
             .unwrap_or(self.config.default_mailbox_capacity);
-        let mailbox: Arc<dyn Mailbox> = match thread_config.scheduling_mode.as_ref() {
-            Some(SchedulingMode::DedicatedThread) => {
+        let mode = thread_config
+            .scheduling_mode
+            .clone()
+            .unwrap_or_else(|| self.config.default_scheduling_mode.clone());
+        let mailbox: Arc<dyn Mailbox> = match &mode {
+            SchedulingMode::DedicatedThread => {
                 Arc::new(SpscRingbufMailbox::new(capacity, actor_path.clone()))
             }
             _ => Arc::new(MpscMailbox::new(capacity, actor_path.clone())),
         };
 
         // Fix up the actor ref's weak mailbox pointer now that mailbox exists.
-        actor_ref.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
+        if supervision.is_none() {
+            actor_ref.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
+        }
 
         // 3. Create context + processor.
         let system_weak = self.self_weak().ok_or_else(|| {
@@ -463,22 +608,11 @@ impl ThreadActorSystem {
             thread_config
                 .supervisor_strategy
                 .clone()
-                .unwrap_or_default(),
+                .unwrap_or_else(|| self.config.default_supervisor_strategy.clone()),
         );
 
-        let boxed_self: BoxedActorRef = Box::new(ThreadActorRef::<A>::new(
-            actor_path.clone(),
-            Arc::downgrade(&mailbox) as WeakMailboxRef,
-            thread_config
-                .backpressure_strategy
-                .clone()
-                .unwrap_or_else(|| self.config.default_backpressure_strategy.clone()),
-            thread_config
-                .ask_timeout
-                .unwrap_or(self.config.default_ask_timeout),
-            None,
-        ));
-        context.set_self_ref(boxed_self);
+        context.set_self_ref(actor_ref.clone_boxed());
+        context.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
 
         let processor = Arc::new(ActorProcessor::<A>::new(
             ThreadActor::new(actor, actor_path.clone()),
@@ -489,15 +623,58 @@ impl ThreadActorSystem {
 
         mailbox.set_processor(processor.clone());
 
-        // 4. Schedule according to the scheduling mode.
-        let mode = thread_config
-            .scheduling_mode
-            .clone()
-            .unwrap_or_else(|| self.config.default_scheduling_mode.clone());
-
-        match &mode {
-            SchedulingMode::DedicatedThread => {
-                self.scheduler_group
+        // Publish registration before scheduling so init/panic callbacks can
+        // find their actor. Both operations are synchronous under this guard:
+        // no duplicate spawn or shutdown drain can interleave between them.
+        {
+            let mut registry = self.registry.write().unwrap();
+            if self.is_shutting_down() {
+                return Err(SpawnError::SystemShutdown);
+            }
+            if let Some(expected) = replacing {
+                let valid = registry
+                    .get(path)
+                    .and_then(ActorRegistryEntry::dynamic)
+                    .is_some_and(|entry| {
+                        Arc::ptr_eq(expected, &entry.mailbox)
+                            && entry
+                                .restart_cancel
+                                .as_ref()
+                                .is_some_and(|control| !control.is_cancelled())
+                    });
+                if !valid {
+                    return Err(SpawnError::SystemShutdown);
+                }
+            } else if registry.contains_key(path) {
+                return Err(SpawnError::ActorPathAlreadyExists(path.to_string()));
+            }
+            // Lock the logical address through publication and scheduling.
+            // Existing references cannot observe an unscheduled generation.
+            let mut cell = supervision
+                .as_ref()
+                .map(|entry| entry.mailbox.lock().unwrap());
+            let old_mailbox = cell.as_mut().map(|cell| {
+                std::mem::replace(&mut **cell, Arc::downgrade(&mailbox) as WeakMailboxRef)
+            });
+            let previous = registry.insert(
+                path.to_string(),
+                ActorRegistryEntry::Dynamic(DynamicActorEntry {
+                    actor_ref: actor_ref.clone() as Arc<dyn ActorRef>,
+                    address_cell: actor_ref.mailbox_cell(),
+                    mailbox: mailbox.clone(),
+                    config: thread_config.clone(),
+                    stop_completion: None,
+                    supervision: supervision.clone(),
+                    restart_cancel: None,
+                }),
+            );
+            let mode = thread_config
+                .scheduling_mode
+                .clone()
+                .unwrap_or_else(|| self.config.default_scheduling_mode.clone());
+            let scheduled = match &mode {
+                SchedulingMode::DedicatedThread => self
+                    .scheduler_group
                     .dedicated_scheduler
                     .schedule_typed_by_processor::<A>(
                         path,
@@ -505,51 +682,31 @@ impl ThreadActorSystem {
                         processor,
                         thread_config.clone(),
                     )
-                    .map_err(|e| SpawnError::SchedulerError(e.to_string()))?;
-            }
-            SchedulingMode::Sharded { affinity_key } => {
-                let shards = self.scheduler_group.sharded();
-                shards
+                    .map_err(|error| SpawnError::SchedulerError(error.to_string())),
+                SchedulingMode::Sharded { affinity_key } => self
+                    .scheduler_group
+                    .sharded()
                     .schedule_affinity(path, mailbox.clone(), affinity_key)
-                    .map_err(SpawnError::SchedulerError)?;
-            }
-            SchedulingMode::SharedPool { .. } => {
-                self.scheduler_group
+                    .map_err(SpawnError::SchedulerError),
+                SchedulingMode::SharedPool { .. } => self
+                    .scheduler_group
                     .shared_scheduler
-                    .schedule(path, mailbox.clone(), Some(thread_config.clone()))
-                    .await
-                    .map_err(|e| SpawnError::SchedulerError(e.to_string()))?;
+                    .schedule_now(path, mailbox.clone(), Some(thread_config.clone()))
+                    .map_err(|error| SpawnError::SchedulerError(error.to_string())),
+            };
+            if let Err(error) = scheduled {
+                registry.remove(path);
+                if let Some(previous) = previous {
+                    registry.insert(path.to_owned(), previous);
+                }
+                if let (Some(cell), Some(old)) = (cell.as_mut(), old_mailbox) {
+                    **cell = old;
+                }
+                return Err(error);
             }
         }
 
-        // 5. Register in the registry (authoritative duplicate check).
-        {
-            let mut registry = self.registry.write().unwrap();
-            if registry.contains_key(path) {
-                return Err(SpawnError::ActorPathAlreadyExists(path.to_string()));
-            }
-            registry.insert(
-                path.to_string(),
-                ActorRegistryEntry {
-                    actor_ref: actor_ref.clone() as Arc<dyn ActorRef>,
-                    mailbox: mailbox.clone(),
-                    config: thread_config.clone(),
-                },
-            );
-        }
-
-        Ok(ThreadActorRef::<A>::new(
-            actor_path,
-            Arc::downgrade(&mailbox) as WeakMailboxRef,
-            thread_config
-                .backpressure_strategy
-                .clone()
-                .unwrap_or_else(|| self.config.default_backpressure_strategy.clone()),
-            thread_config
-                .ask_timeout
-                .unwrap_or(self.config.default_ask_timeout),
-            None,
-        ))
+        Ok((*actor_ref).clone())
     }
 
     /// M3: spawn a supervised child with a respawn factory.
@@ -568,30 +725,71 @@ impl ThreadActorSystem {
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
         F: Fn() -> A + Send + Sync + 'static,
     {
-        let first = factory();
-        let thread_config = ThreadActorConfig {
-            supervisor_strategy: Some(strategy.clone()),
-            ..Default::default()
-        };
-        let r = self.spawn_at::<A>(first, path, None, thread_config).await?;
-
-        // Register the supervision entry with the typed respawn factory.
-        let respawn: Arc<dyn Fn() -> crate::thread::system::ErasedSpawnBoxTyped + Send + Sync> = {
-            let factory = Arc::new(factory);
-            Arc::new(move || {
-                let fresh = factory();
-                crate::thread::system::ErasedSpawnBoxTyped::from_typed(fresh)
-            })
-        };
-        self.supervision_registry.register(
+        self.spawn_supervised_with_config(
+            factory,
             path,
-            crate::thread::supervisor_exec::SupervisionEntry {
-                strategy,
-                restarts: Vec::new(),
-                respawn,
+            ThreadActorConfig {
+                supervisor_strategy: Some(strategy),
+                ..Default::default()
             },
-        );
-        Ok(r)
+        )
+        .await
+    }
+
+    /// Spawn a supervised logical actor. All references and watches survive
+    /// successful restarts, and each generation retains this configuration.
+    /// Messages queued in a failed generation are discarded, not replayed.
+    /// Restart factories run in isolation under the configured shutdown deadline.
+    pub async fn spawn_supervised_with_config<A, F>(
+        self: &Arc<Self>,
+        factory: F,
+        path: &str,
+        thread_config: ThreadActorConfig,
+    ) -> Result<ThreadActorRef<A>, SpawnError>
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        use crate::thread::supervisor_exec::{Respawn, SupervisionEntry};
+        let first = factory();
+        let factory = Arc::new(factory);
+        let restart_path = path.to_owned();
+        let restart_config = thread_config.clone();
+        let respawn: Respawn = Arc::new(move |system, entry, old_mailbox| {
+            let factory = factory.clone();
+            let path = restart_path.clone();
+            let config = restart_config.clone();
+            Box::pin(async move {
+                let slots = Arc::new(tokio::sync::Semaphore::new(1));
+                let permit = slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
+                let actor = crate::thread::scheduler::shared::poll_isolated(
+                    async move { Ok(factory()) },
+                    permit,
+                    slots,
+                    Arc::new(Notify::new()),
+                )
+                .await
+                .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
+                system
+                    .spawn_at_internal(actor, &path, None, config, Some(entry), Some(&old_mailbox))
+                    .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
+                Ok(())
+            })
+        });
+        let supervision = Arc::new(SupervisionEntry {
+            strategy: thread_config
+                .supervisor_strategy
+                .clone()
+                .unwrap_or_else(|| self.config.default_supervisor_strategy.clone()),
+            restarts: Mutex::new(Vec::new()),
+            mailbox: Arc::new(Mutex::new(Weak::<MpscMailbox>::new() as WeakMailboxRef)),
+            respawn,
+        });
+        self.spawn_at_internal(first, path, None, thread_config, Some(supervision), None)
     }
 
     /// Spawn an erased actor from boxed components (used by ThreadContext::spawn).
@@ -624,7 +822,7 @@ impl ThreadActorSystem {
             .read()
             .unwrap()
             .get(path)
-            .map(|e| e.actor_ref.clone())
+            .map(ActorRegistryEntry::actor_ref)
     }
 
     /// Look up an actor's mailbox by path.
@@ -633,43 +831,169 @@ impl ThreadActorSystem {
             .read()
             .unwrap()
             .get(path)
-            .map(|e| e.mailbox.clone())
+            .and_then(|e| e.dynamic().map(|e| e.mailbox.clone()))
     }
 
-    /// Stop and remove an actor from the system.
+    /// Stop an actor with the system's configured deadline. Concurrent callers
+    /// await the same operation; cancelling a caller does not abandon cleanup.
+    /// A notification error does not undo termination of the actor itself.
     pub async fn stop_actor(&self, path: &str) -> Result<(), SystemError> {
-        let entry = {
+        await_stop(self.request_stop(path, None)?).await
+    }
+
+    /// Reserve an owned stop synchronously. Context self-stop only requests
+    /// this operation: waiting for it inside a handler would deadlock the hook.
+    /// Contexts supply their mailbox to reject obsolete actor generations.
+    pub(crate) fn request_stop(
+        &self,
+        path: &str,
+        expected: Option<&Arc<dyn Mailbox>>,
+    ) -> Result<StopCompletion, SystemError> {
+        self.request_stop_matching(path, |entry| {
+            expected.is_none_or(|mailbox| {
+                entry
+                    .dynamic()
+                    .is_some_and(|entry| Arc::ptr_eq(mailbox, &entry.mailbox))
+            })
+        })
+    }
+
+    /// References stop the logical actor atomically with restart publication.
+    /// Context self-stop still uses its generation-specific mailbox above.
+    pub(crate) fn request_stop_ref(
+        &self,
+        path: &str,
+        address: &Arc<Mutex<WeakMailboxRef>>,
+    ) -> Result<StopCompletion, SystemError> {
+        self.request_stop_matching(path, |entry| {
+            entry
+                .dynamic()
+                .is_some_and(|entry| Arc::ptr_eq(address, &entry.address_cell))
+        })
+    }
+
+    fn request_stop_matching(
+        &self,
+        path: &str,
+        matches: impl FnOnce(&ActorRegistryEntry) -> bool,
+    ) -> Result<StopCompletion, SystemError> {
+        let system = self.self_arc().ok_or(SystemError::NotRunning)?;
+        let completion = {
             let mut registry = self.registry.write().unwrap();
-            registry.remove(path)
+            let entry = registry
+                .get_mut(path)
+                .ok_or_else(|| SystemError::ActorNotFound(path.into()))?;
+            if !matches(entry) {
+                return Err(SystemError::ActorNotFound(path.into()));
+            }
+            if let ActorRegistryEntry::Typed(entry) = entry {
+                entry
+                    .control
+                    .request_stop(tokio::time::Instant::now() + self.config.shutdown_timeout);
+                return Ok(entry.control.completion());
+            }
+            let entry = entry.dynamic_mut().expect("dynamic entry checked above");
+            if let Some(completion) = &entry.stop_completion {
+                if let Some(control) = &entry.restart_cancel {
+                    control.cancel();
+                }
+                completion.clone()
+            } else {
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                entry.stop_completion = Some(receiver.clone());
+                let mailbox = entry.mailbox.clone();
+                let mode = entry
+                    .config
+                    .scheduling_mode
+                    .clone()
+                    .unwrap_or_else(|| self.config.default_scheduling_mode.clone());
+                mailbox.seal();
+                let path = path.to_owned();
+                let deadline = tokio::time::Instant::now() + self.config.shutdown_timeout;
+                self.runtime_handle.spawn(async move {
+                    let result = system
+                        .stop_registered_actor(&path, mailbox.clone(), mode, deadline)
+                        .await;
+                    // The tombstone stays until descheduling and notifications
+                    // complete. Never remove a replacement generation.
+                    let mut registry = system.registry.write().unwrap();
+                    if registry
+                        .get(&path)
+                        .and_then(ActorRegistryEntry::dynamic)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.mailbox, &mailbox))
+                    {
+                        registry.remove(&path);
+                    }
+                    sender.send_replace(Some(StopOutcome::from_result(result)));
+                });
+                receiver
+            }
         };
+        Ok(completion)
+    }
 
-        let entry = match entry {
-            Some(e) => e,
-            None => return Err(SystemError::ActorNotFound(path.to_string())),
-        };
-
-        // Stop the processor gracefully (sends Stop control message).
-        if let Some(processor) = entry.mailbox.get_processor() {
-            let _ = processor.stop_erased().await;
+    async fn stop_registered_actor(
+        &self,
+        path: &str,
+        mailbox: Arc<dyn Mailbox>,
+        mode: SchedulingMode,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SystemError> {
+        mailbox.seal();
+        let processor = mailbox.get_processor();
+        if let Some(processor) = &processor {
+            processor.cancel_context_tasks();
         }
-
-        // Deschedule.
-        let shared_ret = self.scheduler_group.shared_scheduler.deschedule(path);
-        let dedicated_ret = self
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let drained = drain_mailbox(mailbox.clone(), slots.clone());
+        let graceful = async {
+            drained
+                .await
+                .map_err(|error| SystemError::ShutdownError(error.to_string()))?
+                .map_err(|error| SystemError::ShutdownError(error.to_string()))?;
+            if let Some(processor) = processor.clone() {
+                self.scheduler_group
+                    .stop_hook(path, &mode, processor, slots, deadline)
+                    .await?;
+            }
+            Ok(())
+        };
+        let stopped = tokio::time::timeout_at(deadline, graceful)
+            .await
+            .unwrap_or_else(|_| {
+                Err(SystemError::Timeout(format!(
+                    "actor {path} stop exceeded configured deadline"
+                )))
+            });
+        // Release suspended actor futures in all execution modes, including
+        // a handler that prevented before_stop from acquiring the actor lock.
+        if let Some(processor) = &processor {
+            processor.cancel_processing();
+        }
+        let _ = self.scheduler_group.shared_scheduler.deschedule(path).await;
+        if let Some(sharded) = self
+            .scheduler_group
+            .sharded_scheduler
+            .lock()
+            .unwrap()
+            .as_ref()
+        {
+            let _ = sharded.deschedule(path);
+        }
+        let dedicated = self
             .scheduler_group
             .dedicated_scheduler
-            .deschedule(path)
+            .deschedule_until(path, deadline)
             .await;
-        let _ = (shared_ret, dedicated_ret);
-
-        // Close the mailbox.
-        entry.mailbox.close().await;
-
-        // Notify watchers.
-        self.notify_termination(path, parrot_api::supervisor::DeathReason::Normal)
+        let notified = self
+            .notify_termination_until(path, parrot_api::supervisor::DeathReason::Normal, deadline)
             .await;
-
-        Ok(())
+        stopped?;
+        match dedicated {
+            Ok(()) | Err(SystemError::ActorNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        notified
     }
 
     /// Get actor count.
@@ -692,15 +1016,32 @@ impl ThreadActorSystem {
             return Err(SystemError::ShuttingDown);
         }
 
-        let entries: Vec<Arc<dyn Mailbox>> = {
+        let targets = {
             let registry = self.registry.read().unwrap();
-            registry.values().map(|e| e.mailbox.clone()).collect()
+            registry
+                .values()
+                .map(|entry| {
+                    (
+                        entry.actor_ref(),
+                        entry.dynamic().map(|entry| entry.mailbox.clone()),
+                    )
+                })
+                .collect::<Vec<_>>()
         };
-
-        for mailbox in entries {
-            let _ = mailbox
-                .push(msg_clone(&msg)?, BackpressureStrategy::DropNewest)
-                .await;
+        for (actor, mailbox) in targets {
+            let message = msg_clone(&msg)?;
+            match mailbox {
+                Some(mailbox) => mailbox
+                    .push(message, BackpressureStrategy::DropNewest)
+                    .await
+                    .map_err(|error| SystemError::ShutdownError(error.to_string()))?,
+                None => tokio::time::timeout(self.config.shutdown_timeout, actor.deliver(message))
+                    .await
+                    .map_err(|_| {
+                        SystemError::Timeout(format!("broadcast to {} timed out", actor.path()))
+                    })?
+                    .map_err(|error| SystemError::ShutdownError(error.to_string()))?,
+            }
         }
         Ok(())
     }
@@ -715,49 +1056,153 @@ impl ThreadActorSystem {
         Some(self.scheduler_group.shared_scheduler.metrics())
     }
 
+    /// Join one owned shutdown operation. Every caller observes completion;
+    /// dropping a caller does not cancel resource cleanup or erase errors.
     pub async fn shutdown_internal(&self) -> Result<(), SystemError> {
-        if self.is_shutting_down.swap(true, Ordering::SeqCst) {
-            return Ok(()); // already shutting down
-        }
-
-        info!("ThreadActorSystem shutting down");
-
-        // Remove all entries.
-        let entries: Vec<(String, ActorRegistryEntry)> = {
-            let mut registry = self.registry.write().unwrap();
-            registry.drain().collect()
-        };
-
-        // Stop processors (before_stop lifecycle).
-        for (path, entry) in &entries {
-            if let Some(processor) = entry.mailbox.get_processor()
-                && let Err(e) = processor.stop_erased().await
-            {
-                warn!("Failed to stop actor {}: {}", path, e);
+        let completion = {
+            let mut state = self.shutdown_completion.lock().unwrap();
+            if let Some(completion) = state.as_ref() {
+                completion.clone()
+            } else {
+                self.is_shutting_down.store(true, Ordering::SeqCst);
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                let work = self
+                    .shutdown_resources(tokio::time::Instant::now() + self.config.shutdown_timeout);
+                self.runtime_handle.spawn(async move {
+                    sender.send_replace(Some(StopOutcome::from_result(work.await)));
+                });
+                *state = Some(receiver.clone());
+                receiver
             }
-        }
+        };
+        await_stop(completion).await
+    }
 
-        // Shutdown schedulers.
-        // Note: use the inherent async `shutdown` methods, NOT the sync
-        // `ThreadScheduler` trait wrappers which `block_on` internally and
-        // would panic ("Cannot start a runtime from within a runtime").
-        let _ = self.scheduler_group.shared_scheduler.shutdown(5000).await;
-        let _ = self.scheduler_group.dedicated_scheduler.shutdown().await;
+    fn shutdown_resources(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> parrot_api::types::BoxedFuture<'static, Result<(), SystemError>> {
+        let registry = self.registry.clone();
+        let config = self.config.clone();
+        let scheduler_group = self.scheduler_group.clone();
+        let watch_registry = self.watch_registry.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
+        Box::pin(async move {
+            info!("ThreadActorSystem shutting down");
 
-        // Close all mailboxes.
-        for (_, entry) in &entries {
-            entry.mailbox.close().await;
-        }
+            // Remove all entries.
+            let entries: Vec<(String, ActorRegistryEntry)> = {
+                let mut registry = registry.write().unwrap();
+                registry.drain().collect()
+            };
 
-        // Notify termination watchers.
-        for (path, _) in &entries {
-            self.notify_termination(path, parrot_api::supervisor::DeathReason::Normal)
-                .await;
-        }
+            // Seal immediately without invoking user message destructors on
+            // the runtime thread. Owned drain tasks do disposal below.
+            for (_, entry) in &entries {
+                if let ActorRegistryEntry::Typed(entry) = entry {
+                    entry.control.request_stop(deadline);
+                    continue;
+                }
+                let entry = entry.dynamic().unwrap();
+                if let Some(control) = &entry.restart_cancel {
+                    control.cancel();
+                }
+                entry.mailbox.seal();
+                if let Some(processor) = entry.mailbox.get_processor() {
+                    processor.cancel_context_tasks();
+                }
+            }
 
-        self.shutdown_signal.notify_waiters();
-        info!("ThreadActorSystem stopped ({} actors)", entries.len());
-        Ok(())
+            // Stop independently: a wedged actor must not prevent other actors'
+            // lifecycle hooks from running. All phases share ONE configured deadline.
+            let stop_slots = Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1)));
+            let stops = entries.iter().map(|(path, entry)| {
+                let slots = stop_slots.clone();
+                let schedulers = scheduler_group.clone();
+                let dynamic = entry.dynamic();
+                let mode = dynamic
+                    .and_then(|entry| entry.config.scheduling_mode.clone())
+                    .unwrap_or_else(|| config.default_scheduling_mode.clone());
+                let completion = match entry {
+                    ActorRegistryEntry::Dynamic(entry) => entry.stop_completion.clone(),
+                    ActorRegistryEntry::Typed(entry) => Some(entry.control.completion()),
+                };
+                let processor = dynamic.and_then(|entry| entry.mailbox.get_processor());
+                let drained = if completion.is_none() {
+                    dynamic.map(|entry| drain_mailbox(entry.mailbox.clone(), slots.clone()))
+                } else {
+                    None
+                };
+                async move {
+                    if let Some(completion) = completion {
+                        return await_stop(completion).await;
+                    }
+                    if let Some(drained) = drained {
+                        drained
+                            .await
+                            .map_err(|error| {
+                                SystemError::ShutdownError(format!("mailbox {path}: {error}"))
+                            })?
+                            .map_err(|error| {
+                                SystemError::ShutdownError(format!("mailbox {path}: {error}"))
+                            })?;
+                    }
+                    let Some(processor) = processor else {
+                        return Ok(());
+                    };
+                    schedulers
+                        .stop_hook(path, &mode, processor, slots, deadline)
+                        .await
+                }
+            });
+            let stopped = tokio::time::timeout_at(deadline, futures::future::join_all(stops)).await;
+            let timed_out = stopped.is_err();
+            let stop_error = stopped
+                .ok()
+                .and_then(|results| results.into_iter().find_map(Result::err));
+
+            for (_, entry) in &entries {
+                if let Some(processor) = entry
+                    .dynamic()
+                    .and_then(|entry| entry.mailbox.get_processor())
+                {
+                    processor.cancel_processing();
+                }
+            }
+
+            // Every scheduler receives cancellation even if the hook deadline has
+            // elapsed. Async waits are cancelled; uncooperative synchronous code
+            // cannot be forcibly terminated safely inside this process.
+            let sharded = scheduler_group.sharded_scheduler.lock().unwrap().clone();
+            let remaining_ms = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis() as u64;
+            let (_, dedicated, shards) = tokio::join!(
+                scheduler_group.shared_scheduler.shutdown(remaining_ms),
+                scheduler_group.dedicated_scheduler.shutdown_until(deadline),
+                async {
+                    match sharded {
+                        Some(scheduler) => scheduler.shutdown_until(deadline).await,
+                        None => Ok(()),
+                    }
+                }
+            );
+            watch_registry.lock().unwrap().clear();
+
+            shutdown_signal.notify_waiters();
+            if timed_out {
+                return Err(SystemError::Timeout(
+                    "actor shutdown exceeded configured deadline".into(),
+                ));
+            }
+            dedicated?;
+            shards?;
+            if let Some(error) = stop_error {
+                return Err(error);
+            }
+            info!("ThreadActorSystem stopped ({} actors)", entries.len());
+            Ok(())
+        })
     }
 }
 

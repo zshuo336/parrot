@@ -210,8 +210,8 @@ fn derive_async_handler_opt_in_runs_on_actix() {
 
 #[tokio::test]
 async fn engine_context_handle_safe_downcasts() {
-    let data = 42u32;
-    let raw = NonNull::from(&data);
+    let mut data = 42u32;
+    let raw = NonNull::from(&mut data);
     let erased: NonNull<dyn Any> = raw;
     // Engine-side minting (single unsafe boundary — mirrors what the
     // Actix adapter does internally).

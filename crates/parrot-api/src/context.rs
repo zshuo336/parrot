@@ -230,14 +230,16 @@ pub trait ActorContext: Send + Sync {
     /// 3. Runs cleanup
     fn stop<'a>(&'a mut self) -> BoxedFuture<'a, ActorResult<()>>;
 
-    /// Sends message without response
+    /// Enqueues a message without waiting for its handler or response.
+    /// May wait for mailbox capacity according to the target's backpressure policy.
+    /// Self-delivery can still wait if that actor's bounded mailbox is full.
     ///
     /// ## Parameters
     /// - `target`: Recipient actor
     /// - `msg`: Message to send
     ///
     /// ## Performance
-    /// - Non-blocking operation
+    /// - Does not wait for business processing
     /// - May allocate on heap
     fn send<'a>(
         &'a self,
@@ -261,6 +263,12 @@ pub trait ActorContext: Send + Sync {
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
     /// Schedules a one-time delayed message.
+    /// Registration returns immediately after reserving one context task slot.
+    /// The task uses `ActorRef::deliver`, without waiting for a business reply.
+    /// It belongs to the creating actor generation: stopping cancels pending
+    /// delivery, and successful managed stop waits for task payload disposal.
+    /// An already admitted message remains owned by the recipient's mailbox.
+    /// Invalid delays, closed owners, or exhausted task capacity return errors.
     ///
     /// # Parameters
     /// * `target` - Recipient actor reference
@@ -277,6 +285,11 @@ pub trait ActorContext: Send + Sync {
     ) -> BoxedFuture<'a, ActorResult<()>>;
 
     /// Schedules a recurring message.
+    /// Registers one owned task with the same cancellation rules as `schedule_once`.
+    /// The first delivery follows `initial_delay`; each later delivery follows
+    /// `interval` after the previous delivery is admitted (fixed delay, no catch-up
+    /// burst). A zero interval is rejected. Delivery failure terminates the task
+    /// and is logged; registration success does not guarantee later delivery.
     ///
     /// # Parameters
     /// * `target` - Recipient actor reference

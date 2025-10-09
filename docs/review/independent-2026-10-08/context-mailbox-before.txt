@@ -1,0 +1,170 @@
+These runs were made after the second-batch runtime and Actix ownership repairs, but before the context/timeout/mailbox repairs. Failures are expected baseline evidence, not final acceptance results.
+
+Context six-regression baseline before context/timeout repair
+    Blocking waiting for file lock on build directory
+   Compiling parrot v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 24s
+     Running tests/test_context_messaging_contract.rs (target/debug/deps/test_context_messaging_contract-63a5593e546c7d60)
+
+running 6 tests
+test context_ask_crosses_engines_without_private_envelopes ... FAILED
+test thread_context_send_to_self_does_not_wait_for_handler ... FAILED
+test actix_context_send_to_self_does_not_wait_for_handler ... FAILED
+test thread_context_ask_applies_default_timeout_to_the_exchange ... FAILED
+test inline_ask_timeout_includes_full_mailbox_wait ... FAILED
+test boxed_ask_timeout_includes_full_mailbox_wait ... FAILED
+
+failures:
+
+---- context_ask_crosses_engines_without_private_envelopes stdout ----
+
+thread 'context_ask_crosses_engines_without_private_envelopes' (2143541) panicked at crates/parrot/tests/test_context_messaging_contract.rs:104:29:
+thread context to Actix: MessageHandlingError("unexpected envelope")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- thread_context_send_to_self_does_not_wait_for_handler stdout ----
+
+thread 'thread_context_send_to_self_does_not_wait_for_handler' (2143544) panicked at crates/parrot/tests/test_context_messaging_contract.rs:81:24:
+send must only enqueue: TimeoutDetail("Request to actor /self timed out after 500ms")
+
+---- actix_context_send_to_self_does_not_wait_for_handler stdout ----
+
+thread 'actix_context_send_to_self_does_not_wait_for_handler' (2143539) panicked at crates/parrot/tests/test_context_messaging_contract.rs:89:28:
+send must only enqueue: Other(Failed to deliver message: Message delivery timed out)
+
+---- thread_context_ask_applies_default_timeout_to_the_exchange stdout ----
+
+thread 'thread_context_ask_applies_default_timeout_to_the_exchange' (2143543) panicked at crates/parrot/tests/test_context_messaging_contract.rs:119:5:
+context timeout must expire: Err(Elapsed(()))
+
+---- inline_ask_timeout_includes_full_mailbox_wait stdout ----
+
+thread 'inline_ask_timeout_includes_full_mailbox_wait' (2143542) panicked at crates/parrot/tests/test_context_messaging_contract.rs:135:5:
+mailbox enqueue must share the ask deadline: Err(Elapsed(()))
+
+---- boxed_ask_timeout_includes_full_mailbox_wait stdout ----
+
+thread 'boxed_ask_timeout_includes_full_mailbox_wait' (2143540) panicked at crates/parrot/tests/test_context_messaging_contract.rs:135:5:
+mailbox enqueue must share the ask deadline: Err(Elapsed(()))
+
+
+failures:
+    actix_context_send_to_self_does_not_wait_for_handler
+    boxed_ask_timeout_includes_full_mailbox_wait
+    context_ask_crosses_engines_without_private_envelopes
+    inline_ask_timeout_includes_full_mailbox_wait
+    thread_context_ask_applies_default_timeout_to_the_exchange
+    thread_context_send_to_self_does_not_wait_for_handler
+
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+error: test failed, to rerun pass `-p parrot --test test_context_messaging_contract`
+
+
+Typed enqueue timeout baseline
+   Compiling parrot-api v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.89s
+     Running unittests src/lib.rs (target/debug/deps/parrot_api-c20fd3a583037f5b)
+
+running 1 test
+test typed_channel::tests::ask_timeout_cancels_wait_for_mailbox_capacity ... FAILED
+
+failures:
+
+---- typed_channel::tests::ask_timeout_cancels_wait_for_mailbox_capacity stdout ----
+
+thread 'typed_channel::tests::ask_timeout_cancels_wait_for_mailbox_capacity' (2146349) panicked at crates/parrot-api/src/typed_channel.rs:464:9:
+Err(Elapsed(()))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    typed_channel::tests::ask_timeout_cancels_wait_for_mailbox_capacity
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 124 filtered out; finished in 0.50s
+
+error: test failed, to rerun pass `-p parrot-api --lib`
+
+
+Mailbox five-regression baseline before close/capacity repair
+   Compiling parrot v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.32s
+     Running tests/test_mailbox_close_contract.rs (target/debug/deps/test_mailbox_close_contract-4abedaf40f59e044)
+
+running 5 tests
+test spsc_raw_sender_is_counted_and_closed ... FAILED
+test priority_and_normal_messages_share_capacity ... FAILED
+test spsc_close_rejects_waiting_producer ... FAILED
+test mpsc_close_rejects_waiting_producer ... FAILED
+test ringbuf_close_rejects_waiting_producer ... ok
+
+failures:
+
+---- spsc_raw_sender_is_counted_and_closed stdout ----
+
+thread 'spsc_raw_sender_is_counted_and_closed' (2153869) panicked at crates/parrot/tests/test_mailbox_close_contract.rs:50:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+
+---- priority_and_normal_messages_share_capacity stdout ----
+
+thread 'priority_and_normal_messages_share_capacity' (2153866) panicked at crates/parrot/tests/test_mailbox_close_contract.rs:40:5:
+assertion failed: matches!(mailbox.push(Box::new(2_u64), BackpressureStrategy::Error).await,
+    Err(MailboxError::Full { capacity: 1 }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- spsc_close_rejects_waiting_producer stdout ----
+
+thread 'spsc_close_rejects_waiting_producer' (2153868) panicked at crates/parrot/tests/test_mailbox_close_contract.rs:16:5:
+pending producer must fail: Ok(Ok(()))
+
+---- mpsc_close_rejects_waiting_producer stdout ----
+
+thread 'mpsc_close_rejects_waiting_producer' (2153865) panicked at crates/parrot/tests/test_mailbox_close_contract.rs:16:5:
+pending producer must fail: Ok(Ok(()))
+
+
+failures:
+    mpsc_close_rejects_waiting_producer
+    priority_and_normal_messages_share_capacity
+    spsc_close_rejects_waiting_producer
+    spsc_raw_sender_is_counted_and_closed
+
+test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p parrot --test test_mailbox_close_contract`
+
+
+Watcher delivery baseline before explicit system deadline
+   Compiling parrot v0.1.0 (/Users/biluochun/work/error.d/library/parrot/crates/parrot)
+warning: unused import: `address::ActorRef`
+ --> crates/parrot/tests/test_watch_delivery_deadline.rs:4:59
+  |
+4 | use parrot_api::{actor::{Actor, ActorState, EmptyConfig}, address::ActorRef, types::{ActorResult, BoxedFuture, BoxedMessage}};
+  |                                                           ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `parrot` (test "test_watch_delivery_deadline") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.85s
+     Running tests/test_watch_delivery_deadline.rs (target/debug/deps/test_watch_delivery_deadline-ca9302ac6bdb0ac7)
+
+running 1 test
+test full_watcher_cannot_block_other_watchers_or_hide_delivery_failure ... FAILED
+
+failures:
+
+---- full_watcher_cannot_block_other_watchers_or_hide_delivery_failure stdout ----
+
+thread 'full_watcher_cannot_block_other_watchers_or_hide_delivery_failure' (2200713) panicked at crates/parrot/tests/test_watch_delivery_deadline.rs:49:5:
+stop must report notification deadline: Err(Elapsed(()))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    full_watcher_cannot_block_other_watchers_or_hide_delivery_failure
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+error: test failed, to rerun pass `-p parrot --test test_watch_delivery_deadline`
