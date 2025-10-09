@@ -83,10 +83,11 @@ impl Default for RealClock {
 
 impl Clock for RealClock {
     fn now_ms(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        EPOCH
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
     }
     fn election_timeout_ms(&self) -> u64 {
         self.election_ms + (self.now_ms() % 300) // 抖动防同步选举
@@ -165,6 +166,11 @@ impl RaftNode {
     ) -> Self {
         let id = id.into();
         let jitter = id_jitter(&id) % 300;
+        let last_heartbeat_ms = clock.now_ms();
+        let mut peers = peers;
+        peers.retain(|peer| peer != &id);
+        peers.sort();
+        peers.dedup();
         Self {
             id,
             peers,
@@ -179,7 +185,7 @@ impl RaftNode {
             match_index: HashMap::new(),
             votes_received: Vec::new(),
             clock,
-            last_heartbeat_ms: 0,
+            last_heartbeat_ms,
             timeout_jitter_ms: jitter,
             outbox: Vec::new(),
             pending_apply: Vec::new(),
@@ -340,6 +346,9 @@ impl RaftNode {
         last_log_index: LogIndex,
         last_log_term: Term,
     ) {
+        if from != candidate || !self.peers.contains(&from) {
+            return;
+        }
         if term < self.current_term {
             self.outbox.push((
                 from,
@@ -376,6 +385,9 @@ impl RaftNode {
     }
 
     fn step_vote_resp(&mut self, from: NodeId, term: Term, granted: bool) {
+        if !self.peers.iter().any(|p| p == &from) {
+            return;
+        }
         if term > self.current_term {
             self.current_term = term;
             self.role = Role::Follower;
@@ -432,6 +444,9 @@ impl RaftNode {
         entries: Vec<LogEntry>,
         leader_commit: LogIndex,
     ) {
+        if from != leader || !self.peers.iter().any(|p| p == &from) {
+            return;
+        }
         if term < self.current_term {
             self.outbox.push((
                 from,
@@ -472,6 +487,26 @@ impl RaftNode {
             ));
             return;
         }
+        // Validate the complete batch before mutating the log. Gaps, index 0,
+        // future terms, or overwrites of a committed prefix are invalid RPCs.
+        let valid = entries.iter().enumerate().all(|(offset, entry)| {
+            prev_log_index.checked_add(offset as u64 + 1) == Some(entry.index)
+                && entry.term <= term
+                && (entry.index > self.commit_index
+                    || self.log.get((entry.index - 1) as usize) == Some(entry))
+        });
+        if !valid {
+            self.outbox.push((
+                from,
+                RaftRpc::AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                },
+            ));
+            return;
+        }
+        let matched = prev_log_index + entries.len() as u64;
         // 追加/覆盖冲突（同 index 不同 term → 截断后重放）
         for e in entries {
             let slot = e.index as usize - 1;
@@ -485,7 +520,7 @@ impl RaftNode {
             }
         }
         // commit 推进（min(leader_commit, 本地末尾)）
-        let new_commit = leader_commit.min(self.last_log_index());
+        let new_commit = leader_commit.min(matched);
         if new_commit > self.commit_index {
             // 论文 §5.4.2：只提交当前任期条目（通过复制计数间接提交旧条目——
             // 本实现 commit_index 单点由 leader 推进，follower 信任 leader_commit
@@ -501,19 +536,25 @@ impl RaftNode {
             RaftRpc::AppendEntriesResp {
                 term: self.current_term,
                 success: true,
-                match_index: self.last_log_index(),
+                match_index: matched,
             },
         ));
     }
 
     fn step_append_resp(&mut self, from: NodeId, term: Term, success: bool, match_index: LogIndex) {
+        if !self.peers.iter().any(|p| p == &from) {
+            return;
+        }
         if term > self.current_term {
             self.current_term = term;
             self.role = Role::Follower;
             self.voted_for = None;
             return;
         }
-        if self.role != Role::Leader {
+        if self.role != Role::Leader || term != self.current_term {
+            return;
+        }
+        if match_index > self.last_log_index() {
             return;
         }
         if success {
@@ -521,7 +562,7 @@ impl RaftNode {
             *mi = (*mi).max(match_index);
             // nextIndex 前推
             let ni = self.next_index.entry(from).or_insert(1);
-            *ni = (*ni).max(match_index + 1);
+            *ni = (*ni).max(match_index.saturating_add(1));
             self.advance_commit();
         } else {
             // 回退重试（线性——简单正确；条目量小可接受）
@@ -536,11 +577,17 @@ impl RaftNode {
         let mut indexes: Vec<LogIndex> = self
             .peers
             .iter()
-            .filter_map(|p| self.match_index.get(p).copied())
+            .map(|p| {
+                self.match_index
+                    .get(p)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(self.last_log_index())
+            })
             .collect();
         indexes.push(self.last_log_index());
         indexes.sort_unstable();
-        let majority = indexes[indexes.len() / 2];
+        let majority = indexes[indexes.len().saturating_sub(self.quorum())];
         // §5.4.2：只提交当前任期（当前任期条目复制到多数派才推进）
         if majority > self.commit_index {
             let cur_term_entry = self
@@ -701,6 +748,171 @@ impl TestNet {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn elected(peers: &[&str]) -> RaftNode {
+        let mut node = RaftNode::new(
+            "a",
+            peers.iter().map(|p| p.to_string()).collect(),
+            Arc::new(ManualClock::new()),
+        );
+        node.start_election();
+        for peer in peers {
+            node.step(
+                (*peer).into(),
+                RaftRpc::RequestVoteResp {
+                    term: node.current_term,
+                    vote_granted: true,
+                },
+            );
+        }
+        assert_eq!(node.role, Role::Leader);
+        node.outbox();
+        node
+    }
+
+    #[test]
+    fn even_clusters_require_strict_majority() {
+        for size in [2, 4, 6] {
+            let peers: Vec<String> = (1..size).map(|i| format!("peer-{i}")).collect();
+            let mut node = elected(&peers.iter().map(String::as_str).collect::<Vec<_>>());
+            node.propose(vec![42]).unwrap();
+            for (i, peer) in peers.iter().enumerate() {
+                node.step(
+                    peer.clone(),
+                    RaftRpc::AppendEntriesResp {
+                        term: node.current_term,
+                        success: true,
+                        match_index: 1,
+                    },
+                );
+                assert_eq!(node.commit_index, u64::from(i + 2 > size / 2));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_unknown_or_impossible_ack_cannot_commit() {
+        let mut node = elected(&["b", "c"]);
+        node.propose(vec![1]).unwrap();
+        for (peer, term, index) in [
+            ("b", 0, 1),
+            ("stranger", node.current_term, 1),
+            ("b", node.current_term, u64::MAX),
+        ] {
+            node.step(
+                peer.into(),
+                RaftRpc::AppendEntriesResp {
+                    term,
+                    success: true,
+                    match_index: index,
+                },
+            );
+            assert_eq!(node.commit_index, 0);
+        }
+        node.broadcast_append(); // malicious indices must not poison nextIndex
+        node.step(
+            "b".into(),
+            RaftRpc::AppendEntriesResp {
+                term: node.current_term,
+                success: true,
+                match_index: 1,
+            },
+        );
+        assert_eq!(node.commit_index, 1);
+    }
+
+    #[test]
+    fn votes_require_configured_source_matching_candidate() {
+        let mut node = RaftNode::new(
+            "a",
+            vec!["b".into(), "c".into()],
+            Arc::new(ManualClock::new()),
+        );
+        node.start_election();
+        node.step(
+            "stranger".into(),
+            RaftRpc::RequestVoteResp {
+                term: node.current_term,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(node.role, Role::Candidate);
+        let term = node.current_term;
+        node.step(
+            "b".into(),
+            RaftRpc::RequestVote {
+                term: term + 1,
+                candidate: "c".into(),
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        );
+        assert_eq!(node.current_term, term);
+        assert_eq!(node.voted_for.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn append_ack_and_commit_cover_only_matching_prefix() {
+        let mut node = RaftNode::new("b", vec!["a".into()], Arc::new(ManualClock::new()));
+        node.log = vec![
+            LogEntry {
+                term: 1,
+                index: 1,
+                cmd: vec![1],
+            },
+            LogEntry {
+                term: 1,
+                index: 2,
+                cmd: vec![2],
+            },
+        ];
+        node.step(
+            "a".into(),
+            RaftRpc::AppendEntries {
+                term: 2,
+                leader: "a".into(),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: 2,
+            },
+        );
+        assert_eq!(
+            node.commit_index, 1,
+            "unverified suffix cannot be committed by a heartbeat"
+        );
+        assert!(matches!(
+            node.outbox().pop().unwrap().1,
+            RaftRpc::AppendEntriesResp {
+                match_index: 1,
+                success: true,
+                ..
+            }
+        ));
+        let original = node.log.clone();
+        for index in [0, 3, u64::MAX] {
+            node.step(
+                "a".into(),
+                RaftRpc::AppendEntries {
+                    term: 2,
+                    leader: "a".into(),
+                    prev_log_index: 1,
+                    prev_log_term: 1,
+                    entries: vec![LogEntry {
+                        term: 2,
+                        index,
+                        cmd: vec![],
+                    }],
+                    leader_commit: 3,
+                },
+            );
+            assert_eq!(node.log, original);
+            assert!(matches!(
+                node.outbox().pop().unwrap().1,
+                RaftRpc::AppendEntriesResp { success: false, .. }
+            ));
+        }
+    }
 
     // F4：3 节点选主（超时 → 选举 → 多数派确认）
     #[test]

@@ -98,7 +98,8 @@ fn spec(name: &str) -> ComponentSpec {
         artifact: ArtifactRef::Props {
             factory: "app.m5.echo".into(),
         },
-        alt_artifact: None,        instances: InstancePolicy::Singleton,
+        alt_artifact: None,
+        instances: InstancePolicy::Singleton,
         placement: Default::default(),
         upgrade: Default::default(),
         deps: vec![],

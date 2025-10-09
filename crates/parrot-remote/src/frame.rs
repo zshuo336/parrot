@@ -392,7 +392,8 @@ impl Frame {
         let body_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if body_len > MAX_FRAME_LEN {
             tracing::warn!(
-                len = body_len, max = MAX_FRAME_LEN,
+                len = body_len,
+                max = MAX_FRAME_LEN,
                 "frame length exceeds cap (corrupted stream? malicious peer? mismatched MAX_FRAME_LEN)"
             );
             return Err(FrameError::TooLarge {
@@ -400,10 +401,21 @@ impl Frame {
                 max: MAX_FRAME_LEN,
             });
         }
+        if body_len < BODY_FIXED_OVERHEAD as u32 {
+            return Err(FrameError::MalformedLengths {
+                flen: body_len,
+                plen: 0,
+                klen: 0,
+            });
+        }
         if buf.len() < 4 + body_len as usize {
             return Ok(None); // 半包
         }
-        buf.advance(4);
+        // Parse only this frame: malformed inner lengths must never consume a
+        // following frame. Validate every variable field before slicing it.
+        let mut body = buf.split_to(4 + body_len as usize);
+        body.advance(4);
+        let buf = &mut body;
         let version = buf.get_u8();
         if version != PROTOCOL_VERSION {
             tracing::warn!(
@@ -454,6 +466,12 @@ impl Frame {
         let cid = buf.get_u64_le();
         let hop_count = buf.get_u8();
         let hop_limit = buf.get_u8();
+        if hop_limit == 0 || hop_count >= hop_limit {
+            return Err(FrameError::HopExceeded {
+                count: hop_count,
+                limit: hop_limit,
+            });
+        }
         // reserved u48（帧偏移 18..24）——此前已顺序消费 ver/ft/flags/cid/hop 共 14B
         // 低 32bit = seq（端到端重排序号，0=不参与）；高 16bit 保留必须 0
         let seq = buf.get_u32_le();
@@ -471,6 +489,13 @@ impl Frame {
             });
         }
         let path_len = buf.get_u32_le() as usize;
+        if buf.remaining() < 4 || path_len > buf.remaining() - 4 {
+            return Err(FrameError::MalformedLengths {
+                flen: body_len,
+                plen: path_len as u32,
+                klen: 0,
+            });
+        }
         let path = String::from_utf8(buf.copy_to_bytes(path_len).to_vec()).map_err(|e| {
             tracing::warn!(
                 len = path_len,
@@ -483,6 +508,13 @@ impl Frame {
             }
         })?;
         let key_len = buf.get_u32_le() as usize;
+        if key_len > buf.remaining() {
+            return Err(FrameError::MalformedLengths {
+                flen: body_len,
+                plen: path_len as u32,
+                klen: key_len as u32,
+            });
+        }
         let key = String::from_utf8(buf.copy_to_bytes(key_len).to_vec()).map_err(|e| {
             tracing::warn!(
                 len = key_len,
@@ -494,21 +526,7 @@ impl Frame {
                 source: e.utf8_error(),
             }
         })?;
-        let payload_len = body_len as usize - BODY_FIXED_OVERHEAD - path_len - key_len;
-        if path_len + key_len + BODY_FIXED_OVERHEAD > body_len as usize {
-            tracing::warn!(
-                flen = body_len,
-                plen = path_len,
-                klen = key_len,
-                "declared lengths exceed frame body (corrupted or hostile frame)"
-            );
-            return Err(FrameError::MalformedLengths {
-                flen: body_len,
-                plen: path_len as u32,
-                klen: key_len as u32,
-            });
-        }
-        let payload = buf.copy_to_bytes(payload_len);
+        let payload = buf.copy_to_bytes(buf.remaining());
         let header = FrameHeader {
             frame_len: body_len,
             version,
@@ -889,6 +907,52 @@ mod tests {
         assert!(matches!(
             Frame::decode(&mut b),
             Err(FrameError::Utf8 { field: "path", .. })
+        ));
+
+        // A complete but too-short body must be rejected without a panic.
+        let mut short = BytesMut::from(&[10u8, 0, 0, 0, 1, frame_type::TELL][..]);
+        assert!(matches!(
+            Frame::decode(&mut short),
+            Err(FrameError::MalformedLengths { .. })
+        ));
+        let mut no_key = BytesMut::from(vec![0u8; 4 + BODY_FIXED_OVERHEAD].as_slice());
+        no_key[..4].copy_from_slice(&(BODY_FIXED_OVERHEAD as u32).to_le_bytes());
+        no_key[4] = PROTOCOL_VERSION;
+        no_key[5] = frame_type::TELL;
+        no_key[17] = DEFAULT_HOP_LIMIT;
+        no_key[28..32].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            Frame::decode(&mut no_key),
+            Err(FrameError::MalformedLengths { .. })
+        ));
+
+        // Internal path/key lengths cannot consume bytes from a following frame.
+        let first = Frame::tell("/a", "k", Bytes::new());
+        let second = Frame::tell("/b", "k", Bytes::new());
+        let mut joined = BytesMut::new();
+        first.encode(&mut joined).unwrap();
+        joined[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut tail = BytesMut::new();
+        second.encode(&mut tail).unwrap();
+        joined.extend_from_slice(&tail);
+        assert!(matches!(
+            Frame::decode(&mut joined),
+            Err(FrameError::MalformedLengths { .. })
+        ));
+
+        assert_eq!(
+            joined, tail,
+            "invalid lengths must not consume the next frame"
+        );
+        assert_eq!(Frame::decode(&mut joined).unwrap().unwrap().path, "/b");
+
+        let mut exhausted = Frame::tell("/x", "k", Bytes::new());
+        exhausted.header.hop_count = exhausted.header.hop_limit;
+        let mut wire = BytesMut::new();
+        exhausted.encode(&mut wire).unwrap();
+        assert!(matches!(
+            Frame::decode(&mut wire),
+            Err(FrameError::HopExceeded { .. })
         ));
     }
 

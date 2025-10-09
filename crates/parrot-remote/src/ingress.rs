@@ -55,59 +55,95 @@ impl RelayMetrics {
     }
 }
 
-/// 转发映射：forward_cid → (orig_cid, 回源 FrameSender, 到期时刻)。
+/// Forward correlation ID → original ID, return sender, destination and creation time.
 ///
 /// hub 路由（07 §6）核心结构：入站 ASK 目标节点非本节点时，分配新 cid
 /// 转发到目标节点；REPLY/REPLY_ERR 回来按新 cid 查表还原 orig_cid，经
-/// 保存的回源 sender 送回发起方。条目带 TTL（防目标节点泄漏——超时清理
-/// 由 complete/断连时的懒扫描兜底）。
+/// 保存的回源 sender 送回发起方。容量 65536，65s TTL；系统每秒清理，
+/// 目标断连时按目标节点清理。
 pub struct RelayTable {
-    slots: std::sync::Mutex<std::collections::HashMap<u64, (u64, FrameSender, std::time::Instant)>>,
+    slots: std::sync::Mutex<std::collections::HashMap<u64, RelaySlot>>,
     ttl: std::time::Duration,
+    capacity: usize,
+}
+
+struct RelaySlot {
+    orig_cid: u64,
+    back: FrameSender,
+    target: String,
+    created: std::time::Instant,
 }
 
 impl RelayTable {
     pub fn new() -> Self {
         Self {
-            slots: std::sync::Mutex::new(Default::default()),
+            slots: Default::default(),
             ttl: std::time::Duration::from_secs(65),
+            capacity: 65536,
         }
     }
 
-    /// 登记映射（forward_cid 分配方：hub 的 CallbackRegistry.next_cid）。
-    pub fn insert(&self, forward_cid: u64, orig_cid: u64, back: FrameSender) {
+    /// Register before making the forwarded request visible to its destination.
+    pub fn insert(&self, forward_cid: u64, orig_cid: u64, back: FrameSender, target: &str) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.len() >= self.capacity || slots.contains_key(&forward_cid) {
+            return false;
+        }
+        slots.insert(
+            forward_cid,
+            RelaySlot {
+                orig_cid,
+                back,
+                target: target.into(),
+                created: std::time::Instant::now(),
+            },
+        );
+        true
+    }
+
+    pub fn take(&self, forward_cid: u64) -> Option<(u64, FrameSender)> {
         self.slots
             .lock()
             .unwrap()
-            .insert(forward_cid, (orig_cid, back, std::time::Instant::now()));
+            .remove(&forward_cid)
+            .filter(|slot| slot.created.elapsed() < self.ttl)
+            .map(|slot| (slot.orig_cid, slot.back))
     }
 
-    /// 取出并移除（REPLY 回程一次性消费）。过期条目返回 None（懒清理）。
-    pub fn take(&self, forward_cid: u64) -> Option<(u64, FrameSender)> {
-        let mut g = self.slots.lock().unwrap();
-        match g.remove(&forward_cid) {
-            Some((orig, back, at)) if at.elapsed() < self.ttl => Some((orig, back)),
-            _ => None,
-        }
-    }
-
-    /// 目标节点断连：其作为转发目标的所有挂起条目失效（回源 REPLY_ERR）。
-    /// 返回失效条目（调用方逐条发 ConnectionLost 错误帧）。
     pub fn fail_target(&self, target: &str) -> Vec<(u64, u64, FrameSender)> {
-        let mut g = self.slots.lock().unwrap();
-        let hit: Vec<u64> = g
+        let mut slots = self.slots.lock().unwrap();
+        let ids: Vec<_> = slots
             .iter()
-            .filter(|(_, (_, back, _))| back.node_id() == target)
+            .filter(|(_, slot)| slot.target == target)
             .map(|(cid, _)| *cid)
             .collect();
-        hit.iter()
-            .filter_map(|cid| g.remove(cid).map(|(o, b, _)| (*cid, o, b)))
+        ids.into_iter()
+            .filter_map(|cid| {
+                slots
+                    .remove(&cid)
+                    .map(|slot| (cid, slot.orig_cid, slot.back))
+            })
             .collect()
     }
 
-    #[allow(clippy::len_without_is_empty)] // 表容量语义，is_empty 无意义（测试用 len==0 断言）
+    /// Actively reclaim expired mappings even if no reply ever arrives.
+    pub fn expire(&self) -> Vec<(u64, FrameSender)> {
+        let mut slots = self.slots.lock().unwrap();
+        let ids: Vec<_> = slots
+            .iter()
+            .filter(|(_, slot)| slot.created.elapsed() >= self.ttl)
+            .map(|(cid, _)| *cid)
+            .collect();
+        ids.into_iter()
+            .filter_map(|cid| slots.remove(&cid).map(|slot| (slot.orig_cid, slot.back)))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.slots.lock().unwrap().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -281,8 +317,24 @@ impl Ingress {
         }
     }
 
+    fn is_remote_target(&self, path: &str) -> bool {
+        target_node(path).is_some_and(|target| {
+            self.relay
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|router| target != router.self_node())
+        })
+    }
+
     async fn on_ask(&self, frame: Frame, back: &FrameSender) {
         let cid = frame.header.correlation_id;
+        // Node identity precedes local lookup and codec dispatch. A router
+        // can forward opaque payloads and cannot capture a remote namesake.
+        if self.is_remote_target(&frame.path) {
+            self.try_relay_ask(&frame, back, cid).await;
+            return;
+        }
         // 剥 reply_to 前缀（DEV_01 §3.1 约定）
         let (reply_to, payload) = match frame.split_reply_to() {
             Ok(v) => v,
@@ -403,6 +455,15 @@ impl Ingress {
         else {
             return Some(ErrCode::ActorNotFound);
         };
+        if frame.header.hop_count.saturating_add(1) >= frame.header.hop_limit {
+            back.send_frame(Frame::reply_err(
+                orig_cid,
+                &frame.path,
+                ErrCode::RouteUnreachable,
+                "relay hop limit exhausted",
+            ));
+            return Some(ErrCode::RouteUnreachable);
+        }
         // ③ 有路由能力但无直连 → RouteUnreachable（比 ActorNotFound 语义准）
         let Some(sender) = router.sender_of(target) else {
             let _ = back
@@ -420,19 +481,33 @@ impl Ingress {
         let mut fwd = frame.clone();
         fwd.header.correlation_id = forward_cid;
         fwd.header.hop_count = fwd.header.hop_count.saturating_add(1);
-        if sender.send(fwd).await.is_err() {
-            let _ = back
-                .send(Frame::reply_err(
+        // Reserve before registering, then publish without an intervening await:
+        // fast replies and cancellation cannot race map insertion.
+        let permit = match tokio::time::timeout(self.relay_table.ttl, sender.tx.reserve()).await {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                back.send_frame(Frame::reply_err(
                     orig_cid,
                     &frame.path,
                     ErrCode::ConnectionLost,
-                    "relay link closed",
-                ))
-                .await;
-            return Some(ErrCode::ConnectionLost);
+                    "relay unavailable",
+                ));
+                return Some(ErrCode::ConnectionLost);
+            }
+        };
+        if !self
+            .relay_table
+            .insert(forward_cid, orig_cid, back.clone(), target)
+        {
+            back.send_frame(Frame::reply_err(
+                orig_cid,
+                &frame.path,
+                ErrCode::Overloaded,
+                "relay capacity exhausted",
+            ));
+            return Some(ErrCode::Overloaded);
         }
-        // 映射登记（REPLY 回来自动还原回源）
-        self.relay_table.insert(forward_cid, orig_cid, back.clone());
+        permit.send(fwd);
         RELAYED_ASK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // 方案 A：目标可直拨 → 向源注入 ROUTE_HINT（源学直连，后续帧不再
         // 经 hub——try_send 队列满仅丢弃 hint，学习退化为继续中转，无害）
@@ -482,12 +557,13 @@ impl Ingress {
     /// 三类路径：
     /// 1. **终点是本节点的直连 seq 帧**：per-from 重排任务——seq 流来自
     ///    唯一源（直连对端），流身份成立，可安全重排
-    /// 2. **中转帧**（目标节点非本节点，含来自 uplink hub 的和 hub 收到
-    ///    的跨 spoke 帧）：seq 流多目标/多源交错不可归因 → bypass 直转
+    /// 2. **中转帧**（目标节点非本节点或 hop_count > 0）：线上缺原始
+    ///    发送方标识，多源 seq 不可按 hub 身份合并 → bypass 直转
     /// 3. **seq==0 帧**：旧实现/异构网关 → bypass 直投（兼容语义）
     ///
     /// 重排任务冷启动：首帧 seq=N>1（切换后直连新流）→ 缓冲等 250ms——
-    /// 在途 uplink 前缀帧走 bypass 路径先投（时序恰好正确），超时放行 N。
+    /// 超时放行 N。Wire 1.0 未带原始发送方/会话标识，当前不能保证
+    /// hub/直连切换的端到端 FIFO；等待窗口不能替代此保证。
     /// 背压：bounded channel 满则 dispatch 挂起 → 读循环挂起（RC8 贯通）。
     async fn on_tell(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
         let seq = frame.header.seq;
@@ -502,7 +578,7 @@ impl Ingress {
             None => true,
             Some(me) => target_node(&frame.path).map(|t| t == me).unwrap_or(true),
         };
-        if seq == crate::frame::SEQ_NONE || !destined_here {
+        if seq == crate::frame::SEQ_NONE || !destined_here || frame.header.hop_count > 0 {
             self.tell_deliver_or_relay(frame, back).await;
             return;
         }
@@ -715,6 +791,12 @@ impl Ingress {
 
     /// TELL 实际投递（本地命中 / hub 中转 / 死信）——原 on_tell 主体。
     async fn tell_deliver_or_relay(&self, frame: Frame, back: &FrameSender) {
+        if self.is_remote_target(&frame.path) {
+            if !self.try_relay_tell(&frame, back) {
+                DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
         let decoded = match CodecRegistry::global().decode_incoming(&frame.type_key, &frame.payload)
         {
             Ok(m) => m,
@@ -743,6 +825,9 @@ impl Ingress {
 
     /// hub 转发 TELL（无回程语义——转发成功即完事）。
     fn try_relay_tell(&self, frame: &Frame, back: &FrameSender) -> bool {
+        if frame.header.hop_count.saturating_add(1) >= frame.header.hop_limit {
+            return false;
+        }
         let Some(target) = target_node(&frame.path) else {
             tracing::debug!(
                 path = %frame.path,
@@ -777,6 +862,10 @@ impl Ingress {
     }
 
     async fn on_stop(&self, frame: Frame) {
+        if self.is_remote_target(&frame.path) {
+            self.try_relay_tell(&frame, &FrameSender::detached());
+            return;
+        }
         if let Some(r) = self.local.lookup(local_path(&frame.path)).await {
             let _ = r.stop().await;
         }
@@ -1166,11 +1255,13 @@ mod tests {
         // sender None → 死信；关键断言：不缓冲——立即死信计数）
         ig.dispatch(seq_tell_to("nB", 9, 9), &back, "nA").await; // 终点 nB ≠ me
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        // bypass 证明：本地命中立即投递（无 250ms 重排等待）——sink 已 9
-        assert_eq!(
-            sink.lock().unwrap().as_slice(),
-            &[9u8],
-            "中转帧 bypass 立即投递"
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "remote destination must never hit a local namesake"
+        );
+        assert!(
+            !ig.reorder_tx.lock().unwrap().contains_key("nA"),
+            "transit traffic bypasses local reordering"
         );
     }
 
@@ -1405,10 +1496,36 @@ mod tests {
     // EG5：RelayTable fail_target 精确失效（目标维度的挂起回收）
     #[test]
     fn eg5_relay_table_fail_target() {
-        let t = RelayTable::new();
-        assert_eq!(t.len(), 0);
-        assert!(t.fail_target("nX").is_empty(), "空表 fail 无害");
-        assert_eq!(t.len(), 0);
+        let table = RelayTable::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let source = FrameSender::new(tx, "source");
+        assert!(table.insert(1, 101, source.clone(), "dest-a"));
+        assert!(table.insert(2, 102, source, "dest-b"));
+        assert!(table.fail_target("source").is_empty());
+        let failed = table.fail_target("dest-a");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            (failed[0].0, failed[0].1, failed[0].2.node_id()),
+            (1, 101, "source")
+        );
+        assert_eq!(table.take(2).unwrap().0, 102);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn relay_table_capacity_and_expiry() {
+        let table = RelayTable {
+            slots: Default::default(),
+            ttl: std::time::Duration::ZERO,
+            capacity: 1,
+        };
+        assert!(table.insert(1, 101, FrameSender::detached(), "dest"));
+        assert!(!table.insert(2, 102, FrameSender::detached(), "dest"));
+        let expired = table.expire();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, 101);
+        assert!(table.is_empty());
+        assert!(table.insert(2, 102, FrameSender::detached(), "dest"));
     }
 
     // EG6：RelayMetrics 门面读数（不暴露 Atomic 原语的 API 契约）

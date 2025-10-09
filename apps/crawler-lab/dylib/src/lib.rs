@@ -90,13 +90,16 @@ unsafe extern "C" fn on_drain(_self_: *mut ()) -> u32 {
     ABI_OK
 }
 
-static VT: AbiVt = AbiVt { handle_msg, on_drain };
+static VT: AbiVt = AbiVt {
+    handle_msg,
+    on_drain,
+};
 
 #[no_mangle]
 pub static PARROT_ABI_META: AbiMeta = AbiMeta {
     abi_version: PARROT_ABI_VERSION,
     parrot_min: 1,
-    name: b"crawler-hub\0".as_ptr(),
-    name_len: 12,
+    name: c"crawler-hub".as_ptr().cast(),
+    name_len: 11,
     hooks: AbiHooks { construct, destroy },
 };

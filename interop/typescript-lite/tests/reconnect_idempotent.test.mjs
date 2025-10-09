@@ -63,5 +63,16 @@ test("handshake ack replays each registration exactly once", async () => {
   assert.equal(regs.filter((r) => r.key.endsWith("edge/rpa")).length, 2);
   assert.equal(regs.filter((r) => r.key.endsWith("edge/cam")).length, 2);
 
+  for (let round = 0; round < 5; round++) {
+    const before = decodeSent(stub).filter((f) => f.key.startsWith("$receptionist.register:")).length;
+    stub.onmessage?.({data: buildFrame(FT.HANDSHAKE_ACK, newCid(), "", "__handshake__", handshakeAckBody("gw")).slice().buffer});
+    const after = decodeSent(stub).filter((f) => f.key.startsWith("$receptionist.register:")).length;
+    assert.equal(after - before, 2, `round ${round} must replay each unique registration once`);
+  }
+  await node.register("edge/rpa", "rpa-main");
+  const beforeDuplicate = decodeSent(stub).length;
+  stub.onmessage?.({data: buildFrame(FT.HANDSHAKE_ACK, newCid(), "", "__handshake__", handshakeAckBody("gw")).slice().buffer});
+  assert.equal(decodeSent(stub).length - beforeDuplicate, 2);
+
   node.close();
 });

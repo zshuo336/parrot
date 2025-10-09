@@ -157,13 +157,14 @@ pub struct RemoteActorSystem {
     pub nodes: NodeTable,
     pub callbacks: Arc<CallbackRegistry>,
     pub ingress: Arc<Ingress>,
+    seq_counters: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
     /// K1/S1：SWIM 成员表（gossip 入站合并点——Arc 共享给钩子与驱动）。
     pub membership: Arc<tokio::sync::Mutex<crate::swim::Membership>>,
     transport: Box<dyn Transport>,
     inbound_tx: mpsc::Sender<(Frame, FrameSender, String)>,
     inbound_rx: tokio::sync::Mutex<mpsc::Receiver<(Frame, FrameSender, String)>>,
     /// 已建立连接（node_id → sender/status）
-    links: tokio::sync::Mutex<Vec<(String, FrameSender, Arc<NodeStatus>)>>,
+    links: std::sync::RwLock<Vec<(String, FrameSender, Arc<NodeStatus>)>>,
     /// 星型 uplink（07 §6）：hub/border 链路的 sender——目标不在直连表
     /// 时的默认路由出口。
     uplink: std::sync::RwLock<Option<FrameSender>>,
@@ -261,11 +262,12 @@ impl RemoteActorSystem {
             nodes: NodeTable::new(),
             callbacks,
             ingress,
+            seq_counters: Default::default(),
             membership,
             transport,
             inbound_tx: in_tx,
             inbound_rx: tokio::sync::Mutex::new(in_rx),
-            links: tokio::sync::Mutex::new(Vec::new()),
+            links: std::sync::RwLock::new(Vec::new()),
             uplink: std::sync::RwLock::new(None),
             dial_addrs: std::sync::Mutex::new(Default::default()),
             shutdown_tx,
@@ -309,6 +311,21 @@ impl RemoteActorSystem {
                 }
             }
         });
+        let table = self.ingress.relay_table.clone();
+        let mut shutdown = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    _ = tick.tick() => {
+                        for (cid, back) in table.expire() {
+                            back.send_frame(Frame::reply_err(cid, "", crate::error::ErrCode::Timeout, "relay expired"));
+                        }
+                    }
+                }
+            }
+        });
         // listen + accept 循环
         if let Some(bind) = self.config.bind {
             self.transport.listen(bind).await?;
@@ -335,6 +352,9 @@ impl RemoteActorSystem {
         let accept_task = tokio::spawn(async move {
             let peer_hs = HandshakeBody {
                 node_id: peer_sys.config.node_id.clone(),
+                capabilities: crate::handshake::caps::BIN | peer_sys.config.extra_caps,
+                topology_role: peer_sys.config.topology_role,
+                direct_addr: peer_sys.config.direct_addr.clone(),
                 ..Default::default()
             };
             let peer_in = peer_sys.inbound_tx.clone();
@@ -373,6 +393,8 @@ impl RemoteActorSystem {
         let my_hs = HandshakeBody {
             node_id: self.config.node_id.clone(),
             capabilities: crate::handshake::caps::BIN | self.config.extra_caps,
+            topology_role: self.config.topology_role,
+            direct_addr: self.config.direct_addr.clone(),
             ..Default::default()
         };
         let my_in = self.inbound_tx.clone();
@@ -419,10 +441,11 @@ impl RemoteActorSystem {
     async fn register_link(self: &Arc<Self>, conn: ConnectionHandle) {
         let status = Arc::new(NodeStatus::default());
         status.set(NodeState::Connected);
-        self.links
-            .lock()
-            .await
-            .push((conn.node_id.clone(), conn.sender.clone(), status.clone()));
+        self.links.write().unwrap().push((
+            conn.node_id.clone(),
+            conn.sender.clone(),
+            status.clone(),
+        ));
         // 星型 uplink 记录（07 §6）：对端角色是 hub/border → 此链路可做
         // 默认路由（目标不在直连表时经它中转）。多个 hub 取最新（hub
         // 主备是 P5 拓扑管理的职责）。
@@ -454,15 +477,37 @@ impl RemoteActorSystem {
         let mut closed = conn.closed;
         let node_id = conn.node_id.clone();
         let this = self.clone();
+        let closed_sender = conn.sender.clone();
         tokio::spawn(async move {
             let _ = (&mut closed).await;
             tracing::debug!(node = %node_id, "connection closed (register_link watcher)");
-            this.links.lock().await.retain(|(n, _, _)| n != &node_id);
+            status.set(NodeState::Disconnected);
+            let has_replacement = {
+                let mut links = this.links.write().unwrap();
+                links.retain(|(_, sender, _)| !sender.tx.same_channel(&closed_sender.tx));
+                links.iter().any(|(node, _, _)| node == &node_id)
+            };
+            // An old connection closing must not remove a newer connection
+            // or mark its node disconnected.
+            if has_replacement {
+                return;
+            }
+            for (_, cid, back) in this.ingress.relay_table.fail_target(&node_id) {
+                back.send_frame(Frame::reply_err(
+                    cid,
+                    "",
+                    crate::error::ErrCode::ConnectionLost,
+                    "relay target disconnected",
+                ));
+            }
             // 直拨地址随链路失效清除（节点重启换端口后由新握手重新声明）
             this.dial_addrs.lock().unwrap().remove(&node_id);
             // uplink 失效清理（该 hub 断连——读侧 try_send 失败自然兜底）
             let mut g = this.uplink.write().unwrap();
-            if g.as_ref().map(|s| s.node_id() == node_id).unwrap_or(false) {
+            if g.as_ref()
+                .map(|s| s.tx.same_channel(&closed_sender.tx))
+                .unwrap_or(false)
+            {
                 *g = None;
                 tracing::info!(node = %node_id, "uplink cleared");
             }
@@ -474,7 +519,7 @@ impl RemoteActorSystem {
 
     /// 已建链路快照（测试/诊断观测点——node_id + sender + 状态）。
     pub async fn links_snapshot(&self) -> Vec<(String, FrameSender, Arc<NodeStatus>)> {
-        self.links.lock().await.clone()
+        self.links.read().unwrap().clone()
     }
 
     /// 解析远程路径拿 ref（校验 parrot:// 前缀 + node 在表）。
@@ -488,9 +533,10 @@ impl RemoteActorSystem {
         let has_uplink = self.uplink.read().map(|g| g.is_some()).unwrap_or(false);
         let in_links = self
             .links
-            .try_lock()
-            .map(|g| g.iter().any(|(n, _, _)| n == node))
-            .unwrap_or(false);
+            .read()
+            .unwrap()
+            .iter()
+            .any(|(n, sender, _)| n == node && !sender.is_closed());
         if self.nodes.require(node).is_err() && !in_links && !has_uplink {
             return Err(RemoteError::UnknownNode(node.to_string()));
         }
@@ -509,22 +555,35 @@ impl RemoteActorSystem {
                 }
             }
         }
-        let links = self.links.try_lock();
-        let nodes = match links {
-            Ok(g) => g
-                .iter()
-                .map(|(n, s, st)| (n.clone(), s.clone(), st.clone()))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
         let inner = Arc::new(RemoteInner {
-            nodes,
+            nodes: Vec::new(),
+            system: Some(Arc::downgrade(self)),
             callbacks: self.callbacks.clone(),
             self_node: self.config.node_id.clone(),
             uplink: self.uplink.read().ok().and_then(|g| g.clone()),
-            seq_counters: Default::default(),
+            seq_counters: self.seq_counters.clone(),
         });
         Ok(RemoteActorRef::new(path, node, inner))
+    }
+
+    pub(crate) fn sender_of(&self, node: &str) -> Option<FrameSender> {
+        if *self.shutdown_tx.borrow() {
+            return None;
+        }
+        self.links
+            .read()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(id, sender, _)| id == node && !sender.is_closed())
+            .map(|(_, sender, _)| sender.clone())
+            .or_else(|| {
+                self.uplink
+                    .read()
+                    .unwrap()
+                    .clone()
+                    .filter(|s| !s.is_closed())
+            })
     }
 
     /// facade 三级路由的远程出口实现（parrot::RemoteGateway 注入面）。
@@ -624,8 +683,8 @@ impl RemoteActorSystem {
         self.admin_pending.insert(req_id, tx);
         let sender = self
             .links
-            .lock()
-            .await
+            .read()
+            .unwrap()
             .iter()
             .find(|(n, _, _)| n == node)
             .map(|(_, s, _)| s.clone())
@@ -678,8 +737,8 @@ impl RemoteActorSystem {
         self.admin_pending_v2.insert(req_id, tx);
         let sender = self
             .links
-            .lock()
-            .await
+            .read()
+            .unwrap()
             .iter()
             .find(|(n, _, _)| n == node)
             .map(|(_, s, _)| s.clone())
@@ -846,7 +905,7 @@ impl RemoteActorSystem {
 
     pub async fn shutdown(&self) -> Result<(), RemoteError> {
         let _ = self.shutdown_tx.send(true); // ConnectionTask 全部退出 → closed 信号 → links 清
-        self.links.lock().await.clear();
+        self.links.write().unwrap().clear();
         self.callbacks
             .fail_all(crate::error::ErrCode::ConnectionLost, "system shutdown");
         self.admin_pending_v2.fail_all("system shutdown");
@@ -1000,9 +1059,9 @@ struct SystemRelay {
 impl crate::ingress::RelayRouter for SystemRelay {
     fn sender_of(&self, node: &str) -> Option<crate::transport::FrameSender> {
         let sys = self.system.upgrade()?;
-        // try_lock：转发路径非阻塞（busy 时短暂 miss → RouteUnreachable
-        // 由上层语义兜底；避免 hub 转发把 ingress 循环挂死在锁上）
-        let g = sys.links.try_lock().ok()?;
+        // Registry critical sections contain no awaits. Contention must not
+        // turn an existing route into a spurious RouteUnreachable error.
+        let g = sys.links.read().unwrap();
         g.iter()
             .find(|(n, _, _)| n == node)
             .map(|(_, s, _)| s.clone())
@@ -1036,7 +1095,7 @@ impl crate::ingress::RelayRouter for SystemRelay {
         // 已有该节点直连链路 → 无需动作（新地址不同时也重拨：先移除旧链）
         let already = sys
             .links
-            .try_lock()
+            .read()
             .map(|g| g.iter().any(|(n, _, _)| n == node))
             .unwrap_or(false);
         if already {

@@ -536,9 +536,15 @@ impl From<ArtifactRef> for parrot_remote::admin_v2::AdminArtifactRef {
             ArtifactRef::Props { factory } => AdminArtifactRef::Props { factory },
             ArtifactRef::Wasm { digest, uri } => AdminArtifactRef::Wasm { digest, uri },
             ArtifactRef::Dylib { digest, uri, abi } => AdminArtifactRef::Dylib { digest, uri, abi },
-            ArtifactRef::Jvm { main_class, coords, uri } => {
-                AdminArtifactRef::Jvm { main_class, coords, uri }
-            }
+            ArtifactRef::Jvm {
+                main_class,
+                coords,
+                uri,
+            } => AdminArtifactRef::Jvm {
+                main_class,
+                coords,
+                uri,
+            },
             ArtifactRef::PyModule {
                 module,
                 runtime_env,
@@ -561,9 +567,15 @@ impl From<parrot_remote::admin_v2::AdminArtifactRef> for ArtifactRef {
             AdminArtifactRef::Props { factory } => ArtifactRef::Props { factory },
             AdminArtifactRef::Wasm { digest, uri } => ArtifactRef::Wasm { digest, uri },
             AdminArtifactRef::Dylib { digest, uri, abi } => ArtifactRef::Dylib { digest, uri, abi },
-            AdminArtifactRef::Jvm { main_class, coords, uri } => {
-                ArtifactRef::Jvm { main_class, coords, uri }
-            }
+            AdminArtifactRef::Jvm {
+                main_class,
+                coords,
+                uri,
+            } => ArtifactRef::Jvm {
+                main_class,
+                coords,
+                uri,
+            },
             AdminArtifactRef::PyModule {
                 module,
                 runtime_env,
@@ -604,7 +616,8 @@ mod tests {
             artifact: ArtifactRef::Props {
                 factory: format!("app.{name}"),
             },
-            alt_artifact: None,            instances: InstancePolicy::Singleton,
+            alt_artifact: None,
+            instances: InstancePolicy::Singleton,
             placement: PlacementConstraint::default(),
             upgrade: UpgradePolicy::default(),
             deps: vec![],
@@ -768,12 +781,17 @@ mod tests {
             ArtifactRef::Jvm {
                 main_class: "M".into(),
                 coords: None,
-             uri: None,},
+                uri: None,
+            },
             ArtifactRef::PyModule {
                 module: "m".into(),
                 runtime_env: None,
-             uri: None,},
-            ArtifactRef::Beam { app: "a".into() , uri: None,},
+                uri: None,
+            },
+            ArtifactRef::Beam {
+                app: "a".into(),
+                uri: None,
+            },
         ];
         let mut matched = 0;
         for e in engines {
@@ -880,7 +898,8 @@ mod tests {
                         digest: "abc".into(),
                         uri: "file:///a.wasm".into(),
                     },
-                    alt_artifact: None,                    instances: InstancePolicy::Sharded(4),
+                    alt_artifact: None,
+                    instances: InstancePolicy::Sharded(4),
                     placement: PlacementConstraint {
                         role: Some("hub".into()),
                         realm: None,
@@ -906,8 +925,10 @@ mod tests {
                     artifact: ArtifactRef::Jvm {
                         main_class: "Main".into(),
                         coords: Some("g:a:1".into()),
-                     uri: None,},
-                    alt_artifact: None,                    instances: InstancePolicy::Pool(3),
+                        uri: None,
+                    },
+                    alt_artifact: None,
+                    instances: InstancePolicy::Pool(3),
                     placement: Default::default(),
                     upgrade: UpgradePolicy::Recreate { state_snapshots: 2 },
                     deps: vec!["p".into()],
@@ -920,8 +941,10 @@ mod tests {
                     artifact: ArtifactRef::PyModule {
                         module: "m".into(),
                         runtime_env: Some(toml::Value::from(true)),
-                     uri: None,},
-                    alt_artifact: None,                    instances: InstancePolicy::Ephemeral,
+                        uri: None,
+                    },
+                    alt_artifact: None,
+                    instances: InstancePolicy::Ephemeral,
                     placement: Default::default(),
                     upgrade: UpgradePolicy::HotSwap {
                         drain_timeout_ms: 500,
@@ -935,8 +958,10 @@ mod tests {
                     engine: EngineKind::Erlang,
                     artifact: ArtifactRef::Beam {
                         app: "frontier".into(),
-                     uri: None,},
-                    alt_artifact: None,                    instances: InstancePolicy::Singleton,
+                        uri: None,
+                    },
+                    alt_artifact: None,
+                    instances: InstancePolicy::Singleton,
                     placement: Default::default(),
                     upgrade: UpgradePolicy::default(),
                     deps: vec![],
@@ -1073,15 +1098,20 @@ Props = { factory = "f" }
             ArtifactRef::Props {
                 factory: "f".into(),
             },
-            ArtifactRef::Beam { app: "a".into() , uri: None,},
+            ArtifactRef::Beam {
+                app: "a".into(),
+                uri: None,
+            },
             ArtifactRef::PyModule {
                 module: "m".into(),
                 runtime_env: None,
-             uri: None,},
+                uri: None,
+            },
             ArtifactRef::Jvm {
                 main_class: "M".into(),
                 coords: None,
-             uri: None,},
+                uri: None,
+            },
             ArtifactRef::Wasm {
                 digest: "d".into(),
                 uri: "u".into(),
@@ -1125,7 +1155,8 @@ Props = { factory = "f" }
                 .into_iter()
                 .collect(),
             )),
-         uri: None,};
+            uri: None,
+        };
         let wire: AdminArtifactRef = orig.clone().into();
         let back: ArtifactRef = wire.into();
         assert_eq!(back, orig, "toml 文本互转保真");
@@ -1186,9 +1217,13 @@ mod r5_tests {
         assert_eq!(crawler.alt_artifact.as_ref().unwrap().kind(), "wasm");
         // 三方言组件 uri 指向 app 内构建产物
         let f = m.components.iter().find(|c| c.name == "frontier").unwrap();
-        assert!(matches!(&f.artifact, ArtifactRef::Beam { uri: Some(u), .. } if u.contains("erlang/")));
+        assert!(
+            matches!(&f.artifact, ArtifactRef::Beam { uri: Some(u), .. } if u.contains("erlang/"))
+        );
         let i = m.components.iter().find(|c| c.name == "index").unwrap();
-        assert!(matches!(&i.artifact, ArtifactRef::PyModule { uri: Some(u), .. } if u.contains("python/")));
+        assert!(
+            matches!(&i.artifact, ArtifactRef::PyModule { uri: Some(u), .. } if u.contains("python/"))
+        );
         let s = m.components.iter().find(|c| c.name == "search").unwrap();
         assert!(matches!(&s.artifact, ArtifactRef::Jvm { uri: Some(u), .. } if u.contains(".jar")));
         validate(&m).unwrap();
@@ -1210,6 +1245,8 @@ mod r5_tests {
         let m2: AppManifest = toml::from_str(&out).unwrap();
         assert_eq!(m, m2);
         // uri 保留
-        assert!(matches!(m.components[0].artifact, ArtifactRef::Beam { ref uri, .. } if uri.is_some()));
+        assert!(
+            matches!(m.components[0].artifact, ArtifactRef::Beam { ref uri, .. } if uri.is_some())
+        );
     }
 }

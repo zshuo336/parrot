@@ -24,6 +24,18 @@ pub struct CallbackRegistry {
     capacity: usize,
 }
 
+/// Removes an outstanding callback on success, error, timeout, or cancellation.
+pub(crate) struct PendingCallback<'a> {
+    registry: &'a CallbackRegistry,
+    cid: u64,
+}
+
+impl Drop for PendingCallback<'_> {
+    fn drop(&mut self) {
+        self.registry.remove(self.cid);
+    }
+}
+
 impl Default for CallbackRegistry {
     fn default() -> Self {
         Self::new(65536)
@@ -57,6 +69,13 @@ impl CallbackRegistry {
         }
         g.insert(cid, (tx, node.into()));
         Ok(())
+    }
+
+    pub(crate) fn guard(&self, cid: u64) -> PendingCallback<'_> {
+        PendingCallback {
+            registry: self,
+            cid,
+        }
     }
 
     pub fn remove(&self, cid: u64) -> bool {

@@ -367,7 +367,8 @@ mod tests {
             artifact: ArtifactRef::Props {
                 factory: format!("f-{name}"),
             },
-            alt_artifact: None,            instances: InstancePolicy::Singleton,
+            alt_artifact: None,
+            instances: InstancePolicy::Singleton,
             placement: Default::default(),
             upgrade: Default::default(),
             deps: vec![],
@@ -714,8 +715,14 @@ mod tests {
                 },
             ),
             (
-                mk(ArtifactRef::Beam { app: "app1".into(), uri: None }),
-                A::Beam { app: "app1".into(), uri: None },
+                mk(ArtifactRef::Beam {
+                    app: "app1".into(),
+                    uri: None,
+                }),
+                A::Beam {
+                    app: "app1".into(),
+                    uri: None,
+                },
             ),
         ];
         for (spec, want) in cases {

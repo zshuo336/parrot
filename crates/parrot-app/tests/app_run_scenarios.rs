@@ -441,7 +441,16 @@ async fn scenario_jvm_gateway_real_subprocess() {
         components: vec![comp(
             "search",
             EngineKind::Akka,
-            ArtifactRef::Jvm { main_class: "crawler.search.SearchComponent".into(), coords: None, uri: Some(format!("file://{}", repo_root().join("apps/crawler-lab/jvm/target/crawler-lab-jvm-1.0.0.jar").display())) },
+            ArtifactRef::Jvm {
+                main_class: "crawler.search.SearchComponent".into(),
+                coords: None,
+                uri: Some(format!(
+                    "file://{}",
+                    repo_root()
+                        .join("apps/crawler-lab/jvm/target/crawler-lab-jvm-1.0.0.jar")
+                        .display()
+                )),
+            },
         )],
         wiring: vec![],
         config_overlay: None,
@@ -508,7 +517,10 @@ async fn scenario_failure_kills_gateway_procs() {
             comp(
                 "erl1",
                 EngineKind::Erlang,
-                ArtifactRef::Beam { app: "frontier".into(), uri: None },
+                ArtifactRef::Beam {
+                    app: "frontier".into(),
+                    uri: None,
+                },
             ),
             comp(
                 "bad",

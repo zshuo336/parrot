@@ -201,7 +201,7 @@ pub enum AdminReplyV2 {
 /// 单节点指标快照（四方言网关同构产出——观测五件套 P1）。
 ///
 /// 计数器全为「进程启动以来累计」；速率由探针侧两次采样差分计算。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MetricsSnapshot {
     /// 采集时刻（unix 毫秒——网关侧时钟）。
     pub ts_ms: u64,
@@ -241,30 +241,6 @@ pub struct MetricsSnapshot {
     pub memory_rss: u64,
     /// 网关启动时刻（unix 毫秒——0=未知）。
     pub uptime_start_ms: u64,
-}
-
-impl Default for MetricsSnapshot {
-    fn default() -> Self {
-        Self {
-            ts_ms: 0,
-            runtime: String::new(),
-            connections: 0,
-            handshakes_ok: 0,
-            handshakes_failed: 0,
-            asks_rx: 0,
-            tells_rx: 0,
-            replies_tx: 0,
-            reply_errs: 0,
-            bytes_rx: 0,
-            bytes_tx: 0,
-            heartbeats_rx: 0,
-            components: 0,
-            component_states: Vec::new(),
-            processes: 0,
-            memory_rss: 0,
-            uptime_start_ms: 0,
-        }
-    }
 }
 
 impl MetricsSnapshot {
@@ -983,9 +959,9 @@ mod tests {
         assert_eq!(bytes[0], sys_event_tag::ADMIN_CMD_V2);
         assert_eq!(bytes[1], 0x04); // 变体索引 4（第五命令）
         match crate::admin::decode_sys_event(&bytes).unwrap() {
-            crate::admin::SysEvent::AdminCommandV2(AdminCommandV2::MetricsReport {
-                req_id,
-            }) => assert_eq!(req_id, 42),
+            crate::admin::SysEvent::AdminCommandV2(AdminCommandV2::MetricsReport { req_id }) => {
+                assert_eq!(req_id, 42)
+            }
             other => panic!("wrong: {other:?}"),
         }
     }

@@ -78,6 +78,22 @@ test("pipeline two frames", () => {
   assert.ok(detail.includes("route"));
 });
 
+test("malformed lengths and exhausted hop are rejected without overread", () => {
+  const dec = new FrameDecoder();
+  const bad = new Uint8Array(4 + 28);
+  new DataView(bad.buffer).setUint32(0, 28, true);
+  bad[4] = 1;
+  bad[5] = FT.TELL;
+  bad[17] = 8;
+  new DataView(bad.buffer).setUint32(24, 1, true);
+  assert.throws(() => { dec.feed(bad); dec.nextFrame(); }, /invalid path length/);
+
+  const exhausted = buildFrame(FT.TELL, 1n, "/x", "k", new Uint8Array(), 0, 8, 8);
+  const d2 = new FrameDecoder();
+  d2.feed(exhausted);
+  assert.throws(() => d2.nextFrame(), /hop limit exceeded/);
+});
+
 test("handshake tlv: mandatory fields + chosen codec pb", () => {
   const body = handshakeAckBody("ts-lite-1");
   const tags = parseTlv(body).map(([t]) => t);

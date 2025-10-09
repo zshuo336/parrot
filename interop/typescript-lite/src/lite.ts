@@ -171,7 +171,7 @@ export class ParrotLite {
     if (ft === FT.HANDSHAKE_ACK) {
       this.backoffMs = 1000; // 重连成功重置
       // 重注册（幂等 upsert——云端 (node_id,key,path) 主键）。
-      // 快照遍历：register 会 push registrations——直接迭代会自增长死循环
+      // register keeps one entry per (key, path), including across reconnects.
       for (const r of [...this.registrations]) {
         void this.register(r.key, r.path).catch(() => {});
       }
@@ -236,7 +236,9 @@ export class ParrotLite {
 
   /** receptionist 注册（断线重连自动重注册）。 */
   async register(key: string, path: string, _meta?: Record<string, unknown>): Promise<void> {
-    this.registrations.push({ key, path });
+    if (!this.registrations.some((r) => r.key === key && r.path === path)) {
+      this.registrations.push({ key, path });
+    }
     // TELL 形式的注册事件（桥/gateway 侧约定 type_key）
     this.send(buildFrame(FT.TELL, newCid(), path, `$receptionist.register:${key}`, new Uint8Array(0)));
   }

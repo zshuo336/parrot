@@ -82,7 +82,7 @@ help: ## 显示本帮助
 	@echo "  fast          debug workspace 全量（默认）"
 	@echo "  full          debug 全量 + release 阈值 + ignored 压测 + lint"
 	@echo "  stress        只跑压测（release --include-ignored）"
-	@echo "  polyglot      TS + Python + JVM + Erlang + C++（缺工具链自动 SKIP）"
+	@echo "  polyglot      TS + Python + JVM + Erlang + C++（缺工具链失败）"
 	@echo "  full-polyglot full + polyglot"
 	@echo ""
 	@echo "裁剪变量：CRATE= FEATURE= RELEASE=1 V=1 N=4 EXTRA=\"--nocapture\""
@@ -97,7 +97,7 @@ help: ## 显示本帮助
 # cargo 参数拼接（空值自然消失）
 CARGO_SCOPE := $(if $(CRATE),-p $(CRATE),)
 CARGO_FEAT  := $(if $(FEATURE),--features $(FEATURE),)
-CARGO_REL   := $(if $(filter $(RELEASE),1),--release,)
+CARGO_REL   := $(if $(or $(filter 1,$(RELEASE)),$(filter release,$(MODE))),--release,)
 CARGO_VERB  := $(if $(filter $(V),1),-v,)
 TEST_THREADS := $(if $(N),--test-threads=$(N),)
 
@@ -156,7 +156,7 @@ endif
 # ---- 快速模式：debug 单测+集成（日常默认）---------------------------------
 test-fast: build
 	$(CARGO) test $(CARGO_SCOPE) $(CARGO_FEAT) $(CARGO_REL) $(CARGO_VERB) -- $(TEST_THREADS) $(EXTRA)
-	@echo "✓ 快速模式完成（debug workspace 测试）"
+	@echo "✓ 快速模式完成（当前 scope/profile 测试）"
 
 # ---- 全模式：debug 全量 + release 阈值 + ignored 压测 + lint ---------------
 test-full: test-fast lint
@@ -173,23 +173,23 @@ test-stress:
 	$(CARGO) test --release $(CARGO_SCOPE) $(CARGO_FEAT) --lib --bins --tests -- --include-ignored $(TEST_THREADS) $(EXTRA)
 	@echo "✓ 压测模式完成（release --include-ignored；doc-tests 由 fast/full 覆盖——ignore 示例不参与压测语义）"
 
-# ---- 多语言模式：TS + Python + JVM + Erlang + C++（缺工具链 SKIP）----------
+# ---- 多语言模式：TS + Python + JVM + Erlang + C++（缺工具链失败）----------
 test-polyglot: check-ts check-py check-jvm check-erl check-cpp
 	@echo "✓ 多语言模式完成（TS/Python/JVM/Erlang/C++）"
 
 # ---- 五运行时全链集成场景（crawler-lab：大规模爬虫+索引+Web 检索）----------
-# 依赖齐备才跑（erl/java/python+ray/node）；缺项跳过并提示。
-LAB_SCRIPT := deploy/crawler-lab/run-lab.sh
+# 验收入口：依赖缺失即失败，不把未执行当作通过。
+LAB_SCRIPT := apps/crawler-lab/deploy/run-lab.sh
 test-lab:
 	@if [ -x "$(LAB_SCRIPT)" ] && command -v erl >/dev/null 2>&1 \
 	   && command -v java >/dev/null 2>&1 && command -v node >/dev/null 2>&1 \
 	   && python3 -c "import ray" >/dev/null 2>&1; then \
 		$(CARGO) build -p crawler-lab $(CARGO_Q) ; \
 		./$(LAB_SCRIPT) --pages 200 --depth 2 --fanout 3 --batch 32 ; \
+		echo "✓ 五运行时全链场景通过（Erlang+Rust+Ray+Akka+TS-Lite）" ; \
 	else \
-		echo "==> [lab] 跳过（需 erl+java+node+python3/ray 工具链）" ; \
+		echo "ERROR: lab requires $(LAB_SCRIPT), erl, java, node and python3/ray" >&2 ; exit 1 ; \
 	fi
-	@echo "✓ 五运行时全链场景完成（Erlang+Rust+Ray+Akka+TS-Lite）"
 
 test-full-polyglot: test-full test-polyglot
 	@echo "✓ 全模式 + 多语言完成"
@@ -215,13 +215,13 @@ erl:
 cpp: build-cpp
 	cd $(CPP_DIR)/bin && ./test_vectors && ./test_interop
 
-# check-*：polyglot 聚合用；缺工具链时 SKIP（打印提示），装了则必须通过
+# check-*：polyglot 聚合用；工具链缺失或任何测试失败均失败
 check-ts:
 	@if command -v npm >/dev/null 2>&1; then \
 		echo "==> [npm] TypeScript lite 测试"; \
 		(cd $(TS_DIR) && npm test); \
 	else \
-		echo "==> [npm] SKIP：未安装 npm"; \
+		echo "==> [npm] ERROR：未安装 npm" >&2; exit 1; \
 	fi
 
 check-py:
@@ -229,7 +229,7 @@ check-py:
 		echo "==> [python3] pytest 协议向量测试"; \
 		(cd $(PY_DIR) && python3 -m pytest tests/ -q); \
 	else \
-		echo "==> [python3] SKIP：未安装 python3"; \
+		echo "==> [python3] ERROR：未安装 python3" >&2; exit 1; \
 	fi
 
 check-jvm:
@@ -237,7 +237,7 @@ check-jvm:
 		echo "==> [mvn] JVM 协议测试"; \
 		(cd $(JVM_DIR) && mvn -q -s settings-central.xml test); \
 	else \
-		echo "==> [mvn] SKIP：未安装 mvn"; \
+		echo "==> [mvn] ERROR：未安装 mvn" >&2; exit 1; \
 	fi
 
 check-erl:
@@ -245,7 +245,7 @@ check-erl:
 		echo "==> [erl] Erlang 网关 wire 测试"; \
 		(cd $(ERL_DIR) && $(ERL_RUN)); \
 	else \
-		echo "==> [erl] SKIP：未安装 Erlang"; \
+		echo "==> [erl] ERROR：未安装 Erlang" >&2; exit 1; \
 	fi
 
 check-cpp:
@@ -254,7 +254,7 @@ check-cpp:
 		$(MAKE) --no-print-directory build-cpp; \
 		(cd $(CPP_DIR)/bin && ./test_vectors && ./test_interop); \
 	else \
-		echo "==> [clang++] SKIP：未安装 clang++"; \
+		echo "==> [clang++] ERROR：未安装 clang++" >&2; exit 1; \
 	fi
 
 # ══════════════════════════════════════════════════════════════════════════

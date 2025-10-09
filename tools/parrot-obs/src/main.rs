@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parrot_remote::{LocalLookup, NodeAddr, RemoteActorSystem, RemoteConfig};
-use parrot_remote::admin_v2::MetricsSnapshot;
 use parrot_api::address::ActorRef as _;
+use parrot_remote::admin_v2::MetricsSnapshot;
+use parrot_remote::{LocalLookup, NodeAddr, RemoteActorSystem, RemoteConfig};
 
 /// 纯客户端形态（不接收外部 actor 寻址——LocalLookup 返回 None）。
 struct NoopLookup;
@@ -126,7 +126,9 @@ fn parse_nodes(args: &[String]) -> Vec<NodeSpec> {
     let mut out = Vec::new();
     for a in args {
         for token in a.split(|c: char| c == ',' || c.is_whitespace()) {
-            let Some((k, v)) = token.split_once('=') else { continue };
+            let Some((k, v)) = token.split_once('=') else {
+                continue;
+            };
             if !["erl", "ray", "jvm"].contains(&k) {
                 continue;
             }
@@ -155,7 +157,10 @@ async fn connect(nodes: &[NodeSpec]) -> anyhow::Result<Arc<RemoteActorSystem>> {
         let addr = match n.addr.parse() {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("⚠ 节点 {}={} 地址非法（期望 host:port）：{e}——跳过", n.name, n.addr);
+                eprintln!(
+                    "⚠ 节点 {}={} 地址非法（期望 host:port）：{e}——跳过",
+                    n.name, n.addr
+                );
                 continue;
             }
         };
@@ -195,7 +200,7 @@ fn uptime_hms(s: u64) -> String {
 /// 单节点一行摘要。
 fn status_line(name: &str, m: &MetricsSnapshot) -> String {
     format!(
-        "{:<14} {:<18} up {:>10}  conn={} asks={} replies={} err={} io={} rss={}",
+        "{:<14} {:<18} up {:>10}  conn={} asks={} replies={} err={} io={}/{} rss={}",
         name,
         m.runtime,
         uptime_hms(m.uptime_secs()),
@@ -203,7 +208,8 @@ fn status_line(name: &str, m: &MetricsSnapshot) -> String {
         m.asks_rx,
         m.replies_tx,
         m.reply_errs,
-        format!("{}/{}", human_bytes(m.bytes_rx), human_bytes(m.bytes_tx)),
+        human_bytes(m.bytes_rx),
+        human_bytes(m.bytes_tx),
         human_bytes(m.memory_rss),
     )
 }
@@ -217,7 +223,16 @@ fn metrics_table(rows: &[(String, MetricsSnapshot)]) -> String {
     ));
     out.push_str(&format!(
         "│{:<14}│{:<18}│{:>9}│{:>9}│{:>9}│{:>9}│{:>11}│{:>11}│{:>9}│{:>9}│\n",
-        "节点", "运行时", "uptime", "conn", "asks", "tells", "bytes_rx", "bytes_tx", "replies", "errs"
+        "节点",
+        "运行时",
+        "uptime",
+        "conn",
+        "asks",
+        "tells",
+        "bytes_rx",
+        "bytes_tx",
+        "replies",
+        "errs"
     ));
     for (name, m) in rows {
         out.push_str(&format!(
@@ -241,12 +256,12 @@ fn metrics_table(rows: &[(String, MetricsSnapshot)]) -> String {
     // 组件明细
     for (name, m) in rows {
         if !m.component_states.is_empty() {
-            out.push_str(&format!("\n[{name}] 组件 ({}):\n", m.component_states.len()));
+            out.push_str(&format!(
+                "\n[{name}] 组件 ({}):\n",
+                m.component_states.len()
+            ));
             for c in &m.component_states {
-                out.push_str(&format!(
-                    "  {:<40} {:<10} {}\n",
-                    c.path, c.state, c.version
-                ));
+                out.push_str(&format!("  {:<40} {:<10} {}\n", c.path, c.state, c.version));
             }
         }
     }
@@ -254,8 +269,12 @@ fn metrics_table(rows: &[(String, MetricsSnapshot)]) -> String {
 }
 
 /// 两次快照差分 → 速率表（trace 子命令）。
-fn rates_table(before: &[(String, MetricsSnapshot)], after: &[(String, MetricsSnapshot)], secs: f64) -> String {
-    let mut out = String::from(format!("\n≈ {secs:.1}s 差分速率：\n"));
+fn rates_table(
+    before: &[(String, MetricsSnapshot)],
+    after: &[(String, MetricsSnapshot)],
+    secs: f64,
+) -> String {
+    let mut out = format!("\n≈ {secs:.1}s 差分速率：\n");
     out.push_str(&format!(
         "{:<14}{:>12}{:>12}{:>14}{:>14}{:>12}\n",
         "节点", "asks/s", "tells/s", "rx/s", "tx/s", "hb/s"
@@ -274,7 +293,12 @@ fn rates_table(before: &[(String, MetricsSnapshot)], after: &[(String, MetricsSn
         };
         out.push_str(&format!(
             "{:<14}{:>12.1}{:>12.1}{:>14}{:>14}{:>12.1}\n",
-            n, asks, tells, human_bytes(rx as u64), human_bytes(tx as u64), hb
+            n,
+            asks,
+            tells,
+            human_bytes(rx as u64),
+            human_bytes(tx as u64),
+            hb
         ));
     }
     out
@@ -289,10 +313,7 @@ async fn collect_all(
     let mut out = Vec::new();
     for n in nodes {
         let r = client.metrics_report(&n.name).await;
-        out.push((
-            n.name.clone(),
-            r.map_err(|e| format!("{e:?}")),
-        ));
+        out.push((n.name.clone(), r.map_err(|e| format!("{e:?}"))));
     }
     out
 }
@@ -312,12 +333,18 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 }
 
 fn flag_num(args: &[String], name: &str, default: u64) -> u64 {
-    flag(args, name).and_then(|v| v.parse().ok()).unwrap_or(default)
+    flag(args, name)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 // ───────────────────────── Web 控制台 ─────────────────────────
 
-async fn serve_web(client: Arc<RemoteActorSystem>, nodes: Vec<NodeSpec>, port: u16) -> anyhow::Result<()> {
+async fn serve_web(
+    client: Arc<RemoteActorSystem>,
+    nodes: Vec<NodeSpec>,
+    port: u16,
+) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
@@ -347,10 +374,18 @@ async fn serve_web(client: Arc<RemoteActorSystem>, nodes: Vec<NodeSpec>, port: u
                             },
                         );
                     }
-                    ("200 OK".into(), "application/json".into(), serde_json::to_string(&arr).unwrap())
+                    (
+                        "200 OK",
+                        "application/json",
+                        serde_json::to_string(&arr).unwrap(),
+                    )
                 }
-                "/" | "/index.html" => ("200 OK".into(), "text/html; charset=utf-8".into(), DASHBOARD_HTML.to_string()),
-                _ => ("404 Not Found".into(), "text/plain".into(), "not found".into()),
+                "/" | "/index.html" => (
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    DASHBOARD_HTML.to_string(),
+                ),
+                _ => ("404 Not Found", "text/plain", "not found".into()),
             };
             let resp = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -446,7 +481,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().cloned().unwrap_or_else(|| "help".into());
-    let rest: Vec<String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).cloned().collect();
+    let rest: Vec<String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
     let nodes = parse_nodes(&rest);
     if nodes.is_empty() {
         eprintln!("parrot-obs {cmd}：未给节点（erl=… ray=… jvm=… 至少一个）");
@@ -500,7 +540,7 @@ async fn main() -> anyhow::Result<()> {
                 for i in 0..rounds {
                     let t = Instant::now();
                     match client.remote_ref(&path) {
-                        Ok(r) => match r.send(Box::new(ProbePing(i as u64))).await {
+                        Ok(r) => match r.send(Box::new(ProbePing(i))).await {
                             Ok(_) => print!(" ✓{:>4}ms", t.elapsed().as_millis()),
                             Err(e) => print!(" ERR({e}) "),
                         },
@@ -600,7 +640,10 @@ async fn main() -> anyhow::Result<()> {
                 if all_lat.is_empty() {
                     "—".into()
                 } else {
-                    format!("{:.2}ms", all_lat[((all_lat.len() as f64 - 1.0) * q) as usize] as f64 / 1000.0)
+                    format!(
+                        "{:.2}ms",
+                        all_lat[((all_lat.len() as f64 - 1.0) * q) as usize] as f64 / 1000.0
+                    )
                 }
             };
             println!(

@@ -1,0 +1,11 @@
+**/target
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+.git
+.metals
+.scala-build
+.vscode
+.codex
+.claude
+*.tar

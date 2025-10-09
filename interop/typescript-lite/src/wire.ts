@@ -12,13 +12,15 @@
  */
 
 export const WIRE_VERSION = 1;
+export const MAX_FRAME_LEN = 16 * 1024 * 1024;
+const BODY_FIXED_OVERHEAD = 28;
 
 export const FT = {
   HANDSHAKE: 0x01,
   HANDSHAKE_ACK: 0x02,
   HEARTBEAT: 0x03,
   HEARTBEAT_ACK: 0x04,
-  SYSTEM_EVENT: 0x05,
+  SYSTEM_EVENT: 0x20,
   ASK: 0x10,
   REPLY: 0x11,
   REPLY_ERR: 0x12,
@@ -52,7 +54,8 @@ export function buildFrame(
 ): Uint8Array {
   const pathB = enc.encode(path);
   const keyB = enc.encode(typeKey);
-  const bodyLen = 28 + pathB.length + keyB.length + payload.length;
+  const bodyLen = BODY_FIXED_OVERHEAD + pathB.length + keyB.length + payload.length;
+  if (bodyLen > MAX_FRAME_LEN) throw new Error(`frame too large: ${bodyLen}`);
   const out = new Uint8Array(4 + bodyLen);
   const dv = new DataView(out.buffer);
   dv.setUint32(0, bodyLen, true);
@@ -100,6 +103,8 @@ export class FrameDecoder {
     }
     const dv = new DataView(this.buf.buffer, this.buf.byteOffset);
     const bodyLen = dv.getUint32(this.pos, true);
+    if (bodyLen < BODY_FIXED_OVERHEAD) throw new Error(`invalid frame length ${bodyLen}`);
+    if (bodyLen > MAX_FRAME_LEN) throw new Error(`frame too large: ${bodyLen}`);
     if (avail < 4 + bodyLen) {
       this.compact();
       return null;
@@ -113,10 +118,14 @@ export class FrameDecoder {
     const cid = bdv.getBigUint64(4, true);
     const hopCount = bdv.getUint8(12);
     const hopLimit = bdv.getUint8(13);
+    if (hopLimit === 0 || hopCount >= hopLimit) throw new Error(`hop limit exceeded ${hopCount}/${hopLimit}`);
     const pathLen = bdv.getUint32(20, true);
+    if (pathLen > bodyLen - BODY_FIXED_OVERHEAD) throw new Error(`invalid path length ${pathLen}`);
     const path = dec.decode(body.subarray(24, 24 + pathLen));
     const keyOff = 24 + pathLen;
+    if (keyOff + 4 > bodyLen) throw new Error("missing type key length");
     const keyLen = bdv.getUint32(keyOff, true);
+    if (keyLen > bodyLen - BODY_FIXED_OVERHEAD - pathLen) throw new Error(`invalid type key length ${keyLen}`);
     const typeKey = dec.decode(body.subarray(keyOff + 4, keyOff + 4 + keyLen));
     const payload = body.slice(keyOff + 4 + keyLen);
     this.pos += 4 + bodyLen;

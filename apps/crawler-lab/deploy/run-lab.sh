@@ -17,7 +17,7 @@
 #  依赖：erl / java(mvn jar) / python3+ray / node / cargo build -p crawler-lab
 # ============================================================================
 set -uo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
 ROOT="$PWD"
 
 LAB_MODE="${LAB_MODE:-direct}"
@@ -31,8 +31,7 @@ trap cleanup EXIT INT TERM
 if [ "$LAB_MODE" = "registry" ]; then
   # ══════════ 模式 B：registry（网关主动注册到应用）══════════
   echo "==> [registry] 先起应用（监听 :$APP_PORT，等待网关注册）"
-  BIN=./target/release/crawler-lab
-  [ -x "$BIN" ] || BIN=./target/debug/crawler-lab
+  BIN="${PARROT_LAB_BIN:-./target/debug/crawler-lab}"
   "$BIN" --bind 0.0.0.0:$APP_PORT --wait 60 "$@" > /tmp/lab_app.out 2>&1 &
   APP_PID=$!
   PIDS+=("$APP_PID")
@@ -104,8 +103,7 @@ fi
 echo "    三网关就绪（erl:19861 jvm:19862 ray:19863）"
 
 echo "==> [4/5] Rust 应用（apps/crawler-lab——爬取→双路索引→搜索验证）"
-BIN=./target/release/crawler-lab
-[ -x "$BIN" ] || BIN=./target/debug/crawler-lab
+BIN="${PARROT_LAB_BIN:-./target/debug/crawler-lab}"
 "$BIN" erl=127.0.0.1:19861 ray=127.0.0.1:19863 jvm=127.0.0.1:19862 "$@"
 rc=$?
 

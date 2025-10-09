@@ -15,12 +15,13 @@ use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use crate::codec_registry::CodecRegistry;
 use crate::error::ErrCode;
 use crate::frame::Frame;
-use crate::node::{NodeState, NodeStatus};
+use crate::node::NodeStatus;
 use crate::registry::{CallbackRegistry, ReplyPayload};
 use crate::transport::FrameSender;
 
 /// 远程 ref 共享内核。
 pub struct RemoteInner {
+    pub(crate) system: Option<std::sync::Weak<crate::system::RemoteActorSystem>>,
     pub nodes: Vec<(String, FrameSender, Arc<NodeStatus>)>,
     pub callbacks: Arc<CallbackRegistry>,
     pub self_node: String,
@@ -30,7 +31,7 @@ pub struct RemoteInner {
     /// 端到端 TELL 序号分配（per 目标节点单调递增，从 1 起；跨路径切换
     /// 连续——接收端据此重排。外层 Mutex 简单正确：临界区仅查表+自增，
     /// 无 await；高并发 TELL 热点可换 sharded，当前压测未见瓶颈）。
-    pub(crate) seq_counters: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    pub(crate) seq_counters: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
 }
 
 impl RemoteInner {
@@ -46,12 +47,15 @@ impl RemoteInner {
         *c
     }
     /// 出站链路：按 node_id 查（P1 单链路；fail-over 是 P2 重连任务职责）。
-    fn sender_of(&self, node_id: &str) -> Option<&FrameSender> {
+    fn sender_of(&self, node_id: &str) -> Option<FrameSender> {
+        if let Some(system) = &self.system {
+            return system.upgrade()?.sender_of(node_id);
+        }
         self.nodes
             .iter()
-            .find(|(n, _, _)| n == node_id)
-            .map(|(_, s, _)| s)
-            .or(self.uplink.as_ref())
+            .find(|(n, sender, _)| n == node_id && !sender.is_closed())
+            .map(|(_, s, _)| s.clone())
+            .or_else(|| self.uplink.clone().filter(|s| !s.is_closed()))
     }
 }
 
@@ -129,44 +133,35 @@ impl ActorRef for RemoteActorRef {
                 .callbacks
                 .insert(cid, self.node_id.clone(), tx)
                 .map_err(|e| e.to_actor_error())?;
-            // 3. 发帧（reply_to = 系统回程路径，05 §5.1）
-            let sender = self
-                .inner
-                .sender_of(&self.node_id)
-                .ok_or_else(|| {
-                    self.inner.callbacks.remove(cid);
+            let _pending = self.inner.callbacks.guard(cid);
+            // The deadline covers queue admission as well as the reply. The
+            // guard also runs when a caller drops this future at either await.
+            let request = async {
+                let sender = self.inner.sender_of(&self.node_id).ok_or_else(|| {
                     ActorError::InternalError(format!(
                         "remote link to {} unavailable",
                         self.node_id
                     ))
-                })?
-                .clone();
-            let reply_to = format!("parrot://{}/_remote/reply", self.inner.self_node);
-            let frame = Frame::ask(cid, &self.path, &key, payload, Some(&reply_to));
-            if let Err(e) = sender.send(frame).await {
-                self.inner.callbacks.remove(cid);
-                return Err(ErrCode::ConnectionLost.to_actor_error(e.to_string()));
-            }
-            // 4. 等回包（无界 / 带超时——ADR-10）
+                })?;
+                let reply_to = format!("parrot://{}/_remote/reply", self.inner.self_node);
+                let frame = Frame::ask(cid, &self.path, &key, payload, Some(&reply_to));
+                sender
+                    .send(frame)
+                    .await
+                    .map_err(|e| ErrCode::ConnectionLost.to_actor_error(e.to_string()))?;
+                let reply = rx.await.map_err(|_| {
+                    ErrCode::ConnectionLost.to_actor_error("connection lost".into())
+                })?;
+                self.reply_to_result(reply)
+            };
             match timeout {
-                None => match rx.await {
-                    Ok(p) => self.reply_to_result(p),
-                    Err(_) => Err(ErrCode::ConnectionLost.to_actor_error("connection lost".into())),
-                },
-                Some(d) => match tokio::time::timeout(d, rx).await {
-                    Ok(Ok(p)) => self.reply_to_result(p),
-                    Ok(Err(_)) => {
-                        Err(ErrCode::ConnectionLost.to_actor_error("connection lost".into()))
-                    }
-                    Err(_) => {
-                        // 调用方放弃：清回调；迟到 REPLY 查表 miss → metric drop（RC4）
-                        self.inner.callbacks.remove(cid);
-                        Err(ActorError::TimeoutDetail(format!(
-                            "remote ask {} after {:?}",
-                            self.path, d
-                        )))
-                    }
-                },
+                None => request.await,
+                Some(d) => tokio::time::timeout(d, request).await.unwrap_or_else(|_| {
+                    Err(ActorError::TimeoutDetail(format!(
+                        "remote ask {} after {:?}",
+                        self.path, d
+                    )))
+                }),
             }
         })
     }
@@ -177,14 +172,18 @@ impl ActorRef for RemoteActorRef {
             let sender = self.inner.sender_of(&self.node_id).ok_or_else(|| {
                 ActorError::InternalError(format!("remote link to {} unavailable", self.node_id))
             })?;
+            // Reserve queue space before allocating a sequence. Cancellation
+            // during backpressure must not create a missing sequence number.
+            let permit = sender
+                .tx
+                .reserve()
+                .await
+                .map_err(|_| ErrCode::ConnectionLost.to_actor_error("writer dropped".into()))?;
             // 端到端 seq（per 目标节点单调递增）：接收端 TELL 重排用。
             // 分配与入队同线程紧邻（先取号再 send），原子计数保证唯一性；
             // 极端并发下 33 先于 32 入队由接收端重排兜底。
             let seq = self.inner.next_seq(self.node_id.clone());
-            sender
-                .send(Frame::tell_with_seq(&self.path, &key, payload, seq))
-                .await
-                .map_err(|e| ErrCode::ConnectionLost.to_actor_error(e.to_string()))?;
+            permit.send(Frame::tell_with_seq(&self.path, &key, payload, seq));
             Ok(())
         })
     }
@@ -207,15 +206,7 @@ impl ActorRef for RemoteActorRef {
     }
 
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-        // 弱一致：NodeTable 状态 == Connected（DEV_01 §8.9 明示）
-        Box::pin(async move {
-            self.inner
-                .nodes
-                .iter()
-                .find(|(n, _, _)| n == &self.node_id)
-                .map(|(_, _, st)| st.get() == NodeState::Connected)
-                .unwrap_or(false)
-        })
+        Box::pin(async move { self.inner.sender_of(&self.node_id).is_some() })
     }
 
     fn clone_boxed(&self) -> BoxedActorRef {
@@ -230,6 +221,7 @@ impl ActorRef for RemoteActorRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::NodeState;
 
     fn test_inner_with_sender() -> (Arc<RemoteInner>, tokio::sync::mpsc::Receiver<Frame>) {
         let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(16);
@@ -237,6 +229,7 @@ mod tests {
         status.set(NodeState::Connected);
         (
             Arc::new(RemoteInner {
+                system: None,
                 nodes: vec![("n1".into(), crate::transport::FrameSender::anon(tx), status)],
                 callbacks: Arc::new(CallbackRegistry::new(8)),
                 self_node: "self".into(),
@@ -251,6 +244,7 @@ mod tests {
     #[tokio::test]
     async fn ref_notremotable_local() {
         let inner = Arc::new(RemoteInner {
+            system: None,
             nodes: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new(8)),
             self_node: "test".into(),
@@ -270,6 +264,7 @@ mod tests {
     #[tokio::test]
     async fn ref_no_link_errors() {
         let inner = Arc::new(RemoteInner {
+            system: None,
             nodes: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new(8)),
             self_node: "test".into(),
@@ -343,12 +338,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelled_ask_cleans_callback_at_both_awaits() {
+        for full in [false, true] {
+            let (inner, _rx) = test_inner_with_sender();
+            let r = RemoteActorRef::new("/x", "n1", inner.clone());
+            if full {
+                for _ in 0..16 {
+                    inner.nodes[0].1.send(Frame::heartbeat()).await.unwrap();
+                }
+            }
+            assert!(tokio::time::timeout(
+                Duration::from_millis(10),
+                r.send(Box::new(crate::ingress::TestAsk(1)))
+            )
+            .await
+            .is_err());
+            assert!(
+                inner.callbacks.is_empty(),
+                "external cancellation leaked a slot, full={full}"
+            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                r.send_with_timeout(
+                    Box::new(crate::ingress::TestAsk(2)),
+                    Some(Duration::from_millis(10)),
+                ),
+            )
+            .await
+            .expect("queue admission must respect ask deadline");
+            assert!(matches!(result, Err(ActorError::TimeoutDetail(_))));
+            assert!(inner.callbacks.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_tell_does_not_allocate_a_sequence() {
+        let (inner, mut rx) = test_inner_with_sender();
+        let reference = RemoteActorRef::new("/x", "n1", inner.clone());
+        for _ in 0..16 {
+            inner.nodes[0].1.send(Frame::heartbeat()).await.unwrap();
+        }
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            reference.deliver(Box::new(crate::ingress::TestAsk(1)))
+        )
+        .await
+        .is_err());
+        for _ in 0..16 {
+            rx.recv().await.unwrap();
+        }
+        reference
+            .deliver(Box::new(crate::ingress::TestAsk(2)))
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.seq, 1);
+    }
+
     // 回调表容量满 → insert 失败 → InternalError（capacity=1 预占满）
     #[tokio::test]
     async fn ref_ask_capacity_reject() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(16);
         let status = Arc::new(NodeStatus::default());
         let inner = Arc::new(RemoteInner {
+            system: None,
             nodes: vec![("n1".into(), crate::transport::FrameSender::anon(tx), status)],
             callbacks: Arc::new(CallbackRegistry::new(1)),
             self_node: "self".into(),

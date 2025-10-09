@@ -1,13 +1,15 @@
-Cargo.lock
+# Application/workspace lockfiles are versioned; generated fixture/PoC locks are not.
+**/Cargo.lock
+!/Cargo.lock
 tasks/
 target/
 temp_code/
 gitcmd.sh
-# .DS_Store
-.d*
-.D*
-.C*
-.c*
+# Local caches and agent state (do not hide build/CI configuration).
+.cache/
+.codex/
+.claude/
+.scala-build/
 
 # ---- P6 提交范围控制（2026-10-05）----
 # IDE / 编辑器
@@ -36,3 +38,5 @@ interop/cpp-lite/bin/
 *.dump
 erl_crash.dump
 gw-jvm-libs.tar
+
+.cursorignore

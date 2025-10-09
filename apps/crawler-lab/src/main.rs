@@ -518,7 +518,9 @@ async fn run_scenario(
                 coords: None,
                 uri: Some(format!(
                     "file://{}",
-                    app_root.join("jvm/target/crawler-lab-jvm-1.0.0.jar").display()
+                    app_root
+                        .join("jvm/target/crawler-lab-jvm-1.0.0.jar")
+                        .display()
                 )),
             },
         ),
@@ -538,7 +540,10 @@ async fn run_scenario(
             )
             .await
             .unwrap_or_else(|e| panic!("deploy {node}/{name} 失败: {e:?}"));
-        println!("[lab] 组件部署 {node}/{name} → {instances:?}（{}ms）", t0.elapsed().as_millis());
+        println!(
+            "[lab] 组件部署 {node}/{name} → {instances:?}（{}ms）",
+            t0.elapsed().as_millis()
+        );
     }
 
     let m = Arc::new(Metrics::new());

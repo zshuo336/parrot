@@ -165,12 +165,19 @@ async fn mg_multiengine_deploy_running_ask_status_full_chain() {
     let frontier = comp(
         "frontier",
         EngineKind::Erlang,
-        ArtifactRef::Beam { app: "frontier".into(), uri: None },
+        ArtifactRef::Beam {
+            app: "frontier".into(),
+            uri: None,
+        },
     );
     let mut index = comp(
         "index",
         EngineKind::Ray,
-        ArtifactRef::PyModule { module: "index".into(), runtime_env: None, uri: None },
+        ArtifactRef::PyModule {
+            module: "index".into(),
+            runtime_env: None,
+            uri: None,
+        },
     );
     let mut search = comp(
         "search",
@@ -284,7 +291,10 @@ async fn mg_erlang_gateway_smoke() {
         comp(
             "frontier",
             EngineKind::Erlang,
-            ArtifactRef::Beam { app: "frontier".into(), uri: None },
+            ArtifactRef::Beam {
+                app: "frontier".into(),
+                uri: None,
+            },
         ),
         103,
     )
@@ -299,7 +309,11 @@ async fn mg_ray_gateway_smoke() {
         comp(
             "index",
             EngineKind::Ray,
-            ArtifactRef::PyModule { module: "index".into(), runtime_env: None, uri: None },
+            ArtifactRef::PyModule {
+                module: "index".into(),
+                runtime_env: None,
+                uri: None,
+            },
         ),
         102,
     )

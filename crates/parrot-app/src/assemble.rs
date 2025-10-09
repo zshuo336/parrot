@@ -155,6 +155,12 @@ impl AssemblingContext {
                 }
             };
 
+            // Record ownership before hooks: a failed start hook must also stop
+            // the component that has just been spawned.
+            self.registry.insert(comp.name.clone(), refs);
+            self.paths.insert(comp.name.clone(), (comp.engine, paths));
+            self.started.push(comp.name.clone());
+
             // on_start 钩子：发 ParrotAppHook(START) 等回执
             if let Some(hook_path) = &comp.hooks.on_start {
                 let full = if hook_path.starts_with('/') {
@@ -162,7 +168,14 @@ impl AssemblingContext {
                 } else {
                     format!("/{hook_path}")
                 };
-                match fire_hook(&refs, &full, hook_phase::START, self.hooks_timeout).await {
+                match fire_hook(
+                    &self.registry[&comp.name],
+                    &full,
+                    hook_phase::START,
+                    self.hooks_timeout,
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(DeployError::HookTimeout { .. }) => {
                         // 超时：回滚已起组件再报错
@@ -190,10 +203,6 @@ impl AssemblingContext {
                     }
                 }
             }
-
-            self.registry.insert(comp.name.clone(), refs);
-            self.paths.insert(comp.name.clone(), (comp.engine, paths));
-            self.started.push(comp.name.clone());
         }
         Ok(())
     }
@@ -241,7 +250,7 @@ async fn spawn_component(
                     return Err(DeployError::Artifact(format!(
                         "wasm/dylib artifacts require feature-gated runtime (C/D 阶段): {}",
                         other.kind()
-                    )))
+                    )));
                 }
             },
             paths,
@@ -556,6 +565,7 @@ mod tests {
         events: Mutex<Vec<String>>,
         fail_spawn_on: Mutex<Option<String>>,
         hook_delay: Mutex<Duration>,
+        fail_hook: std::sync::atomic::AtomicBool,
     }
 
     impl Journal {
@@ -564,6 +574,7 @@ mod tests {
                 events: Mutex::new(vec![]),
                 fail_spawn_on: Mutex::new(None),
                 hook_delay: Mutex::new(Duration::ZERO),
+                fail_hook: std::sync::atomic::AtomicBool::new(false),
             })
         }
         fn log(&self, e: impl Into<String>) {
@@ -610,6 +621,11 @@ mod tests {
                     tokio::time::sleep(delay).await;
                 }
                 journal.log(format!("ask:{path}:{phase}"));
+                if journal.fail_hook.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(parrot_api::errors::ActorError::MessageHandlingError(
+                        "injected hook failure".into(),
+                    ));
+                }
                 if phase <= 2 {
                     Ok(Box::new(ParrotAppHook(phase)) as BoxedMessage)
                 } else {
@@ -728,7 +744,8 @@ mod tests {
             artifact: ArtifactRef::Props {
                 factory: format!("app.{name}"),
             },
-            alt_artifact: None,            instances: InstancePolicy::Singleton,
+            alt_artifact: None,
+            instances: InstancePolicy::Singleton,
             placement: PlacementConstraint::default(),
             upgrade: UpgradePolicy::default(),
             deps: deps.iter().map(|s| s.to_string()).collect(),
@@ -771,7 +788,8 @@ mod tests {
         erl.engine = EngineKind::Erlang;
         erl.artifact = ArtifactRef::Beam {
             app: "frontier".into(),
-         uri: None,};
+            uri: None,
+        };
         let m = manifest(vec![comp("hub", &[]), erl]);
         let plan = plan(&m, &LocalTopology).unwrap();
         let d = make_deployer(&j);
@@ -931,14 +949,20 @@ mod tests {
             matches!(err, DeployError::HookTimeout { comp, hook } if comp == "a" && hook == "/user/a")
         );
         assert!(ctx.started().is_empty(), "rolled back");
+        assert_eq!(
+            j.snapshot(),
+            vec!["spawn:/user/a", "stop:/user/a", "stop_paths:/user/a"]
+        );
+        assert!(ctx.component_refs("a").is_none());
+        ctx.teardown(&d).await.unwrap();
+        assert_eq!(j.snapshot().len(), 3, "cleanup must not stop twice");
     }
 
     #[tokio::test]
     async fn hook_ask_error_fails_assembly() {
         let j = Journal::new();
-        // JournalRef 对 phase>2 报错——用 drain/未知 phase 模拟组件崩溃：
-        // 直接构造 spawner 返回错误 actor 不可行（替身固定）——改用 fail_spawn
-        *j.fail_spawn_on.lock().unwrap() = Some("app.a".into());
+        j.fail_hook
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut c = comp("a", &[]);
         c.hooks.on_start = Some("/user/a".into());
         let m = manifest(vec![c]);
@@ -950,6 +974,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DeployError::Engine(_)));
+        assert_eq!(
+            j.snapshot(),
+            vec![
+                "spawn:/user/a",
+                "ask:/user/a:0",
+                "stop:/user/a",
+                "stop_paths:/user/a"
+            ]
+        );
+        assert!(ctx.started().is_empty());
     }
 
     #[tokio::test]
@@ -1096,7 +1130,8 @@ mod tests {
         bad.artifact = ArtifactRef::PyModule {
             module: "m".into(),
             runtime_env: None,
-         uri: None,};
+            uri: None,
+        };
         let m = manifest(vec![bad]);
         let plan = plan(&m, &LocalTopology).unwrap();
         let d = make_deployer(&j);

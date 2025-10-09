@@ -9,13 +9,14 @@ FROM rust:1.98-slim AS builder
 
 WORKDIR /build
 
-# 依赖层缓存（先拷 manifest 再拷源码——cargo 依赖不变时跳过重编译）
+# Cargo resolves every workspace member, including applications.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY tools/ tools/
+COPY apps/ apps/
 
 # 静态偏好构建（release；目标仅节点 crate 链）
-RUN cargo build --release -p parrot-node
+RUN cargo build --locked --release -p parrot-node
 
 # ── runtime：与 builder 同代基系（trixie）——glibc 一致性 ──────────────────
 FROM debian:trixie-slim
@@ -36,6 +37,6 @@ ENV PARROT_BIND=0.0.0.0:9801
 EXPOSE 9801
 
 HEALTHCHECK --interval=5s --timeout=3s --start-period=3s --retries=3 \
-    CMD ["/usr/local/bin/parrot-node"]
+    CMD ["env", "PARROT_HEALTHCHECK=1", "/usr/local/bin/parrot-node"]
 
 ENTRYPOINT ["/usr/local/bin/parrot-node"]

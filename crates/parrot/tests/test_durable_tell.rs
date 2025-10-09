@@ -3,7 +3,7 @@
 //! - `durable_offline_replay`（时间压缩版）：断线期间 tell 100 条 →
 //!   重连重放全达零丢失、端侧去重零重复处理
 //! - `durable_offline_5min_real`（#[ignore]）：真实 5min 断网门禁（DEV_00 §4.2）
-//! - `tell_ack_not_slow`：ACK 路径开销 <1ms p99（预算断言）
+//! - `wal_ack_latency_report`：显式运行的磁盘同步延迟报告（不裁剪尾部）
 //!
 //! 拓扑：cloud(proxy) --mem--> edge（K6 同款基建）。
 
@@ -44,6 +44,9 @@ macro_rules! remote_msg {
 }
 
 remote_msg!(DTell, "bin:durable::DTell#v1");
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Processed(Vec<u64>);
+remote_msg!(Processed, "bin:durable::Processed#v1");
 
 /// 端侧收件 actor：去重 + 计数（处理完成即 ACK 语义源）。
 struct EdgeSink {
@@ -60,6 +63,9 @@ impl Actor for EdgeSink {
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
+            if msg.is::<Processed>() {
+                return Ok(Box::new(Processed(self.processed.clone())) as BoxedMessage);
+            }
             if let Some(DTell(seq)) = msg.downcast_ref::<DTell>() {
                 if self.dedup.filter("cloud-proxy", *seq) {
                     self.processed.push(*seq);
@@ -152,11 +158,10 @@ async fn durable_offline_replay() {
     assert_eq!(replay.len(), 100, "all durable tells survive offline");
 
     // 重放到端侧（按 seq 序）——首达全处理
-    let (_edge_rs, edge_facade) = edge_node("edge-1").await;
-    let sink = edge_facade
-        .get_actor(&ActorPath::placeholder("/user/sink"))
-        .await
-        .unwrap();
+    let (edge_rs, edge_facade) = edge_node("edge-1").await;
+    let (proxy_rs, proxy_facade) = edge_node("cloud-proxy").await;
+    proxy_rs.connect_mem_pair(&edge_rs).await.unwrap();
+    let sink = proxy_rs.remote_ref("parrot://edge-1/user/sink").unwrap();
     for rec in &replay {
         let msg: DTell = parrot_api::message::serde_remote_deserialize(&rec.payload).unwrap();
         sink.send(Box::new(msg)).await.unwrap();
@@ -168,18 +173,25 @@ async fn durable_offline_replay() {
         let _ = sink.send(Box::new(msg)).await.unwrap();
     }
 
-    // 验证：问 sink 处理数（经 ask 计数——重投零重复处理由 DedupTable 保证）
-    // 探针：DTell(seq) 回显 seq；用 101 号探针 + 内部状态断言改为重放双投后
-    // 询问（sink 返回处理数：发送 DTell(u64::MAX) 特殊探针语义过重——直接断言
-    // dedup 行为已在单测覆盖，这里验证端到端投递无错即可）
-    for seq in 1..=100u64 {
-        let r = sink.send(Box::new(DTell(seq))).await.unwrap();
-        assert_eq!(r.downcast_ref::<DTell>().unwrap().0, seq);
-    }
+    let observed = sink.send(Box::new(Processed(vec![]))).await.unwrap();
+    assert_eq!(
+        observed.downcast_ref::<Processed>().unwrap().0,
+        (1..=100).collect::<Vec<_>>(),
+        "every sequence is processed once even after duplicate remote delivery"
+    );
 
     // ACK 水位推进 → WAL 清空
     wal2.ack("edge-1", "cloud-proxy", 100).unwrap();
     assert_eq!(wal2.pending_len(), 0, "watermark drains wal");
+    wal2.sync().unwrap();
+    drop(wal2);
+    let recovered = Wal::open(&dir).unwrap();
+    assert!(recovered.replay("edge-1").is_empty());
+    drop(recovered);
+    proxy_rs.shutdown().await.unwrap();
+    edge_rs.shutdown().await.unwrap();
+    drop(proxy_facade);
+    drop(edge_facade);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -211,14 +223,11 @@ async fn durable_offline_5min_real() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// ACK 路径不拖慢正常 tell：<1ms 额外延迟 p99。
-///
-/// 环境加固：预热 50 轮（页缓存/分配器热身后）再测——CI 并行跑
-/// workspace 全量时 debug 模式计时受 CPU 竞争影响，p99 噪声大；
-/// 预热 + 中位置窗口（去掉冷启动毛刺）保证断言测的是路径成本而非
-/// 调度抖动（预算 1ms 是 ACK 语义预算，不是调度器预算）。
+/// Explicit disk latency experiment; no percentile trimming or universal
+/// filesystem latency assertion. Run in isolation on a documented target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tell_ack_not_slow() {
+#[ignore = "disk latency experiment: run in isolation with --release --ignored --nocapture"]
+async fn wal_ack_latency_report() {
     let dir = std::env::temp_dir().join(format!("parrot-ack-lat-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let wal = Wal::open(&dir).unwrap();
@@ -235,12 +244,12 @@ async fn tell_ack_not_slow() {
     // 预热（页缓存 + 分配器 steady state）
     for i in 0..50u64 {
         wal.append(WalRecord {
-            seq: 10_000 + i,
+            seq: 1 + i,
             ..rec.clone()
         })
         .unwrap();
         wal.flush().unwrap();
-        wal.ack("e", "s", 10_000 + i).unwrap();
+        wal.ack("e", "s", 1 + i).unwrap();
     }
 
     // 无 ACK 基线：append+flush
@@ -248,7 +257,7 @@ async fn tell_ack_not_slow() {
     for i in 0..200u64 {
         let t0 = Instant::now();
         wal.append(WalRecord {
-            seq: i,
+            seq: 51 + i,
             ..rec.clone()
         })
         .unwrap();
@@ -260,29 +269,19 @@ async fn tell_ack_not_slow() {
     for i in 0..200u64 {
         let t0 = Instant::now();
         wal.append(WalRecord {
-            seq: 1000 + i,
+            seq: 251 + i,
             ..rec.clone()
         })
         .unwrap();
         wal.flush().unwrap();
-        wal.ack("e", "s", 1000 + i).unwrap();
+        wal.ack("e", "s", 251 + i).unwrap();
         with_ack.push(t0.elapsed().as_nanos() as u64);
     }
-    // 掐尾 10% 去冷尾噪声（slice 一次切好——避免重复借用）
-    let cut = |v: &mut Vec<u64>| {
-        v.sort_unstable();
-        let n = v.len();
-        v.truncate(n - n / 10);
-    };
-    cut(&mut base);
-    cut(&mut with_ack);
-    let b99 = base[(base.len() * 99) / 100] as f64;
-    let a99 = with_ack[(with_ack.len() * 99) / 100] as f64;
-    let overhead = a99 - b99;
-    println!("ack overhead p99: {overhead:.0}ns (base {b99:.0}ns, with-ack {a99:.0}ns)");
-    assert!(
-        overhead < 1_000_000.0,
-        "ACK path adds {overhead:.0}ns p99, budget 1ms"
-    );
+    base.sort_unstable();
+    with_ack.sort_unstable();
+    let b99 = base[(base.len() * 99).div_ceil(100) - 1];
+    let a99 = with_ack[(with_ack.len() * 99).div_ceil(100) - 1];
+    println!("WAL append+sync p99={b99}ns; append+sync+ack p99={a99}ns (untrimmed)");
+    assert_eq!(wal.pending_len(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }

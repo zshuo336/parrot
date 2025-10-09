@@ -1,0 +1,101 @@
+   Compiling parrot-independent-probes v0.0.0 (/tmp/parrot-independent-probes)
+warning: unused imports: `SchedulingMode`, `ThreadActorConfig`, `ThreadActorSystemConfig`, and `system::ThreadActorSystem`
+   --> src/lib.rs:107:23
+    |
+107 | ...read::{system::ThreadActorSystem,context::ThreadContext,config::{ThreadActorSystemConfig,ThreadActorConfig,SchedulingMode}}};
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^                                 ^^^^^^^^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Sink` is never constructed
+  --> src/lib.rs:16:8
+   |
+16 | struct Sink { seen: Arc<Mutex<Vec<u64>>>, pending: bool, fail: bool }
+   |        ^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `Lookup` is never constructed
+  --> src/lib.rs:28:8
+   |
+28 | struct Lookup(Sink);
+   |        ^^^^^^
+
+warning: function `pair` is never used
+  --> src/lib.rs:31:10
+   |
+31 | async fn pair(name:&str,pending:bool)->(Arc<RemoteActorSystem>,Arc<RemoteActorSystem>,Arc<Mutex<Vec<u64>>>) {
+   |          ^^^^
+
+warning: struct `Clock` is never constructed
+  --> src/lib.rs:68:8
+   |
+68 | struct Clock(AtomicU64);
+   |        ^^^^^
+
+warning: struct `Spawner` is never constructed
+  --> src/lib.rs:86:8
+   |
+86 | struct Spawner(Arc<Mutex<Vec<String>>>);
+   |        ^^^^^^^
+
+warning: struct `Gw` is never constructed
+  --> src/lib.rs:92:8
+   |
+92 | struct Gw;
+   |        ^^
+
+warning: struct `Forwarder` is never constructed
+   --> src/lib.rs:109:8
+    |
+109 | struct Forwarder(Option<BoxedActorRef>);
+    |        ^^^^^^^^^
+
+warning: struct `TypedEcho` is never constructed
+   --> src/lib.rs:137:8
+    |
+137 | struct TypedEcho;
+    |        ^^^^^^^^^
+
+warning: `parrot-independent-probes` (lib) generated 9 warnings (run `cargo fix --lib -p parrot-independent-probes` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.41s
+     Running unittests src/lib.rs (/tmp/parrot-independent-probes/target/debug/deps/parrot_independent_probes-14a76205c5e2c09c)
+
+running 12 tests
+PROBE hop_count=hop_limit accepted
+test exhausted_hop_is_accepted ... ok
+
+thread 'malformed_frame_panics' (1179940) panicked at /Users/biluochun/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bytes-1.12.1/src/lib.rs:207:5:
+advance out of bounds: the len is 6 but advancing by 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+PROBE malformed panic=true
+test malformed_frame_panics ... ok
+PROBE raft 2/4 replicas commit=1
+PROBE typed duplicate_path accepted, registry_count=0, after_shutdown replies=42,43
+PROBE twin n0=ExpectedEndpoint { endpoint: test four_node_raft_commits_with_two_replicas ... ok
+test typed_actor_survives_system_shutdown_and_duplicates_path ... ok
+"tcp://10.0.0:7", border: "parrot://fed/c0" } n256=ExpectedEndpoint { endpoint: "tcp://10.0.0:7", border: "parrot://fed/c0" }
+PROBE rollback alive=["/user/broken"] started=[]
+test failing_start_hook_leaves_component_running ... ok
+test twin_mapping_is_not_injective ... ok
+PROBE WAL acknowledged replay after reopen=1
+test wal_recovery_replays_acknowledged_record ... ok
+PROBE tell_helper count=20000 inversions=4662
+test tell_helper_reorders_single_caller ... ok
+PROBE external_timeout callbacks=1
+test externally_cancelled_ask_leaks_callback ... ok
+PROBE multi_ref received=[0]
+test multiple_refs_drop_tells ... ok
+PROBE same shard A->B result=Err(TimeoutDetail("Request to actor /user/sb timed out after 250ms")) elapsed=252.421541ms
+PROBE shared worker=1 A->B result=Err(TimeoutDetail("Request to actor /user/b timed out after 250ms")) elapsed=252.557625ms
+test same_shard_blocks_acyclic_ask ... ok
+test single_shared_worker_blocks_acyclic_ask ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+   Doc-tests parrot_independent_probes
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

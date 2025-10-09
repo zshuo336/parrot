@@ -24,7 +24,7 @@ echo "==> [1/3] 构建 crawler-lab"
 cargo build -p crawler-lab -q --release || { echo "构建失败"; exit 1; }
 
 echo "==> [2/3] 四运行时全链（golden 同参数：pages=60 depth=2 fanout=3 batch=32）"
-if ! ./deploy/crawler-lab/run-lab.sh --pages 60 --depth 2 --fanout 3 --batch 32 --skip-ts > "$OUT" 2>&1; then
+if ! PARROT_LAB_BIN=./target/release/crawler-lab ./apps/crawler-lab/deploy/run-lab.sh --pages 60 --depth 2 --fanout 3 --batch 32 --skip-ts > "$OUT" 2>&1; then
   echo "run-lab 失败——尾部日志："
   tail -15 "$OUT"
   exit 1
@@ -66,7 +66,7 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo ""
-echo "crawler-lab 回归 PASS（迁移前后 cid 轨迹等价——G1/M1 行为等价门禁）"
+echo "crawler-lab 回归 PASS（固定工作负载计数与查询结果匹配）"
 
 # --keep-output：保留现场排查
 if [[ " $* " != *" --keep-output "* ]]; then

@@ -112,32 +112,53 @@ impl Wal {
                 if crc32(body) != crc {
                     break; // crc 失败 → 截断（崩溃写一半）
                 }
-                if let Ok((rec, _)) = bincode::serde::decode_from_slice::<WalRecord, _>(
+                let (rec, consumed) = bincode::serde::decode_from_slice::<WalRecord, _>(
                     body,
                     bincode::config::standard(),
-                ) {
-                    pending.push(rec);
+                )
+                .map_err(|e| format!("wal invalid record {path:?} at {off}: {e}"))?;
+                if consumed != body.len() {
+                    return Err(format!("wal trailing record data {path:?} at {off}"));
                 }
+                pending.push(rec);
                 off += 8 + len;
                 good_end = off;
             }
             if good_end < data.len() {
-                // 截断尾段坏尾巴
-                std::fs::write(&path, &data[..good_end])
-                    .map_err(|e| format!("wal truncate {path:?}: {e}"))?;
+                // Only the last segment can contain an interrupted append.
+                // Earlier corruption is data loss, not a recoverable tail.
+                if Some(sid) != seg_ids.last() {
+                    return Err(format!(
+                        "wal corruption in sealed segment {path:?} at {good_end}"
+                    ));
+                }
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| format!("wal open for truncate: {e}"))?;
+                file.set_len(good_end as u64)
+                    .map_err(|e| format!("wal truncate: {e}"))?;
+                file.sync_all()
+                    .map_err(|e| format!("wal sync truncate: {e}"))?;
                 // 截断点之后不再解析（本段结束）
             }
-            // acked 水位由 ACK 标记记录恢复（wal_ack 写 ACK_MARKER）
-            let _ = &mut acked;
         }
         // 重建水位：pending 里按 (endpoint,sender) 最大 seq 之前的已 ACK 部分
         // 简化：水位从 ACK_MARKER 记录读（payload 为 [u8 1] 标记 + 内嵌 sender/seq）
         for rec in &pending {
             if rec.type_key == "#ack" {
-                acked.insert((rec.endpoint.clone(), rec.sender.clone()), rec.seq);
+                let watermark = acked
+                    .entry((rec.endpoint.clone(), rec.sender.clone()))
+                    .or_insert(0);
+                *watermark = (*watermark).max(rec.seq);
             }
         }
-        pending.retain(|r| r.type_key != "#ack");
+        pending.retain(|r| {
+            r.type_key != "#ack"
+                && acked
+                    .get(&(r.endpoint.clone(), r.sender.clone()))
+                    .is_none_or(|seq| r.seq > *seq)
+        });
 
         // 开新段（或续写最后段）
         let seg_id = seg_ids.last().map(|s| s + 1).unwrap_or(1);
@@ -146,6 +167,7 @@ impl Wal {
             .append(true)
             .open(dir.join(format!("seg-{seg_id:08}.log")))
             .map_err(|e| format!("wal create: {e}"))?;
+        sync_dir(&dir)?;
         Ok(Self {
             dir,
             segment_max,
@@ -159,41 +181,43 @@ impl Wal {
         })
     }
 
-    /// 追加一条待确认记录（写盘，不 fsync——组提交由 flush 驱动）。
+    /// Append a pending record. `sync`/`flush` establish the durability boundary.
+    /// Sequence numbers are positive and ACKs are cumulative per endpoint/sender.
     pub fn append(&self, rec: WalRecord) -> Result<(), String> {
         let mut g = self.inner.lock().unwrap();
-        let body = bincode::serde::encode_to_vec(&rec, bincode::config::standard())
-            .map_err(|e| format!("wal encode: {e}"))?;
-        let mut frame = Vec::with_capacity(8 + body.len());
-        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&crc32(&body).to_le_bytes());
-        frame.extend_from_slice(&body);
-        g.file
-            .write_all(&frame)
-            .map_err(|e| format!("wal write: {e}"))?;
-        g.seg_bytes += frame.len() as u64;
+        if rec.type_key == "#ack" || rec.seq == 0 {
+            return Err("wal reserved record type or zero sequence".into());
+        }
+        if g.acked
+            .get(&(rec.endpoint.clone(), rec.sender.clone()))
+            .is_some_and(|seq| rec.seq <= *seq)
+        {
+            return Ok(()); // Retrying an already acknowledged append is harmless.
+        }
+        write_record(&mut g, &rec)?;
         g.pending.push(rec);
-        // 段滚动
         if g.seg_bytes >= self.segment_max {
-            g.seg_id += 1;
-            g.seg_bytes = 0;
-            g.file = std::fs::OpenOptions::new()
-                .create(true)
+            // A later sync on the active file must also cover all sealed files.
+            g.file
+                .sync_all()
+                .map_err(|e| format!("wal sync before roll: {e}"))?;
+            let next_id = g.seg_id.checked_add(1).ok_or("wal segment id exhausted")?;
+            let next_file = std::fs::OpenOptions::new()
+                .create_new(true)
                 .append(true)
-                .open(self.dir.join(format!("seg-{:08}.log", g.seg_id)))
+                .open(self.dir.join(format!("seg-{next_id:08}.log")))
                 .map_err(|e| format!("wal roll: {e}"))?;
+            sync_dir(&self.dir)?;
+            g.file = next_file;
+            g.seg_id = next_id;
+            g.seg_bytes = 0;
         }
         Ok(())
     }
 
     /// 组提交 flush（proxy 定时 10ms 或批量后调）。
     pub fn flush(&self) -> Result<(), String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .file
-            .flush()
-            .map_err(|e| format!("wal flush: {e}"))
+        self.sync()
     }
 
     /// 同步落盘（崩溃安全点）。
@@ -218,39 +242,49 @@ impl Wal {
             type_key: "#ack".into(),
             payload: bytes::Bytes::new(),
         };
-        let body = bincode::serde::encode_to_vec(&marker, bincode::config::standard())
-            .map_err(|e| format!("wal encode ack: {e}"))?;
-        let mut frame = Vec::with_capacity(8 + body.len());
-        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&crc32(&body).to_le_bytes());
-        frame.extend_from_slice(&body);
-        g.file
-            .write_all(&frame)
-            .map_err(|e| format!("wal write ack: {e}"))?;
-        g.seg_bytes += frame.len() as u64;
-
-        // 水位更新 + pending 清理（≤seq 的记录已确认）
-        g.acked.insert((endpoint.into(), sender.into()), seq);
+        write_record(&mut g, &marker)?;
+        let watermark = g.acked.entry((endpoint.into(), sender.into())).or_insert(0);
+        *watermark = (*watermark).max(seq);
+        let watermark = *watermark;
         g.pending
-            .retain(|r| !(r.endpoint == endpoint && r.sender == sender && r.seq <= seq));
-        // 段清理：pending 为空时删除非当前段（整段删除——无逐条空洞）
+            .retain(|r| !(r.endpoint == endpoint && r.sender == sender && r.seq <= watermark));
         if g.pending.is_empty() {
-            let cur = g.seg_id;
-            drop(g);
-            if let Ok(rd) = std::fs::read_dir(&self.dir) {
-                for e in rd.flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if let Some(sid) = name
-                        .strip_prefix("seg-")
-                        .and_then(|s| s.strip_suffix(".log"))
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        if sid < cur {
-                            let _ = std::fs::remove_file(e.path());
-                        }
+            // Checkpoint ALL watermarks in the surviving file before deleting
+            // any segment. Keep the lock so an append cannot race this GC.
+            let checkpoints: Vec<_> = g
+                .acked
+                .iter()
+                .map(|((endpoint, sender), seq)| WalRecord {
+                    endpoint: endpoint.clone(),
+                    sender: sender.clone(),
+                    seq: *seq,
+                    path: String::new(),
+                    type_key: "#ack".into(),
+                    payload: bytes::Bytes::new(),
+                })
+                .collect();
+            for checkpoint in checkpoints {
+                write_record(&mut g, &checkpoint)?;
+            }
+            g.file
+                .sync_all()
+                .map_err(|e| format!("wal sync checkpoint: {e}"))?;
+            for entry in std::fs::read_dir(&self.dir).map_err(|e| format!("wal gc readdir: {e}"))? {
+                let entry = entry.map_err(|e| format!("wal gc entry: {e}"))?;
+                let name = entry.file_name();
+                if let Some(sid) = name
+                    .to_str()
+                    .and_then(|s| s.strip_prefix("seg-"))
+                    .and_then(|s| s.strip_suffix(".log"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    if sid < g.seg_id {
+                        std::fs::remove_file(entry.path())
+                            .map_err(|e| format!("wal gc remove: {e}"))?;
                     }
                 }
             }
+            sync_dir(&self.dir)?;
         }
         Ok(())
     }
@@ -274,6 +308,32 @@ impl Wal {
     }
 }
 
+fn write_record(inner: &mut WalInner, record: &WalRecord) -> Result<(), String> {
+    let body = bincode::serde::encode_to_vec(record, bincode::config::standard())
+        .map_err(|e| format!("wal encode: {e}"))?;
+    let len = u32::try_from(body.len()).map_err(|_| "wal record too large")?;
+    let mut frame = Vec::with_capacity(8 + body.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&crc32(&body).to_le_bytes());
+    frame.extend_from_slice(&body);
+    inner
+        .file
+        .write_all(&frame)
+        .map_err(|e| format!("wal write: {e}"))?;
+    inner.seg_bytes += frame.len() as u64;
+    Ok(())
+}
+
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("wal sync directory: {e}"))?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// 端侧去重表：(sender, seq) 已处理集合——滑动窗口（按 sender 水位裁剪）。
 #[derive(Default)]
 pub struct DedupTable {
@@ -294,9 +354,12 @@ impl DedupTable {
         }
         if self.seen.insert((sender.to_string(), seq), ()).is_none() {
             // 推进水位：连续段确认后裁剪 seen（防无限增长）
-            let mut next = seq;
-            while self.seen.remove(&(sender.to_string(), next + 1)).is_some() {
-                next += 1;
+            let mut next = wm;
+            while let Some(candidate) = next.checked_add(1) {
+                if self.seen.remove(&(sender.to_string(), candidate)).is_none() {
+                    break;
+                }
+                next = candidate;
             }
             self.watermark.insert(sender.to_string(), next);
             true
@@ -370,6 +433,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn wal_ack_survives_reopen_and_is_cumulative() {
+        let dir = std::env::temp_dir().join(format!("parrot-wal-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let wal = Wal::open_with(&dir, 1024).unwrap();
+            wal.append(rec("e", "s", 1)).unwrap();
+            wal.append(rec("e", "s", 2)).unwrap();
+            wal.ack("e", "s", 2).unwrap();
+            wal.ack("e", "s", 1).unwrap(); // must not regress the watermark
+            wal.sync().unwrap();
+        }
+        let wal = Wal::open_with(&dir, 1024).unwrap();
+        assert!(
+            wal.replay("e").is_empty(),
+            "acked records must not replay after restart"
+        );
+        wal.append(rec("e", "s", 3)).unwrap();
+        assert_eq!(
+            wal.replay("e").iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![3]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wal_partial_ack_and_gc_preserve_all_stream_watermarks() {
+        let dir = std::env::temp_dir().join(format!("parrot-wal-segments-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let wal = Wal::open_with(&dir, 1).unwrap(); // every append seals a segment
+            for record in [rec("e", "s", 1), rec("e", "s", 2), rec("e", "other", 1)] {
+                wal.append(record).unwrap();
+            }
+            wal.ack("e", "s", 1).unwrap();
+            wal.sync().unwrap();
+        }
+        {
+            let wal = Wal::open_with(&dir, 1).unwrap();
+            assert_eq!(
+                wal.replay("e"),
+                vec![rec("e", "other", 1), rec("e", "s", 2)]
+            );
+            wal.ack("e", "s", 2).unwrap();
+            wal.ack("e", "other", 1).unwrap();
+            assert_eq!(wal.pending_len(), 0);
+        }
+        let wal = Wal::open_with(&dir, 1).unwrap();
+        for record in [rec("e", "s", 1), rec("e", "s", 2), rec("e", "other", 1)] {
+            wal.append(record).unwrap();
+        }
+        assert_eq!(
+            wal.pending_len(),
+            0,
+            "GC must retain ACK watermarks for every stream"
+        );
+        wal.append(rec("e", "s", 3)).unwrap();
+        assert_eq!(wal.replay("e"), vec![rec("e", "s", 3)]);
+        drop(wal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wal_sealed_corruption_is_reported_without_modifying_files() {
+        let dir = std::env::temp_dir().join(format!("parrot-wal-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let wal = Wal::open_with(&dir, 1).unwrap();
+            wal.append(rec("e", "s", 1)).unwrap();
+            wal.append(rec("e", "s", 2)).unwrap();
+            wal.sync().unwrap();
+        }
+        let segment = dir.join("seg-00000001.log");
+        let mut damaged = std::fs::read(&segment).unwrap();
+        damaged[8] ^= 0xff;
+        std::fs::write(&segment, &damaged).unwrap();
+        assert!(Wal::open(&dir).err().unwrap().contains("sealed segment"));
+        assert_eq!(std::fs::read(&segment).unwrap(), damaged);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     // 去重表：重放重复不二次处理
     #[test]
     fn dedup_table_filters() {
@@ -380,6 +524,16 @@ mod tests {
         assert!(d.filter("s1", 3));
         assert!(!d.filter("s1", 2), "replayed old dropped");
         assert!(d.filter("s2", 1), "independent sender");
+    }
+
+    #[test]
+    fn dedup_out_of_order_does_not_advance_past_a_gap() {
+        let mut d = DedupTable::new();
+        assert!(d.filter("s", 3));
+        assert!(d.filter("s", 1));
+        assert!(d.filter("s", 2));
+        assert!(!d.filter("s", 3));
+        assert!(!d.filter("s", 1));
     }
 
     // crc32 与 IEEE 参考值对齐（"123456789" → 0xCBF43926）

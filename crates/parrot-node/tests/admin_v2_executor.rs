@@ -225,7 +225,8 @@ fn fetch_props_passthrough_and_cross_dialect_rejected() {
         AdminArtifactRef::Jvm {
             main_class: "M".into(),
             coords: None,
-         uri: None,},
+            uri: None,
+        },
     ] {
         let err = ArtifactChannel.fetch(&art).unwrap_err();
         assert_eq!(err.0, v2_err::DIALECT_MISMATCH);
@@ -353,7 +354,8 @@ async fn deploy_non_props_dialect_mismatch() {
         version: "1".into(),
         artifact: AdminArtifactRef::Beam {
             app: "frontier".into(),
-         uri: None,},
+            uri: None,
+        },
         instances: AdminInstancePolicy::Singleton,
         config: None,
     };
