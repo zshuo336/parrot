@@ -1,7 +1,7 @@
-# Application/workspace lockfiles are versioned; generated fixture/PoC locks are not.
-**/Cargo.lock
-!/Cargo.lock
+# Every source workspace's Cargo.lock is versioned, including standalone
+# applications, fixtures, POCs and benchmarks. Generated target trees stay ignored.
 tasks/
+docs/
 target/
 temp_code/
 gitcmd.sh
@@ -40,3 +40,7 @@ erl_crash.dump
 gw-jvm-libs.tar
 
 .cursorignore
+
+# Local validated crawler business build state
+/apps/crawler-lab/.business-artifacts.json
+/apps/crawler-lab/.business-artifacts.lock

@@ -1,124 +1,138 @@
-//! POC 4：单块内存擦除（一 alloc 模式）。
+//! A type-erased message in one allocation containing a header and its payload.
 //!
-//! 问题：现状每消息 2 次装箱（消息 Box + Any 擦除），堆分配 2 次。
-//! 方案：SingleAllocEnvelope —— 一次分配同时容纳【擦除头 + 消息本体】，
-//! 消息按对齐摆放在同一块内存上，downcast 只做指针运算，零额外分配。
-//!
-//! 对标：SmallBox / thin-box / header-allocated slab（Erlang term 的
-//! boxed header 思想：header 与 payload 连续分配）。
+//! This saves one allocation compared with a genuinely double-boxed envelope.
+//! Coercing `Box<M>` to `Box<dyn Any + Send>` itself does not allocate again.
+//! Header storage is still allocated for a zero-sized payload. The payload may
+//! perform its own allocations; those are outside this envelope's guarantee.
+#![deny(unsafe_op_in_unsafe_fn)]
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::any::{Any, TypeId};
-use std::ptr::NonNull;
+use std::mem::ManuallyDrop;
+use std::ptr::{self, NonNull};
 
-/// 擦除头（布局在块首）。
 #[repr(C)]
 struct Header {
     type_id: TypeId,
     drop_fn: unsafe fn(*mut u8),
-    /// payload 相对块首的偏移（按消息对齐摆放）
     payload_off: usize,
-    /// 整块 layout（dealloc 用）
     layout: Layout,
 }
 
-/// 单分配消息信封。
+/// An owning, single-allocation message envelope. Construction accepts only
+/// `Send + 'static` payloads. Sharing by reference is intentionally unsupported:
+/// a `Send` payload need not be `Sync`.
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<erased_alloc::SingleAllocEnvelope>();
+/// ```
 pub struct SingleAllocEnvelope {
     ptr: NonNull<u8>,
 }
 
+/// Owns the raw block after its payload is moved out or begins destruction.
+/// Keeping this guard on the stack also frees the block if payload Drop unwinds.
+struct Allocation {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        // SAFETY: this guard exclusively owns an allocation made with this exact
+        // layout. Header is nonzero-sized, even when the payload is a ZST.
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+unsafe fn drop_payload<M>(p: *mut u8) {
+    // SAFETY: only called from the header paired with an initialized M, once.
+    unsafe { ptr::drop_in_place(p.cast::<M>()) };
+}
+
 impl SingleAllocEnvelope {
-    /// 一次分配：header + padding + payload 连续。
+    /// Allocate header, alignment padding, and the moved payload together.
+    /// Layout overflow panics before allocation; allocation failure follows
+    /// Rust's allocator error handler, just as Box does.
     pub fn new<M: Any + Send>(msg: M) -> Self {
-        let type_id = TypeId::of::<M>();
-        let payload_layout = Layout::new::<M>();
-        // header 对齐 ≥ payload 对齐时直接前放；否则整体对齐取 max
-        let align = payload_layout.align().max(Layout::new::<Header>().align());
-        // 布局：[header][padding to payload align][payload]
-        let header_size = Layout::new::<Header>().size();
-        let payload_off = (header_size + payload_layout.align() - 1) & !(payload_layout.align() - 1);
-        let total = payload_off + payload_layout.size();
-        let layout = Layout::from_size_align(total, align).expect("layout");
-
+        let (layout, payload_off) = Layout::new::<Header>()
+            .extend(Layout::new::<M>())
+            .expect("envelope layout exceeds addressable allocation size");
+        let layout = layout.pad_to_align();
+        // SAFETY: Layout::extend checked size and alignment; Header is nonzero.
+        let raw = unsafe { alloc(layout) };
+        let ptr = NonNull::new(raw).unwrap_or_else(|| handle_alloc_error(layout));
+        // SAFETY: the block has sufficient size/alignment for both objects.
+        // These writes cannot unwind; ownership of msg transfers into the block.
         unsafe {
-            let raw = alloc(layout);
-            let ptr = NonNull::new(raw).expect("alloc failed");
-
-            // 写 header
-            let hdr = ptr.as_ptr() as *mut Header;
-            // 特化 drop：包装为裸函数（M 类型在编译期已知）
-            unsafe fn make_drop<M2>() -> unsafe fn(*mut u8) {
-                unsafe fn dropper<M3>(p: *mut u8) {
-                    let m = std::ptr::read(p as *const M3);
-                    drop(m);
-                }
-                dropper::<M2>
-            }
-            std::ptr::write(
-                hdr,
+            ptr::write(
+                ptr.as_ptr().cast::<Header>(),
                 Header {
-                    type_id,
-                    drop_fn: make_drop::<M>(),
+                    type_id: TypeId::of::<M>(),
+                    drop_fn: drop_payload::<M>,
                     payload_off,
                     layout,
                 },
             );
-
-            // 写 payload（move 进去）
-            let payload_ptr = ptr.as_ptr().add(payload_off) as *mut M;
-            std::ptr::write(payload_ptr, msg);
-
-            Self { ptr }
+            ptr::write(ptr.as_ptr().add(payload_off).cast::<M>(), msg);
         }
+        Self { ptr }
     }
 
-    /// 类型检查 + 取回（downcast 只是指针运算 + TypeId 比较）。
-    pub fn downcast<M: Any + Send>(mut self) -> Result<M, Self> {
-        if self.type_id() == TypeId::of::<M>() {
-            unsafe {
-                let hdr = self.ptr.as_ptr() as *const Header;
-                let payload_ptr = self.ptr.as_ptr().add((*hdr).payload_off) as *const M;
-                let m = std::ptr::read(payload_ptr);
-                // 手动释放内存；forget 防止 Drop::drop 再次 dealloc/drop
-                let layout = (*hdr).layout;
-                let raw = self.ptr.as_ptr();
-                std::mem::forget(self);
-                dealloc(raw, layout);
-                Ok(m)
-            }
-        } else {
-            Err(self)
+    fn header(&self) -> &Header {
+        // SAFETY: all live envelopes own a fully initialized immutable header.
+        unsafe { &*self.ptr.as_ptr().cast::<Header>() }
+    }
+
+    /// Recover the payload without another allocation. A mismatched type
+    /// returns the original envelope unchanged, retaining ownership of its M.
+    pub fn downcast<M: Any + Send>(self) -> Result<M, Self> {
+        if self.type_id() != TypeId::of::<M>() {
+            return Err(self);
         }
+        let this = ManuallyDrop::new(self);
+        let header = this.header();
+        let allocation = Allocation {
+            ptr: this.ptr,
+            layout: header.layout,
+        };
+        // SAFETY: TypeId matches M, the header supplies its aligned offset, and
+        // self is consumed. ManuallyDrop prevents destruction of the moved M.
+        let value = unsafe { ptr::read(this.ptr.as_ptr().add(header.payload_off).cast::<M>()) };
+        drop(allocation);
+        Ok(value)
     }
 
     pub fn type_id(&self) -> TypeId {
-        unsafe { (*(self.ptr.as_ptr() as *const Header)).type_id }
+        self.header().type_id
     }
 }
 
 impl Drop for SingleAllocEnvelope {
     fn drop(&mut self) {
-        unsafe {
-            let hdr = self.ptr.as_ptr() as *const Header;
-            let payload_ptr = self.ptr.as_ptr().add((*hdr).payload_off);
-            ((*hdr).drop_fn)(payload_ptr);
-            dealloc(self.ptr.as_ptr(), (*hdr).layout);
-        }
+        let header = self.header();
+        let _allocation = Allocation {
+            ptr: self.ptr,
+            layout: header.layout,
+        };
+        // SAFETY: the header and payload were initialized together, the drop
+        // function matches M, and &mut self has exclusive ownership. The guard
+        // deallocates after this call, including when M::drop panics.
+        unsafe { (header.drop_fn)(self.ptr.as_ptr().add(header.payload_off)) };
     }
 }
 
-// 修正：Drop 用 &mut self（self.ptr 已 NonNull，as_ptr 需解引用）
-
-// Send 声明：块内 payload 是 M: Send（构造时 move 独占）
+// SAFETY: constructor requires M: Send, no borrowed payload escapes, and the
+// allocation, including its destructor, transfers with its exclusive owner.
 unsafe impl Send for SingleAllocEnvelope {}
 
-// ============ 基线对照（现状：两次分配） ============
-
+/// A real double-boxed comparison. The erased object's concrete type is `Box<M>`:
+/// recover it with `downcast::<Box<M>>()`. Nonzero-sized M costs two allocations;
+/// ZST M costs only the outer pointer-sized allocation. This is a comparison
+/// model, not evidence that every production message path double-boxes.
 pub fn two_alloc_baseline<M: Any + Send>(msg: M) -> Box<dyn Any + Send> {
-    Box::new(msg) // 1 次外层分配（内含 M）。现状路径还要 envelope Box → 2 次
+    Box::new(Box::new(msg))
 }
-
-// ============ POC 验证 ============
 
 #[cfg(test)]
 mod tests {
@@ -131,7 +145,10 @@ mod tests {
 
     #[test]
     fn single_alloc_roundtrip() {
-        let env = SingleAllocEnvelope::new(BigMsg { _data: [0; 32], tag: 42 });
+        let env = SingleAllocEnvelope::new(BigMsg {
+            _data: [0; 32],
+            tag: 42,
+        });
         assert_eq!(env.type_id(), TypeId::of::<BigMsg>());
         let m = env.downcast::<BigMsg>().ok().expect("type match");
         assert_eq!(m.tag, 42);
@@ -140,7 +157,7 @@ mod tests {
     #[test]
     fn single_alloc_wrong_type_keeps_envelope() {
         let env = SingleAllocEnvelope::new(1234u64);
-        let back = env.downcast::<String>().err().expect("must fail");
+        let back = env.downcast::<String>().expect_err("must fail");
         // 原 envelope 仍可用
         let m = back.downcast::<u64>().ok().unwrap();
         assert_eq!(m, 1234);
@@ -161,6 +178,10 @@ mod tests {
             let env = SingleAllocEnvelope::new(Tracked);
             drop(env);
         }
-        assert_eq!(DROPS.load(Ordering::SeqCst), before + 1, "payload Drop 必须执行");
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            before + 1,
+            "payload Drop 必须执行"
+        );
     }
 }

@@ -75,19 +75,28 @@
 pub mod actor;
 pub mod address;
 pub mod context;
+pub mod death_watch;
 pub mod engine;
 pub mod errors;
+pub mod local_typed;
 pub mod macros;
 pub mod message;
+mod owned_input;
 pub mod priority;
 pub mod receptionist;
+mod receptionist_scope;
+#[cfg(feature = "remote")]
+mod remote_decode;
 pub mod runtime;
 pub mod stream;
+mod stream_dispatch;
 pub mod supervisor;
 pub mod system;
+pub mod trace;
 pub mod typed;
 pub mod typed_channel;
 pub mod types;
+mod watch_input;
 
 pub use actor::{
     ActixEngineExt, Actor, ActorConfig, ActorFactory, ActorState, EngineContextHandle,
@@ -95,7 +104,11 @@ pub use actor::{
 pub use address::{ActorPath, ActorRef};
 pub use context::ActorContext;
 pub use engine::{ActorRefErased, BoxedActorRefErased, BoxedResult, EngineRuntime, ErasedActor};
+pub use engine::{
+    AsyncEngineCatalog, AsyncEngineRegistration, AsyncEngineRuntime, RuntimeActor, SpawnOptions,
+};
 pub use message::{Message, MessageEnvelope, MessageOptions, MessagePriority};
+pub use runtime::TokioActorRuntime;
 pub use stream::{ActorStreamHandler, StreamHandler, StreamRegistry, StreamRegistryExt};
 pub use supervisor::{DeathReason, SupervisionDecision, SupervisorStrategy};
 pub use system::{ActorSystem, ActorSystemConfig, SystemError};
@@ -109,3 +122,5 @@ pub use priority::{BACKGROUND, CRITICAL, HIGH, LOW, NORMAL};
 pub use parrot_api_derive::Message as MessageDerive;
 pub use parrot_api_derive::ParrotActor;
 pub use parrot_api_derive::ParrotTypedActor;
+
+pub mod typed_context;

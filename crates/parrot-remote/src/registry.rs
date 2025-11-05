@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::error::RemoteError;
-use crate::transport::LATE_REPLY_DROPPED;
+use crate::transport::{FrameSender, LATE_REPLY_DROPPED};
 
 /// REPLY 载荷语义（成功带 type_key；失败带结构化错误）。
 #[derive(Debug, Clone)]
@@ -19,10 +19,19 @@ pub enum ReplyPayload {
 
 pub struct CallbackRegistry {
     next_cid: AtomicU64,
-    /// cid → (oneshot, 目标 node)——单链路断连只 fail 该 node 的挂起（K6）。
-    slots: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<ReplyPayload>, String)>>,
+    /// Logical destination and actual connection are distinct for hub routes.
+    slots: Mutex<HashMap<u64, CallbackSlot>>,
     capacity: usize,
 }
+
+struct CallbackSlot {
+    tx: tokio::sync::oneshot::Sender<ReplyPayload>,
+    node: String,
+    connection: Option<FrameSender>,
+}
+
+/// Network replies rejected because they do not belong to the recorded connection.
+pub static WRONG_REPLY_SOURCE: AtomicU64 = AtomicU64::new(0);
 
 /// Removes an outstanding callback on success, error, timeout, or cancellation.
 pub(crate) struct PendingCallback<'a> {
@@ -55,19 +64,54 @@ impl CallbackRegistry {
         self.next_cid.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// 满 → RemoteError::CallbacksFull（Overloaded 语义）。
-    /// `node`：目标节点（单链路断连精准 fail 用）。
+    /// Register a locally completed callback. Network dispatch cannot complete
+    /// unbound slots; use insert_on for actual remote requests.
     pub fn insert(
         &self,
         cid: u64,
         node: impl Into<String>,
         tx: tokio::sync::oneshot::Sender<ReplyPayload>,
     ) -> Result<(), RemoteError> {
-        let mut g = self.slots.lock().unwrap();
-        if g.len() >= self.capacity {
+        self.insert_slot(cid, node.into(), tx, None)
+    }
+
+    pub fn insert_on(
+        &self,
+        cid: u64,
+        node: impl Into<String>,
+        tx: tokio::sync::oneshot::Sender<ReplyPayload>,
+        connection: &FrameSender,
+    ) -> Result<(), RemoteError> {
+        self.insert_slot(cid, node.into(), tx, Some(connection.clone()))
+    }
+
+    fn insert_slot(
+        &self,
+        cid: u64,
+        node: String,
+        tx: tokio::sync::oneshot::Sender<ReplyPayload>,
+        connection: Option<FrameSender>,
+    ) -> Result<(), RemoteError> {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.contains_key(&cid) {
+            return Err(RemoteError::Transport("duplicate correlation id".into()));
+        }
+        if slots.len() >= self.capacity {
             return Err(RemoteError::CallbacksFull(self.capacity));
         }
-        g.insert(cid, (tx, node.into()));
+        // Under the same lock as fail_connection: no registration can slip in
+        // after disconnect cleanup has already visited the table.
+        if connection.as_ref().is_some_and(FrameSender::is_closed) {
+            return Err(RemoteError::Transport("connection already closed".into()));
+        }
+        slots.insert(
+            cid,
+            CallbackSlot {
+                tx,
+                node,
+                connection,
+            },
+        );
         Ok(())
     }
 
@@ -82,11 +126,10 @@ impl CallbackRegistry {
         self.slots.lock().unwrap().remove(&cid).is_some()
     }
 
-    /// REPLY 到达：完成挂起 ask。false = 迟到回复（调用方已超时放弃）
-    /// → metric late_reply_dropped +1（ADR-10）。
+    /// Trusted local completion. Network ingress must use complete_from.
     pub fn complete(&self, cid: u64, payload: ReplyPayload) -> bool {
-        if let Some((tx, _)) = self.slots.lock().unwrap().remove(&cid) {
-            let _ = tx.send(payload);
+        if let Some(slot) = self.slots.lock().unwrap().remove(&cid) {
+            let _ = slot.tx.send(payload);
             true
         } else {
             LATE_REPLY_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -94,29 +137,73 @@ impl CallbackRegistry {
         }
     }
 
+    /// Validate and consume atomically. A forged reply cannot steal a real slot.
+    pub fn complete_from(&self, cid: u64, payload: ReplyPayload, from: &FrameSender) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        let Some(slot) = slots.get(&cid) else {
+            LATE_REPLY_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if !slot
+            .connection
+            .as_ref()
+            .is_some_and(|owner| owner.same_connection(from))
+        {
+            WRONG_REPLY_SOURCE.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let slot = slots.remove(&cid).expect("slot checked under lock");
+        let _ = slot.tx.send(payload);
+        true
+    }
+
+    pub fn fail_connection(
+        &self,
+        connection: &FrameSender,
+        code: crate::error::ErrCode,
+        detail: &str,
+    ) -> usize {
+        let mut slots = self.slots.lock().unwrap();
+        let before = slots.len();
+        let ids: Vec<_> = slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.connection
+                    .as_ref()
+                    .is_some_and(|owner| owner.same_connection(connection))
+            })
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in ids {
+            let slot = slots.remove(&cid).expect("slot checked under lock");
+            let _ = slot.tx.send(ReplyPayload::Err(code, detail.to_owned()));
+        }
+        before - slots.len()
+    }
+
     /// 断连清空：所有挂起 ask 得 ConnectionLost（POC 实证路径——系统级关闭用）。
     pub fn fail_all(&self, code: crate::error::ErrCode, detail: &str) -> usize {
         let mut n = 0;
         let mut g = self.slots.lock().unwrap();
-        for (_, (tx, _)) in g.drain() {
-            let _ = tx.send(ReplyPayload::Err(code, detail.to_string()));
+        for (_, slot) in g.drain() {
+            let _ = slot.tx.send(ReplyPayload::Err(code, detail.to_string()));
             n += 1;
         }
         n
     }
 
-    /// 单链路断连：只 fail 发往 `node` 的挂起 ask（其它链路不受牵连——K6 多联语义）。
+    /// Explicit node-wide administrative failure. Not a connection-close hook.
     pub fn fail_node(&self, node: &str, code: crate::error::ErrCode, detail: &str) -> usize {
         let mut n = 0;
         let mut g = self.slots.lock().unwrap();
         let cids: Vec<u64> = g
             .iter()
-            .filter(|(_, (_, nd))| nd == node)
+            .filter(|(_, slot)| slot.node == node)
             .map(|(cid, _)| *cid)
             .collect();
         for cid in cids {
-            if let Some((tx, _)) = g.remove(&cid) {
-                let _ = tx.send(ReplyPayload::Err(code, detail.to_string()));
+            if let Some(slot) = g.remove(&cid) {
+                let _ = slot.tx.send(ReplyPayload::Err(code, detail.to_string()));
                 n += 1;
             }
         }
@@ -233,5 +320,85 @@ mod tests {
         r.fail_all(crate::error::ErrCode::ConnectionLost, "x");
         let c = r.next_cid();
         assert!(c > b);
+    }
+
+    fn connection(
+        name: &str,
+    ) -> (
+        FrameSender,
+        tokio::sync::mpsc::Receiver<crate::frame::Frame>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        (FrameSender::new(tx, name), rx)
+    }
+    #[test]
+    fn bound_slots_use_physical_writer_for_completion_and_failure() {
+        let r = CallbackRegistry::new(8);
+        let (a, _a_rx) = connection("same-hub");
+        let (b, _b_rx) = connection("same-hub");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        r.insert_on(1, "logical-destination", tx, &a).unwrap();
+        let reply = || ReplyPayload::Ok(bytes::Bytes::from_static(b"value"), "key".into());
+        assert!(!r.complete_from(1, reply(), &b));
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r.fail_connection(&b, crate::ErrCode::ConnectionLost, "wrong"),
+            0
+        );
+        assert!(r.complete_from(1, reply(), &a));
+        r.fail_connection(&a, crate::ErrCode::ConnectionLost, "later close");
+        assert!(matches!(
+            futures::executor::block_on(rx).unwrap(),
+            ReplyPayload::Ok(_, _)
+        ));
+    }
+
+    #[test]
+    fn duplicate_id_cannot_replace_pending_callback() {
+        let r = CallbackRegistry::new(2);
+        let (a, _a_rx) = connection("peer");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        r.insert_on(1, "dest", tx, &a).unwrap();
+        let (replacement, _) = tokio::sync::oneshot::channel();
+        assert!(r.insert_on(1, "other", replacement, &a).is_err());
+        assert_eq!(r.len(), 1);
+        r.fail_connection(&a, crate::ErrCode::ConnectionLost, "closed");
+        assert!(matches!(
+            futures::executor::block_on(rx).unwrap(),
+            ReplyPayload::Err(crate::ErrCode::ConnectionLost, _)
+        ));
+    }
+
+    #[test]
+    fn network_cannot_complete_unbound_local_slot() {
+        let r = CallbackRegistry::new(2);
+        let (connection, _rx) = connection("peer");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        r.insert(1, "peer", tx).unwrap();
+        let reply = || ReplyPayload::Err(crate::ErrCode::Stopped, "local".into());
+        assert!(!r.complete_from(1, reply(), &connection));
+        assert_eq!(r.len(), 1);
+        assert!(r.complete(1, reply()));
+        assert!(futures::executor::block_on(rx).is_ok());
+    }
+
+    #[test]
+    fn closed_writer_cannot_be_registered_after_disconnect_cleanup() {
+        let r = CallbackRegistry::new(2);
+        let (connection, _rx) = connection("peer");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        r.insert_on(1, "dest", tx, &connection).unwrap();
+        connection.close();
+        assert_eq!(
+            r.fail_connection(&connection, crate::ErrCode::ConnectionLost, "closed"),
+            1
+        );
+        assert!(matches!(
+            futures::executor::block_on(rx).unwrap(),
+            ReplyPayload::Err(crate::ErrCode::ConnectionLost, _)
+        ));
+        let (late, _) = tokio::sync::oneshot::channel();
+        assert!(r.insert_on(2, "dest", late, &connection).is_err());
+        assert!(r.is_empty());
     }
 }

@@ -1,28 +1,23 @@
-//! F2（DEV_09 §3.6）：镜像 actor——`MirrorPolicy{src_prefix, mirror_path}`
-//! 双写。
+//! Bounded, best-effort shadow delivery for references looked up through the facade.
 //!
-//! 语义（09 §8 调试五件套）：
-//! - 发往 `src_prefix` 命中目标的每条消息 → 原投递 **加** 镜像副本
-//!   （copy 到 `mirror_path`——影子组件观察线上流量）；
-//! - 镜像副本 **fire-and-forget**：投递失败记日志，不回传错误、不影响
-//!   原路径（调试面零干扰铁律）；
-//! - ask：原 ask 正常等回执；镜像侧只送 tell 副本（不等待——避免双倍
-//!   RTT）。
+//! Register an explicit copier for each supported message type. Copying executes
+//! synchronously on the caller and must be bounded and side-effect free. The
+//! worker delivers only TELLs; its errors never replace the primary result.
+mod runtime;
+use parrot_api::{
+    address::ActorRef,
+    message::MessageOptions,
+    types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage},
+};
+pub use runtime::MirrorHandle;
+pub(crate) use runtime::MirrorRegistry;
+use std::{any::TypeId, sync::Arc, time::Duration};
 
-use parrot_api::address::ActorRef;
-use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
-use std::sync::Arc;
-use std::time::Duration;
-
-/// 镜像策略（注册面：`ParrotActorSystem::register_mirror_policy`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorPolicy {
-    /// 源前缀（此前缀下的目标引用被双写包装）。
     pub src_prefix: String,
-    /// 镜像目标路径（副本投递处——影子组件 spawn 位）。
     pub mirror_path: String,
 }
-
 impl MirrorPolicy {
     pub fn new(src_prefix: impl Into<String>, mirror_path: impl Into<String>) -> Self {
         Self {
@@ -30,218 +25,277 @@ impl MirrorPolicy {
             mirror_path: mirror_path.into(),
         }
     }
+    fn validate(&self) -> Result<(), MirrorError> {
+        let local = |path: &str| {
+            path.starts_with('/')
+                && !path.starts_with("//")
+                && path.len() <= 4096
+                && !path.chars().any(char::is_control)
+        };
+        let actix_prefix = self.src_prefix.starts_with("actix://")
+            && self.src_prefix.len() <= 4096
+            && !self.src_prefix.chars().any(char::is_control);
+        let actix_target = self
+            .mirror_path
+            .strip_prefix("actix://")
+            .is_some_and(|tail| {
+                let id = tail.rsplit_once('/').map_or(tail, |(_, id)| id);
+                self.mirror_path.len() <= 4096
+                    && !tail.chars().any(char::is_control)
+                    && uuid::Uuid::parse_str(id).is_ok()
+            });
+        if !(local(&self.src_prefix) || actix_prefix)
+            || !(local(&self.mirror_path) || actix_target)
+            || self.src_prefix == self.mirror_path
+        {
+            return Err(MirrorError::InvalidPolicy);
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Copy)]
+pub struct MirrorOptions {
+    /// Total pending copies, including copying, queue and in-flight admission.
+    pub capacity: usize,
+    pub max_message_bytes: usize,
+    pub max_pending_bytes: usize,
+    pub delivery_timeout: Duration,
+}
+impl Default for MirrorOptions {
+    fn default() -> Self {
+        Self {
+            capacity: 256,
+            max_message_bytes: 1024 * 1024,
+            max_pending_bytes: 8 * 1024 * 1024,
+            delivery_timeout: Duration::from_millis(100),
+        }
+    }
+}
+impl MirrorOptions {
+    fn validate(self) -> Result<(), MirrorError> {
+        if self.capacity == 0
+            || self.capacity > 65_536
+            || self.max_message_bytes == 0
+            || self.max_message_bytes > self.max_pending_bytes
+            || self.max_pending_bytes > 64 * 1024 * 1024
+            || self.delivery_timeout.is_zero()
+            || self.delivery_timeout > Duration::from_secs(60)
+        {
+            return Err(MirrorError::InvalidOptions);
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MirrorError {
+    #[error("mirror requires distinct local /paths or native actix:// paths (at most 4096 bytes)")]
+    InvalidPolicy,
+    #[error("invalid mirror count, byte budget or delivery timeout")]
+    InvalidOptions,
+    #[error("register at least one message copier before registering a mirror policy")]
+    NoCopier,
+    #[error("mirror registration requires a Tokio runtime")]
+    NoRuntime,
+    #[error("mirror registry is closed")]
+    Closed,
+    #[error("mirror registry limit reached")]
+    RegistryFull,
+    #[error("mirror copier disposal failed (registration committed: {committed}): {reason}")]
+    CopierDisposal { committed: bool, reason: String },
+}
+type Measure = dyn Fn(&BoxedMessage) -> Result<usize, String> + Send + Sync;
+type CopyMessage = dyn Fn(&BoxedMessage) -> Result<BoxedMessage, String> + Send + Sync;
+/// Typed copying contract. Account for owned heap data in `measure` before
+/// copying. These application functions must terminate promptly and may not
+/// mutate the source. Aliasing through Arc/interior mutability remains the
+/// application's responsibility; arbitrary user allocation is not sandboxed.
+#[derive(Clone)]
+pub struct MirrorCopier {
+    type_id: TypeId,
+    measure: Arc<Measure>,
+    copy: Arc<CopyMessage>,
+}
+impl MirrorCopier {
+    // Fields may own unrelated hostile captures. Dispose each independently.
+    fn retire(self) -> Result<(), String> {
+        fn dispose<T>(value: T) -> Result<(), String> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
+                .map_err(crate::owned_payload::panic_message)
+        }
+        let Self { measure, copy, .. } = self;
+        let measure = dispose(measure);
+        let copy = dispose(copy);
+        match (measure, copy) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(a), Err(b)) => Err(format!("measure: {a}; copy: {b}")),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
+    pub fn new<T: Send + 'static>(
+        measure: impl Fn(&T) -> usize + Send + Sync + 'static,
+        copy: impl Fn(&T) -> Result<T, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            type_id: TypeId::of::<T>(),
+            measure: Arc::new(move |msg| {
+                msg.downcast_ref::<T>()
+                    .map(&measure)
+                    .ok_or_else(|| "copier type mismatch".into())
+            }),
+            copy: Arc::new(move |msg| {
+                let value = msg.downcast_ref::<T>().ok_or("copier type mismatch")?;
+                Ok(Box::new(copy(value)?) as BoxedMessage)
+            }),
+        }
+    }
+    pub fn cloned<T: Clone + Send + 'static>(
+        measure: impl Fn(&T) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(measure, |value: &T| Ok(value.clone()))
+    }
+}
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MirrorStats {
+    pub attempted: u64,
+    pub queued: u64,
+    /// Shadow mailbox admissions, not completed processing.
+    pub admitted: u64,
+    pub copy_failed: u64,
+    pub full: u64,
+    pub missing_target: u64,
+    pub delivery_failed: u64,
+    pub cancelled: u64,
+    /// Failed framework-owned shadow input or copier retirements. A copier
+    /// retirement counts once even if both of its captures fail. These failures
+    /// do not replace the primary result or imply shadow processing completed.
+    pub disposal_failed: u64,
+    /// Unexpected worker termination, distinct from an individual admission failure.
+    pub worker_failed: u64,
+}
+/// The facade keeps the policy worker alive. Clones share its capacity and
+/// cancellation state. Creating and dropping an unpolled call has no effects.
+pub(crate) trait MirrorLookup: Send + Sync {
+    fn lookup<'a>(&'a self, path: &'a str) -> BoxedFuture<'a, Option<BoxedActorRef>>;
 }
 
-/// 双写引用（原引用 + 镜像出口）。
-///
-/// 由 system facade 查找命中策略时包装产生——调用方无感。
 pub struct MirrorRef {
     inner: Arc<dyn ActorRef>,
-    policy: MirrorPolicy,
+    lookup: Arc<dyn MirrorLookup>,
+    handle: MirrorHandle,
 }
-
 impl std::fmt::Debug for MirrorRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MirrorRef")
             .field("path", &self.inner.path())
-            .field("policy", &self.policy)
+            .field("policy", self.handle.policy())
             .finish()
     }
 }
-
 impl MirrorRef {
-    pub fn new(inner: Arc<dyn ActorRef>, policy: MirrorPolicy) -> Self {
-        Self { inner, policy }
-    }
-
-    /// 镜像投递（tell 语义副本——失败仅日志）。
-    fn mirror_tell(&self, msg: &BoxedMessage) {
-        // BoxedMessage 无 clone 协议位（类型擦除）——镜像副本经原引用
-        // 的 send 返回值旁路不可行；首版策略：镜像侧 send 消息的副本
-        // 由上层序列化组件承担（wire 形态组件）。此处保守仅投可安全
-        // 共享的引用语义：跳过镜像并记录（诚实边界——升级点在
-        // Message::clone_boxed 协议位）。
-        let _ = msg;
-        tracing::debug!(
-            src = %self.policy.src_prefix,
-            mirror = %self.policy.mirror_path,
-            "mirror tell skipped (BoxedMessage clone protocol pending)"
-        );
+    pub(crate) fn new(
+        inner: Arc<dyn ActorRef>,
+        lookup: Arc<dyn MirrorLookup>,
+        handle: MirrorHandle,
+    ) -> Self {
+        Self {
+            inner,
+            lookup,
+            handle,
+        }
     }
 }
-
 #[async_trait::async_trait]
 impl ActorRef for MirrorRef {
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        self.mirror_tell(&msg);
-        self.inner.send(msg)
+        Box::pin(parrot_api::trace::capture(async move {
+            self.handle
+                .offer(&msg, self.lookup.clone(), self.inner.path());
+            self.inner.send(msg).await
+        }))
     }
-
     fn send_with_timeout<'a>(
         &'a self,
         msg: BoxedMessage,
-        t: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        self.mirror_tell(&msg);
-        self.inner.send_with_timeout(msg, t)
+        Box::pin(parrot_api::trace::capture(async move {
+            let started = tokio::time::Instant::now();
+            self.handle
+                .offer(&msg, self.lookup.clone(), self.inner.path());
+            self.inner
+                .send_with_timeout(msg, remaining_budget(started, timeout)?)
+                .await
+        }))
     }
-
+    fn send_with_options<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(parrot_api::trace::capture(async move {
+            options.validate_single_attempt()?;
+            let started = tokio::time::Instant::now();
+            let mut options = options;
+            self.handle
+                .offer(&msg, self.lookup.clone(), self.inner.path());
+            options.timeout = remaining_budget(started, options.timeout)?;
+            self.inner.send_with_options(msg, options).await
+        }))
+    }
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        self.mirror_tell(&msg);
-        self.inner.deliver(msg)
+        Box::pin(parrot_api::trace::capture(async move {
+            self.handle
+                .offer(&msg, self.lookup.clone(), self.inner.path());
+            self.inner.deliver(msg).await
+        }))
     }
-
+    fn deliver_with_options<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(parrot_api::trace::capture(async move {
+            options.validate_single_attempt()?;
+            let started = tokio::time::Instant::now();
+            let mut options = options;
+            self.handle
+                .offer(&msg, self.lookup.clone(), self.inner.path());
+            options.timeout = remaining_budget(started, options.timeout)?;
+            self.inner.deliver_with_options(msg, options).await
+        }))
+    }
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         self.inner.stop()
     }
-
     fn path(&self) -> String {
         self.inner.path()
     }
-
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
         self.inner.is_alive()
     }
-
-    fn clone_boxed(&self) -> BoxedActorRefAlias {
+    fn clone_boxed(&self) -> BoxedActorRef {
         Box::new(Self {
             inner: self.inner.clone(),
-            policy: self.policy.clone(),
+            lookup: self.lookup.clone(),
+            handle: self.handle.clone(),
         })
     }
-
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
 
-/// Box<dyn ActorRef> 别名（types 导出一致）。
-type BoxedActorRefAlias = parrot_api::types::BoxedActorRef;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use parrot_api::types::BoxedMessage;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// 计数回显引用（测试桩——记录 send/deliver 次数）。
-    #[derive(Debug)]
-    struct CountingRef {
-        path: String,
-        sends: AtomicUsize,
-        delivers: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl ActorRef for CountingRef {
-        fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-            self.sends.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(msg) })
-        }
-        fn send_with_timeout<'a>(
-            &'a self,
-            msg: BoxedMessage,
-            _t: Option<Duration>,
-        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-            self.send(msg)
-        }
-        fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-            self.delivers.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                let _ = msg;
-                Ok(())
-            })
-        }
-        fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn path(&self) -> String {
-            self.path.clone()
-        }
-        fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-            Box::pin(async { true })
-        }
-        fn clone_boxed(&self) -> parrot_api::types::BoxedActorRef {
-            unreachable!("测试桩不走 clone_boxed")
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    fn msg() -> BoxedMessage {
-        // 单元消息占位（BoxedMessage=Box<dyn Any+Send>）
-        Box::new(42u32)
-    }
-
-    #[tokio::test]
-    async fn send_passes_through() {
-        let inner = Arc::new(CountingRef {
-            path: "/user/real".into(),
-            sends: AtomicUsize::new(0),
-            delivers: AtomicUsize::new(0),
-        });
-        let m = MirrorRef::new(inner.clone(), MirrorPolicy::new("/user/", "/user/mirror"));
-        let r = m.send(msg()).await.unwrap();
-        // 回执透传（原消息体）
-        assert!(r.downcast::<u32>().is_ok());
-        assert_eq!(inner.sends.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn deliver_passes_through() {
-        let inner = Arc::new(CountingRef {
-            path: "/user/real".into(),
-            sends: AtomicUsize::new(0),
-            delivers: AtomicUsize::new(0),
-        });
-        let m = MirrorRef::new(inner.clone(), MirrorPolicy::new("/user/", "/user/mirror"));
-        m.deliver(msg()).await.unwrap();
-        assert_eq!(inner.delivers.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn path_and_alive_forwarded() {
-        let inner = Arc::new(CountingRef {
-            path: "/user/real".into(),
-            sends: AtomicUsize::new(0),
-            delivers: AtomicUsize::new(0),
-        });
-        let m = MirrorRef::new(inner, MirrorPolicy::new("/user/", "/m"));
-        assert_eq!(m.path(), "/user/real");
-        assert!(m.is_alive().await);
-    }
-
-    #[tokio::test]
-    async fn stop_forwarded_no_mirror() {
-        let inner = Arc::new(CountingRef {
-            path: "/user/real".into(),
-            sends: AtomicUsize::new(0),
-            delivers: AtomicUsize::new(0),
-        });
-        let m = MirrorRef::new(inner, MirrorPolicy::new("/user/", "/m"));
-        m.stop().await.unwrap();
-    }
-
-    #[test]
-    fn policy_fields() {
-        let p = MirrorPolicy::new("/user/src-", "/user/mirror");
-        assert_eq!(p.src_prefix, "/user/src-");
-        assert_eq!(p.mirror_path, "/user/mirror");
-    }
-
-    // ActorRefExt::ask 走 send——mirror 侧不阻塞（send 内先 mirror 后直发）
-    #[tokio::test]
-    async fn ask_semantics_preserved() {
-        let inner = Arc::new(CountingRef {
-            path: "/user/real".into(),
-            sends: AtomicUsize::new(0),
-            delivers: AtomicUsize::new(0),
-        });
-        let m = MirrorRef::new(inner.clone(), MirrorPolicy::new("/user/", "/m"));
-        // send 两次（ask 重试路径模拟）——计数透传
-        let _ = m.send(msg()).await;
-        let _ = m.send(msg()).await;
-        assert_eq!(inner.sends.load(Ordering::SeqCst), 2);
-    }
+fn remaining_budget(
+    started: tokio::time::Instant,
+    timeout: Option<Duration>,
+) -> ActorResult<Option<Duration>> {
+    timeout
+        .map(|budget| {
+            budget
+                .checked_sub(started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(parrot_api::errors::ActorError::Timeout)
+        })
+        .transpose()
 }

@@ -1,78 +1,28 @@
-/**
- * reconnect 幂等（DEV_03 §2.4）：HANDSHAKE_ACK → registrations 重放恰一次/条目。
- * 运行：node --test tests/（node:test 原生）
- */
-import test from "node:test";
-import assert from "node:assert/strict";
-
-import { ParrotLite } from "../dist/lite.js";
-import { FrameDecoder, FT, buildFrame, handshakeAckBody, newCid } from "../dist/wire.js";
-
-function mkWs() {
-  return {
-    sent: [],
-    onmessage: null,
-    onclose: null,
-    onopen: null,
-    onerror: null,
-    readyState: 1,
-    send(d) {
-      this.sent.push(d);
-    },
-    close() {
-      this.readyState = 3;
-    },
-  };
-}
-
-function decodeSent(ws) {
-  const dec = new FrameDecoder();
-  for (const s of ws.sent) dec.feed(s);
-  const out = [];
-  for (let f = dec.nextFrame(); f; f = dec.nextFrame()) {
-    out.push({ ft: f.ft, path: f.path, key: f.typeKey });
-  }
-  return out;
-}
-
-test("handshake ack replays each registration exactly once", async () => {
-  const stub = mkWs();
-  const node = await ParrotLite.connect({
-    url: "ws://x",
-    nodeId: "lite-1",
-    wsFactory: () => {
-      queueMicrotask(() => stub.onopen?.());
-      return stub;
-    },
-  });
-
-  await node.register("edge/rpa", "rpa-main");
-  await node.register("edge/cam", "cam-main");
-  assert.equal(
-    decodeSent(stub).filter((f) => f.key.startsWith("$receptionist.register:")).length,
-    2,
-  );
-
-  // 重连完成：服务端 HANDSHAKE_ACK 到达 → registrations 重放
-  stub.onmessage?.({
-    data: buildFrame(FT.HANDSHAKE_ACK, newCid(), "", "__handshake__", handshakeAckBody("gw"))
-      .slice().buffer,
-  });
-  const regs = decodeSent(stub).filter((f) => f.key.startsWith("$receptionist.register:"));
-  assert.equal(regs.length, 4); // replay 恰好 +2（每条注册一次）
-  assert.equal(regs.filter((r) => r.key.endsWith("edge/rpa")).length, 2);
-  assert.equal(regs.filter((r) => r.key.endsWith("edge/cam")).length, 2);
-
-  for (let round = 0; round < 5; round++) {
-    const before = decodeSent(stub).filter((f) => f.key.startsWith("$receptionist.register:")).length;
-    stub.onmessage?.({data: buildFrame(FT.HANDSHAKE_ACK, newCid(), "", "__handshake__", handshakeAckBody("gw")).slice().buffer});
-    const after = decodeSent(stub).filter((f) => f.key.startsWith("$receptionist.register:")).length;
-    assert.equal(after - before, 2, `round ${round} must replay each unique registration once`);
-  }
-  await node.register("edge/rpa", "rpa-main");
-  const beforeDuplicate = decodeSent(stub).length;
-  stub.onmessage?.({data: buildFrame(FT.HANDSHAKE_ACK, newCid(), "", "__handshake__", handshakeAckBody("gw")).slice().buffer});
-  assert.equal(decodeSent(stub).length - beforeDuplicate, 2);
-
-  node.close();
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {setTimeout as delay} from 'node:timers/promises';
+import {ParrotLite, FrameDecoder, FT, buildFrame, handshakeAckBody} from '../dist/index.js';
+const decode=bytes=>{const d=new FrameDecoder();d.feed(bytes);return d.nextFrame();};
+async function until(predicate) { const end=Date.now()+2000; while(!predicate()) {if(Date.now()>end)throw new Error('fixture event missing');await delay(2);} }
+test('actual reconnect replays each unique registration once on the new socket',async()=>{
+  const sockets=[];
+  const node=await ParrotLite.connect({url:'ws://fixture',nodeId:'client',reconnectDelayMs:5,connectTimeoutMs:100,wsFactory:()=>{
+    const ws={readyState:0,bufferedAmount:0,sent:[],onopen:null,onclose:null,onmessage:null,onerror:null,
+      send(bytes){this.sent.push(decode(bytes));if(decode(bytes).ft===FT.HANDSHAKE)queueMicrotask(()=>this.onmessage?.({data:buildFrame(FT.HANDSHAKE_ACK,1n,'','',handshakeAckBody('peer')).buffer}));},
+      close(){this.readyState=3;this.onclose?.();}};
+    sockets.push(ws);queueMicrotask(()=>{ws.readyState=1;ws.onopen?.();});return ws;
+  }});
+  try {
+    await node.register('edge/rpa','rpa-main');await node.register('edge/cam','cam-main');await node.register('edge/rpa','rpa-main');
+    for(let round=0;round<3;round++) {
+      const old=sockets.at(-1);const oldCount=old.sent.length;old.close();
+      await until(()=>sockets.length===round+2&&sockets.at(-1).sent.length===3);
+      const current=sockets.at(-1);const regs=current.sent.filter(f=>f.typeKey.startsWith('$receptionist.register:'));
+      assert.deepEqual(regs.map(f=>[f.typeKey,f.path]),[['$receptionist.register:edge/rpa','rpa-main'],['$receptionist.register:edge/cam','cam-main']]);
+      assert.equal(old.sent.length,oldCount);assert.equal(current.sent[0].ft,FT.HANDSHAKE);
+    }
+    const last=sockets.at(-1);last.onmessage?.({data:buildFrame(FT.HANDSHAKE_ACK,2n,'','',handshakeAckBody('peer')).buffer});
+    assert.equal(last.readyState,3,'duplicate ACK retires the current generation, it is not a reconnect');
+  } finally {node.close();}
+  const count=sockets.length;await delay(20);assert.equal(sockets.length,count,'close cancels retry timer');
 });

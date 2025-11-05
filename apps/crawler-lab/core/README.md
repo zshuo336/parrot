@@ -1,0 +1,24 @@
+# Crawler component business
+
+`crawler-lab-core` owns each instance's visited set, synthetic pages, token frequencies, outlinks and sequence cursor. Embedded, Dylib and Wasm execute this same kernel. The host owns network I/O to Erlang frontier, Ray indexing and JVM search. ABI/WIT has not gained arbitrary networking or filesystem privileges.
+
+Build with `make build-crawler-business` (Rust wasm32-unknown-unknown target and wasm-tools 1.261.0 required). `make test-crawler-business` additionally builds the gateway components and TypeScript, tests all three forms, then runs five real polyglot scenarios against the unchanged historical golden. Ray, Erlang, Java/Maven and Node/npm are required; missing dependencies fail the gate. The Wasm lockfile belongs to its standalone workspace. All three test entry points require a successful current-source build receipt; they never bootstrap Cargo from a running test. See [artifact build receipts](../../../docs/CRAWLER_BUSINESS_ARTIFACTS.md) for custom paths and invalidation rules.
+
+The CLI defaults to embedded business. Select a built library with `--hub-dylib FILE --trust-native-sha256 HEX64`; this explicitly authorizes trusted native code and its dependencies. Select the sandboxed component with `--hub-wasm FILE --hub-sha256 HEX64`. The launcher accepts the same options. Supply the SHA-256 of the actual file; a wrong digest fails admission. Native artifacts are platform-specific. The launcher defaults to standard `crawler.app.toml` assembly and declared wiring; `LAB_MODE=direct|registry` selects the compatibility paths. Historical raw CID equivalence remains uncertified.
+
+Configuration is a JSON object with exactly `pages`, `depth`, `fanout`, `batch`, carried in the TOML string `settings`. The native public host wraps it in `[config]` alongside its actor identity; direct ABI callers can provide top-level settings. Wasm reads `ctx.config-get("settings")`. Omitted settings use defaults; malformed or out-of-range values fail startup. Limits match the CLI: pages 0..1,000,000, depth 0..65,535, fanout 0..256, batch 1..256.
+
+All numbers below are unsigned little-endian. A blob is u32 byte length followed by its bytes; text must be valid UTF-8. A frontier list is u32 count followed by `(u64 id, blob URL, u16 depth)` records. Input/output is at most 4 MiB, request records at most configured batch, page replies at most 256, term replies at most 8,704, outlinks at most 65,536. Counts, lengths, truncation and trailing bytes are checked before state commits.
+
+- `crawl/Tick` request: u64 sequence followed by a frontier list. Sequence starts at 1. Each entry must belong to the configured synthetic site and depth.
+- Tick reply: ASCII `CTK1`, u64 sequence, u64 cumulative fetched, u32 page count plus `(u64 id, blob HTML)` records, u32 term count plus `(blob term, u64 id, u32 frequency)` records, then a frontier list of outlinks.
+- `crawl/Progress`: empty request; replies u64 successful ticks and u64 visited pages.
+- `crawl/Stat`: empty request; replies u64 handled count including this successful Stat.
+- `crawl/Echo`: echoes bytes. `crawl/Bump`: exactly one byte; adds that value to handled count and returns empty bytes (preserves the old Wasm tell capability with strict payload validation).
+- Wasm-only `crawl/Self`: empty request; returns the host actor path and counts as one successful message.
+
+A successful Tick stages the complete batch, encodes the reply and checks reply capacity before updating visited/counters/cache. The most recent identical request can be retried with byte-identical output and no second commit; different content at that sequence, older sequences and gaps are rejected. This is one-entry, in-memory replay, not durable or distributed exactly-once delivery. Invalid requests and insufficient reply capacity do not update state. Drain permits only Stat/Progress. A Wasm trap is governed by the host runtime's poisoned-instance lifecycle, not a promise to replay a partially executed trap.
+
+Pages retain the historical 64-bit xorshift algorithm. Modulo occurs before conversion to `usize`, so Wasm32 and native hosts agree. Terms are now lexicographically ordered per page; the historical host used HashMap iteration. Golden counters and search ranking agree, but historical raw message byte/CID ordering is not certified.
+
+Crawler Wasm budgets are 1 billion fuel/message, 100 automatic epochs (approximately one second) and 128 MiB linear memory. The real maximum-batch test covers 256 pages and approximately 65,536 outlinks; these are finite admission limits, not a throughput SLA or whole-crawl memory guarantee. Frontier still has its separate queue/seen quotas. There is no atomic commit across frontier dequeue, component Tick, Ray and JVM writes: a failed run cannot yet safely resume from a persisted crawl ledger.

@@ -1,165 +1,187 @@
-//! K0 管理协议集成测试（DEV_02 §0.4）：远程 spawn/stop 全链路。
-//!
-//! 载体：mem 双节点（spawn_named_e2e 等 5 用例——TCP 同语义已由 P1 RC 矩阵
-//! 覆盖传输层，此处聚焦管理协议本身）。
-
-use std::sync::Arc;
-
-use parrot_api::address::ActorRef;
-use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
+//! Administrative commands must create, conflict with and stop actual Thread actors.
+use parrot::thread::{context::ThreadContext, system::ThreadActorSystem};
+use parrot_api::{
+    actor::{Actor, ActorState, EmptyConfig},
+    address::ActorRef,
+    types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage},
+};
 use parrot_remote::{LocalLookup, RemoteActorSystem, RemoteConfig};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
 
-// ---------------- 测试 props 工厂（目标节点注册） ----------------
-
-/// echo actor：ask 回显 / tell 计数。
-#[derive(Debug)]
-pub struct Echo;
-
-impl Echo {
-    #[allow(dead_code)]
-    fn handle(msg: BoxedMessage) -> ActorResult<BoxedMessage> {
-        Ok(msg)
-    }
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, parrot_api_derive::RemoteMessage)]
+struct Value(u64);
+impl parrot_api::Message for Value {
+    type Result = Self;
 }
-
-fn spawn_echo(_path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-    Box::pin(async { Ok(Box::new(EchoRef) as BoxedActorRef) })
-}
-
-parrot_api::message::inventory::submit! {
-    parrot_remote::admin::PropsFactory {
-        name: "test.echo",
-        spawn: spawn_echo,
-    }
-}
-
-#[derive(Debug)]
-struct EchoRef;
-
-#[async_trait::async_trait]
-impl ActorRef for EchoRef {
-    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        self.send_with_timeout(msg, None)
-    }
-    fn send_with_timeout<'a>(
-        &'a self,
+struct Echo;
+impl Actor for Echo {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+    fn receive_message<'a>(
+        &'a mut self,
         msg: BoxedMessage,
-        _t: Option<std::time::Duration>,
+        _: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move { Ok(msg) })
     }
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move { Ok(()) })
-    }
-    fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move { Ok(()) })
-    }
-    fn path(&self) -> String {
-        "/user/echo".into()
-    }
-    fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-        Box::pin(async move { true })
-    }
-    fn clone_boxed(&self) -> BoxedActorRef {
-        Box::new(Self)
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
 }
-
-/// LocalLookup：echo ref 桩（spawn 后可查到）。
-struct TestLookup;
-
+// Inventory factories are process-global. Each test registers only its unique
+// requested path with a weak engine reference; no fixture owns another's actors.
+fn engines() -> &'static Mutex<HashMap<String, Weak<ThreadActorSystem>>> {
+    static ENGINES: OnceLock<Mutex<HashMap<String, Weak<ThreadActorSystem>>>> = OnceLock::new();
+    ENGINES.get_or_init(Default::default)
+}
+fn spawn_echo(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
+    let engine = engines().lock().unwrap().get(path).and_then(Weak::upgrade);
+    let path = path.to_owned();
+    Box::pin(async move {
+        let engine = engine.ok_or_else(|| {
+            parrot_api::errors::ActorError::InternalError("test engine missing".into())
+        })?;
+        let actor = engine
+            .spawn_at(Echo, &path, None, Default::default())
+            .await
+            .map_err(|e| parrot_api::errors::ActorError::InternalError(e.to_string()))?;
+        Ok(Box::new(actor) as BoxedActorRef)
+    })
+}
+parrot_api::message::inventory::submit! {
+    parrot_remote::admin::PropsFactory { name: "test.real.echo", spawn: spawn_echo }
+}
+struct Lookup(Arc<ThreadActorSystem>);
 #[async_trait::async_trait]
-impl LocalLookup for TestLookup {
-    async fn lookup(&self, path: &str) -> Option<Box<dyn ActorRef>> {
-        if path == "/user/echo" {
-            Some(Box::new(EchoRef))
-        } else {
-            None
+impl LocalLookup for Lookup {
+    async fn lookup(&self, path: &str) -> Option<BoxedActorRef> {
+        self.0.get_actor_ref(path).map(|actor| actor.clone_boxed())
+    }
+}
+struct Fixture {
+    client: Arc<RemoteActorSystem>,
+    server: Arc<RemoteActorSystem>,
+    engine: Arc<ThreadActorSystem>,
+    path: String,
+    target: String,
+}
+impl Fixture {
+    async fn new(name: &str) -> Self {
+        let engine = ThreadActorSystem::shared(Default::default());
+        let path = format!("/user/{name}");
+        let target = format!("admin-{name}-server");
+        engines()
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Arc::downgrade(&engine));
+        let server =
+            RemoteActorSystem::new(RemoteConfig::mem(&target), Arc::new(Lookup(engine.clone())))
+                .unwrap();
+        let client = RemoteActorSystem::new(
+            RemoteConfig::mem(format!("admin-{name}-client")),
+            Arc::new(Lookup(engine.clone())),
+        )
+        .unwrap();
+        server.start().await.unwrap();
+        client.start().await.unwrap();
+        client.connect_mem_pair(&server).await.unwrap();
+        Self {
+            client,
+            server,
+            engine,
+            path,
+            target,
         }
     }
+    async fn spawn(&self) -> Result<parrot_remote::RemoteActorRef, parrot_remote::RemoteError> {
+        self.client
+            .spawn_named(&self.target, &self.path, "test.real.echo")
+            .await
+    }
+    async fn close(&self) {
+        self.client.shutdown().await.unwrap();
+        self.server.shutdown().await.unwrap();
+        self.engine.shutdown_internal().await.unwrap();
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        engines().lock().unwrap().remove(&self.path);
+    }
 }
 
-async fn mem_pair(a_id: &str, b_id: &str) -> (Arc<RemoteActorSystem>, Arc<RemoteActorSystem>) {
-    let ra = RemoteActorSystem::new(RemoteConfig::mem(a_id), Arc::new(TestLookup)).unwrap();
-    let rb = RemoteActorSystem::new(RemoteConfig::mem(b_id), Arc::new(TestLookup)).unwrap();
-    ra.start().await.unwrap();
-    rb.start().await.unwrap();
-    ra.connect_mem_pair(&rb).await.unwrap();
-    (ra, rb)
-}
-
-// ---------------- §0.4 用例 ----------------
-
-/// `spawn_named_e2e`：目标节点注册工厂 → 发起方 spawn_named → ask 即达。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn spawn_named_e2e() {
-    let (ra, _rb) = mem_pair("admin-a", "admin-b").await;
-    // "test.echo" 工厂已由本测试进程 inventory 注册（两侧同进程共享）
-    let r = ra
-        .spawn_named("admin-b", "/user/echo", "test.echo")
-        .await
-        .expect("spawn_named");
-    assert_eq!(r.node_id(), "admin-b");
-    assert_eq!(r.path(), "parrot://admin-b/user/echo");
+    let fixture = Fixture::new("roundtrip").await;
+    let actor = fixture.spawn().await.unwrap();
+    assert_eq!(fixture.engine.actor_count(), 1);
+    let result = actor.send(Box::new(Value(42))).await.unwrap();
+    assert_eq!(result.downcast_ref::<Value>().unwrap().0, 42);
+    fixture.close().await;
 }
-
-/// `spawn_named_unknown_props`：未注册名 → Failed(NotRemotable) 快速失败，零副作用。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_named_unknown_props() {
-    let (ra, _rb) = mem_pair("adm-ua", "adm-ub").await;
-    let err = ra
-        .spawn_named("adm-ub", "/user/ghost", "nowhere.props")
+#[tokio::test]
+async fn spawn_named_unknown_props_has_no_side_effects() {
+    let fixture = Fixture::new("unknown").await;
+    let error = fixture
+        .client
+        .spawn_named(&fixture.target, &fixture.path, "unregistered")
         .await
         .unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("not registered"), "got {msg:?}");
-    assert!(
-        msg.contains('4') || msg.contains("NotRemotable"),
-        "code=4 NotRemotable: {msg:?}"
-    );
+    assert!(error.to_string().contains("not registered"));
+    assert_eq!(fixture.engine.actor_count(), 0);
+    fixture.close().await;
 }
-
-/// `admin_stop_with_receipt`：回执到达且目标 actor 已 stop。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_stop_with_receipt() {
-    let (ra, _rb) = mem_pair("adm-sa", "adm-sb").await;
-    // 先 spawn 再 stop（lookup 桩对 /user/echo 恒可达——语义等价）
-    ra.spawn_named("adm-sb", "/user/echo", "test.echo")
+#[tokio::test]
+async fn admin_stop_with_receipt_closes_the_actual_actor_mailbox() {
+    let fixture = Fixture::new("stop").await;
+    let actor = fixture.spawn().await.unwrap();
+    actor.send(Box::new(Value(1))).await.unwrap();
+    fixture
+        .client
+        .admin_stop(&fixture.target, &fixture.path)
         .await
         .unwrap();
-    ra.admin_stop("adm-sb", "/user/echo")
-        .await
-        .expect("admin stop receipt");
-}
-
-/// `spawn_path_conflict`：同路径已存在 → Failed(ProtocolViolation, "path exists")。
-/// （桩 lookup 恒命中——以 lookup 结果为"已存在"判据的实现语义测试）
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_path_conflict() {
-    let (ra, _rb) = mem_pair("adm-ca", "adm-cb").await;
-    // 第一次成功
-    ra.spawn_named("adm-cb", "/user/echo", "test.echo")
+    let result = tokio::time::timeout(Duration::from_secs(2), actor.send(Box::new(Value(2))))
         .await
         .unwrap();
-    // 第二次同路径：工厂 spawn 桩返回 Ok——真实引擎下会 Conflict；
-    // 此处断言协议层行为：第二次请求仍得到确定性回执（Spawned 或 Failed），
-    // 不挂起不崩溃。真实 path 冲突语义由 parrot 引擎集成测试覆盖（M4 已有）。
-    let r2 = ra.spawn_named("adm-cb", "/user/echo", "test.echo").await;
-    assert!(r2.is_ok(), "stub spawns idempotent: {r2:?}");
+    assert!(result.is_err(), "stopped actor still executed a request");
+    fixture.close().await;
 }
-
-/// `admin_requires_role`：非 admin 连接发 AdminCommand → REPLY_ERR(Forbidden)。
-/// （P2 前期 admin_allowed 恒 true——K4 mTLS 后启用证书校验；本用例为占位
-/// 断言权限钩子存在且默认放行，K4 落地后翻转为拒绝断言。）
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_requires_role() {
-    let (ra, _rb) = mem_pair("adm-ra", "adm-rb").await;
-    // P2 前期：显式配置对端信任边界内放行
-    assert!(parrot_remote::admin::admin_allowed("adm-rb"));
-    ra.spawn_named("adm-rb", "/user/echo", "test.echo")
-        .await
-        .expect("allowed in trust boundary");
+#[tokio::test]
+async fn concurrent_spawn_path_conflict_preserves_one_live_actor() {
+    let fixture = Fixture::new("conflict").await;
+    let (first, second) = tokio::join!(fixture.spawn(), fixture.spawn());
+    assert_ne!(first.is_ok(), second.is_ok(), "exactly one spawn must win");
+    assert_eq!(fixture.engine.actor_count(), 1);
+    let actor = first.or(second).unwrap();
+    let reply = actor.send(Box::new(Value(7))).await.unwrap();
+    assert_eq!(reply.downcast_ref::<Value>().unwrap().0, 7);
+    fixture.close().await;
+}
+#[tokio::test]
+async fn in_process_admin_is_authorized() {
+    let fixture = Fixture::new("inprocess").await;
+    let sender = fixture.client.links_snapshot().await[0].1.clone();
+    assert!(parrot_remote::admin::admin_allowed(
+        &parrot_remote::ControlPolicy::LocalOnly,
+        &sender
+    ));
+    fixture.spawn().await.unwrap();
+    assert_eq!(fixture.engine.actor_count(), 1);
+    fixture.close().await;
+}
+#[test]
+fn claimed_admin_name_is_not_a_credential() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let peer = parrot_remote::FrameSender::new(tx, "operator.test");
+    let policy = parrot_remote::ControlPolicy::AuthenticatedNodes(["operator.test".into()].into());
+    assert!(!parrot_remote::admin::admin_allowed(&policy, &peer));
+    assert!(!parrot_remote::admin::admin_allowed(
+        &parrot_remote::ControlPolicy::LocalOnly,
+        &peer
+    ));
 }

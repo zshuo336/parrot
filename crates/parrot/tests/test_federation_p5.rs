@@ -1,89 +1,65 @@
 //! P5 集成验收（DEV_05 §9 DoD——07 §11 P5 出口判据）。
 //!
-//! - `hub_relay_matrix`：三模式 × ask/tell × 断 hub 降级（07 §11）
-//! - `directory_full_chain`：注册 → Raft 复制 → 查询 → INVALIDATE → 重解析
-//! - `cross_cluster_via_directory`：两套集群经 Directory 互访（模拟 compose）
+//! - `relay_helper_preserves_two_independent_returns`: pure RelayHub decisions.
+//!   Actual mode/ASK/TELL/hub-loss contracts live in parrot-remote topology_routing.
+//! - `directory_model_replicas_apply_once_and_cache_invalidates`：内存复制模型 → 各副本独立 apply → 本地缓存失效
+//! - `directory_model_cross_cluster_lookup`：本地目录／缓存模型（无 compose 或网络）
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parrot_remote::cache::{CacheState, ResolveAction, ResolveCache, resolve_decision};
-use parrot_remote::raft::{ManualClock, StateMachine, TestNet};
+use parrot_remote::raft::{ManualClock, TestNet};
 use parrot_remote::roles::directory::{DirCmd, DirQuery, DirectoryReplica};
 use parrot_remote::roles::hub::RelayHub;
 use parrot_remote::roles::route_reflector::RouteReflector;
-use parrot_remote::topology::{RouteEntry, RouteGossip, RouteTable, TopologyConfig, TopologyMode};
-
-// ── hub_relay_matrix（07 §11：三模式矩阵 × 降级） ───────
+use parrot_remote::topology::{RouteEntry, RouteGossip, RouteTable};
 
 #[test]
-fn hub_relay_matrix() {
-    for mode in [TopologyMode::Hub, TopologyMode::Mesh, TopologyMode::Hybrid] {
-        for hub_alive in [true, false] {
-            // strict 星型形态（relay_fallback=false）只在 hub 死时有意义断言
-            let cfg_strict = TopologyConfig {
-                mode,
-                relay_fallback: false,
-                ..Default::default()
-            };
-            if mode == TopologyMode::Hub && !hub_alive {
-                assert!(!cfg_strict.relay_fallback, "strict hub must not fallback");
-            }
-            let cfg = TopologyConfig {
-                mode,
-                relay_fallback: true,
-                ..Default::default()
-            };
-            // 场景：eu-1 经 hub 可达；us-1 直连可达
-            let mut routes = RouteTable::new();
-            routes.merge(&RouteGossip {
-                entries: vec![
-                    RouteEntry {
-                        prefix: "parrot://eu-1/".into(),
-                        next_hop: "hub".into(),
-                        cost: 2,
-                        version: 1,
-                    },
-                    RouteEntry {
-                        prefix: "parrot://us-1/".into(),
-                        next_hop: "us-1".into(),
-                        cost: 1,
-                        version: 1,
-                    },
-                ],
-                digest: 0,
-            });
-            let mut hub = RelayHub::new("hub-1", routes);
-
-            // eu 目标：hub 中继（三模式均可达——mesh 下也允许中继路径）
-            let r = hub.relay_ask(1, "parrot://eu-1/user/x", b"m", "src/_remote", 0, 8);
-            if hub_alive {
-                let (next, new_cid, hop) = r.expect("hub alive relays");
-                assert_eq!(next, "hub");
-                assert_eq!(hop, 1);
-                let (orig, rt) = hub.relay_reply(new_cid).unwrap();
-                assert_eq!((orig, rt.as_str()), (1, "src/_remote"));
-            } else {
-                // hub 死：决策层面（网络面由 ingress 集成覆盖）——
-                // relay_fallback=true 时允许 mesh 兜底继续中继语义
-                let _ = &cfg;
-            }
-
-            // us 目标：直连（cost=1——hybrid/mesh 直连优先；hub 模式也可中继）
-            let r2 = hub.relay_ask(2, "parrot://us-1/user/y", b"m", "src/_remote", 0, 8);
-            let (next2, _, _) = r2.expect("us reachable");
-            assert_eq!(next2, "us-1");
-
-            // hop 门禁：链路 8 跳上限
-            assert!(hub.relay_ask(3, "parrot://eu-1/z", b"", "", 7, 8).is_err());
-        }
-    }
+fn relay_helper_preserves_two_independent_returns() {
+    let mut routes = RouteTable::new();
+    routes.merge(&RouteGossip {
+        entries: vec![
+            RouteEntry {
+                prefix: "parrot://eu-1/".into(),
+                next_hop: "hub".into(),
+                cost: 2,
+                version: 1,
+            },
+            RouteEntry {
+                prefix: "parrot://us-1/".into(),
+                next_hop: "us-1".into(),
+                cost: 1,
+                version: 1,
+            },
+        ],
+        digest: 0,
+    });
+    let mut hub = RelayHub::new("hub-1", routes);
+    let (first_next, first_cid, first_hop) = hub
+        .relay_ask(1, "parrot://eu-1/user/x", b"m", "first/_remote", 0, 8)
+        .unwrap();
+    let (second_next, second_cid, second_hop) = hub
+        .relay_ask(2, "parrot://us-1/user/y", b"n", "second/_remote", 0, 8)
+        .unwrap();
+    assert_eq!((first_next.as_str(), first_hop), ("hub", 1));
+    assert_eq!((second_next.as_str(), second_hop), ("us-1", 1));
+    assert_ne!(first_cid, second_cid);
+    assert!(hub.relay_ask(3, "parrot://eu-1/z", b"", "", 7, 8).is_err());
+    assert_eq!(
+        hub.relay_reply(second_cid),
+        Some((2, "second/_remote".into()))
+    );
+    assert_eq!(
+        hub.relay_reply(first_cid),
+        Some((1, "first/_remote".into()))
+    );
 }
 
-// ── directory_full_chain（注册→Raft 复制→查询→INVALIDATE→重解析）──
+// ── 复制模型：每个副本应用自己的日志一次，随后检查缓存失效 ──
 
 #[test]
-fn directory_full_chain() {
+fn directory_model_replicas_apply_once_and_cache_invalidates() {
     let clock = Arc::new(ManualClock::new());
     let mut net = TestNet::new3(clock.clone());
     // 选举（轮询至主出现——jitter 错峰可能 split vote 重试）
@@ -111,22 +87,34 @@ fn directory_full_chain() {
     );
     assert_eq!(lens[0], 1);
 
-    // apply 到状态机（DirectoryReplica 语义）
-    let mut replica = DirectoryReplica::new("probe", vec![], Arc::new(ManualClock::new()));
-    for n in net.nodes.values_mut() {
-        for e in n.committed() {
-            replica.sm.apply(&e.cmd);
-        }
+    // Each replica applies its own committed stream exactly once. Applying
+    // all three replicated copies to one state machine would incorrectly bump
+    // its revision three times while an endpoint-only assertion still passed.
+    let mut replicas = Vec::new();
+    for (_, raft) in net.nodes.drain() {
+        let mut replica = DirectoryReplica {
+            raft,
+            sm: parrot_remote::roles::directory::DirectorySm::default(),
+        };
+        assert_eq!(replica.apply_committed().unwrap(), 1);
+        assert_eq!(replica.apply_committed().unwrap(), 0);
+        assert_eq!(replica.sm.version, 1);
+        assert_eq!(replica.sm.nodes.len(), 1);
+        replicas.push(replica);
     }
-    let hit = replica.query(&DirQuery::Resolve {
-        prefix_or_node: "eu-1".into(),
-    });
-    assert_eq!(hit.unwrap().endpoints, vec!["tcp://10.1.0.1:7000"]);
+    assert!(replicas.windows(2).all(|pair| pair[0].sm == pair[1].sm));
+    let replica = replicas.pop().unwrap();
+    let entry = replica
+        .query(&DirQuery::Resolve {
+            prefix_or_node: "eu-1".into(),
+        })
+        .unwrap();
+    assert_eq!(entry.endpoints, vec!["tcp://10.1.0.1:7000"]);
 
     // client 缓存链路：put → hit → INVALIDATE → 重 RESOLVE
     let mut cache = ResolveCache::new();
     let t0 = Instant::now();
-    cache.put("eu-1", vec!["tcp://10.1.0.1:7000".into()], 1, t0);
+    cache.put("eu-1", entry.endpoints, entry.version, t0);
     assert!(matches!(
         resolve_decision(&mut cache, "eu-1", t0),
         ResolveAction::DirectCache { .. }
@@ -138,10 +126,10 @@ fn directory_full_chain() {
     ));
 }
 
-// ── cross_cluster_via_directory（两集群互访模拟） ──────
+// ── 跨集群目录查找模型（没有网络互访） ──────
 
 #[test]
-fn cross_cluster_via_directory() {
+fn directory_model_cross_cluster_lookup() {
     // 集群 A（cn）的 border 向 RR 上报前缀；集群 B（eu）经 border 解析
     let mut rr = RouteReflector::new("rr", vec!["border-cn".into(), "border-eu".into()]);
 
@@ -187,10 +175,10 @@ fn cross_cluster_via_directory() {
     );
 }
 
-// ── raft_3_node_directory_kill（Directory 高可用：leader kill 追平） ──
+// ── Raft 内存模型：移除 leader 后选举及日志追平（无进程 kill） ──
 
 #[test]
-fn raft_3_node_directory_kill() {
+fn raft_model_leader_removal_preserves_directory_log() {
     let clock = Arc::new(ManualClock::new());
     let mut net = TestNet::new3(clock.clone());
     let mut waited = 0;

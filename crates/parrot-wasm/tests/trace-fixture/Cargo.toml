@@ -1,0 +1,17 @@
+[package]
+name = "parrot-wasm-trace-fixture"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+wit-bindgen = "0.57"
+
+[profile.release]
+opt-level = 1

@@ -12,7 +12,8 @@
 //! - The consumer side (`receive_message(payload)`) takes ownership and drops
 //!   the box inside user code — the engine cannot intercept. Therefore
 //!   recycling is opt-in via [`Pooled<T>`], whose `Drop` returns the box to
-//!   the originating thread-local pool.
+//!   the current thread's pool. Moving a wrapper to another thread therefore
+//!   transfers its eventual cache residency to that thread.
 //! - `oneshot` reply channels are single-use and **never** pooled.
 //!
 //! ## Bound policy
@@ -24,11 +25,12 @@
 //!
 //! ## Expected benefit profile
 //!
-//! A global-allocator `malloc+free` pair costs ~40–80ns round-trip. With ask
-//! p50 at ~30µs the single-message latency win is ~0.2% (noise). The real
-//! wins are **allocation-rate reduction** (measurable under sustained flood:
-//! fewer allocator arenas touched, steadier p99) and deterministic memory
-//! for embedded-style workloads. Benchmarks in `test_message_pool.rs`.
+//! Pooling can reduce fresh allocations when a workload reuses boxes on the
+//! same thread. Net throughput depends on allocator caches, type lookup, payload
+//! initialization and execution topology. The microbenchmark in
+//! `test_message_pool.rs` checks exact work and per-worker counter deltas before
+//! reporting elapsed time; it does not establish a general speedup or latency
+//! claim for actor messaging.
 
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
@@ -73,7 +75,7 @@ impl Pool {
     }
 }
 
-/// Global metrics snapshot (sums across threads at call time).
+/// Counters for the calling thread only; no cross-thread aggregation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PoolStats {
     pub acquired_fresh: u64,
@@ -176,7 +178,7 @@ fn release<T: Send + 'static>(boxed: Box<T>) {
 /// the pool instead of the global allocator.
 ///
 /// Implementation note: moving a value out of a type with `Drop` is not
-/// allowed directly, so the inner box is wrapped in [`ManuallyDrop`]. On
+/// allowed directly, so the inner box is wrapped in [`std::mem::ManuallyDrop`]. On
 /// drop we `take` it out (leaving a logically-empty slot that is never
 /// re-observed) and hand it to the pool.
 pub struct Pooled<T: Send + 'static> {

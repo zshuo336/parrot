@@ -21,8 +21,10 @@ pub struct ThreadReplyChannel(pub oneshot::Sender<ActorResult<BoxedMessage>>);
 #[async_trait]
 impl ReplyChannel for ThreadReplyChannel {
     async fn send_reply(self: Box<Self>, msg: ActorResult<BoxedMessage>) -> ActorResult<()> {
-        // Ignore the result of send. If the receiver was dropped, it means the asker
-        // is no longer waiting (e.g., due to timeout or shutdown), which is fine.
+        // A dropped receiver means the asker timed out or shut down. Preserve
+        // that fact as a reply-channel error so the caller can distinguish a
+        // delivered reply from a late one; the original business result is
+        // still returned by the failed send and is retired with the channel.
         let result = self.0.send(msg);
         match result {
             Ok(_) => Ok(()),
@@ -31,8 +33,11 @@ impl ReplyChannel for ThreadReplyChannel {
     }
 }
 
-// TODO: Need an ActixReplyChannel implementation if enabling interop,
-// potentially wrapping actix::prelude::Recipient<ReplyMessage> or similar.
+// This channel is intentionally thread-engine-only. Actix ask/reply uses its
+// managed actor envelope and lifecycle receipt directly; adding an Actix
+// adapter here would create a second reply protocol without a production
+// caller. Keep the trait private to the thread implementation until a shared
+// cross-engine reply contract exists.
 
 #[cfg(test)]
 mod tests {

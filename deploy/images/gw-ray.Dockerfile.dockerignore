@@ -1,0 +1,16 @@
+**
+!deploy
+deploy/*
+!deploy/images
+deploy/images/*
+!deploy/images/requirements-ray-build.lock
+!deploy/images/requirements-ray.lock
+!deploy/images/install-ray.sh
+!interop
+interop/*
+!interop/python
+interop/python/*
+!interop/python/parrot_protocol
+!interop/python/parrot_protocol/**
+**/__pycache__
+**/*.pyc

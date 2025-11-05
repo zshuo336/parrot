@@ -84,7 +84,11 @@ where
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to initialize actor at {:?}: {}", self.path, e);
+                error!(
+                    "Failed to initialize actor at {:?}: {}",
+                    self.path,
+                    crate::error_receipt::actor_summary(&e)
+                );
                 self.state = ActorState::Stopped;
                 Err(e)
             }
@@ -117,7 +121,7 @@ where
     /// Process a message.
     pub async fn process_message<'a>(
         &'a mut self,
-        msg: BoxedMessage,
+        mut msg: BoxedMessage,
         ctx: &'a mut ThreadContext<A>,
     ) -> ActorResult<BoxedMessage> {
         // Handle control messages specially
@@ -150,6 +154,38 @@ where
             return Err(ActorError::Other(anyhow!("Actor is not running")));
         }
 
+        let _activity = if msg.is::<crate::receive_timeout::IdleSignal>() {
+            let signal = *msg
+                .downcast::<crate::receive_timeout::IdleSignal>()
+                .unwrap();
+            let Some(activity) = ctx.idle.claim(signal) else {
+                return Ok(Box::new(()));
+            };
+            msg = Box::new(parrot_api::context::LifecycleEvent::ReceiveTimeout);
+            activity
+        } else {
+            ctx.idle.enter()
+        };
+
+        if msg.is::<crate::children::ChildTerminated>() {
+            self.inner
+                .handle_child_terminated(
+                    msg.downcast::<crate::children::ChildTerminated>()
+                        .unwrap()
+                        .0,
+                    ctx,
+                )
+                .await?;
+            return Ok(Box::new(()));
+        }
+        if msg.is::<crate::streams::StreamEvent>() {
+            return crate::streams::dispatch(
+                *msg.downcast::<crate::streams::StreamEvent>().unwrap(),
+                &mut self.inner,
+                ctx,
+            )
+            .await;
+        }
         // Handle Ask messages specially
         if msg.is::<AskEnvelope>() {
             return self
@@ -160,6 +196,36 @@ where
         // Handle Ask messages specially
         // call inner actor's receive_message
         self.inner.receive_message(msg, ctx).await
+    }
+
+    /// Exclude engine control and legacy envelopes before consulting user policy.
+    pub(crate) fn can_batch_message(&self, message: &BoxedMessage) -> bool {
+        self.state == ActorState::Running
+            && !message.is::<ControlMessage>()
+            && !message.is::<crate::receive_timeout::IdleSignal>()
+            && !message.is::<crate::streams::StreamEvent>()
+            && !message.is::<crate::children::ChildTerminated>()
+            && !message.is::<parrot_api::context::ActorTerminated>()
+            && !message.is::<crate::thread::system::Terminated>()
+            && !message.is::<crate::thread::system::WatchRequest>()
+            && !message.is::<crate::thread::system::UnwatchRequest>()
+            && !message.is::<AskEnvelope>()
+            && self.inner.can_batch_message(message)
+    }
+
+    pub(crate) async fn process_business_batch(
+        &mut self,
+        messages: Vec<BoxedMessage>,
+        ctx: &mut ThreadContext<A>,
+    ) -> Vec<ActorResult<BoxedMessage>> {
+        if self.state != ActorState::Running {
+            return messages
+                .into_iter()
+                .map(|_| Err(ActorError::Stopped))
+                .collect();
+        }
+        let _activity = ctx.idle.enter();
+        self.inner.receive_batch(messages, ctx).await
     }
 
     /// Handle internal control messages
@@ -174,6 +240,7 @@ where
                 if self.state == ActorState::Starting {
                     // Transition to Running state
                     self.state = ActorState::Running;
+                    ctx.idle.activate();
                     info!("Actor at {:?} is now running", self.path);
                     Ok(Box::new(()))
                 } else {
@@ -192,26 +259,9 @@ where
                 Ok(Box::new(()))
             }
 
-            ControlMessage::ChildFailure { path, reason } => {
-                debug!(
-                    "Handling ChildFailure message for child {:?} at parent {:?}: {}",
-                    path, self.path, reason
-                );
-                // get child_ref from context children
-                let child_ref = ctx
-                    .children()
-                    .and_then(|child| {
-                        child
-                            .read_all()
-                            .iter()
-                            .find(|child| child.eq_path(path))
-                            .map(|c| c.clone_boxed())
-                    })
-                    .ok_or_else(|| ActorError::Other(anyhow!("Child actor reference not found")))?;
-
-                self.inner.handle_child_terminated(child_ref, ctx).await?;
-                Ok(Box::new(()))
-            }
+            ControlMessage::ChildFailure { .. } => Err(ActorError::MessageHandlingError(
+                "path-only ChildFailure cannot establish a generation failure or termination; managed supervision uses private ownership endpoints".into(),
+            )),
 
             ControlMessage::SystemShutdown => {
                 debug!(
@@ -253,8 +303,9 @@ where
             }
             Err(e) => {
                 // Send error reply
-                let _ = reply.send(Err(e));
-                Ok(Box::new(()))
+                let error = std::sync::Arc::new(e);
+                let _ = reply.send(Err(crate::supervision_policy::reply_error(error.clone())));
+                Err(crate::supervision_policy::reply_error(error))
             }
         }
     }
@@ -270,15 +321,20 @@ where
 
         // Transition to Stopping state
         self.state = ActorState::Stopping;
+        ctx.idle.close();
 
         // Call the inner actor's before_stop method
-        let result = self.inner.before_stop(ctx).await;
+        let result = self
+            .inner
+            .before_stop(ctx)
+            .await
+            .map_err(crate::error_receipt::protect_actor);
 
         // Transition to Stopped state regardless of result
         self.state = ActorState::Stopped;
 
         // Notify all watchers
-        self.notify_watchers_of_termination(ctx);
+        self.notify_watchers_of_termination(ctx).await;
 
         info!("Actor at {:?} has stopped", self.path);
 
@@ -286,7 +342,7 @@ where
     }
 
     /// Notify all watchers that this actor has terminated
-    fn notify_watchers_of_termination(&self, _ctx: &ThreadContext<A>) {
+    async fn notify_watchers_of_termination(&self, ctx: &ThreadContext<A>) {
         if let Some(watchers) = self.watchers.as_ref() {
             debug!(
                 "Notifying {} watchers of termination for actor at {:?}",
@@ -294,21 +350,52 @@ where
                 self.path
             );
 
-            // TODO: Implement actual notification logic
-            // This would involve sending death notification messages to all watchers
-            // For now this is just a placeholder
+            // This legacy path predates the generation-aware DeathWatch owned
+            // by the system registry. Keep it functional for direct
+            // `ThreadActor` users by resolving each watcher through the same
+            // system registry and delivering the compatibility `Terminated`
+            // message. Managed actors use the newer bounded channel and do not
+            // pass through this fallback.
+            let Some(system) = ctx.system_weak_ref().upgrade() else {
+                return;
+            };
+            let notify_timeout = system.config().shutdown_timeout;
+            for watcher_path in watchers {
+                let Some(watcher) = system.get_actor_ref(watcher_path) else {
+                    continue;
+                };
+                let event = crate::thread::system::Terminated {
+                    path: self.path.path.clone(),
+                    reason: parrot_api::supervisor::DeathReason::Normal,
+                };
+                match tokio::time::timeout(notify_timeout, watcher.deliver(Box::new(event))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        debug!(
+                            watcher = %watcher_path,
+                            error = %error,
+                            "legacy termination notification was not delivered"
+                        );
+                    }
+                    Err(_) => {
+                        debug!(
+                            watcher = %watcher_path,
+                            "legacy termination notification exceeded shutdown deadline"
+                        );
+                    }
+                }
+            }
         }
     }
 }
-
-// Note: This is a stub implementation that will be expanded in future PRs
-// to include more actor lifecycle management, supervision, etc.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::thread::context::ThreadContext;
     use parrot_api::actor::EmptyConfig;
+    use parrot_api::address::ActorRef;
+    use std::sync::Arc;
 
     /// Actor that records lifecycle callbacks.
     #[derive(Debug, Default)]
@@ -578,5 +665,62 @@ mod tests {
         let result = actor.initialize(&mut ctx).await;
         assert!(result.is_err());
         assert_eq!(actor.state(), ActorState::Stopped);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_watcher_receives_termination_event() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Watcher(Arc<AtomicUsize>);
+        impl Actor for Watcher {
+            type Config = EmptyConfig;
+            type Context = ThreadContext<Self>;
+
+            fn receive_message<'a>(
+                &'a mut self,
+                msg: BoxedMessage,
+                _ctx: &'a mut Self::Context,
+            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+                if msg.is::<crate::thread::system::Terminated>() {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async move { Ok(msg) })
+            }
+
+            fn state(&self) -> ActorState {
+                ActorState::Running
+            }
+        }
+
+        let system = crate::thread::system::ThreadActorSystem::shared(
+            crate::thread::config::ThreadActorSystemConfig::default(),
+        );
+        let seen = Arc::new(AtomicUsize::new(0));
+        let watcher = system
+            .spawn_at(
+                Watcher(seen.clone()),
+                "/user/legacy-watcher",
+                None,
+                crate::thread::config::ThreadActorConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut direct = ThreadActor::new(
+            LifecycleActor::default(),
+            ActorPath::for_test("/user/direct-legacy"),
+        );
+        direct.add_watcher(watcher.path().to_string());
+        let mut context = ThreadContext::<LifecycleActor>::new_for_test_with(
+            "/user/direct-legacy",
+            Arc::downgrade(&system),
+        );
+        direct.shutdown(&mut context).await.unwrap();
+
+        // A follow-up ask is a mailbox barrier: the legacy event must have
+        // been handled before this response is observed.
+        watcher.send(Box::new(()) as BoxedMessage).await.unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        system.shutdown_internal().await.unwrap();
     }
 }

@@ -14,7 +14,7 @@ use crate::thread::scheduler::queue::SchedulingQueue;
 #[derive(Debug, Default)]
 pub struct WorkerManager {
     /// Map of scheduled actor paths
-    scheduled: Mutex<HashMap<String, ()>>,
+    scheduled: Mutex<HashMap<String, Arc<dyn Mailbox>>>,
 
     /// Worker status slots (one per worker, for metrics)
     worker_statuses: Mutex<Vec<Arc<AtomicUsize>>>,
@@ -52,19 +52,30 @@ impl WorkerManager {
             .expect("WorkerManager built without scheduling queue");
         {
             let mut scheduled = self.scheduled.lock().unwrap();
-            scheduled.insert(path, ());
+            if scheduled.contains_key(&path) {
+                return Err(crate::thread::error::SystemError::RegistrationError(
+                    format!("actor {path} is already scheduled"),
+                ));
+            }
+            if !queue.register(&mailbox) {
+                return Err(crate::thread::error::SystemError::ShuttingDown);
+            }
+            scheduled.insert(path, mailbox.clone());
         }
-        queue.push(mailbox);
+        if mailbox.schedule_state().try_enqueue() {
+            queue.enqueue_registered(mailbox, crate::thread::scheduler::queue::Lane::Normal);
+        }
         Ok(())
     }
 
     /// Stop tracking an actor
     pub fn stop_processor(&self, path: &str) -> Result<(), crate::thread::error::SystemError> {
-        let mut scheduled = self.scheduled.lock().unwrap();
-        if scheduled.remove(path).is_none() {
-            return Err(crate::thread::error::SystemError::ActorNotFound(
-                path.to_string(),
-            ));
+        let mailbox =
+            self.scheduled.lock().unwrap().remove(path).ok_or_else(|| {
+                crate::thread::error::SystemError::ActorNotFound(path.to_string())
+            })?;
+        if let Some(queue) = &self.scheduling_queue {
+            queue.unregister(&mailbox);
         }
         Ok(())
     }

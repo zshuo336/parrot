@@ -1,196 +1,334 @@
-use crossbeam_queue::SegQueue;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 
 use crate::thread::mailbox::Mailbox;
 
-/// Scheduling lane for a ready mailbox (M2 priority scheduling).
-///
-/// `High` is drained strictly before `Normal`: workers pop from the high
-/// lane first, giving O(1) priority jumps for system messages and
-/// user messages declared with `MessagePriority >= 70`.
-///
-/// Within a lane, FIFO order is preserved (two `SegQueue`s).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+type ReadyMailbox = Arc<dyn Mailbox>;
+
+/// High-priority ready work is selected before normal work. Admission order
+/// within a lane is preserved, including registered actors waiting for space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lane {
-    /// Default lane for normal-priority work (FIFO among Normal).
-    Normal,
-    /// Priority lane drained before Normal (FIFO among High).
     High,
+    Normal,
 }
 
-/// A queue that holds references to mailboxes that have messages ready for processing.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Admission {
+    lane: Lane,
+    ticket: u128,
+}
+struct Entry {
+    mailbox: ReadyMailbox,
+    admission: Admission,
+}
+struct Registration {
+    mailbox: Weak<dyn Mailbox>,
+    // Fixed per-actor readiness state, never one allocation per wake/message.
+    // ScheduleState retains ownership until a worker actually takes this work.
+    deferred: Option<Admission>,
+}
+#[derive(Default)]
+struct State {
+    normal: VecDeque<Entry>,
+    high: VecDeque<Entry>,
+    registered: HashMap<usize, Registration>,
+    deferred_count: usize,
+    next_ticket: u128,
+    closed: bool,
+}
+impl State {
+    fn len(&self) -> usize {
+        self.normal.len() + self.high.len()
+    }
+    fn admission(&mut self, lane: Lane) -> Admission {
+        let admission = Admission {
+            lane,
+            ticket: self.next_ticket,
+        };
+        self.next_ticket += 1;
+        admission
+    }
+    fn append(&mut self, entry: Entry) {
+        match entry.admission.lane {
+            Lane::High => self.high.push_back(entry),
+            Lane::Normal => self.normal.push_back(entry),
+        }
+    }
+    fn oldest_deferred(&self) -> Option<(usize, Admission)> {
+        if self.deferred_count == 0 {
+            return None;
+        }
+        self.registered
+            .iter()
+            .filter_map(|(&id, entry)| entry.deferred.map(|admission| (id, admission)))
+            .min_by_key(|(_, admission)| *admission)
+    }
+    fn take_deferred(&mut self, id: usize) -> Option<Entry> {
+        let registration = self.registered.get_mut(&id)?;
+        let admission = registration.deferred.take()?;
+        self.deferred_count -= 1;
+        match registration.mailbox.upgrade() {
+            Some(mailbox) => Some(Entry { mailbox, admission }),
+            None => {
+                self.registered.remove(&id);
+                None
+            }
+        }
+    }
+    fn refill(&mut self, capacity: usize) {
+        while self.len() < capacity {
+            let Some((id, _)) = self.oldest_deferred() else {
+                break;
+            };
+            if let Some(entry) = self.take_deferred(id) {
+                self.append(entry);
+            }
+        }
+    }
+}
+fn identity(mailbox: &ReadyMailbox) -> usize {
+    Arc::as_ptr(mailbox) as *const () as usize
+}
+
+/// A bounded ready queue shared by high and normal priority lanes.
 ///
-/// The SchedulingQueue is a central component of the SharedThreadPool scheduler.
-/// It stores Arc<dyn Mailbox> instances that have signaled they have messages
-/// ready for processing. Worker threads pull mailboxes from this queue to process
-/// their messages.
+/// `push`/`push_with_lane` are nonblocking admission operations and return the
+/// mailbox unchanged when full. They never allocate an overflow queue or task.
+/// The shared scheduler registers actors separately: when ready admission is
+/// full, a coalesced readiness marker stays in that actor's registration. Workers
+/// select the oldest such marker when draining, preserving accepted wakeups and
+/// allowing more actors than queue slots. Mailbox capacities continue to apply
+/// backpressure to message producers. Deferred actor count is exposed separately.
 ///
-/// M2 priority scheduling: the queue internally maintains **two lanes**
-/// (High/Normal), each a lock-free SegQueue. `try_pop` drains the High lane
-/// first, so a mailbox containing high-priority messages O(1)-jumps over any
-/// backlog of normal-priority mailboxes. Lane selection happens at push time
-/// (see `push_with_lane`); plain `push` keeps the historical Normal-lane
-/// behavior, which preserves FIFO semantics for all existing callers.
-///
-/// # Thread Safety
-/// - Uses lock-free queues internally (SegQueue per lane)
-/// - Safe for concurrent producers and consumers
-/// - Uses Notify for efficient worker wakeup
-///
-/// # Performance Characteristics
-/// - O(1) push and pop operations in both lanes
-/// - Lock-free implementation for high throughput
-/// - High-lane preemption is a single extra empty-queue check on pop
+/// An uncontended admission/pop is O(1). Saturation scans the actor registrations
+/// for the oldest eligible deferred actor; this deliberately favors bounded
+/// memory and correct progress over an unbounded overflow worklist.
+/// All lane/capacity decisions share one lock. User mailbox operations and
+/// mailbox destruction are performed outside it.
 pub struct SchedulingQueue {
-    /// Lock-free queue holding ready mailboxes (normal lane)
-    normal: Arc<SegQueue<Arc<dyn Mailbox + Send + Sync>>>,
-
-    /// Lock-free queue holding ready mailboxes (high-priority lane)
-    high: Arc<SegQueue<Arc<dyn Mailbox + Send + Sync>>>,
-
-    /// Notification mechanism to wake up workers when queue has items
+    state: Mutex<State>,
     notify: Arc<Notify>,
-
-    /// Maximum capacity tracker (for metrics and monitoring)
-    #[allow(dead_code)]
     max_capacity: usize,
 }
-
 impl fmt::Debug for SchedulingQueue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock().unwrap();
         f.debug_struct("SchedulingQueue")
             .field("max_capacity", &self.max_capacity)
-            .field("normal_len", &self.normal.len())
-            .field("high_len", &self.high.len())
+            .field("normal_len", &state.normal.len())
+            .field("high_len", &state.high.len())
+            .field("deferred", &state.deferred_count)
             .finish()
     }
 }
-
 impl SchedulingQueue {
-    /// Creates a new SchedulingQueue with the specified initial capacity
+    /// Construct a queue with a strictly positive capacity, shared by both lanes.
+    /// Panics for zero, like bounded channel constructors. File configuration
+    /// rejects zero during validation before constructing a scheduler.
     pub fn new(max_capacity: usize) -> Self {
+        assert!(
+            max_capacity > 0,
+            "scheduling queue capacity must be positive"
+        );
         Self {
-            normal: Arc::new(SegQueue::new()),
-            high: Arc::new(SegQueue::new()),
+            state: Mutex::new(State::default()),
             notify: Arc::new(Notify::new()),
             max_capacity,
         }
     }
-
-    /// Pushes a mailbox into the queue (Normal lane).
-    ///
-    /// If the queue was empty, this will notify any waiting workers.
-    ///
-    /// # Parameters
-    /// * `mailbox` - Strong reference to a Mailbox that has messages ready to process
-    pub fn push(&self, mailbox: Arc<dyn Mailbox + Send + Sync>) {
-        self.push_with_lane(mailbox, Lane::Normal);
+    /// Nonblocking normal-lane admission. Err returns ownership when full/closed.
+    pub fn push(&self, mailbox: ReadyMailbox) -> Result<(), ReadyMailbox> {
+        self.push_with_lane(mailbox, Lane::Normal)
     }
-
-    /// Pushes a mailbox into a specific lane.
-    ///
-    /// High-lane entries are popped before any Normal-lane entry. Use for
-    /// system messages (Terminated / control) and user messages with
-    /// `MessagePriority >= HIGH (70)`.
-    pub fn push_with_lane(&self, mailbox: Arc<dyn Mailbox + Send + Sync>, lane: Lane) {
-        match lane {
-            Lane::Normal => self.normal.push(mailbox),
-            Lane::High => self.high.push(mailbox),
+    /// Both lanes share the same capacity. Failed admission leaves the caller
+    /// responsible for the mailbox; no wakeup or scheduling ownership is lost.
+    pub fn push_with_lane(&self, mailbox: ReadyMailbox, lane: Lane) -> Result<(), ReadyMailbox> {
+        let mut state = self.state.lock().unwrap();
+        state.refill(self.max_capacity);
+        if state.closed || state.len() >= self.max_capacity {
+            return Err(mailbox);
         }
-        // Notify one worker that a mailbox is available
+        let admission = state.admission(lane);
+        state.append(Entry { mailbox, admission });
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+    pub(crate) fn register(&self, mailbox: &ReadyMailbox) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.registered.contains_key(&identity(mailbox)) {
+            return false;
+        }
+        state.registered.insert(
+            identity(mailbox),
+            Registration {
+                mailbox: Arc::downgrade(mailbox),
+                deferred: None,
+            },
+        );
+        true
+    }
+    /// Called only by a holder of the mailbox's scheduling ownership. Full
+    /// queues retain that ownership in one fixed readiness marker per actor.
+    pub(crate) fn enqueue_registered(&self, mailbox: ReadyMailbox, lane: Lane) -> bool {
+        let schedule = mailbox.schedule_state();
+        let mut state = self.state.lock().unwrap();
+        let id = identity(&mailbox);
+        if state.closed || !state.registered.contains_key(&id) {
+            // Release before a concurrent re-registration can publish new work.
+            // The trait access happened above, outside the queue lock.
+            schedule.force_release();
+            return false;
+        }
+        if let Some(deferred) = &mut state.registered.get_mut(&id).unwrap().deferred {
+            deferred.lane = deferred.lane.min(lane);
+        } else {
+            state.refill(self.max_capacity);
+            let admission = state.admission(lane);
+            if state.len() < self.max_capacity {
+                state.append(Entry {
+                    mailbox: mailbox.clone(),
+                    admission,
+                });
+            } else {
+                state.registered.get_mut(&id).unwrap().deferred = Some(admission);
+                state.deferred_count += 1;
+            }
+        }
+        drop(state);
+        self.notify.notify_one();
+        true
+    }
+    pub(crate) fn unregister(&self, mailbox: &ReadyMailbox) {
+        let id = identity(mailbox);
+        let schedule = mailbox.schedule_state();
+        let mut state = self.state.lock().unwrap();
+        let was_deferred = state
+            .registered
+            .remove(&id)
+            .is_some_and(|entry| entry.deferred.is_some());
+        if was_deferred {
+            state.deferred_count -= 1;
+        }
+        let mut removed = Vec::new();
+        let State { normal, high, .. } = &mut *state;
+        for lane in [normal, high] {
+            let mut retained = VecDeque::new();
+            for entry in lane.drain(..) {
+                if identity(&entry.mailbox) == id {
+                    removed.push(entry);
+                } else {
+                    retained.push_back(entry);
+                }
+            }
+            *lane = retained;
+        }
+        if was_deferred || !removed.is_empty() {
+            // No worker owns this ready admission. It may be registered again.
+            // A running mailbox keeps ownership until its worker releases it.
+            schedule.force_release();
+        }
+        state.refill(self.max_capacity);
+        drop(state);
+        drop(removed);
         self.notify.notify_one();
     }
-
-    /// Tries to pop a mailbox from the queue, High lane first.
-    ///
-    /// # Returns
-    /// * `Some(mailbox)` - A mailbox that has messages ready to process
-    /// * `None` - The queue is empty
-    pub fn try_pop(&self) -> Option<Arc<dyn Mailbox + Send + Sync>> {
-        // Priority drain: high lane strictly before normal lane.
-        if let Some(mailbox) = self.high.pop() {
-            return Some(mailbox);
+    /// Atomically close admission and transfer ready ownership without invoking
+    /// user mailbox methods or destructors under the queue lock.
+    pub(crate) fn close_and_take(&self) -> Vec<ReadyMailbox> {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        let registrations = std::mem::take(&mut state.registered);
+        state.deferred_count = 0;
+        let normal = std::mem::take(&mut state.normal);
+        let high = std::mem::take(&mut state.high);
+        drop(state);
+        let mut mailboxes: Vec<_> = normal.into_iter().chain(high).map(|e| e.mailbox).collect();
+        for registration in registrations.into_values() {
+            if registration.deferred.is_some()
+                && let Some(mailbox) = registration.mailbox.upgrade()
+            {
+                mailboxes.push(mailbox);
+            }
         }
-        self.normal.pop()
+        self.notify.notify_waiters();
+        mailboxes
     }
-
-    /// Asynchronously waits for a mailbox to become available.
-    ///
-    /// This method will:
-    /// 1. First try to pop a mailbox immediately
-    /// 2. If none is available, wait for a notification
-    /// 3. After notification, try to pop again
-    ///
-    /// This approach ensures that workers don't miss notifications and
-    /// don't spin unnecessarily when the queue is empty.
-    ///
-    /// # Returns
-    /// Future resolving to Arc<dyn Mailbox>
-    pub async fn pop(&self) -> Arc<dyn Mailbox + Send + Sync> {
+    #[cfg(test)]
+    pub(crate) fn close(&self) {
+        for mailbox in self.close_and_take() {
+            mailbox.schedule_state().force_release();
+        }
+    }
+    /// Pop the oldest high-priority admission, otherwise the oldest normal one.
+    /// Deferred high work may precede a full normal lane without exceeding capacity.
+    pub fn try_pop(&self) -> Option<ReadyMailbox> {
+        let mut state = self.state.lock().unwrap();
         loop {
-            // First try to pop immediately
-            if let Some(mailbox) = self.try_pop() {
-                return mailbox;
-            }
-
-            // If nothing is available, wait for notification
-            self.notify.notified().await;
-
-            // Try again after notification (might still fail if another worker got it first)
-            if let Some(mailbox) = self.try_pop() {
-                return mailbox;
-            }
-
-            // If we get here, another worker took the mailbox, so we loop and wait again
+            let front = state
+                .high
+                .front()
+                .or_else(|| state.normal.front())
+                .map(|entry| entry.admission);
+            let deferred = state.oldest_deferred();
+            let entry = if let Some((id, _)) =
+                deferred.filter(|(_, admission)| front.is_none_or(|front| *admission < front))
+            {
+                let Some(entry) = state.take_deferred(id) else {
+                    continue;
+                };
+                entry
+            } else {
+                state
+                    .high
+                    .pop_front()
+                    .or_else(|| state.normal.pop_front())?
+            };
+            state.refill(self.max_capacity);
+            return Some(entry.mailbox);
         }
     }
-
-    /// Gets the number of mailboxes currently in the queue (both lanes).
-    ///
-    /// This is a snapshot and may change by the time the value is used.
-    ///
-    /// # Returns
-    /// Current queue length
+    pub async fn pop(&self) -> ReadyMailbox {
+        loop {
+            // Register before inspecting the queue, including with multiple
+            // concurrent consumers (Notify stores only one unclaimed permit).
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(mailbox) = self.try_pop() {
+                return mailbox;
+            }
+            notified.await;
+        }
+    }
     pub fn len(&self) -> usize {
-        self.normal.len() + self.high.len()
+        self.state.lock().unwrap().len()
     }
-
-    /// Current length of the high-priority lane.
     pub fn high_len(&self) -> usize {
-        self.high.len()
+        self.state.lock().unwrap().high.len()
     }
-
-    /// Current length of the normal lane.
     pub fn normal_len(&self) -> usize {
-        self.normal.len()
+        self.state.lock().unwrap().normal.len()
     }
-
-    /// Checks if the queue is empty.
-    ///
-    /// This is a snapshot and may change by the time the value is used.
-    ///
-    /// # Returns
-    /// true if the queue is empty, false otherwise
+    pub fn deferred_len(&self) -> usize {
+        self.state.lock().unwrap().deferred_count
+    }
+    pub fn capacity(&self) -> usize {
+        self.max_capacity
+    }
     pub fn is_empty(&self) -> bool {
-        self.normal.is_empty() && self.high.is_empty()
+        self.len() == 0
     }
-
-    /// Gets a clone of the notification mechanism for workers to wait on.
-    ///
-    /// # Returns
-    /// Arc<Notify> that workers can await on
     pub fn notify_handle(&self) -> Arc<Notify> {
         self.notify.clone()
     }
-
-    /// Gets a clone of the underlying normal-lane queue for direct access.
-    ///
-    /// # Returns
-    /// Arc<SegQueue<Arc<dyn Mailbox>>>
-    pub fn queue_handle(&self) -> Arc<SegQueue<Arc<dyn Mailbox + Send + Sync>>> {
-        self.normal.clone()
+    /// Shared access uses the same bounded admission API; raw lane mutation
+    /// would bypass capacity checks and worker notifications.
+    pub fn queue_handle(self: &Arc<Self>) -> Arc<Self> {
+        self.clone()
     }
 }
 
@@ -200,7 +338,7 @@ mod tests {
     use crate::thread::mailbox::mpsc::MpscMailbox;
     use parrot_api::address::ActorPath;
 
-    fn make_mailbox(name: &str) -> Arc<dyn Mailbox + Send + Sync> {
+    fn make_mailbox(name: &str) -> Arc<dyn Mailbox> {
         Arc::new(MpscMailbox::new(4, ActorPath::placeholder(name)))
     }
 
@@ -220,8 +358,8 @@ mod tests {
         let m1 = make_mailbox("q/a");
         let m2 = make_mailbox("q/b");
 
-        queue.push(m1);
-        queue.push(m2);
+        queue.push(m1).unwrap();
+        queue.push(m2).unwrap();
         assert_eq!(queue.len(), 2);
         assert!(!queue.is_empty());
 
@@ -241,10 +379,12 @@ mod tests {
         let queue = SchedulingQueue::new(16);
         // Normal backlog: n1..n3
         for i in 1..=3 {
-            queue.push(make_mailbox(&format!("q/n{}", i)));
+            queue.push(make_mailbox(&format!("q/n{}", i))).unwrap();
         }
         // High arrival after the backlog exists
-        queue.push_with_lane(make_mailbox("q/h1"), Lane::High);
+        queue
+            .push_with_lane(make_mailbox("q/h1"), Lane::High)
+            .unwrap();
 
         // High must be popped first despite arriving last.
         assert_eq!(queue.try_pop().unwrap().path().path, "q/h1");
@@ -258,9 +398,13 @@ mod tests {
     #[test]
     fn test_high_lane_preserves_fifo_within_lane() {
         let queue = SchedulingQueue::new(16);
-        queue.push_with_lane(make_mailbox("q/h2"), Lane::High);
-        queue.push_with_lane(make_mailbox("q/h1"), Lane::High);
-        queue.push(make_mailbox("q/n1"));
+        queue
+            .push_with_lane(make_mailbox("q/h2"), Lane::High)
+            .unwrap();
+        queue
+            .push_with_lane(make_mailbox("q/h1"), Lane::High)
+            .unwrap();
+        queue.push(make_mailbox("q/n1")).unwrap();
 
         assert_eq!(queue.try_pop().unwrap().path().path, "q/h2");
         assert_eq!(queue.try_pop().unwrap().path().path, "q/h1");
@@ -270,8 +414,10 @@ mod tests {
     #[test]
     fn test_len_counts_both_lanes() {
         let queue = SchedulingQueue::new(16);
-        queue.push(make_mailbox("q/n"));
-        queue.push_with_lane(make_mailbox("q/h"), Lane::High);
+        queue.push(make_mailbox("q/n")).unwrap();
+        queue
+            .push_with_lane(make_mailbox("q/h"), Lane::High)
+            .unwrap();
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.normal_len(), 1);
         assert_eq!(queue.high_len(), 1);
@@ -290,7 +436,7 @@ mod tests {
 
         // Give the consumer a moment to park, then push.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        queue.push(make_mailbox("q/late"));
+        queue.push(make_mailbox("q/late")).unwrap();
 
         let path = tokio::time::timeout(std::time::Duration::from_secs(2), consumer)
             .await
@@ -302,13 +448,15 @@ mod tests {
     #[tokio::test]
     async fn test_async_pop_prefers_high_lane() {
         let queue = Arc::new(SchedulingQueue::new(16));
-        queue.push(make_mailbox("q/n0")); // normal backlog exists
+        queue.push(make_mailbox("q/n0")).unwrap(); // normal backlog exists
 
         let got = queue.pop().await;
         // With no high entry, normal is popped.
         assert_eq!(got.path().path, "q/n0");
 
-        queue.push_with_lane(make_mailbox("q/h0"), Lane::High);
+        queue
+            .push_with_lane(make_mailbox("q/h0"), Lane::High)
+            .unwrap();
         let got = queue.pop().await;
         assert_eq!(got.path().path, "q/h0");
     }
@@ -334,9 +482,9 @@ mod tests {
 
     #[test]
     fn test_queue_handle_shares_state() {
-        let queue = SchedulingQueue::new(8);
+        let queue = Arc::new(SchedulingQueue::new(8));
         let handle = queue.queue_handle();
-        handle.push(make_mailbox("q/shared"));
+        handle.push(make_mailbox("q/shared")).unwrap();
         // The handle observes the same underlying queue.
         assert_eq!(queue.len(), 1);
         assert!(queue.try_pop().is_some());
@@ -350,7 +498,7 @@ mod tests {
                 let q = queue.clone();
                 std::thread::spawn(move || {
                     for i in 0..100 {
-                        q.push(make_mailbox(&format!("q/p{}/{}", p, i)));
+                        q.push(make_mailbox(&format!("q/p{}/{}", p, i))).unwrap();
                     }
                 })
             })
@@ -373,5 +521,167 @@ mod tests {
         let queue = SchedulingQueue::new(8);
         let repr = format!("{:?}", queue);
         assert!(repr.contains("SchedulingQueue"));
+    }
+    #[test]
+    fn saturated_registrations_preserve_priority_fifo_and_coalesce_wakes() {
+        let queue = SchedulingQueue::new(1);
+        let mailboxes: Vec<_> = ["normal-1", "normal-2", "high-1", "high-2"]
+            .into_iter()
+            .map(make_mailbox)
+            .collect();
+        for (index, mailbox) in mailboxes.iter().enumerate() {
+            assert!(queue.register(mailbox));
+            assert!(mailbox.schedule_state().try_enqueue());
+            assert!(queue.enqueue_registered(
+                mailbox.clone(),
+                if index < 2 { Lane::Normal } else { Lane::High }
+            ));
+        }
+        for _ in 0..1000 {
+            assert!(!mailboxes[1].schedule_state().try_enqueue());
+        }
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.deferred_len(),
+            3,
+            "wake storms cannot allocate more ready entries"
+        );
+        for expected in ["high-1", "high-2", "normal-1", "normal-2"] {
+            assert_eq!(queue.try_pop().unwrap().path().path, expected);
+            assert!(queue.len() <= 1);
+        }
+        assert!(queue.try_pop().is_none());
+        assert_eq!(queue.deferred_len(), 0);
+    }
+
+    #[test]
+    fn rejected_admission_returns_the_same_mailbox_and_shared_handle_cannot_bypass_capacity() {
+        let queue = Arc::new(SchedulingQueue::new(1));
+        queue.push(make_mailbox("occupied")).unwrap();
+        let rejected = make_mailbox("rejected");
+        let returned = queue
+            .queue_handle()
+            .push_with_lane(rejected.clone(), Lane::High)
+            .unwrap_err();
+        assert!(Arc::ptr_eq(&rejected, &returned));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.try_pop().unwrap().path().path, "occupied");
+        queue.push(returned).unwrap();
+        assert_eq!(queue.try_pop().unwrap().path().path, "rejected");
+    }
+
+    #[test]
+    fn unregister_removes_only_that_generation_and_promotes_waiting_work() {
+        let queue = SchedulingQueue::new(1);
+        let old = make_mailbox("same-path");
+        let next = make_mailbox("same-path");
+        let other = make_mailbox("other");
+        for mailbox in [&old, &next, &other] {
+            assert!(queue.register(mailbox));
+            assert!(queue.enqueue_registered(mailbox.clone(), Lane::Normal));
+        }
+        queue.unregister(&old);
+        assert!(!queue.enqueue_registered(old, Lane::High));
+        assert!(Arc::ptr_eq(&queue.try_pop().unwrap(), &next));
+        assert!(Arc::ptr_eq(&queue.try_pop().unwrap(), &other));
+        assert!(queue.is_empty());
+        assert_eq!(queue.deferred_len(), 0);
+        queue.close();
+        assert!(!queue.register(&next));
+        assert!(queue.push(other).is_err());
+    }
+
+    #[test]
+    fn a_stale_weak_registration_does_not_block_live_work() {
+        let queue = SchedulingQueue::new(1);
+        let first = make_mailbox("first");
+        let stale = make_mailbox("stale");
+        let last = make_mailbox("last");
+        for mailbox in [&first, &stale, &last] {
+            assert!(queue.register(mailbox));
+            assert!(queue.enqueue_registered(mailbox.clone(), Lane::Normal));
+        }
+        drop(stale);
+        assert_eq!(queue.try_pop().unwrap().path().path, "first");
+        assert_eq!(queue.try_pop().unwrap().path().path, "last");
+        assert_eq!(queue.deferred_len(), 0);
+    }
+
+    #[test]
+    fn closing_releases_ready_ownership_but_not_a_running_worker() {
+        let queue = SchedulingQueue::new(1);
+        let running = make_mailbox("running");
+        let resident = make_mailbox("resident");
+        let deferred = make_mailbox("deferred");
+        assert!(queue.register(&running));
+        assert!(running.schedule_state().try_enqueue());
+        assert!(queue.enqueue_registered(running.clone(), Lane::Normal));
+        let _processing = queue.try_pop().unwrap();
+        for mailbox in [&resident, &deferred] {
+            assert!(queue.register(mailbox));
+            assert!(mailbox.schedule_state().try_enqueue());
+            assert!(queue.enqueue_registered(mailbox.clone(), Lane::Normal));
+        }
+        queue.close();
+        assert!(resident.schedule_state().try_enqueue());
+        assert!(deferred.schedule_state().try_enqueue());
+        assert!(!running.schedule_state().try_enqueue());
+        assert!(queue.is_empty());
+        assert_eq!(queue.deferred_len(), 0);
+    }
+
+    #[test]
+    fn concurrent_saturation_never_exceeds_capacity_or_loses_admitted_entries() {
+        let queue = Arc::new(SchedulingQueue::new(3));
+        let consumer_queue = queue.clone();
+        let consumer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = std::collections::HashSet::new();
+            while seen.len() < 400 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "lost an admitted entry"
+                );
+                if let Some(mailbox) = consumer_queue.try_pop() {
+                    assert!(seen.insert(mailbox.path().path.clone()), "duplicate entry");
+                } else {
+                    std::thread::yield_now();
+                }
+                assert!(consumer_queue.len() <= 3);
+            }
+        });
+        let producers: Vec<_> = (0..4)
+            .map(|producer| {
+                let queue = queue.clone();
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    for n in 0..100 {
+                        let mut mailbox = make_mailbox(&format!("{producer}/{n}"));
+                        loop {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "queue failed to release admission capacity"
+                            );
+                            match queue.push_with_lane(
+                                mailbox,
+                                if n % 2 == 0 { Lane::High } else { Lane::Normal },
+                            ) {
+                                Ok(()) => break,
+                                Err(returned) => {
+                                    mailbox = returned;
+                                    std::thread::yield_now();
+                                }
+                            }
+                        }
+                        assert!(queue.len() <= 3);
+                    }
+                })
+            })
+            .collect();
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        consumer.join().unwrap();
+        assert!(queue.is_empty());
     }
 }

@@ -6,6 +6,7 @@
 
 #include "parrot_lite.h"
 
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -14,7 +15,17 @@
 #include "assert_t.h" // CHECK 宏（vectors 同款）
 
 int main(int argc, char **argv) {
-  const int port = argc > 1 ? atoi(argv[1]) : 0;
+  unsigned port = 0;
+  bool valid = argc <= 2;
+  if (valid && argc == 2) {
+    const auto end = argv[1] + std::strlen(argv[1]);
+    const auto parsed = std::from_chars(argv[1], end, port);
+    valid = parsed.ec == std::errc{} && parsed.ptr == end && port <= 65535;
+  }
+  if (!valid) {
+    std::fprintf(stderr, "usage: %s [port: 0..65535]\n", argv[0]);
+    return 2;
+  }
 
   if (port == 0) {
     // ── ABI 冒烟：未连接态语义 ──────────────────────────
@@ -35,7 +46,7 @@ int main(int argc, char **argv) {
 
   // ── 真实互操作：Rust echo 节点 ────────────────────────
   char url[64];
-  snprintf(url, sizeof(url), "parrot://127.0.0.1:%d", port);
+  snprintf(url, sizeof(url), "parrot://127.0.0.1:%u", port);
   CHECK(pl_connect(url, "cpp-lite-1", nullptr) == 0, "connect+handshake");
 
   // receptionist 注册（TELL $receptionist.register:——不期待回包）
@@ -49,7 +60,7 @@ int main(int argc, char **argv) {
   CHECK(rc == 0, "pl_ask rc");
   if (rc == 0) {
     CHECK(out_len == sizeof(req), "echo len");
-    CHECK(out && memcmp(out, req, out_len) == 0, "echo bytes");
+    CHECK(out_len == sizeof(req) && out && memcmp(out, req, sizeof(req)) == 0, "echo bytes");
     pl_free(out); // 调用方释放（防双 free——§7.4）
   }
 

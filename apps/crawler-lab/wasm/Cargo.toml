@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = "0.57"
+crawler-lab-core = { path = "../core" }
 
 [profile.release]
 opt-level = 1

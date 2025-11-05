@@ -73,10 +73,14 @@ pub type MessageId = Uuid;
 /// - 60-79: High priority tasks
 /// - 80-100: Critical tasks (highest priority)
 ///
+/// These labels describe the value, not distinct scheduler queues. Current
+/// priority-aware references use two lanes: >=70 is high, <70 is normal.
+/// FIFO-only references reject the high lane through the options API.
+///
 /// ## Thread Safety
 /// - Implements Send + Sync
 /// - Copy semantic for efficient passing
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MessagePriority(u8);
 
 impl MessagePriority {
@@ -259,7 +263,7 @@ pub trait Message: Send + 'static {
 
     /// Returns the message options for this message.
     ///
-    /// Default implementation returns default message options.
+    /// The default returns None; typed delivery then inherits `priority()`.
     ///
     /// # Returns
     /// * `MessageOptions` - The options for this message
@@ -297,13 +301,13 @@ pub trait Message: Send + 'static {
 }
 
 // create a trait for cloneable message
-pub trait CloneableMessageTrait: Send {
+pub trait CloneableMessageTrait: Send + Sync {
     fn clone_message(&self) -> Box<dyn CloneableMessageTrait>;
     fn into_boxed_message(self: Box<Self>) -> BoxedMessage;
 }
 
 // implement CloneableMessageTrait for any type that implements Message
-impl<T: Message + Clone + 'static> CloneableMessageTrait for T {
+impl<T: Message + Clone + Sync + 'static> CloneableMessageTrait for T {
     fn clone_message(&self) -> Box<dyn CloneableMessageTrait> {
         Box::new(self.clone())
     }
@@ -345,7 +349,7 @@ impl CloneableMessage {
     /// convert a type that implements Message + Clone to CloneableMessage
     pub fn from_message<T>(message: T) -> Self
     where
-        T: Message + Clone + 'static,
+        T: Message + Clone + Sync + 'static,
     {
         CloneableMessage {
             message: Box::new(message) as Box<dyn CloneableMessageTrait>,
@@ -360,12 +364,12 @@ impl CloneableMessage {
     // create a CloneableMessage from any cloneable type
     pub fn from_cloneable<T>(value: T) -> Self
     where
-        T: Clone + Send + 'static,
+        T: Clone + Send + Sync + 'static,
     {
         // create a special wrapper type
         struct CloneableValue<T: Clone + Send + 'static>(T);
 
-        impl<T: Clone + Send + 'static> CloneableMessageTrait for CloneableValue<T> {
+        impl<T: Clone + Send + Sync + 'static> CloneableMessageTrait for CloneableValue<T> {
             fn clone_message(&self) -> Box<dyn CloneableMessageTrait> {
                 Box::new(CloneableValue(self.0.clone()))
             }
@@ -406,14 +410,6 @@ impl CloneableMessage {
 
         // 2. Try custom message types
 
-        // For TestMessage type (explicit handling for test purposes)
-        if std::any::type_name_of_val(boxed.as_ref()).contains("TestMessage") {
-            // We can't directly clone custom types without knowing their type
-            // In a real implementation, we would need a registry or trait-based solution
-            // For now, we'll return None to indicate that custom types aren't supported yet
-            return None;
-        }
-
         // Final fallback - we can't reliably clone unknown types
         None
     }
@@ -442,25 +438,29 @@ enum MessageContainer {
     Shared(SharedMessage),
 }
 
-/// Implement From<MessageContainer> for BoxedMessage
+/// Internal adapter preserving exclusive or shared message ownership.
 ///
-/// This implementation allows for conversion between MessageContainer and BoxedMessage.
+/// `MessageContainer` is private. These examples show the equivalent public
+/// representations accepted by [`ActorRef::send`], without requiring that adapter.
+/// An exclusive box contains the original concrete message type:
 ///
-/// # Parameters
-/// * `container` - The MessageContainer to convert
-///
-/// # Returns
-/// exclusive example:
-/// ```ignore
-/// let container = MessageContainer::Exclusive(Box::new(Message1));
-/// let boxed_message = container.into(); // return type is Box<dyn Any + Send>
-/// actor.send(boxed_message);
+/// ```rust
+/// use parrot_api::types::BoxedMessage;
+/// let boxed: BoxedMessage = Box::new(42_u64);
+/// assert_eq!(*boxed.downcast::<u64>().unwrap(), 42);
 /// ```
-/// shared example:
-/// ```ignore
-/// let container = MessageContainer::Shared(Arc::new(Message1));
-/// let boxed_message = container.into(); // return type is Box<Arc<dyn Any + Send + Sync>>
-/// actor.send(boxed_message);
+///
+/// A shared message is boxed as an `Arc`, so the receiver first recovers the
+/// shared handle. The underlying payload and allocation remain shared:
+///
+/// ```rust
+/// use parrot_api::types::{BoxedMessage, SharedMessage};
+/// use std::sync::Arc;
+/// let shared: SharedMessage = Arc::new(String::from("hello"));
+/// let boxed: BoxedMessage = Box::new(shared.clone());
+/// let recovered = *boxed.downcast::<SharedMessage>().unwrap();
+/// assert!(Arc::ptr_eq(&shared, &recovered));
+/// assert_eq!(recovered.downcast_ref::<String>().unwrap(), "hello");
 /// ```
 impl From<MessageContainer> for BoxedMessage {
     fn from(container: MessageContainer) -> Self {
@@ -505,14 +505,47 @@ impl<T: 'static + Clone + Send> BoxedMessageClone for T {
 }
 
 /// Message options for controlling delivery and processing
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MessageOptions {
-    /// Message processing timeout
+    /// Caller deadline: admission plus reply for ask; admission only for tell.
+    /// Expiry does not roll back an already accepted message.
     pub timeout: Option<Duration>,
-    /// Retry policy for failed processing
+    /// Policy for the explicit replayable `ActorRefExt::ask_retrying` operation.
+    /// Single-attempt ask/tell reject this option instead of silently ignoring it.
     pub retry_policy: Option<RetryPolicy>,
-    /// Message priority level
+    /// Scheduling class: values >= 70 request the high lane; lower values use
+    /// the normal lane. FIFO-only references reject the high lane.
     pub priority: MessagePriority,
+}
+
+impl MessageOptions {
+    /// Resolve message-declared options, falling back to its priority method.
+    pub fn for_message<M: Message>(message: &M) -> Self {
+        message.message_options().unwrap_or_else(|| Self {
+            priority: message.priority(),
+            ..Default::default()
+        })
+    }
+
+    /// Reject a retry policy where no replayable payload was supplied.
+    pub fn validate_single_attempt(&self) -> Result<(), crate::errors::ActorError> {
+        if self.retry_policy.is_some() {
+            return Err(crate::errors::ActorError::MessageHandlingError(
+                "retry_policy requires ActorRefExt::ask_retrying with a Clone message and an explicit retry predicate".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject high priority when the target only supports FIFO admission.
+    pub fn validate_fifo(&self) -> Result<(), crate::errors::ActorError> {
+        if self.priority.value() >= 70 {
+            return Err(crate::errors::ActorError::MessageHandlingError(
+                "high message priority is unsupported by this reference".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for MessageOptions {
@@ -528,6 +561,8 @@ impl Default for MessageOptions {
 /// Message envelope for type-erased message passing
 #[derive(Debug)]
 pub struct MessageEnvelope {
+    /// Causal parent captured when this envelope is constructed.
+    pub trace_context: Option<crate::trace::TraceContext>,
     /// Unique message identifier
     pub id: MessageId,
     /// Message payload
@@ -548,8 +583,9 @@ impl MessageEnvelope {
         options: Option<MessageOptions>,
     ) -> Self {
         // if options are provided, use them, otherwise use the message options
-        let options = options.unwrap_or_else(|| payload.message_options().unwrap_or_default());
+        let options = options.unwrap_or_else(|| MessageOptions::for_message(&payload));
         Self {
+            trace_context: crate::trace::TraceContext::current(),
             id: Uuid::new_v4(),
             payload: Box::new(payload),
             sender,
@@ -583,6 +619,7 @@ impl MessageEnvelope {
         options: MessageOptions,
     ) -> Self {
         Self {
+            trace_context: crate::trace::TraceContext::current(),
             id: Uuid::new_v4(),
             message_type: std::any::type_name_of_val(&*boxed_msg),
             payload: boxed_msg,
@@ -596,9 +633,9 @@ impl MessageEnvelope {
 ///
 /// Defines how the system should handle message delivery
 /// or processing failures through retries.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RetryPolicy {
-    /// Maximum number of retry attempts
+    /// Maximum number of retries after the initial attempt (0 means no retry).
     pub max_attempts: u32,
 
     /// Base interval between retry attempts
@@ -608,11 +645,44 @@ pub struct RetryPolicy {
     pub backoff_strategy: BackoffStrategy,
 }
 
+impl RetryPolicy {
+    /// Delay before a one-based retry (1 is the first retry after initial failure).
+    /// Fixed and linear arithmetic saturates; exponential growth is capped.
+    pub fn delay(&self, retry: u32) -> Result<Duration, crate::errors::ActorError> {
+        use crate::errors::ActorError;
+        if retry == 0 {
+            return Err(ActorError::MessageHandlingError(
+                "retry index must be positive".into(),
+            ));
+        }
+        Ok(match self.backoff_strategy {
+            BackoffStrategy::Fixed => self.retry_interval,
+            BackoffStrategy::Linear => self.retry_interval.saturating_mul(retry),
+            BackoffStrategy::Exponential { base, max_interval } => {
+                if !base.is_finite() || base < 1.0 {
+                    return Err(ActorError::MessageHandlingError(
+                        "retry exponential base must be finite and >= 1".into(),
+                    ));
+                }
+                if self.retry_interval.is_zero() {
+                    Duration::ZERO
+                } else {
+                    let seconds =
+                        self.retry_interval.as_secs_f64() * base.powf(f64::from(retry - 1));
+                    Duration::try_from_secs_f64(seconds)
+                        .unwrap_or(max_interval)
+                        .min(max_interval)
+                }
+            }
+        })
+    }
+}
+
 /// Strategies for adjusting retry intervals between attempts.
 ///
 /// Different backoff strategies can be used to handle various
 /// types of failures and network conditions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BackoffStrategy {
     /// Constant interval between retries
     Fixed,
@@ -991,30 +1061,32 @@ mod tests {
 // Remote messaging contract (DEV_01 §3.4 / TECH_DESIGN_05 §3.1)
 // ---------------------------------------------------------------------------
 
-/// 编解码注册项：derive 宏生成的 inventory 条目（禁止手写 submit）。
+/// 编解码注册项：derive 宏生成或协议适配器显式提交的 inventory 条目。
 ///
-/// `encode`/`decode` 是类型擦除的 bincode 包装；`type_id` 供发送侧
+/// `encode`/`decode` 必须遵守键前缀对应的编码；`type_id` 供发送侧
 /// TypeId -> TYPE_KEY 反查（encode_outgoing 出口）。
 #[cfg(feature = "remote")]
 pub struct CodecRegistration {
-    /// "bin:{crate}::{Type}#v{n}" / "pb:{package}.{Message}"（07 §2.1 type_key 规范）
+    /// "bin:{module_path}::{Type}#v{n}" / "pb:{package}.{Message}"
     pub type_key: &'static str,
     /// 注册消息类型的 TypeId
     pub type_id: std::any::TypeId,
-    /// &BoxedMessage -> bincode bytes（内部 downcast 到具体类型）
+    /// &BoxedMessage -> wire bytes（内部 downcast 到具体类型）
     pub encode: fn(&BoxedMessage) -> Result<Vec<u8>, String>,
-    /// bincode bytes -> BoxedMessage（内部具体类型装箱）
+    /// wire bytes -> BoxedMessage（内部具体类型装箱）
     pub decode: fn(&[u8]) -> Result<BoxedMessage, String>,
 }
 
 #[cfg(feature = "remote")]
 inventory::collect!(CodecRegistration);
 
-/// 远程可达消息契约（05 §3.1）。实现由 #[derive(RemoteMessage)] 生成，禁止手写 impl。
+/// 远程消息的稳定线上身份，由 `#[derive(RemoteMessage)]` 生成并注册编解码器。
 ///
-/// 格式："bin:{crate}::{Type}#v{n}"（默认 #v1；布局变更显式改键，06 I1）
+/// 缺省键为 `bin:{module_path}::{Type}#v1`；布局变更显式升版。
+/// bin 编解码器要求 Serialize + DeserializeOwned；pb 编解码器要求
+/// prost::Message + Default（启用 remote-protobuf）。不把 serde 当作 protobuf schema。
 #[cfg(feature = "remote")]
-pub trait RemoteMessage: Message + Serialize + DeserializeOwned {
+pub trait RemoteMessage: Message {
     /// 线上类型键（两端一致才可互通；schema-diff 对拍凭据）
     const TYPE_KEY: &'static str;
 }
@@ -1029,9 +1101,36 @@ pub fn serde_remote_serialize<T: Serialize>(v: &T) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("bincode encode: {e}"))
 }
 
+/// Per-payload limits used by the standard bincode codec.
+#[cfg(feature = "remote")]
+pub use crate::remote_decode::RemoteDecodeLimits;
+
+/// Decode one complete bincode message with default byte, value and depth limits.
+/// Strings/byte buffers validate their full encoded slice before allocating.
 #[cfg(feature = "remote")]
 pub fn serde_remote_deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
-    bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-        .map(|(v, _)| v)
-        .map_err(|e| format!("bincode decode: {e}"))
+    serde_remote_deserialize_with_limits(bytes, RemoteDecodeLimits::default())
+}
+
+/// Decode with explicit per-message limits. Protocol adapters may choose stricter
+/// limits or a larger value budget for known schemas. This does not bound arbitrary
+/// application code inside a user-written Deserialize implementation.
+#[cfg(feature = "remote")]
+pub fn serde_remote_deserialize_with_limits<T: DeserializeOwned>(
+    bytes: &[u8],
+    limits: RemoteDecodeLimits,
+) -> Result<T, String> {
+    crate::remote_decode::deserialize(bytes, limits)
+}
+
+/// Protobuf encoding for derives using an explicit `pb:` key.
+#[cfg(feature = "remote-protobuf")]
+pub fn protobuf_remote_serialize<T: prost::Message>(value: &T) -> Result<Vec<u8>, String> {
+    Ok(value.encode_to_vec())
+}
+
+/// Decode a complete protobuf message. Unknown protobuf fields remain compatible.
+#[cfg(feature = "remote-protobuf")]
+pub fn protobuf_remote_deserialize<T: prost::Message + Default>(bytes: &[u8]) -> Result<T, String> {
+    T::decode(bytes).map_err(|e| format!("protobuf decode: {e}"))
 }

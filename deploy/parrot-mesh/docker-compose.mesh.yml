@@ -1,5 +1,5 @@
 # 由 gen-mesh.sh 生成（N=5）——勿手改；重新生成：./gen-mesh.sh 5
-# 拓扑：链式种子 parrot-i → parrot-(i-1)；mesh 网络 IP 固定（172.28.0.0/16 段）
+# 拓扑：每节点向全部前序节点建立链路；端点使用 compose 服务 DNS
 name: parrot-mesh-5
 
 x-common: &common
@@ -8,10 +8,7 @@ x-common: &common
     context: ../..
     dockerfile: deploy/Dockerfile
   restart: unless-stopped
-  networks:
-    mesh:
-      # 固定 IP（4 起——.1/.2 网关/DNS 保留）：探测与断言确定性
-      ipv4_address: 172.28.0.9
+  networks: [mesh]
 
 services:
   parrot-1:
@@ -20,86 +17,79 @@ services:
     environment:
       PARROT_NODE_ID: parrot-1
       PARROT_BIND: 0.0.0.0:9801
+      PARROT_SECURITY_MODE: insecure-development
       PARROT_SEEDS: ""
       PARROT_ACTORS: echo,counter,kv,slow
-    networks:
-      mesh:
-        ipv4_address: 172.28.0.4
     ports:
-      - "21801:9801"
+      - "127.0.0.1:21801:9801"
   parrot-2:
     <<: *common
     container_name: mesh-parrot-2
     environment:
       PARROT_NODE_ID: parrot-2
       PARROT_BIND: 0.0.0.0:9801
-      PARROT_SEEDS: "parrot-1=172.28.0.4:9801"
+      PARROT_SECURITY_MODE: insecure-development
+      PARROT_SEEDS: "parrot-1=parrot-1:9801"
       PARROT_ACTORS: echo,counter,kv,slow
-    networks:
-      mesh:
-        ipv4_address: 172.28.0.5
     ports:
-      - "21802:9801"
+      - "127.0.0.1:21802:9801"
   parrot-3:
     <<: *common
     container_name: mesh-parrot-3
     environment:
       PARROT_NODE_ID: parrot-3
       PARROT_BIND: 0.0.0.0:9801
-      PARROT_SEEDS: "parrot-2=172.28.0.5:9801"
+      PARROT_SECURITY_MODE: insecure-development
+      PARROT_SEEDS: "parrot-1=parrot-1:9801,parrot-2=parrot-2:9801"
       PARROT_ACTORS: echo,counter,kv,slow
-    networks:
-      mesh:
-        ipv4_address: 172.28.0.6
     ports:
-      - "21803:9801"
+      - "127.0.0.1:21803:9801"
   parrot-4:
     <<: *common
     container_name: mesh-parrot-4
     environment:
       PARROT_NODE_ID: parrot-4
       PARROT_BIND: 0.0.0.0:9801
-      PARROT_SEEDS: "parrot-3=172.28.0.6:9801"
+      PARROT_SECURITY_MODE: insecure-development
+      PARROT_SEEDS: "parrot-1=parrot-1:9801,parrot-2=parrot-2:9801,parrot-3=parrot-3:9801"
       PARROT_ACTORS: echo,counter,kv,slow
-    networks:
-      mesh:
-        ipv4_address: 172.28.0.7
     ports:
-      - "21804:9801"
+      - "127.0.0.1:21804:9801"
   parrot-5:
     <<: *common
     container_name: mesh-parrot-5
     environment:
       PARROT_NODE_ID: parrot-5
       PARROT_BIND: 0.0.0.0:9801
-      PARROT_SEEDS: "parrot-4=172.28.0.7:9801"
+      PARROT_SECURITY_MODE: insecure-development
+      PARROT_SEEDS: "parrot-1=parrot-1:9801,parrot-2=parrot-2:9801,parrot-3=parrot-3:9801,parrot-4=parrot-4:9801"
       PARROT_ACTORS: echo,counter,kv,slow
-    networks:
-      mesh:
-        ipv4_address: 172.28.0.8
     ports:
-      - "21805:9801"
+      - "127.0.0.1:21805:9801"
   probe:
     <<: *common
     container_name: mesh-probe
     profiles: ["probe"]
     entrypoint: ["/usr/local/bin/parrot-probe"]
     command:
-      - parrot-1=172.28.0.4:9801
-      - parrot-2=172.28.0.5:9801
-      - parrot-3=172.28.0.6:9801
-      - parrot-4=172.28.0.7:9801
-      - parrot-5=172.28.0.8:9801
+      - --insecure-development
+      - parrot-1=parrot-1:9801
+      - parrot-2=parrot-2:9801
+      - parrot-3=parrot-3:9801
+      - parrot-4=parrot-4:9801
+      - parrot-5=parrot-5:9801
     depends_on:
-      - parrot-1
-      - parrot-2
-      - parrot-3
-      - parrot-4
-      - parrot-5
+      parrot-1:
+        condition: service_healthy
+      parrot-2:
+        condition: service_healthy
+      parrot-3:
+        condition: service_healthy
+      parrot-4:
+        condition: service_healthy
+      parrot-5:
+        condition: service_healthy
     restart: "no"
-    networks:
-      mesh:
-        ipv4_address: 172.28.0.10
 
 networks:
   mesh:

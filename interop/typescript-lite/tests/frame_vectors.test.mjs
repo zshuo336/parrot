@@ -3,9 +3,31 @@
  * 运行：node --test tests/（node:test 原生——零 jest 依赖）
  */
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { loadSharedVectors } from './support/shared-vectors.mjs';
 import test from "node:test";
 import assert from "node:assert/strict";
+
+test('shared error payload corpus', () => {
+  const rows = readFileSync(new URL('../../../docs/vectors/error-payloads.tsv', import.meta.url), 'utf8')
+    .split('\n').filter(line => line && !line.startsWith('#')).map(line => line.split('\t'));
+  assert.equal(rows.length, 30);
+  for (const [name, result, payload, code, detail] of rows) {
+    const bytes = Buffer.from(payload, 'hex');
+    if (result === 'reject') assert.throws(() => decodeErrPayload(bytes), undefined, name);
+    else {
+      assert.equal(result, 'accept');
+      const decoded = decodeErrPayload(bytes);
+      assert.equal(decoded.code, Number(code), name);
+      assert.equal(Buffer.from(decoded.detail, 'utf8').toString('hex'), detail, name);
+      assert.equal(Buffer.from(encodeErrPayload(decoded.code, decoded.detail)).toString('hex'), payload, name);
+    }
+  }
+});
+
+test('error encoder rejects invalid codes and unpaired surrogates', () => {
+  for (const code of [0, 14, -1, 65536, 1.5, NaN, true]) assert.throws(() => encodeErrPayload(code, 'error'));
+  assert.throws(() => encodeErrPayload(3, '\ud800'));
+});
 
 import {
   FT,
@@ -17,16 +39,21 @@ import {
   parseTlv,
 } from "../dist/wire.js";
 
-const VECTORS = JSON.parse(
-  readFileSync(resolve(process.cwd(), "../../docs/vectors/wire1.json"), "utf8"),
-);
+const VECTORS = loadSharedVectors();
 
 const hexToBytes = (hex) =>
   new Uint8Array((hex.match(/../g) ?? []).map((h) => parseInt(h, 16)));
 
 test("frozen contract", () => {
   assert.equal(VECTORS.frozen, true);
+  const names = new Set(VECTORS.vectors.map(vec => vec.name));
+  for (const name of ['ask-basic', 'tell-basic', 'reply-err-stopped', 'heartbeat']) assert.ok(names.has(name));
 });
+
+function encodeDecoded(frame) {
+  return buildFrame(frame.ft, frame.cid, frame.path, frame.typeKey, frame.payload,
+    frame.flags, frame.hopCount, frame.hopLimit, frame.sequence);
+}
 
 for (const vec of VECTORS.vectors) {
   test(`roundtrip ${vec.name}`, () => {
@@ -36,6 +63,7 @@ for (const vec of VECTORS.vectors) {
       vec.path,
       vec.type_key,
       hexToBytes(vec.payload_hex),
+      vec.flags, vec.hop_count, vec.hop_limit, vec.sequence,
     );
     assert.equal(Buffer.from(frame).toString("hex"), vec.bytes_hex);
   });
@@ -47,12 +75,42 @@ for (const vec of VECTORS.vectors) {
     assert.ok(f);
     assert.equal(f.cid, BigInt(vec.correlation_id));
     assert.equal(f.ft, parseInt(vec.frame_type, 16));
+    assert.equal(f.flags, vec.flags);
+    assert.equal(f.hopCount, vec.hop_count);
+    assert.equal(f.hopLimit, vec.hop_limit);
+    assert.equal(f.sequence, vec.sequence);
     assert.equal(f.path, vec.path);
     assert.equal(f.typeKey, vec.type_key);
     assert.equal(Buffer.from(f.payload).toString("hex"), vec.payload_hex);
+    assert.equal(Buffer.from(encodeDecoded(f)).toString('hex'), vec.bytes_hex);
     assert.equal(dec.nextFrame(), null);
   });
+
+  test(`all split points ${vec.name}`, () => {
+    const bytes = hexToBytes(vec.bytes_hex);
+    for (let split = 0; split < bytes.length; split++) {
+      const decoder = new FrameDecoder();
+      decoder.feed(bytes.slice(0, split));
+      assert.equal(decoder.nextFrame(), null, `${vec.name} split=${split}`);
+      decoder.feed(bytes.slice(split));
+      const frame = decoder.nextFrame();
+      assert.ok(frame, `${vec.name} split=${split}`);
+      assert.equal(Buffer.from(encodeDecoded(frame)).toString('hex'), vec.bytes_hex);
+      assert.equal(decoder.nextFrame(), null);
+    }
+  });
 }
+
+test('all shared vectors pipeline preserves order and bytes', () => {
+  const decoder = new FrameDecoder();
+  decoder.feed(Buffer.concat(VECTORS.vectors.map(vec => Buffer.from(vec.bytes_hex, 'hex'))));
+  for (const vec of VECTORS.vectors) {
+    const frame = decoder.nextFrame();
+    assert.ok(frame, vec.name);
+    assert.equal(Buffer.from(encodeDecoded(frame)).toString('hex'), vec.bytes_hex);
+  }
+  assert.equal(decoder.nextFrame(), null);
+});
 
 test("partial: byte-by-byte feed emits only on complete", () => {
   const frame = buildFrame(FT.ASK, 7n, "/user/x", "bin:t::M", new Uint8Array([42]));
@@ -88,7 +146,8 @@ test("malformed lengths and exhausted hop are rejected without overread", () => 
   new DataView(bad.buffer).setUint32(24, 1, true);
   assert.throws(() => { dec.feed(bad); dec.nextFrame(); }, /invalid path length/);
 
-  const exhausted = buildFrame(FT.TELL, 1n, "/x", "k", new Uint8Array(), 0, 8, 8);
+  const exhausted = buildFrame(FT.TELL, 1n, "/x", "k", new Uint8Array(), 0, 0, 8);
+  exhausted[16] = 8;
   const d2 = new FrameDecoder();
   d2.feed(exhausted);
   assert.throws(() => d2.nextFrame(), /hop limit exceeded/);
@@ -97,10 +156,10 @@ test("malformed lengths and exhausted hop are rejected without overread", () => 
 test("handshake tlv: mandatory fields + chosen codec pb", () => {
   const body = handshakeAckBody("ts-lite-1");
   const tags = parseTlv(body).map(([t]) => t);
-  for (const t of [1, 4, 5, 6, 7, 8]) assert.ok(tags.includes(t));
+  for (const t of [1, 4, 5, 6, 7, 9]) assert.ok(tags.includes(t));
   const fields = new Map(parseTlv(body));
   assert.equal(new TextDecoder().decode(fields.get(1)), "ts-lite-1");
   const caps = new DataView(fields.get(4).buffer, fields.get(4).byteOffset).getUint32(0, true);
   assert.equal(caps, 0x02); // pb-only（07 §8.1）
-  assert.equal(new TextDecoder().decode(fields.get(8)), "pb");
+  assert.equal(new TextDecoder().decode(fields.get(9)), "pb");
 });

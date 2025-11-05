@@ -1,0 +1,2 @@
+target/
+# Preserve the upstream test workspace lockfile for reproducible validation.

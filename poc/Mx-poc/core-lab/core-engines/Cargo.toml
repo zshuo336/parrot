@@ -1,0 +1,9 @@
+[package]
+name = "core-engines"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+api-neutral = { path = "../api-neutral" }
+typed-static = { path = "../typed-static" }
+beam-sched = { path = "../beam-sched" }

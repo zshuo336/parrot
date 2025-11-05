@@ -298,12 +298,22 @@ async fn cancelling_stop_caller_does_not_abandon_typed_cleanup() {
     let caller = tokio::spawn(async move { stopping.stop().await });
     event(&mut events, "hook").await;
     caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
     let result = actor.stop().await;
     assert!(matches!(
         result,
         Err(parrot_api::errors::ActorError::TimeoutDetail(_))
     ));
     event(&mut events, "actor_drop").await;
+    // A timeout receipt precedes disposal; the Drop signal in turn precedes
+    // the lifecycle monitor receiving completion and removing this generation.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while system.get_actor(&actor.path().to_owned()).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled caller must leave retirement owned by the monitor");
     assert_eq!(system.status().active_actors, 0);
     system.as_ref().clone().shutdown().await.unwrap();
 }

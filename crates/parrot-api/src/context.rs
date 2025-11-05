@@ -26,7 +26,7 @@ use crate::errors::ActorError;
 use crate::message::{CloneableMessage, Message};
 use crate::receptionist::{ReceptionistKey, ReceptionistStream};
 use crate::stream::StreamRegistry;
-use crate::supervisor::SupervisorStrategyType;
+use crate::supervisor::{DeathReason, SupervisorStrategyType};
 use crate::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use async_trait::async_trait;
 use std::hash::Hash;
@@ -49,6 +49,19 @@ use std::time::Duration;
 /// All methods are thread-safe and can be called concurrently
 #[async_trait]
 pub trait ActorSpawner: Send + Sync {
+    /// Submit a repeatable constructor through an engine's typed factory bridge.
+    /// The constructor owns its configuration; it is not called before admission.
+    fn spawn_factory_erased<'a>(
+        &'a self,
+        _factory: BoxedMessage,
+        _strategy: Option<SupervisorStrategyType>,
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
+        Box::pin(async {
+            Err(crate::errors::ActorError::InitializationError(
+                "this spawner has no repeatable factory bridge".into(),
+            ))
+        })
+    }
     /// Creates new actor instance
     ///
     /// ## Parameters
@@ -87,11 +100,53 @@ pub trait ActorSpawner: Send + Sync {
     ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>;
 }
 
+/// Engine bridge preserving the callable creation operation when an actor is erased.
+/// Engine context types implement this for the actors they can execute. Custom
+/// spawners may implement their own bridge; arbitrary `Any` is not executable.
+pub trait ActorSpawnContext<A: Actor> {
+    fn wrap_spawn(actor: A) -> BoxedMessage;
+}
+
+/// Engine bridge for repeatable constructors, separate from instance spawning.
+pub trait ActorFactoryContext<A: Actor> {
+    fn wrap_factory<F: Fn() -> A + Send + Sync + 'static>(factory: F) -> BoxedMessage;
+}
+
 /// Type-safe extension methods for actor spawning.
 ///
 /// This trait provides convenience methods for spawning actors
 /// while preserving their type information.
 pub trait ActorSpawnerExt: ActorSpawner {
+    /// Create a logical child whose constructor can be called again on failure.
+    /// Its failure policy is inherited from the parent. Capture configuration in
+    /// the constructor so each replacement can consume the same settings.
+    fn spawn_factory<A: Actor, F: Fn() -> A + Send + Sync + 'static>(
+        &self,
+        factory: F,
+    ) -> BoxedFuture<'_, ActorResult<BoxedActorRef>>
+    where
+        A::Context: ActorFactoryContext<A>,
+    {
+        self.spawn_factory_erased(
+            <A::Context as ActorFactoryContext<A>>::wrap_factory(factory),
+            None,
+        )
+    }
+
+    /// Create a logical child with an explicit failure policy.
+    fn spawn_factory_with_strategy<A: Actor, F: Fn() -> A + Send + Sync + 'static>(
+        &self,
+        factory: F,
+        strategy: SupervisorStrategyType,
+    ) -> BoxedFuture<'_, ActorResult<BoxedActorRef>>
+    where
+        A::Context: ActorFactoryContext<A>,
+    {
+        self.spawn_factory_erased(
+            <A::Context as ActorFactoryContext<A>>::wrap_factory(factory),
+            Some(strategy),
+        )
+    }
     /// Spawns a new actor with preserved type information.
     ///
     /// # Type Parameters
@@ -107,8 +162,14 @@ pub trait ActorSpawnerExt: ActorSpawner {
         &'a self,
         actor: A,
         config: A::Config,
-    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
-        self.spawn(Box::new(actor), Box::new(config))
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>
+    where
+        A::Context: ActorSpawnContext<A>,
+    {
+        self.spawn(
+            <A::Context as ActorSpawnContext<A>>::wrap_spawn(actor),
+            Box::new(config),
+        )
     }
 
     /// Spawns a supervised actor with preserved type information.
@@ -128,8 +189,15 @@ pub trait ActorSpawnerExt: ActorSpawner {
         actor: A,
         config: A::Config,
         strategy: SupervisorStrategyType,
-    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
-        self.spawn_with_strategy(Box::new(actor), Box::new(config), strategy)
+    ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>>
+    where
+        A::Context: ActorSpawnContext<A>,
+    {
+        self.spawn_with_strategy(
+            <A::Context as ActorSpawnContext<A>>::wrap_spawn(actor),
+            Box::new(config),
+            strategy,
+        )
     }
 }
 
@@ -340,7 +408,12 @@ pub trait ActorContext: Send + Sync {
     /// Returns references to all child actors.
     fn children(&self) -> Option<ReadOnlyChildrenVec>;
 
-    /// Sets timeout for receiving messages.
+    /// Sets an idle receive timeout, independent of outgoing ask deadlines.
+    /// Managed Thread/Actix actors receive LifecycleEvent::ReceiveTimeout after
+    /// this much idle time following initialization or a completed handler.
+    /// Active handlers pause the clock; the timeout handler starts a new idle
+    /// interval on completion. None or zero disables it and invalidates pending
+    /// idle tokens. Unrepresentable durations are disabled with a diagnostic.
     ///
     /// # Parameters
     /// * `timeout` - Duration after which timeout occurs, or None to disable
@@ -363,6 +436,28 @@ pub trait ActorContext: Send + Sync {
 
     /// Returns mutable access to actor spawning interface.
     fn spawner(&mut self) -> &mut dyn ActorSpawner;
+
+    /// Optional owner-thread child factories in this real parent generation.
+    /// Unsupported engines/contexts return None without consuming any inputs.
+    fn local_spawner(&self) -> Option<&dyn crate::engine::AsyncLocalActorSpawner> {
+        None
+    }
+
+    /// Optional engine-neutral child creation. Query capability before building
+    /// inputs; unsupported contexts do not consume application resources.
+    fn async_spawner(&self) -> Option<&dyn crate::engine::AsyncActorSpawner> {
+        None
+    }
+
+    /// Resolve an actor path through this context's owning engine.
+    /// Resolution does not wait for a connection or check that the actor exists
+    /// remotely. A returned reference may still fail when used. Engines without
+    /// this capability, unknown local paths and unavailable remote routes return
+    /// `None`. Thread contexts support local paths and, with an injected remote
+    /// gateway, explicit `parrot://` paths returned by service discovery.
+    fn resolve_actor(&self, _path: &str) -> Option<BoxedActorRef> {
+        None
+    }
 
     // ---------------- Receptionist（DEV_02 §3.1 / K2） ----------------
     // 双引擎 context 各自转发实现（remote 未启用时默认 Unsupported）。
@@ -409,8 +504,16 @@ pub trait ActorContextMessage: ActorContext {
     /// Result indicating success or failure
     fn send_self<M: Message>(&self, msg: M) -> ActorResult<()> {
         let self_ref = self.get_self_ref();
-        tokio::spawn(async move {
-            let _ = self_ref.send(Box::new(msg) as BoxedMessage).await;
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            ActorError::InternalError(
+                "send_self requires an active Tokio runtime; use ask_self or get_self_ref().deliver(...).await outside a runtime"
+                    .into(),
+            )
+        })?;
+        handle.spawn(async move {
+            if let Err(error) = self_ref.send(Box::new(msg) as BoxedMessage).await {
+                tracing::debug!(%error, "send_self delivery failed after task admission");
+            }
         });
         Ok(())
     }
@@ -454,7 +557,7 @@ pub trait ActorContextScheduler: ActorContext {
     ///
     /// # Returns
     /// Future resolving to the scheduled task
-    async fn schedule<M: Message>(
+    async fn schedule<M: Message + Clone + Sync>(
         &self,
         msg: M,
         delay: Duration,
@@ -481,7 +584,7 @@ pub trait ActorContextScheduler: ActorContext {
 /// ## Thread Safety
 /// - Implements Send + Sync
 /// - Safe for concurrent access
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScheduledTask {
     /// Unique task identifier
     /// - **Uniqueness**: Guaranteed unique within system
@@ -497,6 +600,58 @@ pub struct ScheduledTask {
     /// - **Precision**: System time precision
     /// - **Timezone**: UTC based
     pub schedule_time: std::time::SystemTime,
+
+    /// Engine-owned cancellation hook. It is intentionally private so task
+    /// identity and ownership stay with the creating actor generation.
+    pub(crate) cancel: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ScheduledTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScheduledTask")
+            .field("id", &self.id)
+            .field("target", &self.target.path())
+            .field("schedule_time", &self.schedule_time)
+            .finish()
+    }
+}
+
+impl ScheduledTask {
+    /// Construct a task without a cancellation hook (for metadata-only use).
+    pub fn new(
+        id: uuid::Uuid,
+        target: Arc<dyn ActorRef>,
+        schedule_time: std::time::SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            target,
+            schedule_time,
+            cancel: None,
+        }
+    }
+
+    /// Construct a task returned by an engine scheduler.
+    pub fn with_cancel(
+        id: uuid::Uuid,
+        target: Arc<dyn ActorRef>,
+        schedule_time: std::time::SystemTime,
+        cancel: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            id,
+            target,
+            schedule_time,
+            cancel: Some(cancel),
+        }
+    }
+
+    /// Cancel this task if it is still owned by its creating context.
+    pub fn cancel(&self) {
+        if let Some(cancel) = &self.cancel {
+            cancel();
+        }
+    }
 }
 
 impl PartialEq for ScheduledTask {
@@ -548,6 +703,26 @@ pub enum LifecycleEvent {
 
     /// Message receive timeout occurred
     ReceiveTimeout,
+}
+
+impl Message for LifecycleEvent {
+    type Result = ();
+}
+
+/// Termination notification for engines implementing the `DeathWatch`
+/// capability (managed Actix and Thread). ThreadActorSystem's legacy path API
+/// continues to use its own `Terminated` message; ThreadContext uses this one.
+#[derive(Debug, Clone)]
+pub struct ActorTerminated {
+    /// Logical actor identity, independent of path reuse. A successful supervised
+    /// restart retains this identity; manual same-path replacement does not.
+    pub generation: uuid::Uuid,
+    pub path: String,
+    pub reason: DeathReason,
+}
+
+impl crate::message::Message for ActorTerminated {
+    type Result = ();
 }
 
 #[cfg(test)]
@@ -694,11 +869,13 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             target: Arc::new(R),
             schedule_time: t,
+            cancel: None,
         };
         let b = ScheduledTask {
             id: a.id,
             target: Arc::new(R), // 同 path
             schedule_time: t,
+            cancel: None,
         };
         assert_eq!(a, b);
         // hash 一致（HashMap 可聚合）
@@ -712,6 +889,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             target: Arc::new(R),
             schedule_time: t,
+            cancel: None,
         };
         assert_ne!(b, c);
     }
@@ -764,6 +942,11 @@ mod tests {
             }
             fn state(&self) -> ActorState {
                 ActorState::Running
+            }
+        }
+        impl ActorSpawnContext<A> for dyn ActorContext {
+            fn wrap_spawn(actor: A) -> BoxedMessage {
+                Box::new(actor)
             }
         }
         let s = NullSpawner;

@@ -14,8 +14,17 @@ pub struct FrameSender {
 }
 
 impl FrameSender {
+    /// Reject invalid caller input before waiting for capacity. Memory and TCP
+    /// admission share the same contract; local errors do not retire the link.
     pub async fn send(&self, f: Frame) -> Result<(), String> {
-        self.tx.send(f).await.map_err(|_| "writer dropped".to_string())
+        f.validated_body_len()?;
+        self.tx
+            .send(f)
+            .await
+            .map_err(|_| "writer dropped".to_string())
+    }
+    pub async fn closed(&self) {
+        self.tx.closed().await;
     }
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
@@ -35,8 +44,14 @@ pub fn memory_pair() -> (FrameLink, FrameLink) {
     let (tx_a_to_b, rx_a_to_b) = mpsc::channel(1024);
     let (tx_b_to_a, rx_b_to_a) = mpsc::channel(1024);
     (
-        FrameLink { sender: FrameSender { tx: tx_a_to_b }, incoming: rx_b_to_a },
-        FrameLink { sender: FrameSender { tx: tx_b_to_a }, incoming: rx_a_to_b },
+        FrameLink {
+            sender: FrameSender { tx: tx_a_to_b },
+            incoming: rx_b_to_a,
+        },
+        FrameLink {
+            sender: FrameSender { tx: tx_b_to_a },
+            incoming: rx_a_to_b,
+        },
     )
 }
 
@@ -44,17 +59,27 @@ pub fn memory_pair() -> (FrameLink, FrameLink) {
 
 /// TCP 服务端：bind 后立即返回 (地址, link 接收器)；accept 在后台进行，
 /// 客户端可立刻连接（连接建立时序：bind→addr 公布→connect/accept 并行）。
-pub async fn tcp_listen() -> Result<(std::net::SocketAddr, tokio::sync::oneshot::Receiver<FrameLink>), String> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
+pub async fn tcp_listen() -> Result<
+    (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<FrameLink>,
+    ),
+    String,
+> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| e.to_string())?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (mut tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, _peer)) => {
-                stream.set_nodelay(true).ok();
-                let _ = tx.send(stream_to_link(stream));
+        tokio::select! {
+            _ = tx.closed() => {},
+            accepted = listener.accept() => {
+                if let Ok((stream, _peer)) = accepted {
+                    stream.set_nodelay(true).ok();
+                    let _ = tx.send(stream_to_link(stream));
+                }
             }
-            Err(_) => { /* rx 被 drop，客户端将超时 */ }
         }
     });
     Ok((addr, rx))
@@ -89,31 +114,44 @@ fn stream_to_link(stream: tokio::net::TcpStream) -> FrameLink {
     let (tx_out, mut rx_out) = mpsc::channel::<Frame>(1024);
     let (tx_in, rx_in) = mpsc::channel::<Frame>(1024);
 
-    // 写任务
+    // One owner scopes both halves: EOF, malformed input, dropped consumer or
+    // write failure closes the whole link and its admission queue.
     tokio::spawn(async move {
-        while let Some(f) = rx_out.recv().await {
-            let mut buf = BytesMut::new();
-            f.encode(&mut buf);
-            if wr.write_all(&buf).await.is_err() {
-                break;
-            }
-        }
-    });
-    // 读任务
-    tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(64 * 1024);
-        loop {
-            match rd.read_buf(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            while let Ok(Some(frame)) = Frame::decode(&mut buf) {
-                if tx_in.send(frame).await.is_err() {
+        let writer = async {
+            while let Some(f) = rx_out.recv().await {
+                let mut buf = BytesMut::new();
+                if f.encode(&mut buf).is_err() || wr.write_all(&buf).await.is_err() {
                     return;
                 }
             }
+        };
+        let reader = async {
+            let mut buf = BytesMut::with_capacity(8192);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match Frame::decode(&mut buf) {
+                    Ok(Some(frame)) => {
+                        if tx_in.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                    Ok(None) => match rd.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    },
+                }
+            }
+        };
+        tokio::select! {
+            _ = writer => {},
+            _ = reader => {},
+            _ = tx_in.closed() => {},
         }
     });
 
-    FrameLink { sender: FrameSender { tx: tx_out }, incoming: rx_in }
+    FrameLink {
+        sender: FrameSender { tx: tx_out },
+        incoming: rx_in,
+    }
 }

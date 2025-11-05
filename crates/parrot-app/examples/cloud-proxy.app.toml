@@ -1,0 +1,47 @@
+name = "durable-proxy-example"
+version = "1.0.0"
+
+[[components]]
+name = "orders"
+engine = "parrot"
+
+[components.artifact.Props]
+factory = "parrot.cloud-proxy"
+
+[components.config]
+# Change to a deployment-owned persistent absolute directory.
+directory = "/tmp/parrot-cloud-proxy-example"
+# An explicit node identity is required. The receiver is supplied by your app.
+receiver = "tcp://warehouse@127.0.0.1:19881"
+path = "/user/orders"
+session = "orders-v1"
+# Requires an authenticated transactional receiver. Configure host/receiver mTLS.
+transactional = true
+# To use CloudProxySubmitIdempotent, choose a NEW directory/session and enable.
+# Existing v1 directories cannot be switched even when pending is empty.
+idempotent_submissions = false
+max_submission_receipts = 65536
+max_submission_receipt_bytes = 16777216
+mailbox_capacity = 1024
+# Admission charge covers queued, waiting-to-enqueue and executing business.
+# Each request adds 128 bytes, each business item 64, plus key/payload lengths (and request_id for keyed requests).
+max_inflight_bytes = 67108864
+max_request_bytes = 16793728
+max_pending_records = 100000
+max_pending_bytes = 67108864
+max_disk_bytes = 1073741824
+segment_bytes = 67108864
+# Queued ordinary requests coalesce automatically; explicit SubmitBatch is optional.
+# Every successful item is durable before its result returns.
+group_commit_max_records = 64
+group_commit_interval_ms = 10
+attempt_timeout_ms = 10000
+retry_min_ms = 100
+retry_max_ms = 30000
+drain_timeout_ms = 5000
+
+[components.hooks]
+on_start = "."
+on_stop = "."
+# Add on_drain = "." to require delivery of accepted work before shutdown;
+# an offline receiver then causes a reported drain timeout, preserving the WAL.

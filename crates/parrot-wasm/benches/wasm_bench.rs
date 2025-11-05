@@ -1,11 +1,9 @@
-//! C 阶段基准（DEV_09 §3.3 门禁：<10µs 增量实例化）。
-//!
-//! 计量的"增量实例化" = 同 Engine + 预编译 Component 缓存命中后的
-//! `Store::new + linker instantiate`（首编译 ~ms 级不计入门禁——
-//! 真实部署每节点一次）。
+//! Cached file-based instantiation benchmark: includes reading the artifact,
+//! cache lookup, Store creation, linking and dropping the instance.
+//! First compilation is warmed up outside the measured loop.
 //!
 //! 运行：`cargo bench -p parrot-wasm --features runtime`
-//! 门禁断言：p50 < 10µs（同 digest instantiate——缓存命中路径）。
+//! Criterion reports a local baseline; no three-engine overhead gate is claimed.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use parrot_wasm::runtime::WasmRuntime;
@@ -16,7 +14,7 @@ fn fixture_path() -> std::path::PathBuf {
 }
 
 fn bench_instantiate(c: &mut Criterion) {
-    let rt = WasmRuntime::new(WasmConfig::default()).unwrap();
+    let rt = WasmRuntime::new_with_manual_epoch(WasmConfig::default()).unwrap();
     // 预热编译缓存（首编译——不计入门禁）
     let _ = rt.instantiate(&fixture_path(), HostCtx::default()).unwrap();
 

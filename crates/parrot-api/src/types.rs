@@ -47,11 +47,13 @@ use std::sync::Arc;
 /// throughout the system.
 pub type BoxedActorRef = Box<dyn ActorRef>;
 
-/// Thread-safe shared reference to an actor.
+/// Shared actor-reference handle, retained under its historical public name.
 ///
-/// This type provides a reference-counted, thread-safe handle to an actor.
-/// Used for sharing actor references across multiple owners while ensuring
-/// proper cleanup when all references are dropped.
+/// This is `Arc<dyn ActorRef>`, not `std::sync::Weak`. Clones retain the
+/// reference object and any resources owned by that implementation. The
+/// engine controls actor-instance termination independently of this type;
+/// holding a reference does not prove the instance is running. Use
+/// `Arc::downgrade` when actual weak ownership is required.
 pub type WeakActorTarget = Arc<dyn ActorRef>;
 
 /// Type-erased message container.

@@ -1,9 +1,11 @@
-//! Actix 引擎压测套件（与 thread 版逻辑逐字节对齐）。
+//! Actix 引擎压测套件（双引擎采用相同固定计算量；调度与准入分别测量）。
 //!
 //! 运行：`cargo test --test engine_stress_actix -- --nocapture --ignored`
 
 mod engine_stress_common;
+use futures::FutureExt;
 
+use engine_stress_common::contracts::*;
 use engine_stress_common::*;
 use parrot::actix::actor::ActixActor;
 use parrot::actix::context::ActixContext;
@@ -24,14 +26,16 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 pub struct BenchActor {
+    _owner: ActorOwner,
     pub ops: Arc<AtomicU64>,
     pub cpu_sink: Arc<AtomicU64>,
     pub messages: Arc<AtomicU64>,
 }
 
 impl BenchActor {
-    pub fn new(ops: Arc<AtomicU64>, cpu_sink: Arc<AtomicU64>) -> Self {
+    pub fn new(ops: Arc<AtomicU64>, cpu_sink: Arc<AtomicU64>, owner: ActorOwner) -> Self {
         Self {
+            _owner: owner,
             ops,
             cpu_sink,
             messages: Arc::new(AtomicU64::new(0)),
@@ -68,7 +72,25 @@ impl parrot_api::actor::ActixEngineExt for BenchActor {
         _ctx: &'a mut Self::Context,
         _engine: parrot_api::actor::EngineContextHandle,
     ) -> Option<ActorResult<BoxedMessage>> {
-        let out: BoxedMessage = if let Some(t) = msg.downcast_ref::<CpuTask>() {
+        let out: BoxedMessage = if let Some(pause) = msg.downcast_ref::<PauseForTimeout>() {
+            if let Err(error) = pause.execute() {
+                return Some(Err(error));
+            }
+            Box::new(())
+        } else if let Some(t) = msg.downcast_ref::<GatedWork>() {
+            self.ops.fetch_add(1, Ordering::Relaxed);
+            let result = match t.solid() {
+                Ok(Some(value)) => value,
+                Ok(None) => return Some(Ok(Box::new(()) as BoxedMessage)),
+                Err(error) => return Some(Err(error)),
+            };
+            self.cpu_sink.fetch_add(result.value, Ordering::Relaxed);
+            self.ops.fetch_add(1, Ordering::Relaxed);
+            Box::new(result)
+        } else if let Some(probe) = msg.downcast_ref::<ProbeMessage>() {
+            self.ops.fetch_add(1, Ordering::Relaxed);
+            Box::new(probe.execute())
+        } else if let Some(t) = msg.downcast_ref::<CpuTask>() {
             // Pre-mark so tests can observe the task has entered the handler.
             self.ops.fetch_add(1, Ordering::Relaxed);
             let r = burn_cpu(t.iterations, t.salt);
@@ -78,6 +100,12 @@ impl parrot_api::actor::ActixEngineExt for BenchActor {
         } else if let Some(t) = msg.downcast_ref::<IoTask>() {
             // 同步 handler 中不能 sleep；记为延迟值（延迟模拟见 bench 内 tokio::spawn）
             Box::new(t.duration_ms)
+        } else if let Some(t) = msg.downcast_ref::<TimedLongTask>() {
+            self.ops.fetch_add(1, Ordering::Relaxed);
+            let measured = timed_cpu(t.total_iterations);
+            self.cpu_sink.fetch_add(measured.value, Ordering::Relaxed);
+            self.ops.fetch_add(1, Ordering::Relaxed);
+            Box::new(measured)
         } else if let Some(t) = msg.downcast_ref::<LongRunningTask>() {
             // Mark start BEFORE the compute so the starvation test can
             // observe the task is actually running.
@@ -219,18 +247,19 @@ async fn setup() -> anyhow::Result<(ParrotActorSystem, ActixActorSystem)> {
     Ok((parrot, actix_sys))
 }
 
-fn spawn_actor(
+async fn spawn_actor(
+    scope: &ActorScope,
     sys: &ActixActorSystem,
     ops: Arc<AtomicU64>,
     cpu_sink: Arc<AtomicU64>,
 ) -> Box<dyn ActorRef> {
-    sys.spawn_root_typed(BenchActor::new(ops, cpu_sink), EmptyConfig)
-        .now_or_never()
-        .expect("spawn ready")
-        .expect("spawn ok")
+    let actor = sys
+        .spawn_root_typed(BenchActor::new(ops, cpu_sink, scope.owner()), EmptyConfig)
+        .await
+        .expect("spawn ok");
+    scope.track(actor.as_ref());
+    actor
 }
-
-use futures::FutureExt;
 
 // ---------------------------------------------------------------------------
 // 异步 handler actor：验证 actix 适配层的 async IO 能力
@@ -239,6 +268,7 @@ use futures::FutureExt;
 /// `use_async_handler() == true`：所有消息走 `receive_message`（async fn），
 /// handler 内部做真实异步等待（模拟 IO）。与 thread 版 IoActor 逻辑对齐。
 pub struct IoAsyncActor {
+    _owner: ActorOwner,
     pub done: Arc<AtomicU64>,
 }
 
@@ -255,7 +285,7 @@ impl Actor for IoAsyncActor {
 
     fn receive_message<'a>(
         &'a mut self,
-        _msg: BoxedMessage,
+        msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         let done = self.done.clone();
@@ -263,7 +293,11 @@ impl Actor for IoAsyncActor {
             // 真实异步等待（IO 模拟）：await 期间释放 arbiter 线程
             tokio::time::sleep(Duration::from_millis(10)).await;
             done.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::new(1u64) as BoxedMessage)
+            let value = msg
+                .downcast_ref::<Echo>()
+                .ok_or_else(|| ActorError::MessageHandlingError("expected IO Echo".into()))?
+                .value;
+            Ok(Box::new(value) as BoxedMessage)
         })
     }
 
@@ -296,13 +330,13 @@ async fn bench_sequential_ask(
         samples.push(t0.elapsed().as_micros());
     }
     report.push(BenchResult {
+        unit: "messages",
         name: name.into(),
         engine: "actix",
         total_messages: n,
         elapsed: start.elapsed(),
         latencies: latency_stats(samples),
         correctness: true,
-        cpu_work_secs: None,
         note: String::new(),
     });
     Ok(())
@@ -343,19 +377,19 @@ async fn bench_concurrent_ask(
         }
     }
     report.push(BenchResult {
+        unit: "messages",
         name: name.into(),
         engine: "actix",
         total_messages: (concurrency * per_task as usize) as u64,
         elapsed: start.elapsed(),
         latencies: latency_stats(samples),
         correctness: correct,
-        cpu_work_secs: None,
         note: format!("concurrency={}", concurrency),
     });
     Ok(())
 }
 
-async fn bench_tell_throughput(
+async fn bench_request_throughput(
     report: &Report,
     name: &str,
     sys: &ActixActorSystem,
@@ -365,9 +399,7 @@ async fn bench_tell_throughput(
 ) -> anyhow::Result<()> {
     let start = Instant::now();
     for i in 0..n {
-        actor
-            .send(Box::new(Echo { value: i }) as BoxedMessage)
-            .await?;
+        checked_u64(actor.as_ref(), Box::new(Echo { value: i }), i).await?;
     }
     let ok = wait_until(
         || ops.load(Ordering::Relaxed) >= n,
@@ -376,13 +408,13 @@ async fn bench_tell_throughput(
     )
     .await;
     report.push(BenchResult {
+        unit: "messages",
         name: name.into(),
         engine: "actix",
         total_messages: n,
         elapsed: start.elapsed(),
         latencies: latency_stats(vec![]),
         correctness: ok,
-        cpu_work_secs: None,
         note: if ok {
             String::new()
         } else {
@@ -393,11 +425,49 @@ async fn bench_tell_throughput(
     Ok(())
 }
 
+pub struct ChunkActor {
+    _owner: ActorOwner,
+}
+impl parrot_api::actor::ActixEngineExt for ChunkActor {}
+impl Actor for ChunkActor {
+    type Config = EmptyConfig;
+    type Context = ActixContext<ActixActor<Self>>;
+    fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            if let Some(work) = msg.downcast_ref::<GatedWork>() {
+                return Ok(match work.chunked().await? {
+                    Some(result) => Box::new(result) as BoxedMessage,
+                    None => Box::new(()) as BoxedMessage,
+                });
+            }
+            if let Some(probe) = msg.downcast_ref::<ProbeMessage>() {
+                return Ok(Box::new(probe.execute()) as BoxedMessage);
+            }
+            Err(ActorError::MessageHandlingError(
+                "unknown chunk message".into(),
+            ))
+        })
+    }
+    fn use_async_handler(&self) -> bool {
+        true
+    }
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 测试入口
 // ---------------------------------------------------------------------------
 
-// 分钟级 CPU 场景使全套耗时 ~3.5 分钟（release）；日常回归请跳过：
+// Fixed-work CPU experiments can take several minutes; duration depends on the host.
 //   cargo test -p parrot --release            # 跳过压测
 //   cargo test -p parrot --release -- --ignored --nocapture   # 只跑压测
 #[test]
@@ -406,67 +476,76 @@ fn actix_engine_full_suite() {
     // Actix 需要 System 上下文；在其内运行 tokio multi-thread 不冲突（actix System 自带 arbiter）
     actix::System::new().block_on(async {
         // tokio IO/timer 能力：actix System 基于 tokio，可直接使用
-        let report = Report::new();
+        let report = Report::new().with_runtime(format!("Actix System caller; default settings={:?}", parrot::actix::system::ActixSystemSettings::default()));
         println!("==================== ACTIX ENGINE STRESS ====================");
 
+        let expected = oracle::prepare(std::thread::available_parallelism().unwrap().get());
         let (parrot, sys) = setup().await.expect("setup");
+        let scope = ActorScope::default();
+        let result = std::panic::AssertUnwindSafe(async {
 
         // ---------- 1. Echo ask 基线 ----------
         let ops = Arc::new(AtomicU64::new(0));
         let cpu_sink = Arc::new(AtomicU64::new(0));
-        let a1 = spawn_actor(&sys, ops.clone(), cpu_sink.clone());
+        let a1 = spawn_actor(&scope, &sys, ops.clone(), cpu_sink.clone()).await;
         bench_sequential_ask(&report, "seq-ask-echo-1k", a1.as_ref(), 1_000).await.unwrap();
+        scope.cleanup().await?;
 
         let ops2 = Arc::new(AtomicU64::new(0));
-        let a2 = spawn_actor(&sys, ops2.clone(), cpu_sink.clone());
+        let a2 = spawn_actor(&scope, &sys, ops2.clone(), cpu_sink.clone()).await;
         bench_concurrent_ask(&report, "conc-ask-echo-c8-m1000", a2, 8, 1_000).await.unwrap();
+        scope.cleanup().await?;
 
         let ops3 = Arc::new(AtomicU64::new(0));
-        let a3 = spawn_actor(&sys, ops3.clone(), cpu_sink.clone());
+        let a3 = spawn_actor(&scope, &sys, ops3.clone(), cpu_sink.clone()).await;
         bench_concurrent_ask(&report, "conc-ask-echo-c64-m200", a3, 64, 200).await.unwrap();
-
-        // ---------- 2. tell 吞吐 ----------
+        scope.cleanup().await?;
+        // ---------- 2. request/reply throughput ----------
         let ops4 = Arc::new(AtomicU64::new(0));
-        let a4 = spawn_actor(&sys, ops4.clone(), cpu_sink.clone());
-        bench_tell_throughput(&report, "tell-echo-100k", &sys, a4, 100_000, ops4.clone()).await.unwrap();
+        let a4 = spawn_actor(&scope, &sys, ops4.clone(), cpu_sink.clone()).await;
+        bench_request_throughput(&report, "request-echo-100k", &sys, a4, 100_000, ops4.clone()).await.unwrap();
 
+        scope.cleanup().await?;
         // ---------- 3. CPU 密集 ----------
         {
             let ops5 = Arc::new(AtomicU64::new(0));
-            let a5 = spawn_actor(&sys, ops5.clone(), cpu_sink.clone());
+            let a5 = spawn_actor(&scope, &sys, ops5.clone(), cpu_sink.clone()).await;
             let mut samples = Vec::new();
             let start = Instant::now();
             for i in 0..200u64 {
                 let t0 = Instant::now();
                 let r = a5.ask(CpuTask { iterations: 200_000, salt: i }).await.unwrap();
-                assert!(r > 0);
-                samples.push(t0.elapsed().as_micros());
+                let completed = Instant::now();
+                assert_eq!(r, expected[&(200_000, i)]);
+                samples.push(completed.duration_since(t0).as_micros());
             }
             report.push(BenchResult {
+                unit: "messages",
                 name: "cpu-serial-200x200k".into(), engine: "actix",
                 total_messages: 200, elapsed: start.elapsed(),
                 latencies: latency_stats(samples), correctness: true,
-                cpu_work_secs: None,
-                note: "~200µs work/msg".into(),
+                note: "200000 fixed iterations per message".into(),
             });
         }
         {
             // 并行 CPU：actor 分散到 arbiter 池（默认 CPU 数量个 OS 线程）
+            scope.cleanup().await?;
             let ops_multi = Arc::new(AtomicU64::new(0));
             let mut refs = Vec::new();
             for _ in 0..64 {
-                refs.push(spawn_actor(&sys, ops_multi.clone(), cpu_sink.clone()));
+                refs.push(spawn_actor(&scope, &sys, ops_multi.clone(), cpu_sink.clone()).await);
             }
             let start = Instant::now();
             let mut handles = Vec::new();
             for (i, r) in refs.into_iter().enumerate() {
+                let expected = expected.clone();
                 handles.push(tokio::spawn(async move {
                     let mut samples = Vec::new();
                     for k in 0..25u64 {
                         let t0 = Instant::now();
                         let v = r.ask(CpuTask { iterations: 200_000, salt: i as u64 * 1000 + k }).await?;
                         samples.push(t0.elapsed().as_micros());
-                        assert!(v > 0);
+                        assert_eq!(v, expected[&(200_000, i as u64 * 1000 + k)]);
                     }
                     anyhow::Ok(samples)
                 }));
@@ -474,18 +553,19 @@ fn actix_engine_full_suite() {
             let mut all = Vec::new();
             for h in handles { all.extend(h.await.unwrap().unwrap()); }
             report.push(BenchResult {
-                name: "cpu-parallel-8actors-200k".into(), engine: "actix",
+                unit: "messages",
+                name: "cpu-parallel-64actors-200k".into(), engine: "actix",
                 total_messages: 64 * 25, elapsed: start.elapsed(),
                 latencies: latency_stats(all), correctness: true,
-                cpu_work_secs: None,
                 note: "64 actors × 25 msgs × 200k iters (pooled arbiters)".into(),
             });
         }
 
+        scope.cleanup().await?;
         // ---------- 4. 洪泛 ----------
         {
             let ops_flood = Arc::new(AtomicU64::new(0));
-            let af = spawn_actor(&sys, ops_flood.clone(), cpu_sink.clone());
+            let af = spawn_actor(&scope, &sys, ops_flood.clone(), cpu_sink.clone()).await;
             let n = 500_000u64;
             let start = Instant::now();
             let mut jhs = Vec::new();
@@ -493,7 +573,7 @@ fn actix_engine_full_suite() {
                 let ar = af.clone_boxed();
                 jhs.push(tokio::spawn(async move {
                     for i in 0..(n / 4) {
-                        ar.send(Box::new(Echo { value: i + p }) as BoxedMessage).await?;
+                        checked_u64(ar.as_ref(), Box::new(Echo { value: i + p }), i + p).await?;
                     }
                     anyhow::Ok(())
                 }));
@@ -506,70 +586,43 @@ fn actix_engine_full_suite() {
                 Duration::from_secs(300), Duration::from_millis(20),
             ).await;
             report.push(BenchResult {
-                name: "flood-500k-tell".into(), engine: "actix",
+                unit: "messages",
+                name: "flood-500k-requests".into(), engine: "actix",
                 total_messages: n, elapsed: start.elapsed(),
                 latencies: latency_stats(vec![]), correctness: drained && ok,
-                cpu_work_secs: None,
                 note: format!("sent in {:.3}s; {}", sent_elapsed.as_secs_f64(), if drained { "drained" } else { "TIMEOUT" }),
             });
         }
 
-        // ---------- 5. ask 超时边界 ----------
-        // 探测 ask 从独立 OS 线程发出（自带 current-thread runtime），带 1ms
-        // 超时。actor 所在 arbiter 正在跑重任务时，探测必然超时——验证
-        // 超时语义在新调度路径下不变。
+        scope.cleanup().await?;
+        // ---------- 5. timeout after confirmed handler entry ----------
         {
-            let ops_t = Arc::new(AtomicU64::new(0));
-            let at = spawn_actor(&sys, ops_t.clone(), cpu_sink.clone());
-            // fire-and-forget 两个重任务（每个 ~260ms）
-            for s in 1..=2u64 {
-                at.tell(CpuTask { iterations: 50_000_000, salt: s });
-            }
-            let started = wait_until(
-                || ops_t.load(Ordering::Relaxed) >= 1,
-                Duration::from_secs(10),
-                Duration::from_millis(1),
-            ).await;
-            assert!(started, "heavy task must start");
-            // Probe from a dedicated OS thread with its own runtime: the
-            // 1ms timeout must fire while the actor's arbiter is busy.
-            let probe_ref = at.clone_boxed();
-            let probe = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .unwrap();
-                rt.block_on(async move {
-                    probe_ref
-                        .send_with_timeout(Box::new(Echo { value: 1 }), Some(Duration::from_millis(1)))
-                        .await
-                })
-            });
-            let r = probe.join().expect("probe thread");
-            let correct = r.is_err();
+            let at = spawn_actor(&scope, &sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone()).await;
+            let start = Instant::now();
+            let correct = exercise_request_timeout(at).await?;
             report.push(BenchResult {
+                unit: "messages",
                 name: "ask-timeout-short".into(), engine: "actix",
-                total_messages: 2, elapsed: Duration::from_millis(0),
+                total_messages: 2, elapsed: start.elapsed(),
                 latencies: latency_stats(vec![]), correctness: correct,
-                cpu_work_secs: None,
-                note: format!("short-timeout ask result err: {:?}", r.err().map(|e| e.to_string())),
+                note: "1ms request deadline while an acknowledged handler is gated".into(),
             });
         }
 
+        scope.cleanup().await?;
         // ---------- 6. 停止后发送 ----------
         {
             let ops_s = Arc::new(AtomicU64::new(0));
-            let asref = spawn_actor(&sys, ops_s.clone(), cpu_sink.clone());
+            let asref = spawn_actor(&scope, &sys, ops_s.clone(), cpu_sink.clone()).await;
             let alive_before = asref.is_alive().await;
-            asref.stop().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            scope.cleanup().await?;
             let alive_after = asref.is_alive().await;
             let r = asref.send(Box::new(Echo { value: 1 }) as BoxedMessage).await;
             report.push(BenchResult {
+                unit: "messages",
                 name: "send-after-stop".into(), engine: "actix",
                 total_messages: 1, elapsed: Duration::from_millis(0),
-                latencies: latency_stats(vec![]), correctness: r.is_err(),
-                cpu_work_secs: None,
+                latencies: latency_stats(vec![]), correctness: matches!(r, Err(ActorError::Stopped)) && !asref.is_alive().await,
                 note: format!(
                     "alive before={}, after={}; send => {:?}",
                     alive_before, alive_after,
@@ -578,6 +631,7 @@ fn actix_engine_full_suite() {
             });
         }
 
+        scope.cleanup().await?;
         // ---------- 7. 大量 actor ----------
         {
             let start = Instant::now();
@@ -585,7 +639,7 @@ fn actix_engine_full_suite() {
             let mut ok = 0;
             for i in 0..20_000 {
                 let ops_h = Arc::new(AtomicU64::new(0));
-                let r = spawn_actor(&sys, ops_h, cpu_sink.clone());
+                let r = spawn_actor(&scope, &sys, ops_h, cpu_sink.clone()).await;
                 // 唯一路径后注册表不再互相覆盖
                 let _ = i;
                 refs.push(r);
@@ -595,125 +649,99 @@ fn actix_engine_full_suite() {
             for r in refs {
                 let a = r.clone_boxed();
                 jhs.push(tokio::spawn(async move {
-                    a.send(Box::new(Echo { value: 1 }) as BoxedMessage).await.is_ok()
+                    checked_u64(a.as_ref(), Box::new(Echo { value: 1 }), 1).await.is_ok()
                 }));
             }
             for jh in jhs { if jh.await.unwrap() { ok += 1; } }
             report.push(BenchResult {
+                unit: "messages",
                 name: "herd-20000-actors".into(), engine: "actix",
-                total_messages: 20_000, elapsed: spawn_elapsed,
+                total_messages: 20_000, elapsed: start.elapsed(),
                 latencies: latency_stats(vec![]), correctness: ok == 20_000,
-                cpu_work_secs: None,
-                note: format!("spawned 20000 in {:.3}s; all accepted send", spawn_elapsed.as_secs_f64()),
+                note: format!("spawned 20000 in {:.3}s; all requests replied", spawn_elapsed.as_secs_f64()),
             });
         }
 
+        scope.cleanup().await?;
         // ---------- 8. 长时程 ----------
         {
             let ops_l = Arc::new(AtomicU64::new(0));
-            let al = spawn_actor(&sys, ops_l.clone(), cpu_sink.clone());
+            let al = spawn_actor(&scope, &sys, ops_l.clone(), cpu_sink.clone()).await;
             let start = Instant::now();
-            let r = al.ask(LongRunningTask { total_iterations: 2_000_000_000 }).await?;
+            let r = al.send_with_timeout(Box::new(LongRunningTask { total_iterations: 2_000_000_000 }), Some(STRESS_REQUEST_TIMEOUT)).await?;
+            let r = *r.downcast::<u64>().map_err(|_| anyhow::anyhow!("long work reply type"))?;
             let elapsed = start.elapsed();
             report.push(BenchResult {
+                unit: "messages",
                 name: "longrun-2G-iters".into(), engine: "actix",
                 total_messages: 1, elapsed,
-                latencies: latency_stats(vec![elapsed.as_micros()]), correctness: r > 0,
-                cpu_work_secs: None,
+                latencies: latency_stats(vec![elapsed.as_micros()]), correctness: r == expected[&(2_000_000_000, 7)],
                 note: "single 2G-iteration compute".into(),
             });
         }
 
 
-        // ---------- 9. 饥饿交叉验证（ticker 探测法） ----------
+        scope.cleanup().await?;
+        // ---------- 9. Cross-actor probes overlapping the actual CPU interval ----------
         {
             let ops_a = Arc::new(AtomicU64::new(0));
             let ops_b = Arc::new(AtomicU64::new(0));
-            let aa = spawn_actor(&sys, ops_a.clone(), cpu_sink.clone());
-            let ab = spawn_actor(&sys, ops_b.clone(), cpu_sink.clone());
-
+            let aa = spawn_actor(&scope, &sys, ops_a, cpu_sink.clone()).await;
+            let ab = spawn_actor(&scope, &sys, ops_b, cpu_sink.clone()).await;
             let stop = Arc::new(AtomicU64::new(0));
-            let t_origin = Instant::now();
-            let samples = Arc::new(std::sync::Mutex::new(Vec::<(u128, u128)>::new())); // (elapsed_ms, lat_us)
+            let samples = Arc::new(std::sync::Mutex::new(Vec::<ProbeSample>::new()));
+            let (baseline_ready, baseline_received) = tokio::sync::oneshot::channel();
             let ticker = {
                 let ab = ab.clone_boxed();
                 let stop = stop.clone();
                 let samples = samples.clone();
                 tokio::spawn(async move {
                     let mut i = 0u64;
+                    let mut baseline_ready = Some(baseline_ready);
                     while stop.load(Ordering::Relaxed) == 0 {
-                        let t0 = Instant::now();
-                        if let Ok(v) = ab.ask(Echo { value: i }).await {
-                            assert_eq!(v, i);
-                            samples.lock().unwrap().push((t_origin.elapsed().as_millis(), t0.elapsed().as_micros()));
+                        let started = Instant::now();
+                        let value = Echo::extract_result(ab.send_with_timeout(Box::new(Echo { value: i }), Some(STRESS_REQUEST_TIMEOUT)).await?)?;
+                        let completed = Instant::now();
+                        assert_eq!(value, i);
+                        samples.lock().unwrap().push(ProbeSample { started, completed });
+                        if let Some(ready) = baseline_ready.take() {
+                            let _ = ready.send(());
                         }
                         i += 1;
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
+                    anyhow::Ok(())
                 })
             };
+            // A real response proves the ticker has started; executor scheduling
+            // is not inferred from a sleep.
+            let baseline_result = baseline_received.await;
+            if baseline_result.is_err() {
+                ticker.await??;
+                anyhow::bail!("probe ended without a baseline response");
+            }
+            // This is a deliberate baseline collection period, not a proxy for
+            // where the heavy handler begins or ends.
             tokio::time::sleep(Duration::from_millis(150)).await;
-            let baseline: Vec<u128> = samples.lock().unwrap().iter().map(|(_, l)| *l).collect();
-            let base_stats = latency_stats(baseline);
-
-            let heavy_start = Instant::now();
-            let heavy = tokio::spawn({
-                let ar = aa.clone_boxed();
-                async move {
-                    let _ = ar.send(Box::new(LongRunningTask { total_iterations: 1_000_000_000 }) as BoxedMessage).await;
-                }
-            });
-            let started = wait_until(
-                || ops_a.load(Ordering::Relaxed) > 0,
-                Duration::from_secs(10),
-                Duration::from_millis(1),
-            ).await;
-            // 注意：单 arbiter 下 wait_until 与 handler 互斥，此处 started==true 时计算可能已结束
-            let compute_t0_ms = t_origin.elapsed().as_millis();
-            let compute_window_start = Instant::now();
-
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            let compute_t1_ms = t_origin.elapsed().as_millis();
-            let in_window: Vec<u128> = samples
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(ts, _)| *ts >= compute_t0_ms && *ts <= compute_t1_ms)
-                .map(|(_, l)| *l)
-                .collect();
-            let in_window_stats = latency_stats(in_window);
-            let during: Vec<u128> = samples.lock().unwrap().iter().map(|(_, l)| *l).collect();
-            let during_new: Vec<u128> = if during.len() > base_stats.count as usize {
-                during[base_stats.count as usize..].to_vec()
-            } else { during.clone() };
-            let during_stats = latency_stats(during_new);
-
-            let _ = heavy.await;
-            let compute_elapsed = heavy_start.elapsed();
+            let work = aa.send_with_timeout(Box::new(TimedLongTask { total_iterations: 1_000_000_000 }), Some(STRESS_REQUEST_TIMEOUT)).await;
             stop.store(1, Ordering::Relaxed);
-            let _ = ticker.await;
-
+            let ticker_result = ticker.await;
+            let measured = *work?.downcast::<TimedWorkResult>().map_err(|_| anyhow::anyhow!("heavy handler returned the wrong result type"))?;
+            ticker_result??;
+            let window = probe_window(&samples.lock().unwrap(), measured.started, measured.completed)?;
             report.push(BenchResult {
+                unit: "messages",
                 name: "starve-echo-during-longrun".into(),
                 engine: "actix",
-                total_messages: during_stats.count,
-                elapsed: compute_window_start.elapsed(),
-                latencies: during_stats.clone(),
-                correctness: true,
-                cpu_work_secs: None,
-                note: format!(
-                    "heavy={:.1}s; probes-in-window={} (p99={:.2}ms max={:.2}ms); baseline p99={:.2}ms; started_observed={}",
-                    compute_elapsed.as_secs_f64(),
-                    in_window_stats.count,
-                    in_window_stats.p99_us as f64 / 1000.0,
-                    in_window_stats.max_us as f64 / 1000.0,
-                    base_stats.p99_us as f64 / 1000.0,
-                    started,
-                ),
+                total_messages: window.completed,
+                elapsed: measured.completed.duration_since(measured.started),
+                latencies: window.overlapping.clone(),
+                correctness: window.baseline.count > 0 && measured.value == expected[&(1_000_000_000, 7)],
+                note: format!("CPU interval measured inside handler; {} probe completions within interval; {} overlapping request round trips (may finish after CPU work); baseline n={} p99={:.2}ms. Zero progress is a measured outcome, not a harness failure.", window.completed, window.overlapping.count, window.baseline.count, window.baseline.p99_us as f64 / 1000.0),
             });
         }
 
-
+        scope.cleanup().await?;
         // ---------- 10. IO 密集：async handler 内真实 await ----------
         // `use_async_handler() == true` 的 actor：消息走 receive_message
         // （async fn），handler 内 tokio::time::sleep(10ms) 模拟 IO 等待。
@@ -723,19 +751,16 @@ fn actix_engine_full_suite() {
             let io_done = Arc::new(AtomicU64::new(0));
             let mut refs = Vec::new();
             for _ in 0..64 {
-                refs.push(
-                    sys.spawn_root_typed(IoAsyncActor { done: io_done.clone() }, EmptyConfig)
-                        .now_or_never()
-                        .expect("spawn ready")
-                        .expect("spawn ok"),
-                );
+                let actor = sys.spawn_root_typed(IoAsyncActor { done: io_done.clone(), _owner: scope.owner() }, EmptyConfig).await.expect("spawn ok");
+                scope.track(actor.as_ref());
+                refs.push(actor);
             }
             let start = Instant::now();
             let mut handles = Vec::new();
             for r in refs {
                 handles.push(tokio::spawn(async move {
                     for _ in 0..20u64 {
-                        r.send(Box::new(Echo { value: 1 }) as BoxedMessage).await?;
+                        checked_u64(r.as_ref(), Box::new(Echo { value: 1 }), 1).await?;
                     }
                     anyhow::Ok(())
                 }));
@@ -749,13 +774,13 @@ fn actix_engine_full_suite() {
             let total = 64 * 20;
             let serial_expected = total as f64 * 10.0 / 1000.0;
             report.push(BenchResult {
+                unit: "messages",
                 name: "io-async-64actors-10ms".into(),
                 engine: "actix",
                 total_messages: total as u64,
                 elapsed,
                 latencies: latency_stats(vec![]),
                 correctness: drained,
-                cpu_work_secs: None,
                 note: format!(
                     "async sleep(10ms) in handler; {} tasks wall={:.2}s (serial would be {:.2}s; speedup {:.1}x)",
                     total, elapsed.as_secs_f64(), serial_expected, serial_expected / elapsed.as_secs_f64(),
@@ -769,267 +794,52 @@ fn actix_engine_full_suite() {
         // （与 thread 版逐字节对齐的负载参数）
         // =====================================================================
 
+        scope.cleanup().await?;
         // ---------- M1. 分钟级任务 + 持续加入新长任务/中任务 + 短探测 ----------
         {
             const LONG_ACTORS: usize = 8;
             const BACKUP_ACTORS: usize = 4;
-            const LONG_ITERS: u64 = 57_200_000_000;   // ~65s @release
-            const MEDIUM_ITERS: u64 = 2_400_000_000;  // ~2.7s @release
-            const MEDIUM_PER_BACKUP: u64 = 10;        // 40 medium tasks
-            let nominal = (LONG_ACTORS as f64 * LONG_ITERS as f64
-                + BACKUP_ACTORS as f64 * MEDIUM_PER_BACKUP as f64 * MEDIUM_ITERS as f64)
-                / BURN_RATE;
 
             let mut long_refs = Vec::new();
             for i in 0..LONG_ACTORS {
                 let ops_i = Arc::new(AtomicU64::new(0));
-                let r = spawn_actor(&sys, ops_i, cpu_sink.clone());
+                let r = spawn_actor(&scope, &sys, ops_i, cpu_sink.clone()).await;
                 let _ = i;
                 long_refs.push(r);
             }
             let mut backup_refs = Vec::new();
             for i in 0..BACKUP_ACTORS {
                 let ops_i = Arc::new(AtomicU64::new(0));
-                let r = spawn_actor(&sys, ops_i, cpu_sink.clone());
+                let r = spawn_actor(&scope, &sys, ops_i, cpu_sink.clone()).await;
                 let _ = i;
                 backup_refs.push(r);
             }
-            let probe = spawn_actor(&sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
+            let probe = spawn_actor(&scope, &sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone()).await;
 
-            let start = Instant::now();
-            let mut handles = Vec::new();
-            for (i, r) in long_refs.into_iter().enumerate() {
-                handles.push(tokio::spawn(async move {
-                    let t0 = Instant::now();
-                    let v = r.ask(MinuteCpuTask { iterations: LONG_ITERS, salt: 0xD00D + i as u64 }).await?;
-                    anyhow::Ok(vec![t0.elapsed().as_micros(), v as u128])
-                }));
-            }
-            for (i, r) in backup_refs.into_iter().enumerate() {
-                handles.push(tokio::spawn(async move {
-                    let mut lats = Vec::new();
-                    for k in 0..MEDIUM_PER_BACKUP {
-                        let t0 = Instant::now();
-                        let _ = r.ask(MediumCpuTask { iterations: MEDIUM_ITERS, salt: 0xBACC + i as u64 * 100 + k }).await?;
-                        lats.push(t0.elapsed().as_micros());
-                    }
-                    anyhow::Ok(lats)
-                }));
-            }
-            // 短探测：每 200ms 一个 ~1.2µs TinyTask
-            let probe_stop = Arc::new(AtomicU64::new(0));
-            let probe_handle = {
-                let pr = probe.clone_boxed();
-                let st = probe_stop.clone();
-                tokio::spawn(async move {
-                    let mut lats = Vec::new();
-                    while st.load(Ordering::Relaxed) == 0 {
-                        let t0 = Instant::now();
-                        let _ = pr.ask(TinyTask { salt: 0xE }).await;
-                        lats.push(t0.elapsed().as_micros());
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    lats
-                })
-            };
-
-            let mut correct = true;
-            let mut all_lats: Vec<u128> = Vec::new();
-            for h in handles {
-                match h.await {
-                    Ok(Ok(mut v)) => all_lats.append(&mut v),
-                    _ => correct = false,
-                }
-            }
-            probe_stop.store(1, Ordering::Relaxed);
-            let probe_lats = probe_handle.await.unwrap_or_default();
-            let elapsed = start.elapsed();
-            let ps = latency_stats(probe_lats.clone());
-            report.push(BenchResult {
-                name: "mixed-minute-cpu-plus-incoming".into(),
-                engine: "actix",
-                total_messages: (LONG_ACTORS + BACKUP_ACTORS * MEDIUM_PER_BACKUP as usize) as u64,
-                elapsed,
-                latencies: ps.clone(),
-                correctness: correct,
-                cpu_work_secs: Some(nominal),
-                note: format!(
-                    "8×65s long + 40×2.7s medium concurrent; probe(tiny ask) p99={:.1}ms max={:.1}ms over {} probes",
-                    ps.p99_us as f64 / 1000.0, ps.max_us as f64 / 1000.0, ps.count,
-                ),
-            });
+            report.push(mixed_workload("actix", long_refs, backup_refs, probe, expected.clone()).await?);
         }
 
-        // ---------- M2. 同一 actor 混合负载 FIFO ----------
+        scope.cleanup().await?;
+        // ---------- M2. Confirmed backlog probe ----------
         {
-            const LONG_ITERS: u64 = 30_000_000_000;  // ~34s @release
-            const MEDIUM: u64 = 6;                  // 6 × 1.2G (~1.5s) ≈ 9.3s
-            const MEDIUM_ITERS: u64 = 2_400_000_000; // ~2.7s
-            const TINY: u64 = 4_000;
-            let nominal = (LONG_ITERS as f64 + MEDIUM as f64 * MEDIUM_ITERS as f64
-                + TINY as f64 * 1_000.0) / BURN_RATE;
-
-            let shared = spawn_actor(&sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
-            let start = Instant::now();
-            // actix 的 send(None) 等价 ask 无超时？——send_with_timeout(None) 走
-            // 纯投递路径（do_send 语义）见 reference.rs: None => do_send。
-            let mut jhs = Vec::new();
-            {
-                let sr = shared.clone_boxed();
-                jhs.push(tokio::spawn(async move {
-                    sr.send_with_timeout(Box::new(MinuteCpuTask { iterations: LONG_ITERS, salt: 1 }), None).await?;
-                    anyhow::Ok(())
-                }));
-            }
-            for k in 0..MEDIUM {
-                let sr = shared.clone_boxed();
-                jhs.push(tokio::spawn(async move {
-                    sr.send_with_timeout(Box::new(MediumCpuTask { iterations: MEDIUM_ITERS, salt: 100 + k }), None).await?;
-                    anyhow::Ok(())
-                }));
-            }
-            for k in 0..TINY {
-                let sr = shared.clone_boxed();
-                jhs.push(tokio::spawn(async move {
-                    sr.send_with_timeout(Box::new(TinyTask { salt: k }), None).await?;
-                    anyhow::Ok(())
-                }));
-            }
-            for jh in jhs { jh.await.unwrap().unwrap(); }
-            // 哨兵 ask：长超时覆盖整条队列
-            let t_probe = Instant::now();
-            let _ = shared
-                .send_with_timeout(Box::new(TinyTask { salt: 0x5 }), Some(Duration::from_secs(300)))
-                .await;
-            let tail_latency = t_probe.elapsed();
-            let elapsed = start.elapsed();
-
-            report.push(BenchResult {
-                name: "mixed-same-actor-fifo".into(),
-                engine: "actix",
-                total_messages: 1 + MEDIUM + TINY,
-                elapsed,
-                latencies: latency_stats(vec![]),
-                correctness: true,
-                cpu_work_secs: Some(nominal),
-                note: format!(
-                    "1×34s + 6×2.7s + 4000 tiny FIFO on ONE actor; tail-probe ask lat={:.0}ms (≈queued-behind time)",
-                    tail_latency.as_secs_f64() * 1000.0,
-                ),
-            });
+            let shared = spawn_actor(&scope, &sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone()).await;
+            report.push(mixed_backlog("actix", shared, expected.clone()).await?);
         }
 
-        // ---------- M3. 分片长任务（协作式让出）vs 连续长任务 ----------
+        scope.cleanup().await?;
+        // ---------- M3. Same computation and admitted probes ----------
         {
-            const TOTAL: u64 = 30_000_000_000;   // ~34s @release each variant
-            const CHUNK: u64 = 1_500_000_000;   // ~20 片
-
-            // async handler actor：片间 tokio yield（use_async_handler = true）
-            pub struct ChunkAsyncActor;
-            // M6: async opt-in actor——同步快路径默认 None。
-impl parrot_api::actor::ActixEngineExt for ChunkAsyncActor {}
-
-impl Actor for ChunkAsyncActor {
-                type Config = EmptyConfig;
-                type Context = ActixContext<ActixActor<Self>>;
-                fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
-                    Box::pin(async { Ok(()) })
-                }
-                fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-                    Box::pin(async move {
-                        let Some(t) = msg.downcast_ref::<ChunkedLongTask>() else {
-                            return Ok(msg);
-                        };
-                        let total = t.total_iterations;
-                        let chunk = t.chunk_iterations.max(1);
-                        let mut acc: u64 = t.salt;
-                        let mut done = 0u64;
-                        while done < total {
-                            let take = chunk.min(total - done);
-                            acc = acc.wrapping_add(burn_cpu(take, acc));
-                            done += take;
-                            tokio::task::yield_now().await;
-                        }
-                        Ok(Box::new(acc) as BoxedMessage)
-                    })
-                }
-                fn use_async_handler(&self) -> bool { true }
-                fn state(&self) -> ActorState { ActorState::Running }
-            }
-
-            let chunked = sys.spawn_root_typed(ChunkAsyncActor, EmptyConfig).now_or_never().expect("spawn ready").expect("chunk spawn");
-            let _chunked2 = sys.spawn_root_typed(ChunkAsyncActor, EmptyConfig).now_or_never().expect("spawn ready").expect("chunk spawn 2");
-            let solid = spawn_actor(&sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
-
-            // A) 连续（solid，同步 handler）
-            let t0 = Instant::now();
-            solid
-                .send_with_timeout(Box::new(MinuteCpuTask { iterations: TOTAL, salt: 3 }), None)
-                .await
-                .unwrap();
-            let solid_probe = {
-                let sr = solid.clone_boxed();
-                tokio::spawn(async move {
-                    let tp = Instant::now();
-                    let v = sr
-                        .send_with_timeout(Box::new(TinyTask { salt: 1 }), Some(Duration::from_secs(300)))
-                        .await?;
-                    anyhow::Ok((tp.elapsed(), v))
-                })
-            };
-            let (solid_wait, _) = solid_probe.await.unwrap().unwrap();
-            let solid_long = t0.elapsed();
-
-            // B) 分片（async + yield）
-            let t1 = Instant::now();
-            let chunked_ref: Box<dyn ActorRef> = chunked;
-            let chunk_handle = {
-                let cr = chunked_ref.clone_boxed();
-                tokio::spawn(async move {
-                    cr.send_with_timeout(
-                        Box::new(ChunkedLongTask { total_iterations: TOTAL, chunk_iterations: CHUNK, salt: 3 }),
-                        Some(Duration::from_secs(300)),
-                    ).await
-                })
-            };
-            let chunk_probe = {
-                let cr2: Box<dyn ActorRef> = chunked_ref.clone_boxed();
-                tokio::spawn(async move {
-                    let tp = Instant::now();
-                    let v = cr2
-                        .send_with_timeout(Box::new(TinyTask { salt: 2 }), Some(Duration::from_secs(300)))
-                        .await?;
-                    anyhow::Ok((tp.elapsed(), v))
-                })
-            };
-            let _ = chunk_handle.await;
-            let (chunk_wait, _) = chunk_probe.await.unwrap().unwrap();
-            let chunk_long = t1.elapsed();
-
-            let nominal = TOTAL as f64 / BURN_RATE;
-            let yield_overhead_pct = (chunk_long.as_secs_f64() / solid_long.as_secs_f64() - 1.0) * 100.0;
-            report.push(BenchResult {
-                name: "chunked-vs-solid-longrun".into(),
-                engine: "actix",
-                total_messages: 2,
-                elapsed: solid_long + chunk_long,
-                latencies: latency_stats(vec![solid_wait.as_micros(), chunk_wait.as_micros()]),
-                correctness: true,
-                cpu_work_secs: Some(nominal * 2.0),
-                note: format!(
-                    "solid={:.1}s (tiny queued {:.0}ms) vs chunked×20 (tiny wait {:.0}ms); yield overhead {:.1}%",
-                    solid_long.as_secs_f64(),
-                    solid_wait.as_secs_f64() * 1000.0,
-                    chunk_wait.as_secs_f64() * 1000.0,
-                    yield_overhead_pct,
-                ),
-            });
+            let chunked = sys.spawn_root_typed(ChunkActor {_owner:scope.owner()}, EmptyConfig).await?;
+            scope.track(chunked.as_ref());
+            let solid = spawn_actor(&scope, &sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone()).await;
+            report.push(compare_chunked("actix", solid.as_ref(), chunked.as_ref(), 30_000_000_000, 1_500_000_000, expected[&(30_000_000_000,3)]).await?);
         }
 
-        // ---------- E1. 乒乓 RTT ----------
+        scope.cleanup().await?;
+        // ---------- E1. Caller-mediated pair of requests ----------
         {
-            let pa = spawn_actor(&sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
-            let pb = spawn_actor(&sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
+            let pa = spawn_actor(&scope, &sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone()).await;
+            let pb = spawn_actor(&scope, &sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone()).await;
             const BOUNCES: u64 = 10_000;
             let mut samples = Vec::with_capacity(BOUNCES as usize / 10);
             let start = Instant::now();
@@ -1043,27 +853,29 @@ impl Actor for ChunkAsyncActor {
                 i += 1;
             }
             report.push(BenchResult {
-                name: "pingpong-rtt-10k".into(),
+                unit: "messages",
+                name: "caller-two-actor-requests-10k".into(),
                 engine: "actix",
                 total_messages: BOUNCES * 2,
                 elapsed: start.elapsed(),
                 latencies: latency_stats(samples),
-                cpu_work_secs: None,
                 correctness: true,
-                note: "2-hop ask RTT (A→B), sampled every 10th".into(),
+                note: "caller→A then caller→B sequential request pair, sampled every 10th".into(),
             });
         }
 
-        // ---------- E2. 背靠背自传递 ----------
+        scope.cleanup().await?;
+        // ---------- E2. Back-to-back caller requests ----------
         {
             let ops_c = Arc::new(AtomicU64::new(0));
-            let ca = spawn_actor(&sys, ops_c.clone(), cpu_sink.clone());
+            let ca = spawn_actor(&scope, &sys, ops_c.clone(), cpu_sink.clone()).await;
             const CHAIN_TICKS: u64 = 20_000;
             let start = Instant::now();
             let mut i = 0u64;
             while i < CHAIN_TICKS {
                 let v = ca.ask(Echo { value: i }).await?;
-                let _ = ca.send_with_timeout(Box::new(Echo { value: v + 1 }), None).await?;
+                anyhow::ensure!(v == i, "first chained reply");
+                checked_u64(ca.as_ref(), Box::new(Echo { value: v + 1 }), i + 1).await?;
                 i += 1;
             }
             let ok = wait_until(
@@ -1071,34 +883,35 @@ impl Actor for ChunkAsyncActor {
                 Duration::from_secs(60), Duration::from_millis(2),
             ).await;
             report.push(BenchResult {
-                name: "self-chain-ask-tell-20k".into(),
+                unit: "messages",
+                name: "back-to-back-requests-20k".into(),
                 engine: "actix",
                 total_messages: CHAIN_TICKS * 2,
                 elapsed: start.elapsed(),
                 latencies: latency_stats(vec![]),
-                cpu_work_secs: None,
                 correctness: ok,
-                note: "back-to-back ask→tell to same actor (degenerate chain)".into(),
+                note: "back-to-back request/reply to same actor".into(),
             });
         }
 
+        scope.cleanup().await?;
         // ---------- E3. 慢消费者 + 快生产者 ----------
         {
             const PRODUCERS: usize = 8;
             const PER_PRODUCER: u64 = 5_000;
-            let iters_per_msg: u64 = 170_000; // ~200µs 实测标定
-            let nominal = (PRODUCERS as f64 * PER_PRODUCER as f64 * iters_per_msg as f64) / BURN_RATE;
+            let iters_per_msg: u64 = 170_000; // fixed iterations, not a duration guarantee
 
             let ops_cons = Arc::new(AtomicU64::new(0));
-            let consumer = spawn_actor(&sys, ops_cons.clone(), cpu_sink.clone());
+            let consumer = spawn_actor(&scope, &sys, ops_cons.clone(), cpu_sink.clone()).await;
 
             let start = Instant::now();
             let mut jhs = Vec::new();
             for pid in 0..PRODUCERS {
                 let cr = consumer.clone_boxed();
+                let expected = expected.clone();
                 jhs.push(tokio::spawn(async move {
                     for k in 0..PER_PRODUCER {
-                        cr.send_with_timeout(Box::new(CpuTask { iterations: iters_per_msg, salt: pid as u64 * 10_000 + k }), None).await?;
+                        checked_u64(cr.as_ref(), Box::new(CpuTask { iterations: iters_per_msg, salt: pid as u64 * 10_000 + k }), expected[&(iters_per_msg, pid as u64 * 10_000 + k)]).await?;
                     }
                     anyhow::Ok(())
                 }));
@@ -1115,21 +928,22 @@ impl Actor for ChunkAsyncActor {
             ).await;
             let elapsed = start.elapsed();
             report.push(BenchResult {
-                name: "slow-consumer-8prod-40k".into(),
+                unit: "messages",
+                name: "slow-consumer-8prod-40k-requests".into(),
                 engine: "actix",
                 total_messages: target,
                 elapsed,
                 latencies: latency_stats(vec![]),
                 correctness: drained && send_ok,
-                cpu_work_secs: Some(nominal),
                 note: format!(
-                    "8 producers × 5000 × ~200µs msgs into ONE consumer; send-all={:.2}s; drain={}",
+                    "8 producers × 5000 × 170000-iteration requests into ONE consumer; send-all={:.2}s; drain={}",
                     send_elapsed.as_secs_f64(),
                     if drained { "ok" } else { "TIMEOUT" },
                 ),
             });
         }
 
+        scope.cleanup().await?;
         // ---------- E4. 创建/销毁风暴 ----------
         {
             const WAVES: usize = 5;
@@ -1139,39 +953,224 @@ impl Actor for ChunkAsyncActor {
             for _w in 0..WAVES {
                 let mut refs = Vec::new();
                 for _i in 0..PER_WAVE {
-                    let r = spawn_actor(&sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
+                    let r = spawn_actor(&scope, &sys, Arc::new(AtomicU64::new(0)), cpu_sink.clone()).await;
                     refs.push(r);
                 }
                 for (idx, r) in refs.iter().take(10).enumerate() {
-                    if r.ask(Echo { value: idx as u64 }).await.is_ok() {
+                    if checked_u64(r.as_ref(), Box::new(Echo { value: idx as u64 }), idx as u64).await.is_ok() {
                         alive_checks += 1;
                     }
                 }
-                for r in &refs {
-                    let _ = r.stop().await;
-                }
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                scope.cleanup().await?;
             }
             let elapsed = start.elapsed();
             report.push(BenchResult {
+                unit: "lifecycle operations",
                 name: "spawn-stop-storm-5k".into(),
                 engine: "actix",
-                total_messages: (WAVES * PER_WAVE) as u64,
+                total_messages: (WAVES * (PER_WAVE + 10)) as u64,
                 elapsed,
                 latencies: latency_stats(vec![]),
                 correctness: alive_checks == (WAVES * 10) as u64,
-                cpu_work_secs: None,
-                note: format!("5 waves × 1000 spawn+ask+stop; alive spot-checks {}/50", alive_checks),
+                note: format!("5000 spawn/stop cycles; 5050 operations = 5000 stop calls + 50 echo replies; exact spot-checks {}/50; every actor destroyed", alive_checks),
             });
         }
 
 
         println!("==================== ACTIX REPORT ====================");
         println!("{}", report.dump_markdown());
-        std::fs::write("/tmp/parrot_bench_actix.md", report.dump_markdown()).ok();
 
-        let _ = sys.shutdown().await;
-        let _ = parrot;
-        anyhow::Ok(())
+
+        scope.cleanup().await?;
+        anyhow::ensure!(report.results.lock().unwrap().len() == 20, "all scenarios must execute");
+        println!("[stress-owners] actix created={} destroyed={}", scope.counts().0, scope.counts().1);
+        report.verify()
+        }).catch_unwind().await;
+        let shutdown = parrot.internal_shutdown().await;
+        match result {
+            Ok(result) => { shutdown?; result?; report.save(std::env::var_os("PARROT_STRESS_REPORT").unwrap_or_else(|| "/tmp/parrot_bench_actix.md".into())) },
+            Err(panic) => { shutdown.expect("cleanup after failed stress run"); std::panic::resume_unwind(panic) },
+        }
     }).unwrap();
+}
+
+#[test]
+fn timeout_probe_observes_actual_handler_entry_and_release() {
+    actix::System::new().block_on(async {
+        let (parrot, sys) = setup().await.unwrap();
+        let scope = ActorScope::default();
+        let actor = spawn_actor(
+            &scope,
+            &sys,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        let result = exercise_request_timeout(actor).await;
+        scope.cleanup().await.unwrap();
+        parrot.internal_shutdown().await.unwrap();
+        assert!(
+            result.unwrap(),
+            "the gated actor must return a timeout, not another error"
+        );
+    });
+}
+
+fn run_runtime_contract(
+    test: impl for<'a> FnOnce(
+        &'a ActixActorSystem,
+        &'a ActorScope,
+    ) -> futures::future::LocalBoxFuture<'a, anyhow::Result<()>>,
+) {
+    actix::System::new().block_on(async {
+        let (parrot, sys) = setup().await.unwrap();
+        let scope = ActorScope::default();
+        let result = std::panic::AssertUnwindSafe(test(&sys, &scope))
+            .catch_unwind()
+            .await;
+        let cleanup = scope.cleanup().await;
+        let shutdown = parrot.internal_shutdown().await;
+        match result {
+            Ok(result) => {
+                if let Err(error) = result {
+                    panic!("contract: {error:?}; cleanup: {cleanup:?}; shutdown: {shutdown:?}");
+                }
+                cleanup.unwrap();
+                shutdown.unwrap();
+            }
+            Err(panic) => {
+                eprintln!("panic cleanup: {cleanup:?}; shutdown: {shutdown:?}");
+                std::panic::resume_unwind(panic)
+            }
+        }
+    });
+}
+
+#[test]
+fn actual_cpu_echo_and_async_io_replies_have_exact_values() {
+    run_runtime_contract(|sys, scope| {
+        Box::pin(async move {
+            let sink = Arc::new(AtomicU64::new(0));
+            let actor = spawn_actor(scope, sys, Arc::new(AtomicU64::new(0)), sink.clone()).await;
+            for message in [
+                Box::new(CpuTask {
+                    iterations: 107,
+                    salt: 3,
+                }) as BoxedMessage,
+                Box::new(MediumCpuTask {
+                    iterations: 107,
+                    salt: 3,
+                }),
+                Box::new(MinuteCpuTask {
+                    iterations: 107,
+                    salt: 3,
+                }),
+            ] {
+                checked_u64(actor.as_ref(), message, 4046730678074085073).await?;
+            }
+            anyhow::ensure!(
+                sink.load(Ordering::Relaxed) == 4046730678074085073u64.wrapping_mul(3),
+                "CPU completion checksum"
+            );
+            checked_u64(actor.as_ref(), Box::new(Echo { value: 42 }), 42).await?;
+            checked_u64(
+                actor.as_ref(),
+                Box::new(TinyTask { salt: 3 }),
+                oracle::reference(1000, 3),
+            )
+            .await?;
+            checked_u64(
+                actor.as_ref(),
+                Box::new(LongRunningTask {
+                    total_iterations: 107,
+                }),
+                oracle::reference(107, 7),
+            )
+            .await?;
+            let done = Arc::new(AtomicU64::new(0));
+            let io = sys
+                .spawn_root_typed(
+                    IoAsyncActor {
+                        done: done.clone(),
+                        _owner: scope.owner(),
+                    },
+                    EmptyConfig,
+                )
+                .await?;
+            scope.track(io.as_ref());
+            checked_u64(io.as_ref(), Box::new(Echo { value: 42 }), 42).await?;
+            anyhow::ensure!(done.load(Ordering::Relaxed) == 1, "IO completion receipt");
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn queued_probes_measure_real_busy_actors_and_cancel_unreleased_work() {
+    run_runtime_contract(|sys, scope| {
+        Box::pin(async move {
+            let sink = Arc::new(AtomicU64::new(0));
+            let solid = spawn_actor(scope, sys, Arc::new(AtomicU64::new(0)), sink.clone()).await;
+            let chunked = sys
+                .spawn_root_typed(
+                    ChunkActor {
+                        _owner: scope.owner(),
+                    },
+                    EmptyConfig,
+                )
+                .await?;
+            scope.track(chunked.as_ref());
+            for (total, chunk) in [(107, 8), (200_003, 8_000), (0, 0)] {
+                compare_chunked(
+                    "actix",
+                    solid.as_ref(),
+                    chunked.as_ref(),
+                    total,
+                    chunk,
+                    oracle::reference(total, 3),
+                )
+                .await?;
+            }
+            let before = sink.load(Ordering::Relaxed);
+            let pending = QueuedProbe::start(solid.as_ref(), 1_000_000_000, 3, None, 5).await?;
+            drop(pending);
+            checked_u64(solid.as_ref(), Box::new(Echo { value: 7 }), 7).await?;
+            anyhow::ensure!(
+                sink.load(Ordering::Relaxed) == before,
+                "abandoned gated work must not start CPU computation"
+            );
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn stage_cleanup_destroys_every_actor_even_while_caller_addresses_survive() {
+    run_runtime_contract(|sys, scope| {
+        Box::pin(async move {
+            for wave in 0..2u64 {
+                let mut addresses = Vec::new();
+                for i in 0..32u64 {
+                    let actor = spawn_actor(
+                        scope,
+                        sys,
+                        Arc::new(AtomicU64::new(0)),
+                        Arc::new(AtomicU64::new(0)),
+                    )
+                    .await;
+                    checked_u64(actor.as_ref(), Box::new(Echo { value: i }), i).await?;
+                    addresses.push(actor);
+                }
+                scope.cleanup().await?;
+                anyhow::ensure!(
+                    scope.counts() == ((wave + 1) * 32, (wave + 1) * 32),
+                    "actual owner destruction count"
+                );
+                for actor in addresses {
+                    anyhow::ensure!(!actor.is_alive().await, "old caller address remained live");
+                }
+            }
+            Ok(())
+        })
+    });
 }

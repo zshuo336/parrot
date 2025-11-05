@@ -30,15 +30,6 @@ fn rt(fuel: u64) -> WasmRuntime {
     .unwrap()
 }
 
-fn rt_epoch(deadline: u64) -> WasmRuntime {
-    WasmRuntime::new(WasmConfig {
-        fuel_per_message: 10_000_000,
-        epoch_deadline: deadline,
-        memory_limit_mb: 64,
-    })
-    .unwrap()
-}
-
 fn host() -> HostCtx {
     let mut c = HostCtx {
         self_path: "/user/wtest".into(),
@@ -133,15 +124,66 @@ fn wit_frozen_text_anchors() {
 }
 
 #[test]
-fn wit_frozen_sha_stable() {
-    // 全文 sha256——修改 WIT 必然改变 hash（CI 防漂移门禁数据源）
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    wit_include::PARROT_ACTOR_WIT.hash(&mut h);
-    // 仅断言可重复（值本身不冻结——文本锚定测试已覆盖内容）
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    wit_include::PARROT_ACTOR_WIT.hash(&mut h2);
-    assert_eq!(h.finish(), h2.finish());
+fn wit_frozen_text_matches_versioned_contract() {
+    // Independent v0.1.0 snapshot: a changed source cannot update both sides.
+    let expected = r#"// parrot-actor WIT world —— C2（DEV_09 §3.3 / 09 §4.2）冻结件。
+//
+// 冻结纪律：本文件一旦合入即视为公共 API（semver 管理）；修改 = 破坏性
+// 变更，须走 protocol break 评审（与 docs/vectors/admin_v2.json 同规）。
+//
+// 包名裁定：TECH_DESIGN_09 §4.2 原文 `parrot:component@0.1.0`（DEV_09
+// 施工文档 §3.3 写 parrot:actor——以设计文档为准，包名 component）。
+// world 名 `parrot-actor`（组件形态 = actor）。
+//
+// 宿主能力（能力制——最小权限）：
+//   self-ref      自身路径（/user/{name}）
+//   log           日志（tracing 汇入宿主 log_sink）
+//   config-get    只读 parrot-config 投影（overlay 合成后视图）
+//   clock-now-ms  单调时钟（测试可注入）
+// 1.0 不给网络/文件（P2 再议——09 §4.2 诚实声明）。
+
+package parrot:component@0.1.0;
+
+interface ctx {
+    /// 组件消息（与 Wire 帧同构：type_key + bytes——组件内部序列化自由）。
+    record msg {
+        type-key: string,
+        payload: list<u8>,
+    }
+
+    /// 组件自身 actor 路径。
+    self-ref: func() -> string;
+    /// 日志（level: 0=error 1=warn 2=info 3=debug 4=trace）。
+    log: func(level: u8, msg: string);
+    /// 只读配置投影（key 不存在 → none）。
+    config-get: func(key: string) -> option<string>;
+    /// 单调时钟（毫秒）。
+    clock-now-ms: func() -> u64;
+}
+
+interface handler {
+    use ctx.{msg};
+
+    /// ask：处理消息并回载荷（err = 组件自述错误串）。
+    handle: func(m: msg) -> result<list<u8>, string>;
+    /// tell：单向（无返回）。
+    tell: func(m: msg);
+    /// 实例启动钩子（spawn 后一次）。
+    on-start: func();
+    /// 升级 drain 钩子（§7——排空语义交组件自述）。
+    on-drain: func();
+}
+
+world parrot-actor {
+    import ctx;
+    export handler;
+}
+"#;
+    assert_eq!(
+        wit_include::PARROT_ACTOR_WIT,
+        expected,
+        "PARROT_WIT_V0_1_0_CONTRACT_CHANGED"
+    );
 }
 
 // ════════════════════════════════════════════════════════════
@@ -171,14 +213,16 @@ fn instantiate_missing_file() {
 
 #[test]
 fn instantiate_garbage_bytes() {
-    let dir = std::env::temp_dir().join("parrot-wasm-test-garbage");
-    std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join("bad.wasm");
-    std::fs::write(&p, b"not wasm at all").unwrap();
+    // Immutable fixture: parallel test processes must not delete each other's
+    // input and accidentally pass this test with a missing-file error.
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/invalid-component.wat");
     let r = rt(100_000);
     let e = r.instantiate(&p, host()).unwrap_err();
-    assert!(matches!(e, ComponentError::AbiVersion(_)), "got {e:?}");
-    std::fs::remove_file(&p).ok();
+    assert!(
+        matches!(&e, ComponentError::AbiVersion(detail) if detail.starts_with("compile:")),
+        "got {e:?}"
+    );
 }
 
 // ════════════════════════════════════════════════════════════
@@ -224,9 +268,9 @@ fn handle_config_get() {
 fn handle_clock() {
     let r = rt(100_000);
     let mut c = inst(&r);
-    let out = c.handle("clock", &[]).unwrap();
-    let ms = u64::from_le_bytes(out.try_into().unwrap());
-    assert!(ms > 1_700_000_000_000, "unix ms plausible: {ms}");
+    let first = u64::from_le_bytes(c.handle("clock", &[]).unwrap().try_into().unwrap());
+    let second = u64::from_le_bytes(c.handle("clock", &[]).unwrap().try_into().unwrap());
+    assert!(second >= first, "the WIT clock must not go backwards");
 }
 
 #[test]
@@ -284,29 +328,9 @@ fn sandbox_fuel_metrics_counted() {
     assert!(m.fuel_consumed > 0);
 }
 
-#[test]
-fn sandbox_epoch_deadline() {
-    // epoch 协作抢占：后台心跳线程递增 engine epoch，deadline=1 的
-    // spin 死循环必被 epoch trap 中断（fuel 10M 不会先耗尽）
-    let r = rt_epoch(1);
-    let engine = r.engine().clone();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let s2 = stop.clone();
-    let ticker = std::thread::spawn(move || {
-        while !s2.load(std::sync::atomic::Ordering::Relaxed) {
-            engine.increment_epoch();
-            std::thread::sleep(std::time::Duration::from_micros(200));
-        }
-    });
-    let mut c = inst(&r);
-    let e = c.handle("spin", &[]).unwrap_err();
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    ticker.join().unwrap();
-    assert!(
-        matches!(e, ComponentError::EpochDeadline),
-        "expected EpochDeadline, got {e:?}"
-    );
-}
+// The epoch boundary is tested inside the runtime module, where the deadline
+// can be armed before advancing the clock and entering the real guest. A
+// background ticker here races fuel exhaustion and tests OS scheduling.
 
 #[test]
 fn sandbox_trap_does_not_corrupt_host() {
@@ -451,21 +475,13 @@ fn metrics_fuel_scales_with_work() {
 // ════════════════════════════════════════════════════════════
 
 #[test]
-fn cache_same_digest_reuses_compiled() {
+fn cached_instances_remain_callable() {
     let r = rt(100_000);
-    let t0 = std::time::Instant::now();
     let _c1 = inst(&r);
-    let first = t0.elapsed();
-    let t1 = std::time::Instant::now();
     let mut c2 = r.instantiate(&fixture_path(), host()).unwrap();
     c2.on_start().unwrap();
-    let second = t1.elapsed();
-    // 二次实例化应显著快于首次（编译缓存命中；宽松断言防 CI 抖动）
-    assert!(
-        second.as_micros() < first.as_micros().max(1) * 3,
-        "first={first:?} second={second:?}"
-    );
-    // 功能仍正确
+    // Actual compiled identity reuse is tested internally with Component::same.
+    // Relative wall-clock speed is not evidence of a cache hit.
     let out = c2.handle("echo", b"cached").unwrap();
     assert_eq!(out, b"cached");
 }

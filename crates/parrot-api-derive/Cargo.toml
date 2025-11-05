@@ -14,4 +14,6 @@ darling = "0.20"
 
 [dev-dependencies]
 # Doc examples exercise the generated code paths, which reference parrot_api.
-parrot-api = { path = "../parrot-api" }
+parrot-api = { path = "../parrot-api", features = ["remote-protobuf"] }
+serde = { version = "1", features = ["derive"] }
+prost = "0.14.4"

@@ -1,23 +1,23 @@
 """ParrotDispatcher 行为测试（不启 socket——ray init 本地模式）。"""
 
 import struct
+import time
 
 import pytest
 
-ray = pytest.importorskip("ray")
-
 from parrot_protocol.ray_gw import ParrotDispatcher  # noqa: E402
+from parrot_protocol.ray_gw import _kill_and_confirm
+from ray_test_cluster import owned_ray_cluster
 
 
 @pytest.fixture(scope="module")
 def ray_ctx():
-    if not ray.is_initialized():
-        ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
-    yield
-    # module 级不 shutdown（跨测试复用）
+    ray = pytest.importorskip("ray")
+    with owned_ray_cluster(ray, label='adapter'):
+        yield ray
 
 
-def test_dispatch_routes_by_type_key(ray_ctx):
+def test_dispatch_routes_by_type_key():
     d = ParrotDispatcher()
 
     @d.handler("bin:t::Ping")
@@ -30,7 +30,7 @@ def test_dispatch_routes_by_type_key(ray_ctx):
     assert struct.unpack("<Q", rp)[0] == 42
 
 
-def test_dispatch_unknown_key_raises(ray_ctx):
+def test_dispatch_unknown_key_raises():
     d = ParrotDispatcher()
     with pytest.raises(KeyError):
         d.dispatch("bin:missing::X", b"")
@@ -38,6 +38,8 @@ def test_dispatch_unknown_key_raises(ray_ctx):
 
 def test_dispatcher_as_ray_actor(ray_ctx):
     """ParrotDispatcher 在 ray.remote worker 内可用（E4 转正核心形态）。"""
+
+    ray = ray_ctx
 
     @ray.remote
     class W:
@@ -55,17 +57,22 @@ def test_dispatcher_as_ray_actor(ray_ctx):
         return ("bin:t::AddR", struct.pack("<Q", a + b + 1000))
 
     w = W.remote(d)
-    rk, rp = ray.get(w.ask.remote("bin:t::Add", struct.pack("<QQ", 3, 4)))
-    assert rk == "bin:t::AddR"
-    assert struct.unpack("<Q", rp)[0] == 1007
+    try:
+        rk, rp = ray.get(w.ask.remote("bin:t::Add", struct.pack("<QQ", 3, 4)), timeout=10)
+        assert rk == "bin:t::AddR"
+        assert struct.unpack("<Q", rp)[0] == 1007
+    finally:
+        _kill_and_confirm(ray, w, w.__ray_ready__, time.monotonic() + 10)
 
 
 def test_ray_1000_tasks(ray_ctx):
-    """06 §3.4.3 门禁：1000 并行 pb 任务派发，总耗时 vs 纯 ray 损耗 <15%。
+    """06 §3.4.3 门禁：1000 并行 raw bin 任务派发，总耗时 vs 纯 ray 损耗 <15%。
 
     公平基线：等形态 actor 调用（网关即 actor——dispatch 层才是被测增量）。
     """
+    ray = ray_ctx
     import time
+    import statistics
 
     d = ParrotDispatcher()
 
@@ -82,26 +89,35 @@ def test_ray_1000_tasks(ray_ctx):
         def ask(self, k, p):
             return self._dd.dispatch(k, p)
 
-        def ask_pure(self, p: bytes):
+        def ask_pure(self, _key: str, p: bytes):
             (v,) = struct.unpack("<Q", p)
-            return struct.pack("<Q", v * 2)
+            return ("bin:t::NR", struct.pack("<Q", v * 2))
 
     w = W.remote(d)
 
-    # dispatch 路径（经 TYPE_KEY 分发）
-    t0 = time.perf_counter()
-    tasks = [w.ask.remote("bin:t::N", struct.pack("<Q", i)) for i in range(1000)]
-    for t in tasks:
-        ray.get(t)
-    t_dispatch = time.perf_counter() - t0
+    expected = [("bin:t::NR", struct.pack("<Q", i * 2)) for i in range(1000)]
 
-    # 基线：同 actor 无 dispatch（等序列化/等调用形态）
-    t0 = time.perf_counter()
-    tasks = [w.ask_pure.remote(struct.pack("<Q", i)) for i in range(1000)]
-    for t in tasks:
-        ray.get(t)
-    t_pure = time.perf_counter() - t0
+    def run(method):
+        started = time.perf_counter()
+        results = ray.get([method.remote("bin:t::N", struct.pack("<Q", i)) for i in range(1000)], timeout=30)
+        elapsed = time.perf_counter() - started
+        assert results == expected, "every task must return the right value in input order"
+        return elapsed
 
-    overhead = (t_dispatch - t_pure) / t_pure
-    print(f"\ndispatch={t_dispatch:.3f}s pure={t_pure:.3f}s overhead={overhead:.1%}")
-    assert overhead < 0.15, f"dispatch overhead {overhead:.1%} exceeds 15% gate"
+    try:
+        # Both paths warm the same actor before timing; creation/scheduling and
+        # different argument/return shapes are not dispatcher overhead.
+        run(w.ask)
+        run(w.ask_pure)
+        ratios = []
+        for pair in range(6):
+            if pair % 2:
+                pure, dispatch = run(w.ask_pure), run(w.ask)
+            else:
+                dispatch, pure = run(w.ask), run(w.ask_pure)
+            ratios.append(dispatch / pure - 1)
+        overhead = statistics.median(ratios)
+        print(f"\npaired overheads={ratios}, median={overhead:.1%}")
+        assert overhead < 0.15, f"dispatch overhead {overhead:.1%} exceeds 15% gate"
+    finally:
+        _kill_and_confirm(ray, w, w.__ray_ready__, time.monotonic() + 10)

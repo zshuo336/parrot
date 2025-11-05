@@ -1,324 +1,556 @@
-//! POC 2：监督执行器（Supervisor）+ Watch 死亡通知（Death Watch）。
+//! An owned, flat supervision tree with bounded mailboxes and terminal DeathWatch.
 //!
-//! 评测 F8/F6/F18：actor 框架的"身份性功能"。
-//! 实现：
-//!   - SupervisorTree：父 spawn 子，子 panic/dead → 按 strategy 决策
-//!     （Restart / Stop / Escalate），带 restart 退避与窗口限频
-//!   - DeathWatch：monitor/monitoree 分离（任意方可 watch 任意 ref）
-//!   - Terminated 广播（watcher 收到死因：Normal / Panic / Killed）
-
-use std::collections::HashMap;
+//! Each admitted child has one worker that exclusively owns its factory and
+//! actor, including across restarts. A restart retains the child identity;
+//! DeathWatch fires once, after final retirement, not on each recovered panic.
+//! Escalation stops this supervisor's entire child set and closes admission.
+//! Synchronous callbacks must return before stop/shutdown can finish.
+use std::any::Any;
+use std::cell::Cell;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-pub type BoxedMessage = Box<dyn std::any::Any + Send>;
+pub type BoxedMessage = Box<dyn Any + Send>;
 pub type BoxedResult = Result<BoxedMessage, String>;
+pub type Actor = Box<dyn FnMut(BoxedMessage) -> BoxedResult + Send>;
+/// Owned by one child worker; no internal factory lock or unsafe closure clone.
+pub type ChildFactory = Box<dyn FnMut() -> Actor + Send>;
+const MAILBOX_CAPACITY: usize = 1024;
+const MAX_WATCHERS: usize = 4096;
+thread_local! { static WORKER_OF: Cell<usize> = const { Cell::new(0) }; }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeathReason {
     Normal,
     Panic(String),
     Killed,
     Escalated(String),
+    NotFound,
 }
-
 impl std::fmt::Display for DeathReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeathReason::Normal => write!(f, "normal"),
-            DeathReason::Panic(m) => write!(f, "panic: {m}"),
-            DeathReason::Killed => write!(f, "killed"),
-            DeathReason::Escalated(m) => write!(f, "escalated: {m}"),
-        }
+        write!(f, "{self:?}")
     }
 }
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchEvent {
-    Terminated { path: String, reason: DeathReason },
+    Terminated {
+        path: String,
+        /// None only for a watch of a path that was not registered.
+        generation: Option<u64>,
+        reason: DeathReason,
+    },
 }
-
-/// 监督策略。
 #[derive(Debug, Clone)]
 pub enum SupervisionStrategy {
-    /// 崩溃即重启（带窗口限频：window 内超过 max_restarts 则升级）
-    OneForOne { max_restarts: usize, window: Duration },
+    /// Window-limited restarts, with interruptible 10..250 ms exponential delay.
+    OneForOne {
+        max_restarts: usize,
+        window: Duration,
+    },
     Stop,
     Escalate,
 }
-
-/// 子 actor 工厂（重启需要重建闭包）。
-/// 共享可重入工厂：Arc<Mutex<>> 包裹，重启时再调一次生成新实例。
-pub type ChildFactory = Arc<Mutex<Box<dyn FnMut() -> Box<dyn FnMut(BoxedMessage) -> BoxedResult + Send> + Send>>>;
-
-struct ChildEntry {
-    path: String,
-    factory: ChildFactory,
-    strategy: SupervisionStrategy,
-    restarts: Vec<Instant>, // 窗口内重启时间戳
+fn safe_drop<T>(value: T) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
+        // Ordinary panic payloads are released too. Only a secondary panic
+        // payload whose destructor may itself panic is deliberately abandoned,
+        // avoiding an unbounded recursive panic during retirement.
+        if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            std::mem::forget(secondary);
+        }
+    }
 }
-
+struct Owned<T>(Option<T>);
+impl<T> Drop for Owned<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            safe_drop(value);
+        }
+    }
+}
+struct Work {
+    message: Option<BoxedMessage>,
+    reply: Option<Sender<BoxedResult>>,
+    deadline: Option<Instant>,
+}
+impl Work {
+    fn complete(&mut self, result: BoxedResult) {
+        if let Some(reply) = self.reply.take() {
+            safe_drop(reply.send(result));
+        } else {
+            safe_drop(result);
+        }
+    }
+}
+impl Drop for Work {
+    fn drop(&mut self) {
+        if let Some(message) = self.message.take() {
+            safe_drop(message);
+        }
+        if let Some(reply) = self.reply.take() {
+            safe_drop(reply.send(Err("actor stopped before processing message".into())));
+        }
+    }
+}
+struct Slot {
+    generation: u64,
+    inbox: VecDeque<Work>,
+    outstanding: usize,
+    stop: Option<DeathReason>,
+}
+struct Watch {
+    generation: u64,
+    tx: Sender<WatchEvent>,
+}
+#[derive(Default)]
+struct State {
+    children: BTreeMap<String, Slot>,
+    watches: BTreeMap<(String, String), Watch>,
+    next_generation: u64,
+    closing: bool,
+}
+struct Shared {
+    state: Mutex<State>,
+    wake: Condvar,
+    started: AtomicUsize,
+    exited: AtomicUsize,
+    failed_workers: AtomicUsize,
+}
+struct WorkerExit(Arc<Shared>);
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        self.0.exited.fetch_add(1, Ordering::SeqCst);
+        WORKER_OF.set(0);
+    }
+}
 pub struct Supervisor {
-    children: Mutex<HashMap<String, ChildEntry>>,
-    /// 死亡通知总线（watcher 订阅）
-    watchers: Mutex<HashMap<String, Sender<WatchEvent>>>, // watcher_path → tx
-    /// actor 路径 → 发送端（投递消息用）
-    mails: Mutex<HashMap<String, Sender<(BoxedMessage, Option<Sender<BoxedResult>>)>>>,
+    shared: Arc<Shared>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
 }
-
 impl Supervisor {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { children: Mutex::new(HashMap::new()), watchers: Mutex::new(HashMap::new()), mails: Mutex::new(HashMap::new()) })
+        Arc::new(Self {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::default()),
+                wake: Condvar::new(),
+                started: AtomicUsize::new(0),
+                exited: AtomicUsize::new(0),
+                failed_workers: AtomicUsize::new(0),
+            }),
+            workers: Mutex::new(vec![]),
+        })
     }
-
-    /// supervise spawn：起线程跑 actor，panic 捕获 → 策略执行 → 通知 watcher。
+    /// Admit a unique child path and own its worker. Factory initialization runs
+    /// asynchronously on that worker; failures obey the same supervision policy
+    /// as handler panics. An ask can be used to observe successful initialization.
     pub fn spawn_supervised(
-        self: &Arc<Self>,
-        mut factory: ChildFactory,
+        &self,
+        factory: ChildFactory,
         path: &str,
         strategy: SupervisionStrategy,
     ) -> Result<String, String> {
-        // 先登记条目（策略/重启历史），再跑首轮
-        self.children.lock().unwrap().insert(
-            path.to_string(),
-            ChildEntry { path: path.into(), factory: factory.clone(), strategy, restarts: vec![] },
+        // Retain a separate owner until all locks are released, including when
+        // OS thread creation fails and drops the closure given to spawn.
+        let startup = Arc::new(Mutex::new(Owned(Some(factory))));
+        if path.is_empty() {
+            return Err("empty actor path".into());
+        }
+        if matches!(&strategy, SupervisionStrategy::OneForOne { window, .. } if window.is_zero()) {
+            return Err("restart window must be positive".into());
+        }
+        let mut state = self.shared.state.lock().unwrap();
+        if state.closing {
+            return Err("supervisor stopped".into());
+        }
+        if state.children.contains_key(path) {
+            return Err("actor path already registered".into());
+        }
+        let generation = state.next_generation;
+        state.next_generation = generation.checked_add(1).ok_or("generation exhausted")?;
+        // Lock order: state -> workers. Shutdown releases state before joining;
+        // worker reentry sees closing and never waits for the join lock.
+        let mut workers = self.workers.lock().unwrap();
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].is_finished() {
+                if workers.swap_remove(index).join().is_err() {
+                    self.shared.failed_workers.fetch_add(1, Ordering::SeqCst);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        state.children.insert(
+            path.into(),
+            Slot {
+                generation,
+                inbox: VecDeque::new(),
+                outstanding: 0,
+                stop: None,
+            },
         );
-        self.start_child(path, factory)
-    }
-
-    fn start_child(self: &Arc<Self>, path: &str, factory: ChildFactory) -> Result<String, String> {
-        let (tx, rx) = channel::<(BoxedMessage, Option<Sender<BoxedResult>>)>();
-        self.mails.lock().unwrap().insert(path.to_string(), tx.clone());
-
-        let sup = self.clone();
+        let shared = self.shared.clone();
         let path_owned = path.to_string();
-        std::thread::spawn(move || {
-            let mut actor = (factory.lock().unwrap())();
-            for (msg, rtx) in rx {
-                let outcome = catch_unwind(AssertUnwindSafe(|| actor(msg)));
-                match outcome {
-                    Ok(r) => {
-                        if let Some(rtx) = rtx { let _ = rtx.send(r); }
+        let child_startup = startup.clone();
+        let result = std::thread::Builder::new()
+            .name(format!("poc-supervised-{generation}"))
+            .spawn(move || worker(shared, path_owned, generation, child_startup, strategy));
+        match result {
+            Ok(handle) => workers.push(handle),
+            Err(error) => {
+                state.children.remove(path);
+                drop(workers);
+                drop(state);
+                return Err(format!("thread spawn: {error}"));
+            }
+        }
+        drop(workers);
+        drop(state);
+        Ok(path.into())
+    }
+    /// One terminal event for this target's current generation. Repeating the
+    /// same (watcher,target) pair replaces that subscription; other targets stay.
+    /// A missing target immediately yields NotFound. At most 4096 subscriptions.
+    pub fn watch(&self, watcher: &str, target: &str) -> Result<Receiver<WatchEvent>, String> {
+        let (tx, rx) = channel();
+        let mut state = self.shared.state.lock().unwrap();
+        let Some(generation) = state.children.get(target).map(|s| s.generation) else {
+            drop(state);
+            let _ = tx.send(WatchEvent::Terminated {
+                path: target.into(),
+                generation: None,
+                reason: DeathReason::NotFound,
+            });
+            return Ok(rx);
+        };
+        let key = (watcher.into(), target.into());
+        if state.watches.len() >= MAX_WATCHERS && !state.watches.contains_key(&key) {
+            return Err("watch capacity exceeded".into());
+        }
+        state.watches.insert(key, Watch { generation, tx });
+        Ok(rx)
+    }
+    pub fn unwatch(&self, watcher: &str) {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .watches
+            .retain(|(w, _), _| w != watcher);
+    }
+    pub fn unwatch_target(&self, watcher: &str, target: &str) {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .watches
+            .remove(&(watcher.into(), target.into()));
+    }
+    fn enqueue(&self, path: &str, work: Work) -> Result<(), (String, Work)> {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.closing {
+            return Err(("supervisor stopped".into(), work));
+        }
+        let Some(slot) = state.children.get_mut(path) else {
+            return Err(("actor not found".into(), work));
+        };
+        if slot.stop.is_some() {
+            return Err(("actor stopping".into(), work));
+        }
+        if slot.outstanding >= MAILBOX_CAPACITY {
+            return Err(("mailbox full".into(), work));
+        }
+        slot.outstanding += 1;
+        slot.inbox.push_back(work);
+        drop(state);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
+    /// Admission only. Rejection returns the original message to the caller.
+    pub fn tell(&self, path: &str, msg: BoxedMessage) -> Result<(), (String, BoxedMessage)> {
+        self.enqueue(
+            path,
+            Work {
+                message: Some(msg),
+                reply: None,
+                deadline: None,
+            },
+        )
+        .map_err(|(error, mut work)| (error, work.message.take().unwrap()))
+    }
+    pub fn ask(&self, path: &str, msg: BoxedMessage) -> BoxedResult {
+        self.ask_with_timeout(path, msg, Duration::from_secs(5))
+    }
+    /// The timeout includes queue residence. Expired queued work is never
+    /// started; a callback already running cannot be forcibly cancelled.
+    pub fn ask_with_timeout(
+        &self,
+        path: &str,
+        msg: BoxedMessage,
+        timeout: Duration,
+    ) -> BoxedResult {
+        if timeout.is_zero() {
+            safe_drop(msg);
+            return Err("ask timeout must be positive".into());
+        }
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            safe_drop(msg);
+            return Err("ask timeout is too large".into());
+        };
+        let (tx, rx) = channel();
+        if let Err((error, work)) = self.enqueue(
+            path,
+            Work {
+                message: Some(msg),
+                reply: Some(tx),
+                deadline: Some(deadline),
+            },
+        ) {
+            drop(work);
+            return Err(error);
+        }
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|e| e.to_string())?
+    }
+    /// Request normal termination, preserving the path until all user resources
+    /// retire. A previously registered watch observes completion.
+    pub fn stop_child(&self, path: &str) -> Result<(), String> {
+        let mut state = self.shared.state.lock().unwrap();
+        let slot = state.children.get_mut(path).ok_or("actor not found")?;
+        if slot.stop.is_none() {
+            slot.stop = Some(DeathReason::Normal);
+        }
+        drop(state);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
+    pub fn alive_count(&self) -> usize {
+        self.shared.state.lock().unwrap().children.len()
+    }
+    pub fn worker_counts(&self) -> (usize, usize) {
+        (
+            self.shared.started.load(Ordering::SeqCst),
+            self.shared.exited.load(Ordering::SeqCst),
+        )
+    }
+    pub fn request_shutdown(&self) {
+        close_tree(&self.shared);
+    }
+    pub fn shutdown(&self) -> Result<(), String> {
+        self.request_shutdown();
+        if WORKER_OF.get() == Arc::as_ptr(&self.shared) as usize {
+            return Err("shutdown requested from worker; cannot join itself".into());
+        }
+        let mut workers = self.workers.lock().unwrap();
+        for handle in workers.drain(..) {
+            if handle.join().is_err() {
+                self.shared.failed_workers.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if self.shared.failed_workers.load(Ordering::SeqCst) != 0 {
+            Err("worker panicked outside supervision boundary".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+fn close_tree(shared: &Shared) {
+    let mut state = shared.state.lock().unwrap();
+    state.closing = true;
+    for slot in state.children.values_mut() {
+        if slot.stop.is_none() {
+            slot.stop = Some(DeathReason::Killed);
+        }
+    }
+    drop(state);
+    shared.wake.notify_all();
+}
+fn stop_reason(shared: &Shared, path: &str) -> Option<DeathReason> {
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .children
+        .get(path)
+        .unwrap()
+        .stop
+        .clone()
+}
+fn panic_reason(payload: BoxedMessage) -> DeathReason {
+    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "opaque panic payload".into()
+    };
+    safe_drop(payload);
+    DeathReason::Panic(message)
+}
+/// None means restart; Some means this child must retire.
+fn after_failure(
+    shared: &Shared,
+    path: &str,
+    strategy: &SupervisionStrategy,
+    restarts: &mut VecDeque<Instant>,
+    reason: DeathReason,
+) -> Option<DeathReason> {
+    if let Some(stop) = stop_reason(shared, path) {
+        return Some(stop);
+    }
+    match strategy {
+        SupervisionStrategy::Stop => Some(reason),
+        SupervisionStrategy::Escalate => {
+            close_tree(shared);
+            Some(DeathReason::Escalated(reason.to_string()))
+        }
+        SupervisionStrategy::OneForOne {
+            max_restarts,
+            window,
+        } => {
+            let now = Instant::now();
+            restarts.retain(|t| now.duration_since(*t) < *window);
+            if restarts.len() >= *max_restarts {
+                close_tree(shared);
+                return Some(DeathReason::Escalated(format!(
+                    "restart budget exhausted: {path}: {reason}"
+                )));
+            }
+            restarts.push_back(now);
+            let delay = Duration::from_millis((10u64 << (restarts.len() - 1).min(5)).min(250));
+            let state = shared.state.lock().unwrap();
+            let (state, _) = shared
+                .wake
+                .wait_timeout_while(state, delay, |s| {
+                    s.children.get(path).unwrap().stop.is_none()
+                })
+                .unwrap();
+            state.children.get(path).unwrap().stop.clone()
+        }
+    }
+}
+fn worker(
+    shared: Arc<Shared>,
+    path: String,
+    generation: u64,
+    startup: Arc<Mutex<Owned<ChildFactory>>>,
+    strategy: SupervisionStrategy,
+) {
+    WORKER_OF.set(Arc::as_ptr(&shared) as usize);
+    shared.started.fetch_add(1, Ordering::SeqCst);
+    let _exit = WorkerExit(shared.clone());
+    let mut factory = startup.lock().unwrap().0.take().unwrap();
+    drop(startup);
+    let mut actor: Option<Actor> = None;
+    let mut restarts = VecDeque::new();
+    let reason = loop {
+        if let Some(stop) = stop_reason(&shared, &path) {
+            break stop;
+        }
+        if actor.is_none() {
+            match catch_unwind(AssertUnwindSafe(&mut factory)) {
+                Ok(instance) => actor = Some(instance),
+                Err(payload) => {
+                    if let Some(reason) = after_failure(
+                        &shared,
+                        &path,
+                        &strategy,
+                        &mut restarts,
+                        panic_reason(payload),
+                    ) {
+                        break reason;
                     }
-                    Err(panic) => {
-                        let reason = DeathReason::Panic(panic_msg(panic));
-                        if let Some(rtx) = rtx {
-                            let _ = rtx.send(Err(format!("panic: {:?}", reason)));
-                        }
-                        sup.on_child_death(&path_owned, reason);
-                        return; // 线程退出，由 supervisor 决策重启
-                    }
+                    continue;
                 }
             }
-            // 通道关闭：正常退出
-            sup.on_child_death(&path_owned, DeathReason::Normal);
-        });
-        Ok(path.to_string())
-    }
-
-    /// 子死亡 → 策略决策 + 死亡广播。
-    fn on_child_death(self: &Arc<Self>, path: &str, reason: DeathReason) {
-        // 通知 watcher（Death Watch 语义：无论什么死法都广播）
-        self.broadcast(path, &reason);
-
-        if reason == DeathReason::Normal {
-            return; // 正常退出不重启
         }
-
-        let decision = {
-            let mut g = self.children.lock().unwrap();
-            match g.get_mut(path) {
-                None => None,
-                Some(entry) => match &entry.strategy {
-                    SupervisionStrategy::Stop => Some(Decision::Stop),
-                    SupervisionStrategy::Escalate => Some(Decision::Escalate(reason.to_string())),
-                    SupervisionStrategy::OneForOne { max_restarts, window } => {
-                        let now = Instant::now();
-                        entry.restarts.retain(|t| now.duration_since(*t) < *window);
-                        if entry.restarts.len() >= *max_restarts {
-                            Some(Decision::Escalate(format!("restart budget exhausted: {}", path)))
-                        } else {
-                            entry.restarts.push(now);
-                            Some(Decision::Restart)
-                        }
-                    }
-                },
+        let next = {
+            let mut state = shared.state.lock().unwrap();
+            loop {
+                let slot = state.children.get_mut(&path).unwrap();
+                if slot.stop.is_some() {
+                    break None;
+                }
+                if let Some(work) = slot.inbox.pop_front() {
+                    break Some(work);
+                }
+                state = shared.wake.wait(state).unwrap();
             }
         };
-
-        match decision {
-            Some(Decision::Restart) => {
-                // 重建 actor（共享 factory 再调一次）
-                let factory = {
-                    let g = self.children.lock().unwrap();
-                    g.get(path).map(|e| e.factory.clone())
-                };
-                if let Some(f) = factory {
-                    let _ = self.start_child(path, f);
+        let Some(mut work) = next else {
+            continue;
+        };
+        let failure = if work.deadline.is_some_and(|d| Instant::now() >= d) {
+            work.complete(Err("ask expired before execution".into()));
+            None
+        } else {
+            match catch_unwind(AssertUnwindSafe(|| {
+                actor.as_mut().unwrap()(work.message.take().unwrap())
+            })) {
+                Ok(reply) => {
+                    work.complete(reply);
+                    None
+                }
+                Err(payload) => {
+                    let reason = panic_reason(payload);
+                    work.complete(Err(reason.to_string()));
+                    Some(reason)
                 }
             }
-            Some(Decision::Stop) => { /* 不重启 */ }
-            Some(Decision::Escalate(msg)) => {
-                // POC：升级 = 广播给所有 watcher + 停树
-                self.broadcast(path, &DeathReason::Escalated(msg));
-            }
-            None => {}
-        }
-    }
-
-    fn broadcast(&self, path: &str, reason: &DeathReason) {
-        let ws = self.watchers.lock().unwrap();
-        for tx in ws.values() {
-            let _ = tx.send(WatchEvent::Terminated { path: path.into(), reason: reason.clone() });
-        }
-    }
-
-    // ---------------- Watch API ----------------
-
-    /// 任意方 watch 任意路径（monitor 与被 monitor 分离）。
-    pub fn watch(&self, watcher_path: &str, target_path: &str) -> Receiver<WatchEvent> {
-        let _ = target_path;
-        let (tx, rx) = channel();
-        self.watchers.lock().unwrap().insert(watcher_path.to_string(), tx);
-        rx
-    }
-
-    /// 解除 watch。
-    pub fn unwatch(&self, watcher_path: &str) {
-        self.watchers.lock().unwrap().remove(watcher_path);
-    }
-
-    // ---------------- 消息投递 ----------------
-
-    pub fn tell(&self, path: &str, msg: BoxedMessage) -> Result<(), String> {
-        let mails = self.mails.lock().unwrap();
-        mails.get(path).ok_or("not found")?.send((msg, None)).map_err(|e| e.to_string())
-    }
-
-    pub fn ask(&self, path: &str, msg: BoxedMessage) -> BoxedResult {
-        let (rtx, rrx) = channel();
+        };
         {
-            let mails = self.mails.lock().unwrap();
-            let tx = mails.get(path).ok_or_else(|| "not found".to_string())?;
-            tx.send((msg, Some(rtx))).map_err(|e| e.to_string())?;
+            let mut state = shared.state.lock().unwrap();
+            state.children.get_mut(&path).unwrap().outstanding -= 1;
         }
-        rrx.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?
-    }
-}
-
-enum Decision {
-    Restart,
-    Stop,
-    Escalate(String),
-}
-
-fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = p.downcast_ref::<&str>() { s.to_string() }
-    else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
-    else { "opaque panic".into() }
-}
-
-// ============ 测试 ============
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn counter_factory() -> ChildFactory {
-        Arc::new(Mutex::new(
-            Box::new(|| {
-                // 每次工厂调用生成全新 actor 闭包（重启后计数归零——验证 factory 重建）
-                Box::new(|msg: BoxedMessage| {
-                    if let Some(n) = msg.downcast_ref::<u64>() {
-                        if *n == 999 { panic!("boom"); }
-                        Ok(Box::new(n + 1) as BoxedMessage)
-                    } else { Err("unsupported".into()) }
-                }) as Box<dyn FnMut(BoxedMessage) -> BoxedResult + Send>
-            }) as Box<dyn FnMut() -> Box<dyn FnMut(BoxedMessage) -> BoxedResult + Send> + Send>,
-        ))
-    }
-
-    #[test]
-    fn supervisor_restart_on_panic() {
-        let sup = Supervisor::new();
-        sup.spawn_supervised(
-            counter_factory(),
-            "/sup/counter",
-            SupervisionStrategy::OneForOne { max_restarts: 3, window: Duration::from_secs(10) },
-        )
-        .unwrap();
-
-        // 正常 ask
-        let r = sup.ask("/sup/counter", Box::new(41u64)).unwrap();
-        assert_eq!(*r.downcast::<u64>().unwrap(), 42);
-
-        // 触发 panic（999）→ 重启 → 计数逻辑恢复
-        let _ = sup.ask("/sup/counter", Box::new(999u64));
-        std::thread::sleep(Duration::from_millis(100)); // 等重启
-        let r = sup.ask("/sup/counter", Box::new(1u64)).unwrap();
-        assert_eq!(*r.downcast::<u64>().unwrap(), 2, "panic 后应自动重启恢复");
-    }
-
-    #[test]
-    fn death_watch_notification() {
-        let sup = Supervisor::new();
-        sup.spawn_supervised(
-            counter_factory(),
-            "/victim",
-            SupervisionStrategy::OneForOne { max_restarts: 1, window: Duration::from_secs(10) },
-        )
-        .unwrap();
-        let rx = sup.watch("/watcher", "/victim");
-
-        // 击杀
-        let _ = sup.ask("/victim", Box::new(999u64));
-        let ev = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        match ev {
-            WatchEvent::Terminated { path, reason } => {
-                assert_eq!(path, "/victim");
-                assert!(matches!(reason, DeathReason::Panic(_)));
+        drop(work);
+        if let Some(reason) = failure {
+            safe_drop(actor.take());
+            if let Some(reason) = after_failure(&shared, &path, &strategy, &mut restarts, reason) {
+                break reason;
             }
         }
-    }
-
-    #[test]
-    fn restart_budget_escalation() {
-        let sup = Supervisor::new();
-        let n = AtomicU64::new(0);
-        let factory: ChildFactory = Arc::new(Mutex::new(
-            Box::new(move || {
-                n.fetch_add(1, Ordering::SeqCst);
-                Box::new(|msg: BoxedMessage| {
-                    if msg.downcast_ref::<u64>().map(|v| *v == 999).unwrap_or(false) {
-                        panic!("boom");
-                    }
-                    Ok(Box::new(0u64) as BoxedMessage)
-                }) as Box<dyn FnMut(BoxedMessage) -> BoxedResult + Send>
-            }) as Box<dyn FnMut() -> Box<dyn FnMut(BoxedMessage) -> BoxedResult + Send> + Send>,
-        ));
-        sup.spawn_supervised(
-            factory,
-            "/fragile",
-            SupervisionStrategy::OneForOne { max_restarts: 2, window: Duration::from_secs(10) },
-        )
-        .unwrap();
-        let rx = sup.watch("w", "/fragile");
-
-        // 连环击杀 → 窗口内超限 → Escalate
-        for _ in 0..3 {
-            let _ = sup.ask("/fragile", Box::new(999u64));
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let mut escalated = false;
-        while let Ok(ev) = rx.recv_timeout(Duration::from_millis(300)) {
-            if let WatchEvent::Terminated { reason: DeathReason::Escalated(_), .. } = ev {
-                escalated = true;
-                break;
-            }
-        }
-        assert!(escalated, "超限应升级 Escalate");
+    };
+    // Close this identity before user destructors reenter. Preserve it until
+    // actor, factory and all pending messages have actually retired.
+    let pending = {
+        let mut state = shared.state.lock().unwrap();
+        let slot = state.children.get_mut(&path).unwrap();
+        slot.stop = Some(reason.clone());
+        std::mem::take(&mut slot.inbox)
+    };
+    safe_drop(actor);
+    safe_drop(factory);
+    drop(pending); // each Work contains its own destructor boundary
+    let watches = {
+        let mut state = shared.state.lock().unwrap();
+        assert_eq!(state.children.get(&path).unwrap().generation, generation);
+        state.children.remove(&path);
+        let keys: Vec<_> = state
+            .watches
+            .iter()
+            .filter(|((_, target), watch)| target == &path && watch.generation == generation)
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.into_iter()
+            .map(|key| state.watches.remove(&key).unwrap())
+            .collect::<Vec<_>>()
+    };
+    for watch in watches {
+        let _ = watch.tx.send(WatchEvent::Terminated {
+            path: path.clone(),
+            generation: Some(generation),
+            reason: reason.clone(),
+        });
     }
 }

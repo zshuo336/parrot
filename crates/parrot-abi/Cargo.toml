@@ -2,7 +2,7 @@
 name = "parrot-abi"
 version = "0.1.0"
 edition = "2021"
-description = "Parrot dylib component ABI: repr(C) boundary contract + safe-load/unload protocol (DEV_09 D)"
+description = "Parrot dylib component ABI: repr(C) boundary contract + trusted native load/unload protocol (DEV_09 D)"
 license = "MIT"
 
 # D 阶段（DEV_09 §3.4 / 09 §4.3）：
@@ -14,7 +14,9 @@ license = "MIT"
 [features]
 default = []
 # 宿主侧加载器（libloading/tokio 重依赖——按需启用；与 parrot-wasm 同策略 R1）
-loader = ["dep:libloading", "dep:sha2", "dep:hex", "dep:tokio"]
+# Cargo does not inherit this repository's root patch in external workspaces.
+# Require the repaired runtime explicitly; see vendor/tokio/PARROT_PATCH.md.
+loader = ["dep:libloading", "dep:sha2", "dep:hex", "dep:tokio", "tokio/parrot-native-progress", "dep:object", "dep:rustc-demangle", "dep:libc", "dep:tempfile"]
 
 [dependencies]
 # D1 面（default feature）零依赖——thiserror 仅错误类型格式化
@@ -22,7 +24,13 @@ thiserror = "2.0"
 libloading = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
-tokio = { version = "1", features = ["time"], optional = true }
+tokio = { version = "1", features = ["time", "sync", "rt"], optional = true }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "macho", "std"], optional = true }
+rustc-demangle = { version = "0.1", optional = true }
+tempfile = { version = "3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

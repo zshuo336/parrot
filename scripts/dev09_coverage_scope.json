@@ -1,0 +1,34 @@
+{
+  "crates/parrot-app/src/lib.rs": {
+    "reason": "Only module declarations, re-exports and documentation; no executable body.",
+    "inputs": {
+      "crates/parrot-app/src/lib.rs": "88b6afdcb9a6edf1f0ff8270d597c7f2bee9a100d2af2e9d38d9f2e40265e67e"
+    }
+  },
+  "crates/parrot-app/src/debug/mod.rs": {
+    "reason": "Only module declarations, re-exports and documentation; no executable body.",
+    "inputs": {
+      "crates/parrot-app/src/debug/mod.rs": "9d8f6b6644bba9ad970da43b4dc95bdd7210578d1e5797a96101a91a71319ac2"
+    }
+  },
+  "crates/parrot-app/src/orchestrator/mod.rs": {
+    "reason": "Only module declarations, re-exports and documentation; no executable body.",
+    "inputs": {
+      "crates/parrot-app/src/orchestrator/mod.rs": "e17da244eb8fdb9a0bbd520fa8ace93343fbd1d1fc130c0818b065a9a2e57ee5"
+    }
+  },
+  "crates/parrot-app/src/assemble/tests/retirement_contract.rs": {
+    "reason": "Test-only module behind cfg(test); excluded from production source inventory.",
+    "inputs": {
+      "crates/parrot-app/src/assemble/tests/retirement_contract.rs": "4d1e39f4731916c46be29fde8f278e8bea2d67452ca89628e40f3975ce328593",
+      "crates/parrot-app/src/assemble.rs": "2061b3d4f901db248f051a5b9120b2ba2736d7dc272f062d109b42fd279bf19a"
+    }
+  },
+  "crates/parrot-app/src/host/gateway_process_tests.rs": {
+    "reason": "Test-only module behind cfg(test); excluded from production source inventory.",
+    "inputs": {
+      "crates/parrot-app/src/host/gateway_process_tests.rs": "60a6b62eb683e6b6ac2bf56748d663ce941f88791e39b44f6118fc489d1b1c53",
+      "crates/parrot-app/src/host.rs": "b090265013fc684d19ce27fd10ee584fe8128c34f4a29ce93568958b60f89f70"
+    }
+  }
+}

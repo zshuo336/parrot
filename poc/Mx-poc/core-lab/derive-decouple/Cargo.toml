@@ -13,3 +13,4 @@ proc-macro2 = "1"
 
 [dev-dependencies]
 api-neutral = { path = "../api-neutral" }
+core-engines = { path = "../core-engines" }

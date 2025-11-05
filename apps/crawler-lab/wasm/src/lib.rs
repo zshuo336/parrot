@@ -1,70 +1,60 @@
-//! crawler-lab parrot 组件（wasm 形态——R2 双形态之一）。
-//!
-//! R1/R2（应用体系架构纠正）：本 crate 是 apps/crawler-lab 的业务代码。
-//! 构建产物 crawler-hub.wasm（component model）经 parrot 标准包分发：
-//! crawler.app.toml 声明 `artifact = { Wasm = { uri, digest } }`，parrot
-//! 网关 deploy 时经 parrot-wasm runtime 实例化（fuel/epoch 沙箱）。
-//!
-//! 消息契约（与 dylib 形态同键——双形态行为一致锚点）：
-//!   "crawl/Echo"  → payload 原样回
-//!   "crawl/Stat"  → 内部消息计数 u64 LE
-//!   "crawl/Tick"  → 编排一跳（预留）→ 0u64
-//!   "crawl/Self"  → ctx.self-ref()（沙箱宿主能力探针）
-
-use std::cell::Cell;
-
-thread_local! {
-    static MSGS: Cell<u64> = const { Cell::new(0) };
-}
-
+//! Sandboxed crawler business. Same Tick/Stat/Progress/Echo protocol and
+//! settings as the native component; WIT retains its no-network capability set.
+use crawler_lab_core::{Config, Hub, MAX_BYTES};
+use std::cell::RefCell;
+thread_local! { static HUB: RefCell<Option<Hub>> = const { RefCell::new(None) }; }
 mod bindings {
-    // 冻结 WIT 相对路径（app wasm 目录 → parrot-wasm/wit）
-    wit_bindgen::generate!({
-        path: "../../../crates/parrot-wasm/wit",
-        world: "parrot-actor",
-    });
-
+    wit_bindgen::generate!({ path: "../../../crates/parrot-wasm/wit", world: "parrot-actor" });
     use super::*;
     use exports::parrot::component::handler::{Guest, Msg};
-    use parrot::component::ctx::{log, self_ref};
-
+    use parrot::component::ctx::{config_get, log, self_ref};
     pub struct Handler;
-
     impl Guest for Handler {
-        fn handle(m: Msg) -> Result<Vec<u8>, String> {
-            let n = MSGS.with(|c| {
-                c.set(c.get() + 1);
-                c.get()
-            });
-            match m.type_key.as_str() {
-                "crawl/Echo" => Ok(m.payload),
-                "crawl/Stat" => Ok(n.to_le_bytes().to_vec()),
-                "crawl/Tick" => Ok(0u64.to_le_bytes().to_vec()),
-                "crawl/Self" => {
-                    let p = self_ref();
-                    log(2, &format!("crawler-hub(wasm) at {p}"));
-                    Ok(p.into_bytes())
+        fn handle(message: Msg) -> Result<Vec<u8>, String> {
+            if message.type_key == "crawl/Self" {
+                if !message.payload.is_empty() {
+                    return Err("Self requires empty payload".into());
                 }
-                other => Err(format!("unknown type_key: {other}")),
+                return HUB.with(|hub| {
+                    hub.borrow_mut()
+                        .as_mut()
+                        .ok_or("crawler not started")?
+                        .handle("crawl/Echo", self_ref().as_bytes(), MAX_BYTES)
+                        .map_err(|e| e.to_string())
+                });
+            }
+            HUB.with(|hub| {
+                hub.borrow_mut()
+                    .as_mut()
+                    .ok_or("crawler not started")?
+                    .handle(&message.type_key, &message.payload, MAX_BYTES)
+                    .map_err(|e| e.to_string())
+            })
+        }
+        fn tell(message: Msg) {
+            if let Err(error) = Self::handle(message) {
+                log(0, &error);
             }
         }
-
-        fn tell(m: Msg) {
-            if m.type_key == "crawl/Bump" {
-                if let Some(b) = m.payload.first() {
-                    MSGS.with(|c| c.set(c.get() + *b as u64));
-                }
-            }
-        }
-
         fn on_start() {
-            log(2, "crawler-hub(wasm) started");
+            let config = match config_get("settings") {
+                Some(value) => {
+                    Config::from_json(value.as_bytes()).expect("invalid crawler settings")
+                }
+                None => Config::default(),
+            };
+            HUB.with(|hub| {
+                *hub.borrow_mut() = Some(Hub::new(config).expect("invalid crawler settings"))
+            });
+            log(2, "crawler business started");
         }
-
         fn on_drain() {
-            log(2, "crawler-hub(wasm) drained");
+            HUB.with(|hub| {
+                if let Some(hub) = hub.borrow_mut().as_mut() {
+                    hub.drain();
+                }
+            });
         }
     }
-
     export!(Handler);
 }

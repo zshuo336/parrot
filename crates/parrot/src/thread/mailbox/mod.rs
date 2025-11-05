@@ -14,6 +14,7 @@ use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::processor::ProcessorInterface;
 
+pub mod admission;
 pub mod mpsc;
 pub mod spsc;
 pub mod spsc_ringbuf;
@@ -35,7 +36,7 @@ pub enum MailboxItem {
 
 impl MailboxItem {
     /// 兼容还原：把条目转回 `BoxedMessage`（AskEnvelope 装箱一次）。
-    /// 供旧消费路径（`pop` + downcast::<AskEnvelope>）使用。
+    /// 供旧消费路径（`pop` + `downcast::<AskEnvelope>`）使用。
     pub fn into_boxed_message(self) -> BoxedMessage {
         match self {
             MailboxItem::Ask(env) => Box::new(env),
@@ -157,6 +158,11 @@ pub trait Mailbox: Debug + Send + Sync + 'static {
         // Return value: whether the message entered the high lane.
         self.push(msg, strategy).await?;
         Ok(false)
+    }
+
+    /// Whether explicit high-lane admission is supported.
+    fn supports_high_priority(&self) -> bool {
+        false
     }
 
     /// Whether this mailbox currently holds any high-priority messages (M2).

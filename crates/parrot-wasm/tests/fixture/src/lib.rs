@@ -64,6 +64,15 @@ mod bindings {
                 "spin" => loop {
                     std::hint::spin_loop();
                 },
+                "memory-pages" => Ok((core::arch::wasm32::memory_size(0) as u64)
+                    .to_le_bytes().to_vec()),
+                "grow" => {
+                    let pages = u32::from_le_bytes(
+                        m.payload.try_into().map_err(|_| "grow: need 4B")?,
+                    );
+                    let previous = core::arch::wasm32::memory_grow(0, pages as usize);
+                    Ok((previous as u64).to_le_bytes().to_vec())
+                }
                 "state" => {
                     let v = COUNTER.with(|c| {
                         c.set(c.get() + 1);

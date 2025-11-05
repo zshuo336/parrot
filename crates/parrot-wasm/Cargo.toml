@@ -13,16 +13,20 @@ license = "MIT"
 
 [features]
 default = []
-runtime = ["dep:wasmtime"]
+runtime = ["dep:wasmtime", "dep:libc"]
 
 [dependencies]
-wasmtime = { version = "49", features = ["component-model", "cranelift", "runtime", "std"], optional = true }
+wasmtime = { version = "49.0.5", features = ["component-model", "cranelift", "runtime", "std"], optional = true }
 thiserror = "2.0"
 tracing = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+# Open artifact paths without blocking on FIFOs before file-type validation.
+libc = { version = "0.2", optional = true }
+
 [dev-dependencies]
 # wasm 工具链独立于 runtime feature——单测只在 runtime 档编译（同 feature）
-wasmtime = { version = "49", features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "49.0.5", features = ["component-model", "cranelift", "runtime", "std"] }
 tokio = { version = "1", features = ["full"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 

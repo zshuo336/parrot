@@ -516,7 +516,10 @@ async fn blocked_factory(
 
 #[tokio::test(flavor = "current_thread")]
 async fn explicit_stop_cancels_blocked_factory_and_reserves_path() {
-    let system = ThreadActorSystem::shared(Default::default());
+    let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
+        shutdown_timeout: Duration::from_millis(80),
+        ..Default::default()
+    });
     let gate = FactoryGate::new();
     let _release = ReleaseFactory(gate.clone());
     let actor = blocked_factory(&system, gate.clone()).await;
@@ -547,8 +550,13 @@ async fn explicit_stop_cancels_blocked_factory_and_reserves_path() {
     tokio::time::timeout(Duration::from_millis(500), actor.stop())
         .await
         .unwrap()
+        .expect_err("running constructor is not a completed stop");
+    assert!(system.get_actor_ref("/victim").is_some());
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(2), gate.finished.notified())
+        .await
         .unwrap();
-    assert!(system.get_actor_ref("/victim").is_none());
+    removed(&system).await;
     let replacement = system
         .spawn_at(
             Generation {
@@ -559,10 +567,6 @@ async fn explicit_stop_cancels_blocked_factory_and_reserves_path() {
             None,
             Default::default(),
         )
-        .await
-        .unwrap();
-    gate.release();
-    tokio::time::timeout(Duration::from_secs(2), gate.finished.notified())
         .await
         .unwrap();
     for _ in 0..100 {
@@ -577,7 +581,10 @@ async fn explicit_stop_cancels_blocked_factory_and_reserves_path() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_cancels_blocked_factory_without_late_publication() {
-    let system = ThreadActorSystem::shared(Default::default());
+    let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
+        shutdown_timeout: Duration::from_millis(80),
+        ..Default::default()
+    });
     let gate = FactoryGate::new();
     let _release = ReleaseFactory(gate.clone());
     let actor = blocked_factory(&system, gate.clone()).await;
@@ -589,11 +596,13 @@ async fn shutdown_cancels_blocked_factory_without_late_publication() {
     tokio::time::timeout(Duration::from_millis(500), system.shutdown_internal())
         .await
         .unwrap()
-        .unwrap();
+        .expect_err("running constructor is not a completed shutdown");
+    assert!(system.get_actor_ref("/victim").is_some());
     gate.release();
     tokio::time::timeout(Duration::from_secs(2), gate.finished.notified())
         .await
         .unwrap();
+    removed(&system).await;
     assert_eq!(system.actor_count(), 0);
     assert!(!actor.is_alive().await);
 }
@@ -612,9 +621,16 @@ async fn blocked_factory_times_out_without_poisoning_path() {
     tokio::time::timeout(Duration::from_secs(2), gate.started.notified())
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_millis(500), removed(&system))
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        system.get_actor_ref("/victim").is_some(),
+        "deadline cannot release a running constructor"
+    );
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(2), gate.finished.notified())
         .await
         .unwrap();
+    removed(&system).await;
     let replacement = system
         .spawn_at(
             Generation {
@@ -625,10 +641,6 @@ async fn blocked_factory_times_out_without_poisoning_path() {
             None,
             Default::default(),
         )
-        .await
-        .unwrap();
-    gate.release();
-    tokio::time::timeout(Duration::from_secs(2), gate.finished.notified())
         .await
         .unwrap();
     for _ in 0..100 {
@@ -703,9 +715,11 @@ async fn panic_cleanup_is_bounded_and_failed_retirement_does_not_restart() {
     tokio::time::timeout(Duration::from_secs(2), drop_gate.started.notified())
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_millis(500), removed(&system))
-        .await
-        .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        system.get_actor_ref("/victim").is_some(),
+        "retain the failed generation until queued destructors finish"
+    );
     assert_eq!(
         count.load(Ordering::SeqCst),
         1,
@@ -715,6 +729,14 @@ async fn panic_cleanup_is_bounded_and_failed_retirement_does_not_restart() {
     tokio::time::timeout(Duration::from_secs(2), drop_gate.finished.notified())
         .await
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), removed(&system))
+        .await
+        .unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "late disposal must not revive an expired restart"
+    );
     system.shutdown_internal().await.unwrap();
 }
 

@@ -11,3 +11,5 @@ path = "src/lib.rs"
 
 [dependencies]
 parrot-abi = { path = "../../../crates/parrot-abi", default-features = false }
+crawler-lab-core = { path = "../core" }
+toml = "0.8"

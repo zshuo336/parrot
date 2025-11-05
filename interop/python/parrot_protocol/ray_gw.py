@@ -1,17 +1,15 @@
-"""Parrot Ray Gateway（DEV_03 §5 / E4 转正）。
+"""Parrot Ray Gateway: Wire 1.0 connections to one owned Ray runtime.
 
-Rust 节点 <--Wire 1.0(TLV 握手)--> 本网关 <--ray API--> Ray actor。
+Admin deployment creates path-owned dispatchers or native Ray actor handles.
+ASK selects /user/{name}[-{i}] (also /ray/user/... and full Parrot URIs).
+TELL selects the same path without a Wire completion receipt.
 
-- ParrotDispatcher（ray.remote actor）：TYPE_KEY → handler 分发；
-  ask = ray.get（同步配对）；deliver = 不 get（非取消语义——文档明示）
-- 路径映射：parrot://…/ray/{name} ↔ ActorHandle（named actor）
-
-用法（对齐 JVM ParrotGatewayMain 的 CLI 契约）：
-  python3 -m parrot_protocol.ray_gw <port>        # 打印 RAY_GW_PORT=<port>
+CLI: python3 -m parrot_protocol.ray_gw [port] [parrot=host:port] [--trace-export-endpoint URL]
 """
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import os
 import queue
 import socket
@@ -19,9 +17,21 @@ import struct
 import sys
 import threading
 import time
+import uuid
 
 from .wire import (
+    BODY_FIXED_OVERHEAD,
+    ERR_PROTOCOL_VIOLATION,
+    ERR_OVERLOADED,
+    MAX_FRAME_LEN,
+    DEFAULT_HANDSHAKE_FRAME_LEN,
+    CAPS_BIN_PB,
+    CAPS_MEASURED_METRICS,
+    CAPS_TRACE_CONTEXT,
+    FLAG_TRACE_CONTEXT,
+    decode_handshake,
     FT_ASK,
+    FT_ERROR,
     FT_HANDSHAKE,
     FT_HANDSHAKE_ACK,
     FT_HEARTBEAT,
@@ -39,16 +49,24 @@ from .wire import (
     parse_tlv,
     split_reply_to,
 )
+from .trace import capture_parent, transferred_scope
 
 ERR_UNKNOWN_TYPE_KEY = 6
+
+
+class UnknownTypeKeyError(KeyError):
+    """Dispatcher lookup failed, distinct from a KeyError inside user code."""
+
 
 # DEV_08：ASK 执行池大小（慢 handler 并发度；环境变量可覆盖——
 # PARROT_RAY_GW_WORKERS=1 即退化为旧行为做 A/B 对照）
 RAY_GW_ASK_WORKERS = int(os.environ.get("PARROT_RAY_GW_WORKERS", "8"))
+if not 1 <= RAY_GW_ASK_WORKERS <= 128:
+    raise ValueError("PARROT_RAY_GW_WORKERS must be between 1 and 128")
 
 # ---------------- 观测五件套：网关级指标注册表 ----------------
 # 全部链路（listen + 反拨）共用的线程安全计数器；进程启动时刻固定。
-_START_MS = int(time.time() * 1000)
+_GATEWAY_CAPABILITIES = CAPS_BIN_PB | CAPS_MEASURED_METRICS | CAPS_TRACE_CONTEXT
 
 
 class _GatewayMetrics:
@@ -56,6 +74,8 @@ class _GatewayMetrics:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self.epoch = str(uuid.uuid4())
+        self.started_ms = int(time.time() * 1000)
         self._c = {
             "connections": 0,
             "handshakes_ok": 0, "handshakes_failed": 0,
@@ -66,53 +86,284 @@ class _GatewayMetrics:
 
     def bump(self, key: str, n: int = 1) -> None:
         with self._lock:
-            self._c[key] = self._c.get(key, 0) + n
+            self._c[key] = min((1 << 64) - 1, max(0, self._c.get(key, 0) + n))
 
-    def snapshot(self) -> dict:
+    def received(self, frame) -> None:
+        """Only fully decoded Wire frames, including all UTF-8 header bytes."""
+        self.bump("bytes_rx", 4 + BODY_FIXED_OVERHEAD + len(frame.path.encode())
+                  + len(frame.type_key.encode()) + len(frame.payload))
+        counter = {FT_ASK: "asks_rx", FT_TELL: "tells_rx",
+                   FT_HEARTBEAT: "heartbeats_rx"}.get(frame.ft)
+        if counter is not None:
+            self.bump(counter)
+
+    def transmitted(self, frame: bytes) -> None:
+        """Called only after sendall succeeds, never on enqueue/partial failure.
+
+        Production writers receive already encoded frames. Ignore non-frame
+        bytes used by low-level writer lifecycle fixtures.
+        """
+        if len(frame) < 4 + BODY_FIXED_OVERHEAD or int.from_bytes(frame[:4], "little") != len(frame) - 4:
+            return
+        self.bump("bytes_tx", len(frame))
+        kind = frame[5]
+        if kind in (FT_REPLY, FT_REPLY_ERR):
+            self.bump("replies_tx")
+        if kind == FT_REPLY_ERR:
+            self.bump("reply_errs")
+
+    def _sample(self) -> tuple[dict, bool]:
         import platform
 
         with self._lock:
             base = dict(self._c)
-        # RSS 尽力而为：/proc/self/status（Linux）；macOS 无 procfs → 0
-        rss = 0
-        try:
-            with open("/proc/self/status", encoding="ascii") as fh:
-                for line in fh:
-                    if line.startswith("VmRSS:"):
-                        rss = int(line.split()[1]) * 1024
-                        break
-        except OSError:
-            pass
-        procs = threading.active_count()
-        try:
-            import warnings
-
-            import ray as _ray  # noqa: PLC0415
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")  # ray.state.actors 弃用告警
-                procs += len(_ray.state.actors().keys())
-        except Exception:  # noqa: BLE001 —— ray 未起/桩形态
-            pass
+        rss = _resident_bytes()
         base.update({
             "ts_ms": int(time.time() * 1000),
             "runtime": f"python/{platform.python_version()}",
-            "processes": procs,
-            "memory_rss": rss,
-            "uptime_start_ms": _START_MS,
+            "processes": threading.active_count(),
+            "memory_rss": 0 if rss is None else rss,
+            "uptime_start_ms": self.started_ms,
         })
-        # connections：活跃连接计数（可暂负于竞态——clamp 0）
-        base["connections"] = max(base.get("connections", 0), 0)
-        return base
+        return base, rss is not None
+
+    def snapshot(self) -> dict:
+        return self._sample()[0]
+
+    def measured(self) -> dict:
+        from .admin_v2 import METRICS_ALL
+
+        snapshot, rss_available = self._sample()
+        available = METRICS_ALL & ~((1 << 12) | (1 << 13))
+        if not rss_available:
+            available &= ~(1 << 15)
+        return {"snapshot": snapshot, "available": available, "epoch": self.epoch,
+                "process_kind": "python_threads"}
+
+
+def _resident_bytes() -> int | None:
+    # Bounded, local RSS only; no Ray cluster RPC and no synthetic zero mask.
+    try:
+        with open("/proc/self/status", "rb") as source:
+            data = source.read(65537)
+        if len(data) > 65536:
+            return None
+        for line in data.decode("ascii").splitlines():
+            if line.startswith("VmRSS:"):
+                fields = line.split()
+                if len(fields) != 3 or fields[2] != "kB":
+                    return None
+                value = int(fields[1]) * 1024
+                return value if 0 <= value < 1 << 64 else None
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return None
+
+
+class _ConnectionMetricLease:
+    """One entered Wire handshake attempt, retired exactly once by its owner."""
+    def __init__(self, metrics):
+        self.metrics = metrics
+        self.connected = False
+        self.closed = False
+
+    def complete(self):
+        with self.metrics._lock:
+            if not self.closed and not self.connected:
+                self.connected = True
+                for key in ("handshakes_ok", "connections"):
+                    self.metrics._c[key] = min((1 << 64)-1, self.metrics._c[key] + 1)
+
+    def close(self):
+        with self.metrics._lock:
+            if self.closed:
+                return
+            self.closed = True
+            if self.connected:
+                self.metrics._c["connections"] -= 1
+            else:
+                self.metrics._c["handshakes_failed"] = min((1 << 64)-1, self.metrics._c["handshakes_failed"] + 1)
 
 
 METRICS = _GatewayMetrics()
 
 
 # ---------------- B3（DEV_09）：admin-v2 ray 方言执行器 ----------------
-# DeployComponent{PyModule} → ray job API submit(working_dir=module 目录,
-# runtime_env) → module 内 parrot_entry(ctx) 起命名 actor；
-# Drain/Stop → ray kill 命名 actor；Status → 网关侧登记表 + ray 探活。
+# DeployComponent{PyModule} → worker 内 importlib 载入模块并调用
+# parrot_entry(ctx)；独立执行器也支持返回 Ray actor handle。
+# Drain/Stop → 按路径退休；Status → owner 最近确认的逐路径状态（不是独立探活）。
+
+
+class _AskPermit:
+    def __init__(self, owner, size):
+        self._owner = owner
+        self._size = size
+        self._released = False
+
+    def release(self, _future=None):
+        with self._owner.lock:
+            if not self._released:
+                self._released = True
+                self._owner.pending -= 1
+                self._owner.bytes -= self._size
+                self._owner.changed.notify_all()
+
+
+class _AskAdmission:
+    """One gateway-wide ledger, including running work on retired connections."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
+        self._closed = False
+        self.pending = 0
+        self.bytes = 0
+
+    def acquire(self, size):
+        with self.lock:
+            if self._closed or self.pending >= 256 or size > 16 * 1024 * 1024 - self.bytes:
+                return None
+            self.pending += 1
+            self.bytes += size
+            return _AskPermit(self, size)
+
+    def seal(self):
+        with self.lock:
+            self._closed = True
+
+    def wait(self, deadline):
+        with self.changed:
+            while self.pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('gateway requests are still running')
+                self.changed.wait(remaining)
+
+
+class _ManagementQueue:
+    """Gateway-owned FIFO, including the currently executing command.
+
+    A worker is created only when idle work becomes available and exits when
+    drained. All admissions and worker transitions use a short independent lock;
+    a blocked factory cannot hold this lock or stall connection heartbeats.
+    """
+    def __init__(self):
+        from collections import deque
+        self._queue = deque()
+        self._lock = threading.Lock()
+        self._count = 0
+        self._bytes = 0
+        self._thread = None
+        self._closed = False
+
+    def submit(self, action, args, size):
+        with self._lock:
+            if self._closed or self._count >= 256 or size > 16 * 1024 * 1024 - self._bytes:
+                return False
+            self._queue.append((action, args, size))
+            self._count += 1
+            self._bytes += size
+            if self._thread is None:
+                thread = threading.Thread(target=self._run, name=f'parrot-management-{id(self):x}', daemon=True)
+                self._thread = thread
+                try:
+                    thread.start()
+                except Exception:
+                    self._thread = None
+                    self._queue.pop()
+                    self._count -= 1
+                    self._bytes -= size
+                    return False
+            return True
+
+    def close(self, deadline):
+        with self._lock:
+            self._closed = True
+            discarded = list(self._queue)
+            self._queue.clear()
+            self._count -= len(discarded)
+            self._bytes -= sum(item[2] for item in discarded)
+            thread = self._thread
+        discarded.clear()  # Release callable/argument ownership outside the lock.
+        if thread is not None:
+            thread.join(max(0, deadline - time.monotonic()))
+            if thread.is_alive():
+                raise TimeoutError('gateway management operation is still running')
+
+    def _run(self):
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._thread = None
+                    return
+                action, args, size = self._queue.popleft()
+            try:
+                action(*args)
+            except BaseException as error:
+                # A broken reply sink or user SystemExit must not strand all
+                # other accepted commands. The executing slot still retires.
+                try:
+                    print(f'[ray-gw] management task failed: {_detail(error)}', file=sys.stderr, flush=True)
+                except BaseException:
+                    pass  # Diagnostic output cannot break ownership of the queue.
+            finally:
+                with self._lock:
+                    self._count -= 1
+                    self._bytes -= size
+                del action, args
+
+
+class RayAdminState:
+    """Gateway-owned component registry, retained across connection retirement.
+
+    Serialize lifecycle operations so a concurrent stop cannot erase a newer
+    deployment. Create one owner per gateway, after serializing its dispatcher
+    into the Ray worker; this lock never crosses the Ray process boundary.
+    """
+
+    def __init__(self) -> None:
+        self.components: dict[str, dict] = {}
+        self.lock = threading.RLock()
+        self.ask_admission = _AskAdmission()
+        self.management = _ManagementQueue()
+        self.local_runtime = None
+        # Immutable snapshots let connection admission reject uncertain/retiring
+        # paths without waiting on a possibly blocked lifecycle operation.
+        self.path_states = {}
+        self.closing = False
+
+    def route_error(self, path):
+        if self.closing:
+            return dict(ok=False, code=3, detail='gateway is closing')
+        state = self.path_states.get(_logical_path(path))
+        if state is not None and state != 'running':
+            return dict(ok=False, code=3, detail='component is not running: ' + _logical_path(path))
+        return None
+
+
+def _registry_operation(method):
+    from functools import wraps
+
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._state.lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
+def _reply_boundary(method):
+    """Keep response preparation failures owned by their network connection."""
+    from functools import wraps
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException:
+            if self._on_reply_failure is None:
+                raise  # Standalone sinks retain their explicit failure contract.
+            self._on_reply_failure()
+            return None
+    return guarded
 
 
 class RayAdminExecutor:
@@ -124,15 +375,19 @@ class RayAdminExecutor:
     """
 
     def __init__(self, out_queue, ray_module=None, gateway_dispatcher=None,
-                 worker_ref=None) -> None:
+                 worker_ref=None, state: RayAdminState | None = None,
+                 on_reply_failure=None) -> None:
+        if on_reply_failure is not None and not callable(on_reply_failure):
+            raise TypeError('on_reply_failure must be callable')
+        self._on_reply_failure = on_reply_failure
         self._out = out_queue          # 回帧队列（writer 线程消费）
         self._ray = ray_module         # 可注入（测试桩）；None → import ray
-        self._components: dict[str, dict] = {}
-        self._lock = threading.Lock()
-        # R4：网关 dispatcher（deploy 组件挂载点；None = 测试桩形态）
+        self._state = state if state is not None else RayAdminState()
+        self._components = self._state.components
+        self._lock = self._state.lock
+        # 本地模式的 gateway handler；部署组件由独立 path runtime 持有。
         self._gw_dispatcher = gateway_dispatcher
-        # R4：ray actor 引用（组件 dispatcher 送进 actor 进程挂载——
-        # 本地 mount 对 actor 内深拷贝副本无效）
+        # 工厂必须在真实 worker 进程执行，不能修改 driver 内的序列化副本。
         self._worker = worker_ref
 
     # ---- ray 句柄（惰性导入；测试注入桩）----
@@ -144,6 +399,7 @@ class RayAdminExecutor:
         return self._ray
 
     # ---- 回帧 ----
+    @_reply_boundary
     def _send_reply(self, req_id: int, reply: dict, reply_to: str) -> None:
         from .admin_v2 import encode_admin_reply_v2
 
@@ -153,7 +409,7 @@ class RayAdminExecutor:
         )
 
     # ---- SYSTEM_EVENT 入口（serve 帧循环调用）----
-    def on_frame(self, cid: int, reply_to: str, payload: bytes) -> bool:
+    def on_frame(self, cid: int, reply_to: str, payload: bytes, *, encoded_size=None) -> bool:
         """SYSTEM_EVENT 帧 → admin v2 命令处理。返回 True = 已消费。"""
         from .admin_v2 import (
             TAG_ADMIN_CMD_V2,
@@ -167,13 +423,23 @@ class RayAdminExecutor:
             return False  # 非 admin-v2（gossip 等）——原路透传给调用方忽略
         if tag != TAG_ADMIN_CMD_V2:
             return False  # 回执帧不落在网关侧（发起方 pending 表消费）
-        cmd = decode_admin_cmd_v2(payload)
-        # 命令执行线程池外跑（deploy 可能拉 ray job——秒级；不阻塞收帧）
-        threading.Thread(
-            target=self._dispatch, args=(cmd, reply_to), daemon=True
-        ).start()
+        try:
+            cmd = decode_admin_cmd_v2(payload)
+            if cmd['req_id'] != cid:
+                raise ValueError('admin request ID disagrees with frame CID')
+        except ValueError:
+            from .admin_v2 import ERR_DIALECT_MISMATCH
+            self._send_reply(cid, dict(kind='failed', req_id=cid,
+                code=ERR_DIALECT_MISMATCH, detail='invalid admin payload or request correlation'), reply_to)
+            return True
+        minimum_size = 4 + BODY_FIXED_OVERHEAD + len(reply_to.encode('utf-8')) + len(payload)
+        size = minimum_size if encoded_size is None else max(minimum_size, encoded_size)
+        if not self._state.management.submit(self._dispatch, (cmd, reply_to), size):
+            self._send_reply(cmd['req_id'], dict(kind='failed', req_id=cmd['req_id'],
+                code=ERR_OVERLOADED, detail='gateway management capacity or scheduler unavailable'), reply_to)
         return True
 
+    @_reply_boundary
     def _dispatch(self, cmd: dict, reply_to: str) -> None:
         from .admin_v2 import (
             ERR_ARTIFACT_FETCH,
@@ -195,209 +461,191 @@ class RayAdminExecutor:
                 reply = self.status(cmd["path_prefix"])
             elif kind == "metrics":
                 reply = {"kind": "metrics", "snapshot": self.collect_metrics()}
+            elif kind == "measured_metrics":
+                reply = {"kind": "measured_metrics", "metrics": self.collect_measured_metrics()}
             else:  # pragma: no cover —— 解码层已限四形态
                 reply = {"kind": "failed", "code": ERR_DIALECT_MISMATCH,
                          "detail": f"unknown kind {kind}"}
         except _NotFound as e:
             reply = {"kind": "failed", "code": ERR_COMPONENT_NOT_FOUND,
                      "detail": f"no component under {e}"}
-        except Exception as e:  # noqa: BLE001
-            reply = {"kind": "failed", "code": ERR_ARTIFACT_FETCH, "detail": str(e)}
+        except BaseException as e:  # User code runs on an owned background worker.
+            reply = {"kind": "failed", "code": ERR_ARTIFACT_FETCH, "detail": _detail(e)}
         reply["req_id"] = cmd["req_id"]
         self._send_reply(cmd["req_id"], reply, reply_to)
 
     # ---- 观测五件套：指标采集（admin-v2 MetricsReport）----
+    @_registry_operation
     def collect_metrics(self) -> dict:
-        snap = METRICS.snapshot()
+        return self._add_component_metrics(METRICS.snapshot())
+
+    @_registry_operation
+    def collect_measured_metrics(self) -> dict:
+        metrics = METRICS.measured()
+        self._add_component_metrics(metrics["snapshot"])
+        metrics["available"] |= (1 << 12) | (1 << 13)
+        return metrics
+
+    def _add_component_metrics(self, snap: dict) -> dict:
         with self._lock:
             comps = list(self._components.items())
         states = []
         for name, info in comps:
             for p in info.get("paths", []):
-                states.append({"path": p, "state": "running",
+                states.append({"path": p, "state": info["states"][p],
                                "version": info.get("version", "?")})
         snap["components"] = len(comps)
         snap["component_states"] = states
         return snap
 
-    # ---- Deploy：PyModule → ray job → parrot_entry(ctx) 命名 actor ----
-    def deploy(self, comp: dict) -> dict:
-        from .admin_v2 import ERR_DIALECT_MISMATCH
-
-        art = comp["artifact"]
-        if art["kind"] != "pymodule":
-            return {
-                "kind": "failed",
-                "code": ERR_DIALECT_MISMATCH,
-                "detail": f"ray executor expects PyModule, got {art['kind']}",
-            }
-        # R3：uri（file:// 目录形态）= app 源码 working_dir——优先于
-        # module 相对发现（app 标准包直发形态）
-        uri = art.get("uri")
-        if uri and uri.startswith("file://"):
-            module_dir = uri[len("file://"):]
-        else:
-            module_dir = os.path.dirname(art["module"].replace(".", "/")) or "."
-        # runtime_env：TOML 文本 → dict（py3.11+ tomllib；旧版容错降级）
-        env_dict: dict = {}
-        re_text = art.get("runtime_env")
-        if re_text:
-            try:
-                import tomllib  # noqa: PLC0415
-
-                env_dict = tomllib.loads(re_text)
-            except ImportError:
-                env_dict = {"pip": [], "env_vars": {}, "_raw": re_text}
-        ray = self.ray
-        # ray job submission（集群形态）——本地 init 形态退化为
-        # importlib 直载 module + 本地调用 parrot_entry
-        instances = _expand_paths(comp["name"], comp["instances"])
-        try:
-            handles = self._launch(comp, module_dir, env_dict, instances)
-        except Exception as e:  # noqa: BLE001
-            return {
-                "kind": "failed",
-                "code": 0x0A00,
-                "detail": f"ray launch failed: {e}",
-            }
-        with self._lock:
-            self._components[comp["name"]] = {
-                "version": comp["version"],
-                "paths": instances,
-                "handles": handles,
-            }
-        return {"kind": "deployed", "instances": instances}
-
-    def _launch(self, comp: dict, module_dir: str, env_dict: dict, instances: list[str]):
-        """PyModule 启动：module 目录为 working_dir。
-
-        真 ray 集群：JobSubmissionClient().submit(working_dir, entrypoint)。
-        本地 ray.init（测试/单机形态）：importlib 直载 + parrot_entry 本地起
-        命名 actor（ray.get 强制落位——与 serve 的 worker 就绪等待同式）。
-
-        R4：parrot_entry 返回 ParrotDispatcher（app 组件形态——apps/*/python）
-        时额外挂载到网关 dispatcher（组件 handler 优先于内置探针）；
-        返回 ray actor 句柄时保持 B3 句柄形态（兼容旧 fixture）。
-        """
-        # dispatcher 形态：组件送入 ray actor 进程构建+挂载（ask 路由到
-        # 组件 handler）；网关本地 dispatcher 同挂（测试桩/本地直连形态）
-        handles: list = []
-        mounted = None
-        module_name = comp["artifact"]["module"]
-        if self._worker is not None:
-            self.ray.get(self._worker.mount_module.remote(
-                comp["name"], module_name, module_dir, env_dict, instances))
-            mounted = True
-        else:
-            import importlib
-            import os
-            import sys
-
-            # working_dir 语义：module 目录入 sys.path（app 标准包解包位）
-            if module_dir and module_dir not in sys.path:
-                sys.path.insert(0, os.path.abspath(module_dir))
-            mod = importlib.import_module(module_name)
-            entry = getattr(mod, "parrot_entry", None)
-            if entry is None:
-                raise RuntimeError(f"{module_name} has no parrot_entry(ctx)")
-            # parrot_entry(ctx) → dispatcher 工厂；ctx 含 instances/env
-            for path in instances:
-                h = entry({"path": path, "env": env_dict, "ray": self.ray})
-                handles.append(h)
-                if _is_dispatcher(h):
-                    mounted = h
-            if mounted is not None and self._gw_dispatcher is not None:
-                self._gw_dispatcher.mount(mounted)
-        return handles
-
-    def _unmount(self, info: dict, comp_name: str | None = None) -> None:
-        """卸载组件 dispatcher（drain/stop——句柄形态无操作）。"""
-        if self._worker is not None and comp_name is not None:
-            try:
-                self._worker.unmount_name.remote(comp_name)
-            except Exception:  # noqa: BLE001
-                pass
-        for h in info.get("handles", []):
-            if _is_dispatcher(h):
+    def _runtime(self):
+        with self._state.lock:
+            if self._state.local_runtime is None:
+                self._state.local_runtime = _ComponentRuntime(self._gw_dispatcher or ParrotDispatcher(), self._ray)
                 if self._gw_dispatcher is not None:
-                    self._gw_dispatcher.unmount(h)
+                    self._gw_dispatcher._component_runtime = self._state.local_runtime
+            return self._state.local_runtime
 
-    # ---- Drain：排空（命名 actor 优雅停——ray 无 drain 原语，
-    #      语义映射为 drain 钩子调用 + ray.kill(no_restart=True)）----
-    def drain(self, prefix: str, timeout_ms: int) -> tuple[int, int]:
-        comps = self._match(prefix)
-        if not comps:
+    def _call(self, method, *args, deadline=None):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('component retirement deadline elapsed')
+        if self._worker is None:
+            return getattr(self._runtime(), method)(*args)
+        ref = getattr(self._worker, method).remote(*args)
+        if deadline is None:
+            return self.ray.get(ref)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('component retirement deadline elapsed')
+        return self.ray.get(ref, timeout=remaining)
+
+    def _set_paths(self, name, info, paths, states):
+        if not paths:
+            self._components.pop(name, None)
+        else:
+            info['paths'] = list(paths)
+            info['states'] = dict(states)
+            if self._worker is None:
+                info['handles'] = self._runtime().handles(paths)
+            self._components[name] = info
+        self._publish_path_states()
+
+    def _publish_path_states(self):
+        self._state.path_states = {p: info['states'][p]
+                                   for info in self._components.values() for p in info['paths']}
+
+    @_registry_operation
+    def deploy(self, comp):
+        from .admin_v2 import ERR_DIALECT_MISMATCH, ERR_ARTIFACT_FETCH, ERR_SPAWN_FAILED
+        name = comp['name']
+        if name in self._components:
+            return dict(kind='failed', code=ERR_ARTIFACT_FETCH, detail=f'component {name} already deployed; stop it first')
+        art = comp['artifact']
+        if art['kind'] != 'pymodule':
+            return dict(kind='failed', code=ERR_DIALECT_MISMATCH, detail='ray executor expects PyModule')
+        try:
+            paths = _expand_paths(name, comp['instances'])
+            occupied = {p for info in self._components.values() for p in info['paths']}
+            if occupied.intersection(paths):
+                raise ValueError('component logical path collision')
+            if len(occupied) + len(paths) > 4096:
+                raise ValueError('gateway instance capacity exhausted')
+            from .ray_artifacts import source_directory
+            module_dir = source_directory(art['module'], art.get('uri'))
+            from .ray_environments import parse_environment
+            env = parse_environment(art.get('runtime_env'))
+            if env and self._worker is None:
+                raise ValueError('runtime_env requires an isolated production Ray worker')
+        except Exception as error:
+            return dict(kind='failed', code=ERR_SPAWN_FAILED, detail=_detail(error))
+        info = dict(version=comp['version'], paths=paths, handles=[], states={p:'starting' for p in paths})
+        self._components[name] = info
+        self._publish_path_states()
+        try:
+            receipt = self._call('mount_module', name, art['module'], module_dir, env, paths,
+                                 comp['version'], comp.get('config'))
+            if not isinstance(receipt, dict) or type(receipt.get('ok')) is not bool:
+                raise ValueError('invalid component mount receipt')
+            retained = receipt['paths']
+            if (not isinstance(retained, list) or any(not isinstance(p, str) for p in retained) or
+                    len(set(retained)) != len(retained) or not set(retained).issubset(paths)):
+                raise ValueError('invalid component mount paths')
+            if receipt['ok'] and retained != paths:
+                raise ValueError('incomplete successful component mount')
+            self._set_paths(name, info, retained, {p:'running' if receipt['ok'] else 'stop_failed' for p in retained})
+            if not receipt['ok']:
+                return dict(kind='failed', code=ERR_SPAWN_FAILED, detail=_detail(receipt.get('detail', 'component startup failed')))
+        except Exception as error:
+            # A failed RPC is not proof that the worker did nothing. Retain all
+            # requested paths so an explicit Stop can retire an uncertain commit.
+            self._set_paths(name, info, paths, {p:'deploy_failed' for p in paths})
+            return dict(kind='failed', code=ERR_SPAWN_FAILED, detail=_detail(error))
+        return dict(kind='deployed', instances=paths)
+
+    def _retire_selected(self, name, info, selected, deadline=None):
+        info['states'].update({p: 'retiring' if deadline is None else 'draining' for p in selected})
+        self._publish_path_states()
+        try:
+            millis = None if deadline is None else max(0, int((deadline-time.monotonic())*1000))
+            result = self._call('retire_paths', name, selected, millis, deadline=deadline)
+            if (not isinstance(result, dict) or set(result) != set(selected) or
+                    any(value not in (None, 'stop_failed', 'drain_failed') for value in result.values())):
+                raise ValueError('invalid component retirement receipt')
+        except Exception:
+            state = 'stop_failed' if deadline is None else 'drain_failed'
+            info['states'].update({p:state for p in selected})
+            self._publish_path_states()
+            raise
+        retired = {p for p, state in result.items() if state is None}
+        states = {p:result.get(p, info['states'][p]) for p in info['paths'] if p not in retired}
+        self._set_paths(name, info, [p for p in info['paths'] if p not in retired], states)
+        return len(retired), len(selected)-len(retired)
+
+    @_registry_operation
+    def stop(self, prefix):
+        matched = self._match(prefix)
+        if not matched:
             raise _NotFound(prefix)
+        failure = None
+        for name, info, selected in matched:
+            try:
+                _, remaining = self._retire_selected(name, info, selected)
+                if remaining:
+                    failure = RuntimeError('component stop incomplete; handles retained')
+            except Exception as error:
+                failure = error
+        if failure is not None:
+            raise failure
+        return dict(kind='stopped')
+
+    @_registry_operation
+    def drain(self, prefix, timeout_ms):
+        matched = self._match(prefix)
+        if not matched:
+            raise _NotFound(prefix)
+        deadline = time.monotonic() + min(timeout_ms, 60000) / 1000
         drained = aborted = 0
-        deadline = time.monotonic() + min(timeout_ms, 60000) / 1000.0
-        for name, info in comps:
-            ok = True
-            for h in info["handles"]:
-                try:
-                    if hasattr(h, "parrot_drain"):
-                        h.parrot_drain.remote()
-                        self.ray.get(h.parrot_drain.remote())
-                except Exception:  # noqa: BLE001
-                    ok = False
-            if ok and time.monotonic() < deadline:
-                self._kill_handles(info["handles"])
-                self._unmount(info, name)
-                drained += len(info["paths"])
-            else:
-                aborted += len(info["paths"])
-            with self._lock:
-                self._components.pop(name, None)
+        for name, info, selected in matched:
+            try:
+                done, pending = self._retire_selected(name, info, selected, deadline)
+                drained += done
+                aborted += pending
+            except Exception:
+                aborted += len(selected)
         return drained, aborted
 
-    # ---- Stop：立即停（ray.kill 全部实例句柄）----
-    def stop(self, prefix: str) -> dict:
-        comps = self._match(prefix)
-        if not comps:
+    @_registry_operation
+    def status(self, prefix):
+        matched = self._match(prefix)
+        if not matched:
             raise _NotFound(prefix)
-        for name, info in comps:
-            self._kill_handles(info["handles"])
-            self._unmount(info, name)
-            with self._lock:
-                self._components.pop(name, None)
-        return {"kind": "stopped"}
+        return dict(kind='status', states=[dict(path=p, state=info['states'][p], version=info['version'])
+                    for _, info, selected in matched for p in selected])
 
-    # ---- Status：登记表 + 句柄探活（stub：alive 标记；真 ray：登记表为准）----
-    def status(self, prefix: str) -> dict:
-        comps = self._match(prefix)
-        if not comps:
-            raise _NotFound(prefix)
-        states = []
-        for _name, info in comps:
-            alive = all(
-                getattr(h, "alive", True) for h in info["handles"]
-            )
-            for p in info["paths"]:
-                states.append({
-                    "path": p,
-                    "state": "running" if alive else "degraded",
-                    "version": info["version"],
-                })
-        return {"kind": "status", "states": states}
+    def _match(self, prefix):
+        return [(name, info, [p for p in info['paths'] if _matches(p, prefix)])
+                for name, info in self._components.items() if any(_matches(p, prefix) for p in info['paths'])]
 
-    # ---- 前缀匹配（Rust 侧同规：整段相等或后随 '-'）----
-    def _match(self, prefix: str) -> list[tuple[str, dict]]:
-        with self._lock:
-            return [
-                (name, dict(info))
-                for name, info in self._components.items()
-                if any(
-                    p == prefix or (p.startswith(prefix) and p[len(prefix) : len(prefix) + 1] == "-")
-                    for p in info["paths"]
-                )
-            ]
-
-    def _kill_handles(self, handles: list) -> None:
-        ray = self.ray
-        for h in handles:
-            try:
-                ray.kill(h, no_restart=True)
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def _is_dispatcher(h) -> bool:
@@ -420,23 +668,25 @@ class _NotFound(Exception):
 
 
 def _expand_paths(name: str, policy: dict) -> list[str]:
-    """实例路径展开（与 parrot-app/Rust executor 同规）。"""
-    if policy["kind"] == "singleton":
-        return [f"/user/{name}"]
-    n = policy["count"]
-    return [f"/user/{name}-{i}" for i in range(n)]
-
+    if not _valid_name(name):
+        raise ValueError('invalid component name')
+    if policy['kind'] == 'singleton':
+        return [f'/user/{name}']
+    if policy['kind'] not in ('pool', 'sharded'):
+        raise ValueError('unknown instance policy')
+    count = policy['count']
+    if type(count) is not int or not 1 <= count <= 256:
+        raise ValueError('instance count must be between 1 and 256')
+    return [f'/user/{name}-{i}' for i in range(count)]
 
 
 class ParrotDispatcher:
-    """TYPE_KEY → handler 分发（ray 侧单例形态）。
+    """One dispatcher's type-key handlers, with optional explicit composition.
 
-    子类注册 handler：`@dispatcher.handler("pb:demo/Echo")`。
-
-    R4（应用体系架构纠正）：`mount` 支持挂载已部署组件的子 dispatcher
-    （deploy 时网关调用）——组件 handler 与网关内置探针同键时组件优先
-    （业务键唯一——冲突视为部署错误抛 KeyError）。网关自身不再内置
-    业务 handler（业务已迁 apps/*/python/）。
+    Admin deployment does not mount components into a global type-key search:
+    it owns each dispatcher at an exact logical path in _ComponentRuntime.
+    Standalone callers use dispatch_path for admin-deployed components.
+    mount/unmount remain explicit in-process composition helpers.
     """
 
     def __init__(self) -> None:
@@ -451,393 +701,955 @@ class ParrotDispatcher:
         return deco
 
     def mount(self, sub: "ParrotDispatcher") -> None:
-        """挂载组件 dispatcher（deploy）——重复挂载幂等跳过。"""
+        """显式组合本地 dispatcher；同一对象重复挂载幂等。"""
         if sub not in self._mounted:
             self._mounted.append(sub)
 
     def unmount(self, sub: "ParrotDispatcher") -> None:
-        """卸载组件 dispatcher（drain/stop）。"""
+        """解除显式本地组合；不改变管理组件生命周期。"""
         if sub in self._mounted:
             self._mounted.remove(sub)
 
-    def dispatch(self, type_key: str, payload: bytes) -> tuple[str, bytes]:
+    def dispatch_path(self, path, type_key, payload):
+        runtime = getattr(self, '_component_runtime', None)
+        if runtime is None:
+            raise KeyError('no component runtime')
+        result = runtime.ask(path, type_key, payload)
+        if not result['ok']:
+            raise KeyError(result['detail'])
+        return result['key'], result['payload']
+
+    def dispatch(self, type_key: str, payload: bytes, *, trace_recorder=None,
+                 trace_path='', trace_operation='ask') -> tuple[str, bytes]:
         # 已部署组件优先（业务键）——网关内置探针兜底
         for sub in reversed(self._mounted):
             fn = sub._handlers.get(type_key)
             if fn is not None:
-                return fn(type_key, payload)
+                return _recorded_handler(fn, type_key, payload, trace_recorder, trace_path, trace_operation)
         fn = self._handlers.get(type_key)
         if fn is None:
-            raise KeyError(f"unknown type key {type_key}")
-        return fn(type_key, payload)
+            raise UnknownTypeKeyError(f"unknown type key {type_key}")
+        return _recorded_handler(fn, type_key, payload, trace_recorder, trace_path, trace_operation)
+
+
+def _recorded_handler(fn, key, payload, recorder, path, operation):
+    if recorder is None:
+        return fn(key, payload)
+    from .trace import TraceActor
+    from .trace_recording import handler_scope
+    with handler_scope(recorder, path, key, operation):
+        return TraceActor._trace_sync_result(fn(key, payload))
+
+
+def _logical_path(path):
+    if path.startswith('parrot://'):
+        authority, separator, tail = path[len('parrot://'):].partition('/')
+        if not authority or not separator:
+            return ''
+        path = '/' + tail
+    if path.startswith('/ray/user/'):
+        path = path[len('/ray'):]
+    if not path.startswith('/user/'):
+        return ''
+    # Components currently expose their root dispatcher, not arbitrary children.
+    name = path[len('/user/'):]
+    return path if _valid_name(name, 260) else ''
+
+
+def _valid_name(name, limit=256):
+    return (isinstance(name, str) and 0 < len(name) <= limit and name not in ('.', '..') and
+            all(c.isalnum() or c in '-_.' for c in name))
+
+
+def _matches(path, prefix):
+    return path == prefix or path.startswith(prefix + '-')
+
+
+def _detail(error):
+    try:
+        message = str(error)
+    except BaseException:
+        message = 'unprintable ' + type(error).__name__
+    return message.encode('utf-8', errors='replace').decode('utf-8')[:1024]
+
+
+def _kill_and_confirm(ray, handle, probe, deadline=None):
+    """Wait for Ray's death report; kill may return before a probe stops running."""
+    end = time.monotonic() + 5 if deadline is None else deadline
+    if time.monotonic() >= end:
+        raise TimeoutError('actor retirement deadline elapsed')
+    ray.kill(handle, no_restart=True)
+    while True:
+        remaining = end-time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('actor death was not confirmed')
+        try:
+            ray.get(probe.remote(), timeout=remaining)
+        except ray.exceptions.ActorDiedError:
+            return
+        except Exception as error:
+            setup_error = getattr(ray.exceptions, 'RuntimeEnvSetupError', ())
+            # RayTaskError also inherits its user cause. A wrapped user error
+            # cannot prove that actor construction/execution never started.
+            if type(error) is setup_error:
+                return
+            raise
+        # Ray 2.59 can execute a queued method after kill submission. An alive
+        # reply is neither death confirmation nor a permanent retirement failure.
+        time.sleep(min(0.01, max(0, end-time.monotonic())))
+
+
+class _ComponentRuntime:
+    """Path-owned component handles; instantiated inside the Ray worker.
+
+    The standalone executor uses the same implementation under a local lock.
+    The registry retains failed cleanup handles, never publishes a partial pool,
+    and does not transfer application closures out of their owning process.
+    """
+    def __init__(self, dispatcher, ray_module=None, prepared_root=None, trace_config=None):
+        self._prepared_root = prepared_root
+        self._artifacts = {}
+        self._dispatcher = dispatcher
+        self._ray = ray_module
+        self._entries = {}
+        self._lock = threading.RLock()
+        self._trace_config = None
+        self._trace_recorder = None
+        if trace_config is not None:
+            self.configure_tracing(trace_config)
+
+    def configure_tracing(self, config):
+        from .trace_recording import TraceRecorder
+        with self._lock:
+            if self._entries or self._trace_recorder is not None:
+                raise RuntimeError('configure recording once, before mounting components')
+            recorder = TraceRecorder(config)
+            self._trace_config = config
+            self._trace_recorder = recorder
+            return True
+
+    def trace_snapshot(self, path=None):
+        """Non-destructive process snapshot. Collect native paths before retirement."""
+        with self._lock:
+            if path is not None:
+                entry = self._entries.get(_logical_path(path))
+                if entry is None:
+                    raise KeyError('no live trace owner: ' + path)
+                if not _is_dispatcher(entry['handle']):
+                    if self._trace_recorder is None:
+                        return dict(enabled=False)
+                    return self.ray.get(entry['handle'].parrot_trace_snapshot.remote(), timeout=5)
+            return (dict(enabled=False) if self._trace_recorder is None else
+                    self._trace_recorder.snapshot(None if path is None else _logical_path(path)))
+
+    def trace_acknowledge(self, path, span_ids):
+        """Release a saved snapshot's spans, never implicit in snapshot/export."""
+        with self._lock:
+            if self._trace_recorder is None:
+                raise RuntimeError('recording disabled')
+            if path is not None:
+                entry = self._entries.get(_logical_path(path))
+                if entry is None or entry['state'] != 'running':
+                    raise KeyError('no live trace owner: ' + path)
+                if not _is_dispatcher(entry['handle']):
+                    return self.ray.get(entry['handle'].parrot_trace_acknowledge.remote(span_ids), timeout=5)
+            return self._trace_recorder.acknowledge(span_ids, None if path is None else _logical_path(path))
+
+    def trace_export_status(self, path=None):
+        with self._lock:
+            entry = self._entries.get(_logical_path(path)) if path is not None else None
+            if path is not None and entry is None:
+                raise KeyError('trace owner not found: ' + path)
+            if entry is not None and not _is_dispatcher(entry['handle']):
+                return self.ray.get(entry['handle'].parrot_trace_export_status.remote(), timeout=5)
+            return dict(enabled=False) if self._trace_recorder is None else self._trace_recorder.export_status()
+
+    def trace_finish(self, timeout=5.0):
+        with self._lock:
+            return (dict(ok=True, enabled=False) if self._trace_recorder is None else
+                    self._trace_recorder.finish_export(timeout))
+
+    def trace_flush(self, path=None, timeout=5.0):
+        with self._lock:
+            entry = self._entries.get(_logical_path(path)) if path is not None else None
+            if path is not None and entry is None:
+                raise KeyError('trace owner not found: ' + path)
+            if entry is not None and not _is_dispatcher(entry['handle']):
+                return self.ray.get(entry['handle'].parrot_trace_flush.remote(timeout), timeout=timeout)
+            return (dict(ok=True, enabled=False) if self._trace_recorder is None else
+                    self._trace_recorder.flush_export(timeout, None if path is None else _logical_path(path)))
+
+    @property
+    def ray(self):
+        if self._ray is None:
+            import ray
+            self._ray = ray
+        return self._ray
+
+    def ready(self):
+        return True
+
+    def handles(self, paths):
+        with self._lock:
+            return [self._entries[p]['handle'] for p in paths if p in self._entries]
+
+    def _context(self, name):
+        from contextlib import nullcontext
+        artifact = self._artifacts.get(name)
+        return artifact['imports'].enter() if artifact and artifact['imports'] else nullcontext()
+
+    def _release_artifact(self, name):
+        artifact = self._artifacts.get(name)
+        if artifact is not None:
+            if artifact['snapshot'] is not None:
+                artifact['snapshot'].close()
+            del self._artifacts[name]
+
+    def mount_module(self, name, module_name, module_dir, env, paths, version, config):
+        import importlib
+        from pathlib import Path
+        from .ray_artifacts import Snapshot, Imports, MAX_OWNED_BYTES
+        with self._lock:
+            if any(path in self._entries for path in paths):
+                retained = [p for p in paths if p in self._entries and self._entries[p]['owner'] == name]
+                return dict(ok=False, paths=retained, detail='logical path already owned')
+            created = []
+            try:
+                root = self._prepared_root
+                if module_dir is not None and root is None:
+                    owned = sum(a['snapshot'].size for a in self._artifacts.values() if a['snapshot'])
+                    snapshot = Snapshot(module_dir, MAX_OWNED_BYTES-owned)
+                    root = snapshot.root
+                    self._artifacts[name] = dict(snapshot=snapshot, imports=Imports(root, snapshot.tops))
+                if root is not None:
+                    target = Path(root).joinpath(*module_name.split('.'))
+                    if not target.with_suffix('.py').is_file() and not (target/'__init__.py').is_file():
+                        raise ValueError('entry module is missing from the artifact snapshot')
+                with self._context(name):
+                    module = importlib.import_module(module_name)
+                    entry = getattr(module, 'parrot_entry')
+                    for path in paths:
+                        handle = entry(dict(path=path, version=version, config=config, env=env, ray=self.ray))
+                        native = not _is_dispatcher(handle)
+                        ready = getattr(handle, '__ray_ready__', None) if native else None
+                        if native and not callable(getattr(ready, 'remote', None)):
+                            raise TypeError('parrot_entry must return a dispatcher or Ray actor handle')
+                        self._entries[path] = dict(owner=name, handle=handle, state='starting')
+                        created.append(path)
+                        if native:
+                            self.ray.get(ready.remote(), timeout=5)
+                            if self._trace_config is not None:
+                                method = getattr(handle, 'parrot_trace_configure', None)
+                                if not callable(getattr(method, 'remote', None)):
+                                    raise TypeError('recording requires TraceActor or AsyncTraceActor')
+                                self._entries[path]['trace_config_attempted'] = True
+                                if self.ray.get(method.remote(self._trace_config, path), timeout=5) is not True:
+                                    raise ValueError('invalid native trace configuration receipt')
+                                self._entries[path]['trace_configured'] = True
+                for path in created:
+                    self._entries[path]['state'] = 'running'
+                return dict(ok=True, paths=created)
+            except BaseException as error:
+                self.retire_paths(name, created)
+                retained = [p for p in created if p in self._entries]
+                if not retained:
+                    try:
+                        self._release_artifact(name)
+                    except BaseException:
+                        # Preserve a cleanup-only owner if filesystem retirement fails.
+                        self._entries[paths[0]] = dict(owner=name, handle=None, state='stop_failed')
+                        retained = [paths[0]]
+                return dict(ok=False, paths=retained, detail=_detail(error))
+
+    def retire_paths(self, name, paths, timeout_ms=None):
+        with self._lock:
+            deadline = None if timeout_ms is None else time.monotonic() + min(timeout_ms, 60000) / 1000
+            states = {}
+            for path in paths:
+                entry = self._entries.get(path)
+                if entry is None:
+                    states[path] = None  # Retry after an uncertain remote receipt is idempotent.
+                    continue
+                if entry['owner'] != name:
+                    raise ValueError('logical path belongs to another component')
+                entry['state'] = 'retiring' if deadline is None else 'draining'
+                handle = entry['handle']
+                try:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError('component drain deadline elapsed')
+                        hook = getattr(handle, 'parrot_drain', None)
+                        if hook is not None:
+                            if _is_dispatcher(handle):
+                                with self._context(name):
+                                    hook()
+                            else:
+                                self.ray.get(hook.remote(), timeout=remaining)
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('component drain deadline elapsed')
+                    if handle is not None and not _is_dispatcher(handle):
+                        if (self._trace_config is not None and self._trace_config.export is not None
+                                and entry.get('trace_config_attempted') and not entry.get('trace_finished')):
+                            remaining = 5.0 if deadline is None else deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError('native trace retirement deadline elapsed')
+                            receipt = self.ray.get(handle.parrot_trace_finish.remote(remaining), timeout=remaining)
+                            _require_trace_finish(receipt, allow_disabled=not entry.get('trace_configured'))
+                            entry['trace_finished'] = True
+                        _kill_and_confirm(self.ray, handle, handle.__ray_ready__, deadline)
+                    elif handle is not None and self._trace_recorder is not None and self._trace_config.export is not None:
+                        remaining = 5.0 if deadline is None else deadline - time.monotonic()
+                        receipt = self._trace_recorder.flush_export(remaining, path)
+                        if receipt.get('ok') is not True:
+                            raise RuntimeError('dispatcher trace export incomplete')
+                    if not any(p != path and e['owner'] == name for p,e in self._entries.items()):
+                        self._release_artifact(name)
+                    del self._entries[path]
+                    states[path] = None
+                except BaseException:
+                    entry['state'] = 'stop_failed' if deadline is None else 'drain_failed'
+                    states[path] = entry['state']
+            return states
+
+    def ask_traced(self, path, key, payload, parent):
+        with transferred_scope(parent):
+            return self.ask(path, key, payload)
+
+    def deliver_traced(self, path, key, payload, parent):
+        with transferred_scope(parent):
+            return self.deliver(path, key, payload)
+
+    def ask(self, path, key, payload, *, _trace_operation='ask'):
+        with self._lock:
+            if (self._trace_recorder is not None and self._trace_config.export is not None
+                    and self._trace_recorder.closed):
+                return dict(ok=False, code=3, detail='trace owner is retiring')
+            logical = _logical_path(path)
+            entry = self._entries.get(logical)
+            if entry is None:
+                # Only explicitly configured gateway handlers may fall back.
+                # A deployed component's same-named handler is never searched.
+                if logical and key in self._dispatcher._handlers:
+                    reply_key, reply = _recorded_handler(self._dispatcher._handlers[key], key, payload,
+                                                        self._trace_recorder, logical, _trace_operation)
+                else:
+                    return dict(ok=False, code=1, detail='actor not found: ' + path)
+            elif entry['state'] != 'running':
+                return dict(ok=False, code=3, detail='component is retiring: ' + logical)
+            else:
+                handle = entry['handle']
+                if _is_dispatcher(handle):
+                    with self._context(entry['owner']):
+                        if self._trace_recorder is None:
+                            reply_key, reply = handle.dispatch(key, payload)
+                        else:
+                            reply_key, reply = handle.dispatch(key, payload, trace_recorder=self._trace_recorder,
+                                                              trace_path=logical, trace_operation=_trace_operation)
+                else:
+                    parent = capture_parent()
+                    if parent is None and self._trace_recorder is None:
+                        reply_key, reply = self.ray.get(handle.ask.remote(key, payload))
+                    else:
+                        method = getattr(handle, 'ask_traced', None)
+                        if not callable(getattr(method, 'remote', None)):
+                            return dict(ok=False, code=4, detail='native actor requires TraceActor or AsyncTraceActor')
+                        reply_key, reply = self.ray.get(method.remote(key, payload, parent))
+            return dict(ok=True, key=reply_key, payload=reply)
+
+    def deliver(self, path, key, payload):
+        # A native actor may distinguish delivery from request/reply. Completion
+        # remains internal: normal TELL emits no Wire success/failure receipt.
+        with self._lock:
+            entry = self._entries.get(_logical_path(path))
+            if entry is not None and entry['state'] == 'running' and not _is_dispatcher(entry['handle']):
+                parent = capture_parent()
+                if parent is not None or self._trace_recorder is not None:
+                    method = getattr(entry['handle'], 'deliver_traced', None)
+                    if not callable(getattr(method, 'remote', None)):
+                        raise TypeError('native actor requires TraceActor or AsyncTraceActor')
+                    self.ray.get(method.remote(key, payload, parent))
+                    return
+                method = getattr(entry['handle'], 'deliver', None)
+                if callable(getattr(method, 'remote', None)):
+                    self.ray.get(method.remote(key, payload))
+                    return
+            self.ask(path, key, payload, _trace_operation='tell')
+
+
+class GatewayCleanupError(RuntimeError):
+    """Cleanup did not complete; owner.close() retains an explicit retry path."""
+    def __init__(self, owner, cause):
+        self.owner = owner
+        super().__init__('gateway cleanup incomplete: ' + _detail(cause))
+
+
+def _require_trace_finish(receipt, *, allow_disabled=False):
+    if (allow_disabled and isinstance(receipt, dict) and set(receipt) == {'ok', 'enabled'}
+            and receipt['ok'] is True and receipt['enabled'] is False):
+        return
+    if (not isinstance(receipt, dict) or receipt.get('ok') is not True or
+            receipt.get('enabled') is not True or receipt.get('running') is not False or
+            type(receipt.get('pending')) is not int or receipt['pending'] != 0 or
+            type(receipt.get('active')) is not int or receipt['active'] != 0 or receipt.get('error') is not None):
+        raise RuntimeError('trace export retirement not confirmed')
+
+
+class _GatewayResources:
+    def __init__(self, ray, state):
+        self.ray, self.state = ray, state
+        self.worker = None
+        self._retirement = None
+        self._retired = False
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def close(self, timeout=10.0):
+        import math
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('gateway shutdown timeout must be finite and positive')
+        deadline = time.monotonic() + timeout
+        if not self._lock.acquire(timeout=timeout):
+            raise GatewayCleanupError(self, TimeoutError('another cleanup attempt is still running'))
+        try:
+            if self._closed:
+                return
+            self.state.closing = True
+            self.state.ask_admission.seal()
+            self.state.management.close(deadline)
+            self.state.ask_admission.wait(deadline)
+            if self.worker is not None:
+                if not self._retired:
+                    if self._retirement is None:
+                        self._retirement = self.worker.close.remote()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('gateway retirement deadline elapsed')
+                    try:
+                        receipt = self.ray.get(self._retirement, timeout=remaining)
+                    except Exception as error:
+                        timeout_type = getattr(self.ray.exceptions, 'GetTimeoutError', TimeoutError)
+                        if not isinstance(error, (TimeoutError, timeout_type)):
+                            self._retirement = None
+                        raise
+                    self._retirement = None
+                    if (not isinstance(receipt, dict) or type(receipt.get('ok')) is not bool or
+                            receipt != {'ok': True, 'pending': []}):
+                        raise RuntimeError('deployment retirement incomplete: ' + _detail(receipt))
+                    self._retired = True
+                _kill_and_confirm(self.ray, self.worker, self.worker.ready, deadline)
+                self.worker = None
+            with self.state.lock:
+                self.state.components.clear()
+                self.state.path_states = {}
+            self._closed = True
+        except BaseException as error:
+            raise GatewayCleanupError(self, error) from error
+        finally:
+            self._lock.release()
 
 
 def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
-          parrot_addr: str | None = None) -> None:
+          parrot_addr: str | None = None, *, shutdown_timeout=10.0, trace_config=None) -> None:
     """启动网关（阻塞）。
 
     - ray.init 参数可注入（测试用 num_cpus=2 / include_dashboard=False）
     - parrot_addr（双模式组网之注册模式）：给出 "host:port" 时不再被动
       accept，而是主动拨号 parrot 节点并发起客户端握手（发 HANDSHAKE →
       收 HANDSHAKE_ACK），随后同一帧循环服务——生产拓扑形态。
-    - dispatcher 可注入（默认空——无 handler 时 ASK 一律 UnknownTypeKey）
+    - dispatcher 可注入（默认空；未部署 path 返回 ActorNotFound）
     - DEV_08 并发模型：收包线程只做帧解码与派发；ASK 的 ray.get 在
       worker 线程池执行（慢 handler 不阻塞后续帧/心跳）；回复经
-      out 队列由 writer 线程写出（天然合并写、无锁竞争）。
+      有界 outbox 由单独 writer 写出。组件 worker 默认串行执行。
     """
     import ray
+    import math
+    if not isinstance(shutdown_timeout, (int, float)) or not math.isfinite(shutdown_timeout) or shutdown_timeout <= 0:
+        raise ValueError('gateway shutdown timeout must be finite and positive')
+    if trace_config is not None:
+        from .trace_recording import TraceConfig
+        if not isinstance(trace_config, TraceConfig):
+            raise TypeError('expected TraceConfig')
 
-    ray.init(**(ray_kwargs or {"num_cpus": 2, "include_dashboard": False, "log_to_driver": False}))
+    from .ray_startup import initialize
+    if ray.is_initialized():
+        if ray_kwargs:
+            raise ValueError('ray_kwargs cannot reconfigure an existing Ray runtime')
+    else:
+        initialize(ray, ray_kwargs or {"num_cpus": 2, "include_dashboard": False, "log_to_driver": False})
 
     dispatch = dispatcher or ParrotDispatcher()
 
-    @ray.remote
-    class RayWorker:
-        """ParrotDispatcher 的 ray actor 化（ask=ray.get / deliver=fire-and-forget）。
+    from .ray_hosts import IsolatedRuntime
+    admin_state = RayAdminState()
+    owner = _GatewayResources(ray, admin_state)
+    try:
+        factory = ray.remote(IsolatedRuntime).options(num_cpus=0)
+        worker = factory.remote(dispatch) if trace_config is None else factory.remote(dispatch, trace_config=trace_config)
+        owner.worker = worker
+        _serve_network(port, dispatch, worker, ray, admin_state, parrot_addr)
+    finally:
+        owner.close(shutdown_timeout)
 
-        R4：mount_module/unmount_name 远程方法——deploy 的 PyModule 组件
-        在 actor 进程内 importlib 载入 + parrot_entry 实例化 + 挂载
-        （dispatcher 含闭包状态，跨进程序列化会因 actor 侧无模块而
-        失败——组件必须在目标进程内构建）。ask 路由：组件 handler
-        优先（后挂载优先），网关探针兜底。
-        """
 
-        def __init__(self, d: ParrotDispatcher) -> None:
-            self._d = d
-            self._mounted: dict[str, object] = {}  # comp_name → dispatcher
-
-        def ask(self, type_key: str, payload: bytes) -> tuple[str, bytes]:
-            for sub in reversed(list(self._mounted.values())):
-                fn = getattr(sub, "_handlers", {}).get(type_key)
-                if fn is not None:
-                    return fn(type_key, payload)
-            return self._d.dispatch(type_key, payload)
-
-        def deliver(self, type_key: str, payload: bytes) -> None:
-            self.ask(type_key, payload)  # 不 get（非取消语义）
-
-        def mount_module(self, comp_name: str, module_name: str, module_dir: str,
-                         env_dict: dict, paths: list[str]) -> list[str]:
-            """actor 进程内载入 app 组件模块并挂载其 dispatcher。"""
-            import importlib
-            import os
-            import sys
-
-            if module_dir and module_dir not in sys.path:
-                sys.path.insert(0, os.path.abspath(module_dir))
-            mod = importlib.import_module(module_name)
-            entry = getattr(mod, "parrot_entry", None)
-            if entry is None:
-                raise RuntimeError(f"{module_name} has no parrot_entry(ctx)")
-            import ray as _ray
-
-            for p in paths:
-                h = entry({"path": p, "env": env_dict, "ray": _ray})
-                if _is_dispatcher(h):
-                    self._mounted[comp_name] = h
-            return paths
-
-        def unmount_name(self, comp_name: str) -> None:
-            self._mounted.pop(comp_name, None)
-
-    worker = RayWorker.remote(dispatch)
-
+def _serve_network(port, dispatch, worker, ray, admin_state, parrot_addr):
     if parrot_addr:
-        # 注册模式：主动拨号 parrot 节点 + 客户端握手（Rust 侧 accept 后
-        # 会回 HANDSHAKE_ACK——随后双向帧流与被动模式完全一致）
-        # worker 就绪等待：actor 异步调度（SchedulingCancelled 规避——
-        # ray.get 强制等待首个任务落位再进入帧循环）
-        class _Ready:
-            def ready(self) -> bool:
-                return True
-
-        _probe = ray.remote(_Ready).remote()
-        ray.get(_probe.ready.remote())
-        host, _, pport = parrot_addr.partition(":")
-
-        # ---- 容灾：重连监督 + 半开检测（与 Rust hub 心跳对称）----
-        # connect_loop：断线/半开 → 指数退避重拨（1s→60s）→ 重新握手注册。
-        # 首连成功打印 RAY_GW_REGISTERED（stdout 契约）；重连静默恢复。
-        import time as _time
-
-        def connect_loop() -> None:
-            attempt = 0
-            announced = False
-            while True:
-                if attempt:
-                    _time.sleep(min(60.0, 1.0 * (2 ** min(attempt, 6))))
-                try:
-                    s = socket.create_connection((host, int(pport)), timeout=10)
-                except OSError as e:
-                    print(f"[ray-gw] connect parrot failed: {e!r}", file=sys.stderr, flush=True)
-                    attempt += 1
-                    continue
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                try:
-                    serve_link(s, attempt, announced)
-                    announced = True  # serve_link 正常返回 = 曾成功注册
-                except _HalfOpen:
-                    print("[ray-gw] parrot silent >10s — half-open, reconnecting",
-                          file=sys.stderr, flush=True)
-                attempt = 0 if announced else attempt + 1
-
-        class _HalfOpen(Exception):
-            pass
-
-        def serve_link(sock: socket.socket, _attempt: int, announced: bool) -> None:
-            out_local: queue.Queue[bytes] = queue.Queue()
-
-            def writer() -> None:
-                while True:
-                    sock.sendall(out_local.get())
-
-            threading.Thread(target=writer, daemon=True).start()
-
-            from concurrent.futures import ThreadPoolExecutor
-
-            pool_local = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
-
-            # B3（DEV_09）：admin-v2 执行器（回帧经 out_local——writer 线程）
-            admin_local = RayAdminExecutor(out_local, gateway_dispatcher=dispatch,
-                                           worker_ref=worker)
-
-            def reply(cid: int, key: str, payload: bytes) -> None:
-                METRICS.bump("replies_tx")
-                METRICS.bump("bytes_tx", len(payload) + len(key))
-                out_local.put(build_frame(FT_REPLY, cid, "", key, payload))
-
-            def reply_err(cid: int, code: int, detail: str) -> None:
-                METRICS.bump("replies_tx")
-                METRICS.bump("reply_errs")
-                out_local.put(build_frame(FT_REPLY_ERR, cid, "", "", encode_err_payload(code, detail)))
-
-            def run_ask(cid: int, type_key: str, payload: bytes) -> None:
-                try:
-                    rkey, rpayload = ray.get(worker.ask.remote(type_key, payload))
-                    reply(cid, rkey, rpayload)
-                except Exception as e:  # noqa: BLE001
-                    reply_err(cid, ERR_UNKNOWN_TYPE_KEY, str(e))
-
-            # 方案 A：直连学习表 node → socket（hint 到达后台拨号建立）
-            direct_links: dict[str, socket.socket] = {}
-
-            def on_route_hint(payload: bytes) -> None:
-                try:
-                    nlen = int.from_bytes(payload[0:2], "little")
-                    node = payload[2:2 + nlen].decode()
-                    alen = int.from_bytes(payload[2 + nlen:4 + nlen], "little")
-                    addr = payload[4 + nlen:4 + nlen + alen].decode()
-                except Exception:  # noqa: BLE001
-                    return
-                if node in direct_links:
-                    return
-
-                def dial() -> None:
-                    h, _, p = addr.partition(":")
-                    try:
-                        ds = socket.create_connection((h, int(p)), timeout=10)
-                        ds.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                        # 客户端握手（对端 accept 侧回 ACK）
-                        out_d: queue.Queue[bytes] = queue.Queue()
-
-                        def w_d() -> None:
-                            while True:
-                                ds.sendall(out_d.get())
-
-                        threading.Thread(target=w_d, daemon=True).start()
-                        out_d.put(build_frame(FT_HANDSHAKE, 1, "", "__handshake__",
-                                              handshake_body("ray-gw-1")))
-                        # 简化：不等待 ACK 即登记（对端 accept 逻辑固定回 ACK；
-                        # 失败由 socket 异常清理）。直连承载 ASK/TELL 出站。
-                        direct_links[node] = ds
-                        print(f"[ray-gw] direct link to {node} up", file=sys.stderr, flush=True)
-                    except OSError as e:
-                        print(f"[ray-gw] direct dial {node} failed: {e!r}",
-                              file=sys.stderr, flush=True)
-
-                threading.Thread(target=dial, daemon=True).start()
-
-            dec_local = FrameDecoder()
-            handshake_done = False
-            last_inbound = _time.monotonic()
-            if not announced:
-                print(f"RAY_GW_REGISTERED={parrot_addr}", flush=True)
-            out_local.put(build_frame(FT_HANDSHAKE, 1, "", "__handshake__",
-                                      handshake_body("ray-gw-1")))
-            sock.settimeout(5.0)  # 半开检测唤醒周期
+        ray.get(worker.ready.remote())
+        from urllib.parse import urlsplit
+        address = urlsplit("//" + parrot_addr)
+        host, port = address.hostname, address.port
+        if not host or not port:
+            raise ValueError("invalid registration address")
+        attempt = 0
+        announced = False
+        while True:
+            if attempt:
+                time.sleep(min(60.0, 2 ** min(attempt - 1, 6)))
             try:
-                while True:
-                    try:
-                        chunk = sock.recv(65536)
-                    except socket.timeout:
-                        if _time.monotonic() - last_inbound > 10.0:
-                            raise _HalfOpen()
-                        continue
-                    if not chunk:
-                        return
-                    last_inbound = _time.monotonic()
-                    dec_local.feed(chunk)
-                    while (f := dec_local.next_frame()) is not None:
-                        try:
-                            if not handshake_done:
-                                if f.ft == FT_HANDSHAKE_ACK:
-                                    print(f"[ray-gw] parrot {parrot_addr} handshake ok",
-                                          file=sys.stderr, flush=True)
-                                    handshake_done = True
-                                    METRICS.bump("handshakes_ok")
-                                continue
-                            if f.ft == FT_ASK:
-                                METRICS.bump("asks_rx")
-                                METRICS.bump("bytes_rx", len(f.payload))
-                                reply_to, real_payload = split_reply_to(f.payload) or ("", f.payload)
-                                _ = reply_to
-                                pool_local.submit(run_ask, f.cid, f.type_key, real_payload)
-                            elif f.ft == FT_TELL:
-                                METRICS.bump("tells_rx")
-                                METRICS.bump("bytes_rx", len(f.payload))
-                                worker.deliver.remote(f.type_key, f.payload)
-                            elif f.ft == FT_HEARTBEAT:
-                                METRICS.bump("heartbeats_rx")
-                                out_local.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
-                            elif f.ft == FT_ROUTE_HINT:
-                                on_route_hint(f.payload)
-                            elif f.ft == FT_SYSTEM_EVENT:
-                                # B3：admin-v2（0x03 命令）——执行器消费；其余忽略
-                                admin_local.on_frame(f.cid, f.path, f.payload)
-                        except Exception as loop_err:  # noqa: BLE001
-                            print(f"[ray-gw] frame loop error: {loop_err!r}",
-                                  file=sys.stderr, flush=True)
-            finally:
-                pool_local.shutdown(wait=False)
-                sock.close()
+                sock = socket.create_connection((host, port), timeout=10)
+            except OSError as error:
+                print(f"[ray-gw] connect failed: {error!r}", file=sys.stderr, flush=True)
+                attempt += 1
+                continue
+            established = False
 
-        connect_loop()
+            def ready():
+                nonlocal established, announced
+                established = True
+                if not announced:
+                    print(f"RAY_GW_REGISTERED={parrot_addr}", flush=True)
+                    announced = True
+
+            with ExitStack() as connection:
+                connection.callback(sock.close)
+                links = _DirectLinks(dispatch, worker, ray, admin_state)
+                connection.callback(links.close)
+                _serve_connection_guarded(sock, dispatch, worker, ray, admin_state,
+                                          initiator=True, ready=ready, route_hint=links.hint,
+                                          idle_timeout=10.0)
+            attempt = 1 if established else attempt + 1
         return
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # DEV_08：大帧突发下内核缓冲放大（wire 1.0 上限 16MiB 帧体）
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-    srv.bind(("127.0.0.1", port))
-    srv.listen(128)
-    print(f"RAY_GW_PORT={srv.getsockname()[1]}", flush=True)
+    with ExitStack() as network:
+        connections = _ConnectionDrivers()
+        network.callback(connections.close)
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        network.callback(srv.close)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(128)
+        print(f"RAY_GW_PORT={srv.getsockname()[1]}", flush=True)
 
-    # 多连接生命周期：每连接独立线程（探针/应用/压测可并发连接；
-    # METRICS 模块级跨连接累计——uptime/进程数全局一致）
-    while True:
-        sock, _addr = srv.accept()
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        threading.Thread(
-            target=_serve_connection_guarded,
-            args=(sock, dispatch, worker, ray),
-            daemon=True,
-        ).start()
+        while True:
+            sock, _addr = srv.accept()
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                connections.start(sock, dispatch, worker, ray, admin_state)
+            except BaseException:
+                sock.close()
+                raise
 
 
-def _serve_connection_guarded(sock, dispatch, worker, ray) -> None:
-    METRICS.bump("connections", 1)
+class _ConnectionDrivers:
+    """Own accepted sockets and join their Wire drivers before serve unwinds.
+
+    Closing a peer retires only that connection. Gateway exit first shuts down
+    every live socket to wake readers/writers, then joins every started driver.
+    Completed thread objects are pruned on admission, without retaining every
+    historical connection. Running ASK/admin work remains owned by its runtime.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sockets = set()
+        self._threads = set()
+        self._closed = False
+
+    def start(self, sock, *args):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('gateway connection owner is closed')
+            self._threads = {thread for thread in self._threads if thread.is_alive()}
+            thread = threading.Thread(target=self._run, args=(sock, args),
+                                      name='parrot-gateway-connection', daemon=True)
+            self._sockets.add(sock)
+            self._threads.add(thread)
+            try:
+                thread.start()
+            except BaseException:
+                if thread.ident is None:
+                    self._sockets.discard(sock)
+                    self._threads.discard(thread)
+                raise
+
+    def _run(self, sock, args):
+        try:
+            _serve_connection_guarded(sock, *args)
+        finally:
+            with self._lock:
+                self._sockets.discard(sock)
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            sockets, threads = list(self._sockets), list(self._threads)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        for thread in threads:
+            thread.join()
+        with self._lock:
+            self._sockets.clear()
+            self._threads.clear()
+
+
+
+class _ConnectionOutbox:
+    """Bound queued plus in-flight wire bytes; overload retires the connection."""
+
+    MAX_PENDING_FRAMES = 256
+    MAX_PENDING_BYTES = 16 * 1024 * 1024
+
+    def __init__(self, sock):
+        self._sock = sock
+        self.max_frame_len = MAX_FRAME_LEN
+        self._pending_frames = 0
+        self._pending_bytes = 0
+        self._queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._thread = threading.Thread(target=self._write, name="parrot-gateway-writer", daemon=True)
+        self._thread.start()
+
+    def put(self, frame):
+        if len(frame) >= 4 and int.from_bytes(frame[:4], "little") == len(frame) - 4 and len(frame) - 4 > self.max_frame_len:
+            self._finish()
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            if (self._pending_frames >= self.MAX_PENDING_FRAMES or
+                    len(frame) > self.MAX_PENDING_BYTES - self._pending_bytes):
+                self._retire_locked()
+            else:
+                self._pending_frames += 1
+                self._pending_bytes += len(frame)
+                self._queue.put(frame)
+                return True
+        # Closing on overload must also unblock the in-flight socket write and
+        # reader; never enqueue an error response into the full outbox.
+        self._shutdown_socket()
+        return False
+
+    def _retire_locked(self):
+        self._closed = True
+        while True:
+            try:
+                frame = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if frame is not None:
+                self._pending_frames -= 1
+                self._pending_bytes -= len(frame)
+        self._queue.put(None)
+
+    def _shutdown_socket(self):
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _finish(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._retire_locked()
+        self._shutdown_socket()
+
+    def _write(self):
+        try:
+            while True:
+                frame = self._queue.get()
+                if frame is None:
+                    return
+                try:
+                    self._sock.sendall(frame)
+                    METRICS.transmitted(frame)
+                finally:
+                    # The writer owns this frame after dequeue, including when
+                    # shutdown concurrently discards the remaining queue.
+                    with self._lock:
+                        self._pending_frames -= 1
+                        self._pending_bytes -= len(frame)
+        except OSError:
+            # Also wake the reader so a failed writer cannot leave a live session.
+            pass
+        finally:
+            self._finish()
+
+    def close(self):
+        self._finish()
+        self._thread.join()
+
+
+class _DirectLinks:
+    """Bounded child connections owned by one registered parent connection."""
+    def __init__(self, dispatch, worker, ray, admin_state, max_links=8):
+        from concurrent.futures import ThreadPoolExecutor
+        self._dispatch, self._worker, self._ray = dispatch, worker, ray
+        self._admin_state = admin_state
+        self._lock = threading.Lock()
+        self._closed = False
+        self._links = {}
+        self._max_links = max_links
+        self._pool = ThreadPoolExecutor(max_workers=max_links, thread_name_prefix="parrot-direct")
+
+    def hint(self, payload):
+        from urllib.parse import urlsplit
+        if not 4 <= len(payload) <= 4096:
+            return
+        try:
+            nlen = int.from_bytes(payload[:2], "little")
+            off = 2 + nlen
+            if off + 2 > len(payload):
+                return
+            node = payload[2:off].decode()
+            alen = int.from_bytes(payload[off:off+2], "little")
+            if off + 2 + alen != len(payload):
+                return
+            address = urlsplit("//" + payload[off+2:].decode())
+            host, port = address.hostname, address.port
+            if not node or not host or not port or address.path or address.query or address.fragment or address.username:
+                return
+        except (ValueError, UnicodeError):
+            return
+        with self._lock:
+            if self._closed or node in self._links or len(self._links) >= self._max_links:
+                return
+            self._links[node] = None
+            self._pool.submit(self._dial, node, host, port)
+
+    def _dial(self, node, host, port):
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=10)
+            with self._lock:
+                if self._closed:
+                    return
+                self._links[node] = sock
+            _serve_connection_guarded(sock, self._dispatch, self._worker, self._ray,
+                                      self._admin_state, initiator=True, expected_node=node,
+                                      idle_timeout=10.0)
+        except (OSError, ValueError) as error:
+            print(f"[ray-gw] direct dial {node!r} failed: {error!r}", file=sys.stderr, flush=True)
+        finally:
+            if sock is not None:
+                sock.close()
+            with self._lock:
+                self._links.pop(node, None)
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            sockets = [sock for sock in self._links.values() if sock is not None]
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        # Socket connects have a ten-second timeout; hostname resolution is
+        # governed by the system resolver. Join every child before retirement.
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _serve_connection_guarded(sock, dispatch, worker, ray, admin_state=None, **options) -> None:
+    lease = _ConnectionMetricLease(METRICS)
     try:
-        _serve_connection(sock, dispatch, worker, ray)
-    except OSError:
-        pass  # 对端异常断开
+        _serve_connection(sock, dispatch, worker, ray, admin_state, lease=lease, **options)
+    except (OSError, ValueError) as error:
+        print(f"[ray-gw] connection retired: {error!r}", file=sys.stderr, flush=True)
     finally:
-        METRICS.bump("connections", -1)
+        lease.close()
         try:
             sock.close()
         except OSError:
             pass
 
 
-def _serve_connection(sock, dispatch, worker, ray) -> None:
-    """单连接服务（serve 的 listen 循环逐连接调用）。"""
-    import queue as _queue
+def _serve_connection(sock, dispatch, worker, ray, admin_state=None, *, lease,
+                      initiator=False, ready=None, expected_node=None,
+                      route_hint=None, handshake_timeout=10.0, idle_timeout=None) -> None:
+    """One Wire driver for listen, registration and owned direct connections."""
     from concurrent.futures import ThreadPoolExecutor
 
-    out: _queue.Queue[bytes] = _queue.Queue()
+    with ExitStack() as connection:
+        if admin_state is None:
+            admin_state = RayAdminState()
+        out = _ConnectionOutbox(sock)
+        connection.callback(out.close)
+        pool = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
+        connection.callback(pool.shutdown, wait=False, cancel_futures=True)
 
-    def writer() -> None:
-        while True:
-            sock.sendall(out.get())
-
-    threading.Thread(target=writer, daemon=True).start()
-
-    # DEV_08：ASK 执行池——ray.get 阻塞调用移出收包线程（头阻塞消除）。
-    pool = ThreadPoolExecutor(max_workers=RAY_GW_ASK_WORKERS)
-
-    def reply(cid: int, key: str, payload: bytes) -> None:
-        METRICS.bump("replies_tx")
-        METRICS.bump("bytes_tx", len(payload) + len(key))
-        out.put(build_frame(FT_REPLY, cid, "", key, payload))
-
-    def reply_err(cid: int, code: int, detail: str) -> None:
-        METRICS.bump("replies_tx")
-        METRICS.bump("reply_errs")
-        out.put(build_frame(FT_REPLY_ERR, cid, "", "", encode_err_payload(code, detail)))
-
-    def run_ask(cid: int, type_key: str, payload: bytes) -> None:
-        try:
-            rkey, rpayload = ray.get(worker.ask.remote(type_key, payload))
-            reply(cid, rkey, rpayload)
-        except Exception as e:  # noqa: BLE001
-            reply_err(cid, ERR_UNKNOWN_TYPE_KEY, str(e))
-
-    # B3（DEV_09）：admin-v2 执行器（回帧经 out 队列——writer 线程）
-    # R4：dispatcher + worker 传入——deploy 组件挂载路由（actor 进程内）
-    admin_exec = RayAdminExecutor(out, gateway_dispatcher=dispatch, worker_ref=worker)
-
-    dec = FrameDecoder()
-    handshake_done = False
-    while True:
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        dec.feed(chunk)
-        while (f := dec.next_frame()) is not None:
+        def run_ask(cid, reply_to, path, type_key, payload, parent):
             try:
+                result = admin_state.route_error(path)
+                if result is None:
+                    with transferred_scope(parent):
+                        if worker is None:
+                            result = admin._runtime().ask(path, type_key, payload)
+                        elif parent is None:
+                            result = ray.get(worker.ask.remote(path, type_key, payload))
+                        else:
+                            result = ray.get(worker.ask_traced.remote(path, type_key, payload, parent))
+                if result['ok']:
+                    out.put(build_frame(FT_REPLY, cid, reply_to, result['key'], result['payload']))
+                else:
+                    out.put(build_frame(FT_REPLY_ERR, cid, reply_to, '',
+                                        encode_err_payload(result['code'], result['detail'])))
+            except BaseException as error:
+                # This is an owned background task, not the driver's main thread.
+                # User SystemExit/KeyboardInterrupt must not disappear in a Future.
+                try:
+                    code = ERR_UNKNOWN_TYPE_KEY if isinstance(error, UnknownTypeKeyError) else ERR_PROTOCOL_VIOLATION
+                    out.put(build_frame(FT_REPLY_ERR, cid, reply_to, "",
+                                        encode_err_payload(code, _detail(error))))
+                except BaseException:
+                    # Even diagnostic construction can fail. Retire only this
+                    # connection so callers observe failure instead of waiting.
+                    out._finish()
+
+        admin = RayAdminExecutor(out, ray_module=ray, gateway_dispatcher=dispatch,
+                                worker_ref=worker, state=admin_state,
+                                on_reply_failure=out._finish)
+        # Both handshake frames use the global bound, before negotiation.
+        decoder = FrameDecoder()
+        deadline = time.monotonic() + handshake_timeout
+        last_inbound = time.monotonic()
+        handshake_done = False
+        trace_capable = False
+        if initiator:
+            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            encoded = build_frame(FT_HANDSHAKE, 1, "", "__handshake__",
+                                  handshake_body(os.environ.get("PARROT_NODE_ID", "ray-gw-1"),
+                                                 _GATEWAY_CAPABILITIES))
+            # Before handshake admission no business/admin task can enqueue a
+            # frame; the outbox is idle, so there is exactly one socket writer.
+            sock.sendall(encoded)
+            METRICS.transmitted(encoded)
+        while True:
+            if not handshake_done:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Wire handshake deadline elapsed")
+                sock.settimeout(remaining)
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                if not handshake_done or (idle_timeout is not None and time.monotonic() - last_inbound >= idle_timeout):
+                    raise TimeoutError("Wire handshake or idle deadline elapsed")
+                continue
+            if not chunk:
+                return
+            last_inbound = time.monotonic()
+            decoder.feed(chunk)
+            while (frame := decoder.next_frame()) is not None:
+                METRICS.received(frame)
+                if frame.ft == FT_ERROR:
+                    # Retire outside the recoverable application-dispatch boundary.
+                    raise ValueError("remote terminal ERROR")
+                # Decoding is structurally lossless; execution admits only
+                # metadata flags. Batch/compression/encryption/completion and
+                # durable envelopes require semantics not implemented here.
+                if frame.flags & ~(2 | 8 | FLAG_TRACE_CONTEXT) or frame.type_key == "parrot:durable#v1":
+                    raise ValueError("unsupported execution envelope")
+                encoded_size = (4 + BODY_FIXED_OVERHEAD + len(frame.path.encode('utf-8')) +
+                                len(frame.type_key.encode('utf-8')) + len(frame.payload))
+                if frame.flags & FLAG_TRACE_CONTEXT and not trace_capable:
+                    raise ValueError("unnegotiated causal context")
+                trace_parent = frame.take_trace_parent()
+                parent = None if trace_parent is None else trace_parent.encode()
                 if not handshake_done:
-                    if f.type_key == "__handshake__" or f.ft == FT_HANDSHAKE:
-                        fields = dict(parse_tlv(f.payload))
-                        peer = fields.get(1, b"?").decode()
-                        print(f"[ray-gw] handshake from {peer}", file=sys.stderr, flush=True)
-                        METRICS.bump("handshakes_ok")
-                        out.put(
-                            build_frame(
-                                FT_HANDSHAKE_ACK,
-                                f.cid,
-                                "",
-                                "__handshake__",
-                                handshake_ack_body("ray-gw-1"),
-                            )
-                        )
-                        handshake_done = True
+                    expected = FT_HANDSHAKE_ACK if initiator else FT_HANDSHAKE
+                    if frame.ft != expected:
+                        raise ValueError("unexpected frame before Wire handshake")
+                    peer = decode_handshake(frame.payload, acknowledgement=initiator)
+                    if expected_node is not None and peer["node_id"] != expected_node:
+                        raise ValueError("direct link peer identity mismatch")
+                    if not initiator:
+                        encoded = build_frame(FT_HANDSHAKE_ACK, frame.cid, "", "__handshake__",
+                            handshake_ack_body(os.environ.get("PARROT_NODE_ID", "ray-gw-1"),
+                                               _GATEWAY_CAPABILITIES, peer["chosen_codec"]))
+                        sock.sendall(encoded)
+                        METRICS.transmitted(encoded)
+                    # Activate only after ACK has been fully written/validated,
+                    # before decoding any pipelined established frame.
+                    negotiated = min(peer["max_frame_len"], DEFAULT_HANDSHAKE_FRAME_LEN, MAX_FRAME_LEN)
+                    out.max_frame_len = negotiated
+                    decoder.max_frame_len = negotiated
+                    lease.complete()
+                    handshake_done = True
+                    trace_capable = bool(peer['capabilities'] & CAPS_TRACE_CONTEXT)
+                    sock.settimeout(None if idle_timeout is None else min(5.0, idle_timeout))
+                    if ready is not None:
+                        ready()
                     continue
-                if f.ft == FT_ASK:
-                    METRICS.bump("asks_rx")
-                    METRICS.bump("bytes_rx", len(f.payload))
-                    reply_to, real_payload = split_reply_to(f.payload) or ("", f.payload)
-                    _ = reply_to  # 回程经 cid 配对（reply_to 仅诊断）
-                    pool.submit(run_ask, f.cid, f.type_key, real_payload)
-                elif f.ft == FT_TELL:
-                    METRICS.bump("tells_rx")
-                    METRICS.bump("bytes_rx", len(f.payload))
-                    worker.deliver.remote(f.type_key, f.payload)
-                elif f.ft == FT_HEARTBEAT:
-                    METRICS.bump("heartbeats_rx")
-                    out.put(build_frame(FT_HEARTBEAT_ACK, f.cid, "", "", b""))
-                elif f.ft == FT_SYSTEM_EVENT:
-                    # B3（DEV_09）：admin-v2（0x03 命令）——执行器消费；其余忽略
-                    admin_exec.on_frame(f.cid, f.path, f.payload)
-            except Exception as loop_err:  # noqa: BLE001
-                print(f"[ray-gw] frame loop error: {loop_err!r}", file=sys.stderr, flush=True)
-    pool.shutdown(wait=False)
+                if frame.ft in (FT_HANDSHAKE, FT_HANDSHAKE_ACK):
+                    raise ValueError("duplicate Wire handshake")
+                try:
+                    if frame.ft == FT_ASK:
+                        try:
+                            request = split_reply_to(frame.payload)
+                        except UnicodeError:
+                            request = None
+                        if request is None:
+                            out.put(build_frame(FT_REPLY_ERR, frame.cid, "", "",
+                                encode_err_payload(ERR_PROTOCOL_VIOLATION, "invalid ASK reply_to prefix")))
+                            continue
+                        reply_to, payload = request
+                        permit = admin_state.ask_admission.acquire(encoded_size)
+                        if permit is None:
+                            out.put(build_frame(FT_REPLY_ERR, frame.cid, reply_to, "",
+                                encode_err_payload(ERR_OVERLOADED, "gateway ASK capacity exhausted")))
+                            continue
+                        try:
+                            pending = pool.submit(run_ask, frame.cid, reply_to, frame.path, frame.type_key, payload, parent)
+                        except BaseException as error:
+                            permit.release()
+                            if not isinstance(error, Exception):
+                                raise
+                            out.put(build_frame(FT_REPLY_ERR, frame.cid, reply_to, "",
+                                encode_err_payload(ERR_OVERLOADED, "gateway ASK scheduling unavailable")))
+                            continue
+                        # Bind this request's permit now, not a loop-variable
+                        # closure that could release another request's charge.
+                        pending.add_done_callback(permit.release)
+                    elif frame.ft == FT_TELL:
+                        if admin_state.route_error(frame.path) is not None:
+                            continue
+                        with transferred_scope(parent):
+                            if worker is None:
+                                admin._runtime().deliver(frame.path, frame.type_key, frame.payload)
+                            elif parent is None:
+                                worker.deliver.remote(frame.path, frame.type_key, frame.payload)
+                            else:
+                                worker.deliver_traced.remote(frame.path, frame.type_key, frame.payload, parent)
+                    elif frame.ft == FT_HEARTBEAT:
+                        out.put(build_frame(FT_HEARTBEAT_ACK, frame.cid, "", "", b""))
+                    elif frame.ft == FT_ROUTE_HINT and route_hint is not None:
+                        route_hint(frame.payload)
+                    elif frame.ft == FT_SYSTEM_EVENT:
+                        admin.on_frame(frame.cid, frame.path, frame.payload,
+                            encoded_size=4 + BODY_FIXED_OVERHEAD + len(frame.path.encode('utf-8')) +
+                                         len(frame.type_key.encode('utf-8')) + len(frame.payload))
+                except Exception as error:  # noqa: BLE001
+                    print(f"[ray-gw] frame dispatch error: {error!r}", file=sys.stderr, flush=True)
 
 
-def main(argv: list[str]) -> None:
-    port = int(argv[1]) if len(argv) > 1 else 9851
-    # 双模式组网：argv[2] = "parrot=host:port" → 注册模式（主动拨号 parrot）
-    parrot_addr = None
-    if len(argv) > 2 and argv[2].startswith("parrot="):
-        parrot_addr = argv[2][len("parrot="):]
+def main(argv: list[str], *, ray_kwargs: dict | None = None) -> None:
+    from .gateway_cli import parse_gateway_arguments
+    port, parrot_addr, trace_config = parse_gateway_arguments(argv)
     d = ParrotDispatcher()
 
     @d.handler("bin:u:Ping")
@@ -850,12 +1662,23 @@ def main(argv: list[str]) -> None:
         a, b = struct.unpack("<QQ", p)
         return ("bin:u:AddR", struct.pack("<Q", a + b + 1000))  # ray 方言 +1000
 
-    # R4（应用体系架构纠正）：网关不再内置业务 handler——业务组件经
-    # Deploy{PyModule} 载入（ray 网关 _launch importlib 载入 app 模块，
-    # dispatcher 融合：已部署组件 handler 优先，网关探针兜底）。
+    # Gateway handlers are explicit probes. Deploy creates separate path-owned
+    # components inside the worker; their handlers are not globally merged.
 
 
-    serve(port, d, parrot_addr=parrot_addr)
+    import ray
+    from .ray_startup import graceful_sigterm
+    already_initialized = ray.is_initialized()
+    with graceful_sigterm():
+        try:
+            serve(port, d, ray_kwargs=ray_kwargs, parrot_addr=parrot_addr, trace_config=trace_config)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # The CLI owns a runtime it initialized, including partial startup
+            # failure. Never disconnect an embedding caller's existing runtime.
+            if not already_initialized:
+                ray.shutdown()
 
 
 if __name__ == "__main__":

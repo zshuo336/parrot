@@ -721,6 +721,12 @@ mod tests {
         });
     }
 
+    impl parrot_api::context::ActorSpawnContext<TestActor> for MockActorContext {
+        fn wrap_spawn(actor: TestActor) -> BoxedMessage {
+            Box::new(actor)
+        }
+    }
+
     // Test ActorSpawnerExt trait
     #[test]
     fn test_actor_spawner_ext() {
@@ -779,6 +785,16 @@ mod tests {
         });
     }
 
+    #[test]
+    fn send_self_without_runtime_returns_error_instead_of_panicking() {
+        let ctx = MockActorContext::new("message-no-runtime");
+        let result = ctx.send_self(TestMessage { data: 99 });
+        assert!(matches!(
+            result,
+            Err(ActorError::InternalError(message)) if message.contains("active Tokio runtime")
+        ));
+    }
+
     // Test ScheduledTask
     #[test]
     fn test_scheduled_task() {
@@ -792,23 +808,11 @@ mod tests {
         let id2 = Uuid::new_v4();
 
         // Create tasks for testing
-        let task1 = ScheduledTask {
-            id: id1,
-            target: actor_ref1,
-            schedule_time: now,
-        };
+        let task1 = ScheduledTask::new(id1, actor_ref1, now);
 
-        let task2 = ScheduledTask {
-            id: id1, // Same ID
-            target: actor_ref2,
-            schedule_time: now,
-        };
+        let task2 = ScheduledTask::new(id1, actor_ref2, now); // Same ID
 
-        let task3 = ScheduledTask {
-            id: id2, // Different ID
-            target: actor_ref3,
-            schedule_time: now,
-        };
+        let task3 = ScheduledTask::new(id2, actor_ref3, now); // Different ID
 
         // Test equality (should compare IDs)
         assert_eq!(task1, task2);

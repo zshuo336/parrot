@@ -2,15 +2,17 @@
 #  parrot 网关运行时镜像——Ray/Python 方言
 #
 #  职责：python3 + ray + jieba（分词依赖为 websearch/crawler-lab 共用形态；
-#  其他 app 可 COPY 自带 requirements 覆盖）+ parrot_protocol（框架协议层）
+#  其他 app 应单独锁定并验证附加依赖）+ parrot_protocol（框架协议层）
 #  app 制品（py 模块）经 volume 挂载——镜像不含任何 app 代码。
 #
 #  app compose 引用契约：
 #    build:
 #      context: ../../..
 #      dockerfile: deploy/images/gw-ray.Dockerfile
+#    init: true
 #    volumes:
 #      - ./python:/app/python:ro   # app 模块目录（ray working_dir）
+#  直接 docker run 时必须加 --init，以回收崩溃后成为孤儿的 Ray 子进程。
 #  运行（由 app compose command 指定）：
 #    env PYTHONPATH=/gw:/app/python python3 -m parrot_protocol.ray_gw <port> [parrot=...]
 #
@@ -19,7 +21,9 @@
 ARG REGISTRY_PREFIX=""
 FROM ${REGISTRY_PREFIX}python:3.11-slim
 
-RUN pip install --no-cache-dir 'ray>=2.9' jieba
+COPY deploy/images/requirements-ray-build.lock deploy/images/requirements-ray.lock \
+     deploy/images/install-ray.sh /opt/parrot-deps/
+RUN sh /opt/parrot-deps/install-ray.sh
 
 WORKDIR /gw
 # 框架协议层（单一真源）

@@ -1,0 +1,62 @@
+[
+  {
+    "file": "generics.rs",
+    "pass": true
+  },
+  {
+    "file": "trait_object.rs",
+    "pass": true
+  },
+  {
+    "file": "renamed_api.rs",
+    "pass": true,
+    "api_name": "renamed_api"
+  },
+  {
+    "file": "shadowed_names.rs",
+    "pass": true
+  },
+  {
+    "file": "lifecycle_binding.rs",
+    "pass": true,
+    "api_name": "renamed_api"
+  },
+  {
+    "file": "missing_behaviour.rs",
+    "pass": false,
+    "diagnostics": [
+      "E0277",
+      "ActorBehaviour"
+    ]
+  },
+  {
+    "file": "missing_lifecycle.rs",
+    "pass": false,
+    "diagnostics": [
+      "E0277",
+      "Lifecycle"
+    ]
+  },
+  {
+    "file": "invalid_option.rs",
+    "pass": false,
+    "diagnostics": [
+      "expected crate, lifecycle, or binding"
+    ]
+  },
+  {
+    "file": "empty_binding.rs",
+    "pass": false,
+    "diagnostics": [
+      "binding name must not be empty"
+    ]
+  },
+  {
+    "file": "not_send.rs",
+    "pass": false,
+    "diagnostics": [
+      "E0277",
+      "cannot be sent between threads safely"
+    ]
+  }
+]

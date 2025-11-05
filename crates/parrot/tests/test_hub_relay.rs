@@ -5,6 +5,8 @@
 //! 用例覆盖：ask 转发回程 / tell 转发 / RouteUnreachable（未知节点）/
 //! hop_count 递增 / 断连后映射失效。
 
+// Transport semantics use explicitly trusted development TCP peers;
+// authenticated/denied paths are covered by control_authentication.
 mod common;
 
 use common::*;
@@ -19,6 +21,13 @@ use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_remote::{LocalLookup, RemoteActorSystem, RemoteConfig as RCfg};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn hint_only_source() -> RCfg {
+    let mut config = RCfg::tcp("node-a", None).with_insecure_development();
+    // Isolate ROUTE_HINT learning from independent membership discovery.
+    config.heartbeat_enabled = false;
+    config
+}
 
 // 消息（与 test_remote_semantics 相同键——不同集成测试二进制独立进程，
 // inventory 注册不冲突）
@@ -117,17 +126,30 @@ impl LocalLookup for FacadeLookup {
     }
 }
 
-/// 星型三节点：a、b 互不直连，各连 hub（TCP）。
-async fn star_topology() -> (
+type StarTopology = (
     Arc<RemoteActorSystem>,                       // a
     Arc<RemoteActorSystem>,                       // b
     Arc<RemoteActorSystem>,                       // hub
     std::sync::Arc<std::sync::atomic::AtomicU64>, // b 的 note 计数
-) {
+);
+
+/// 星型三节点：a、b 互不直连，各连 hub（TCP）。
+async fn star_topology() -> StarTopology {
+    star_topology_with_capture(None).await
+}
+
+async fn star_topology_with_capture(
+    capture: Option<parrot_remote::capture::FrameCapture>,
+) -> StarTopology {
     // hub：无本地 actor（纯路由）
+    let mut config = RCfg::tcp("hub", Some("127.0.0.1:0".parse().unwrap()))
+        .with_insecure_development()
+        .with_role(parrot_remote::TopologyRole::Hub);
+    if let Some(capture) = capture {
+        config = config.with_capture(capture);
+    }
     let hub = RemoteActorSystem::new(
-        RCfg::tcp("hub", Some("127.0.0.1:0".parse().unwrap()))
-            .with_role(parrot_remote::TopologyRole::Hub),
+        config,
         Arc::new(FacadeLookup {
             facade: Arc::new(
                 ParrotActorSystem::new(ActorSystemConfig::default())
@@ -166,7 +188,7 @@ async fn star_topology() -> (
     .await
     .unwrap();
     let rb = RemoteActorSystem::new(
-        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())),
+        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())).with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
@@ -182,7 +204,13 @@ async fn star_topology() -> (
 
     // a：纯发起方（无本地 actor）
     let ra = RemoteActorSystem::new(
-        RCfg::tcp("node-a", None),
+        RCfg::tcp("node-a", None)
+            .with_insecure_development()
+            .with_topology(parrot_remote::topology::TopologyConfig {
+                mode: parrot_remote::topology::TopologyMode::Hub,
+                relay_fallback: false,
+                ..Default::default()
+            }),
         Arc::new(FacadeLookup {
             facade: Arc::new(
                 ParrotActorSystem::new(ActorSystemConfig::default())
@@ -261,21 +289,25 @@ async fn rh3_no_route_err() {
 }
 
 // ===========================================================================
-// RH4：hub 断开 B 后，A 的挂起/新 ask 得到失败（不悬挂）
+// RH4: a new ASK fails after the hub observes physical destination disconnect.
 // ===========================================================================
 
 #[tokio::test]
-async fn rh4_relay_link_loss_fails_pending() {
-    let (ra, rb, _hub, _) = star_topology().await;
+async fn rh4_new_ask_fails_after_destination_disconnect() {
+    let (ra, rb, hub, _) = star_topology().await;
     // 拆掉 hub↔B 链路（B 主动断）
-    let _ = rb.shutdown().await;
-    // 给断连传播留时间
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    rb.shutdown().await.unwrap();
+    eventually(Duration::from_secs(3), || async {
+        !hub.missing_direct_connections(&["node-b"]).is_empty()
+    })
+    .await;
     let r = ra.remote_ref("parrot://node-b/user/echo").unwrap();
     let res = tokio::time::timeout(Duration::from_secs(5), r.send(Box::new(HPing(7))))
         .await
         .expect("must not hang");
     assert!(res.is_err(), "ask after link loss must fail");
+    ra.shutdown().await.unwrap();
+    hub.shutdown().await.unwrap();
 }
 
 // ===========================================================================
@@ -284,15 +316,52 @@ async fn rh4_relay_link_loss_fails_pending() {
 
 #[tokio::test]
 async fn rh5_hop_count_incremented() {
-    let (ra, _rb, hub, _) = star_topology().await;
+    use parrot_remote::capture::{CaptureDirection, CaptureLimits, FrameCapture};
+    let (capture, mut receiver) = FrameCapture::channel(CaptureLimits::default()).unwrap();
+    let recording = std::thread::spawn(move || {
+        let mut hops = Vec::new();
+        while let Some(event) = receiver.blocking_recv() {
+            if event.frame.header.frame_type == parrot_remote::frame::frame_type::ASK
+                && event.frame.path == "parrot://node-b/user/echo"
+            {
+                hops.push((
+                    event.direction == CaptureDirection::Tx,
+                    event.frame.header.hop_count,
+                ));
+            }
+        }
+        hops
+    });
+    let (ra, rb, hub, _) = star_topology_with_capture(Some(capture.clone())).await;
     let r = ra.remote_ref("parrot://node-b/user/echo").unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(5), r.send(Box::new(HPing(5))))
+    let reply = tokio::time::timeout(Duration::from_secs(5), r.send(Box::new(HPing(5)))).await;
+    for system in [&ra, &rb, &hub] {
+        system.shutdown().await.unwrap();
+    }
+    capture.close();
+    let mut hops = tokio::task::spawn_blocking(move || recording.join().unwrap())
         .await
-        .expect("ask timeout");
-    // RELAYED_ASK 计数 ≥1（hub 转发生过）
-    let n = parrot_remote::RelayMetrics::relayed_ask();
-    assert!(n >= 1, "hub should have relayed at least one ask, got {n}");
-    let _ = hub;
+        .unwrap();
+    hops.sort_unstable();
+    assert_eq!(
+        reply
+            .expect("ask timeout")
+            .expect("relayed ask failed")
+            .downcast::<HPong>()
+            .unwrap()
+            .0,
+        5
+    );
+    assert_eq!(
+        capture.stats().lost,
+        0,
+        "hop proof requires complete capture"
+    );
+    assert_eq!(
+        hops,
+        vec![(false, 0), (true, 1)],
+        "this hub must receive hop0 and forward hop1"
+    );
 }
 
 // ===========================================================================
@@ -305,6 +374,7 @@ async fn rh6_direct_link_learned_from_hint() {
     // hub
     let hub = RemoteActorSystem::new(
         RCfg::tcp("hub", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development()
             .with_role(parrot_remote::TopologyRole::Hub),
         Arc::new(FacadeLookup {
             facade: Arc::new(
@@ -343,6 +413,7 @@ async fn rh6_direct_link_learned_from_hint() {
             "node-b",
             Some(format!("127.0.0.1:{b_port}").parse().unwrap()),
         )
+        .with_insecure_development()
         .with_direct_addr(format!("127.0.0.1:{b_port}")),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
@@ -359,7 +430,7 @@ async fn rh6_direct_link_learned_from_hint() {
 
     // a：连 hub
     let ra = RemoteActorSystem::new(
-        RCfg::tcp("node-a", None),
+        hint_only_source(),
         Arc::new(FacadeLookup {
             facade: Arc::new(
                 ParrotActorSystem::new(ActorSystemConfig::default())
@@ -398,17 +469,15 @@ async fn rh6_direct_link_learned_from_hint() {
     .await;
 
     // 直连后的 ask（同 ref——sender_of 直连表优先，不再经 hub）
-    let r2 = ra.remote_ref("parrot://node-b/user/echo").unwrap();
-    let reply2 = tokio::time::timeout(Duration::from_secs(5), r2.send(Box::new(HPing(7))))
+    let reply2 = tokio::time::timeout(Duration::from_secs(5), r.send(Box::new(HPing(7))))
         .await
         .expect("direct ask timeout");
     assert_eq!(reply2.unwrap().downcast::<HPong>().unwrap().0, 7);
 }
 
 // ===========================================================================
-// RH7（端到端重排）：TELL 流跨中转→直连切换点，B 收到的顺序与 A 发送
-// 顺序一致（seq 重排网关在 B 侧生效——uplink 在途帧 bypass 先投 + 直连
-// 帧 seq 对齐，物理乱序被吸收）。
+// RH7: per-phase order with the relay phase fully drained before direct traffic.
+// This does not prove FIFO when relay and direct frames are simultaneously in flight.
 // ===========================================================================
 
 /// 顺序录制 actor：记 HNote 到达序（Vec<u64>）。
@@ -440,10 +509,11 @@ impl Actor for OrderActor {
 }
 
 #[tokio::test]
-async fn rh7_tell_order_preserved_across_route_switch() {
+async fn rh7_tell_order_with_drained_relay_before_switch() {
     // 拓扑复用 RH6 形态：hub + b（direct_addr）+ a
     let hub = RemoteActorSystem::new(
         RCfg::tcp("hub", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development()
             .with_role(parrot_remote::TopologyRole::Hub),
         Arc::new(FacadeLookup {
             facade: Arc::new(
@@ -487,6 +557,7 @@ async fn rh7_tell_order_preserved_across_route_switch() {
             "node-b",
             Some(format!("127.0.0.1:{b_port}").parse().unwrap()),
         )
+        .with_insecure_development()
         .with_direct_addr(format!("127.0.0.1:{b_port}")),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
@@ -502,7 +573,7 @@ async fn rh7_tell_order_preserved_across_route_switch() {
     .unwrap();
 
     let ra = RemoteActorSystem::new(
-        RCfg::tcp("node-a", None),
+        hint_only_source(),
         Arc::new(FacadeLookup {
             facade: Arc::new(
                 ParrotActorSystem::new(ActorSystemConfig::default())
@@ -544,9 +615,11 @@ async fn rh7_tell_order_preserved_across_route_switch() {
     let r_ask = ra.remote_ref("parrot://node-b/user/order").unwrap();
     // OrderActor 只回 HNote；ask HPing 会 MessageHandlingError——改发 HNote
     // ask：send 走 ASK，OrderActor 回 HPong
-    let _ = tokio::time::timeout(Duration::from_secs(5), r_ask.send(Box::new(HNote(999))))
+    let marker = tokio::time::timeout(Duration::from_secs(5), r_ask.send(Box::new(HNote(999))))
         .await
-        .expect("relay ask timeout");
+        .expect("relay ask timeout")
+        .expect("phase marker must execute successfully");
+    assert_eq!(marker.downcast::<HPong>().unwrap().0, 999);
     eventually(Duration::from_secs(5), || async {
         ra.links_snapshot()
             .await
@@ -555,10 +628,8 @@ async fn rh7_tell_order_preserved_across_route_switch() {
     })
     .await;
 
-    // 阶段3（切换点）：立刻连发 20 条——前几条可能仍在 uplink 在途/新直连
-    // 已启用，seq 重排应吸收任何物理乱序。直连首帧 seq=21 进入 B 侧全新
-    // 重排流（expected=1 冷启动）→ 250ms 缺口超时放行 21 → 连 drain
-    // 22..40——整段保序，只付一次 250ms 切换税。
+    // The relay phase has already drained. This verifies a new direct phase,
+    // not ordering of messages simultaneously in flight over different routes.
     for i in 20..40u64 {
         r.deliver(Box::new(HNote(i))).await.unwrap();
     }
@@ -567,21 +638,26 @@ async fn rh7_tell_order_preserved_across_route_switch() {
         g.len() == 41
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(200)).await; // 静置收尾
     let got = order.lock().unwrap().clone();
     // 终序：中转期 0..20 → ask 999（中转 bypass）→ 直连期 20..40
     // （冷启动 250ms 放行后整段连 drain）
     let expect: Vec<u64> = (0..20u64).chain([999u64]).chain(20..40u64).collect();
-    assert_eq!(got, expect, "跨切换点 TELL 全序保持（seq 重排生效）");
+    assert_eq!(
+        got, expect,
+        "drained relay and direct phases preserve their exact sequence"
+    );
+    ra.shutdown().await.unwrap();
+    rb.shutdown().await.unwrap();
+    hub.shutdown().await.unwrap();
+    ts_b.shutdown_internal().await.unwrap();
 }
 
 // ===========================================================================
-// RH8（整合·压力）：直连高吞吐 TELL 流 5000 帧全序 + 不丢（重排网关在
-// 高速流下的正确性——不只是切换点边界）
+// RH8：显式限制在途窗口的 5000 帧直连 FIFO 正确性；不作为吞吐/无损反压证明。
 // ===========================================================================
 
 #[tokio::test]
-async fn rh8_direct_high_throughput_order() {
+async fn rh8_direct_fifo_with_bounded_inflight_window() {
     // 两节点直连（无 hub）
     let facade_b = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
@@ -605,7 +681,7 @@ async fn rh8_direct_high_throughput_order() {
     .await
     .unwrap();
     let rb = RemoteActorSystem::new(
-        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())),
+        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())).with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
@@ -615,7 +691,7 @@ async fn rh8_direct_high_throughput_order() {
     let b_port = rb.local_addr().unwrap().port();
 
     let ra = RemoteActorSystem::new(
-        RCfg::tcp("node-a", None),
+        RCfg::tcp("node-a", None).with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: Arc::new(
                 ParrotActorSystem::new(ActorSystemConfig::default())
@@ -638,24 +714,31 @@ async fn rh8_direct_high_throughput_order() {
     .await;
 
     let r = ra.remote_ref("parrot://node-b/user/order").unwrap();
-    let t0 = std::time::Instant::now();
-    for i in 0..5000u64 {
-        r.deliver(Box::new(HNote(i))).await.unwrap();
+    // TELL success is local queue admission, not a peer acknowledgement. Keep
+    // at most 25 business messages outstanding; a separate overload contract
+    // verifies that exceeding the remote budget is visible as link failure.
+    for end in (25..=5000usize).step_by(25) {
+        for i in end - 25..end {
+            r.deliver(Box::new(HNote(i as u64))).await.unwrap();
+        }
+        eventually(Duration::from_secs(5), || async {
+            order.lock().unwrap().len() == end
+        })
+        .await;
     }
-    let send_elapsed = t0.elapsed();
-    eventually(Duration::from_secs(15), || async {
-        order.lock().unwrap().len() == 5000
-    })
-    .await;
     let got = order.lock().unwrap().clone();
     let expect: Vec<u64> = (0..5000u64).collect();
-    assert_eq!(got, expect, "5000 帧直连流全序无丢失");
-    // 观测记录：send 侧耗时（背压贯通体现——deliver 受 B 侧消费节流）
-    println!("rh8: 5000 tells sent in {send_elapsed:?}");
+    assert_eq!(
+        got, expect,
+        "5000 business deliveries must preserve exact order"
+    );
+    ra.shutdown().await.unwrap();
+    rb.shutdown().await.unwrap();
+    ts_b.shutdown_internal().await.unwrap();
 }
 
 // ===========================================================================
-// RH9（整合·关闭）：发送方关闭后再发 tell 不悬挂（重排通道关闭兜底直投）
+// RH9: TELL fails after the sender observes physical peer shutdown.
 // ===========================================================================
 
 #[tokio::test]
@@ -682,7 +765,7 @@ async fn rh9_shutdown_no_hang() {
     .await
     .unwrap();
     let rb = RemoteActorSystem::new(
-        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())),
+        RCfg::tcp("node-b", Some("127.0.0.1:0".parse().unwrap())).with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
@@ -691,7 +774,7 @@ async fn rh9_shutdown_no_hang() {
     rb.start().await.unwrap();
     let b_port = rb.local_addr().unwrap().port();
     let ra = RemoteActorSystem::new(
-        RCfg::tcp("node-a", None),
+        RCfg::tcp("node-a", None).with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: Arc::new(
                 ParrotActorSystem::new(ActorSystemConfig::default())
@@ -715,15 +798,21 @@ async fn rh9_shutdown_no_hang() {
     // 建流 + 发送 + 关闭 B（接收方 Ingress 析构 → 重排任务 recv None 退出）
     let r = ra.remote_ref("parrot://node-b/user/order").unwrap();
     r.deliver(Box::new(HNote(1))).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let _ = rb.shutdown().await;
+    eventually(Duration::from_secs(3), || async {
+        order.lock().unwrap().as_slice() == [1]
+    })
+    .await;
+    rb.shutdown().await.unwrap();
+    eventually(Duration::from_secs(3), || async {
+        !ra.missing_direct_connections(&["node-b"]).is_empty()
+    })
+    .await;
     // A 侧再发：连接已断 → deliver 快速失败（不悬挂）
-    let t0 = std::time::Instant::now();
-    let res = tokio::time::timeout(Duration::from_secs(3), r.deliver(Box::new(HNote(2)))).await;
-    assert!(
-        res.is_ok(),
-        "tell after peer shutdown must resolve fast (got {:?}, elapsed {:?})",
-        res.map(|_| ()),
-        t0.elapsed()
-    );
+    let res = tokio::time::timeout(Duration::from_secs(3), r.deliver(Box::new(HNote(2))))
+        .await
+        .expect("tell after observed peer shutdown must not hang");
+    assert!(res.is_err(), "closed peer must not admit a new TELL");
+    assert_eq!(order.lock().unwrap().as_slice(), [1]);
+    ra.shutdown().await.unwrap();
+    ts_b.shutdown_internal().await.unwrap();
 }

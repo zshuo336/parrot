@@ -1,0 +1,10 @@
+# This file replaces the root ignore rules for the prebuilt JVM runtime image.
+**
+!interop
+interop/*
+!interop/jvm
+interop/jvm/*
+!interop/jvm/target
+interop/jvm/target/*
+!interop/jvm/target/parrot-protocol-jvm-0.1.0.jar
+!gw-jvm-libs.tar

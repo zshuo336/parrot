@@ -295,12 +295,21 @@ async fn cancelling_stop_caller_does_not_abandon_typed_cleanup() {
     let caller = tokio::spawn(async move { actor.stop().await });
     event(&mut events, "hook").await;
     caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
     let result = system.stop_actor("/managed").await;
     assert!(matches!(
         result,
         Err(parrot::thread::error::SystemError::Timeout(_))
     ));
     event(&mut events, "actor_drop").await;
+    // The destructor signal precedes the monitor receiving its completion.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while system.get_actor_ref("/managed").is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned cleanup must retire the timed-out generation");
     assert_eq!(system.actor_count(), 0);
     system.shutdown_internal().await.unwrap();
 }

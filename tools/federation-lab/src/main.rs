@@ -2,12 +2,12 @@
 //!
 //! 子命令：
 //! - `composegen`：生成 50 集群 compose 拓扑（--out docker-compose.yml）
-//! - `twin`：百万节点数字孪生全遍历（G5 门禁——正确性 100% + ≤10min）
+//! - `twin`：数字孪生本地目录契约（分批注册/提交/查询）
 //! - `twin --sample N`：抽样遍历（CI 模式）
 //! - `report`：输出 SCALE_REPORT 数据（收敛/路由/带宽指标占位——实测行）
 
 use federation_lab::composegen::{ComposeGenConfig, Output};
-use federation_lab::twin::{DigitalTwin, TwinConfig};
+mod twin_cli;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -35,37 +35,10 @@ fn main() {
             }
         }
         "twin" => {
-            let mut config = TwinConfig::default();
-            // --clusters/--nodes 缩减空间支持
-            let sample: Option<u64> = args
-                .iter()
-                .position(|a| a == "--sample")
-                .and_then(|p| args.get(p + 1))
-                .and_then(|v| v.parse().ok());
-            if let Some(pos) = args.iter().position(|a| a == "--clusters") {
-                if let Ok(v) = args[pos + 1].parse() {
-                    config.clusters = v;
-                }
+            if let Err(error) = twin_cli::run(&args[2..]) {
+                eprintln!("twin failed: {error}");
+                std::process::exit(2);
             }
-            if let Some(pos) = args.iter().position(|a| a == "--nodes") {
-                if let Ok(v) = args[pos + 1].parse() {
-                    config.nodes_per_cluster = v;
-                }
-            }
-            let twin = DigitalTwin::build(config);
-            let r = match sample {
-                Some(n) => twin.traverse_sampled(n),
-                None => twin.traverse_all(),
-            };
-            println!(
-                "孪生遍历：visited={} correct={} mismatch={} 耗时={}ms",
-                r.visited, r.correct, r.mismatch, r.elapsed_ms
-            );
-            if r.mismatch != 0 {
-                eprintln!("G5 门禁失败：存在错误路由");
-                std::process::exit(1);
-            }
-            println!("G5 门禁通过：路由正确性 100%");
         }
         "twin-app" => {
             // F4（DEV_09 §3.6）：App 孪生门禁——Manifest 输入
@@ -101,7 +74,7 @@ fn main() {
         "help" | "--help" | "-h" => {
             println!("federation-lab：S4 仿真基建（composegen / twin / report / twin-app）");
             println!("  composegen [--clusters N] [--nodes-per-cluster N] [--fold K] [--out FILE]");
-            println!("  twin [--clusters N] [--nodes N] [--sample N]");
+            println!("  twin [--clusters N] [--nodes N] [--sample N] [--shards N] [--realm NAME]");
             println!("  twin-app [--manifest FILE]");
         }
         other => {

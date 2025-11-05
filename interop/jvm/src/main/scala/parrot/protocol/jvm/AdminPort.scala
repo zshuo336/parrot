@@ -1,285 +1,319 @@
 package parrot.protocol.jvm
 
-import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
+import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import akka.actor.typed.{ActorRef, ActorSystem, Behavior, BehaviorInterceptor, DispatcherSelector, PostStop, TypedActorContext}
+import akka.actor.typed.scaladsl.adapter._
 import AdminV2Codec._
 import AdminV2Codec.AdminCommandV2._
 import AdminV2Executor._
+import java.net.URLClassLoader
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
+import scala.concurrent.{Await, Promise}
+import scala.concurrent.duration._
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 
-/** B5 AdminPort：admin-v2 四命令的 akka 方言 Port（可测）。
-  *
-  * 设计：纯 actor 无 Netty 依赖——transport 层收到 SYSTEM_EVENT(tag 0x03)
-  * 帧 → `AdminPort.CmdIn(cid, replyTo, payload)`；本 actor 执行四命令并
-  * 回 `CmdOut(frame 字节)`。deploy 的反射加载在本 actor 内同步执行
-  * （单线程顺序化——登记表无锁）。
-  *
-  * spawn 策略：实例 actor 直接 spawn 在 system 下（/user/{name}[-{i}]
-  * 走 guardian 同层——akka typed 无 user guardian 直挂，实际路径
-  * /user/... 由 BridgeActor resolve 前缀映射吸收）。
+/** Bounded internal pending queue, serialized lifecycle operations on the blocking dispatcher,
+  * and owned component subtrees. Deployed follows a real actor readiness barrier.
   */
 object AdminPort {
-
   sealed trait Msg
-  /** transport → admin：SYSTEM_EVENT 帧内 admin-v2 命令（sink 随帧携带——多连接安全）。 */
   final case class CmdIn(cid: Long, replyTo: String, payload: Array[Byte], sink: ReplySink) extends Msg
-  /** 供测试直接查询登记表快照。 */
+  /** Last completed operation/retirement snapshot, not an independent health probe. */
   final case class Snapshot(req: ActorRef[Map[String, ComponentEntry]]) extends Msg
-
-  def apply(system: ActorSystem[_]): Behavior[Msg] =
-    Behaviors.setup { _ =>
-      active(system, Map.empty)
-    }
-
-  private def active(
-      system: ActorSystem[_],
-      components: Map[String, ComponentEntry]
-  ): Behavior[Msg] =
-    Behaviors.receiveMessage {
-      case CmdIn(cid, replyTo, payload, sink) =>
-        val (newComps, reply) = Try(execute(system, components, payload)) match {
-          case Success((nc, rep)) => (nc, rep)
-          case Failure(e: AdminException) =>
-            (components, AdminReplyV2.Failed(extractReqId(payload, cid), e.code, e.getMessage))
-          case Failure(e: AdminV2Codec.CodecException) =>
-            (components, AdminReplyV2.Failed(extractReqId(payload, cid), ErrDialectMismatch, e.getMessage))
-          case Failure(e) =>
-            (components, AdminReplyV2.Failed(extractReqId(payload, cid), ErrArtifactFetch, Option(e.getMessage).getOrElse(e.getClass.getSimpleName)))
-        }
-        sink.send(cid, replyTo, encodeReply(reply))
-        active(system, newComps)
-
-      case Snapshot(req) =>
-        req ! components
-        Behaviors.same
-    }
-
-  /** 回帧出口（transport 注入；测试可直接消费）。 */
+  private final case class Done(components: Map[String, ComponentEntry]) extends Msg
+  private final case class Changed(components: Map[String, ComponentEntry]) extends Msg
+  private final case class Retired(path: String, ref: ActorRef[Any]) extends Msg
+  private case object WorkerStopped extends Msg
+  final case class Limits(startup: FiniteDuration = 5.seconds, retirement: FiniteDuration = 5.seconds,
+                          pendingCommands: Int = 256, pendingBytes: Long = 16L * 1024 * 1024,
+                          instances: Int = 4096) {
+    require(startup > Duration.Zero && retirement > Duration.Zero)
+    require(startup <= 60.seconds && retirement <= 60.seconds)
+    require(pendingCommands > 0 && pendingBytes > 0 && instances > 0)
+  }
   trait ReplySink { def send(cid: Long, replyTo: String, payload: Array[Byte]): Unit }
+  private def safeDetail(value: String): String = {
+    val normalized = new String(Option(value).getOrElse("operation failed").getBytes("UTF-8"), "UTF-8")
+    normalized.substring(0, normalized.offsetByCodePoints(0, math.min(1024, normalized.codePointCount(0, normalized.length))))
+  }
+  private def requestId(command: CmdIn): Long = command.cid
+  private def failure(id: Long, code: Int, detail: String): AdminReplyV2 =
+    AdminReplyV2.Failed(id, code, safeDetail(detail))
+  private def send(command: CmdIn, reply: AdminReplyV2): Unit =
+    try command.sink.send(command.cid, command.replyTo, encodeReply(reply))
+    catch { case NonFatal(_) => () } // A lost reply sink cannot roll back committed state.
 
-  /** 从 payload 恢复 req_id（解码失败前的 Failed 回执用——cid 即 req_id）。 */
-  private def extractReqId(payload: Array[Byte], cid: Long): Long =
-    Try {
-      val r = decodeCommand(payload)
-      r.reqId
-    }.getOrElse(cid)
+  def apply(system: ActorSystem[_], limits: Limits = Limits()): Behavior[Msg] =
+    apply(system, ComponentRoutes(system), limits)
 
-  // ---------------- 四命令实现 ----------------
+  def apply(system: ActorSystem[_], routes: ComponentRoutes): Behavior[Msg] = apply(system, routes, Limits())
 
-  private def execute(
-      system: ActorSystem[_],
-      components: Map[String, ComponentEntry],
-      payload: Array[Byte]
-  ): (Map[String, ComponentEntry], AdminReplyV2) =
-    decodeCommand(payload) match {
-      case Deploy(reqId, comp) => deploy(system, components, reqId, comp)
-      case Drain(reqId, prefix, timeoutMs) =>
-        (components, drain(components, reqId, prefix, timeoutMs))
-      case Stop(reqId, prefix) =>
-        stop(components, reqId, prefix)
-      case Status(reqId, prefix) =>
-        (components, status(components, reqId, prefix))
-      case AdminCommandV2.MetricsReport(reqId) =>
-        (components, metricsReply(system, components, reqId))
-    }
-
-  /** 观测五件套：指标快照（transport 计数 + akka 系统态 + 登记表）。 */
-  private def metricsReply(
-      system: ActorSystem[_],
-      components: Map[String, ComponentEntry],
-      reqId: Long
-  ): AdminReplyV2 = {
-    val c = GatewayMetrics.snapshot()
-    val states = components.values.flatMap { entry =>
-      entry.paths.map(p => ComponentState(p, "running", entry.version))
-    }.toVector
-    val rt = System.getProperty("java.vm.name", "jvm") + "/" +
-      System.getProperty("java.version", "?")
-    val rss = Try {
-      val pid = java.lang.management.ManagementFactory.getRuntimeMXBean.getName.split("@")(0)
-      // RSS 尽力而为：/proc（Linux）；macOS 无 → 0
-      val f = new java.io.File(s"/proc/$pid/status")
-      if (f.exists()) {
-        scala.io.Source.fromFile(f).getLines()
-          .find(_.startsWith("VmRSS:"))
-          .map(l => l.split("\\s+")(1).toLong * 1024).getOrElse(0L)
-      } else 0L
-    }.getOrElse(0L)
-    AdminReplyV2.Metrics(
-      reqId,
-      MetricsSnapshot(
-        tsMs = System.currentTimeMillis(),
-        runtime = rt,
-        connections = c.connections,
-        handshakesOk = c.handshakesOk,
-        handshakesFailed = c.handshakesFailed,
-        asksRx = c.asksRx, tellsRx = c.tellsRx,
-        repliesTx = c.repliesTx, replyErrs = c.replyErrs,
-        bytesRx = c.bytesRx, bytesTx = c.bytesTx,
-        heartbeatsRx = c.heartbeatsRx,
-        components = components.size,
-        componentStates = states,
-        processes = 0, // actor 计数不可移植——0=方言未提供（RSS 已覆盖资源维度）
-        memoryRss = rss,
-        uptimeStartMs = GatewayMetrics.startedAtMs
-      )
-    )
+  def apply(system: ActorSystem[_], routes: ComponentRoutes, limits: Limits): Behavior[Msg] = {
+    require(routes.belongsTo(system), "component route scope belongs to another ActorSystem")
+    setup(system, routes, limits)
   }
 
-  /** Deploy：child loader → 反射 main_class → ComponentSpi.behavior → spawn。
-    * 返回（新登记表, 回执）。同名组件已存在 → 先 Stop（原子替换语义——
-    * 与 erl 热替换对偶）。
-    */
-  private def deploy(
-      system: ActorSystem[_],
-      components: Map[String, ComponentEntry],
-      reqId: Long,
-      comp: ComponentDeploy
-  ): (Map[String, ComponentEntry], AdminReplyV2) = {
-    val base = components.get(comp.name).map { old =>
-      old.instances.foreach(h => Try(h.stopper()))
-      old.paths.foreach(p => ComponentRoutes.remove(actorNameOf(p)))
-      old.loader.foreach(l => Try(l.close()))
-      components - comp.name
-    }.getOrElse(components)
+  private def setup(system: ActorSystem[_], scope: ComponentRoutes, limits: Limits): Behavior[Msg] = Behaviors.setup { context =>
+    require(context.system == system, "AdminPort must run in its owning ActorSystem")
+    implicit val routes: ComponentRoutes = scope
+    val worker = context.spawn(operations(limits, context.self), "operations", DispatcherSelector.blocking())
+    context.watchWith(worker, WorkerStopped)
+    val queue = mutable.Queue.empty[CmdIn]
+    var current: Option[CmdIn] = None
+    var bytes = 0L
+    var cached = Map.empty[String, ComponentEntry]
+    def weight(command: CmdIn): Long = command.payload.length.toLong + command.replyTo.length * 2L
+    def advance(): Unit = if (current.isEmpty && queue.nonEmpty) {
+      current = Some(queue.dequeue()); worker ! current.get
+    }
+    Behaviors.receiveMessage[Msg] {
+      case command: CmdIn =>
+        // Validate before queue admission or any lifecycle effect. The wire
+        // correlation ID owns the failure receipt even if the body is invalid.
+        Try(decodeCommand(command.payload)) match {
+          case Success(decoded) if decoded.reqId == command.cid =>
+            val size = weight(command)
+            if (queue.size + current.size >= limits.pendingCommands || size > limits.pendingBytes - bytes)
+              send(command, failure(requestId(command), ErrSpawnFailed, "management admission capacity exhausted"))
+            else { bytes += size; queue.enqueue(command); advance() }
+          case _ => send(command, failure(command.cid, ErrDialectMismatch, "invalid admin payload or request correlation"))
+        }
+        Behaviors.same
+      case Done(next) =>
+        cached = next; current.foreach(c => bytes -= weight(c)); current = None; advance()
+        Behaviors.same
+      case Changed(next) => cached = next; Behaviors.same
+      case Snapshot(replyTo) => replyTo ! cached; Behaviors.same
+      case WorkerStopped =>
+        (current.toVector ++ queue).foreach(c => send(c, failure(requestId(c), ErrSpawnFailed, "management owner stopped")))
+        Behaviors.stopped
+      case _ => Behaviors.same
+    }
+  }
 
-    val loader = buildLoader(comp.artifact) // AdminException（0x0A02/0x0A00）直接上抛
+  private def operations(limits: Limits, front: ActorRef[Msg])(implicit routes: ComponentRoutes): Behavior[Msg] = Behaviors.setup { context =>
+    var components = Map.empty[String, ComponentEntry]
+    val loaders = mutable.Set.empty[URLClassLoader]
+    def close(loader: Option[URLClassLoader]): Unit = loader.foreach { value =>
+      if (loaders.remove(value)) Try(value.close())
+    }
+    def forgetRetired(path: String, ref: ActorRef[Any]): Unit = {
+      routes.removeOwned(actorNameOf(path), ref)
+      components = components.flatMap { case (name, entry) =>
+        val kept = entry.instances.filterNot(h => h.path == path && h.ref == ref)
+        if (kept.isEmpty) { close(entry.loader); None }
+        else Some(name -> entry.copy(paths = kept.map(_.path), instances = kept))
+      }
+    }
+    Behaviors.receiveMessage[Msg] {
+      case command: CmdIn =>
+        val result = Try(execute(context, components, command.payload, limits, loaders, close)) match {
+          case Success(value) => value
+          case Failure(e: AdminException) => (components, failure(requestId(command), e.code, e.getMessage))
+          case Failure(e: CodecException) => (components, failure(requestId(command), ErrDialectMismatch, e.getMessage))
+          case Failure(e) => (components, failure(requestId(command), ErrArtifactFetch, e.getMessage))
+        }
+        components = result._1; send(command, result._2); front ! Done(components)
+        Behaviors.same
+      case Retired(path, ref) =>
+        forgetRetired(path, ref); front ! Changed(components)
+        Behaviors.same
+      case _ => Behaviors.same
+    }.receiveSignal {
+      // Akka retires all component children before the owner's PostStop.
+      case (_, PostStop) => loaders.foreach(loader => Try(loader.close())); loaders.clear(); Behaviors.same
+    }
+  }
 
-    val cl = loader.getOrElse(getClass.getClassLoader)
-    val mainClass = comp.artifact match {
-      case AdminV2Codec.ArtifactRef.Jvm(mc, _, _) => mc
-      case other => throw new AdminException(ErrDialectMismatch, s"not jvm artifact: ${kindOf(other)}")
+  private type State = Map[String, ComponentEntry]
+  private def measured(components: State): MeasuredMetrics = {
+    val states = components.values.toVector.flatMap(e => e.instances.map(h => ComponentState(h.path, h.state, e.version)))
+    GatewayMetrics.measured(components.size.toLong, states)
+  }
+  private def remaining(deadline: Long): Long = deadline - System.nanoTime()
+  private def retire(entry: ComponentEntry, selected: InstanceHandle => Boolean, deadline: Long)(implicit routes: ComponentRoutes): ComponentEntry = {
+    val kept = entry.instances.flatMap { h =>
+      if (!selected(h)) Some(h)
+      else {
+        routes.removeOwned(actorNameOf(h.path), h.ref)
+        if (Try(h.stopper(remaining(deadline))).isSuccess) None else Some(h.copy(state = "retiring"))
+      }
+    }
+    entry.copy(paths = kept.map(_.path), instances = kept)
+  }
+  private def replace(state: State, entry: ComponentEntry, close: Option[URLClassLoader] => Unit): State =
+    if (entry.instances.isEmpty) { close(entry.loader); state - entry.name }
+    else state.updated(entry.name, entry)
+
+  private def execute(context: ActorContext[Msg], state: State, payload: Array[Byte], limits: Limits,
+                      loaders: mutable.Set[URLClassLoader], close: Option[URLClassLoader] => Unit)(implicit routes: ComponentRoutes): (State, AdminReplyV2) =
+    decodeCommand(payload) match {
+      case Deploy(id, component) => deploy(context, state, id, component, limits, loaders, close)
+      case Stop(id, prefix) =>
+        val matched = state.values.filter(_.paths.exists(matchesPrefix(_, prefix))).toVector
+        if (matched.isEmpty) throw new AdminException(ErrComponentNotFound, "no component under " + prefix)
+        val deadline = System.nanoTime() + limits.retirement.toNanos
+        var next = state; var incomplete = false
+        matched.foreach { entry =>
+          val result = retire(entry, h => matchesPrefix(h.path, prefix), deadline)
+          incomplete = incomplete || result.instances.exists(h => matchesPrefix(h.path, prefix))
+          next = replace(next, result, close)
+        }
+        (next, if (incomplete) failure(id, ErrDrainTimeout, "component retirement deadline elapsed")
+          else AdminReplyV2.Stopped(id))
+      case Drain(id, prefix, timeoutMs) =>
+        val matched = state.values.filter(_.paths.exists(matchesPrefix(_, prefix))).toVector
+        if (matched.isEmpty) throw new AdminException(ErrComponentNotFound, "no component under " + prefix)
+        val millis = if (java.lang.Long.compareUnsigned(timeoutMs, 60000L) > 0) 60000L else timeoutMs
+        val deadline = System.nanoTime() + millis * 1000000L
+        var next = state; var drained = 0L; var aborted = 0L
+        matched.foreach { entry =>
+          val kept = entry.instances.flatMap { h =>
+            if (!matchesPrefix(h.path, prefix)) Some(h)
+            else {
+              routes.removeOwned(actorNameOf(h.path), h.ref)
+              val finished = Try {
+                if (h.spi.isDefined) h.drainer(remaining(deadline))
+                h.stopper(remaining(deadline))
+              }.isSuccess
+              if (finished) { drained += 1; None }
+              else { aborted += 1; Some(h.copy(state = "draining")) }
+            }
+          }
+          next = replace(next, entry.copy(paths = kept.map(_.path), instances = kept), close)
+        }
+        (next, AdminReplyV2.Drained(id, drained, aborted))
+      case Status(id, prefix) =>
+        val states = state.values.toVector.flatMap(e => e.instances.filter(h => matchesPrefix(h.path, prefix))
+          .map(h => ComponentState(h.path, h.state, e.version)))
+        if (states.isEmpty) throw new AdminException(ErrComponentNotFound, "no component under " + prefix)
+        (state, AdminReplyV2.StatusReply(id, states))
+      case MetricsReport(id) => (state, AdminReplyV2.Metrics(id, measured(state).snapshot))
+      case MeasuredMetricsReport(id) => (state, AdminReplyV2.Measured(id, measured(state)))
     }
 
-    val paths = expandPaths(comp.name, comp.instances)
+  private def deploy(context: ActorContext[Msg], original: State, id: Long, component: ComponentDeploy,
+                     limits: Limits, loaders: mutable.Set[URLClassLoader],
+                     close: Option[URLClassLoader] => Unit)(implicit routes: ComponentRoutes): (State, AdminReplyV2) = {
+    var next = original
+    var loader = Option.empty[URLClassLoader]
     val handles = mutable.ArrayBuffer.empty[InstanceHandle]
     try {
+      if (component.name.isEmpty || component.name.length > 256 || component.name == "." || component.name == ".." ||
+          !component.name.forall(c => c.isLetterOrDigit || c == '-' || c == '_' || c == '.'))
+        throw new AdminException(ErrSpawnFailed, "invalid component name")
+      val paths = expandPaths(component.name, component.instances)
+      val others = original.values.filterNot(_.name == component.name).toVector
+      if (others.map(_.instances.size.toLong).sum + paths.size > limits.instances)
+        throw new AdminException(ErrSpawnFailed, "management instance capacity exhausted")
+      if (others.exists(e => e.paths.exists(paths.contains)))
+        throw new AdminException(ErrSpawnFailed, "component logical path collision")
+      loader = buildLoader(component.artifact); loader.foreach(loaders.add)
+      val mainClass = component.artifact match {
+        case ArtifactRef.Jvm(name, _, _) => name
+        case _ => throw new AdminException(ErrDialectMismatch, "not a JVM artifact")
+      }
+      val cls = try Class.forName(mainClass, false, loader.getOrElse(getClass.getClassLoader))
+        catch { case e: LinkageError => throw new AdminException(ErrSpawnFailed, safeDetail(e.getMessage)) }
+      if (!classOf[ComponentSpi].isAssignableFrom(cls))
+        throw new AdminException(ErrSpawnFailed, mainClass + " does not implement ComponentSpi")
+      val constructor = cls.getDeclaredConstructor()
+      if (java.lang.reflect.Modifier.isAbstract(cls.getModifiers) || !constructor.canAccess(null))
+        throw new AdminException(ErrSpawnFailed, "component requires an accessible concrete no-argument constructor")
+      // Preflight preserves an old incarnation. Failures after its retirement
+      // remove old registration and cannot pretend the old instance still runs.
+      original.get(component.name).foreach { old =>
+        val retired = retire(old, _ => true, System.nanoTime() + limits.retirement.toNanos)
+        next = replace(next, retired, close)
+        if (retired.instances.nonEmpty) throw new AdminException(ErrDrainTimeout, "previous incarnation is still retiring")
+      }
+      val startupDeadline = System.nanoTime() + limits.startup.toNanos
       paths.foreach { path =>
-        val cls = Class.forName(mainClass, true, cl)
-        if (!classOf[ComponentSpi].isAssignableFrom(cls))
-          throw new AdminException(
-            ErrSpawnFailed,
-            s"$mainClass does not implement ComponentSpi"
-          )
-        val spi = cls.getDeclaredConstructor().newInstance().asInstanceOf[ComponentSpi]
-        val ctx = ComponentContext(path, comp.version, comp.config)
-        // 外包 StopWrapper（StopSignal → 级联停 child impl）——顶层无
-        // PoisonPill，ask 语义经 wrapper 转发 impl
-        val ref = system.systemActorOf(wrappingBehavior(spi, ctx), actorNameOf(path))
-        handles += InstanceHandle(path, spi, () => tellStop(ref))
-        // R4：Bridge 路由登记（deploy 组件可 ask）。键 = akkaPath 形态
-        // （剥 /user/ 前缀——与 wire 地址 jvm/user/{akkaPath} 的提取、
-        // 内置探针 targets 的 echo/cpu 同键空间）。
-        ComponentRoutes.put(actorNameOf(path), ref.unsafeUpcast[Any])
+        val ready = Promise[ComponentSpi](); val canceled = new AtomicBoolean(false)
+        val alive = new AtomicBoolean(true)
+        val ref = context.spawn(wrappingBehavior(() => constructor.newInstance().asInstanceOf[ComponentSpi],
+          ComponentContext(path, component.version, component.config), ready, canceled, alive, context.self),
+          "component-" + java.util.UUID.randomUUID(), DispatcherSelector.default())
+        val handle = InstanceHandle(path, None, ref,
+          nanos => { canceled.set(true); stopAndAwait(ref, nanos) },
+          nanos => {
+            if (nanos <= 0) throw new java.util.concurrent.TimeoutException("drain deadline elapsed")
+            val done = Promise[Unit](); ref ! DrainRequest(done); Await.result(done.future, nanos.nanos)
+          }, alive, "starting")
+        handles += handle
+        val time = remaining(startupDeadline)
+        if (time <= 0) throw new java.util.concurrent.TimeoutException("component startup deadline elapsed")
+        val spi = Await.result(ready.future, time.nanos)
+        handles(handles.size - 1) = handle.copy(spi = Some(spi), state = "running")
       }
+      if (!routes.publish(handles.toVector.map(h => (actorNameOf(h.path), h.ref, h.alive))))
+        throw new AdminException(ErrSpawnFailed, "component retired during startup or route already owned")
+      val entry = ComponentEntry(component.name, component.version, paths, loader, handles.toVector)
+      (next.updated(component.name, entry), AdminReplyV2.Deployed(id, paths))
     } catch {
-      case e: AdminException => throw e
-      case e: Exception =>
-        // 回滚已 spawn 实例（依赖序装配失败回滚语义同族）
-        handles.foreach(h => Try(h.stopper()))
-        throw new AdminException(ErrSpawnFailed, s"spawn ${comp.name} failed: ${e.getMessage}")
+      case NonFatal(error) =>
+        val failed = ComponentEntry(component.name, component.version, handles.map(_.path).toVector, loader, handles.toVector)
+        val leftover = retire(failed, _ => true, System.nanoTime() + limits.retirement.toNanos)
+        if (leftover.instances.nonEmpty) next = next.updated(component.name, leftover) else close(loader)
+        val code = error match { case e: AdminException => e.code; case _ => ErrSpawnFailed }
+        (next, failure(id, code, "deploy " + component.name + ": " + Option(error.getMessage).getOrElse(error.getClass.getSimpleName)))
     }
-
-    val entry = ComponentEntry(comp.name, comp.version, paths, loader, handles.toVector)
-    (base + (comp.name -> entry), AdminReplyV2.Deployed(reqId, paths))
   }
 
-  /** Drain：全部实例 drain 钩子 + 共享 deadline；超时实例 aborted。 */
-  private def drain(
-      components: Map[String, ComponentEntry],
-      reqId: Long,
-      prefix: String,
-      timeoutMs: Long
-  ): AdminReplyV2 = {
-    val matched = components.values.filter(_.paths.exists(matchesPrefix(_, prefix))).toVector
-    if (matched.isEmpty)
-      throw new AdminException(ErrComponentNotFound, s"no component under $prefix")
-    val deadline = System.nanoTime() + math.min(timeoutMs, 60000) * 1000000L
-    var drained = 0L
-    var aborted = 0L
-    matched.foreach { entry =>
-      entry.instances.foreach { h =>
-        val fut = Try(h.spi.parrotDrain()).getOrElse(null)
-        val ok = if (fut == null) true
-        else {
-          val remain = deadline - System.nanoTime()
-          if (remain <= 0) false
-          else Try(fut.get(remain, java.util.concurrent.TimeUnit.NANOSECONDS)).isSuccess
+  private def actorNameOf(path: String): String = path.stripPrefix("/user/")
+  private case object StopNow
+  private case object Initialized
+  private case object ImplementationStopped
+  private final case class DrainRequest(done: Promise[Unit])
+  private def stopAndAwait(ref: ActorRef[Any], nanos: Long): Unit = {
+    ref ! StopNow
+    if (nanos <= 0) throw new java.util.concurrent.TimeoutException("retirement deadline elapsed")
+    Await.result(akka.pattern.gracefulStop(ref.toClassic, nanos.nanos, StopNow), nanos.nanos)
+    ()
+  }
+  private def wrappingBehavior(create: () => ComponentSpi, component: ComponentContext,
+                               ready: Promise[ComponentSpi], canceled: AtomicBoolean, alive: AtomicBoolean,
+                               owner: ActorRef[Msg])(implicit routes: ComponentRoutes): Behavior[Any] = Behaviors.setup { outer =>
+    var spi: ComponentSpi = null
+    val interceptor = new BehaviorInterceptor[Any, Any] {
+      override def aroundStart(ctx: TypedActorContext[Any], target: BehaviorInterceptor.PreStartTarget[Any]): Behavior[Any] =
+        try target.start(ctx)
+        catch { case NonFatal(error) => ready.tryFailure(error); throw error }
+
+      override def aroundReceive(ctx: TypedActorContext[Any], msg: Any, target: BehaviorInterceptor.ReceiveTarget[Any]): Behavior[Any] =
+        msg match {
+          case Initialized =>
+            if (canceled.get()) Behaviors.stopped else { ready.trySuccess(spi); Behaviors.same }
+          case DrainRequest(done) =>
+            try {
+              val future = spi.parrotDrain()
+              if (future == null) done.trySuccess(())
+              else future.whenComplete((_: Any, error: Throwable) =>
+                if (error == null) { done.trySuccess(()); () } else { done.tryFailure(error); () })
+            } catch { case NonFatal(error) => done.tryFailure(error) }
+            Behaviors.same
+          case other => target(ctx, other)
         }
-        if (ok) { Try(h.stopper()); drained += 1 }
-        else aborted += 1 // 超时：实例保留运行（与 ray drain 语义一致）
-      }
     }
-    AdminReplyV2.Drained(reqId, drained, aborted)
-  }
-
-  /** Stop：立即停 + 登记/加载器清理。返回新登记表。 */
-  private def stop(
-      components: Map[String, ComponentEntry],
-      reqId: Long,
-      prefix: String
-  ): (Map[String, ComponentEntry], AdminReplyV2) = {
-    val matched = components.values.filter(_.paths.exists(matchesPrefix(_, prefix))).toVector
-    if (matched.isEmpty)
-      throw new AdminException(ErrComponentNotFound, s"no component under $prefix")
-    var next = components
-    matched.foreach { entry =>
-      entry.instances.foreach(h => Try(h.stopper()))
-      entry.paths.foreach(p => ComponentRoutes.remove(actorNameOf(p)))
-      entry.loader.foreach(l => Try(l.close()))
-      next = next - entry.name
+    val initialize = Behaviors.setup[Any] { _ =>
+      try { spi = create(); spi.behavior(component) }
+      catch { case e: LinkageError => throw new IllegalStateException("component linkage initialization failed", e) }
     }
-    (next, AdminReplyV2.Stopped(reqId))
-  }
-
-  /** Status：登记表（探活首期=登记即运行——akka ref 本地存活）。 */
-  private def status(
-      components: Map[String, ComponentEntry],
-      reqId: Long,
-      prefix: String
-  ): AdminReplyV2 = {
-    val matched = components.values.filter(_.paths.exists(matchesPrefix(_, prefix))).toVector
-    if (matched.isEmpty)
-      throw new AdminException(ErrComponentNotFound, s"no component under $prefix")
-    val states = matched.flatMap { entry =>
-      entry.paths.map(p => ComponentState(p, "running", entry.version))
+    val child = outer.spawn(CausalTrace.behavior(Behaviors.intercept(() => interceptor)(initialize),
+      outer.system, component.path), "impl", DispatcherSelector.default())
+    outer.watchWith(child, ImplementationStopped); child ! Initialized
+    Behaviors.receiveMessage[Any] {
+      case StopNow => Behaviors.stopped
+      case ImplementationStopped => ready.tryFailure(new IllegalStateException("component terminated before readiness")); Behaviors.stopped
+      case other => child ! other; Behaviors.same
+    }.receiveSignal {
+      case (_, PostStop) =>
+        ready.tryFailure(new IllegalStateException("component owner retired before readiness"))
+        routes.retired(actorNameOf(component.path), outer.self, alive)
+        owner ! Retired(component.path, outer.self)
+        Behaviors.same
     }
-    AdminReplyV2.StatusReply(reqId, states)
   }
-
-  private def actorNameOf(path: String): String = {
-    val n = path.stripPrefix("/user/")
-    if (n.isEmpty) throw new AdminException(ErrSpawnFailed, s"bad path $path")
-    n
-  }
-
-  /** 顶层实例停止：akka typed 顶层 actor 无 PoisonPill——包一层
-    * StopWrapper：其行为收到任何 StopSignal 即 Behaviors.stopped；
-    * 目标 SPI behavior 作为其子，随父停止级联（akka 停止协议：
-    * 父停 → 子先停）。
-    */
-  private sealed trait StopSignal
-  private case object StopNow extends StopSignal
-
-  private def tellStop(ref: akka.actor.typed.ActorRef[StopSignal]): Unit = ref ! StopNow
-
-  private def wrappingBehavior(spi: ComponentSpi, ctx: ComponentContext): Behavior[Any] =
-    Behaviors
-      .setup[Any] { outer =>
-        val child = outer.spawn[Any](spi.behavior(ctx), "impl")
-        Behaviors.receiveMessage[Any] {
-          case StopNow =>
-            Behaviors.stopped // 父停 → akka 自动停 child（停止协议级联）
-          case BridgeActor.BridgeAsk(key, payload, replyTo) =>
-            child.unsafeUpcast[Any] ! BridgeActor.BridgeAsk(key, payload, replyTo)
-            Behaviors.same
-          case BridgeActor.BridgeTell(key, payload) =>
-            child.unsafeUpcast[Any] ! BridgeActor.BridgeTell(key, payload)
-            Behaviors.same
-          case other =>
-            child.unsafeUpcast[Any] ! other
-            Behaviors.same
-        }
-      }
 }

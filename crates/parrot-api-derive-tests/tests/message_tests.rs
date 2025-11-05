@@ -41,7 +41,7 @@ struct PriorityMessage {
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Message)]
 #[message(
     result = "Vec<String>",
-    validate = "self.items.len() > 0",
+    validate = "!self.items.is_empty()",
     priority = 70
 )]
 struct CompleteMessage {
@@ -227,10 +227,10 @@ mod tests {
             content: "test".to_string(),
         };
         let envelope = msg.into_envelope();
-        let _msg_ref = envelope.message::<BasicMessage>().unwrap();
-        // Assert that _msg_ref is of type BasicMessage
-        assert!(std::any::TypeId::of::<BasicMessage>() == std::any::TypeId::of::<BasicMessage>());
-        assert_eq!(_msg_ref.message_type(), "message_tests::BasicMessage");
+        let msg_ref = envelope.message::<BasicMessage>().unwrap();
+        assert_eq!(msg_ref.content, "test");
+        assert!(envelope.message::<FullFeaturedMessage>().is_none());
+        assert_eq!(msg_ref.message_type(), "message_tests::BasicMessage");
 
         // Test full featured message envelope conversion
         let msg = FullFeaturedMessage { amount: 100.0 };
@@ -249,7 +249,11 @@ mod tests {
         let retry_policy = options.retry_policy.unwrap();
         assert_eq!(retry_policy.max_attempts, 5);
         assert_eq!(retry_policy.retry_interval, Duration::from_secs(3));
-        matches!(retry_policy.backoff_strategy, BackoffStrategy::Fixed);
+        assert!(matches!(
+            retry_policy.backoff_strategy,
+            BackoffStrategy::Exponential { base, max_interval }
+                if base == 2.0 && max_interval == Duration::from_secs(60)
+        ));
     }
 
     #[test]
@@ -299,7 +303,10 @@ mod tests {
         if let Some(retry_policy) = options.retry_policy {
             assert_eq!(retry_policy.max_attempts, 3);
             assert_eq!(retry_policy.retry_interval, Duration::from_secs(2));
-            matches!(retry_policy.backoff_strategy, BackoffStrategy::Fixed);
+            assert!(matches!(
+                retry_policy.backoff_strategy,
+                BackoffStrategy::Fixed
+            ));
         } else {
             panic!("Expected retry policy to be Some");
         }
@@ -314,7 +321,10 @@ mod tests {
         let options = msg.message_options().unwrap();
 
         if let Some(retry_policy) = options.retry_policy {
-            matches!(retry_policy.backoff_strategy, BackoffStrategy::Linear);
+            assert!(matches!(
+                retry_policy.backoff_strategy,
+                BackoffStrategy::Linear
+            ));
         } else {
             panic!("Expected retry policy to be Some");
         }
@@ -329,10 +339,11 @@ mod tests {
         let options = msg.message_options().unwrap();
 
         if let Some(retry_policy) = options.retry_policy {
-            matches!(
+            assert!(matches!(
                 retry_policy.backoff_strategy,
-                BackoffStrategy::Exponential { .. }
-            );
+                BackoffStrategy::Exponential { base, max_interval }
+                    if base == 2.0 && max_interval == Duration::from_secs(60)
+            ));
         } else {
             panic!("Expected retry policy to be Some");
         }
@@ -360,10 +371,11 @@ mod tests {
         if let Some(retry_policy) = options.retry_policy {
             assert_eq!(retry_policy.max_attempts, 5);
             assert_eq!(retry_policy.retry_interval, Duration::from_secs(3));
-            matches!(
+            assert!(matches!(
                 retry_policy.backoff_strategy,
-                BackoffStrategy::Exponential { .. }
-            );
+                BackoffStrategy::Exponential { base, max_interval }
+                    if base == 2.0 && max_interval == Duration::from_secs(60)
+            ));
         } else {
             panic!("Expected retry policy to be Some");
         }
@@ -398,10 +410,11 @@ mod tests {
         if let Some(retry_policy) = envelope.options.retry_policy {
             assert_eq!(retry_policy.max_attempts, 5);
             assert_eq!(retry_policy.retry_interval, Duration::from_secs(3));
-            matches!(
+            assert!(matches!(
                 retry_policy.backoff_strategy,
-                BackoffStrategy::Exponential { .. }
-            );
+                BackoffStrategy::Exponential { base, max_interval }
+                    if base == 2.0 && max_interval == Duration::from_secs(60)
+            ));
         } else {
             panic!("Expected retry policy to be Some");
         }

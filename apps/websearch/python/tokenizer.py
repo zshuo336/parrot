@@ -3,7 +3,7 @@
 R1 架构（五运行时分工，同 crawler-lab 原则）：
   - Rust 漫爬 worker 抓真实网页 → 整页 HTML 发本组件
   - 本组件 jieba 中文分词 + 词频统计 → 词项条目回 Rust（Rust 转发 akka 建倒排）
-  - 落盘：段式索引文件由本组件写（data/index/seg-*.segment——重启不丢）
+  - 本组件只持有实例内存索引；段文件的落盘与回放由 JVM 检索组件负责。
 
 分词：jieba（开源中文分词——Python 原版）；与 JVM 侧 jieba-analysis、
 Rust 侧 jieba-rs 同族（词典算法一致的三语言移植）。
@@ -15,9 +15,10 @@ Rust 侧 jieba-rs 同族（词典算法一致的三语言移植）。
 
 from __future__ import annotations
 
-import os
 import struct
 import threading
+from collections import Counter
+from parrot_protocol.payload import decode_documents
 
 import jieba
 
@@ -29,8 +30,8 @@ _STOP = frozenset(
 )
 
 _lock = threading.Lock()
-_index: dict[str, dict[int, int]] = {}  # term -> {docid: tf}
-_docs: dict[int, str] = {}              # docid -> url（段落盘时写 doc 表）
+MAX_REPLY_ENTRIES = 65_536
+MAX_REPLY_BYTES = 8 * 1024 * 1024
 
 
 def _tokenize(text: str) -> list[str]:
@@ -42,20 +43,16 @@ def _tokenize(text: str) -> list[str]:
 
 def _decode_texts(payload: bytes) -> list[tuple[int, str]]:
     """[n u32][{docid u64 | len u32 | text}...]"""
-    (n,) = struct.unpack_from("<I", payload, 0)
-    off, out = 4, []
-    for _ in range(n):
-        docid, ln = struct.unpack_from("<QI", payload, off)
-        off += 12
-        out.append((docid, payload[off : off + ln].decode("utf-8", errors="replace")))
-        off += ln
-    return out
+    return decode_documents(payload, text=True)
 
 
 def build_dispatcher():
     from parrot_protocol.ray_gw import ParrotDispatcher
 
     d = ParrotDispatcher()
+    index: dict[str, dict[int, int]] = {}
+    document_terms: dict[int, set[str]] = {}
+    index_lock = threading.Lock()
 
     @d.handler("bin:ws/Tokenize")
     def _tokenize_batch(_k: str, p: bytes) -> tuple[str, bytes]:
@@ -63,26 +60,47 @@ def build_dispatcher():
 
         布局与 JVM IndexTerms 同构：[n u32][{len u32|term|docid u64|tf u32}...]
         """
+        # State belongs to this deployed dispatcher, and no state is committed
+        # until all documents tokenize and the bounded reply is fully encoded.
         entries: list[tuple[str, int, int]] = []
-        for docid, text in _decode_texts(p):
-            freq: dict[str, int] = {}
-            for t in _tokenize(text):
-                freq[t] = freq.get(t, 0) + 1
-            for term, tf in freq.items():
+        chunks = []
+        reply_bytes = 4
+        documents = _decode_texts(p)
+        if len({docid for docid, _ in documents}) != len(documents):
+            raise ValueError("duplicate document id in tokenization batch")
+        replacements: dict[int, set[str]] = {}
+        for docid, text in documents:
+            words = Counter(_tokenize(text))
+            replacements[docid] = set(words)
+            for term, tf in words.items():
+                encoded = term.encode("utf-8")
+                reply_bytes += 16 + len(encoded)
+                if len(entries) >= MAX_REPLY_ENTRIES or reply_bytes > MAX_REPLY_BYTES:
+                    raise ValueError("token reply exceeds entry or byte budget")
+                chunks.append(struct.pack("<I", len(encoded)) + encoded + struct.pack("<QI", docid, tf))
                 entries.append((term, docid, tf))
-                with _lock:
-                    _index.setdefault(term, {})[docid] = tf
-        buf = struct.pack("<I", len(entries))
-        for term, docid, tf in entries:
-            tb = term.encode("utf-8")
-            buf += struct.pack("<I", len(tb)) + tb + struct.pack("<QI", docid, tf)
-        return ("bin:ws/Terms", buf)
+        reply = struct.pack("<I", len(entries)) + b"".join(chunks)
+        with index_lock:
+            # Each submitted document replaces its complete term set, including
+            # an empty set. Reverse lookup avoids scanning unrelated postings.
+            for docid, words in replacements.items():
+                for term in document_terms.pop(docid, set()):
+                    del index[term][docid]
+                    if not index[term]:
+                        del index[term]
+                if words:
+                    document_terms[docid] = words
+            for term, docid, tf in entries:
+                index.setdefault(term, {})[docid] = tf
+        return ("bin:ws/Terms", reply)
 
     @d.handler("bin:ws/IndexStats")
     def _stats(_k: str, _p: bytes) -> tuple[str, bytes]:
-        with _lock:
-            terms = len(_index)
-            postings = sum(len(v) for v in _index.values())
+        if _p:
+            raise ValueError("IndexStats requires an empty payload")
+        with index_lock:
+            terms = len(index)
+            postings = sum(len(v) for v in index.values())
         return ("bin:ws/IndexStatsR", struct.pack("<IQ", terms, postings))
 
     return d

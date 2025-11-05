@@ -125,7 +125,7 @@ pub enum ActorError {
     /// This variant wraps any other error types that may occur
     /// during actor system operation. It preserves the original
     /// error context through error source chaining.
-    #[error(transparent)]
+    #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
 
@@ -171,36 +171,62 @@ mod tests {
         assert_eq!(other.to_string(), "inner");
     }
 
-    /// Other 变体保留错误源链（source chaining）。
+    /// The first source is the exact original error, even without its own cause.
+    #[test]
+    fn other_source_preserves_original_type_and_identity() {
+        use std::{
+            error::Error as _,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+        };
+        #[derive(Debug)]
+        struct Root {
+            identity: Arc<()>,
+            formats: Arc<AtomicUsize>,
+        }
+        impl std::fmt::Display for Root {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.formats.fetch_add(1, Ordering::SeqCst);
+                f.write_str("root")
+            }
+        }
+        impl std::error::Error for Root {}
+        let identity = Arc::new(());
+        let formats = Arc::new(AtomicUsize::new(0));
+        let error = ActorError::Other(anyhow::Error::new(Root {
+            identity: identity.clone(),
+            formats: formats.clone(),
+        }));
+        let original = error
+            .source()
+            .and_then(|source| source.downcast_ref::<Root>())
+            .expect("source must expose the original error, not skip it");
+        assert!(Arc::ptr_eq(&original.identity, &identity));
+        assert_eq!(formats.load(Ordering::SeqCst), 0);
+    }
+
+    /// Every concrete level remains accessible through the standard Error API.
     #[test]
     fn other_variant_preserves_source_chain() {
         use std::error::Error as _;
-        // anyhow 包装一个带自身 source 的 std error，链应透传
         #[derive(Debug, thiserror::Error)]
         #[error("middle")]
         struct Middle(#[source] std::io::Error);
-        let io_err = std::io::Error::other("root cause");
-        let inner = Middle(io_err);
-        let err = ActorError::Other(anyhow::Error::new(inner));
-        let src = err.source();
-        assert!(src.is_some(), "anyhow-wrapped std error must chain through");
-        // thiserror transparent 跳过 anyhow 层，链到 Middle 的错误链
-        let s = src.unwrap().to_string();
-        assert!(
-            s == "middle" || s == "root cause",
-            "source chain should reach Middle or its root, got {s}"
-        );
-        // 链最终必须到达 root cause
-        let mut cur = err.source();
-        let mut found_root = false;
-        while let Some(e) = cur {
-            if e.to_string() == "root cause" {
-                found_root = true;
-                break;
-            }
-            cur = e.source();
-        }
-        assert!(found_root, "root cause must be reachable via source chain");
+        let error = ActorError::Other(anyhow::Error::new(Middle(
+            std::io::Error::from_raw_os_error(13),
+        )));
+        let middle = error
+            .source()
+            .and_then(|source| source.downcast_ref::<Middle>())
+            .expect("source must retain Middle itself");
+        let root = middle
+            .source()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("the next source must retain the I/O error");
+        assert_eq!(root.raw_os_error(), Some(13));
+        assert!(root.source().is_none());
     }
 
     /// From<anyhow::Error> 转换。

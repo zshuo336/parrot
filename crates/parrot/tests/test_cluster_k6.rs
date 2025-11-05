@@ -1,10 +1,6 @@
-//! K6 集成语义复跑（DEV_02 §7）：三节点 mem 集群 + 随机 kill + RC 复跑 +
-//! QUIC/TLS 全链路冒烟。
-//!
-//! 断言不变（与 RC1-RC8 同规则），环境加噪：
-//! - 三节点 A-B-C（mem 双联 A-B、A-C），RC1/RC4/RC5 在多成员下复跑
-//! - kill C（shutdown）后 N ask 仍达多数派成员（A、B）
-//! - QUIC 冒烟：ask/echo 过 QUIC 载体（K3 链路验证）
+//! Three-node in-process transport contracts and a real QUIC round trip.
+//! Checks concurrent reply correlation and isolation after a cooperative peer
+//! shutdown. This is not process kill, randomized chaos or consensus validation.
 
 mod common;
 
@@ -140,20 +136,24 @@ async fn spawn_node(
 }
 
 /// 三节点集群（A-B、A-C 星型 mem 双联）。
-async fn trio_cluster() -> (
+async fn trio_cluster(
+    case: &str,
+) -> (
     Arc<RemoteActorSystem>,
     Arc<RemoteActorSystem>,
     Arc<RemoteActorSystem>,
 ) {
-    let (a, _, _) = spawn_node("k6-a").await;
-    let (b, _, _) = spawn_node("k6-b").await;
-    let (c, _, _) = spawn_node("k6-c").await;
+    let (a, _, _) = spawn_node(&format!("{case}-a")).await;
+    let (b, _, _) = spawn_node(&format!("{case}-b")).await;
+    let (c, _, _) = spawn_node(&format!("{case}-c")).await;
     a.connect_mem_pair(&b).await.unwrap();
     a.connect_mem_pair(&c).await.unwrap();
     // 等双链握手完成
     eventually(Duration::from_secs(3), || async {
-        a.remote_ref("parrot://k6-b/user/echo").is_ok()
-            && a.remote_ref("parrot://k6-c/user/echo").is_ok()
+        a.remote_ref(&format!("parrot://{case}-b/user/echo"))
+            .is_ok()
+            && a.remote_ref(&format!("parrot://{case}-c/user/echo"))
+                .is_ok()
     })
     .await;
     (a, b, c)
@@ -163,14 +163,14 @@ async fn trio_cluster() -> (
 // 用例
 // ===========================================================================
 
-/// RC1 恰好一次（三节点）：A 并发 128 ask → B；A 并发 128 ask → C。
+/// Each target returns the matching value for every concurrent ASK.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn k6_rc1_trio_exactly_once() {
-    let (a, b, c) = trio_cluster().await;
+async fn k6_trio_correlates_all_concurrent_replies() {
+    let (a, b, c) = trio_cluster("correlation").await;
 
     // A → B / A → C 各 128 并发 ask（boxed 统一 future 类型）
-    let echo_b = a.remote_ref("parrot://k6-b/user/echo").unwrap();
-    let echo_c = a.remote_ref("parrot://k6-c/user/echo").unwrap();
+    let echo_b = a.remote_ref("parrot://correlation-b/user/echo").unwrap();
+    let echo_c = a.remote_ref("parrot://correlation-c/user/echo").unwrap();
     let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send>>> =
         Vec::new();
     for i in 0..128u64 {
@@ -197,38 +197,34 @@ async fn k6_rc1_trio_exactly_once() {
         "each ping answered once per target: {counts:?}"
     );
 
-    a.shutdown().await.ok();
-    b.shutdown().await.ok();
-    c.shutdown().await.ok();
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
 }
 
-/// kill 加噪：kill C 后 N ask 仍达多数派（A、B 存活）。
+/// Cooperative shutdown of C cannot disrupt the independent A-to-B link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn k6_kill_noise_majority_alive() {
-    let (a, b, c) = trio_cluster().await;
-
-    // kill C（shutdown——进程语义等价）
+async fn k6_stopping_one_peer_preserves_other_connection() {
+    let (a, b, c) = trio_cluster("peer-stop").await;
+    let echo_c = a.remote_ref("parrot://peer-stop-c/user/echo").unwrap();
+    let reply = echo_c.send(Box::new(K6Ping(99))).await.unwrap();
+    assert_eq!(reply.downcast_ref::<K6Pong>().unwrap().0, 99);
     c.shutdown().await.unwrap();
 
-    // kill 后 N=64 ask A→B 全部成功（多数派仍服务）
-    let echo_b = a.remote_ref("parrot://k6-b/user/echo").unwrap();
-    let t0 = Instant::now();
+    let echo_b = a.remote_ref("parrot://peer-stop-b/user/echo").unwrap();
     for i in 0..64u64 {
-        let r = echo_b
-            .send(Box::new(K6Ping(i)))
+        let reply = echo_b
+            .send_with_timeout(Box::new(K6Ping(i)), Some(Duration::from_secs(3)))
             .await
-            .unwrap_or_else(|e| panic!("ask {i} failed after kill: {e:?}"));
-        assert_eq!(r.downcast_ref::<K6Pong>().unwrap().0, i);
+            .unwrap();
+        assert_eq!(reply.downcast_ref::<K6Pong>().unwrap().0, i);
     }
-    // A→C 必须失败（链路已断——ConnectionLost）
-    let echo_c = a.remote_ref("parrot://k6-c/user/echo");
-    if let Ok(ec) = echo_c {
-        let r = ec.send(Box::new(K6Ping(0))).await;
-        assert!(r.is_err(), "ask to killed node must fail, got {:?}", r);
-    }
-    let _ = t0;
-    a.shutdown().await.ok();
-    b.shutdown().await.ok();
+    tokio::time::timeout(Duration::from_secs(3), echo_c.send(Box::new(K6Ping(0))))
+        .await
+        .expect("retained reference to stopped peer must not hang")
+        .expect_err("stopped peer must reject business");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 /// QUIC 全链路冒烟（K3）：A --QUIC--> B ask/echo。
@@ -255,8 +251,8 @@ async fn k6_quic_smoke() {
         let r = echo.send(Box::new(K6Ping(i))).await.unwrap();
         assert_eq!(r.downcast_ref::<K6Pong>().unwrap().0, i);
     }
-    a.shutdown().await.ok();
-    b.shutdown().await.ok();
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 // rustls crypto provider 已在 QuicTransport 构造侧安装（parrot-remote
@@ -283,7 +279,8 @@ async fn spawn_node_quic(
         .await
         .unwrap();
     let rs = RemoteActorSystem::new(
-        RCfg::quic(id.to_string(), Some("127.0.0.1:0".parse().unwrap())),
+        RCfg::quic(id.to_string(), Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: facade.clone(),
         }),

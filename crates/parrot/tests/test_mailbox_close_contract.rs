@@ -255,18 +255,20 @@ async fn disposal_can_inspect_mailbox(mailbox: Arc<dyn Mailbox>, strategy: Backp
         .push(first, BackpressureStrategy::Error)
         .await
         .unwrap();
-    let reject = matches!(strategy, BackpressureStrategy::Error);
-    let outcome = mailbox.push(second, strategy).await;
+    let outcome = mailbox.push(second, strategy.clone()).await;
     let reentered = inspected.load(std::sync::atomic::Ordering::SeqCst);
     mailbox.close().await;
     assert!(
         reentered,
         "user message Drop must be able to inspect the mailbox without a bookkeeping lock deadlock"
     );
-    if reject {
-        assert!(matches!(outcome, Err(MailboxError::Full { .. })));
-    } else {
-        outcome.unwrap();
+    match strategy {
+        BackpressureStrategy::Error => assert!(matches!(outcome, Err(MailboxError::Full { .. }))),
+        BackpressureStrategy::DropNewest => {
+            assert!(matches!(outcome, Err(MailboxError::Dropped { .. })))
+        }
+        BackpressureStrategy::DropOldest => outcome.unwrap(),
+        BackpressureStrategy::Block => unreachable!("disposal test requires a nonblocking policy"),
     }
 }
 #[tokio::test]
@@ -297,6 +299,22 @@ async fn ringbuf_eviction_drops_messages_outside_locks() {
 async fn spsc_drop_newest_drops_messages_outside_locks() {
     disposal_can_inspect_mailbox(
         Arc::new(SpscMailbox::new(1, ActorPath::for_test("/drop"))),
+        BackpressureStrategy::DropNewest,
+    )
+    .await;
+}
+#[tokio::test]
+async fn mpsc_drop_newest_drops_messages_outside_locks() {
+    disposal_can_inspect_mailbox(
+        Arc::new(MpscMailbox::new(1, ActorPath::for_test("/drop"))),
+        BackpressureStrategy::DropNewest,
+    )
+    .await;
+}
+#[tokio::test]
+async fn ringbuf_drop_newest_drops_messages_outside_locks() {
+    disposal_can_inspect_mailbox(
+        Arc::new(SpscRingbufMailbox::new(1, ActorPath::for_test("/drop"))),
         BackpressureStrategy::DropNewest,
     )
     .await;

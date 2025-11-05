@@ -14,16 +14,33 @@ parrot-remote = { path = "../parrot-remote" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+httpdate = "1.0.3"
 toml = "0.8"
 thiserror = "2"
 tracing = "0.1"
 async-trait = "0.1"
 futures = "0.3"
+bytes = { version = "1", features = ["serde"] }
 
 # 宿主形态（09 §2.2 分层：宿主 Runner 依赖引擎；lib 本体零引擎依赖）。
 parrot = { path = "../parrot", optional = true }
+parrot-wasm = { path = "../parrot-wasm", features = ["runtime"], optional = true }
+parrot-abi = { path = "../parrot-abi", features = ["loader"], optional = true }
+sha2 = "0.10"
+url = { version = "2", optional = true }
+tempfile = { version = "3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
+rcgen = "0.14.10"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+tempfile = "3"
+libloading = "0.8.9"
+parking_lot = "0.12.5"
 # 场景测试需要真实 thread 引擎 + ProcessGatewayFactory（host 同集）
 parrot = { path = "../parrot" }
 
@@ -38,4 +55,18 @@ required-features = ["host"]
 
 [features]
 default = []
-host = ["dep:parrot"]
+host = ["dep:parrot", "dep:tempfile", "dep:url"]
+wasm = ["host", "dep:parrot-wasm", "dep:url"]
+dylib = ["host", "dep:parrot-abi", "dep:url"]
+
+[[example]]
+name = "wasm_manifest"
+required-features = ["wasm"]
+
+[[example]]
+name = "dylib_manifest"
+required-features = ["dylib"]
+
+[[example]]
+name = "replay_cli"
+required-features = ["host"]

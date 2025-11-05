@@ -10,7 +10,7 @@ use remote_poc::*;
 // ---------- 测试 actor：ping/echo ----------
 
 struct EchoActor {
-    hits: u64,
+    hits: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Actor for EchoActor {
@@ -27,7 +27,7 @@ impl Actor for EchoActor {
         _c: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            self.hits += 1;
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(Ping(n)) = m.downcast_ref::<Ping>() {
                 return Ok(Box::new(Pong(*n)) as BoxedMessage);
             }
@@ -40,18 +40,27 @@ impl Actor for EchoActor {
         })
     }
 
-
     fn state(&self) -> ActorState {
         ActorState::Running
     }
 }
 
 /// 在节点上 spawn echo actor。
-async fn spawn_echo(ep: &remote_poc::RemoteEndpoint, path: &str) {
+async fn spawn_echo(
+    ep: &remote_poc::RemoteEndpoint,
+    path: &str,
+) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ts: std::sync::Arc<ThreadActorSystem> = ep.local.get_thread_system("main").unwrap();
-    ts.spawn_at::<EchoActor>(EchoActor { hits: 0 }, path, None, Default::default())
-        .await
-        .unwrap();
+    ts.spawn_at::<EchoActor>(
+        EchoActor { hits: hits.clone() },
+        path,
+        None,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    hits
 }
 
 // ---------- RC1: 帧编解码 golden ----------
@@ -60,7 +69,7 @@ async fn spawn_echo(ep: &remote_poc::RemoteEndpoint, path: &str) {
 fn rc1_frame_codec_golden() {
     for (name, frame, bytes) in golden_vectors() {
         let mut buf = bytes::BytesMut::new();
-        frame.encode(&mut buf);
+        frame.encode(&mut buf).unwrap();
         assert_eq!(&buf[..], &bytes[..], "golden re-encode mismatch: {name}");
         let mut dec_buf = bytes::BytesMut::from(&bytes[..]);
         let decoded = Frame::decode(&mut dec_buf).unwrap().unwrap();
@@ -70,13 +79,16 @@ fn rc1_frame_codec_golden() {
 
     let (_, _, bytes) = golden_vectors().remove(0);
     let mut half = bytes::BytesMut::from(&bytes[..10]);
-    assert!(Frame::decode(&mut half).unwrap().is_none(), "half frame must return None");
+    assert!(
+        Frame::decode(&mut half).unwrap().is_none(),
+        "half frame must return None"
+    );
 
     let mut stuck = bytes::BytesMut::new();
     let f1 = Frame::ask(7, "/a", "bin:u:Ping", vec![1, 2]);
     let f2 = Frame::tell("/b", "bin:u:Add", vec![3]);
-    f1.encode(&mut stuck);
-    f2.encode(&mut stuck);
+    f1.encode(&mut stuck).unwrap();
+    f2.encode(&mut stuck).unwrap();
     let d1 = Frame::decode(&mut stuck).unwrap().unwrap();
     let d2 = Frame::decode(&mut stuck).unwrap().unwrap();
     assert_eq!((d1.correlation_id, d2.correlation_id), (7, 0));
@@ -88,11 +100,10 @@ fn rc1_frame_codec_golden() {
 
 #[tokio::test]
 async fn rc2_remote_ask_tell_over_memory_link() {
-    CodecRegistry::reset();
     install_poc_messages();
 
     let (a, b) = endpoint_pair().await;
-    spawn_echo(&b, "/user/echo").await;
+    let hits = spawn_echo(&b, "/user/echo").await;
 
     // A 通过远程 ref ask B 的 actor（远程消息落到真实 parrot actor handler）
     let remote = a.remote_ref("/user/echo");
@@ -104,7 +115,8 @@ async fn rc2_remote_ask_tell_over_memory_link() {
 
     // tell（无回执）
     remote.deliver(Box::new(Ping(1))).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    remote.send(Box::new(Ping(0))).await.unwrap(); // same-connection actor barrier
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
 
     // 不存在路径 → ActorNotFound
     let ghost = a.remote_ref("/user/ghost");
@@ -125,7 +137,6 @@ async fn rc2_remote_ask_tell_over_memory_link() {
 
 #[tokio::test]
 async fn rc6_timeout_semantics() {
-    CodecRegistry::reset();
     install_poc_messages();
 
     struct SlowActor {
@@ -149,7 +160,9 @@ async fn rc6_timeout_semantics() {
                     }
                     return Ok(Box::new(Pong(*n)) as BoxedMessage);
                 }
-                Err(parrot_api::errors::ActorError::MessageHandlingError("unsupported".into()))
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unsupported".into(),
+                ))
             })
         }
         fn state(&self) -> ActorState {
@@ -159,9 +172,14 @@ async fn rc6_timeout_semantics() {
 
     let (a, b) = endpoint_pair().await;
     let ts = b.local.get_thread_system("main").unwrap();
-    ts.spawn_at::<SlowActor>(SlowActor { delay_ms: 400 }, "/user/slow", None, Default::default())
-        .await
-        .unwrap();
+    ts.spawn_at::<SlowActor>(
+        SlowActor { delay_ms: 400 },
+        "/user/slow",
+        None,
+        Default::default(),
+    )
+    .await
+    .unwrap();
 
     let remote = a.remote_ref("/user/slow");
     // 无超时：正常返回
@@ -171,21 +189,26 @@ async fn rc6_timeout_semantics() {
     // 超时 < 处理时长 → Timeout 错误
     let start = std::time::Instant::now();
     let err = remote
-        .send_with_timeout(Box::new(Ping(2)), Some(std::time::Duration::from_millis(50)))
+        .send_with_timeout(
+            Box::new(Ping(2)),
+            Some(std::time::Duration::from_millis(50)),
+        )
         .await
         .unwrap_err();
     match &err {
         parrot_api::errors::ActorError::TimeoutDetail(_) => {}
         other => panic!("expect TimeoutDetail, got {other:?}"),
     }
-    assert!(start.elapsed() < std::time::Duration::from_millis(300), "timeout should fire early");
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(300),
+        "timeout should fire early"
+    );
 }
 
 // ---------- RC8: TCP 传输（真实网络栈） ----------
 
 #[tokio::test]
 async fn rc8_remote_over_real_tcp() {
-    CodecRegistry::reset();
     install_poc_messages();
 
     // 先 bind 拿地址（accept 后台），客户端再 connect —— 无时序死锁
@@ -216,7 +239,7 @@ async fn rc8_remote_over_real_tcp() {
 fn path_format_utf8_roundtrip() {
     let f = Frame::ask(1, "/user/节点A", "bin:u:Ping", vec![]);
     let mut buf = bytes::BytesMut::new();
-    f.encode(&mut buf);
+    f.encode(&mut buf).unwrap();
     let mut dec = buf;
     let out = Frame::decode(&mut dec).unwrap().unwrap();
     assert_eq!(out.path, "/user/节点A");

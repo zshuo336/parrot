@@ -31,30 +31,38 @@ impl CodecRegistry {
     /// 全局单例：首次访问 collect inventory（derive 宏 submit 的注册项）。
     pub fn global() -> &'static Self {
         static G: OnceLock<CodecRegistry> = OnceLock::new();
-        G.get_or_init(|| {
-            let mut by_key = HashMap::new();
-            let mut by_type_id = HashMap::new();
-            for reg in inventory::iter::<CodecRegistration> {
-                if by_key
-                    .insert(
-                        reg.type_key,
-                        CodecEntry {
-                            type_key: reg.type_key,
-                            encode: reg.encode,
-                            decode: reg.decode,
-                        },
-                    )
-                    .is_some()
-                {
-                    panic!(
-                        "duplicate TYPE_KEY registered: {}（两类型撞键=协议级事故）",
-                        reg.type_key
-                    );
-                }
-                by_type_id.insert(reg.type_id, reg.type_key);
+        G.get_or_init(|| Self::from_registrations(inventory::iter::<CodecRegistration>))
+    }
+
+    fn from_registrations<'a>(
+        registrations: impl IntoIterator<Item = &'a CodecRegistration>,
+    ) -> Self {
+        let mut by_key = HashMap::new();
+        let mut by_type_id = HashMap::new();
+        for reg in registrations {
+            assert!(
+                CodecStack::of_type_key(reg.type_key).is_ok(),
+                "invalid TYPE_KEY registered: {:?}",
+                reg.type_key
+            );
+            assert!(
+                !by_key.contains_key(reg.type_key),
+                "duplicate TYPE_KEY registered: {}",
+                reg.type_key
+            );
+            if let Some(previous) = by_type_id.insert(reg.type_id, reg.type_key) {
+                panic!("duplicate TypeId registered under {previous} and {}; use distinct message wrapper types for distinct wire identities", reg.type_key);
             }
-            Self { by_key, by_type_id }
-        })
+            by_key.insert(
+                reg.type_key,
+                CodecEntry {
+                    type_key: reg.type_key,
+                    encode: reg.encode,
+                    decode: reg.decode,
+                },
+            );
+        }
+        Self { by_key, by_type_id }
     }
 
     /// 测试/手写注册（重复 TYPE_KEY panic——strict）。
@@ -72,15 +80,18 @@ impl CodecRegistry {
 
     /// schema-diff 工具钩子（P2 CLI 消费）。
     pub fn dump(&self) -> Vec<(String, CodecStack)> {
-        self.by_key
+        let mut entries: Vec<_> = self
+            .by_key
             .keys()
-            .map(|k| {
+            .map(|key| {
                 (
-                    k.to_string(),
-                    CodecStack::of_type_key(k).unwrap_or(CodecStack::Bin),
+                    key.to_string(),
+                    CodecStack::of_type_key(key).expect("validated registry key"),
                 )
             })
-            .collect()
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries
     }
 
     /// 编码出口：TypeId → TYPE_KEY → encode。未注册 → NotRemotable（RC6：不发帧）。
@@ -126,23 +137,48 @@ mod tests {
 
     fn registry_with_test_msgs() -> &'static CodecRegistry {
         static R: OnceLock<CodecRegistry> = OnceLock::new();
-        R.get_or_init(|| {
-            // 手动构造（绕过 inventory——测试隔离）
-            let mut by_key = HashMap::new();
-            let mut by_type_id = HashMap::new();
-            for reg in manual_registrations() {
-                by_key.insert(
-                    reg.type_key,
-                    CodecEntry {
-                        type_key: reg.type_key,
-                        encode: reg.encode,
-                        decode: reg.decode,
-                    },
-                );
-                by_type_id.insert(reg.type_id, reg.type_key);
-            }
-            CodecRegistry { by_key, by_type_id }
-        })
+        R.get_or_init(|| CodecRegistry::from_registrations(&manual_registrations()))
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate TYPE_KEY")]
+    fn duplicate_key_is_rejected() {
+        let mut entries = manual_registrations();
+        let mut duplicate = manual_registrations().remove(0);
+        duplicate.type_id = TypeId::of::<String>();
+        entries.push(duplicate);
+        CodecRegistry::from_registrations(&entries);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate TypeId")]
+    fn ambiguous_outgoing_identity_is_rejected() {
+        let mut entries = manual_registrations();
+        let mut duplicate = manual_registrations().remove(0);
+        duplicate.type_key = "bin:other::TestMsg#v2";
+        entries.push(duplicate);
+        CodecRegistry::from_registrations(&entries);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid TYPE_KEY")]
+    fn invalid_key_cannot_be_dumped_as_bincode() {
+        let mut entries = manual_registrations();
+        entries[0].type_key = "json:TestMsg";
+        CodecRegistry::from_registrations(&entries);
+    }
+
+    #[test]
+    fn schema_dump_is_sorted_independent_of_registration_order() {
+        let mut entries = manual_registrations();
+        let mut second = manual_registrations().remove(0);
+        second.type_key = "bin:aaa::Other#v1";
+        second.type_id = TypeId::of::<String>();
+        entries.push(second);
+        let forward = CodecRegistry::from_registrations(&entries).dump();
+        entries.reverse();
+        assert_eq!(forward, CodecRegistry::from_registrations(&entries).dump());
+        assert_eq!(forward[0].0, "bin:aaa::Other#v1");
     }
 
     #[test]

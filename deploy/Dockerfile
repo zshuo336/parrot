@@ -8,12 +8,14 @@
 FROM rust:1.98-slim AS builder
 
 WORKDIR /build
+ENV CARGO_BUILD_JOBS=2
 
 # Cargo resolves every workspace member, including applications.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY tools/ tools/
 COPY apps/ apps/
+COPY vendor/ vendor/
 
 # 静态偏好构建（release；目标仅节点 crate 链）
 RUN cargo build --locked --release -p parrot-node
@@ -32,8 +34,8 @@ COPY --from=builder /build/target/release/parrot-probe /usr/local/bin/parrot-pro
 USER parrot
 WORKDIR /home/parrot
 
-# 契约：PARROT_BIND（缺省 0.0.0.0:9801）；healthcheck 走二进制内置 TCP 探测
-ENV PARROT_BIND=0.0.0.0:9801
+# 默认仅回环；外部部署必须显式配置 mTLS，或选择 insecure-development。
+ENV PARROT_BIND=127.0.0.1:9801
 EXPOSE 9801
 
 HEALTHCHECK --interval=5s --timeout=3s --start-period=3s --retries=3 \

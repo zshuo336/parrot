@@ -1,36 +1,71 @@
-//! POC 3：parrot-api 中立化改造（"框架的框架"定位回归）。
-//!
-//! 评测批评：抽象"照着 actix 设计"，thread 引擎被迫长成 actix 形状。
-//! 本 POC 定义一套**引擎中立**的最小 API 面（Face），并用两个形态迥异的
-//! 假想引擎（线程邮箱型 / 事件循环型）验证同一抽象可自然粘合两种范式。
-//!
-//! 对照 Erlang 的 behaviour：callback module 定义"做什么"，
-//! runtime 决定"怎么跑"。Parrot-API 应该是 behaviour 层。
-
+//! Runtime-neutral actor contracts, optional lifecycle adaptation and owned bindings.
+//! No concrete engine dependency belongs in this crate.
 pub mod engine;
+pub mod registry;
+pub use engine::{
+    ActorRefErased, BoxedActorRef, BoxedMessage, BoxedResult, EngineRuntime, ErasedActor, SendError,
+};
+pub use registry::{
+    list_bindings, register_engine_binding, spawn_binding, BindingRegistry, Registration,
+};
 
-// ============ 中立 API 面 ============
-
-/// 消息处理回调（behaviour）：引擎负责调度，behaviour 只管业务。
-/// 注意：没有 Context 生命周期钩子的强假设——那是 actix 形状。
-pub trait ActorBehaviour {
+/// This transferable face deliberately requires Send + 'static. A runtime for
+/// thread-local !Send actors would require a separate local face.
+pub trait ActorBehaviour: Send + 'static {
     fn receive(&mut self, msg: BoxedMessage) -> BoxedResult;
 }
-
-/// 生命周期（可选实现，覆盖默认空实现）。
+/// Optional hooks. Opt in through Spawner::spawn or the derive's lifecycle flag.
 pub trait Lifecycle {
-    fn pre_start(&mut self) -> Result<(), String> { Ok(()) }
+    fn pre_start(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     fn post_stop(&mut self) {}
 }
-
-/// 生成器（统一 spawn 语义）。
+/// Adapt behaviour and lifecycle together on any EngineRuntime, including dyn.
 pub trait Spawner {
-    fn spawn<B: ActorBehaviour + Lifecycle + 'static>(
+    fn spawn<B: ActorBehaviour + Lifecycle>(
         &self,
         behaviour: B,
         path: &str,
     ) -> Result<BoxedActorRef, String>;
 }
-
-// re-export
-pub use engine::{ActorRefErased, BoxedActorRef, BoxedMessage, BoxedResult, ErasedActor, EngineRuntime};
+struct LifecycleActor<B>(B);
+impl<B: ActorBehaviour + Lifecycle> ErasedActor for LifecycleActor<B> {
+    fn pre_start(&mut self) -> Result<(), String> {
+        self.0.pre_start()
+    }
+    fn receive(&mut self, msg: BoxedMessage) -> BoxedResult {
+        self.0.receive(msg)
+    }
+    fn post_stop(&mut self) {
+        self.0.post_stop();
+    }
+}
+impl<E: EngineRuntime + ?Sized> Spawner for E {
+    fn spawn<B: ActorBehaviour + Lifecycle>(
+        &self,
+        behaviour: B,
+        path: &str,
+    ) -> Result<BoxedActorRef, String> {
+        self.spawn_erased(Box::new(LifecycleActor(behaviour)), path)
+    }
+}
+pub(crate) fn safe_drop<T>(value: T) {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
+        if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            std::mem::forget(secondary);
+        }
+    }
+}
+pub(crate) fn panic_error(payload: BoxedMessage) -> String {
+    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "opaque panic".into()
+    };
+    safe_drop(payload);
+    format!("binding factory panicked: {message}")
+}

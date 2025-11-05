@@ -8,9 +8,22 @@
 //! 实现）；③ Replica 封装（RaftNode + DirectorySm + client 语义）。
 //! 传输挂接与 DirectoryApi（RESOLVE_Q 应答）在 F7 解析管线集成。
 
+mod command;
+mod durable;
+mod request;
+pub use request::{directory_command_digest, DirectoryRequestStatus};
+pub mod client;
+pub mod network;
+pub use command::DirectoryApplyError;
+pub use durable::{
+    DirectoryRead, DirectoryReadTicket, DurableDirectory, DurableDirectoryError,
+    DurableDirectoryProposal, DurableDirectoryStatus,
+};
+
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-use crate::raft::{Clock, LogIndex, NotLeader, RaftNode, StateMachine};
+use crate::raft::{Clock, LogIndex, RaftNode, StateMachine};
 
 /// 目录条目（07 §6.4 表格原样）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -37,11 +50,22 @@ pub enum DirCmd {
 }
 
 /// 查询视图（只读快照——client 侧）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DirQuery {
     Resolve { prefix_or_node: String },
     BorderFor { prefix: String },
     NodesForKey { key: String },
+}
+pub(super) fn validate_query(query: &DirQuery) -> Result<usize, DirectoryApplyError> {
+    let text = match query {
+        DirQuery::Resolve { prefix_or_node } => prefix_or_node,
+        DirQuery::BorderFor { prefix } => prefix,
+        DirQuery::NodesForKey { key } => key,
+    };
+    if text.len() > 4096 {
+        return Err(DirectoryApplyError::Capacity);
+    }
+    Ok(text.len())
 }
 
 /// Directory 复制状态机。
@@ -57,12 +81,19 @@ pub struct DirectorySm {
 }
 
 impl StateMachine for DirectorySm {
-    fn apply(&mut self, cmd: &[u8]) {
-        let Ok((cmd, _)) =
-            bincode::serde::decode_from_slice::<DirCmd, _>(cmd, bincode::config::standard())
-        else {
-            return; // 坏条目跳过（防御——Raft 日志一旦写入不可撤）
-        };
+    type Error = DirectoryApplyError;
+    fn apply(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        let cmd = DirCmd::decode(bytes)?;
+        self.version
+            .checked_add(1)
+            .ok_or(DirectoryApplyError::RevisionExhausted)?;
+        self.apply_validated(cmd);
+        Ok(())
+    }
+}
+impl DirectorySm {
+    // Caller has validated the command and reserved revision capacity.
+    fn apply_validated(&mut self, cmd: DirCmd) {
         self.version += 1;
         match cmd {
             DirCmd::Upsert { node, endpoints } => {
@@ -77,9 +108,10 @@ impl StateMachine for DirectorySm {
             DirCmd::Remove { node } => {
                 self.nodes.remove(&node);
                 self.borders.retain(|_, b| b != &node);
-                for nodes in self.key_index.values_mut() {
+                self.key_index.retain(|_, nodes| {
                     nodes.retain(|n| n != &node);
-                }
+                    !nodes.is_empty()
+                });
             }
             DirCmd::BorderDeclare { prefix, node } => {
                 self.borders.insert(prefix, node);
@@ -110,28 +142,40 @@ impl DirectoryReplica {
     }
 
     /// client 写（leader 才受理）。
-    pub fn propose(&mut self, cmd: &DirCmd) -> Result<LogIndex, NotLeader> {
-        let bytes = bincode::serde::encode_to_vec(cmd, bincode::config::standard()).unwrap();
-        self.raft.propose(bytes)
+    pub fn propose(&mut self, cmd: &DirCmd) -> Result<LogIndex, DirectoryWriteError> {
+        let bytes = cmd.encode()?;
+        self.raft
+            .propose(bytes)
+            .map_err(|e| DirectoryWriteError::NotLeader {
+                shard: self.raft.id.clone(),
+                leader: e.0,
+            })
     }
 
     /// 驱动：apply 已提交条目到状态机（宿主周期调用）。
-    pub fn apply_committed(&mut self) -> usize {
-        let entries = self.raft.committed();
-        let n = entries.len();
-        for e in entries {
-            self.sm.apply(&e.cmd);
+    pub fn apply_committed(&mut self) -> Result<usize, DirectoryApplyError> {
+        let commands = self.sm.prepare(self.raft.pending_committed())?;
+        let n = commands.len();
+        self.raft.committed();
+        for cmd in commands {
+            self.sm.apply_validated(cmd);
         }
-        n
+        Ok(n)
     }
 
     /// client 读（线性一致读的先决条件是读经 leader+lease——本实现
     /// 按 07 §6.4 目录语义：命中即可用，版本号供缓存失效判定）。
     pub fn query(&self, q: &DirQuery) -> Option<DirEntry> {
+        self.sm.query(q)
+    }
+}
+
+impl DirectorySm {
+    pub fn query(&self, q: &DirQuery) -> Option<DirEntry> {
         match q {
             DirQuery::Resolve { prefix_or_node } => {
                 // 节点直查（parrot://node 形态）
-                if let Some(e) = self.sm.nodes.get(prefix_or_node) {
+                if let Some(e) = self.nodes.get(prefix_or_node) {
                     return Some(e.clone());
                 }
                 // 前缀所属节点（"parrot://eu-1/user" → 节点 eu-1？——
@@ -141,20 +185,19 @@ impl DirectoryReplica {
             DirQuery::BorderFor { prefix } => {
                 // 最长前缀 border
                 let hit = self
-                    .sm
                     .borders
                     .iter()
                     .filter(|(p, _)| prefix.starts_with(p.as_str()))
                     .max_by_key(|(p, _)| p.len());
                 hit.map(|(_, node)| DirEntry {
                     endpoints: vec![format!("parrot://{node}")],
-                    version: self.sm.version,
+                    version: self.version,
                     ttl_s: 60,
                 })
             }
-            DirQuery::NodesForKey { key } => self.sm.key_index.get(key).map(|nodes| DirEntry {
+            DirQuery::NodesForKey { key } => self.key_index.get(key).map(|nodes| DirEntry {
                 endpoints: nodes.iter().map(|n| format!("parrot://{n}")).collect(),
-                version: self.sm.version,
+                version: self.version,
                 ttl_s: 30,
             }),
         }
@@ -190,7 +233,8 @@ mod tests {
             },
         ];
         for c in &cmds {
-            sm.apply(&bincode::serde::encode_to_vec(c, bincode::config::standard()).unwrap());
+            sm.apply(&bincode::serde::encode_to_vec(c, bincode::config::standard()).unwrap())
+                .unwrap();
         }
         assert_eq!(sm.nodes.len(), 2);
         assert_eq!(sm.nodes["n1"].endpoints, vec!["tcp://10.0.0.1:7000"]);
@@ -202,7 +246,8 @@ mod tests {
                 bincode::config::standard(),
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(sm.nodes.len(), 1);
         assert!(
             !sm.borders.contains_key("parrot://eu-1/"),
@@ -235,7 +280,7 @@ mod tests {
         assert_eq!(idx, 1);
         // 无 peers——advance_commit 需多数派=1（自己）
         assert_eq!(r.raft.commit_index, 1, "单节点即时提交");
-        assert_eq!(r.apply_committed(), 1);
+        assert_eq!(r.apply_committed().unwrap(), 1);
         assert!(r.sm.nodes.contains_key("n1"));
     }
 }
@@ -251,9 +296,72 @@ mod tests {
 /// 与 D1 的区别：D1 按 entity 路由（actor 亲和），S3 按 key 路由（目录
 /// 键空间切分）。两者共享 HashRing 数学（256 vnode——均匀性已验证）。
 pub struct DirectoryShards {
-    /// shard id → 副本组（solo 测试形态 / 3 副本生产形态）。
+    /// shard id → 本地嵌入副本；new 创建单副本组，网络复制宿主尚未接线。
     pub shards: HashMap<String, DirectoryReplica>,
     ring: crate::sharding::HashRing,
+    // Keep the configured participants even if a public test/embedded replica
+    // is temporarily absent. Iterating only the live map would hide lost shards.
+    shard_ids: Vec<String>,
+    identity: std::sync::Arc<()>,
+}
+
+/// One position in a multi-shard proposal. A local append is not commitment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryPosition {
+    pub shard: String,
+    pub index: LogIndex,
+    pub term: crate::raft::Term,
+}
+
+/// Receipt for all participant logs, scoped to this directory's fixed shard set.
+#[derive(Debug, Clone)]
+pub struct DirectoryProposal {
+    identity: std::sync::Arc<()>,
+    positions: Vec<DirectoryPosition>,
+    command_digest: [u8; 32],
+}
+impl DirectoryProposal {
+    pub fn positions(&self) -> &[DirectoryPosition] {
+        &self.positions
+    }
+}
+
+/// Current local observation of the complete receipt. No variant grants a
+/// linearizable read lease. Conflict/unavailability is not proof that the
+/// command was never committed elsewhere; resolve uncertain outcomes explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryProposalStatus {
+    Pending,
+    Committed,
+    Conflict,
+    Unavailable,
+}
+
+/// A failed admission identifies the unavailable or non-leading participant.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DirectoryWriteError {
+    #[error(transparent)]
+    Command(#[from] DirectoryApplyError),
+    #[error("directory has no configured shards")]
+    NoShards,
+    #[error("directory shard unavailable: {0}")]
+    Unavailable(String),
+    #[error("directory shard {shard} is not leader (hint: {leader:?})")]
+    NotLeader {
+        shard: String,
+        leader: Option<String>,
+    },
+}
+
+/// Read failures are distinct from an absent record in the checked API.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DirectoryReadError {
+    #[error("directory has no configured shards")]
+    NoShards,
+    #[error("directory shard unavailable: {0}")]
+    Unavailable(String),
+    #[error("directory aggregate revision overflow")]
+    VersionOverflow,
 }
 
 impl DirectoryShards {
@@ -270,6 +378,8 @@ impl DirectoryShards {
         Self {
             shards,
             ring: crate::sharding::HashRing::new(&ids, 256),
+            shard_ids: ids,
+            identity: std::sync::Arc::new(()),
         }
     }
 
@@ -278,41 +388,183 @@ impl DirectoryShards {
         self.ring.node(key)
     }
 
-    /// 分片写：路由 + propose（leader 才受理——NotLeader 上抛）。
-    pub fn propose(&mut self, cmd: &DirCmd) -> Result<(String, LogIndex), NotLeader> {
-        let key = dir_cmd_key(cmd);
-        let shard_id = self
-            .route(&key)
-            .map(|s| s.to_string())
-            .ok_or(NotLeader(None))?;
-        let shard = self.shards.get_mut(&shard_id).unwrap();
-        let idx = shard.propose(cmd)?;
-        Ok((shard_id, idx))
+    /// Admit a command to its authoritative shard, or Remove to every shard.
+    /// All configured participants must be present and leaders before any append.
+    /// Admission is synchronous in this embedded host; Raft commitment remains
+    /// independent per shard. Retain the entire receipt and wait for all positions.
+    pub fn propose(&mut self, cmd: &DirCmd) -> Result<DirectoryProposal, DirectoryWriteError> {
+        let bytes = cmd.encode()?;
+        let targets = if matches!(cmd, DirCmd::Remove { .. }) {
+            self.shard_ids.clone()
+        } else {
+            vec![self
+                .route(&dir_cmd_key(cmd))
+                .ok_or(DirectoryWriteError::NoShards)?
+                .to_string()]
+        };
+        if targets.is_empty() {
+            return Err(DirectoryWriteError::NoShards);
+        }
+        for id in &targets {
+            let shard = self
+                .shards
+                .get(id)
+                .ok_or_else(|| DirectoryWriteError::Unavailable(id.clone()))?;
+            if shard.raft.role != crate::raft::Role::Leader {
+                return Err(DirectoryWriteError::NotLeader {
+                    shard: id.clone(),
+                    leader: shard.raft.leader_hint.clone(),
+                });
+            }
+        }
+        let command_digest = Sha256::digest(&bytes).into();
+        let mut positions = Vec::with_capacity(targets.len());
+        // No await/callback or other state mutation occurs between preflight and
+        // these appends, so a participant cannot lose leadership during admission.
+        for id in targets {
+            let shard = self
+                .shards
+                .get_mut(&id)
+                .ok_or_else(|| DirectoryWriteError::Unavailable(id.clone()))?;
+            let index =
+                shard
+                    .raft
+                    .propose(bytes.clone())
+                    .map_err(|e| DirectoryWriteError::NotLeader {
+                        shard: id.clone(),
+                        leader: e.0,
+                    })?;
+            positions.push(DirectoryPosition {
+                shard: id,
+                index,
+                term: shard.raft.current_term,
+            });
+        }
+        Ok(DirectoryProposal {
+            identity: self.identity.clone(),
+            positions,
+            command_digest,
+        })
+    }
+
+    /// Observe every original position, including its term and command digest.
+    /// `Committed` does not imply `apply_committed_all` has been called, nor is
+    /// multi-group commitment atomic. A missing/unavailable shard cannot be skipped.
+    pub fn proposal_status(&self, proposal: &DirectoryProposal) -> DirectoryProposalStatus {
+        if !std::sync::Arc::ptr_eq(&self.identity, &proposal.identity) {
+            return DirectoryProposalStatus::Unavailable;
+        }
+        let mut pending = false;
+        for position in &proposal.positions {
+            let Some(shard) = self.shards.get(&position.shard) else {
+                return DirectoryProposalStatus::Unavailable;
+            };
+            let Some(slot) = position
+                .index
+                .checked_sub(1)
+                .and_then(|n| usize::try_from(n).ok())
+            else {
+                return DirectoryProposalStatus::Unavailable;
+            };
+            let Some(entry) = shard.raft.log.get(slot) else {
+                // Admission appended every receipt position synchronously.
+                // An available participant no longer retaining that position
+                // has lost the original suffix; it is not awaiting quorum.
+                return DirectoryProposalStatus::Conflict;
+            };
+            if entry.term != position.term
+                || Sha256::digest(&entry.cmd)[..] != proposal.command_digest
+            {
+                return DirectoryProposalStatus::Conflict;
+            }
+            pending |= shard.raft.commit_index < position.index;
+        }
+        if pending {
+            DirectoryProposalStatus::Pending
+        } else {
+            DirectoryProposalStatus::Committed
+        }
     }
 
     /// 全 shard apply（宿主周期调用——各 shard 独立驱动）。
-    pub fn apply_committed_all(&mut self) -> usize {
-        let mut n = 0;
-        for s in self.shards.values_mut() {
-            n += s.apply_committed();
+    pub fn apply_committed_all(&mut self) -> Result<usize, DirectoryApplyError> {
+        // Preflight all locally pending groups before consuming any queue. This
+        // prevents malformed application from partially updating this local view;
+        // it does not make independent Raft-group commitment atomic.
+        let mut prepared = Vec::with_capacity(self.shards.len());
+        for (id, shard) in &self.shards {
+            prepared.push((
+                id.clone(),
+                shard.sm.prepare(shard.raft.pending_committed())?,
+            ));
         }
-        n
-    }
-
-    /// 分片读（读写同环——保证命中）。
-    ///
-    /// Resolve 按 node 同环路由；BorderFor / NodesForKey 走全 shard 扇出
-    /// （border/key 聚合按共址原则分布，无法单片判定——扇出保正确性）。
-    pub fn query(&self, q: &DirQuery) -> Option<DirEntry> {
-        match q {
-            DirQuery::Resolve { prefix_or_node } => self
-                .route(prefix_or_node)
-                .and_then(|sid| self.shards.get(sid))
-                .and_then(|s| s.query(q)),
-            DirQuery::BorderFor { .. } | DirQuery::NodesForKey { .. } => {
-                self.shards.values().find_map(|s| s.query(q))
+        let mut n = 0;
+        for (id, commands) in prepared {
+            let shard = self
+                .shards
+                .get_mut(&id)
+                .expect("preflight preserved local shards");
+            shard.raft.committed();
+            n += commands.len();
+            for cmd in commands {
+                shard.sm.apply_validated(cmd);
             }
         }
+        Ok(n)
+    }
+
+    /// Convenience local view; unavailable and absent both return None. Use
+    /// `query_checked` when an unavailable shard must be reported to a caller.
+    pub fn query(&self, q: &DirQuery) -> Option<DirEntry> {
+        self.query_checked(q).ok().flatten()
+    }
+
+    /// Read a local applied view, distinguishing absence from unavailability.
+    /// Node and service-key lookups use their fixed owner. Border lookup selects
+    /// the globally longest authoritative prefix. This is not a quorum read.
+    pub fn query_checked(&self, q: &DirQuery) -> Result<Option<DirEntry>, DirectoryReadError> {
+        if self.shard_ids.is_empty() {
+            return Err(DirectoryReadError::NoShards);
+        }
+        Ok(match q {
+            DirQuery::Resolve { prefix_or_node } => self.read_owner(prefix_or_node)?.query(q),
+            DirQuery::NodesForKey { key } => self.read_owner(&format!("key:{key}"))?.query(q),
+            DirQuery::BorderFor { prefix } => {
+                let mut best: Option<(&str, &str)> = None;
+                let mut version = 0u64;
+                for id in &self.shard_ids {
+                    let shard = self
+                        .shards
+                        .get(id)
+                        .ok_or_else(|| DirectoryReadError::Unavailable(id.clone()))?;
+                    // Local aggregate revision increases for every applied shard
+                    // command, even when a query changes to a different owner.
+                    version = version
+                        .checked_add(shard.sm.version)
+                        .ok_or(DirectoryReadError::VersionOverflow)?;
+                    for (p, node) in &shard.sm.borders {
+                        if prefix.starts_with(p)
+                            && self.route(&format!("border:{p}")) == Some(id.as_str())
+                            && best.is_none_or(|(old, _)| p.len() > old.len())
+                        {
+                            best = Some((p, node));
+                        }
+                    }
+                }
+                best.map(|(_, node)| DirEntry {
+                    endpoints: vec![format!("parrot://{node}")],
+                    version,
+                    ttl_s: 60,
+                })
+            }
+        })
+    }
+
+    fn read_owner(&self, key: &str) -> Result<&DirectoryReplica, DirectoryReadError> {
+        let id = self.route(key).ok_or(DirectoryReadError::NoShards)?;
+        self.shards
+            .get(id)
+            .ok_or_else(|| DirectoryReadError::Unavailable(id.into()))
     }
 
     /// 观测：各 shard 条目占比（均匀性门禁——S3 验收用）。
@@ -332,23 +584,13 @@ impl DirectoryShards {
     }
 }
 
-/// DirCmd → 路由 key。
-///
-/// 共址原则（S3）：所有与节点相关的状态（node 条目 + 该节点的 border
-/// 声明 + key 聚合）路由到同一 shard——保证 `Remove` 级联在片内完成
-/// （跨片无残留）。
-///
-/// 例外（语义红线）：
-/// - `KeyAggregate` 按 **key 哈希**路由（与上报节点集无关）——同一 key
-///   的多次上报（节点集变化）必须落同一 shard 覆盖，否则同 key 分裂
-///   成多份（s3_reg_key_aggregate_stable_routing 锁死）。
-/// - `BorderDeclare` 按声明者 node 共址（Remove node 级联清理 border）。
+/// Stable ownership uses the logical record key, never its changing value.
+/// Remove is handled separately as a proposal to every configured shard, since
+/// node references can occur in any border or service-key owner.
 fn dir_cmd_key(cmd: &DirCmd) -> String {
     match cmd {
         DirCmd::Upsert { node, .. } | DirCmd::Remove { node } => node.clone(),
-        // border 声明与声明者共址（Remove node 时片内级联清理）
-        DirCmd::BorderDeclare { node, .. } => node.clone(),
-        // key 聚合按 key 定位（节点集无关——防同 key 分裂）
+        DirCmd::BorderDeclare { prefix, .. } => format!("border:{prefix}"),
         DirCmd::KeyAggregate { key, .. } => format!("key:{key}"),
     }
 }
@@ -373,8 +615,10 @@ mod s3_tests {
             node: "parrot://n1".into(),
             endpoints: vec!["tcp://10.0.0.1:7000".into()],
         };
-        let (shard_id, _) = ds.propose(&cmd).unwrap();
-        assert_eq!(ds.apply_committed_all(), 1);
+        let proposal = ds.propose(&cmd).unwrap();
+        assert_eq!(proposal.positions().len(), 1);
+        let shard_id = &proposal.positions()[0].shard;
+        assert_eq!(ds.apply_committed_all().unwrap(), 1);
         // 读经同一环 → 命中
         let hit = ds.query(&DirQuery::Resolve {
             prefix_or_node: "parrot://n1".into(),
@@ -404,7 +648,7 @@ mod s3_tests {
             })
             .unwrap();
         }
-        ds.apply_committed_all();
+        ds.apply_committed_all().unwrap();
         assert_eq!(ds.total_nodes(), n);
         let sizes = ds.shard_sizes();
         let avg = n as f64 / 4.0;
@@ -415,9 +659,9 @@ mod s3_tests {
         assert!(max_skew < 0.15, "4 shard 偏差 {max_skew:.2}（门禁 ±15%）");
     }
 
-    /// S3-3 Remove 级联在分片内完成（跨片无残留）
+    /// S3-3 Remove 经所有分片日志清理引用（跨片无残留）
     #[test]
-    fn s3_remove_cascade_in_shard() {
+    fn s3_remove_cascades_through_all_shard_logs() {
         let clock = Arc::new(ManualClock::new());
         let mut ds = DirectoryShards::new(2, clock.clone());
         clock.advance(1400);
@@ -434,11 +678,11 @@ mod s3_tests {
             node: "n1".into(),
         })
         .unwrap();
-        ds.apply_committed_all();
+        ds.apply_committed_all().unwrap();
         assert_eq!(ds.total_nodes(), 1);
-        // Remove n1 → border 声明级联清理
+        // Remove n1 → 所有分片提交后清理 border 声明
         ds.propose(&DirCmd::Remove { node: "n1".into() }).unwrap();
-        ds.apply_committed_all();
+        ds.apply_committed_all().unwrap();
         assert_eq!(ds.total_nodes(), 0);
         let borders: usize = ds.shards.values().map(|s| s.sm.borders.len()).sum();
         assert_eq!(borders, 0, "跨 shard 级联无残留");
@@ -461,7 +705,7 @@ mod s3_tests {
             })
             .unwrap();
         }
-        ds4.apply_committed_all();
+        ds4.apply_committed_all().unwrap();
         assert_eq!(ds4.total_nodes(), n);
 
         // 8 shard 新环（模拟扩容：数据搬移 = 全量重放）
@@ -477,7 +721,7 @@ mod s3_tests {
             })
             .unwrap();
         }
-        ds8.apply_committed_all();
+        ds8.apply_committed_all().unwrap();
         assert_eq!(ds8.total_nodes(), n, "扩容后无丢失");
         // 且仍可命中（8 环读写同环）
         assert!(ds8
@@ -524,7 +768,7 @@ mod s3_tests {
             nodes: vec!["n9".into(), "n2".into()], // first 漂移
         })
         .unwrap();
-        ds.apply_committed_all();
+        ds.apply_committed_all().unwrap();
         // 查询必须命中（且只有一份——不因 first 漂移分裂）
         let hit = ds.query(&DirQuery::NodesForKey {
             key: "media/track/r1".into(),
@@ -555,23 +799,28 @@ mod s3_tests {
         for s in ds.shards.values_mut() {
             s.raft.tick();
         }
+        let first = "n1";
+        let second = (0..1000)
+            .map(|i| format!("border-{i}"))
+            .find(|n| ds.route(n) != ds.route(first))
+            .unwrap();
         ds.propose(&DirCmd::BorderDeclare {
             prefix: "parrot://eu-1/".into(),
-            node: "n1".into(),
+            node: first.into(),
         })
         .unwrap();
         ds.propose(&DirCmd::BorderDeclare {
             prefix: "parrot://eu-1/".into(),
-            node: "n2".into(), // 换 border 节点
+            node: second.clone(), // 声明者的节点分片确实变化
         })
         .unwrap();
-        ds.apply_committed_all();
+        ds.apply_committed_all().unwrap();
         let hit = ds.query(&DirQuery::BorderFor {
             prefix: "parrot://eu-1/".into(),
         });
         assert_eq!(
             hit.expect("border 可查").endpoints,
-            vec!["parrot://n2".to_string()],
+            vec![format!("parrot://{second}")],
             "重声明覆盖（后写胜——单一逻辑条目）"
         );
     }

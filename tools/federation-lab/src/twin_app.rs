@@ -149,6 +149,7 @@ mod tests {
             version: "1.0.0".into(),
             components: comps,
             wiring,
+            mirrors: Vec::new(),
             config_overlay: None,
         }
     }

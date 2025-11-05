@@ -1,14 +1,5 @@
-//! interop-erl：Rust ↔ Erlang 网关一致性验证（DEV_03 §7 / E6 集成门禁）。
-//!
-//! 流程：
-//! 1. spawn `escript interop/erlang/parrot_gw.es 0`
-//! 2. 解析 stdout 的 `PARROT_ERL_PORT=<n>`
-//! 3. Rust RemoteActorSystem（TCP，caps 加 PB——erl 网关 pb-only）connect
-//! 4. ask Ping(100) → Pong(103)（erlang 方言 +3）
-//! 5. ask Add(3,4) → AddR(10007)（erlang 方言 +10000）
+//! Owned local erl interoperability probe; see interop/README.md for prerequisites and deadlines.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use parrot_api::address::ActorRef;
@@ -75,8 +66,12 @@ parrot_api::message::inventory::submit! {
             b.put_u64_le(m.1);
             Ok(b.freeze().to_vec())
         },
-        decode: |_b: &[u8]| {
-            Ok(Box::new(UAdd(0, 0)) as BoxedMessage) // Add 请求不做 decode 载体
+        decode: |b: &[u8]| match b.as_chunks::<8>() {
+            ([left, right], []) => Ok(Box::new(UAdd(
+                u64::from_le_bytes(*left),
+                u64::from_le_bytes(*right),
+            )) as BoxedMessage),
+            _ => Err("len!=16".into()),
         },
     }
 }
@@ -107,66 +102,133 @@ impl LocalLookup for NoopLookup {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    let gw = "interop/erlang/parrot_gw.es";
-    let mut child = Command::new("escript")
-        .arg(gw)
-        .arg("0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap_or_else(|e| {
-            eprintln!("interop-erl: spawn escript failed ({e})——检查 erlang 安装");
-            std::process::exit(2);
-        });
+#[path = "interop_probe/options.rs"]
+mod options;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "interop_probe/owner.rs"]
+mod owner;
 
-    let port = {
-        let stdout = child.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).expect("read erl stdout");
-            if n == 0 {
-                eprintln!("interop-erl: erlang gateway exited before printing port");
-                std::process::exit(2);
-            }
-            if let Some(p) = line.strip_prefix("PARROT_ERL_PORT=") {
-                break p.trim().parse::<u16>().expect("parse port");
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => {
+            println!("interop-erl PASS");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("interop-erl: {error}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn run() -> Result<(), String> {
+    Err("verified gateway process ownership requires Linux or macOS".into())
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn run() -> Result<(), String> {
+    let options = options::Options::parse(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(15),
+    )?;
+    let mut signals = options::Signals::new()?;
+    let root = owner::source_root()?;
+    let mut gateway = owner::Gateway::spawn(
+        owner::GatewaySpec {
+            command: vec![
+                "escript".into(),
+                root.join("interop/erlang/parrot_gw.es").into_os_string(),
+                options.port.to_string().into(),
+                "listen=127.0.0.1".into(),
+            ],
+            node: "erl-gw-1",
+            marker: "PARROT_ERL_PORT=",
+            port: options.port,
+            inline_ray: false,
+            startup_output_limit: 262144,
+        },
+        options.startup,
+    )?;
+    let started = tokio::select! {
+        result = gateway.ready() => result,
+        _ = signals.cancelled() => Err("interrupted during gateway startup".into()),
+    };
+    let result = match started {
+        Ok(port) => {
+            println!("erl gateway port: {port}");
+            match RemoteActorSystem::new(
+                RemoteConfig::tcp("interop-erl-rust", None),
+                Arc::new(NoopLookup),
+            ) {
+                Ok(client) => {
+                    let business = tokio::select! {
+                        result = tokio::time::timeout(options.business, probe(&client, port)) => result.unwrap_or_else(|_| Err("business deadline exceeded".into())),
+                        _ = signals.cancelled() => Err("interrupted during business verification".into()),
+                        result = gateway.ended() => Err(format!("gateway ended during business verification: {result:?}")),
+                    };
+                    let shutdown =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), client.shutdown())
+                            .await;
+                    match shutdown {
+                        Ok(Ok(())) => business,
+                        other => Err(format!(
+                            "business: {business:?}; remote shutdown: {other:?}"
+                        )),
+                    }
+                }
+                Err(error) => Err(error.to_string()),
             }
         }
+        Err(error) => Err(error),
     };
-    println!("erlang gateway port: {port}");
-
-    let mut cfg = RemoteConfig::tcp("interop-erl-rust", None);
-    cfg.extra_caps = parrot_remote::handshake::caps::PB; // erl 网关 pb-only
-    let client = RemoteActorSystem::new(cfg, Arc::new(NoopLookup)).unwrap();
-    client.start().await.unwrap();
+    let retired = gateway.retire().await;
+    match (result, retired) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (result, Err(error)) => Err(format!("probe: {result:?}; gateway retirement: {error}")),
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn probe(client: &Arc<RemoteActorSystem>, port: u16) -> Result<(), String> {
+    client.start().await.map_err(|e| e.to_string())?;
     client
         .connect(&parrot_remote::NodeAddr::tcp(
             "erl-gw-1",
-            format!("127.0.0.1:{port}").parse().unwrap(),
+            ([127, 0, 0, 1], port).into(),
         ))
         .await
-        .expect("connect+handshake with pb-only peer");
-
+        .map_err(|e| e.to_string())?;
     let ping = client
         .remote_ref("parrot://erl-gw-1/erl/user/echo")
-        .unwrap();
-    let r = ping.send(Box::new(UPing(100))).await.unwrap();
-    let got = r.downcast_ref::<UPong>().unwrap().0;
-    assert_eq!(got, 103, "erlang dialect: Ping(100) -> Pong(103)");
-
+        .map_err(|e| e.to_string())?;
+    let reply = ping
+        .send(Box::new(UPing(100)))
+        .await
+        .map_err(|e| e.to_string())?;
+    let got = reply
+        .downcast_ref::<UPong>()
+        .ok_or("unexpected Ping response type")?
+        .0;
+    if got != 103 {
+        return Err(format!("Ping(100): expected 103, got {got}"));
+    }
     let add = client
         .remote_ref("parrot://erl-gw-1/erl/user/calc")
-        .unwrap();
-    let r = add.send(Box::new(UAdd(3, 4))).await.unwrap();
-    let got = r.downcast_ref::<UAddR>().unwrap().0;
-    assert_eq!(got, 10007, "erlang dialect: Add(3,4) -> AddR(10007)");
-
-    let _ = child.kill();
-    let _ = child.wait();
-    client.shutdown().await.ok();
-    println!("interop-erl PASS");
+        .map_err(|e| e.to_string())?;
+    let reply = add
+        .send(Box::new(UAdd(3, 4)))
+        .await
+        .map_err(|e| e.to_string())?;
+    let got = reply
+        .downcast_ref::<UAddR>()
+        .ok_or("unexpected Add response type")?
+        .0;
+    if got != 10007 {
+        return Err(format!("Add(3,4): expected 10007, got {got}"));
+    }
+    Ok(())
 }
+
+#[cfg(test)]
+#[path = "interop_probe/codec_contracts.rs"]
+mod codec_contracts;

@@ -3,6 +3,8 @@
 //! 远程消息落到真实 parrot ThreadActorSystem actor（不是桩）——
 //! 语义与本地（X1-X8 cross-engine 用例族）逐条对齐。
 
+// Transport semantics use explicitly trusted development TCP peers;
+// authenticated/denied paths are covered by control_authentication.
 mod common;
 
 use common::*;
@@ -30,6 +32,8 @@ struct RPong(pub u64);
 struct RSeq(pub u64); // FIFO 序号载体
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct RGetSeen; // 取 FIFO 已见列表
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RSeen(Vec<u64>);
 
 macro_rules! remote_msg {
     ($t:ty, $key:literal) => {
@@ -54,6 +58,7 @@ remote_msg!(RPing, "bin:remote_semantics::RPing#v1");
 remote_msg!(RPong, "bin:remote_semantics::RPong#v1");
 remote_msg!(RSeq, "bin:remote_semantics::RSeq#v1");
 remote_msg!(RGetSeen, "bin:remote_semantics::RGetSeen#v1");
+remote_msg!(RSeen, "bin:remote_semantics::RSeen#v1");
 
 // ===========================================================================
 // actor：echo + FIFO 记序 + 慢处理
@@ -103,7 +108,7 @@ impl Actor for FifoActor {
                 return Ok(Box::new(*v) as BoxedMessage);
             }
             if msg.downcast_ref::<RGetSeen>().is_some() {
-                return Ok(Box::new(RSeq(self.seen.len() as u64)) as BoxedMessage);
+                return Ok(Box::new(RSeen(self.seen.clone())) as BoxedMessage);
             }
             Err(parrot_api::errors::ActorError::MessageHandlingError(
                 "unhandled".into(),
@@ -176,7 +181,9 @@ async fn spawn_thread_actor<A>(
 }
 
 /// 组双节点（真实 thread 引擎 actor + mem 链路）。
-async fn two_nodes_mem() -> (
+async fn two_nodes_mem(
+    case: &str,
+) -> (
     Arc<RemoteActorSystem>,
     Arc<RemoteActorSystem>,
     Arc<ParrotActorSystem>,
@@ -193,7 +200,7 @@ async fn two_nodes_mem() -> (
     spawn_thread_actor(&facade_b, &ts_b, SlowActor, "/user/slow").await;
 
     let rb = RemoteActorSystem::new(
-        RCfg::mem("node-b"),
+        RCfg::mem(format!("{case}-b")),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
@@ -206,7 +213,7 @@ async fn two_nodes_mem() -> (
         .await
         .unwrap();
     let ra = RemoteActorSystem::new(
-        RCfg::mem("node-a"),
+        RCfg::mem(format!("{case}-a")),
         Arc::new(FacadeLookup {
             facade: Arc::new(facade_a),
         }),
@@ -217,7 +224,8 @@ async fn two_nodes_mem() -> (
     ra.connect_mem_pair(&rb).await.unwrap();
     // 等 B 侧握手完成（node-b 进 A 的表 + A 进 B 的表）
     eventually(Duration::from_secs(2), || async {
-        ra.remote_ref("parrot://node-b/user/echo").is_ok()
+        ra.remote_ref(&format!("parrot://{case}-b/user/echo"))
+            .is_ok()
     })
     .await;
     (ra, rb, facade_b)
@@ -244,7 +252,8 @@ async fn two_nodes_tcp() -> (
         l.local_addr().unwrap().port()
     };
     let rb = RemoteActorSystem::new(
-        RCfg::tcp("node-b", Some(format!("127.0.0.1:{port}").parse().unwrap())),
+        RCfg::tcp("node-b", Some(format!("127.0.0.1:{port}").parse().unwrap()))
+            .with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
@@ -252,7 +261,7 @@ async fn two_nodes_tcp() -> (
     .unwrap();
     rb.start().await.unwrap();
     let ra = RemoteActorSystem::new(
-        RCfg::tcp("node-a", None),
+        RCfg::tcp("node-a", None).with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: Arc::new(
                 ParrotActorSystem::new(ActorSystemConfig::default())
@@ -283,8 +292,10 @@ async fn two_nodes_tcp() -> (
 /// RC1 恰好一次：128 并发 ask，回复数==128，cid 无重复。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc1_exactly_once_mem() {
-    let (ra, _rb, _) = two_nodes_mem().await;
-    let echo = ra.remote_ref("parrot://node-b/user/echo").unwrap();
+    let (ra, _rb, _) = two_nodes_mem("rc1_exactly_once_mem").await;
+    let echo = ra
+        .remote_ref("parrot://rc1_exactly_once_mem-b/user/echo")
+        .unwrap();
     let mut tasks = Vec::new();
     for i in 0..128u64 {
         let e = echo.clone();
@@ -305,31 +316,37 @@ async fn rc1_exactly_once_mem() {
 /// RC2 FIFO：同源连续 100 TELL 保序。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc2_fifo_mem() {
-    let (ra, _rb, facade_b) = two_nodes_mem().await;
-    let fifo = ra.remote_ref("parrot://node-b/user/fifo").unwrap();
-    for i in 0..100u64 {
-        fifo.deliver(Box::new(RSeq(i))).await.unwrap();
+    let (ra, _rb, facade_b) = two_nodes_mem("rc2_fifo_mem").await;
+    let fifo = ra.remote_ref("parrot://rc2_fifo_mem-b/user/fifo").unwrap();
+    // Stay inside the documented bounded admission window. The local observer
+    // confirms actual business completion, not just outbound queue acceptance.
+    for end in [25u64, 50, 75, 100] {
+        for i in end - 25..end {
+            fifo.deliver(Box::new(RSeq(i))).await.unwrap();
+        }
+        eventually(Duration::from_secs(5), || async {
+            let local = facade_b
+                .get_actor(&ActorPath::placeholder("/user/fifo"))
+                .await
+                .unwrap();
+            let reply = local.send(Box::new(RGetSeen)).await.unwrap();
+            let seen = &reply.downcast_ref::<RSeen>().unwrap().0;
+            assert_eq!(seen, &(0..seen.len() as u64).collect::<Vec<_>>());
+            seen.len() == end as usize
+        })
+        .await;
     }
-    // 等 100 条全部落地（入站串行 → 顺序处理）
-    eventually(Duration::from_secs(5), || async {
-        let local = facade_b
-            .get_actor(&ActorPath::placeholder("/user/fifo"))
-            .await
-            .unwrap();
-        let n = local.send(Box::new(RGetSeen)).await.unwrap();
-        n.downcast_ref::<RSeq>().unwrap().0 == 100
-    })
-    .await;
-    // 顺序验证：直接查 actor 内部（经引擎本地 ask 拿不到列表——用累计断言：
-    // 入站串行保证下 seen 单调；此断言已在 eventually 内验证长度。
-    // 完整序号列表断言由 RC2 加强版（引擎侧记录）覆盖——此处验证长度+无丢。
+    ra.shutdown().await.unwrap();
+    _rb.shutdown().await.unwrap();
 }
 
 /// RC4 超时语义：1ms 超时 + 500ms 慢处理 → 调用方 Timeout；迟到 REPLY drop。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc4_timeout_mem() {
-    let (ra, _rb, _) = two_nodes_mem().await;
-    let slow = ra.remote_ref("parrot://node-b/user/slow").unwrap();
+    let (ra, _rb, _) = two_nodes_mem("rc4_timeout_mem").await;
+    let slow = ra
+        .remote_ref("parrot://rc4_timeout_mem-b/user/slow")
+        .unwrap();
     let before = parrot_remote::LATE_REPLY_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
     let t0 = Instant::now();
     let r = slow
@@ -355,46 +372,30 @@ async fn rc4_timeout_mem() {
 /// RC5 死信：stop 后 send → Stopped 跨网等价。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc5_dead_letter_mem() {
-    let (ra, _rb, facade_b) = two_nodes_mem().await;
+    let (ra, _rb, facade_b) = two_nodes_mem("rc5_dead_letter_mem").await;
     // 本地 spawn 专用 victim
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
     spawn_thread_actor(&facade_b, &ts, EchoActor, "/user/victim").await;
-    let victim = ra.remote_ref("parrot://node-b/user/victim").unwrap();
+    let victim = ra
+        .remote_ref("parrot://rc5_dead_letter_mem-b/user/victim")
+        .unwrap();
     let pong = victim.send(Box::new(RPing(1))).await.unwrap();
     assert_eq!(pong.downcast_ref::<RPong>().unwrap().0, 1);
+    // Retain the reference before STOP: successful engine cleanup removes its
+    // registry entry, so looking it up afterwards races with correct cleanup.
+    let local_victim = ts.get_actor_ref("/user/victim").unwrap();
     victim.stop().await.unwrap();
-    // stop 是 ref 级（mailbox close）——注册表条目由引擎生命周期管理。
-    // 远程死信等价断言：stop 后再 ask 必须得到确定性错误（不悬挂、不成功）
-    // 探针：B 侧本地视角——stop 后本地 send 行为（引擎权威语义）。
-    // stop 异步生效：容忍传播窗口（≤2s 内转为失败即符合死信语义）
-    {
-        let local_victim = facade_b
-            .get_actor(&ActorPath::placeholder("/user/victim"))
-            .await
-            .expect("registry entry persists (ref-level stop)");
-        let mut local_err = None;
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(2) {
-            match tokio::time::timeout(
-                Duration::from_secs(1),
-                local_victim.send(Box::new(RPing(99))),
-            )
-            .await
-            {
-                Err(_) => panic!("local send must not hang"),
-                Ok(Err(e)) => {
-                    eprintln!("LOCAL-STOP-ERR: {e:?}");
-                    local_err = Some(e);
-                    break;
-                }
-                Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(25)).await, // 传播窗口
-            }
-        }
-        assert!(
-            local_err.is_some(),
-            "local send must fail within stop-propagation window"
-        );
-    }
+    eventually(Duration::from_secs(2), || async {
+        ts.get_actor_ref("/user/victim").is_none()
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        local_victim.send(Box::new(RPing(99))),
+    )
+    .await
+    .expect("stopped local reference must not hang")
+    .expect_err("stopped local reference must reject work");
     let err = tokio::time::timeout(Duration::from_secs(3), victim.send(Box::new(RPing(2))))
         .await
         .expect("stop 后 send 必须快速失败（不悬挂）")
@@ -411,18 +412,97 @@ async fn rc5_dead_letter_mem() {
 /// RC6 NotRemotable：未注册类型 → 本地立即错，零帧出网。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc6_not_remotable_mem() {
-    let (ra, _rb, _) = two_nodes_mem().await;
-    let echo = ra.remote_ref("parrot://node-b/user/echo").unwrap();
+    let (ra, _rb, _) = two_nodes_mem("rc6_not_remotable_mem").await;
+    let echo = ra
+        .remote_ref("parrot://rc6_not_remotable_mem-b/user/echo")
+        .unwrap();
     #[derive(Debug)]
     struct Secret;
     let err = echo.send(Box::new(Secret)).await.unwrap_err();
     assert!(err.to_string().contains("not remotable"), "got {err:?}");
 }
 
-/// RC8 反压贯通：对端 Block 策略 + 慢消费 → 发送方 deliver 挂起。
+/// The first message blocks until the test explicitly permits progress.
+struct AdmissionActor {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+    seen: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+impl Actor for AdmissionActor {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            let value = msg.downcast_ref::<RPing>().unwrap().0;
+            if value == 0 {
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.seen.lock().unwrap().push(value);
+            Ok(Box::new(RPong(value)) as BoxedMessage)
+        })
+    }
+    fn state(&self) -> parrot_api::actor::ActorState {
+        parrot_api::actor::ActorState::Running
+    }
+}
+
+/// Local Block admission is pending at capacity and resumes without dropping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rc8_backpressure_mem() {
-    // B 侧：容量 1 + Block 的慢 actor
+async fn rc8_local_block_resumes_and_preserves_order() {
+    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let actor = ts
+        .spawn_at(
+            AdmissionActor {
+                entered: entered.clone(),
+                release: release.clone(),
+                seen: seen.clone(),
+            },
+            "/admission",
+            None,
+            ThreadActorConfig {
+                mailbox_capacity: Some(1),
+                backpressure_strategy: Some(BackpressureStrategy::Block),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    actor.deliver(Box::new(RPing(0))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    actor.deliver(Box::new(RPing(1))).await.unwrap();
+    let pending = actor.deliver(Box::new(RPing(2)));
+    tokio::pin!(pending);
+    assert!(
+        futures::poll!(&mut pending).is_pending(),
+        "full Block mailbox admitted another message"
+    );
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), &mut pending)
+        .await
+        .unwrap()
+        .unwrap();
+    eventually(Duration::from_secs(2), || async {
+        seen.lock().unwrap().len() == 3
+    })
+    .await;
+    assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2]);
+    ts.shutdown_internal().await.unwrap();
+}
+
+/// Remote overload is bounded rejection, not guaranteed end-to-end Block.
+/// The flood future stays owned by the test and is dropped at its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rc8_remote_overload_closes_only_its_connection() {
     let facade_b = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
             .await
@@ -433,8 +513,14 @@ async fn rc8_backpressure_mem() {
         .register_thread_system("eng".into(), ts_b.clone(), true)
         .await
         .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
     ts_b.spawn_at(
-        SlowActor,
+        AdmissionActor {
+            entered: entered.clone(),
+            release: release.clone(),
+            seen: Arc::default(),
+        },
         "/user/slow",
         None,
         ThreadActorConfig {
@@ -445,57 +531,64 @@ async fn rc8_backpressure_mem() {
     )
     .await
     .unwrap();
+    ts_b.spawn_at(EchoActor, "/user/echo", None, ThreadActorConfig::default())
+        .await
+        .unwrap();
     let rb = RemoteActorSystem::new(
-        RCfg::mem("node-b"),
+        RCfg::mem("overload-target"),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),
     )
     .unwrap();
     rb.start().await.unwrap();
-    let facade_a = ParrotActorSystem::new(ActorSystemConfig::default())
+    let mut clients = Vec::new();
+    for name in ["overloaded", "healthy"] {
+        let facade = Arc::new(
+            ParrotActorSystem::new(ActorSystemConfig::default())
+                .await
+                .unwrap(),
+        );
+        let client =
+            RemoteActorSystem::new(RCfg::mem(name), Arc::new(FacadeLookup { facade })).unwrap();
+        client.start().await.unwrap();
+        client.connect_mem_pair(&rb).await.unwrap();
+        clients.push(client);
+    }
+    let slow = clients[0]
+        .remote_ref("parrot://overload-target/user/slow")
+        .unwrap();
+    let link = clients[0].links_snapshot().await[0].1.clone();
+    slow.deliver(Box::new(RPing(0))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .unwrap();
-    let ra = RemoteActorSystem::new(
-        RCfg::mem("node-a"),
-        Arc::new(FacadeLookup {
-            facade: Arc::new(facade_a),
-        }),
-    )
-    .unwrap();
-    ra.start().await.unwrap();
-    // 互联
-    ra.connect_mem_pair(&rb).await.unwrap();
-    eventually(Duration::from_secs(2), || async {
-        ra.remote_ref("parrot://node-b/user/slow").is_ok()
+    let overload = tokio::time::timeout(Duration::from_secs(3), async {
+        for i in 1..=4096u64 {
+            slow.deliver(Box::new(RPing(i))).await?;
+        }
+        Ok::<(), parrot_api::errors::ActorError>(())
     })
     .await;
-
-    let slow = ra.remote_ref("parrot://node-b/user/slow").unwrap();
-    // 预热：一条 ask 确认链路通（同时占住 500ms 处理窗口）
-    let _ = tokio::time::timeout(Duration::from_secs(2), slow.send(Box::new(RPing(0))))
-        .await
-        .expect("warm-up ask")
+    let closed = tokio::time::timeout(Duration::from_secs(2), link.closed()).await;
+    let echo = clients[1]
+        .remote_ref("parrot://overload-target/user/echo")
         .unwrap();
-    // RC8：对端邮箱容量 1 + Block。慢处理窗口内灌 TELL：
-    //   第一条 TELL 填邮箱（处理中被占）→ 第二条 TELL 的 deliver 在 B 侧挂起
-    //   → B 入站串行 → A 侧出站队列堆积 → A 的 deliver 挂起（反压贯通）
-    let slow_ref = slow.clone();
-    let pump = tokio::spawn(async move {
-        // 4096 > 出站1024 + 入站1024 + TCP 缓冲——必然穿透到 deliver 挂起
-        for i in 1..=4096u64 {
-            slow_ref.deliver(Box::new(RPing(i))).await.unwrap();
-        }
-    });
-    // 慢窗口（500ms/条 × 已占位）内 pump 不可能完成
-    let done = tokio::time::timeout(Duration::from_millis(400), pump).await;
-    assert!(done.is_err(), "TELL 流应因对端 Block 反压挂起（RC8 贯通）");
-    // 排空等待：慢窗口结束后 pump 必须能完成（反压是挂起不是死锁——
-    // 4096 条 ÷ 容量1 × 500ms ≈ 34min？不——慢窗口只挡住处理中+邮箱 2 条，
-    // 排空后邮箱腾出即可继续。但 500ms/条 × 4096 条太久——RC8 只验证挂起语义，
-    // 这里直接放弃排空（drop pump），等 B 侧消化当前在制品即可安全退出）
-    drop(done);
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    let healthy =
+        tokio::time::timeout(Duration::from_secs(2), echo.send(Box::new(RPing(42)))).await;
+    release.add_permits(1);
+    for client in clients {
+        client.shutdown().await.unwrap();
+    }
+    rb.shutdown().await.unwrap();
+    ts_b.shutdown_internal().await.unwrap();
+    assert!(
+        matches!(overload, Ok(Err(_))),
+        "overload must report refusal rather than hang or accept everything: {overload:?}"
+    );
+    assert!(closed.is_ok(), "overloaded connection remained open");
+    let reply = healthy.expect("healthy connection stalled").unwrap();
+    assert_eq!(reply.downcast_ref::<RPong>().unwrap().0, 42);
 }
 
 // ===========================================================================
@@ -552,8 +645,19 @@ async fn rc5_dead_letter_tcp() {
             .0,
         1
     );
+    let local_victim = ts.get_actor_ref("/user/victim").unwrap();
     victim.stop().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    eventually(Duration::from_secs(2), || async {
+        ts.get_actor_ref("/user/victim").is_none()
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        local_victim.send(Box::new(RPing(99))),
+    )
+    .await
+    .expect("stopped local reference must not hang")
+    .expect_err("stopped local reference must reject work");
     let err = tokio::time::timeout(Duration::from_secs(3), victim.send(Box::new(RPing(2))))
         .await
         .expect("不悬挂")
@@ -597,7 +701,8 @@ async fn rc7_disconnect_reconnect_tcp() {
     };
     // 重建 B（旧 rb 已 shutdown；facade_b 的引擎 actor 仍存活）
     let rb2 = RemoteActorSystem::new(
-        RCfg::tcp("node-b", Some(format!("127.0.0.1:{port}").parse().unwrap())),
+        RCfg::tcp("node-b", Some(format!("127.0.0.1:{port}").parse().unwrap()))
+            .with_insecure_development(),
         Arc::new(FacadeLookup {
             facade: facade_b.clone(),
         }),

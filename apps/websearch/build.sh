@@ -11,8 +11,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "==> [1/3] Rust 应用"
-( cd ../.. && cargo build -p websearch "${@:---release}" -q )
+echo "==> [1/4] Rust 应用"
+if [ "$#" -eq 0 ]; then set -- --release; fi
+( cd ../.. && cargo build --locked -p websearch "$@" )
 echo "    ✓ target 里 websearch"
 
 echo "==> [2/4] JVM 检索组件（jieba-analysis + BM25）"
@@ -24,6 +25,8 @@ echo "==> [3/4] Erlang frontier（beam 预编译——网关热加载制品）"
 echo "    ✓ erlang/frontier.beam"
 
 echo "==> [4/4] 依赖自检"
-python3 -c "import jieba" 2>/dev/null && echo "    ✓ python jieba" || echo "    ⚠ 缺 jieba（pip3 install jieba）"
-python3 -c "import ray" 2>/dev/null && echo "    ✓ python ray" || echo "    ⚠ 缺 ray（pip3 install ray）"
+python3 -c "import jieba" || { echo "缺 jieba（pip3 install jieba）" >&2; exit 1; }
+echo "    ✓ python jieba"
+python3 -c "import ray" || { echo "缺 ray（pip3 install ray）" >&2; exit 1; }
+echo "    ✓ python ray"
 echo "✓ websearch 构建完成——run.sh <seed-url> 启动"

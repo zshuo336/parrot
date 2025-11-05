@@ -1,24 +1,37 @@
 //! E5 · Receptionist ACL（DEV_03 §6 / 06 §3.5）。
 //!
-//! 静态配置（`acl.json`——serde_json 白名单内；"静态 yaml"的语义以 JSON 承载，
-//! 格式裁定记 DECISIONS_DEPENDENCIES 变更流程）：role（证书 CN 绑定）→
-//! 允许 register/subscribe 的 scope 前缀。
-//!
-//! 执行点：Receptionist 注册/订阅入口（REPLY_ERR code 13 Forbidden）。
-//! P3 静态表；动态 ACL/权限 actor 化在 P4+（红线）。
+//! Static authorization helpers. Prefixes match complete path segments.
+//! ReceptionistFacade checks its injected principal at each operation; callers
+//! authenticate standalone principals. System-owned receptionist gateways check
+//! the local node, and network snapshots check the authorized physical peer.
+//! Both use RemoteConfig::receptionist_acl, which denies all keys by default.
+//! RouteAcl is not yet
+//! wired into the default remote ingress, and these helpers do not establish
+//! TLS identity, wire error mapping, or control-plane authorization.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 /// ACL 规则集（静态加载，进程内只读）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AclRules {
-    /// role → 允许的 scope 前缀列表（key 的第一段匹配）。
+    /// Principal → allowed key prefixes, matched on segment boundaries.
+    #[serde(default, deserialize_with = "deserialize_unique_rules")]
     pub roles: HashMap<String, Vec<String>>,
-    /// 未匹配 role 的默认策略：false=拒绝（白名单模式——默认安全）。
-    #[serde(default)]
+    /// Unmatched principal/key pairs are denied by default.
+    #[serde(default = "default_true")]
     pub default_deny: bool,
+}
+
+impl Default for AclRules {
+    fn default() -> Self {
+        Self {
+            roles: HashMap::new(),
+            default_deny: true,
+        }
+    }
 }
 
 /// 判定结果。
@@ -31,24 +44,52 @@ pub enum AclDecision {
 impl AclRules {
     /// 从 JSON 文本加载。
     pub fn from_json(text: &str) -> Result<Self, String> {
-        serde_json::from_str(text).map_err(|e| format!("acl json parse: {e}"))
+        let rules: Self = serde_json::from_str(text).map_err(|e| format!("acl json parse: {e}"))?;
+        rules.validate()?;
+        Ok(rules)
     }
 
-    /// 空 ACL（全部走 default_deny=false → 全放行——测试/无 ACL 部署形态）。
+    /// Explicitly permit well-formed principals and keys without a grant.
+    /// Invalid input is still denied; this does not authenticate the principal.
     pub fn permissive() -> Self {
-        Self::default()
+        Self {
+            default_deny: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (role, prefixes) in &self.roles {
+            if !valid_segments(role) {
+                return Err(format!("invalid ACL principal: {role:?}"));
+            }
+            for prefix in prefixes {
+                if key_prefix(prefix).is_none() {
+                    return Err(format!("invalid ACL prefix for {role:?}: {prefix:?}"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// role + action scope 判定。
     ///
-    /// `key` 形如 "{scope}/{name}"——scope 是第一段。role 允许列表中任一
-    /// 前缀是 scope 的前缀即放行（"edge" 匹配 "edge/rpa" 与 "edge/sub/x"）。
+    /// `edge` permits `edge` and `edge/rpa`, but not `edge-admin/rpa`.
+    /// A narrower `edge/public` grant permits only that subtree. Malformed
+    /// identities, keys or directly constructed rules fail closed even when
+    /// default_deny is explicitly disabled.
     pub fn check(&self, role: &str, key: &str) -> AclDecision {
-        let scope = key.split('/').next().unwrap_or("");
+        if !valid_segments(role) || !valid_segments(key) || self.validate().is_err() {
+            return AclDecision::Deny;
+        }
         let allowed = self
             .roles
             .get(role)
-            .map(|prefixes| prefixes.iter().any(|p| scope.starts_with(p.as_str())))
+            .map(|prefixes| {
+                prefixes
+                    .iter()
+                    .any(|p| key_prefix(p).is_some_and(|prefix| within(key, prefix)))
+            })
             .unwrap_or(false);
         if allowed {
             AclDecision::Allow
@@ -70,15 +111,26 @@ impl AclRules {
 
 /// F8 · 路由前缀 ACL（DEV_05 §7 / 07 §10 增补）。
 ///
-/// Directory 下发路由前缀附带 ACL：`{prefix, allow: [realm/cluster]}`；
-/// border/hub 转发前校验——**跨 realm 默认拒绝**。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A policy for canonical parrot:// prefixes, with trusted realm/cluster
+/// principals supplied by the caller. Cross-realm access defaults to denied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteAcl {
     /// 前缀 → 允许的 realm/cluster 列表。
+    #[serde(default, deserialize_with = "deserialize_unique_rules")]
     pub routes: HashMap<String, Vec<String>>,
     /// 无条目前缀的默认：true=跨 realm 拒绝（07 §10 安全默认）。
     #[serde(default = "default_true")]
     pub default_deny_cross_realm: bool,
+}
+
+impl Default for RouteAcl {
+    fn default() -> Self {
+        Self {
+            routes: HashMap::new(),
+            default_deny_cross_realm: true,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -87,38 +139,122 @@ fn default_true() -> bool {
 
 impl RouteAcl {
     pub fn from_json(text: &str) -> Result<Self, String> {
-        serde_json::from_str(text).map_err(|e| format!("route acl json parse: {e}"))
+        let rules: Self =
+            serde_json::from_str(text).map_err(|e| format!("route acl json parse: {e}"))?;
+        rules.validate()?;
+        Ok(rules)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (prefix, allowed) in &self.routes {
+            if route_prefix(prefix).is_none() {
+                return Err(format!("invalid route ACL prefix: {prefix:?}"));
+            }
+            for principal in allowed {
+                if principal != "*" && !valid_segments(principal) {
+                    return Err(format!("invalid route ACL principal: {principal:?}"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 转发判定：`src_realm`（发送方 realm/cluster）→ `target_prefix`
     /// （路由前缀——最长匹配条目）。
     pub fn check_route(&self, src_realm: &str, target_prefix: &str) -> AclDecision {
-        // 最长前缀条目
-        let hit = self
-            .routes
-            .iter()
-            .filter(|(p, _)| target_prefix.starts_with(p.as_str()))
-            .max_by_key(|(p, _)| p.len());
-        match hit {
-            Some((_, allow)) => {
-                if allow.iter().any(|r| r == src_realm || r == "*") {
-                    AclDecision::Allow
-                } else {
-                    AclDecision::Deny
-                }
+        let Some(target) = route_prefix(target_prefix) else {
+            return AclDecision::Deny;
+        };
+        if !valid_segments(src_realm) || self.validate().is_err() {
+            return AclDecision::Deny;
+        }
+        let mut best: Option<(usize, bool)> = None;
+        for (prefix, allowed) in &self.routes {
+            let prefix = route_prefix(prefix).expect("validated prefix");
+            if !within(target, prefix) {
+                continue;
             }
-            None => {
-                // 无条目：同 realm 直通；跨 realm 按默认策略
-                let same =
-                    target_prefix.starts_with(&format!("{src_realm}/")) || src_realm.is_empty();
-                if same || !self.default_deny_cross_realm {
-                    AclDecision::Allow
-                } else {
-                    AclDecision::Deny
-                }
+            let permits = allowed.iter().any(|r| r == src_realm || r == "*");
+            match &mut best {
+                Some((length, allow)) if *length == prefix.len() => *allow &= permits,
+                Some((length, _)) if *length > prefix.len() => {}
+                _ => best = Some((prefix.len(), permits)),
             }
         }
+        // An explicit rule overrides same-realm and permissive defaults.
+        // Equal normalized prefixes (with/without trailing slash) intersect
+        // grants, so HashMap iteration order cannot select a weaker policy.
+        let allow = best
+            .map(|(_, allow)| allow)
+            .unwrap_or_else(|| within(target, src_realm) || !self.default_deny_cross_realm);
+        if allow {
+            AclDecision::Allow
+        } else {
+            AclDecision::Deny
+        }
     }
+}
+
+fn within(target: &str, prefix: &str) -> bool {
+    target == prefix
+        || target
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+// No implicit percent decoding or dot-segment normalization in authorization:
+// reject ambiguous inputs rather than granting before a later interpretation.
+fn valid_segments(value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '%' | '?' | '#' | '*' | '\\')
+        })
+        && value.split('/').all(|s| !matches!(s, "" | "." | ".."))
+}
+
+fn key_prefix(value: &str) -> Option<&str> {
+    let prefix = value.strip_suffix('/').unwrap_or(value);
+    valid_segments(prefix).then_some(prefix)
+}
+
+fn route_prefix(value: &str) -> Option<&str> {
+    key_prefix(value.strip_prefix("parrot://")?)
+}
+
+fn deserialize_unique_rules<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Rules;
+    impl<'de> serde::de::Visitor<'de> for Rules {
+        type Value = HashMap<String, Vec<String>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an ACL map with unique keys")
+        }
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut rules = HashMap::new();
+            while let Some((key, value)) = map.next_entry::<String, Vec<String>>()? {
+                match rules.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(value);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate ACL key: {:?}",
+                            entry.key()
+                        )));
+                    }
+                }
+            }
+            Ok(rules)
+        }
+    }
+    deserializer.deserialize_map(Rules)
 }
 
 #[cfg(test)]
@@ -213,12 +349,11 @@ mod tests {
         );
     }
 
-    // 无条目前缀：跨 realm 默认拒；无 realm 单集群直通
+    // 无条目前缀：跨 realm 默认拒；缺少来源身份也拒绝
     #[test]
     fn route_acl_default_policy() {
         let r = route_rules();
-        // 无 realm 标识（单集群/本地域）→ 直通
-        assert_eq!(r.check_route("", "parrot://us-1/x"), AclDecision::Allow);
+        assert_eq!(r.check_route("", "parrot://us-1/x"), AclDecision::Deny);
         // 跨 realm 无条目 → 默认拒绝
         assert_eq!(
             r.check_route("us-realm", "parrot://ap-1/x"),

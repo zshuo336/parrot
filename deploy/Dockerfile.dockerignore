@@ -1,0 +1,35 @@
+# Node builds need the complete Cargo workspace and its patched dependencies.
+**
+!Cargo.toml
+!Cargo.lock
+!crates
+!crates/**
+!tools
+!tools/**
+!apps
+!apps/**
+!vendor
+!vendor/**
+
+# Local configuration and generated outputs must not enter the builder layers.
+**/.env
+**/.env.*
+**/.git
+**/.cache
+**/.metals
+**/.scala-build
+**/.vscode
+**/.idea
+**/.codex
+**/.claude
+**/.DS_Store
+**/target
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+**/.business-artifacts.*
+**/_build
+**/*.pyc
+**/*.beam
+**/*.class
+**/*.tar

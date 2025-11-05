@@ -129,7 +129,8 @@ fn cache_dir_default_and_env() {
 #[test]
 fn cache_dir_env_probe() {
     if std::env::var("PARROT_ARTIFACT_DIR").as_deref() != Ok("/custom/art-dir") {
-        return; // 直接跑（非探针模式）——无断言
+        assert!(ArtifactChannel::cache_dir().is_absolute());
+        return;
     }
     assert_eq!(
         ArtifactChannel::cache_dir(),
@@ -234,9 +235,9 @@ fn fetch_props_passthrough_and_cross_dialect_rejected() {
 }
 
 #[test]
-fn verify_empty_digest_skips() {
+fn verify_empty_digest_is_rejected() {
     let p = temp_artifact("empty-digest", b"whatever");
-    assert!(ArtifactChannel::verify(&p, "").is_ok());
+    assert!(ArtifactChannel::verify(&p, "").is_err());
     std::fs::remove_file(&p).ok();
 }
 
@@ -378,24 +379,22 @@ async fn deploy_engine_mismatch_rejected() {
 }
 
 #[tokio::test]
-async fn deploy_duplicate_path_spawn_failed() {
+async fn deploy_identical_retry_preserves_existing_instance() {
     let ts = engine();
     let name = format!("b2dup{}", line!());
-    let paths = exec_deploy_v2(
-        &ts,
-        deploy_cmd(&name, "deploy.echo", AdminInstancePolicy::Singleton),
-    )
-    .await
-    .expect("first deploy");
-    // 同名重部署 → 路径冲突
-    let err = exec_deploy_v2(
-        &ts,
-        deploy_cmd(&name, "deploy.echo", AdminInstancePolicy::Singleton),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.0, v2_err::SPAWN_FAILED);
-    let _ = ts.stop_actor(&paths[0]).await;
+    let command = deploy_cmd(&name, "deploy.counter", AdminInstancePolicy::Singleton);
+    let paths = exec_deploy_v2(&ts, command.clone()).await.unwrap();
+    let reference = ts.get_actor_ref(&paths[0]).unwrap();
+    reference.send(Box::new(NInc(7))).await.unwrap();
+    assert_eq!(exec_deploy_v2(&ts, command).await.unwrap(), paths);
+    assert_eq!(ask_total(&ts, &paths[0]).await, 7);
+    let mut changed = deploy_cmd(&name, "deploy.counter", AdminInstancePolicy::Singleton);
+    changed.version = "2.0.0".into();
+    assert_eq!(
+        exec_deploy_v2(&ts, changed).await.unwrap_err().0,
+        v2_err::SPAWN_FAILED
+    );
+    reference.stop().await.unwrap();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -566,6 +565,20 @@ async fn executor_drain_timeout_aborts() {
     assert!(ts.get_actor_ref(&format!("/user/{name}")).is_none());
 }
 
+#[tokio::test]
+async fn executor_metrics_does_not_fabricate_transport_counters() {
+    let ts = engine();
+    let ex = NodeComponentExecutor::new(ts);
+    match ex.metrics(9).await {
+        AdminReplyV2::Metrics { snapshot, .. } => {
+            assert_eq!(snapshot.connections, 0);
+            assert_eq!(snapshot.handshakes_ok, 0);
+            assert_eq!(snapshot.uptime_start_ms, 0);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // exec_command_v2 直通（2）+ caps 位（2）
 // ══════════════════════════════════════════════════════════════════════════
@@ -655,4 +668,154 @@ fn instance_paths_policy_expansion() {
         instance_paths("c", AdminInstancePolicy::Sharded { count: 3 }).len(),
         3
     );
+}
+
+#[tokio::test]
+async fn measured_executor_reports_known_zero_without_claiming_network_or_process_uptime() {
+    use parrot_remote::metrics::field;
+    let ts = ThreadActorSystem::shared(Default::default());
+    let ex = NodeComponentExecutor::new(ts.clone());
+    let sample = ex.measured_metrics().await;
+    assert_eq!(sample.value(field::PROCESSES), Some(0));
+    assert_eq!(sample.process_kind, "parrot_actor_entries");
+    assert_eq!(sample.value(field::COMPONENTS), Some(0));
+    assert!(sample.has(field::COMPONENT_STATES));
+    assert_eq!(sample.value(field::CONNECTIONS), None);
+    assert_eq!(sample.value(field::UPTIME_START_MS), None);
+    ts.shutdown_internal().await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_contract_numeric_component_suffix_keeps_its_version() {
+    let ts = engine();
+    let ex = NodeComponentExecutor::new(ts.clone());
+    let name = "contract-service-2026";
+    let deployed = ex
+        .deploy(
+            1,
+            &deploy_cmd(name, "deploy.echo", AdminInstancePolicy::Singleton),
+        )
+        .await;
+    assert!(matches!(deployed, AdminReplyV2::Deployed { .. }));
+    let status = ex.status(2, &format!("/user/{name}")).await;
+    let _ = ex.stop(3, &format!("/user/{name}")).await;
+    let AdminReplyV2::Status { states, .. } = status else {
+        panic!("{status:?}")
+    };
+    assert_eq!(states[0].version, "1.0.0");
+}
+
+#[tokio::test]
+async fn admin_contract_hyphenated_neighbor_is_not_owned_by_shorter_name() {
+    let ts = engine();
+    let ex = NodeComponentExecutor::new(ts.clone());
+    for name in ["contract-neighbor", "contract-neighbor-side"] {
+        assert!(matches!(
+            ex.deploy(
+                1,
+                &deploy_cmd(name, "deploy.echo", AdminInstancePolicy::Singleton)
+            )
+            .await,
+            AdminReplyV2::Deployed { .. }
+        ));
+    }
+    let stopped = ex.stop(2, "/user/contract-neighbor").await;
+    let survivor = ts.get_actor_ref("/user/contract-neighbor-side");
+    let _ = ex.stop(3, "/user/contract-neighbor-side").await;
+    assert!(matches!(stopped, AdminReplyV2::Stopped { .. }));
+    assert!(
+        survivor.is_some(),
+        "stopped an independently deployed component"
+    );
+}
+
+#[tokio::test]
+async fn admin_contract_partial_pool_failure_rolls_back_without_stopping_conflict() {
+    let ts = engine();
+    let ex = NodeComponentExecutor::new(ts.clone());
+    let existing = (parrot_remote::admin::find_factory("deploy.echo")
+        .unwrap()
+        .spawn)("/user/contract-partial-1")
+    .await
+    .unwrap();
+    let result = ex
+        .deploy(
+            1,
+            &deploy_cmd(
+                "contract-partial",
+                "deploy.echo",
+                AdminInstancePolicy::Pool { count: 3 },
+            ),
+        )
+        .await;
+    let leaked = ts.get_actor_ref("/user/contract-partial-0").is_some();
+    let conflict_alive = existing.is_alive().await;
+    // Clean even the old implementation's leak before asserting.
+    if let Some(actor) = ts.get_actor_ref("/user/contract-partial-0") {
+        actor.stop().await.unwrap();
+    }
+    existing.stop().await.unwrap();
+    assert!(matches!(result, AdminReplyV2::Failed { .. }));
+    assert!(
+        !leaked,
+        "failed deployment left its first pool member running"
+    );
+    assert!(conflict_alive, "rollback stopped a pre-existing path owner");
+}
+
+#[tokio::test]
+async fn admin_contract_zero_instances_is_not_successful_deployment() {
+    let ex = NodeComponentExecutor::new(engine());
+    let result = ex
+        .deploy(
+            1,
+            &deploy_cmd(
+                "contract-empty",
+                "deploy.echo",
+                AdminInstancePolicy::Pool { count: 0 },
+            ),
+        )
+        .await;
+    assert!(matches!(result, AdminReplyV2::Failed { .. }), "{result:?}");
+}
+
+#[tokio::test]
+async fn admin_contract_command_helper_retains_deployment_version() {
+    let ts = engine();
+    let path = "/user/contract-command-owner";
+    assert!(matches!(
+        exec_command_v2(
+            &ts,
+            AdminCommandV2::DeployComponent {
+                req_id: 1,
+                component: deploy_cmd(
+                    "contract-command-owner",
+                    "deploy.echo",
+                    AdminInstancePolicy::Singleton
+                )
+            }
+        )
+        .await,
+        AdminReplyV2::Deployed { .. }
+    ));
+    let status = exec_command_v2(
+        &ts,
+        AdminCommandV2::ComponentStatus {
+            req_id: 2,
+            path_prefix: path.into(),
+        },
+    )
+    .await;
+    let _ = exec_command_v2(
+        &ts,
+        AdminCommandV2::StopComponent {
+            req_id: 3,
+            path_prefix: path.into(),
+        },
+    )
+    .await;
+    let AdminReplyV2::Status { states, .. } = status else {
+        panic!("{status:?}")
+    };
+    assert_eq!(states[0].version, "1.0.0");
 }

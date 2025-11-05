@@ -284,13 +284,16 @@ pub enum SystemState {
 /// and performance.
 #[derive(Debug, Clone)]
 pub struct SystemResources {
-    /// Percentage of CPU utilization
+    /// Percentage of CPU utilization. Built-in engines currently return zero
+    /// when per-engine CPU measurement is unavailable; zero does not prove idle.
     pub cpu_usage: f64,
 
-    /// Bytes of memory in use
+    /// Bytes of memory in use. Built-in engines currently return zero when
+    /// per-engine attribution is unavailable; zero does not prove no allocation.
     pub memory_usage: usize,
 
-    /// Number of active threads
+    /// Owned OS worker threads, including retiring workers until joined.
+    /// Excludes tasks on a caller-owned executor and its shared blocking pool.
     pub thread_count: usize,
 }
 

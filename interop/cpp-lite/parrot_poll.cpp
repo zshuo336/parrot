@@ -148,6 +148,7 @@ int pl_pollset_wait(pl_pollset *ps, int timeout_ms) {
   if (ps->backend_fd >= 0) {
     struct epoll_event evs[PL_POLL_MAX_FDS];
     int n = epoll_wait(ps->backend_fd, evs, PL_POLL_MAX_FDS, timeout_ms);
+    if (n < 0) return errno == EINTR ? 0 : -1;
     for (int i = 0; i < n; i++) ps->ready[i] = evs[i].data.fd;
     ps->n_ready = n > 0 ? n : 0;
     return ps->n_ready;
@@ -162,6 +163,7 @@ int pl_pollset_wait(pl_pollset *ps, int timeout_ms) {
       pts = &ts;
     }
     int n = kevent(ps->backend_fd, nullptr, 0, evs, PL_POLL_MAX_FDS, pts);
+    if (n < 0) return errno == EINTR ? 0 : -1;
     int w = 0;
     for (int i = 0; i < n; i++) {
       if (evs[i].flags & EV_ERROR) continue;
@@ -176,7 +178,7 @@ int pl_pollset_wait(pl_pollset *ps, int timeout_ms) {
   if (n <= 0) return n < 0 && errno == EINTR ? 0 : n;
   int w = 0;
   for (int i = 0; i < ps->n_pfds && w < n; i++) {
-    if (ps->pfds[i].revents & (POLLIN | POLLERR | POLLHUP)) ps->ready[w++] = ps->pfds[i].fd;
+    if (ps->pfds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) ps->ready[w++] = ps->pfds[i].fd;
   }
   ps->n_ready = w;
   return w;

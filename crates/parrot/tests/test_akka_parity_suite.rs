@@ -27,10 +27,8 @@ use parrot::thread::context::ThreadContext;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 use parrot_api::address::ActorRefExt;
 use parrot_api::errors::ActorError;
-use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::Message;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -177,17 +175,15 @@ async fn akka_parity_lifecycle_ordering() {
 //    parrot: system.watch(watcher, watched); Terminated delivered to watcher
 // ===========================================================================
 
-/// A watcher that counts unknown-type notifications (the engine's
-/// `Terminated` delivery is crate-private, so we observe it as a non-user
-/// message; Akka's Terminated is a public library message — see GAP 1).
+/// Legacy path watches deliver the public Terminated payload. Arbitrary
+/// application messages must never count as termination evidence.
 #[derive(Debug, Default)]
 struct DeathWatcher {
-    notifications: usize,
-    last_payload_was_unknown: bool,
+    notifications: Vec<parrot::thread::system::Terminated>,
 }
 
 #[derive(Clone, Debug, Message)]
-#[message(result = "usize")]
+#[message(result = "Vec<parrot::thread::system::Terminated>")]
 struct WatcherQuery;
 
 #[derive(Clone, Debug, Message)]
@@ -204,20 +200,19 @@ impl Actor for DeathWatcher {
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            if msg.downcast_ref::<WatcherQuery>().is_some() {
-                return Ok(Box::new(self.notifications) as BoxedMessage);
+            if msg.is::<WatcherQuery>() {
+                return Ok(Box::new(self.notifications.clone()) as BoxedMessage);
             }
-            if msg.downcast_ref::<Tick>().is_some() {
-                self.notifications += 1; // engine Terminated notification
-                return Ok(Box::new(self.notifications) as BoxedMessage);
+            if let Some(event) = msg.downcast_ref::<parrot::thread::system::Terminated>() {
+                self.notifications.push(event.clone());
+                return Ok(Box::new(()) as BoxedMessage);
             }
-            if msg.downcast_ref::<Ping>().is_some() {
+            if msg.is::<Ping>() {
                 return Ok(Box::new("pong".to_string()) as BoxedMessage);
             }
-            // Unknown type = engine-internal message (Terminated path).
-            self.last_payload_was_unknown = true;
-            self.notifications += 1;
-            Ok(Box::new("watched".to_string()) as BoxedMessage)
+            Err(ActorError::MessageHandlingError(
+                "unexpected watcher payload".into(),
+            ))
         })
     }
 
@@ -226,76 +221,130 @@ impl Actor for DeathWatcher {
     }
 }
 
+fn assert_normal_terminations(
+    events: &[parrot::thread::system::Terminated],
+    expected_paths: &[&str],
+) {
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.path.as_str())
+            .collect::<Vec<_>>(),
+        expected_paths,
+        "DeathWatch must deliver exactly the expected public event paths"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| matches!(event.reason, parrot_api::supervisor::DeathReason::Normal)),
+        "successful stop must carry DeathReason::Normal: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn akka_parity_deathwatch_watch_and_terminate() {
-    let ts = mk_system();
-
-    let watcher = ts
-        .spawn_at::<DeathWatcher>(
-            DeathWatcher::default(),
-            "/akka/watcher",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
-    let _watched = ts
-        .spawn_at::<SimpleWatched>(
-            SimpleWatched::default(),
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let ts = mk_system();
+        let watcher = ts
+            .spawn_at::<DeathWatcher>(
+                DeathWatcher::default(),
+                "/akka/watcher",
+                None,
+                // The invalid application message below must not retire this
+                // observer before the DeathWatch contract runs.
+                ThreadActorConfig {
+                    supervisor_strategy: Some(SupervisorStrategy::Resume),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for path in [
             "/akka/watched",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
-
-    // Akka: context.watch(target) — idempotent registration.
-    ts.watch("/akka/watcher".into(), "/akka/watched".into())
-        .await
-        .unwrap();
-    ts.watch("/akka/watcher".into(), "/akka/watched".into())
-        .await
-        .unwrap();
-
-    // Stop the watched actor → watcher must receive the termination notice.
-    ts.stop_actor("/akka/watched").await.unwrap();
-
-    // Akka guarantee: the Terminated message eventually arrives.
-    eventually(Duration::from_secs(5), || async {
-        let n: usize = ask(&watcher, WatcherQuery).await.unwrap();
-        n >= 1
-    })
-    .await;
-
-    // Unwatched target stopping does NOT notify (registration removed).
-    let stranger = ts
-        .spawn_at::<SimpleWatched>(
-            SimpleWatched::default(),
+            "/akka/cancelled",
+            "/akka/rewatched",
             "/akka/stranger",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
-    let _ = stranger;
-    ts.unwatch("/akka/watcher".into(), "/akka/watched".into())
-        .await
-        .unwrap();
-    ts.stop_actor("/akka/stranger").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    let n: usize = ask(&watcher, WatcherQuery).await.unwrap();
-    assert_eq!(
-        n, 1,
-        "unwatch/unregistered stops must not notify — Akka unwatch semantics"
-    );
+        ] {
+            let target = ts
+                .spawn_at::<SimpleWatched>(
+                    SimpleWatched::default(),
+                    path,
+                    None,
+                    ThreadActorConfig::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ask(&target, common::Ping).await.unwrap(), "pong");
+        }
+
+        assert_eq!(ask(&watcher, Ping).await.unwrap(), "pong");
+        let unknown = ask(&watcher, Tick).await;
+        assert!(
+            matches!(unknown, Err(ActorError::MessageHandlingError(ref message))
+            if message == "unexpected watcher payload"),
+            "unknown payload must not masquerade as a termination: {unknown:?}"
+        );
+        assert_normal_terminations(&ask(&watcher, WatcherQuery).await.unwrap(), &[]);
+
+        for path in ["/akka/watched", "/akka/cancelled", "/akka/rewatched"] {
+            for _ in 0..2 {
+                ts.watch("/akka/watcher".into(), path.into()).await.unwrap();
+            }
+        }
+        // Cancel while the target is alive, then re-register the same pair.
+        // Cancellation is idempotent and must not poison future registration.
+        for _ in 0..2 {
+            ts.unwatch("/akka/watcher".into(), "/akka/rewatched".into())
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            ts.watch("/akka/watcher".into(), "/akka/rewatched".into())
+                .await
+                .expect("rewatch after unwatch must succeed");
+        }
+        for _ in 0..2 {
+            ts.unwatch("/akka/watcher".into(), "/akka/cancelled".into())
+                .await
+                .unwrap();
+        }
+
+        // Successful stop joins notification admission. A subsequent query
+        // drains earlier notifications in the watcher's default mailbox.
+        // No sleep or probabilistic quiet window establishes cancellation.
+        ts.stop_actor("/akka/cancelled").await.unwrap();
+        let cancelled = ask(&watcher, WatcherQuery).await.unwrap();
+        assert!(
+            cancelled.is_empty(),
+            "cancelled live subscription must not notify: {cancelled:?}"
+        );
+        ts.stop_actor("/akka/stranger").await.unwrap();
+        assert_normal_terminations(&ask(&watcher, WatcherQuery).await.unwrap(), &[]);
+
+        // Removing another edge must preserve this live subscription.
+        ts.stop_actor("/akka/watched").await.unwrap();
+        assert_normal_terminations(
+            &ask(&watcher, WatcherQuery).await.unwrap(),
+            &["/akka/watched"],
+        );
+        ts.stop_actor("/akka/rewatched").await.unwrap();
+        assert_normal_terminations(
+            &ask(&watcher, WatcherQuery).await.unwrap(),
+            &["/akka/watched", "/akka/rewatched"],
+        );
+        ts.shutdown_internal()
+            .await
+            .expect("DeathWatch shutdown must succeed");
+        assert_eq!(ts.actor_count(), 0);
+    })
+    .await
+    .expect("DeathWatch contract exceeded its independent liveness watchdog");
 }
 
 // ===========================================================================
 // §3 Supervision — Akka: one-for-one { Restart | Resume | Stop | Escalate }
-//    parrot: SupervisorStrategy enum; panic isolation in shared workers.
-//    GAP 2: automatic restart-on-panic is not yet wired (panics isolate but
-//    do not respawn); the test asserts the isolation guarantee and the
-//    manual-respawn pattern that stands in for Akka's restart.
+//    parrot: live-instance Resume, factory-backed Restart with an exact budget,
+//    terminal Stop, and escalation through an actual managed parent.
 // ===========================================================================
 
 #[derive(Clone, Debug, Message)]
@@ -306,10 +355,47 @@ struct SupervisedCount;
 #[message(result = "u64")]
 struct SupervisedBoom(u64);
 
+#[derive(Clone, Debug, Message)]
+#[message(result = "u64")]
+struct SupervisedError;
+
+#[derive(Clone, Debug, Message)]
+#[message(result = "(usize, u64, u64)")]
+struct SupervisedState;
+
+#[derive(Debug, Default)]
+struct SupervisionLifetime {
+    created: std::sync::atomic::AtomicUsize,
+    dropped: std::sync::atomic::AtomicUsize,
+}
+
 #[derive(Debug, Default)]
 struct PanickyWorker {
     count: u64,
     booms: u64,
+    generation: usize,
+    lifetime: Arc<SupervisionLifetime>,
+}
+
+impl PanickyWorker {
+    fn observed(lifetime: Arc<SupervisionLifetime>) -> Self {
+        let generation = lifetime
+            .created
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            lifetime,
+            generation,
+            ..Default::default()
+        }
+    }
+}
+
+impl Drop for PanickyWorker {
+    fn drop(&mut self) {
+        self.lifetime
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Actor for PanickyWorker {
@@ -322,6 +408,15 @@ impl Actor for PanickyWorker {
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
+            if msg.is::<SupervisedState>() {
+                return Ok(Box::new((self.generation, self.count, self.booms)) as BoxedMessage);
+            }
+            if msg.is::<SupervisedError>() {
+                self.booms += 1;
+                return Err(ActorError::MessageHandlingError(
+                    "supervised business failure".into(),
+                ));
+            }
             if let Some(b) = msg.downcast_ref::<SupervisedBoom>() {
                 self.booms += 1;
                 if b.0 != 0 {
@@ -342,79 +437,333 @@ impl Actor for PanickyWorker {
     }
 }
 
-#[tokio::test]
-async fn akka_parity_supervision_panic_isolation() {
-    let ts = mk_system();
-
-    let victim = ts
-        .spawn_at::<PanickyWorker>(
-            PanickyWorker::default(),
-            "/akka/panic-victim",
-            None,
-            ThreadActorConfig::default(),
-        )
+async fn supervised_failure(actor: &dyn parrot_api::address::ActorRef, panic: bool) {
+    let message: BoxedMessage = if panic {
+        Box::new(SupervisedBoom(1))
+    } else {
+        Box::new(SupervisedError)
+    };
+    let error = actor
+        .send_with_timeout(message, Some(Duration::from_secs(3)))
         .await
-        .unwrap();
-    let neighbor = ts
-        .spawn_at::<PanickyWorker>(
-            PanickyWorker::default(),
-            "/akka/panic-neighbor",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
+        .expect_err("the actual failed handler must report failure");
+    if panic {
+        assert!(
+            matches!(error, ActorError::Panic(ref message)
+            if message.contains("supervised failure #1")),
+            "actual panic cause was lost: {error:?}"
+        );
+    } else {
+        assert!(
+            matches!(error, ActorError::MessageHandlingError(ref message)
+            if message == "supervised business failure"),
+            "actual business cause was lost: {error:?}"
+        );
+    }
+}
 
-    // Akka guarantee 1: a failing child does not take down siblings.
-    victim.tell(SupervisedBoom(1)); // panics inside the victim
-    tokio::time::sleep(Duration::from_millis(150)).await;
+async fn supervised_removed(system: &parrot::thread::system::ThreadActorSystem, path: &str) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while system.get_actor_ref(path).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed actor did not retire from the registry");
+}
 
-    // Neighbor unaffected — processes normally.
-    let c: u64 = ask(&neighbor, SupervisedCount)
-        .await
-        .expect("neighbor alive");
-    assert!(c >= 1, "Akka: sibling isolation under child failure");
-
-    // Akka guarantee 2: the system process/test itself survives the panic
-    // (no abort, no poisoned runtime) — the panic is contained per-actor.
-    let c2: u64 = ask(&neighbor, SupervisedCount).await.unwrap();
-    assert_eq!(c2, c + 1);
+async fn supervised_generation(
+    system: &parrot::thread::system::ThreadActorSystem,
+    actor: &parrot::thread::address::ThreadActorRef<PanickyWorker>,
+    path: &str,
+    expected: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            assert!(
+                system.get_actor_ref(path).is_some(),
+                "restart retired the logical actor instead of reconstructing"
+            );
+            if let Ok(reply) = actor
+                .ask_with_timeout(Box::new(SupervisedState), Duration::from_millis(100))
+                .await
+            {
+                let state = *reply.downcast::<(usize, u64, u64)>().unwrap();
+                assert!(
+                    state.0 <= expected,
+                    "restart produced an unexpected extra generation: {state:?}"
+                );
+                if state.0 == expected {
+                    assert_eq!(
+                        state,
+                        (expected, 0, 0),
+                        "restart must construct fresh business state"
+                    );
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected restarted generation did not become responsive");
 }
 
 #[tokio::test]
-async fn akka_parity_supervision_strategy_shapes() {
-    // The strategy vocabulary matches Akka's Supervisor directives.
-    let restart = SupervisorStrategy::Restart {
-        max_retries: 3,
-        within: Duration::from_secs(10),
-    };
-    let resume = SupervisorStrategy::Resume;
-    let stop = SupervisorStrategy::Stop;
-    let escalate = SupervisorStrategy::Escalate;
-    let _ = (restart, resume, stop, escalate);
+async fn akka_parity_supervision_panic_isolation() {
+    use std::sync::atomic::Ordering;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let ts = mk_system();
+        let lifetime = Arc::new(SupervisionLifetime::default());
+        let victim = ts
+            .spawn_at(
+                PanickyWorker::observed(lifetime.clone()),
+                "/akka/panic-victim",
+                None,
+                ThreadActorConfig {
+                    supervisor_strategy: Some(SupervisorStrategy::Stop),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let neighbor = ts
+            .spawn_at(
+                PanickyWorker::default(),
+                "/akka/panic-neighbor",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask(&victim, SupervisedCount).await.unwrap(), 1);
+        assert_eq!(ask(&neighbor, SupervisedCount).await.unwrap(), 1);
+        // The failed ASK is a processing barrier, rather than a guessed sleep.
+        supervised_failure(&victim, true).await;
+        assert_eq!(ask(&neighbor, SupervisedCount).await.unwrap(), 2);
+        supervised_removed(&ts, "/akka/panic-victim").await;
+        assert_eq!(lifetime.created.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lifetime.dropped.load(Ordering::SeqCst),
+            1,
+            "retirement must release actor state even while its reference is retained"
+        );
+        assert!(matches!(
+            ask(&victim, SupervisedCount).await,
+            Err(ActorError::Stopped)
+        ));
+        assert!(matches!(
+            victim.tell(SupervisedBoom(0)).await,
+            Err(ActorError::Stopped)
+        ));
+        assert_eq!(ask(&neighbor, SupervisedCount).await.unwrap(), 3);
+        ts.shutdown_internal().await.unwrap();
+    })
+    .await
+    .expect("panic isolation contract exceeded its watchdog");
+}
 
-    // Default (like Akka's defaultSupervisorStrategy): restart 3-in-10s.
-    assert!(matches!(
-        SupervisorStrategy::default(),
-        SupervisorStrategy::Restart { max_retries: 3, within: d } if d == Duration::from_secs(10)
-    ));
+#[tokio::test]
+async fn akka_parity_supervision_directives() {
+    use std::sync::atomic::Ordering;
+    tokio::time::timeout(Duration::from_secs(25), async {
+        assert!(matches!(SupervisorStrategy::default(),
+            SupervisorStrategy::Restart { max_retries: 3, within: d } if d == Duration::from_secs(10)));
+        for panic in [false, true] {
+            for resume in [false, true] {
+                let ts = mk_system();
+                let lifetime = Arc::new(SupervisionLifetime::default());
+                let path = "/akka/strategy-worker";
+                let actor = ts.spawn_at(PanickyWorker::observed(lifetime.clone()), path, None,
+                    ThreadActorConfig { supervisor_strategy: Some(if resume { SupervisorStrategy::Resume } else { SupervisorStrategy::Stop }),
+                        ..Default::default() }).await.unwrap();
+                assert_eq!(ask(&actor, SupervisedCount).await.unwrap(), 1);
+                supervised_failure(&actor, panic).await;
+                if resume {
+                    assert_eq!(ask(&actor, SupervisedState).await.unwrap(), (0, 1, 1),
+                        "Resume must preserve effects before failure without replaying the message");
+                    assert_eq!(ask(&actor, SupervisedCount).await.unwrap(), 2);
+                    assert_eq!(lifetime.dropped.load(Ordering::SeqCst), 0);
+                } else {
+                    let rejected = actor.ask_with_timeout(Box::new(SupervisedState), Duration::from_secs(3)).await;
+                    // A request admitted before retirement can lose its reply during draining.
+                    assert!(matches!(rejected, Err(ActorError::Stopped | ActorError::ReplyChannelError(_))),
+                        "Stop must reject subsequent business messages: {rejected:?}");
+                    supervised_removed(&ts, path).await;
+                    assert_eq!(lifetime.dropped.load(Ordering::SeqCst), 1);
+                    assert!(matches!(ask(&actor, SupervisedCount).await, Err(ActorError::Stopped)));
+                }
+                assert_eq!(lifetime.created.load(Ordering::SeqCst), 1);
+                ts.shutdown_internal().await.unwrap();
+                assert_eq!(lifetime.dropped.load(Ordering::SeqCst), 1);
+            }
+            let ts = mk_system();
+            let lifetime = Arc::new(SupervisionLifetime::default());
+            let observed = lifetime.clone();
+            let path = "/akka/restart-worker";
+            let actor = ts.spawn_supervised(move || PanickyWorker::observed(observed.clone()), path,
+                SupervisorStrategy::Restart { max_retries: 2, within: Duration::from_secs(60) }).await.unwrap();
+            for generation in 0..3 {
+                supervised_generation(&ts, &actor, path, generation).await;
+                assert_eq!(ask(&actor, SupervisedCount).await.unwrap(), 1);
+                supervised_failure(&actor, panic).await;
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while ts.get_actor_ref(path).is_some() {
+                    if let Ok(reply) = actor.ask_with_timeout(Box::new(SupervisedState), Duration::from_millis(100)).await {
+                        let state = *reply.downcast::<(usize, u64, u64)>().unwrap();
+                        assert!(state.0 <= 2, "restart exceeded the configured two-retry budget: {state:?}");
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("exhausted restart budget did not retire the logical actor");
+            assert_eq!(lifetime.created.load(Ordering::SeqCst), 3);
+            assert_eq!(lifetime.dropped.load(Ordering::SeqCst), 3);
+            assert!(matches!(ask(&actor, SupervisedCount).await, Err(ActorError::Stopped)));
+            ts.shutdown_internal().await.unwrap();
+        }
+        supervised_escalation().await;
+    }).await.expect("supervision directives contract exceeded its watchdog");
+}
 
-    // Strategies are attachable per-actor via config (the Akka
-    // `supervisorStrategy` override point).
-    let cfg = ThreadActorConfig {
-        supervisor_strategy: Some(SupervisorStrategy::Restart {
-            max_retries: 10,
-            within: Duration::from_secs(60),
-        }),
-        ..Default::default()
-    };
+struct EscalationParent {
+    lifetime: Arc<SupervisionLifetime>,
+    child: Arc<SupervisionLifetime>,
+    sibling: Arc<SupervisionLifetime>,
+    decisions: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Drop for EscalationParent {
+    fn drop(&mut self) {
+        self.lifetime
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl Actor for EscalationParent {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+    fn receive_message<'a>(
+        &'a mut self,
+        message: BoxedMessage,
+        ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        use parrot_api::context::{ActorContext, ActorSpawnerExt};
+        use parrot_api::supervisor::{
+            BasicDecisionFn, OneForOneStrategy, SupervisionDecision, SupervisorStrategyType,
+        };
+        Box::pin(async move {
+            if message.is::<SupervisedState>() {
+                return Ok(Box::new(()) as BoxedMessage);
+            }
+            let decisions = self.decisions.clone();
+            let child = ctx.spawner().spawn_supervised(PanickyWorker::observed(self.child.clone()), EmptyConfig,
+                SupervisorStrategyType::OneForOne(OneForOneStrategy {
+                    max_restarts: 0, within: Duration::from_secs(60),
+                    decider: BasicDecisionFn::new(move |error| {
+                        assert!(matches!(error, ActorError::Panic(message) if message.contains("supervised failure #1")));
+                        decisions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        SupervisionDecision::Escalate
+                    }),
+                })).await?;
+            let sibling = ctx
+                .spawner()
+                .spawn_typed(PanickyWorker::observed(self.sibling.clone()), EmptyConfig)
+                .await?;
+            Ok(Box::new((child, sibling)) as BoxedMessage)
+        })
+    }
+}
+
+async fn supervised_escalation() {
+    use std::sync::atomic::Ordering;
     let ts = mk_system();
-    let w = ts
-        .spawn_at::<PanickyWorker>(PanickyWorker::default(), "/akka/strategy-worker", None, cfg)
+    let parent_lifetime = Arc::new(SupervisionLifetime::default());
+    let child_lifetime = Arc::new(SupervisionLifetime::default());
+    let sibling_lifetime = Arc::new(SupervisionLifetime::default());
+    let decisions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let parent = ts
+        .spawn_at(
+            EscalationParent {
+                lifetime: parent_lifetime.clone(),
+                child: child_lifetime.clone(),
+                sibling: sibling_lifetime.clone(),
+                decisions: decisions.clone(),
+            },
+            "/akka/escalation-parent",
+            None,
+            ThreadActorConfig {
+                supervisor_strategy: Some(SupervisorStrategy::Stop),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
-    let c: u64 = ask(&w, SupervisedCount).await.unwrap();
-    assert_eq!(c, 1, "configured-strategy actor runs normally");
+    let reply = parent
+        .ask_with_timeout(Box::new(()), Duration::from_secs(3))
+        .await
+        .unwrap();
+    let (child, sibling) = *reply
+        .downcast::<(
+            parrot_api::types::BoxedActorRef,
+            parrot_api::types::BoxedActorRef,
+        )>()
+        .unwrap();
+    let outsider = ts
+        .spawn_at(
+            PanickyWorker::default(),
+            "/akka/independent",
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ask(&outsider, SupervisedCount).await.unwrap(), 1);
+    supervised_failure(&*child, true).await;
+    supervised_removed(&ts, &child.path()).await;
+    assert!(
+        matches!(
+            parent
+                .ask_with_timeout(Box::new(SupervisedState), Duration::from_secs(3))
+                .await,
+            Err(ActorError::Stopped | ActorError::ReplyChannelError(_))
+        ),
+        "a managed child escalation must stop its configured parent"
+    );
+    // Only a managed parent relationship can retire this parent and its other child.
+    for path in [
+        child.path(),
+        sibling.path(),
+        "/akka/escalation-parent".into(),
+    ] {
+        supervised_removed(&ts, &path).await;
+    }
+    assert_eq!(parent_lifetime.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(child_lifetime.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(sibling_lifetime.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(child_lifetime.created.load(Ordering::SeqCst), 1);
+    assert_eq!(sibling_lifetime.created.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        decisions.load(Ordering::SeqCst),
+        1,
+        "escalation must decide the original child failure exactly once"
+    );
+    assert!(matches!(
+        parent
+            .ask_with_timeout(Box::new(()), Duration::from_secs(3))
+            .await,
+        Err(ActorError::Stopped)
+    ));
+    for actor in [&child, &sibling] {
+        assert!(matches!(
+            actor.send(Box::new(SupervisedCount)).await,
+            Err(ActorError::Stopped)
+        ));
+    }
+    assert_eq!(ask(&outsider, SupervisedCount).await.unwrap(), 2);
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ===========================================================================
@@ -422,112 +771,403 @@ async fn akka_parity_supervision_strategy_shapes() {
 //    parrot: BackpressureStrategy { Block, Error, DropNewest, DropOldest }
 // ===========================================================================
 
-#[tokio::test]
-async fn akka_parity_mailbox_overflow_policies() {
-    // Policy vocabulary parity with Akka's mailbox overflow directives.
-    let _block = BackpressureStrategy::Block; // Akka: block the sender
-    let _error = BackpressureStrategy::Error; // Akka: fail the send
-    let _dn = BackpressureStrategy::DropNewest; // Akka: discard new
-    let _do = BackpressureStrategy::DropOldest; // Akka: discard head
+struct MailboxGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
 
-    // A bounded mailbox actor must accept at least its capacity without
-    // loss, regardless of policy.
-    let ts = mk_system();
-    let cfg = ThreadActorConfig {
-        mailbox_capacity: Some(64),
-        backpressure_strategy: Some(BackpressureStrategy::Block),
-        ..Default::default()
-    };
-    let w = ts
-        .spawn_at::<Counter>(Counter::default(), "/akka/bounded", None, cfg)
-        .await
-        .unwrap();
-    for i in 0..64u64 {
-        let r = ask(&w, IncN(i + 1)).await;
-        assert!(r.is_ok(), "within-capacity message {} must not be lost", i);
+struct MailboxRecorder {
+    observed: tokio::sync::mpsc::UnboundedSender<u64>,
+    values: Vec<u64>,
+}
+
+impl Actor for MailboxRecorder {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
-    let total: u64 = ask(&w, GetTotal).await.unwrap();
-    assert_eq!(
-        total,
-        (1..=64).sum::<u64>(),
-        "no loss within capacity (Akka bounded mailbox)"
+
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            if msg.is::<MailboxGate>() {
+                let gate = *msg.downcast::<MailboxGate>().unwrap();
+                gate.entered.send(()).unwrap();
+                gate.release.await.unwrap();
+                Ok(Box::new(()) as BoxedMessage)
+            } else if let Some(value) = msg.downcast_ref::<u64>() {
+                self.values.push(*value);
+                self.observed.send(*value).unwrap();
+                Ok(Box::new(*value) as BoxedMessage)
+            } else {
+                assert!(msg.is::<()>(), "unexpected mailbox probe message");
+                Ok(Box::new(self.values.clone()) as BoxedMessage)
+            }
+        })
+    }
+}
+
+fn mailbox_rejection(result: ActorResult<BoxedMessage>, strategy: &BackpressureStrategy) {
+    let expected = match strategy {
+        BackpressureStrategy::Error => "Full",
+        BackpressureStrategy::DropNewest => "Dropped",
+        _ => panic!("only rejecting policies have admission errors"),
+    };
+    assert!(
+        matches!(result, Err(ActorError::InternalError(ref message)) if message.contains(expected)),
+        "full mailbox must report {expected}, not success or a reply timeout: {result:?}"
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn akka_parity_mailbox_overflow_policies() {
+    use parrot_api::address::ActorRef;
+
+    for mode in [
+        SchedulingMode::SharedPool {
+            max_messages_per_run: 2,
+        },
+        SchedulingMode::DedicatedThread,
+        SchedulingMode::Sharded {
+            affinity_key: "akka-mailbox".into(),
+        },
+    ] {
+        let ts = mk_system();
+        for strategy in [
+            BackpressureStrategy::Error,
+            BackpressureStrategy::DropNewest,
+            BackpressureStrategy::DropOldest,
+            BackpressureStrategy::Block,
+        ] {
+            for use_ask in [false, true] {
+                let (observed, mut received) = tokio::sync::mpsc::unbounded_channel();
+                let actor = ts
+                    .spawn_at(
+                        MailboxRecorder {
+                            observed,
+                            values: Vec::new(),
+                        },
+                        "/akka/bounded",
+                        None,
+                        ThreadActorConfig {
+                            scheduling_mode: Some(mode.clone()),
+                            mailbox_capacity: Some(2),
+                            backpressure_strategy: Some(strategy.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let (release, gate) = tokio::sync::oneshot::channel();
+                actor
+                    .deliver(Box::new(MailboxGate {
+                        entered,
+                        release: gate,
+                    }))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                // The consumer is inside the gate: polling these asks admits
+                // exactly two envelopes and cannot process their payloads yet.
+                let expected = if use_ask {
+                    let first = actor.send(Box::new(10_u64));
+                    let second = actor.send(Box::new(20_u64));
+                    tokio::pin!(first, second);
+                    assert!(futures::poll!(&mut first).is_pending());
+                    assert!(futures::poll!(&mut second).is_pending());
+                    let third = actor.send(Box::new(30_u64));
+                    tokio::pin!(third);
+                    let third_poll = futures::poll!(&mut third);
+                    if matches!(
+                        strategy,
+                        BackpressureStrategy::Error | BackpressureStrategy::DropNewest
+                    ) {
+                        let std::task::Poll::Ready(result) = third_poll else {
+                            panic!("full ASK must reject immediately");
+                        };
+                        mailbox_rejection(result, &strategy);
+                    } else {
+                        assert!(
+                            third_poll.is_pending(),
+                            "admitted ASK must await its real reply"
+                        );
+                    }
+                    if strategy == BackpressureStrategy::DropOldest {
+                        assert!(
+                            matches!(
+                                futures::poll!(&mut first),
+                                std::task::Poll::Ready(Err(ActorError::ReplyChannelError(_)))
+                            ),
+                            "evicted ASK must close its original reply channel immediately"
+                        );
+                    } else {
+                        assert!(
+                            futures::poll!(&mut first).is_pending(),
+                            "oldest ASK must survive"
+                        );
+                    }
+                    assert!(
+                        futures::poll!(&mut second).is_pending(),
+                        "second ASK must survive"
+                    );
+                    release.send(()).unwrap();
+                    if strategy != BackpressureStrategy::DropOldest {
+                        let reply = tokio::time::timeout(Duration::from_secs(5), &mut first)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(*reply.downcast::<u64>().unwrap(), 10);
+                    }
+                    let reply = tokio::time::timeout(Duration::from_secs(5), &mut second)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(*reply.downcast::<u64>().unwrap(), 20);
+                    if matches!(
+                        strategy,
+                        BackpressureStrategy::DropOldest | BackpressureStrategy::Block
+                    ) {
+                        let reply = tokio::time::timeout(Duration::from_secs(5), &mut third)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(*reply.downcast::<u64>().unwrap(), 30);
+                    }
+                    match strategy {
+                        BackpressureStrategy::DropOldest => vec![20, 30],
+                        BackpressureStrategy::Block => vec![10, 20, 30],
+                        _ => vec![10, 20],
+                    }
+                } else {
+                    actor.deliver(Box::new(10_u64)).await.unwrap();
+                    actor.deliver(Box::new(20_u64)).await.unwrap();
+                    let third = actor.deliver(Box::new(30_u64));
+                    tokio::pin!(third);
+                    match strategy {
+                        BackpressureStrategy::Block => {
+                            assert!(
+                                futures::poll!(&mut third).is_pending(),
+                                "full TELL must block admission"
+                            );
+                            release.send(()).unwrap();
+                            tokio::time::timeout(Duration::from_secs(5), third)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            vec![10, 20, 30]
+                        }
+                        BackpressureStrategy::DropOldest => {
+                            let std::task::Poll::Ready(result) = futures::poll!(&mut third) else {
+                                panic!("eviction must admit immediately");
+                            };
+                            result.unwrap();
+                            release.send(()).unwrap();
+                            vec![20, 30]
+                        }
+                        _ => {
+                            let std::task::Poll::Ready(result) = futures::poll!(&mut third) else {
+                                panic!("full TELL must reject immediately");
+                            };
+                            mailbox_rejection(
+                                result.map(|()| Box::new(()) as BoxedMessage),
+                                &strategy,
+                            );
+                            release.send(()).unwrap();
+                            vec![10, 20]
+                        }
+                    }
+                };
+                for value in &expected {
+                    let actual = tokio::time::timeout(Duration::from_secs(5), received.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(actual, *value, "{mode:?} / {strategy:?} / ASK={use_ask}");
+                }
+                // Observe the drain before querying: a query admitted into a
+                // full DropOldest mailbox would itself evict a valid payload.
+                let snapshot = actor
+                    .send_with_timeout(Box::new(()), Some(Duration::from_secs(5)))
+                    .await
+                    .unwrap();
+                assert_eq!(*snapshot.downcast::<Vec<u64>>().unwrap(), expected);
+                actor.stop().await.unwrap();
+            }
+        }
+        ts.shutdown_internal().await.unwrap();
+    }
+}
+
 // ===========================================================================
-// §5 Scheduling — Akka: system.scheduler.scheduleOnce / scheduleAtFixedRate
+// §5 Scheduling — real Parrot one-shot and fixed-delay context timers
 //    parrot: ThreadContext::schedule_once / schedule_periodic
 // ===========================================================================
 
 #[tokio::test]
 async fn akka_parity_scheduler_once_and_periodic() {
-    let ts = mk_system();
-    let ticks = Arc::new(AtomicU64::new(0));
-    let t2 = ticks.clone();
-
-    struct Timer {
-        fired: Arc<AtomicU64>,
+    use parrot_api::address::ActorRef;
+    use parrot_api::context::ActorContext;
+    use parrot_api::message::CloneableMessage;
+    use parrot_api::types::BoxedActorRef;
+    use std::time::Instant;
+    #[derive(Clone, Debug)]
+    enum TimerTick {
+        Once,
+        Periodic,
     }
-    impl Actor for Timer {
+    struct ScheduleTimers(BoxedActorRef);
+    struct TimerOwner;
+    impl Actor for TimerOwner {
         type Config = EmptyConfig;
         type Context = ThreadContext<Self>;
         fn receive_message<'a>(
             &'a mut self,
             msg: BoxedMessage,
-            _c: &'a mut Self::Context,
+            ctx: &'a mut Self::Context,
         ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-            let fired = self.fired.clone();
             Box::pin(async move {
-                if msg.downcast_ref::<Tick>().is_some() {
-                    fired.fetch_add(1, Ordering::SeqCst);
-                    return Ok(Box::new(()) as BoxedMessage);
-                }
-                Err(ActorError::MessageHandlingError("unknown".into()))
+                let request = msg
+                    .downcast::<ScheduleTimers>()
+                    .expect("expected schedule request");
+                let once_start = Instant::now();
+                ctx.schedule_once(
+                    request.0.clone_boxed(),
+                    Box::new(TimerTick::Once),
+                    Duration::from_millis(30),
+                )
+                .await
+                .expect("real schedule_once registration must succeed");
+                let periodic_start = Instant::now();
+                ctx.schedule_periodic(
+                    request.0,
+                    CloneableMessage::from_cloneable(TimerTick::Periodic),
+                    Duration::from_millis(50),
+                    Duration::from_millis(25),
+                )
+                .await
+                .expect("real schedule_periodic registration must succeed");
+                Ok(Box::new((once_start, periodic_start)) as BoxedMessage)
             })
         }
         fn state(&self) -> ActorState {
             ActorState::Running
         }
     }
-
-    let timer = ts
-        .spawn_at::<Timer>(
-            Timer { fired: t2 },
-            "/akka/timer",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
-
-    // schedule_once via the context: single delayed delivery.
-    // (Driven through a spawned task holding the context-backed ref, the
-    // same way Akka's scheduleOnce targets a receiver.)
-    let aref: parrot_api::types::BoxedActorRef = Box::new(timer.clone());
-    let target = aref.clone_boxed();
-    tokio::spawn(async move {
-        let _ = target.send(Box::new(Tick) as BoxedMessage).await;
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        ticks.load(Ordering::SeqCst) >= 1,
-        "scheduleOnce-equivalent delivery fired"
-    );
-
-    // Fixed-rate: repeated delivery with a stable cadence (Akka
-    // scheduleAtFixedRate). Drive externally, assert ≥3 ticks in window.
-    let deadline = std::time::Instant::now() + Duration::from_millis(200);
-    let mut i = 0u64;
-    while std::time::Instant::now() < deadline {
-        timer.tell(Tick);
-        i += 1;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    struct TimerSink(tokio::sync::mpsc::UnboundedSender<(TimerTick, Instant)>);
+    impl Actor for TimerSink {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                if msg.is::<()>() {
+                    return Ok(Box::new(()) as BoxedMessage);
+                }
+                let tick = *msg
+                    .downcast::<TimerTick>()
+                    .expect("expected real timer payload");
+                self.0
+                    .send((tick, Instant::now()))
+                    .expect("timer observer must remain alive");
+                Ok(Box::new(()) as BoxedMessage)
+            })
+        }
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
     }
-    assert!(
-        ticks.load(Ordering::SeqCst) >= 3,
-        "periodic cadence delivered"
-    );
-    let _ = i;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let ts = mk_system();
+        let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ts
+            .spawn_at::<TimerSink>(
+                TimerSink(events),
+                "/akka/timer-sink",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
+            .unwrap();
+        let owner = ts
+            .spawn_at::<TimerOwner>(
+                TimerOwner,
+                "/akka/timer",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
+            .unwrap();
+        let reply = owner
+            .send(Box::new(ScheduleTimers(Box::new(sink.clone()))))
+            .await
+            .expect("real context timer registration must return its receipt");
+        let (once_start, periodic_start) = *reply.downcast::<(Instant, Instant)>().unwrap();
+        let mut once = Vec::new();
+        let mut periodic = Vec::new();
+        while once.is_empty() || periodic.len() < 3 {
+            let (kind, timestamp) = incoming
+                .recv()
+                .await
+                .expect("timer channel unexpectedly closed");
+            match kind {
+                TimerTick::Once => once.push(timestamp),
+                TimerTick::Periodic => periodic.push(timestamp),
+            }
+        }
+        // Successful owner stop joins its timer tasks. A FIFO query to the
+        // surviving sink drains every delivery admitted before that retirement.
+        owner
+            .stop()
+            .await
+            .expect("timer owner retirement must succeed");
+        sink.send(Box::new(()))
+            .await
+            .expect("timer sink drain barrier must succeed");
+        while let Ok((kind, timestamp)) = incoming.try_recv() {
+            match kind {
+                TimerTick::Once => once.push(timestamp),
+                TimerTick::Periodic => periodic.push(timestamp),
+            }
+        }
+        assert_eq!(once.len(), 1, "schedule_once must deliver exactly once");
+        assert!(
+            once[0].duration_since(once_start) >= Duration::from_millis(30),
+            "schedule_once must honor its delay"
+        );
+        assert!(
+            periodic[0].duration_since(periodic_start) >= Duration::from_millis(50),
+            "schedule_periodic must honor its initial delay"
+        );
+        assert!(
+            periodic.len() >= 3,
+            "real periodic timer must produce repeated deliveries"
+        );
+        // Handler execution can lag behind queue admission. Adjacent handler
+        // timestamps therefore cannot prove the fixed-delay admission interval.
+        assert_eq!(
+            ts.actor_count(),
+            1,
+            "owner stop must leave the independent timer sink alive"
+        );
+        ts.shutdown_internal()
+            .await
+            .expect("timer system shutdown must succeed");
+    })
+    .await
+    .expect("timer contract exceeded its independent liveness watchdog");
 }
 
 // ===========================================================================
@@ -541,7 +1181,7 @@ struct Tid;
 
 #[derive(Debug, Default)]
 struct ThreadReporter {
-    threads: Vec<std::thread::ThreadId>,
+    threads: Vec<(std::thread::ThreadId, Option<String>)>,
 }
 
 impl Actor for ThreadReporter {
@@ -555,13 +1195,14 @@ impl Actor for ThreadReporter {
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if msg.downcast_ref::<Tid>().is_some() {
-                self.threads.push(std::thread::current().id());
+                let thread = std::thread::current();
+                self.threads
+                    .push((thread.id(), thread.name().map(str::to_owned)));
                 return Ok(Box::new(self.threads.len() as u64) as BoxedMessage);
             }
             if let Some(r) = msg.downcast_ref::<ThreadIdsQuery>() {
                 let _ = r;
-                let n = self.threads.len() as u64;
-                return Ok(Box::new(n) as BoxedMessage);
+                return Ok(Box::new(self.threads.clone()) as BoxedMessage);
             }
             Err(ActorError::MessageHandlingError("unknown".into()))
         })
@@ -573,29 +1214,31 @@ impl Actor for ThreadReporter {
 }
 
 #[derive(Clone, Debug, Message)]
-#[message(result = "u64")]
+#[message(result = "Vec<(std::thread::ThreadId, Option<String>)>")]
 struct ThreadIdsQuery;
 
 #[tokio::test]
 async fn akka_parity_pinned_dispatcher_dedicated_thread() {
-    let ts = mk_system_with_dedicated();
-
-    // Akka PinnedDispatcher ≙ DedicatedThread: the actor owns one OS thread.
-    let cfg = ThreadActorConfig {
-        scheduling_mode: Some(SchedulingMode::DedicatedThread),
+    use parrot::thread::config::ThreadActorSystemConfig;
+    use parrot::thread::system::ThreadActorSystem;
+    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig {
+        shared_pool_size: 1,
+        shared_burst_workers_max: 0,
+        max_dedicated_threads: 2,
         ..Default::default()
-    };
+    });
     let pinned = ts
-        .spawn_at::<ThreadReporter>(ThreadReporter::default(), "/akka/pinned", None, cfg)
+        .spawn_at::<ThreadReporter>(
+            ThreadReporter::default(),
+            "/akka/pinned",
+            None,
+            ThreadActorConfig {
+                scheduling_mode: Some(SchedulingMode::DedicatedThread),
+                ..Default::default()
+            },
+        )
         .await
         .expect("spawn dedicated");
-    for _ in 0..5 {
-        let _: u64 = ask(&pinned, Tid).await.unwrap();
-    }
-
-    // Akka default dispatcher ≙ SharedPool: actor shares pool threads
-    // (thread identity may vary — the Akka property is *only* that the
-    // pinned actor stays exclusive, which we assert via its own count).
     let shared = ts
         .spawn_at::<ThreadReporter>(
             ThreadReporter::default(),
@@ -604,15 +1247,35 @@ async fn akka_parity_pinned_dispatcher_dedicated_thread() {
             ThreadActorConfig::default(),
         )
         .await
-        .unwrap();
-    for _ in 0..5 {
-        let _: u64 = ask(&shared, Tid).await.unwrap();
+        .expect("spawn shared");
+    for count in 1..=5u64 {
+        assert_eq!(ask(&pinned, Tid).await.unwrap(), count);
+        assert_eq!(ask(&shared, Tid).await.unwrap(), count);
+        tokio::task::yield_now().await;
     }
-
-    let pinned_n: u64 = ask(&pinned, ThreadIdsQuery).await.unwrap();
-    let shared_n: u64 = ask(&shared, ThreadIdsQuery).await.unwrap();
-    assert_eq!(pinned_n, 5);
-    assert_eq!(shared_n, 5, "both dispatch modes process all messages");
+    let pinned_ids = ask(&pinned, ThreadIdsQuery).await.unwrap();
+    let shared_ids = ask(&shared, ThreadIdsQuery).await.unwrap();
+    assert_eq!(pinned_ids.len(), 5);
+    assert_eq!(shared_ids.len(), 5);
+    assert!(
+        pinned_ids.iter().all(|(id, _)| *id == pinned_ids[0].0),
+        "pinned actor must remain on one OS thread"
+    );
+    assert!(
+        pinned_ids
+            .iter()
+            .all(|(_, name)| name.as_deref() == Some("parrot-dedicated-/akka/pinned")),
+        "dedicated actor must run on its owned named OS thread"
+    );
+    // Shared workers bound concurrent polling, not physical OS-thread identity.
+    // Their blocking executor may choose a different OS thread on each poll.
+    assert!(
+        shared_ids.iter().all(|(id, _)| *id != pinned_ids[0].0),
+        "dedicated actor must not run on the shared worker"
+    );
+    ts.shutdown_internal()
+        .await
+        .expect("dispatcher shutdown must succeed");
 }
 
 // ===========================================================================
@@ -621,71 +1284,249 @@ async fn akka_parity_pinned_dispatcher_dedicated_thread() {
 
 #[tokio::test]
 async fn akka_parity_ask_pattern_with_timeout() {
-    // Akka: (actor ? msg)(timeout) — completing late or never surfaces as
-    // a Timeout error to the caller, not a hang.
-    let ts = mk_system();
-    let slow = ts
-        .spawn_at::<Slowpoke>(Slowpoke, "/akka/slow", None, ThreadActorConfig::default())
-        .await
-        .unwrap();
-
-    // In-budget ask succeeds.
-    let r = tokio::time::timeout(Duration::from_secs(5), ask(&slow, EchoU64(1))).await;
-    assert!(r.is_ok());
-
-    // Out-of-budget ask surfaces a timeout (bounded by our own outer
-    // timeout too, so the test itself can never hang).
-    let started = std::time::Instant::now();
-    let r = tokio::time::timeout(Duration::from_millis(30), ask(&slow, SlowEchoU64(500))).await;
-    assert!(r.is_err(), "ask over budget must time out, not hang");
-    assert!(started.elapsed() < Duration::from_secs(1));
+    use parrot_api::address::ActorRef;
+    struct Gate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    struct ReleaseOnDrop(Arc<Gate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+        }
+    }
+    struct GatedEcho(Arc<Gate>);
+    impl Actor for GatedEcho {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                if msg.is::<SlowEchoU64>() {
+                    self.0.entered.notify_one();
+                    self.0.release.notified().await;
+                    return Ok(Box::new(99u64) as BoxedMessage);
+                }
+                let echo = msg.downcast::<EchoU64>().expect("expected echo message");
+                Ok(Box::new(echo.0) as BoxedMessage)
+            })
+        }
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let ts = mk_system();
+        let gate = Arc::new(Gate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let release = ReleaseOnDrop(gate.clone());
+        let actor = ts
+            .spawn_at::<GatedEcho>(
+                GatedEcho(gate.clone()),
+                "/akka/slow",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
+            .unwrap();
+        let reply = actor
+            .send_with_timeout(Box::new(EchoU64(17)), Some(Duration::from_secs(5)))
+            .await
+            .expect("bounded ASK must return the actual successful reply");
+        assert_eq!(*reply.downcast::<u64>().unwrap(), 17);
+        let held_actor = actor.clone();
+        let held = tokio::spawn(async move {
+            held_actor
+                .send_with_timeout(Box::new(SlowEchoU64(0)), None)
+                .await
+        });
+        gate.entered.notified().await;
+        let duration = Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        let result = actor
+            .send_with_timeout(Box::new(EchoU64(23)), Some(duration))
+            .await;
+        assert!(
+            matches!(result, Err(ActorError::TimeoutDetail(_))),
+            "Parrot bounded ASK must report TimeoutDetail, got {result:?}"
+        );
+        assert!(
+            started.elapsed() >= duration,
+            "Parrot deadline must not expire before requested duration"
+        );
+        drop(release);
+        let held = held
+            .await
+            .expect("held caller panicked")
+            .expect("held request failed");
+        assert_eq!(*held.downcast::<u64>().unwrap(), 99);
+        let recovered = actor
+            .send_with_timeout(Box::new(EchoU64(41)), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *recovered.downcast::<u64>().unwrap(),
+            41,
+            "ASK must recover after timed out caller and released handler"
+        );
+        ts.shutdown_internal()
+            .await
+            .expect("ASK shutdown must succeed");
+    })
+    .await
+    .expect("ASK contract exceeded its independent liveness watchdog");
 }
 
 #[tokio::test]
 async fn akka_parity_pipe_to_and_forward() {
-    // Akka pipeTo: the result of a future is sent to an actor. Parrot
-    // idiom: spawn a task that resolves and tells the target.
-    let ts = mk_system();
-    let target = ts
-        .spawn_at::<Counter>(
-            Counter::default(),
-            "/akka/pipeto",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
+    use parrot_api::address::ActorRef;
 
-    let fwd: parrot_api::types::BoxedActorRef = Box::new(target.clone());
-    let compute = async { 42u64 };
-    let dest = fwd.clone_boxed();
-    tokio::spawn(async move {
-        let v = compute.await;
-        let _ = dest.send(Box::new(IncN(v)) as BoxedMessage).await;
-    });
+    // An application composition, not an engine-level original-sender API:
+    // the computed payload crosses a relay mailbox and the relay awaits its sink.
+    #[derive(Debug)]
+    struct Relay(parrot_api::types::BoxedActorRef);
+    impl Actor for Relay {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            self.0.send(msg)
+        }
+    }
 
-    eventually(Duration::from_secs(5), || async {
-        let total: u64 = ask(&target, GetTotal).await.unwrap();
-        total == 42
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ts = mk_system();
+        let target = ts
+            .spawn_at(
+                Counter::default(),
+                "/akka/pipeto",
+                None,
+                ThreadActorConfig {
+                    supervisor_strategy: Some(SupervisorStrategy::Resume),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let relay = ts
+            .spawn_at(
+                Relay(Box::new(target.clone())),
+                "/akka/forward",
+                None,
+                ThreadActorConfig {
+                    supervisor_strategy: Some(SupervisorStrategy::Resume),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let destination = relay.clone();
+        let (resolve, computation) = tokio::sync::oneshot::channel::<u64>();
+        let producer = tokio::spawn(async move {
+            let value = computation.await.expect("computation owner disappeared");
+            ask(&destination, IncN(value)).await
+        });
+        assert_eq!(ask(&target, GetTotal).await.unwrap(), 0);
+        resolve.send(42).unwrap();
+        assert_eq!(
+            producer.await.unwrap().unwrap(),
+            42,
+            "forwarded reply must reach the producer"
+        );
+        assert_eq!(ask(&target, GetTotal).await.unwrap(), 42);
+        assert_eq!(ask(&relay, IncN(7)).await.unwrap(), 49);
+        assert_eq!(
+            ask(&target, GetTotal).await.unwrap(),
+            49,
+            "each computed value is applied once"
+        );
+
+        let error = relay.send(Box::new(()) as BoxedMessage).await;
+        assert!(
+            matches!(error, Err(ActorError::MessageHandlingError(message)) if message == "unknown"),
+            "a downstream business error must cross the relay unchanged"
+        );
+        assert_eq!(ask(&relay, GetTotal).await.unwrap(), 49);
+        ts.stop_actor("/akka/pipeto").await.unwrap();
+        let error = ask(&relay, IncN(1)).await;
+        assert!(
+            matches!(error, Err(ActorError::Stopped)),
+            "a stopped destination must fail the forwarded ASK: {error:?}"
+        );
+        ts.shutdown_internal().await.unwrap();
     })
-    .await;
+    .await
+    .expect("pipe/forward exceeded its independent liveness watchdog");
 }
 
 // ===========================================================================
 // §8 State & behavior — Akka: become/unbecome, FSM, stash.
 // ===========================================================================
 
-#[derive(Clone, Debug, Message)]
-#[message(result = "String")]
-struct BecomeOp(String);
+// Application-owned behavior stack and deferred business queue. The engine
+// supplies mailbox serialization; it does not expose native become or stash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Behavior {
+    Plain,
+    Scaled(i64),
+}
 
-/// Akka `context.become(handler)`: swap message behavior at runtime.
-/// Parrot: a mode enum + dispatch arm per mode (documented idiom).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BehaviorSnapshot {
+    stack: Vec<Behavior>,
+    deferred: Vec<i64>,
+    suspended: bool,
+    effects: Vec<(i64, i64)>,
+    total: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BehaviorReply {
+    Accepted,
+    Buffered,
+    Drained(usize),
+    Snapshot(BehaviorSnapshot),
+}
+
+#[derive(Clone, Debug)]
+enum BehaviorCommand {
+    Become(Behavior),
+    Unbecome,
+    Suspend,
+    Resume,
+    Add(i64),
+    Snapshot,
+}
+
+impl parrot_api::message::Message for BehaviorCommand {
+    type Result = BehaviorReply;
+}
+
 #[derive(Debug)]
 struct HotSwapActor {
-    mode: u8,
-    stash: Vec<BecomeOp>,
-    processed_unstash: usize,
+    state: BehaviorSnapshot,
+}
+
+impl HotSwapActor {
+    fn apply(&mut self, value: i64) {
+        let result = match self.state.stack.last().unwrap() {
+            Behavior::Plain => value,
+            Behavior::Scaled(scale) => value * scale,
+        };
+        self.state.effects.push((value, result));
+        self.state.total += result;
+    }
 }
 
 impl Actor for HotSwapActor {
@@ -695,42 +1536,50 @@ impl Actor for HotSwapActor {
     fn receive_message<'a>(
         &'a mut self,
         msg: BoxedMessage,
-        _c: &'a mut Self::Context,
+        _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            if let Some(op) = msg.downcast_ref::<BecomeOp>() {
-                match (self.mode, op.0.as_str()) {
-                    (0, "become-fancy") => {
-                        self.mode = 1;
-                        return Ok(Box::new("became".to_string()) as BoxedMessage);
-                    }
-                    (1, "unbecome") => {
-                        self.mode = 0;
-                        return Ok(Box::new("unbecame".to_string()) as BoxedMessage);
-                    }
-
-                    (1, "unstash-all") => {
-                        let n = self.stash.len();
-                        self.processed_unstash += n;
-                        self.stash.clear();
-                        return Ok(Box::new(format!("unstashed-{}", n)) as BoxedMessage);
-                    }
-                    (m, "peek") => {
-                        return Ok(Box::new(format!("mode-{}-stash-{}", m, self.stash.len()))
-                            as BoxedMessage);
-                    }
-                    (_, "stash") => {
-                        self.stash.push(BecomeOp(op.0.clone()));
-                        return Ok(Box::new("stashed".to_string()) as BoxedMessage);
-                    }
-                    _ => {
+            let command = msg.downcast_ref::<BehaviorCommand>().ok_or_else(|| {
+                ActorError::MessageHandlingError("unknown behavior command".into())
+            })?;
+            let reply = match command {
+                BehaviorCommand::Become(behavior) => {
+                    self.state.stack.push(*behavior);
+                    BehaviorReply::Accepted
+                }
+                BehaviorCommand::Unbecome => {
+                    if self.state.stack.len() == 1 {
                         return Err(ActorError::MessageHandlingError(
-                            "state-dependent reject".into(),
+                            "cannot remove base behavior".into(),
                         ));
                     }
+                    self.state.stack.pop();
+                    BehaviorReply::Accepted
                 }
-            }
-            Err(ActorError::MessageHandlingError("unknown".into()))
+                BehaviorCommand::Suspend => {
+                    self.state.suspended = true;
+                    BehaviorReply::Accepted
+                }
+                BehaviorCommand::Resume => {
+                    self.state.suspended = false;
+                    let pending = std::mem::take(&mut self.state.deferred);
+                    let count = pending.len();
+                    for value in pending {
+                        self.apply(value);
+                    }
+                    BehaviorReply::Drained(count)
+                }
+                BehaviorCommand::Add(value) if self.state.suspended => {
+                    self.state.deferred.push(*value);
+                    BehaviorReply::Buffered
+                }
+                BehaviorCommand::Add(value) => {
+                    self.apply(*value);
+                    BehaviorReply::Accepted
+                }
+                BehaviorCommand::Snapshot => BehaviorReply::Snapshot(self.state.clone()),
+            };
+            Ok(Box::new(reply) as BoxedMessage)
         })
     }
 
@@ -741,60 +1590,122 @@ impl Actor for HotSwapActor {
 
 #[tokio::test]
 async fn akka_parity_become_unbecome_stash() {
-    let ts = mk_system();
-    let a = ts
-        .spawn_at::<HotSwapActor>(
-            HotSwapActor {
-                mode: 0,
-                stash: vec![],
-                processed_unstash: 0,
-            },
-            "/akka/hotswap",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
-
-    // Initial behavior.
-    assert_eq!(
-        ask(&a, BecomeOp("peek".into())).await.unwrap(),
-        "mode-0-stash-0"
-    );
-
-    // become: behavior swap (Akka context.become).
-    assert_eq!(
-        ask(&a, BecomeOp("become-fancy".into())).await.unwrap(),
-        "became"
-    );
-    assert_eq!(
-        ask(&a, BecomeOp("peek".into())).await.unwrap(),
-        "mode-1-stash-0"
-    );
-
-    // stash accumulates while in the alternate behavior.
-    assert_eq!(ask(&a, BecomeOp("stash".into())).await.unwrap(), "stashed");
-    assert_eq!(ask(&a, BecomeOp("stash".into())).await.unwrap(), "stashed");
-    assert_eq!(
-        ask(&a, BecomeOp("peek".into())).await.unwrap(),
-        "mode-1-stash-2"
-    );
-
-    // unstashAll: the Akka stash drain point.
-    assert_eq!(
-        ask(&a, BecomeOp("unstash-all".into())).await.unwrap(),
-        "unstashed-2"
-    );
-
-    // unbecome: back to initial behavior.
-    assert_eq!(
-        ask(&a, BecomeOp("unbecome".into())).await.unwrap(),
-        "unbecame"
-    );
-    assert_eq!(
-        ask(&a, BecomeOp("peek".into())).await.unwrap(),
-        "mode-0-stash-0"
-    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let ts = mk_system();
+        let mut expected = BehaviorSnapshot {
+            stack: vec![Behavior::Plain],
+            deferred: vec![],
+            suspended: false,
+            effects: vec![],
+            total: 0,
+        };
+        let actor = ts
+            .spawn_at::<HotSwapActor>(
+                HotSwapActor {
+                    state: expected.clone(),
+                },
+                "/akka/hotswap",
+                None,
+                ThreadActorConfig {
+                    supervisor_strategy: Some(SupervisorStrategy::Resume),
+                    ..ThreadActorConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Snapshot).await.unwrap(),
+            BehaviorReply::Snapshot(expected.clone())
+        );
+        for behavior in [Behavior::Scaled(3), Behavior::Scaled(-2)] {
+            assert_eq!(
+                ask(&actor, BehaviorCommand::Become(behavior))
+                    .await
+                    .unwrap(),
+                BehaviorReply::Accepted
+            );
+            expected.stack.push(behavior);
+        }
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Add(5)).await.unwrap(),
+            BehaviorReply::Accepted
+        );
+        expected.effects.push((5, -10));
+        expected.total = -10;
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Unbecome).await.unwrap(),
+            BehaviorReply::Accepted
+        );
+        expected.stack.pop();
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Suspend).await.unwrap(),
+            BehaviorReply::Accepted
+        );
+        expected.suspended = true;
+        for value in [3, -2, 3, 4] {
+            assert_eq!(
+                ask(&actor, BehaviorCommand::Add(value)).await.unwrap(),
+                BehaviorReply::Buffered
+            );
+            expected.deferred.push(value);
+        }
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Snapshot).await.unwrap(),
+            BehaviorReply::Snapshot(expected.clone()),
+            "buffered work must have no business effects"
+        );
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Resume).await.unwrap(),
+            BehaviorReply::Drained(4)
+        );
+        expected.suspended = false;
+        expected.deferred.clear();
+        expected.effects.extend([(3, 9), (-2, -6), (3, 9), (4, 12)]);
+        expected.total = 14;
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Snapshot).await.unwrap(),
+            BehaviorReply::Snapshot(expected.clone()),
+            "drain must execute every payload once in FIFO order"
+        );
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Resume).await.unwrap(),
+            BehaviorReply::Drained(0)
+        );
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Snapshot).await.unwrap(),
+            BehaviorReply::Snapshot(expected.clone()),
+            "empty drain must not replay previous effects"
+        );
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Unbecome).await.unwrap(),
+            BehaviorReply::Accepted
+        );
+        expected.stack.pop();
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Add(4)).await.unwrap(),
+            BehaviorReply::Accepted
+        );
+        expected.effects.push((4, 4));
+        expected.total = 18;
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Snapshot).await.unwrap(),
+            BehaviorReply::Snapshot(expected.clone()),
+            "unbecome restores the previous handler"
+        );
+        let failure = ask(&actor, BehaviorCommand::Unbecome).await;
+        assert!(
+            matches!(failure, Err(ActorError::MessageHandlingError(reason))
+            if reason == "cannot remove base behavior")
+        );
+        assert_eq!(
+            ask(&actor, BehaviorCommand::Snapshot).await.unwrap(),
+            BehaviorReply::Snapshot(expected),
+            "rejected control must preserve business state"
+        );
+        ts.shutdown_internal().await.unwrap();
+    })
+    .await
+    .expect("state/behavior exceeded its independent liveness watchdog");
 }
 
 // ===========================================================================
@@ -869,14 +1780,13 @@ async fn akka_parity_graceful_stop_and_shutdown() {
     .await
     .unwrap();
 
-    // Graceful single-actor stop (gracefulStop analog): in-flight work
-    // finishes, before_stop runs, watchers notified, path removed.
+    // Successful single-actor stop admits the public termination event
+    // before returning. The watcher query drains that earlier event.
     ts.stop_actor("/akka/shutdown/victim").await.unwrap();
-    eventually(Duration::from_secs(5), || async {
-        let n: usize = ask(&watcher, WatcherQuery).await.unwrap();
-        n >= 1
-    })
-    .await;
+    assert_normal_terminations(
+        &ask(&watcher, WatcherQuery).await.unwrap(),
+        &["/akka/shutdown/victim"],
+    );
     assert!(ts.get_actor_ref("/akka/shutdown/victim").is_none());
 
     // System-wide coordinated shutdown: every actor stopped & registry empty.
@@ -917,128 +1827,228 @@ async fn akka_parity_graceful_stop_and_shutdown() {
 // Documented here so the suite doubles as a living comparison report.
 // ===========================================================================
 
-/// The catalog of measured Akka-parity gaps. Locked by a test to force
-/// conscious updates when a gap closes.
-#[test]
-fn akka_gap_manifest_is_current() {
-    let gaps: &[(&str, &str)] = &[
-        (
-            "GAP-1",
-            "Terminated is crate-private; Akka exposes it publicly with actor identity",
-        ),
-        (
-            "GAP-2",
-            "No automatic restart-on-panic; Akka one-for-one Restart respawns in place (panics isolate but never respawn)",
-        ),
-        (
-            "GAP-3",
-            "No persisted eventsourcing/snapshot (akka-persistence)",
-        ),
-        (
-            "GAP-4",
-            "No priority mailbox ordering (only metadata class; Akka PriorityMailbox reorders queue)",
-        ),
-        (
-            "GAP-5",
-            "become/stash are idioms, not engine primitives (no context.become/stash())",
-        ),
-        (
-            "GAP-6",
-            "No backoff supervision (exponential restart backoff) wired to strategy",
-        ),
-        (
-            "GAP-7",
-            "No per-actor receive-timeout signal to self (timeout surfaces to caller only)",
-        ),
-        (
-            "GAP-8",
-            "No ActorDSL/typed receive builder; dispatch is manual downcast chains",
-        ),
-        (
-            "GAP-9",
-            "No scheduler cancellation handle exposed (schedule_periodic task cannot be cancelled)",
-        ),
-        (
-            "GAP-10",
-            "No mailbox deadlock detection (Akka custom mailbox with NonBlocking + failed sends diagnostics)",
-        ),
-    ];
-    for (id, desc) in gaps {
-        assert!(!id.is_empty() && !desc.is_empty());
-    }
-}
+// Remaining differences are documentation, not executable capability tests.
+// Public termination events, configured Thread restart, priority ordering and
+// receive-timeout now have behavioral regression suites. Checking nonempty
+// strings cannot establish whether any engine capability is implemented.
+// Open differences: actor event-sourcing/snapshots; engine become/stash;
+// exponential restart backoff; an Akka-style receive builder (Parrot has typed
+// generated dispatch); per-task public timer cancellation (actor stop cancels
+// owned timers); automatic mailbox deadlock detection.
 
 // ===========================================================================
 // §11 Router pools — Akka: RoundRobinPool / BroadcastPool / random pool.
 // ===========================================================================
 
+#[derive(Clone, Debug, Message)]
+#[message(result = "Vec<(usize, u64)>")]
+struct PoolDispatch(u64);
+
+/// Application router idiom: every request crosses the router mailbox before
+/// reaching its routees. This does not assert a built-in Akka router facility.
+#[derive(Debug)]
+struct PoolRouter {
+    routees: Vec<parrot_api::types::BoxedActorRef>,
+    next: usize,
+    broadcast: bool,
+}
+
+impl Actor for PoolRouter {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            let Some(dispatch) = msg.downcast_ref::<PoolDispatch>() else {
+                return Err(ActorError::MessageHandlingError(
+                    "unknown router payload".into(),
+                ));
+            };
+            let mut replies = Vec::new();
+            if self.broadcast {
+                for (index, routee) in self.routees.iter().enumerate() {
+                    let total: u64 = routee.ask(IncN(dispatch.0)).await?;
+                    replies.push((index, total));
+                }
+            } else {
+                let index = self.next;
+                self.next = (self.next + 1) % self.routees.len();
+                let total: u64 = self.routees[index].ask(IncN(dispatch.0)).await?;
+                replies.push((index, total));
+            }
+            Ok(Box::new(replies) as BoxedMessage)
+        })
+    }
+}
+
 #[tokio::test]
 async fn akka_parity_round_robin_pool() {
-    // Akka: RoundRobinPool(nrOfInstances) — exactly one routees handles
-    // each message, cycling.
-    let ts = mk_system();
-    const N: usize = 4;
-    let mut routees = Vec::new();
-    for i in 0..N {
-        let r = ts
-            .spawn_at::<Counter>(
-                Counter::default(),
-                &format!("/akka/rr/r{}", i),
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ts = mk_system();
+        let mut routees = Vec::new();
+        for i in 0..4 {
+            routees.push(
+                ts.spawn_at(
+                    Counter::default(),
+                    &format!("/akka/rr/r{i}"),
+                    None,
+                    ThreadActorConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let router = ts
+            .spawn_at(
+                PoolRouter {
+                    routees: routees
+                        .iter()
+                        .cloned()
+                        .map(|r| Box::new(r) as parrot_api::types::BoxedActorRef)
+                        .collect(),
+                    next: 0,
+                    broadcast: false,
+                },
+                "/akka/rr/router",
                 None,
-                ThreadActorConfig::default(),
+                ThreadActorConfig {
+                    supervisor_strategy: Some(SupervisorStrategy::Resume),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
-        routees.push(r);
-    }
-    for i in 0..8u64 {
-        let r = &routees[(i as usize) % N];
-        ask(r, IncN(i + 1)).await.unwrap();
-    }
-    for (i, r) in routees.iter().enumerate() {
-        let t: u64 = ask(r, GetTotal).await.unwrap();
-        let expected = [(1u64 + 5), (2 + 6), (3 + 7), (4 + 8)][i];
-        assert_eq!(t, expected, "routee {} got exactly its two assignments", i);
-    }
+        let expected = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (0, 6),
+            (1, 8),
+            (2, 10),
+            (3, 12),
+        ];
+        let replies =
+            futures::future::join_all((1..=8).map(|value| ask(&router, PoolDispatch(value)))).await;
+        for (reply, assignment) in replies.into_iter().zip(expected) {
+            assert_eq!(
+                reply.unwrap(),
+                vec![assignment],
+                "real router assignment or reply differs"
+            );
+        }
+        for (routee, total) in routees.iter().zip([6, 8, 10, 12]) {
+            assert_eq!(
+                ask(routee, GetTotal).await.unwrap(),
+                total,
+                "routee effects must match the router's replies"
+            );
+        }
+        ts.stop_actor("/akka/rr/r0").await.unwrap();
+        let error = ask(&router, PoolDispatch(100)).await;
+        assert!(
+            matches!(error, Err(ActorError::Stopped)),
+            "failed routee must fail router ASK: {error:?}"
+        );
+        assert_eq!(
+            ask(&router, PoolDispatch(3)).await.unwrap(),
+            vec![(1, 11)],
+            "a failed assignment must not prevent routing to the next live routee"
+        );
+        ts.shutdown_internal().await.unwrap();
+    })
+    .await
+    .expect("round-robin exceeded its independent liveness watchdog");
 }
 
 #[tokio::test]
 async fn akka_parity_broadcast_pool() {
-    // Akka: BroadcastPool — every routee receives every message.
-    let ts = mk_system();
-    const N: usize = 5;
-    let mut routees = Vec::new();
-    for i in 0..N {
-        routees.push(
-            ts.spawn_at::<Counter>(
-                Counter::default(),
-                &format!("/akka/bc/r{}", i),
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ts = mk_system();
+        let mut routees = Vec::new();
+        for i in 0..5 {
+            routees.push(
+                ts.spawn_at(
+                    Counter::default(),
+                    &format!("/akka/bc/r{i}"),
+                    None,
+                    ThreadActorConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let router = ts
+            .spawn_at(
+                PoolRouter {
+                    routees: routees
+                        .iter()
+                        .cloned()
+                        .map(|r| Box::new(r) as parrot_api::types::BoxedActorRef)
+                        .collect(),
+                    next: 0,
+                    broadcast: true,
+                },
+                "/akka/bc/router",
                 None,
-                ThreadActorConfig::default(),
+                ThreadActorConfig {
+                    supervisor_strategy: Some(SupervisorStrategy::Resume),
+                    ..Default::default()
+                },
             )
             .await
-            .unwrap(),
+            .unwrap();
+        for (value, total) in [(7, 7), (11, 18)] {
+            assert_eq!(
+                ask(&router, PoolDispatch(value)).await.unwrap(),
+                (0..5).map(|index| (index, total)).collect::<Vec<_>>(),
+                "broadcast must return an actual reply from every routee"
+            );
+        }
+        for routee in &routees {
+            assert_eq!(
+                ask(routee, GetTotal).await.unwrap(),
+                18,
+                "each broadcast must have exactly one effect per routee"
+            );
+        }
+        // Stop the first routee: fail-fast broadcast must not silently claim
+        // delivery or touch later routees after that observed failure.
+        ts.stop_actor("/akka/bc/r0").await.unwrap();
+        let error = ask(&router, PoolDispatch(100)).await;
+        assert!(
+            matches!(error, Err(ActorError::Stopped)),
+            "failed routee must fail broadcast ASK: {error:?}"
         );
-    }
-    for r in &routees {
-        ask(r, IncN(7)).await.unwrap();
-    }
-    for r in &routees {
-        assert_eq!(ask(r, GetTotal).await.unwrap(), 7);
-    }
+        for routee in &routees[1..] {
+            assert_eq!(ask(routee, GetTotal).await.unwrap(), 18);
+        }
+        ts.shutdown_internal().await.unwrap();
+    })
+    .await
+    .expect("broadcast exceeded its independent liveness watchdog");
 }
 
 // ===========================================================================
-// §12 At-least-once delivery & idempotent consumer — Akka pattern with
-//     `PersistentActor`/`AtLeastOnceDelivery` (single-node semantics).
+// §12 At-least-once delivery: owned durable outbox -> real Thread consumer.
+//     This covers WAL recovery/retry/ACK, not Akka actor event sourcing.
 // ===========================================================================
 
-#[derive(Clone, Debug, Message)]
-#[message(result = "String")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, parrot_api_derive::RemoteMessage)]
 struct DeliverAttempt {
     seq: u64,
-    #[allow(dead_code)]
-    duplicate: bool,
+}
+
+impl parrot_api::message::Message for DeliverAttempt {
+    type Result = String;
 }
 
 #[derive(Clone, Debug, Message)]
@@ -1049,11 +2059,15 @@ struct DeliveredCount;
 #[message(result = "Vec<u64>")]
 struct DeliveredSeqs;
 
-/// Deduplicating receiver: at-least-once upstream, exactly-once effect.
-#[derive(Debug, Default)]
+/// Application idempotence survives a negative receipt while this actor lives.
+/// Durable business state across receiver restarts needs TransactionalInbox.
+#[derive(Debug)]
 struct IdempotentSink {
-    seen: std::collections::HashSet<u64>,
+    dedup: parrot_remote::durable::DedupTable,
     order: Vec<u64>,
+    attempts: tokio::sync::mpsc::UnboundedSender<u64>,
+    release_first: Arc<tokio::sync::Semaphore>,
+    fail_receipt_once: bool,
 }
 
 impl Actor for IdempotentSink {
@@ -1067,13 +2081,24 @@ impl Actor for IdempotentSink {
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(d) = msg.downcast_ref::<DeliverAttempt>() {
-                if self.seen.insert(d.seq) {
+                if let parrot_remote::durable::DedupDecision::Process(permit) =
+                    self.dedup.begin("parity-stream", d.seq).unwrap()
+                {
                     self.order.push(d.seq);
+                    permit.commit();
+                }
+                self.attempts.send(d.seq).unwrap();
+                if self.fail_receipt_once {
+                    self.fail_receipt_once = false;
+                    self.release_first.acquire().await.unwrap().forget();
+                    return Err(ActorError::MessageHandlingError(
+                        "injected negative receipt after business effect".into(),
+                    ));
                 }
                 return Ok(Box::new(format!("ack-{}", d.seq)) as BoxedMessage);
             }
             if msg.downcast_ref::<DeliveredCount>().is_some() {
-                return Ok(Box::new(self.seen.len() as u64) as BoxedMessage);
+                return Ok(Box::new(self.order.len() as u64) as BoxedMessage);
             }
             if msg.downcast_ref::<DeliveredSeqs>().is_some() {
                 return Ok(Box::new(self.order.clone()) as BoxedMessage);
@@ -1087,50 +2112,186 @@ impl Actor for IdempotentSink {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn akka_parity_at_least_once_delivery() {
-    let ts = mk_system();
-    let sink = ts
-        .spawn_at::<IdempotentSink>(
-            IdempotentSink::default(),
-            "/akka/alod/sink",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
+    use parrot_api::message::RemoteMessage;
+    use parrot_remote::durable::{DurableOutbox, OutboxConfig, OutboxError, Wal};
+    use parrot_remote::{LocalLookup, NodeAddr, RemoteActorSystem, RemoteConfig};
 
-    // Upstream retries: seq 1-5 delivered, with duplicates for 2 and 4.
-    for seq in 1..=5u64 {
-        ask(
-            &sink,
-            DeliverAttempt {
-                seq,
-                duplicate: false,
-            },
+    struct Lookup(Option<parrot_api::types::BoxedActorRef>);
+    #[async_trait::async_trait]
+    impl LocalLookup for Lookup {
+        async fn lookup(&self, path: &str) -> Option<parrot_api::types::BoxedActorRef> {
+            if path == "/akka/alod/sink" {
+                self.0.as_ref().map(|actor| actor.clone_boxed())
+            } else {
+                None
+            }
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let id = uuid::Uuid::new_v4();
+        let source_id = format!("parity-source-{id}");
+        let target_id = format!("parity-target-{id}");
+        let evidence =
+            std::env::var_os("PARROT_PARITY_DURABLE_EVIDENCE").map(std::path::PathBuf::from);
+        let base = evidence.clone().unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&base).unwrap();
+        let directory = base.join(format!("parrot-parity-outbox-{id}"));
+        std::fs::create_dir(&directory).unwrap();
+        let source =
+            RemoteActorSystem::new(RemoteConfig::mem(&source_id), Arc::new(Lookup(None))).unwrap();
+        source.start().await.unwrap();
+        let peer = NodeAddr::mem(&target_id);
+        let config = OutboxConfig {
+            attempt_timeout: Duration::from_secs(5),
+            retry_min: Duration::from_millis(10),
+            retry_max: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let mut outbox = DurableOutbox::open(
+            &directory,
+            &source,
+            peer.clone(),
+            "/akka/alod/sink",
+            "session",
+            config.clone(),
         )
         .await
         .unwrap();
-        if seq == 2 || seq == 4 {
-            ask(
-                &sink,
-                DeliverAttempt {
-                    seq,
-                    duplicate: true,
+        let handle = outbox.handle();
+        // Payload sequence differs from the outbox sequence to catch byte/ID substitution.
+        let sequence = [41, 12, 99];
+        for (index, seq) in sequence.into_iter().enumerate() {
+            let payload =
+                parrot_api::message::serde_remote_serialize(&DeliverAttempt { seq }).unwrap();
+            assert_eq!(
+                handle
+                    .enqueue(DeliverAttempt::TYPE_KEY, &payload)
+                    .await
+                    .unwrap(),
+                index as u64 + 1
+            );
+        }
+        assert_eq!(handle.status().pending, 3);
+        assert_eq!(handle.status().last_acked, 0);
+        outbox.close().await.unwrap();
+        assert!(matches!(
+            handle.enqueue(DeliverAttempt::TYPE_KEY, &[]).await,
+            Err(OutboxError::Closed)
+        ));
+        {
+            let wal = Wal::open(&directory).unwrap();
+            let records = wal.replay(&target_id).unwrap();
+            assert_eq!(
+                records.len(),
+                3,
+                "offline accepted records must survive close"
+            );
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(record.seq, index as u64 + 1);
+                let payload: DeliverAttempt =
+                    parrot_api::message::serde_remote_deserialize(&record.payload).unwrap();
+                assert_eq!(payload.seq, sequence[index]);
+            }
+        }
+        source.shutdown().await.unwrap();
+        let source =
+            RemoteActorSystem::new(RemoteConfig::mem(&source_id), Arc::new(Lookup(None))).unwrap();
+        source.start().await.unwrap();
+        let ts = mk_system();
+        let (attempts, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let release_first = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = ts
+            .spawn_at(
+                IdempotentSink {
+                    dedup: parrot_remote::durable::DedupTable::new(),
+                    order: vec![],
+                    attempts,
+                    release_first: release_first.clone(),
+                    fail_receipt_once: true,
+                },
+                "/akka/alod/sink",
+                None,
+                ThreadActorConfig {
+                    supervisor_strategy: Some(SupervisorStrategy::Resume),
+                    ..Default::default()
                 },
             )
             .await
             .unwrap();
+        let target = RemoteActorSystem::new(
+            RemoteConfig::mem(&target_id),
+            Arc::new(Lookup(Some(Box::new(sink.clone())))),
+        )
+        .unwrap();
+        target.start().await.unwrap();
+        // Only the production worker may connect, replay, retry and persist ACKs.
+        let mut outbox = DurableOutbox::open(
+            &directory,
+            &source,
+            peer,
+            "/akka/alod/sink",
+            "session",
+            config,
+        )
+        .await
+        .unwrap();
+        let handle = outbox.handle();
+        assert_eq!(observed.recv().await.unwrap(), 41);
+        assert_eq!(
+            handle.status().last_acked,
+            0,
+            "business execution alone is not a receipt"
+        );
+        assert_eq!(
+            handle.status().pending,
+            3,
+            "no record may be retired before its completion receipt"
+        );
+        release_first.add_permits(1);
+        handle.wait_acked(3).await.unwrap();
+        let mut attempts = Vec::new();
+        while let Ok(seq) = observed.try_recv() {
+            attempts.push(seq);
         }
-    }
-
-    let count: u64 = ask(&sink, DeliveredCount).await.unwrap();
-    assert_eq!(
-        count, 5,
-        "exactly-once effect despite at-least-once delivery"
-    );
-    let order: Vec<u64> = ask(&sink, DeliveredSeqs).await.unwrap();
-    assert_eq!(order, vec![1, 2, 3, 4, 5], "first-delivery order preserved");
+        assert!(
+            attempts.contains(&41),
+            "negative receipt must trigger a real automatic retry"
+        );
+        assert!(
+            attempts.contains(&12) && attempts.contains(&99),
+            "every recovered payload must reach the actor"
+        );
+        assert_eq!(ask(&sink, DeliveredCount).await.unwrap(), 3);
+        assert_eq!(
+            ask(&sink, DeliveredSeqs).await.unwrap(),
+            sequence,
+            "retry must preserve first-effect order without duplication"
+        );
+        let status = handle.status();
+        assert!(status.attempts >= 4);
+        assert_eq!(status.last_acked, 3);
+        assert_eq!(status.pending, 0);
+        outbox.close().await.unwrap();
+        {
+            let wal = Wal::open(&directory).unwrap();
+            assert_eq!(
+                wal.pending_len().unwrap(),
+                0,
+                "completion ACK must survive reopening WAL"
+            );
+        }
+        source.shutdown().await.unwrap();
+        target.shutdown().await.unwrap();
+        ts.shutdown_internal().await.unwrap();
+        if evidence.is_none() {
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+    })
+    .await
+    .expect("durable delivery exceeded its independent liveness watchdog");
 }
 
 // ===========================================================================
@@ -1139,22 +2300,60 @@ async fn akka_parity_at_least_once_delivery() {
 
 #[tokio::test]
 async fn akka_parity_receive_timeout_idle_signal() {
-    // Akka: an idle actor configured with a receive timeout gets a
-    // timeout signal; parrot surfaces the timeout as an ask error to the
-    // CALLER (documented divergence — engine-level idle signal absent).
+    use parrot_api::address::ActorRef;
+    use parrot_api::context::{ActorContext, LifecycleEvent};
+    struct IdleProbe(tokio::sync::mpsc::UnboundedSender<()>);
+    impl Actor for IdleProbe {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+        fn init<'a>(&'a mut self, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move {
+                ctx.set_receive_timeout(Some(Duration::from_millis(25)));
+                Ok(())
+            })
+        }
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                assert!(matches!(
+                    msg.downcast_ref::<LifecycleEvent>(),
+                    Some(LifecycleEvent::ReceiveTimeout)
+                ));
+                ctx.set_receive_timeout(None);
+                self.0.send(()).unwrap();
+                Ok(Box::new(()) as BoxedMessage)
+            })
+        }
+    }
     let ts = mk_system();
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
     let idle = ts
-        .spawn_at::<Slowpoke>(Slowpoke, "/akka/idle", None, ThreadActorConfig::default())
+        .spawn_at(
+            IdleProbe(events),
+            "/akka/idle",
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
         .unwrap();
-
-    let started = std::time::Instant::now();
-    let r = tokio::time::timeout(Duration::from_millis(25), ask(&idle, SlowEchoU64(300))).await;
-    assert!(r.is_err(), "caller-side receive timeout fires");
+    tokio::time::timeout(Duration::from_secs(2), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "bounded, no hang"
+        tokio::time::timeout(Duration::from_millis(100), received.recv())
+            .await
+            .is_err(),
+        "disabled receive timeout must not repeat"
     );
+    idle.stop().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ===========================================================================
@@ -1221,58 +2420,34 @@ impl Actor for MachineFsm {
 #[tokio::test]
 async fn akka_parity_fsm_stop_reasons() {
     let ts = mk_system();
-    // Normal completion.
-    let m = ts
-        .spawn_at::<MachineFsm>(
-            MachineFsm {
-                state: "idle",
-                transitions: vec![],
-                stop_reason: None,
-            },
-            "/akka/fsm/normal",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        ask(&m, FsmInput("start".into()))
+    for (name, transition, expected) in [
+        ("normal", "finish", "done|Some(\"Normal\")"),
+        ("failure", "error", "failed|Some(\"Failure\")"),
+    ] {
+        let actor = ts
+            .spawn_at::<MachineFsm>(
+                MachineFsm {
+                    state: "idle",
+                    transitions: vec![],
+                    stop_reason: None,
+                },
+                &format!("/akka/fsm/{name}"),
+                None,
+                ThreadActorConfig::default(),
+            )
             .await
-            .unwrap()
-            .starts_with("running|")
-    );
-    let fin = ask(&m, FsmInput("finish".into())).await.unwrap();
-    assert!(fin.starts_with("done|"), "{}", fin);
-    assert!(
-        fin.contains("Normal"),
-        "FSM stop reason Normal recorded: {}",
-        fin
-    );
-
-    // Failure path.
-    let f = ts
-        .spawn_at::<MachineFsm>(
-            MachineFsm {
-                state: "idle",
-                transitions: vec![],
-                stop_reason: None,
-            },
-            "/akka/fsm/failure",
-            None,
-            ThreadActorConfig::default(),
-        )
-        .await
-        .unwrap();
-    ask(&f, FsmInput("start".into())).await.unwrap();
-    let err = ask(&f, FsmInput("error".into())).await.unwrap();
-    assert!(err.starts_with("failed|"));
-    assert!(
-        err.contains("Failure"),
-        "FSM stop reason Failure recorded: {}",
-        err
-    );
-
-    // Invalid transitions are rejected (FSM error semantics).
+            .unwrap();
+        assert_eq!(
+            ask(&actor, FsmInput("start".into())).await.unwrap(),
+            "running|None",
+            "FSM start must return the exact state and reason"
+        );
+        assert_eq!(
+            ask(&actor, FsmInput(transition.into())).await.unwrap(),
+            expected,
+            "FSM terminal transition must return the exact state and reason"
+        );
+    }
     let bad = ts
         .spawn_at::<MachineFsm>(
             MachineFsm {
@@ -1286,7 +2461,14 @@ async fn akka_parity_fsm_stop_reasons() {
         )
         .await
         .unwrap();
-    assert!(ask(&f, FsmInput("start".into())).await.is_ok() || true);
-    let r = ask(&bad, FsmInput("finish".into())).await;
-    assert!(r.is_err(), "idle→finish is an invalid FSM transition");
+    let result = ask(&bad, FsmInput("finish".into())).await;
+    assert!(
+        matches!(result, Err(ActorError::MessageHandlingError(ref error)) if error == "invalid transition"),
+        "FSM invalid transition must preserve its business error, got {result:?}"
+    );
+    // This actor's state string is a fixture-level FSM; engine retirement is
+    // explicitly joined below rather than inferred from the word 'done'.
+    ts.shutdown_internal()
+        .await
+        .expect("FSM shutdown must succeed");
 }

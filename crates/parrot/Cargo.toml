@@ -21,22 +21,21 @@ tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 anyhow = "1.0"
 num_cpus = "1.0"
-lazy_static = "1.5.0"
-flume = "0.11.1"
-ringbuf = { version = "0.4.8", features = ["alloc"] } 
+flume = { path = "../../vendor/flume" }
+ringbuf = { version = "0.5.3", features = ["alloc"] }
 crossbeam-queue = "0.3.10"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json"] }
-atty = "0.2.14"
 downcast-rs = "2.0.0"
 
 [dev-dependencies]
-tokio = { workspace = true }
+libloading = "0.8.9"
+tokio = { workspace = true, features = ["test-util"] }
 parrot-remote = { path = "../parrot-remote" }
 parrot-api = { path = "../parrot-api", features = ["remote"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rumqttc = "0.24"
-bincode = "2"
+rumqttc = { path = "../../vendor/rumqttc", default-features = false, features = ["use-rustls-no-provider"] }
+bincode = { workspace = true }
 
 
 [[example]]
@@ -46,4 +45,3 @@ path = "examples/actor/simple.rs"
 [[example]]
 name = "ping_pong"
 path = "examples/ping_pong.rs"
-

@@ -13,6 +13,9 @@ working_dir 载入 `parrot_entry(ctx)` 起命名 actor。
 from __future__ import annotations
 
 import struct
+import threading
+from collections import Counter
+from parrot_protocol.payload import decode_documents
 
 _STOP = frozenset(
     "the a an of to in and or for on with at by is it as be html head title page body".split()
@@ -28,14 +31,7 @@ def _tokenize(html: bytes) -> list[str]:
 
 def _decode_pages(p: bytes) -> list[tuple[int, bytes]]:
     """[n u32][{doc u64|len u32|html}...]"""
-    (n,) = struct.unpack_from("<I", p, 0)
-    off, pages = 4, []
-    for _ in range(n):
-        doc, ln = struct.unpack_from("<QI", p, off)
-        off += 12
-        pages.append((doc, p[off : off + ln]))
-        off += ln
-    return pages
+    return decode_documents(p)
 
 
 def build_dispatcher():
@@ -48,22 +44,30 @@ def build_dispatcher():
 
     d = ParrotDispatcher()
     _index: dict[str, dict[int, int]] = {}
+    index_lock = threading.Lock()
 
     @d.handler("bin:crawl/IndexPage")
     def _index_page(_k: str, p: bytes) -> tuple[str, bytes]:
         pages = _decode_pages(p)
-        terms = 0
-        for doc, html in pages:
-            for t in _tokenize(html):
-                slot = _index.setdefault(t, {})
-                slot[doc] = slot.get(doc, 0) + 1
-                terms += 1
-        return ("bin:crawl/IndexAck", struct.pack("<II", len(pages), terms))
+        # Finish tokenization and construct the reply before any shared state
+        # change; a late parse/tokenizer/encoding failure leaves the index intact.
+        updates = [(doc, Counter(_tokenize(html))) for doc, html in pages]
+        terms = sum(sum(freq.values()) for _, freq in updates)
+        reply = ("bin:crawl/IndexAck", struct.pack("<II", len(pages), terms))
+        with index_lock:
+            for doc, freq in updates:
+                for term, count in freq.items():
+                    slot = _index.setdefault(term, {})
+                    slot[doc] = slot.get(doc, 0) + count
+        return reply
 
     @d.handler("bin:crawl/IndexStats")
     def _index_stats(_k: str, _p: bytes) -> tuple[str, bytes]:
-        postings = sum(len(v) for v in _index.values())
-        return ("bin:crawl/IndexStatsR", struct.pack("<IQ", len(_index), postings))
+        if _p:
+            raise ValueError("IndexStats requires an empty payload")
+        with index_lock:
+            postings = sum(len(v) for v in _index.values())
+            return ("bin:crawl/IndexStatsR", struct.pack("<IQ", len(_index), postings))
 
     return d
 

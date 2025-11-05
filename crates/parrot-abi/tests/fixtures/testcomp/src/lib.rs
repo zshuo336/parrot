@@ -10,18 +10,55 @@ use parrot_abi::{
     AbiComponent, AbiHooks, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, AbiVt, ABI_ERR_OVERFLOW,
     ABI_ERR_PANIC, ABI_ERR_STATE, ABI_OK, PARROT_ABI_VERSION,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static CONSTRUCTS: AtomicU64 = AtomicU64::new(0);
+static DRAINS: AtomicU64 = AtomicU64::new(0);
+static DESTROYS: AtomicU64 = AtomicU64::new(0);
+static ORDER_ERRORS: AtomicU64 = AtomicU64::new(0);
+static FIRST_DESTROY_DRAINS: AtomicU64 = AtomicU64::new(0);
+static GATE: AtomicBool = AtomicBool::new(true);
+
+#[no_mangle]
+pub extern "C" fn lifecycle_observe(index: u32) -> u64 {
+    match index {
+        0 => DRAINS.load(Ordering::Acquire),
+        1 => DESTROYS.load(Ordering::Acquire),
+        2 => ORDER_ERRORS.load(Ordering::Acquire),
+        _ => FIRST_DESTROY_DRAINS.load(Ordering::Acquire),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lifecycle_reset() {
+    DRAINS.store(0, Ordering::Release);
+    DESTROYS.store(0, Ordering::Release);
+    ORDER_ERRORS.store(0, Ordering::Release);
+    FIRST_DESTROY_DRAINS.store(0, Ordering::Release);
+    GATE.store(false, Ordering::Release);
+}
+
+#[no_mangle]
+pub extern "C" fn lifecycle_release() {
+    GATE.store(true, Ordering::Release);
+}
 
 /// 组件状态（self_ 指向——消息计数跨调用）。
 struct CompState {
     msgs: u64,
+    drained: bool,
+    gate: bool,
+    fail: bool,
 }
 
-unsafe extern "C" fn construct(_cfg: AbiStr, out: *mut *mut AbiComponent) -> u32 {
+unsafe extern "C" fn construct(cfg: AbiStr, out: *mut *mut AbiComponent) -> u32 {
     CONSTRUCTS.fetch_add(1, Ordering::Relaxed);
-    let state = Box::into_raw(Box::new(CompState { msgs: 0 }));
+    let state = Box::into_raw(Box::new(CompState {
+        msgs: 0,
+        drained: false,
+        gate: cfg.as_str() == "gate",
+        fail: cfg.as_str() == "error",
+    }));
     let comp = Box::into_raw(Box::new(AbiComponent {
         vt: &VT,
         self_: state as *mut (),
@@ -34,14 +71,20 @@ unsafe extern "C" fn destroy(comp: *mut AbiComponent) {
     if comp.is_null() {
         return;
     }
+    if DESTROYS.load(Ordering::Acquire) == 0 {
+        FIRST_DESTROY_DRAINS.store(DRAINS.load(Ordering::Acquire), Ordering::Release);
+    }
     let boxed = Box::from_raw((*comp).self_ as *mut CompState);
+    if !boxed.drained {
+        ORDER_ERRORS.fetch_add(1, Ordering::AcqRel);
+    }
     drop(boxed);
     drop(Box::from_raw(comp));
+    DESTROYS.fetch_add(1, Ordering::Release);
 }
 
 unsafe extern "C" fn handle_msg(self_: *mut (), msg: AbiMsg, out: *mut AbiReplyBuf) -> u32 {
-    // panic 边界（09 §4.3 双保险的 dylib 侧）：跨界 unwind 是 UB——
-    // 库内 catch 后转错误码（宿主侧 catch_unwind 是第二道防线）
+    // extern C unwind会abort；必须在组件内部捕获并转为错误码。
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle_msg_inner(self_, msg, out)
     }));
@@ -81,19 +124,36 @@ unsafe fn handle_msg_raw(self_: *mut (), msg: AbiMsg, out: *mut AbiReplyBuf) -> 
             panic!("testcomp deliberate panic");
         }
         "cnt" => {
-            let _ = out.write(&CONSTRUCTS.load(Ordering::Relaxed).to_le_bytes());
+            if !out.write(&CONSTRUCTS.load(Ordering::Relaxed).to_le_bytes()) {
+                return ABI_ERR_OVERFLOW;
+            }
             ABI_OK
         }
         "msgs" => {
-            let _ = out.write(&state.msgs.to_le_bytes());
+            if !out.write(&state.msgs.to_le_bytes()) {
+                return ABI_ERR_OVERFLOW;
+            }
             ABI_OK
         }
         _ => ABI_ERR_STATE,
     }
 }
 
-unsafe extern "C" fn on_drain(_self_: *mut ()) -> u32 {
-    ABI_OK
+unsafe extern "C" fn on_drain(self_: *mut ()) -> u32 {
+    let state = &mut *(self_ as *mut CompState);
+    if state.drained {
+        ORDER_ERRORS.fetch_add(1, Ordering::AcqRel);
+    }
+    DRAINS.fetch_add(1, Ordering::Release);
+    while state.gate && !GATE.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+    state.drained = true;
+    if state.fail {
+        ABI_ERR_STATE
+    } else {
+        ABI_OK
+    }
 }
 
 static VT: AbiVt = AbiVt {
@@ -106,7 +166,7 @@ static VT: AbiVt = AbiVt {
 pub static PARROT_ABI_META: AbiMeta = AbiMeta {
     abi_version: PARROT_ABI_VERSION,
     parrot_min: 1,
-    name: b"testcomp\0".as_ptr(),
+    name: c"testcomp".as_ptr().cast(),
     name_len: 8,
     hooks: AbiHooks { construct, destroy },
 };

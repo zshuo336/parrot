@@ -85,11 +85,12 @@ fn m4_actix_static_track_ask_tell_zero_any() {
         assert_eq!(get_r.ask(Get).await.unwrap(), 82, "Get 看到 Add 累积");
 
         r.tell(Add(1)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(r.ask(Add(0)).await.unwrap(), 83, "tell 后再 ask 应看到累积");
 
         let ping_r = r.ref_for::<Ping>();
         assert_eq!(ping_r.ask(Ping("n".into())).await.unwrap(), "n:83");
+        r.stop().await.unwrap();
+        sys.as_ref().clone().shutdown().await.unwrap();
     });
 }
 
@@ -116,7 +117,6 @@ fn m4_actix_dual_track_bridge_into_dyn() {
             .deliver(Box::new(Add(2)) as parrot_api::types::BoxedMessage)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let out = dyn_ref
             .send(Box::new(Add(0)) as parrot_api::types::BoxedMessage)
@@ -133,6 +133,8 @@ fn m4_actix_dual_track_bridge_into_dyn() {
             .send(Box::new("str") as parrot_api::types::BoxedMessage)
             .await;
         assert!(bad.is_err(), "mismatched type must error, not panic");
+        dyn_ref.stop().await.unwrap();
+        sys.as_ref().clone().shutdown().await.unwrap();
     });
 }
 
@@ -155,105 +157,245 @@ fn m4_actix_spawn_typed_single() {
             .unwrap();
         assert_eq!(r.ask(SingleVariant::wrap(Add(21))).await.unwrap(), 42);
         assert_eq!(r.ask(SingleVariant::wrap(Add(0))).await.unwrap(), 0);
+        r.stop().await.unwrap();
+        sys.as_ref().clone().shutdown().await.unwrap();
     });
 }
 
-/// 多 actor 真并行：CPU 密集 handler × N，跨 arbiter 并行应显著快于串行。
-///
-/// 这是 actix 引擎静态轨的关键验证：消费循环跑在 arbiter 池上，
-/// 多个静态轨 actor 落在不同 OS 线程（round-robin）——如果实现
-/// 错误地共享单一执行线程，本测试会超时。
+/// Four handlers must be active on four distinct OS threads before any is released.
+/// The original arithmetic timing bound remains a non-regression check only:
+/// a compiler may simplify this sum, so its duration alone cannot prove parallelism.
 #[test]
 fn m4_actix_static_actors_run_in_parallel() {
+    use futures::FutureExt;
+    use std::collections::HashSet;
+    use std::sync::{
+        Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    #[derive(Default)]
+    struct Gate {
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+    impl Gate {
+        fn wait(&self) {
+            let released = self.released.lock().unwrap();
+            // A broken observer must fail the test instead of hanging a worker.
+            let (released, _) = self
+                .changed
+                .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+                .unwrap();
+            assert!(*released, "observer did not release the overlap gate");
+        }
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+    struct ReleaseOnDrop(Arc<Gate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    struct Observe {
+        gate: Arc<Gate>,
+        entered: mpsc::Sender<(usize, std::thread::ThreadId)>,
+    }
+    impl Message for Observe {
+        type Result = usize;
+    }
+    struct Burn(u64);
+    impl Message for Burn {
+        type Result = u64;
+    }
+    #[derive(ParrotTypedActor)]
+    #[ParrotTypedActor(msgs(Burn, Observe))]
+    struct Burner {
+        id: usize,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl Drop for Burner {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl TypedReceive<Observe> for Burner {
+        fn receive_typed<'a>(&'a mut self, msg: Observe) -> BoxedFuture<'a, ActorResult<usize>> {
+            Box::pin(async move {
+                // No await/yield between announcing entry and blocking. One
+                // arbiter cannot start its next actor until this gate opens.
+                msg.entered
+                    .send((self.id, std::thread::current().id()))
+                    .unwrap();
+                msg.gate.wait();
+                Ok(self.id)
+            })
+        }
+    }
+    impl TypedReceive<Burn> for Burner {
+        fn receive_typed<'a>(&'a mut self, msg: Burn) -> BoxedFuture<'a, ActorResult<u64>> {
+            Box::pin(async move {
+                let mut acc: u64 = 0;
+                for i in 0..msg.0 {
+                    acc = acc.wrapping_add(i);
+                }
+                Ok(acc)
+            })
+        }
+    }
+    fn expected_sum(n: u64) -> u64 {
+        (u128::from(n) * u128::from(n.saturating_sub(1)) / 2) as u64
+    }
+    const ACTORS: usize = 4;
     actix::System::new().block_on(async {
-        // 2 个 worker 起步（ArbiterPool::new 升级 0→1，这里显式 4）
         let sys = Arc::new(
             ActixActorSystem::with_arbiter_count(4)
                 .await
                 .expect("system"),
         );
-
-        /// CPU 燃烧消息：纯迭代计数（无 await 让出）。
-        struct Burn(u64);
-        impl Message for Burn {
-            type Result = u64;
-        }
-
-        #[derive(ParrotTypedActor)]
-        #[ParrotTypedActor(msgs(Burn))]
-        struct Burner;
-
-        impl TypedReceive<Burn> for Burner {
-            fn receive_typed<'a>(&'a mut self, msg: Burn) -> BoxedFuture<'a, ActorResult<u64>> {
-                Box::pin(async move {
-                    let mut acc: u64 = 0;
-                    for i in 0..msg.0 {
-                        acc = acc.wrapping_add(i);
-                    }
-                    Ok(acc)
-                })
-            }
-        }
-
-        const ACTORS: usize = 4;
-        // 工作量自适应：先探测单 actor 速率，使每 actor ~60ms
-        // （llvm-cov 插桩慢 ~10-30×；固定 30M 迭代在插桩下会放大
-        // 调度抖动，让"并行 vs 串行"相对断言失真）
-        let probe = sys
-            .spawn_typed::<Burner, Burn>(Burner, "/m4a/burn-probe")
-            .await
-            .unwrap();
-        let t = Instant::now();
-        let _ = probe.ask(Burn(2_000_000)).await.unwrap();
-        let per_iter = t.elapsed().as_secs_f64() / 2_000_000.0;
-        let work_per_actor = ((0.06 / per_iter) as u64).max(1_000_000);
-        let work: u64 = work_per_actor;
-
-        let refs: Vec<_> = {
-            let mut v = Vec::new();
-            for i in 0..ACTORS {
-                let r = sys
-                    .spawn_typed::<Burner, Burn>(Burner, &format!("/m4a/burn/{i}"))
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let result = std::panic::AssertUnwindSafe(async {
+            let probe = sys
+                .spawn_typed::<Burner, Burn>(
+                    Burner {
+                        id: ACTORS,
+                        dropped: dropped.clone(),
+                    },
+                    "/m4a/burn-probe",
+                )
+                .await
+                .unwrap();
+            let t = Instant::now();
+            let probe_reply = probe.ask(Burn(2_000_000)).await.unwrap();
+            let per_iter = t.elapsed().as_secs_f64() / 2_000_000.0;
+            assert_eq!(
+                probe_reply,
+                expected_sum(2_000_000),
+                "probe arithmetic result"
+            );
+            let work = ((0.06 / per_iter) as u64).max(1_000_000);
+            let mut refs = Vec::new();
+            for id in 0..ACTORS {
+                refs.push(
+                    sys.spawn_typed::<Burner, Burn>(
+                        Burner {
+                            id,
+                            dropped: dropped.clone(),
+                        },
+                        &format!("/m4a/burn/{id}"),
+                    )
                     .await
-                    .unwrap();
-                v.push(r);
+                    .unwrap(),
+                );
             }
-            v
-        };
 
-        // 并行发起全部 ask
-        let t0 = Instant::now();
-        let futs: Vec<_> = refs.iter().map(|r| r.ask(Burn(work))).collect();
-        let results = futures::future::join_all(futs).await;
-        let parallel = t0.elapsed();
+            let gate = Arc::new(Gate::default());
+            let (entered, entries) = mpsc::channel();
+            let release = ReleaseOnDrop(gate.clone());
+            let observer = std::thread::spawn(move || {
+                let _release = release;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut observed = Vec::new();
+                while observed.len() < ACTORS {
+                    match entries.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(entry) => observed.push(entry),
+                        Err(_) => break,
+                    }
+                }
+                (observed, entries)
+            });
+            let observing: Vec<_> = refs
+                .iter()
+                .map(|reference| reference.ref_for::<Observe>())
+                .collect();
+            let replies = futures::future::join_all(observing.iter().map(|reference| {
+                reference.ask_with_timeout(
+                    Observe {
+                        gate: gate.clone(),
+                        entered: entered.clone(),
+                    },
+                    Duration::from_secs(15),
+                )
+            }))
+            .await;
+            let (observed, _entries) = observer.join().expect("independent overlap observer");
+            for (id, reply) in replies.into_iter().enumerate() {
+                assert_eq!(reply.unwrap(), id, "overlap handler identity");
+            }
+            assert_eq!(
+                observed.len(),
+                ACTORS,
+                "all four handlers must enter before any gate is released"
+            );
+            assert_eq!(
+                observed.iter().map(|(id, _)| *id).collect::<HashSet<_>>(),
+                (0..ACTORS).collect()
+            );
+            assert_eq!(
+                observed
+                    .iter()
+                    .map(|(_, thread)| *thread)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                ACTORS,
+                "simultaneous handlers must occupy distinct OS threads"
+            );
 
-        for r in results {
-            assert!(r.is_ok());
+            let t0 = Instant::now();
+            let results = futures::future::join_all(refs.iter().map(|r| r.ask(Burn(work)))).await;
+            let parallel = t0.elapsed();
+            for reply in results {
+                assert_eq!(reply.unwrap(), expected_sum(work));
+            }
+            let one = sys
+                .spawn_typed::<Burner, Burn>(
+                    Burner {
+                        id: ACTORS + 1,
+                        dropped: dropped.clone(),
+                    },
+                    "/m4a/burn-serial",
+                )
+                .await
+                .unwrap();
+            let serial_work = work
+                .checked_mul(ACTORS as u64)
+                .expect("serial workload fits u64");
+            let t1 = Instant::now();
+            let serial_reply = one.ask(Burn(serial_work)).await.unwrap();
+            let serial = t1.elapsed();
+            assert_eq!(serial_reply, expected_sum(serial_work));
+            let (ratio, slack) = if std::env::var("CARGO_LLVM_COV").is_ok() {
+                (6.0, 0.5)
+            } else {
+                (1.2, 0.05)
+            };
+            assert!(
+                parallel.as_secs_f64() < serial.as_secs_f64() * ratio + slack,
+                "arithmetic timing regression: parallel={parallel:?} serial={serial:?}"
+            );
+            for reference in &refs {
+                reference.stop().await.unwrap();
+            }
+            probe.stop().await.unwrap();
+            one.stop().await.unwrap();
+            assert_eq!(
+                dropped.load(Ordering::SeqCst),
+                ACTORS + 2,
+                "stop must retire every actor"
+            );
+        })
+        .catch_unwind()
+        .await;
+        let shutdown = sys.as_ref().clone().shutdown().await;
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
-
-        // 宽松断言：4 actor 并行至少应比"单线程 4×串行"有明显收益。
-        // 串行基线 = 单 actor 同样总工作量。
-        let one = sys
-            .spawn_typed::<Burner, Burn>(Burner, "/m4a/burn-serial")
-            .await
-            .unwrap();
-        let t1 = Instant::now();
-        one.ask(Burn(work * ACTORS as u64)).await.unwrap();
-        let serial = t1.elapsed();
-
-        // 并行应不慢于串行的 1.2 倍（CI 抖动容忍；理想是 ~4x 加速）。
-        // llvm-cov 例外：覆盖率插桩的共享计数器使多线程热循环产生
-        // 缓存行争用（串行标定正常、并行伪性变慢 3-12x），此时只验证
-        // 正确性不验证加速比。
-        let (ratio, slack) = if std::env::var("CARGO_LLVM_COV").is_ok() {
-            (6.0, 0.5)
-        } else {
-            (1.2, 0.05)
-        };
-        assert!(
-            parallel.as_secs_f64() < serial.as_secs_f64() * ratio + slack,
-            "static actors must run in parallel: parallel={parallel:?} serial={serial:?}"
-        );
+        shutdown.expect("parallel test system retirement");
+        assert_eq!(dropped.load(Ordering::SeqCst), ACTORS + 2);
     });
 }
 
@@ -332,5 +474,9 @@ fn m4_actix_dual_track_coexist() {
 
         // 静态轨继续工作（动态轨活动不影响静态轨）
         assert_eq!(typed_r.ask(Add(1)).await.unwrap(), 102);
+        assert_eq!(dyn_ref.ask::<DynAdd>(DynAdd(1)).await.unwrap(), 42);
+        typed_r.stop().await.unwrap();
+        dyn_ref.stop().await.unwrap();
+        sys.as_ref().clone().shutdown().await.unwrap();
     });
 }

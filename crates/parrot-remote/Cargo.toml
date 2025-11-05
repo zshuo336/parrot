@@ -7,11 +7,11 @@ license = "MIT"
 
 [dependencies]
 parrot-config = { path = "../parrot-config" }
-parrot-api = { path = "../parrot-api", features = ["remote"] }
-tokio = { version = "1", features = ["net", "time", "sync", "io-util", "rt-multi-thread", "macros", "test-util"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+parrot-api = { path = "../parrot-api", features = ["remote-protobuf"] }
+tokio = { version = "1", features = ["net", "time", "sync", "io-util", "rt-multi-thread", "macros", "test-util", "process", "signal", "parrot-deferred-mpsc"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
 bytes = { version = "1", features = ["serde"] }
-bincode = "2"
+bincode = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 inventory = "0.3"
 async-trait = "0.1"
@@ -19,15 +19,21 @@ thiserror = "2"
 tracing = "0.1"
 futures = "0.3"
 serde_json = "1"
+tempfile = "3"
+uuid = { version = "1.0", features = ["v4"] }
+sha2 = "0.10.9"
 quinn = { version = "0.11.12", features = ["rustls", "runtime-tokio"] }
-rustls = { version = "0.23.45", features = ["ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1.15.1"
-tokio-rustls = "0.26.6"
-rustls-pemfile = "2.2.0"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+x509-parser = { version = "0.18.1", default-features = false }
 prost = { version = "0.14.4", features = ["derive"] }
 rcgen = "0.14.10"
 # E7 MQTT 桥（DECISIONS_DEPENDENCIES 2026-10-04 裁定：rumqttc 锁 minor）
-rumqttc = "0.24"
+rumqttc = { path = "../../vendor/rumqttc", default-features = false, features = ["use-rustls-no-provider"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["tcp"]
@@ -56,5 +62,7 @@ name = "interop-erl"
 path = "src/bin/interop_erl.rs"
 
 [dev-dependencies]
+parrot-api-derive = { path = "../parrot-api-derive" }
 prost-build = "0.14.4"
 rcgen = "0.14.10"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

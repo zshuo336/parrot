@@ -78,7 +78,7 @@ impl ErrCode {
             Self::RouteUnreachable => ActorError::ActorNotFound(detail),
             Self::ConnectionLost => ActorError::InternalError("remote connection lost".into()),
             Self::DirectoryStale => ActorError::InternalError(format!("directory stale: {detail}")),
-            Self::Overloaded => ActorError::InternalError("remote outbound queue full".into()),
+            Self::Overloaded => ActorError::InternalError(format!("remote overloaded: {detail}")),
             Self::NoCommonCodec => ActorError::InternalError("no common codec".into()),
             Self::ProtocolViolation => {
                 ActorError::InternalError(format!("protocol violation: {detail}"))
@@ -126,15 +126,27 @@ pub fn decode_err_payload(payload: &[u8]) -> Result<(ErrCode, String), String> {
     if payload.len() < 4 {
         return Err(format!("err payload too short: {}", payload.len()));
     }
+    if payload[2] != 0 || payload[3] != 0 {
+        return Err("nonzero error payload reserved field".into());
+    }
     let code = u16::from_le_bytes([payload[0], payload[1]]);
     let code = ErrCode::from_u16(code).ok_or_else(|| format!("unknown err code {code}"))?;
-    let detail = String::from_utf8_lossy(&payload[4..]).to_string();
+    let detail = std::str::from_utf8(&payload[4..])
+        .map_err(|e| format!("invalid error detail UTF-8: {e}"))?
+        .to_owned();
     Ok((code, detail))
 }
 
 /// 远程层错误（本地侧 API 面；wire 上走 ErrCode）。
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
+    /// A valid admin-v2 failure reply; the code remains machine-readable.
+    #[error("{operation} failed: {code:#06x} {detail}")]
+    AdminRejected {
+        operation: &'static str,
+        code: u16,
+        detail: String,
+    },
     #[error("transport: {0}")]
     Transport(String),
     #[error("node not in table: {0}")]
@@ -154,6 +166,7 @@ pub enum RemoteError {
 impl RemoteError {
     pub fn to_actor_error(&self) -> ActorError {
         match self {
+            RemoteError::AdminRejected { .. } => ActorError::InternalError(self.to_string()),
             RemoteError::Transport(s) => {
                 ActorError::InternalError(format!("remote transport: {s}"))
             }

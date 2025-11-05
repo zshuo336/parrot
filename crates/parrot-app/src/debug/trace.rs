@@ -2,7 +2,8 @@
 //!
 //! 数据源：PARROT_TRACE=frame 输出的 trace_line（TX/RX 每帧一行）。
 //! 本模块：逐行解析 → 按 trace_id（TRACING 位帧 cid）聚合 →
-//! hop/path 展开为 span 树（`parrot app trace <app>` 的渲染数据面）。
+//! 按 path 分组、选择最小 hop 路径为根。当前帧不含 parent span 或连接命名空间，
+//! 此投影不能证明跨路径因果关系，也不能安全合并 cid 复用的独立会话。
 
 use std::collections::BTreeMap;
 
@@ -24,7 +25,7 @@ pub struct SpanEvent {
 pub struct SpanNode {
     pub path: String,
     pub events: Vec<SpanEvent>,
-    /// 子节点（hop+1 的相邻路径）。
+    /// 其它路径分组；当前格式不能证明它们的因果父节点。
     pub children: BTreeMap<String, SpanNode>,
 }
 
@@ -64,23 +65,30 @@ impl SpanTree {
 /// 行形态（frame.rs `trace_line`）：
 /// `frame ft=0x10 cid=1 hop=0/8 flags=0x0002 trace_id=1 path="/x" key="bin:t::M" len=1`
 pub fn parse_trace_line(line: &str) -> Option<SpanEvent> {
-    let line = line.trim();
-    if !line.starts_with("frame ") {
+    let raw = line.trim();
+    // Accept only the envelopes emitted by the transport, not an arbitrary
+    // embedded "frame" substring in unrelated application output.
+    let body = raw
+        .strip_prefix("[parrot-trace] TX ")
+        .or_else(|| raw.strip_prefix("[parrot-trace] RX "))
+        .unwrap_or(raw)
+        .strip_prefix("frame ")?;
+    let fields = trace_fields(body)?;
+    let trace_id: u64 = decimal(fields.get("trace_id")?)?;
+    let cid: u64 = decimal(fields.get("cid")?)?;
+    let flags = u16::from_str_radix(hexadecimal(fields.get("flags")?, 4)?, 16).ok()?;
+    if flags & parrot_remote::frame::flags::TRACING == 0 || trace_id != cid {
         return None;
     }
-    let mut fields = BTreeMap::new();
-    for kv in line.split_whitespace().skip(1) {
-        if let Some((k, v)) = kv.split_once('=') {
-            fields.insert(k, v);
-        }
-    }
-    // 仅 TRACING 帧（有 trace_id 字段）参与聚合
-    let trace_id: u64 = fields.get("trace_id")?.parse().ok()?;
-    let frame_type = u8::from_str_radix(fields.get("ft")?.trim_start_matches("0x"), 16).ok()?;
-    let hop_count = fields.get("hop")?.split('/').next()?.parse().ok()?;
-    let path = fields.get("path")?.trim_matches('"').to_string();
-    let type_key = fields.get("key")?.trim_matches('"').to_string();
-    let len: usize = fields.get("len")?.parse().ok()?;
+    let frame_type = u8::from_str_radix(hexadecimal(fields.get("ft")?, 2)?, 16).ok()?;
+    let (count, limit) = fields.get("hop")?.split_once('/')?;
+    let hop_count = decimal(count)?;
+    let _: u8 = decimal(limit)?;
+    // This is a diagnostic parser, not wire admission: even an exhausted hop
+    // limit can be useful in a log. Both numbers must still be well formed.
+    let path = debug_string(fields.get("path")?)?;
+    let type_key = debug_string(fields.get("key")?)?;
+    let len = decimal(fields.get("len")?)?;
     Some(SpanEvent {
         trace_id,
         frame_type,
@@ -88,47 +96,149 @@ pub fn parse_trace_line(line: &str) -> Option<SpanEvent> {
         path,
         type_key,
         len,
-        raw: line.to_string(),
+        raw: raw.to_string(),
     })
 }
 
-/// 多行聚合 → trace_id → SpanTree（根节点 path = 最小 hop 首帧路径）。
-pub fn aggregate(lines: impl Iterator<Item = String>) -> BTreeMap<u64, SpanTree> {
-    let mut trees: BTreeMap<u64, SpanTree> = BTreeMap::new();
-    for line in lines {
-        if let Some(e) = parse_trace_line(&line) {
-            let tree = trees.entry(e.trace_id).or_insert_with(|| SpanTree {
-                trace_id: e.trace_id,
-                root: SpanNode::default(),
-            });
-            // 根 path 空时以首事件 path 立
-            if tree.root.path.is_empty() {
-                tree.root.path = e.path.clone();
+fn decimal<T: std::str::FromStr>(value: &str) -> Option<T> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn hexadecimal(value: &str, max_digits: usize) -> Option<&str> {
+    let value = value.strip_prefix("0x")?;
+    (!value.is_empty() && value.len() <= max_digits && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(value)
+}
+
+/// Split fields without interpreting whitespace or '=' inside Debug strings.
+/// Reject duplicates instead of silently replacing correlation metadata.
+fn trace_fields(mut input: &str) -> Option<BTreeMap<&str, &str>> {
+    let mut fields = BTreeMap::new();
+    while !input.is_empty() {
+        let (key, rest) = input.split_once('=')?;
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        let end = if rest.starts_with('"') {
+            let mut escaped = false;
+            let mut closing = None;
+            for (i, ch) in rest.char_indices().skip(1) {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    closing = Some(i + 1);
+                    break;
+                }
             }
-            insert_event(&mut tree.root, e);
+            closing?
+        } else {
+            rest.find(char::is_whitespace).unwrap_or(rest.len())
+        };
+        let (value, tail) = rest.split_at(end);
+        if value.is_empty()
+            || (!tail.is_empty() && !tail.starts_with(char::is_whitespace))
+            || fields.insert(key, value).is_some()
+        {
+            return None;
+        }
+        input = tail.trim_start();
+    }
+    Some(fields)
+}
+
+/// Rust Debug string syntax differs from JSON (notably \0 and \u{...}).
+fn debug_string(value: &str) -> Option<String> {
+    let value = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut chars = value.chars();
+    let mut decoded = String::with_capacity(value.len());
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => decoded.push(match chars.next()? {
+                '\\' => '\\',
+                '"' => '"',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '0' => '\0',
+                'u' => {
+                    if chars.next()? != '{' {
+                        return None;
+                    }
+                    let mut scalar = 0;
+                    let mut digits = 0;
+                    loop {
+                        let ch = chars.next()?;
+                        if ch == '}' {
+                            break;
+                        }
+                        if !ch.is_ascii_hexdigit() || digits == 6 {
+                            return None;
+                        }
+                        scalar = scalar * 16 + ch.to_digit(16)?;
+                        digits += 1;
+                    }
+                    if digits == 0 {
+                        return None;
+                    }
+                    char::from_u32(scalar)?
+                }
+                _ => return None,
+            }),
+            '"' => return None,
+            ch if ch.is_control() => return None,
+            ch => decoded.push(ch),
         }
     }
-    trees
+    Some(decoded)
 }
 
-fn insert_event(root: &mut SpanNode, e: SpanEvent) {
-    // 首帧（最小 hop）挂根；hop+1 挂相邻子——简化：按 hop 分层，
-    // 同 hop 并列根 children（path 键）
-    if e.path == root.path {
-        root.events.push(e);
-        return;
+/// Group by trace_id and path, selecting the lowest-hop path as the root.
+/// Equal-hop ties use path order, so log arrival order cannot change the root.
+/// Children are path groups, not inferred parent/child spans: the current
+/// frame format contains no parent span identifier or connection namespace.
+/// Keep each observation (including TX/RX) in arrival order within its path.
+/// Callers must supply a correlation scope where cids are not reused.
+pub fn aggregate(lines: impl Iterator<Item = String>) -> BTreeMap<u64, SpanTree> {
+    let mut groups: BTreeMap<u64, BTreeMap<String, SpanNode>> = BTreeMap::new();
+    for line in lines {
+        if let Some(event) = parse_trace_line(&line) {
+            groups
+                .entry(event.trace_id)
+                .or_default()
+                .entry(event.path.clone())
+                .or_insert_with(|| SpanNode {
+                    path: event.path.clone(),
+                    ..Default::default()
+                })
+                .events
+                .push(event);
+        }
     }
-    let child = root
-        .children
-        .entry(e.path.clone())
-        .or_insert_with(|| SpanNode {
-            path: e.path.clone(),
-            ..Default::default()
-        });
-    child.events.push(e);
+    groups
+        .into_iter()
+        .map(|(trace_id, mut paths)| {
+            // Every group has at least one event; include path in the key to
+            // make ties independent of input order, including the empty path.
+            let root_path = paths
+                .values()
+                .flat_map(|node| &node.events)
+                .min_by_key(|event| (event.hop_count, &event.path))
+                .expect("nonempty trace group")
+                .path
+                .clone();
+            let mut root = paths.remove(&root_path).expect("root path exists");
+            root.children = paths;
+            (trace_id, SpanTree { trace_id, root })
+        })
+        .collect()
 }
 
-/// `parrot app trace <app>` 渲染（人类可读树——CLI 数据面）。
+/// 人类可读路径投影；路径用 Debug 转义，防止控制字符改变终端输出。
 pub fn render_tree(tree: &SpanTree) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -142,7 +252,11 @@ pub fn render_tree(tree: &SpanTree) -> String {
 
 fn render_node(n: &SpanNode, out: &mut String, depth: usize) {
     let pad = "  ".repeat(depth);
-    out.push_str(&format!("{pad}{} ×{} frames\n", n.path, n.event_count()));
+    out.push_str(&format!(
+        "{pad}{} ×{} frames\n",
+        n.path.escape_debug(),
+        n.event_count()
+    ));
     for c in n.children.values() {
         render_node(c, out, depth + 1);
     }

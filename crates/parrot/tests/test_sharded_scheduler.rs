@@ -1,11 +1,11 @@
-//! Sharded（亲和性）调度器专项基准 + 新优势域验证（ADR-14）。
-//!
-//! S1 亲和性 ask 吞吐：Sharded vs SharedPool 同 actor 数同消息量
-//! S2 亲和域缓存局部性：同 key 消息序列（模拟会话粘滞）
-//! S3 分片隔离：单分片过载不影响其他分片延迟
-//! S4 分配开销验证：ask 一次分配（ADR-13）后 seq-ask 提升复验
+//! Instrumented sharded scheduling experiments.
+//! S1 compares one fixed-order ask workload; it is not a general speedup proof.
+//! S2 observes actual owner threads, CPU results and overlapping probe progress.
+//! S4 measures current sequential asks; it does not count allocations.
+//! Timing values are descriptive and depend on the host and workload.
 
 mod engine_stress_common;
+mod sharded_isolation;
 
 use engine_stress_common::*;
 use parrot::system::ParrotActorSystem;
@@ -17,7 +17,7 @@ use parrot_api::message::Message;
 use parrot_api::system::ActorSystemConfig;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // 复用压测 BenchActor 形态（本地重定义，逻辑对等）
 struct BenchActor {
@@ -57,7 +57,6 @@ fn dispatch(a: &mut BenchActor, m: BoxedMessage) -> ActorResult<BoxedMessage> {
     }
 }
 
-use parrot_api::address::ActorRef as ActorRefTrait;
 use parrot_api::errors::ActorError;
 
 impl Message for Echo {
@@ -132,7 +131,7 @@ fn s1_sharded_vs_shared_ask_throughput() {
             );
         }
         // warmup
-        for r in &shard_refs { for _ in 0..200 { ask_echo(r, 1).await; } }
+        for r in &shard_refs { for _ in 0..200 { assert_eq!(ask_echo(r, 1).await, 1); } }
         let t0 = Instant::now();
         let mut hs = Vec::new();
         for (i, r) in shard_refs.into_iter().enumerate() {
@@ -143,7 +142,7 @@ fn s1_sharded_vs_shared_ask_throughput() {
                 }
             }));
         }
-        for h in hs { h.await.unwrap(); }
+        for result in futures::future::join_all(hs).await { result.unwrap(); }
         let shard_wall = t0.elapsed();
 
         // --- SharedPool ---
@@ -154,7 +153,7 @@ fn s1_sharded_vs_shared_ask_throughput() {
                     &format!("/s1/pool/{}", i), None, ThreadActorConfig::default()).await.unwrap()
             );
         }
-        for r in &pool_refs { for _ in 0..200 { ask_echo(r, 1).await; } }
+        for r in &pool_refs { for _ in 0..200 { assert_eq!(ask_echo(r, 1).await, 1); } }
         let t1 = Instant::now();
         let mut hs = Vec::new();
         for (i, r) in pool_refs.into_iter().enumerate() {
@@ -165,7 +164,7 @@ fn s1_sharded_vs_shared_ask_throughput() {
                 }
             }));
         }
-        for h in hs { h.await.unwrap(); }
+        for result in futures::future::join_all(hs).await { result.unwrap(); }
         let pool_wall = t1.elapsed();
 
         let total = (N_ACTORS as u64) * PER;
@@ -175,72 +174,20 @@ fn s1_sharded_vs_shared_ask_throughput() {
             pool_wall.as_secs_f64(), total as f64 / pool_wall.as_secs_f64() / 1000.0,
             pool_wall.as_secs_f64() / shard_wall.as_secs_f64(),
         );
-        let _ = ts.shutdown_internal().await;
+        ts.shutdown_internal().await.unwrap();
     });
 }
 
-// ---------------------------------------------------------------------------
-// S2: 分片隔离 —— 一个分片跑重 CPU，其他分片 ask 延迟不受影响
-// ---------------------------------------------------------------------------
-
+// S2 keeps the original four long CPU tasks but verifies actual shard owners,
+// completed results and probe progress inside each measured handler interval.
 #[test]
-#[ignore]
+#[ignore = "four calibrated long CPU tasks; descriptive latency, not a hard isolation SLA"]
 fn s2_shard_isolation_under_overload() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async move {
-        let (_p, ts) = setup().await;
-
-        // victim 分片：domain-heavy 上跑 4 个持续重 CPU actor
-        let mut heavy = Vec::new();
-        for i in 0..4 {
-            heavy.push(
-                ts.spawn_at::<BenchActor>(BenchActor { ops: Arc::new(std::sync::atomic::AtomicU64::new(0)) },
-                    &format!("/s2/heavy/{}", i), None, cfg_sharded("domain-heavy")).await.unwrap()
-            );
-        }
-        // probe 分片：domain-probe 上的轻量 echo
-        let probe = ts.spawn_at::<BenchActor>(BenchActor { ops: Arc::new(std::sync::atomic::AtomicU64::new(0)) },
-            "/s2/probe", None, cfg_sharded("domain-probe")).await.unwrap();
-
-        // 启动重载（fire-and-forget 长任务 × 4，同分片彻底打满）
-        let mut hh = Vec::new();
-        for (i, r) in heavy.into_iter().enumerate() {
-            let rb = r.clone_boxed();
-            hh.push(tokio::spawn(async move {
-                let _ = rb.send_with_timeout(
-                    Box::new(CpuTask { iterations: calibrated_iters(8.0), salt: i as u64 }),
-                    Some(Duration::from_secs(120))).await;
-            }));
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // 探针：100 次 echo ask
-        let mut max_lat = Duration::ZERO;
-        let mut lats = Vec::new();
-        for i in 0..100u64 {
-            let t = Instant::now();
-            let v = ask_echo(&probe, i).await;
-            assert_eq!(v, i);
-            let e = t.elapsed();
-            lats.push(e.as_micros() as u64);
-            if e > max_lat { max_lat = e; }
-        }
-        let st = latency_stats(lats.iter().map(|&x| x as u128).collect());
-        println!(
-            "[S2] probe on separate shard while 4×~9s CPU saturate another: p50={:.0}µs p99={:.0}µs max={:.0}µs",
-            st.p50_us, st.p99_us, st.max_us
-        );
-        assert!(max_lat < Duration::from_millis(50), "probe shard must be isolated, max={:?}", max_lat);
-        let _ = ts.shutdown_internal().await;
-    });
+    sharded_isolation::run(8.0);
 }
 
 // ---------------------------------------------------------------------------
-// S4: ask 分配优化复验（ADR-13 后 seq-ask 吞吐对比历史值）
+// S4: current sequential ask latency and throughput (not an allocation count)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -253,9 +200,20 @@ fn s4_alloc_optimized_seq_ask() {
         .unwrap();
     rt.block_on(async move {
         let (_p, ts) = setup().await;
-        let a = ts.spawn_at::<BenchActor>(BenchActor { ops: Arc::new(std::sync::atomic::AtomicU64::new(0)) },
-            "/s4/echo", None, ThreadActorConfig::default()).await.unwrap();
-        for _ in 0..2000 { ask_echo(&a, 1).await; } // warmup
+        let a = ts
+            .spawn_at::<BenchActor>(
+                BenchActor {
+                    ops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                },
+                "/s4/echo",
+                None,
+                ThreadActorConfig::default(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2000 {
+            assert_eq!(ask_echo(&a, 1).await, 1);
+        } // warmup
         let mut lats = Vec::new();
         let t0 = Instant::now();
         for i in 0..10_000u64 {
@@ -267,9 +225,12 @@ fn s4_alloc_optimized_seq_ask() {
         let wall = t0.elapsed();
         let st = latency_stats(lats);
         println!(
-            "[S4] seq-ask-10k after ADR-13: {:.3}s = {:.0}k/s (p50={:.0}µs p99={:.0}µs) | baseline seq-ask-1k was ~76-85k/s",
-            wall.as_secs_f64(), 10_000.0 / wall.as_secs_f64() / 1000.0, st.p50_us, st.p99_us
+            "[S4] seq-ask-10k: {:.3}s = {:.0}k/s (p50={:.0}µs p99={:.0}µs)",
+            wall.as_secs_f64(),
+            10_000.0 / wall.as_secs_f64() / 1000.0,
+            st.p50_us,
+            st.p99_us
         );
-        let _ = ts.shutdown_internal().await;
+        ts.shutdown_internal().await.unwrap();
     });
 }

@@ -24,29 +24,22 @@ object ParrotGatewayMain {
     case _                => Behaviors.same
   }
 
-  /** cpu：payload 为 bincode varint u64（standard 配置 LEB128 无 zigzag），回 +1 同编码。 */
+  /** CPU probe: bincode standard u64 -> checked +1; invalid inputs are CodecError. */
   def cpuAny: Behavior[Any] = Behaviors.receiveMessage {
-    case BridgeAsk(_, payload, replyTo) =>
-      // LEB128 解码
-      var n    = 0L
-      var i    = 0
-      var p    = 0
-      var cont = true
-      while (cont && p < payload.length && i < 10) {
-        val b = payload(p).toLong & 0xFF
-        n |= (b & 0x7F) << (7 * i)
-        i += 1; p += 1
-        if ((b & 0x80) == 0) cont = false
+    case BridgeAsk("bin:parrot.interop.Cpu#v1", payload, replyTo) =>
+      try {
+        val value = BincodeU64.decode(payload)
+        replyTo ! BridgeReplyOk("bin:parrot.interop.CpuResult#v1", BincodeU64.encode(value + 1))
+      } catch {
+        case _: IllegalArgumentException =>
+          replyTo ! BridgeReplyErr(WireFrame.ErrCode.CodecError, "invalid or overflowing bincode u64")
       }
-      // LEB128 编码 n+1
-      var m   = n + 1
-      val buf = new scala.collection.mutable.ArrayBuffer[Byte](10)
-      while (m >= 0x80) { buf += ((m & 0x7F) | 0x80).toByte; m >>>= 7 }
-      buf += m.toByte
-      replyTo ! BridgeReplyOk("bin:parrot.interop.CpuResult#v1", buf.toArray)
+      Behaviors.same
+    case BridgeAsk(_, _, replyTo) =>
+      replyTo ! BridgeReplyErr(WireFrame.ErrCode.UnknownTypeKey, "CPU probe requires bin:parrot.interop.Cpu#v1")
       Behaviors.same
     case BridgeTell(_, _) => Behaviors.same
-    case _                => Behaviors.same
+    case _ => Behaviors.same
   }
 
   def main(args: Array[String]): Unit = {
@@ -67,30 +60,34 @@ object ParrotGatewayMain {
 
     val guardian = Behaviors.setup[BridgeMsg] { ctx =>
       // echo/cpu 直接 spawn 在 guardian 下（/user/echo、/user/cpu）
-      val echo = ctx.spawn(echoAny, "echo")
-      val cpu  = ctx.spawn(cpuAny, "cpu")
+      val echo = ctx.spawn(CausalTrace.behavior(echoAny, ctx.system, "/user/echo"), "echo")
+      val cpu  = ctx.spawn(CausalTrace.behavior(cpuAny, ctx.system, "/user/cpu"), "cpu")
       // resolve：R4——已部署组件（ComponentRoutes）优先，内置探针兜底。
       // 业务代码已迁 apps/*/jvm（ComponentSpi）；网关只剩协议骨架 + 探针。
       val targets = Map("echo" -> echo.unsafeUpcast[Any], "cpu" -> cpu.unsafeUpcast[Any])
+      val routes = AdminV2Executor.ComponentRoutes(ctx.system)
       val bridge = ctx.spawn(
         BridgeActor(path =>
-          AdminV2Executor.ComponentRoutes.get(path).orElse(targets.get(path))
+          routes.get(path).orElse(targets.get(path)),
+          path => routes.resolveChild(path)(ctx.executionContext)
         ),
         "bridge"
       )
       // B5（DEV_09）：admin-v2 AdminPort（deploy/drain/stop/status）
       val admin = ctx.spawn(AdminPort(ctx.system), "admin-port")
-      val ext = new ParrotTransportExtension(ctx.system, bridge, nodeId, Some(admin))
-      ParrotServerHandler.initSystem(ctx.system)
+      val ext = new ParrotTransportExtension(ctx.system, bridge, nodeId, Some(admin), traceContext = true)
+      akka.actor.CoordinatedShutdown(ctx.system).addTask(
+        akka.actor.CoordinatedShutdown.PhaseServiceUnbind, "parrot-netty-retirement") { () =>
+        import scala.jdk.FutureConverters._
+        ext.shutdown().asScala.map(_ => akka.Done)(ctx.executionContext)
+      }
       parrotReg match {
         case Some(target) =>
-          // 注册模式：注册到 parrot 后驻留（registerTo 内部 sync 等待连接关闭）
+          // Registration starts an owned reconnect chain and returns; ActorSystem stays alive.
           val Array(host, p) = target.split(":")
           System.out.println(s"PARROT_JVM_REGISTERING=$target")
           System.out.flush()
-          ctx.executionContext.execute(() =>
-            ext.registerTo(host, p.toInt)
-          )
+          ext.registerTo(host, p.toInt)
         case None =>
           ext.listen(port)
           System.out.println(s"PARROT_JVM_PORT=${ext.port}")

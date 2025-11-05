@@ -41,6 +41,9 @@ use parrot_remote::{LocalLookup, NodeAddr};
 /// （同 TypeId 多键会在注册表互串）。
 macro_rules! wire_msg {
     ($t:ident, $key:literal) => {
+        wire_msg!($t, $key, |_bytes: &[u8]| Ok::<(), String>(()));
+    };
+    ($t:ident, $key:literal, $validate:expr) => {
         #[derive(Debug, Clone, PartialEq)]
         pub struct $t(pub Vec<u8>);
 
@@ -53,6 +56,7 @@ macro_rules! wire_msg {
                     Ok(m.0.clone())
                 },
                 decode: |b: &[u8]| {
+                    ($validate)(b).map_err(|error| error.to_string())?;
                     Ok(Box::new($t(b.to_vec())) as BoxedMessage)
                 },
             }
@@ -60,122 +64,68 @@ macro_rules! wire_msg {
     };
 }
 
+mod application;
+mod cli;
+mod hub;
+use crawler_lab_core::{tokenize, url_of};
+mod protocol;
+
+// Batch replies are decoded before entering business code, so a malformed
+// suffix cannot turn into a successful prefix or an empty queue indication.
+macro_rules! wire_list_msg {
+    ($t:ident, $key:literal, $entry:ty, $decode:path, $encode:path) => {
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct $t(pub Vec<$entry>);
+        parrot_api::message::inventory::submit! {
+            parrot_api::message::CodecRegistration {
+                type_key: $key,
+                type_id: std::any::TypeId::of::<$t>(),
+                encode: |msg: &BoxedMessage| {
+                    let message = msg.downcast_ref::<$t>().ok_or("wrong reply type")?;
+                    Ok($encode(&message.0))
+                },
+                decode: |bytes: &[u8]| Ok(Box::new($t($decode(bytes).map_err(|e| e.to_string())?)) as BoxedMessage),
+            }
+        }
+    };
+}
+
+fn expect_reply<T: Send + 'static>(reply: BoxedMessage) -> Result<T, String> {
+    reply.downcast::<T>().map(|value| *value).map_err(|_| {
+        format!(
+            "unexpected gateway reply; expected {}",
+            std::any::type_name::<T>()
+        )
+    })
+}
+
 wire_msg!(FrontierPush, "bin:crawl/FrontierPush");
 wire_msg!(FrontierNext, "bin:crawl/FrontierNext");
-wire_msg!(FrontierBatch, "bin:crawl/FrontierBatch");
-wire_msg!(FrontierAck, "bin:crawl/FrontierAck");
+wire_list_msg!(
+    FrontierBatch,
+    "bin:crawl/FrontierBatch",
+    protocol::FrontierEntry,
+    protocol::decode_batch,
+    enc_push
+);
+wire_msg!(FrontierAck, "bin:crawl/FrontierAck", protocol::decode_ack);
 wire_msg!(IndexPage, "bin:crawl/IndexPage");
-wire_msg!(IndexAck, "bin:crawl/IndexAck");
+wire_msg!(IndexAck, "bin:crawl/IndexAck", protocol::decode_index_ack);
 wire_msg!(IndexStatsQuery, "bin:crawl/IndexStats");
-wire_msg!(IndexStatsR, "bin:crawl/IndexStatsR");
+wire_msg!(IndexStatsR, "bin:crawl/IndexStatsR", protocol::decode_stats);
 wire_msg!(IndexTerms, "bin:crawl/IndexTerms");
 wire_msg!(SearchQuery, "bin:crawl/Search");
-wire_msg!(SearchResult, "bin:crawl/SearchResult");
+wire_msg!(
+    SearchResult,
+    "bin:crawl/SearchResult",
+    protocol::decode_search
+);
 wire_msg!(Healthz, "bin:crawl/Healthz");
-wire_msg!(HealthzR, "bin:crawl/HealthzR");
+wire_msg!(HealthzR, "bin:crawl/HealthzR", protocol::decode_health);
 
 // ══════════════════════════════════════════════════════════════════════════
 // 确定性站点模拟
 // ══════════════════════════════════════════════════════════════════════════
-
-/// xorshift64* —— 确定性伪随机（同 seed 同站点）
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545F4914F6CDD1D)
-    }
-}
-
-const VOCAB: &[&str] = &[
-    "parrot",
-    "actor",
-    "cluster",
-    "federate",
-    "wire",
-    "gateway",
-    "swim",
-    "gossip",
-    "raft",
-    "shard",
-    "mailbox",
-    "supervise",
-    "router",
-    "receptionist",
-    "durable",
-    "backpressure",
-    "quic",
-    "mtls",
-    "relay",
-    "border",
-    "digest",
-    "twin",
-    "topology",
-    "latency",
-    "throughput",
-    "crawler",
-    "index",
-    "search",
-    "frontier",
-    "tokenize",
-    "posting",
-    "inverted",
-    "query",
-];
-
-/// 页面 id → URL（确定性：doc-{id}）
-fn url_of(id: u64) -> String {
-    format!("https://site.example/doc-{id}")
-}
-
-/// 页面 id → 合成 HTML（词表确定性采样——文档间词分布有差异，可检索）
-fn synth_page(id: u64) -> Vec<u8> {
-    let mut rng = Rng(id.wrapping_mul(0x9E3779B97F4A7C15) | 1);
-    let n_words = 40 + (rng.next() % 60) as usize;
-    let title = VOCAB[(id as usize) % VOCAB.len()];
-    let mut body = String::new();
-    body.push_str(&format!(
-        "<html><head><title>{title} page</title></head><body>"
-    ));
-    for _ in 0..n_words {
-        let w = VOCAB[(rng.next() as usize) % VOCAB.len()];
-        body.push_str(w);
-        body.push(' ');
-    }
-    body.push_str("</body></html>");
-    body.into_bytes()
-}
-
-/// 页面外链（fanout 条，id 空间内确定性跳转）
-fn outlinks(id: u64, fanout: u64, max_id: u64) -> Vec<u64> {
-    let mut rng = Rng(id.wrapping_mul(0xBF58476D1CE4E5B9) | 1);
-    (0..fanout)
-        .map(|_| rng.next() % max_id)
-        .filter(|&t| t != id)
-        .collect()
-}
-
-/// 分词（与 Ray 侧 _tokenize 同语义——Rust 侧用于本地对账）
-fn tokenize(html: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(html).to_lowercase();
-    let clean: String = text
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
-        .collect();
-    const STOP: &[&str] = &[
-        "the", "a", "an", "of", "to", "in", "and", "or", "for", "on", "with", "at", "by", "is",
-        "it", "as", "be", "html", "head", "title", "page", "body",
-    ];
-    clean
-        .split_whitespace()
-        .filter(|t| t.len() > 1 && !STOP.contains(t))
-        .map(String::from)
-        .collect()
-}
 
 // ══════════════════════════════════════════════════════════════════════════
 // LE 编解码（网关方言）
@@ -192,33 +142,6 @@ fn enc_push(entries: &[(u64, String, u16)]) -> Vec<u8> {
         b.extend_from_slice(&depth.to_le_bytes());
     }
     b
-}
-
-/// next 批次回复：[n u32][{id u64|len u32|url|depth u16}...]
-fn dec_batch(b: &[u8]) -> Vec<(u64, String, u16)> {
-    let mut out = Vec::new();
-    if b.len() < 4 {
-        return out;
-    }
-    let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
-    let mut off = 4;
-    for _ in 0..n {
-        if off + 14 > b.len() {
-            break;
-        }
-        let id = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
-        let ln = u32::from_le_bytes(b[off + 8..off + 12].try_into().unwrap()) as usize;
-        off += 12;
-        if off + ln + 2 > b.len() {
-            break;
-        }
-        let url = String::from_utf8_lossy(&b[off..off + ln]).into_owned();
-        off += ln;
-        let depth = u16::from_le_bytes(b[off..off + 2].try_into().unwrap());
-        off += 2;
-        out.push((id, url, depth));
-    }
-    out
 }
 
 /// IndexPage 批次：[n u32][{doc u64|len u32|html}...]
@@ -272,81 +195,71 @@ impl LocalLookup for NoopLookup {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut targets = Vec::new();
-    let (mut pages, mut depth, mut fanout, mut batch) = (500u64, 2u16, 3u64, 32usize);
-    // 双模式组网：
-    //   A direct   —— 显式 erl=/ray=/jvm= 网关地址（测试形态：点对点指定）
-    //   B registry —— 应用只给 --bind 监听，网关主动拨号注册（生产形态：
-    //                 应用零网关地址知识；等待 erl-gw-1/ray-gw-1/jvm-search-1
-    //                 三节点入表后自动开始）
-    let mut bind_addr: Option<std::net::SocketAddr> = None;
-    let mut wait_secs: u64 = 60;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--pages" => {
-                pages = args[i + 1].parse().unwrap();
-                i += 2
-            }
-            "--depth" => {
-                depth = args[i + 1].parse().unwrap();
-                i += 2
-            }
-            "--fanout" => {
-                fanout = args[i + 1].parse().unwrap();
-                i += 2
-            }
-            "--batch" => {
-                batch = args[i + 1].parse().unwrap();
-                i += 2
-            }
-            "--bind" => {
-                bind_addr = Some(args[i + 1].parse().unwrap());
-                i += 2
-            }
-            "--wait" => {
-                wait_secs = args[i + 1].parse().unwrap();
-                i += 2
-            }
-            _ => {
-                if let Some((id, addr)) = args[i].split_once('=') {
-                    let sa = addr.parse().unwrap_or_else(|_| {
-                        use std::net::ToSocketAddrs;
-                        addr.to_socket_addrs()
-                            .ok()
-                            .and_then(|mut it| it.next())
-                            .unwrap_or_else(|| panic!("无法解析目标: {addr}"))
-                    });
-                    targets.push(NodeAddr::tcp(id, sa));
-                }
-                i += 1
-            }
+    let options = match cli::parse(&args) {
+        Ok(Some(options)) => options,
+        Ok(None) => {
+            print!("{}", cli::USAGE);
+            return;
         }
-    }
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
+        Err(error) => {
+            eprintln!("crawler-lab: {error}\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
-        .unwrap();
-    let code = rt.block_on(async {
-        match bind_addr {
-            // 模式 B：registry（网关主动注册）
-            Some(bind) => run_registry(bind, wait_secs, pages, depth, fanout, batch).await,
-            // 模式 A：direct（显式网关地址）
-            None => {
-                let pick = |id: &str| {
-                    targets
-                        .iter()
-                        .find(|t| t.node_id == id)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            panic!("direct 模式需 {id}=host:port（或用 --bind 走 registry 模式）")
-                        })
-                };
-                let (erl, ray, jvm) = (pick("erl"), pick("ray"), pick("jvm"));
-                run_direct(&erl, &ray, &jvm, pages, depth, fanout, batch).await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("crawler-lab: runtime startup: {error}");
+            std::process::exit(1);
+        }
+    };
+    let cli::Options {
+        mode,
+        pages,
+        depth,
+        fanout,
+        batch,
+        hub,
+        workload_overrides,
+    } = options;
+    let workload = crawler_lab_core::Config {
+        pages,
+        depth,
+        fanout,
+        batch,
+    };
+    let bind = match &mode {
+        cli::Mode::Registry { bind, .. } => Some(*bind),
+        _ => None,
+    };
+    let config = RemoteConfig::tcp("crawler-lab", bind).with_insecure_development();
+    let code = runtime.block_on(async {
+        match mode {
+            cli::Mode::Manifest {
+                path,
+                bind,
+                query,
+                wait_secs,
+            } => {
+                application::run(
+                    &path,
+                    bind,
+                    query,
+                    wait_secs,
+                    workload,
+                    workload_overrides,
+                    hub,
+                )
+                .await
             }
+            cli::Mode::Registry { wait_secs, .. } => {
+                run_registry(config, wait_secs, workload, hub).await
+            }
+            cli::Mode::Direct(targets) => run_direct(config, targets, workload, hub).await,
         }
     });
     std::process::exit(code);
@@ -385,31 +298,86 @@ impl Metrics {
     }
 }
 
+async fn start_client(config: RemoteConfig) -> Result<Arc<RemoteActorSystem>, String> {
+    let client = RemoteActorSystem::new(config, Arc::new(NoopLookup))
+        .map_err(|error| format!("remote configuration: {error}"))?;
+    if let Err(error) = client.start().await {
+        let _ = client.shutdown().await;
+        return Err(format!("remote startup: {error}"));
+    }
+    Ok(client)
+}
+
 /// 模式 A：direct——应用主动连三网关（显式地址；测试形态）。
 async fn run_direct(
-    erl: &NodeAddr,
-    ray: &NodeAddr,
-    jvm: &NodeAddr,
-    pages: u64,
-    depth: u16,
-    fanout: u64,
-    batch: usize,
+    config: RemoteConfig,
+    targets: [cli::Endpoint; 3],
+    workload: crawler_lab_core::Config,
+    hub: cli::Hub,
 ) -> i32 {
-    let client =
-        RemoteActorSystem::new(RemoteConfig::tcp("crawler-lab", None), Arc::new(NoopLookup))
-            .unwrap();
-    client.start().await.unwrap();
-    for t in [erl, ray, jvm] {
-        match client.connect(t).await {
-            Ok(_) => println!("[lab] connected: {}", t.node_id),
-            Err(e) => {
-                eprintln!("[lab] connect {} FAILED: {e}", t.node_id);
+    let client = match start_client(config).await {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("crawler-lab: {error}");
+            return 1;
+        }
+    };
+    for (identity, target) in ["erl-gw-1", "ray-gw-1", "jvm-search-1"]
+        .into_iter()
+        .zip(targets)
+    {
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::lookup_host((target.host.as_str(), target.port)),
+        )
+        .await;
+        let addresses = match resolved {
+            Ok(Ok(addresses)) => {
+                let mut seen = std::collections::HashSet::new();
+                Ok(addresses
+                    .filter(|address| seen.insert(*address))
+                    .collect::<Vec<_>>())
+            }
+            Ok(Err(error)) => Err(format!("resolve {}:{}: {error}", target.host, target.port)),
+            Err(error) => Err(format!(
+                "resolve {}:{} deadline: {error}",
+                target.host, target.port
+            )),
+        };
+        let addresses = match addresses {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                eprintln!("crawler-lab: {error}");
+                let _ = client.shutdown().await;
                 return 1;
             }
+        };
+        let mut connected = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        for address in addresses {
+            let node = NodeAddr::tcp(identity, address);
+            match tokio::time::timeout_at(deadline, client.connect(&node)).await {
+                Ok(Ok(_)) => {
+                    println!("[lab] connected: {identity}");
+                    connected = true;
+                    break;
+                }
+                Ok(Err(error)) => {
+                    eprintln!("crawler-lab: connect {identity} at {address}: {error}")
+                }
+                Err(error) => {
+                    eprintln!("crawler-lab: connect {identity} deadline: {error}");
+                    break;
+                }
+            }
+        }
+        if !connected {
+            let _ = client.shutdown().await;
+            return 1;
         }
     }
     println!("[lab] 组网模式：direct（应用主动拨号网关）");
-    run_scenario(&client, pages, depth, fanout, batch).await
+    run_scenario(&client, workload, hub).await
 }
 
 /// 模式 B：registry——应用只监听，网关主动拨号注册（生产形态）。
@@ -418,66 +386,101 @@ async fn run_direct(
 /// 指向应用地址主动 connect；框架 accept 侧同样把对端 node_id/sender 写入
 /// NodeTable + links——应用等三网关就绪后开始（零网关地址知识）。
 async fn run_registry(
-    bind: std::net::SocketAddr,
+    config: RemoteConfig,
     wait_secs: u64,
-    pages: u64,
-    depth: u16,
-    fanout: u64,
-    batch: usize,
+    workload: crawler_lab_core::Config,
+    hub: cli::Hub,
 ) -> i32 {
-    let client = RemoteActorSystem::new(
-        RemoteConfig::tcp("crawler-lab", Some(bind)),
-        Arc::new(NoopLookup),
-    )
-    .unwrap();
-    client.start().await.unwrap();
-    let local = client.local_addr().expect("bound");
-    println!("[lab] 组网模式：registry（应用监听 {local}，等待网关注册…）");
-
-    // 等待三个网关 node 入表（NodeTable require 可查 = 链路可用）
-    let need = ["erl-gw-1", "ray-gw-1", "jvm-search-1"];
-    let deadline = Instant::now() + std::time::Duration::from_secs(wait_secs);
-    loop {
-        let ready = need
-            .iter()
-            .filter(|n| client.nodes.get(n).is_some())
-            .count();
-        if ready == need.len() {
-            println!("[lab] 三网关已全部注册：{:?}", need);
-            break;
-        }
-        if Instant::now() > deadline {
-            eprintln!("[lab] 等待网关注册超时（{wait_secs}s，就绪 {ready}/3）");
+    let client = match start_client(config).await {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("crawler-lab: {error}");
             return 1;
         }
-        // 已注册的先报进度
-        if ready > 0 {
-            println!("[lab]   已注册 {ready}/3 …");
+    };
+    let Some(local) = client.local_addr() else {
+        eprintln!("crawler-lab: registry listener has no bound address");
+        let _ = client.shutdown().await;
+        return 1;
+    };
+    println!("[lab] 组网模式：registry（应用监听 {local}，等待网关注册…）");
+    // The launcher consumes this record from this process's owned output.
+    // It proves local listener binding, not that gateways have registered yet.
+    println!("PARROT_CRAWLER_PORT={}", local.port());
+
+    // Addresses learned from seeds or gossip are not gateway registrations.
+    let need = ["erl-gw-1", "ray-gw-1", "jvm-search-1"];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    loop {
+        let missing = client.missing_direct_connections(&need);
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!("crawler-lab: 等待网关注册超时（{wait_secs}s，缺少直连：{missing:?}）");
+            let _ = client.shutdown().await;
+            return 1;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
-    // 链路 sender 就绪需要 accept 任务跑完 register_link——给一次让出窗口
-    for _ in 0..50 {
-        if client.links_snapshot().await.len() >= 3 {
+        if missing.is_empty() {
+            println!("[lab] 三网关已全部注册：{need:?}");
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(100)),
+        )
+        .await;
     }
-    run_scenario(&client, pages, depth, fanout, batch).await
+    run_scenario(&client, workload, hub).await
 }
 
 async fn run_scenario(
+    client: &Arc<RemoteActorSystem>,
+    workload: crawler_lab_core::Config,
+    form: cli::Hub,
+) -> i32 {
+    let mut errors = Vec::new();
+    match hub::BusinessHub::new(form, workload.clone()).await {
+        Ok(mut hub) => {
+            if let Err(error) = run_scenario_inner(
+                client,
+                workload.pages,
+                workload.depth,
+                workload.fanout,
+                workload.batch,
+                &mut hub,
+            )
+            .await
+            {
+                errors.push(error);
+            }
+            if let Err(error) = hub.close().await {
+                errors.push(error);
+            }
+        }
+        Err(error) => errors.push(error),
+    }
+    if let Err(error) = client.shutdown().await {
+        errors.push(error.to_string());
+    }
+    if errors.is_empty() {
+        println!("\ncrawler-lab PASS（四运行时全链集成）");
+        0
+    } else {
+        eprintln!("crawler-lab: {}", errors.join("; "));
+        1
+    }
+}
+
+async fn run_scenario_inner(
     client: &Arc<RemoteActorSystem>,
     pages: u64,
     max_depth: u16,
     fanout: u64,
     batch: usize,
-) -> i32 {
+    hub: &mut hub::BusinessHub,
+) -> Result<(), String> {
     // node_id 必须与各网关握手自报一致（erl: erl-gw-1 / ray: ray-gw-1 / jvm: jvm-search-1）
     let frontier = client
         .remote_ref("parrot://erl-gw-1/user/frontier")
         .unwrap();
-    let indexer = client.remote_ref("parrot://ray-gw-1/user/echo").unwrap();
+    let indexer = client.remote_ref("parrot://ray-gw-1/user/index").unwrap();
     let searcher = client
         .remote_ref("parrot://jvm-search-1/jvm/user/search")
         .unwrap();
@@ -539,13 +542,42 @@ async fn run_scenario(
                 },
             )
             .await
-            .unwrap_or_else(|e| panic!("deploy {node}/{name} 失败: {e:?}"));
+            .map_err(|e| format!("deploy {node}/{name}: {e}"))?;
         println!(
             "[lab] 组件部署 {node}/{name} → {instances:?}（{}ms）",
             t0.elapsed().as_millis()
         );
     }
 
+    run_business(
+        &frontier,
+        &indexer,
+        &searcher,
+        &crawler_lab_core::Config {
+            pages,
+            depth: max_depth,
+            fanout,
+            batch,
+        },
+        hub,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn run_business(
+    frontier: &dyn ActorRef,
+    indexer: &dyn ActorRef,
+    searcher: &dyn ActorRef,
+    workload: &crawler_lab_core::Config,
+    hub: &mut hub::BusinessHub,
+) -> Result<Vec<protocol::Hit>, String> {
+    let crawler_lab_core::Config {
+        pages,
+        depth: max_depth,
+        fanout,
+        batch,
+    } = *workload;
     let m = Arc::new(Metrics::new());
 
     // ── 阶段 0：三网关方言 sanity（爬虫前的 wire 通路证明）────────────
@@ -556,36 +588,38 @@ async fn run_scenario(
         p.extend_from_slice(&0u32.to_le_bytes()); // N=0 空探针（不消耗队列）
         let r = frontier.send(Box::new(FrontierNext(p))).await;
         match r {
-            Ok(reply) => println!(
-                "[lab] erl 网关 alive（FrontierBatch n={}）",
-                u32::from_le_bytes(
-                    reply.downcast_ref::<FrontierBatch>().unwrap().0[0..4]
-                        .try_into()
-                        .unwrap()
-                )
-            ),
-            Err(e) => panic!("erl 探活失败: {e:?}"),
+            Ok(reply) => {
+                let FrontierBatch(entries) = expect_reply::<FrontierBatch>(reply)?;
+                println!("[lab] erl 网关 alive（FrontierBatch n={}）", entries.len());
+            }
+            Err(e) => return Err(format!("erl 探活失败: {e:?}")),
         }
     }
-    // Ray Ping: +2 方言（IndexPage 空批次探活——IndexAck(0,0)）
+    // Ray IndexPage has an eight-byte acknowledgement; JVM IndexTerms uses
+    // the same key with a distinct four-byte shape. Check the selected dialect.
     {
-        let r = indexer
+        let reply = indexer
             .send(Box::new(IndexPage(enc_pages(&[]))))
             .await
-            .unwrap();
-        let raw = r.downcast_ref::<IndexAck>().unwrap().0.clone();
-        let (a, b) = (
-            u32::from_le_bytes(raw[0..4].try_into().unwrap()),
-            u32::from_le_bytes(raw[4..8].try_into().unwrap()),
-        );
-        assert_eq!((a, b), (0, 0), "ray 空批次 IndexAck(0,0)");
+            .map_err(|e| format!("ray empty index probe: {e}"))?;
+        expect_ray_ack(reply, 0, 0)?;
         println!("[lab] ray 网关 alive（IndexAck(0,0)）");
     }
-    // JVM Healthz
     {
-        let r = searcher.send(Box::new(Healthz(vec![]))).await.unwrap();
-        let json = String::from_utf8_lossy(&r.downcast_ref::<HealthzR>().unwrap().0).into_owned();
-        println!("[lab] jvm 网关 alive: {json}");
+        let health = read_health(searcher).await?;
+        if health
+            != (protocol::Health {
+                terms: 0,
+                postings: 0,
+                queries: 0,
+            })
+        {
+            return Err(format!("new JVM component is not empty: {health:?}"));
+        }
+        println!(
+            "[lab] jvm 网关 alive: {}",
+            serde_json::to_string(&health).map_err(|e| e.to_string())?
+        );
     }
 
     // ── 阶段 1：种子注入 Erlang frontier ─────────────────────────────
@@ -594,10 +628,11 @@ async fn run_scenario(
     let seeds: Vec<(u64, String, u16)> = (0..pages.min(batch as u64 * 2))
         .map(|id| (id, url_of(id), 0u16))
         .collect();
-    frontier
+    let reply = frontier
         .send(Box::new(FrontierPush(enc_push(&seeds))))
         .await
-        .unwrap();
+        .map_err(|e| format!("frontier seed push: {e}"))?;
+    expect_frontier_ack(reply)?;
     m.pushed
         .fetch_add(seeds.len() as u64, std::sync::atomic::Ordering::Relaxed);
     println!("[lab] 种子 {} 条已注入（{:?}）", seeds.len(), t1.elapsed());
@@ -605,12 +640,13 @@ async fn run_scenario(
     // ── 阶段 2：爬取循环（fetch → 出链回注 → 双路索引）────────────────
     println!("[lab] === 阶段 2：爬取循环（depth≤{max_depth} fanout={fanout}）===");
     let t2 = Instant::now();
-    let mut visited: std::collections::HashSet<u64> = Default::default();
-    let mut pending_outlinks: Vec<(u64, String, u16)> = Vec::new();
     let mut pages_buf: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut terms_buf: Vec<(String, u64, u32)> = Vec::new();
     // 对账基准：Rust 侧累计的去重词表（与 ray/jvm 两路索引必须收敛一致）
-    let mut all_terms: std::collections::HashSet<String> = Default::default();
+    let mut reference_index: std::collections::HashMap<
+        String,
+        std::collections::HashMap<u64, u32>,
+    > = Default::default();
     let mut last_progress = Instant::now();
 
     loop {
@@ -622,60 +658,48 @@ async fn run_scenario(
         // frontier 取批
         let mut q = vec![];
         q.extend_from_slice(&(batch as u32).to_le_bytes());
-        let r = frontier.send(Box::new(FrontierNext(q))).await.unwrap();
-        let batch_urls = dec_batch(&r.downcast_ref::<FrontierBatch>().unwrap().0);
+        let r = frontier
+            .send(Box::new(FrontierNext(q)))
+            .await
+            .map_err(|e| format!("frontier next: {e}"))?;
+        let FrontierBatch(batch_urls) = expect_reply::<FrontierBatch>(r)?;
         if batch_urls.is_empty() {
             break;
         }
-        // fetch（合成页面）+ 出链收集 + 索引缓冲
-        for (id, _url, depth) in batch_urls {
-            if !visited.insert(id) {
-                continue;
-            }
-            let html = synth_page(id);
-            // 本地分词对账用词频 + JVM 倒排条目
-            let mut freq: std::collections::HashMap<String, u32> = Default::default();
-            for t in tokenize(&html) {
-                *freq.entry(t).or_insert(0) += 1;
-            }
-            for (term, tf) in &freq {
-                terms_buf.push((term.clone(), id, *tf));
-                all_terms.insert(term.clone());
-            }
-            pages_buf.push((id, html));
-            m.fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // 出链（深度受限回注）
-            if depth < max_depth {
-                for t in outlinks(id, fanout, pages) {
-                    pending_outlinks.push((t, url_of(t), depth + 1));
-                }
-            }
+        // Actual component business: synthesis, term frequencies, dedup and
+        // outlink filtering happen inside Tick (native/Wasm/embedded kernel).
+        let tick = hub.tick(&batch_urls).await?;
+        for (term, id, tf) in &tick.terms {
+            reference_index
+                .entry(term.clone())
+                .or_default()
+                .insert(*id, *tf);
         }
+        m.fetched.fetch_add(
+            tick.pages.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        pages_buf.extend(tick.pages);
+        terms_buf.extend(tick.terms);
         // 缓冲满 → 双路索引（ray: CPU 分词统计；jvm: 倒插入库）
         if pages_buf.len() >= batch {
-            flush_index(&indexer, &searcher, &mut pages_buf, &mut terms_buf, &m).await;
+            flush_index(indexer, searcher, &mut pages_buf, &mut terms_buf, &m).await?;
         }
-        // 出链批量回注 frontier
-        if !pending_outlinks.is_empty() {
-            // 只回注未访问过的（去重交给 ets seen——但减少无用流量）
-            let chunk: Vec<_> = pending_outlinks
-                .iter()
-                .filter(|(id, _, _)| !visited.contains(id))
-                .cloned()
-                .collect();
-            pending_outlinks.clear();
-            if !chunk.is_empty() {
-                frontier
-                    .send(Box::new(FrontierPush(enc_push(&chunk))))
-                    .await
-                    .unwrap();
-                m.pushed
-                    .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+        // Network effects remain host-owned; the component supplies the batch.
+        if !tick.outlinks.is_empty() {
+            let reply = frontier
+                .send(Box::new(FrontierPush(enc_push(&tick.outlinks))))
+                .await
+                .map_err(|e| format!("frontier outlink push: {e}"))?;
+            expect_frontier_ack(reply)?;
+            m.pushed.fetch_add(
+                tick.outlinks.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
     // 收尾 flush
-    flush_index(&indexer, &searcher, &mut pages_buf, &mut terms_buf, &m).await;
+    flush_index(indexer, searcher, &mut pages_buf, &mut terms_buf, &m).await?;
     println!(
         "[lab] 爬取完成：fetched={}（去重后）pushed_total={} 耗时 {:?}",
         m.fetched.load(std::sync::atomic::Ordering::Relaxed),
@@ -685,34 +709,32 @@ async fn run_scenario(
 
     // ── 阶段 3：双路索引对账（ray 词频视角 vs jvm 倒排视角）───────────
     println!("[lab] === 阶段 3：索引对账 ===");
-    let unique_terms_expected = all_terms.len() as u64;
+    let unique_terms_expected = reference_index.len() as u64;
+    let postings_expected: u64 = reference_index.values().map(|docs| docs.len() as u64).sum();
     {
-        // ray stats：IndexStats 键空载 → [terms u32][postings u64]
-        let r = indexer
+        let reply = indexer
             .send(Box::new(IndexStatsQuery(vec![])))
             .await
-            .unwrap();
-        let raw = &r.downcast_ref::<IndexStatsR>().unwrap().0;
-        let terms = u32::from_le_bytes(raw[0..4].try_into().unwrap());
-        let postings = u64::from_le_bytes(raw[4..12].try_into().unwrap());
-        let expected_terms = unique_terms_expected;
+            .map_err(|e| format!("ray index stats: {e}"))?;
+        let IndexStatsR(raw) = expect_reply(reply)?;
+        let (terms, postings) = protocol::decode_stats(&raw).map_err(|e| e.to_string())?;
+        if u64::from(terms) != unique_terms_expected || postings != postings_expected {
+            return Err(format!("Ray index mismatch: ({terms}, {postings}), expected ({unique_terms_expected}, {postings_expected})"));
+        }
+        println!("[lab] ray 索引: terms={terms} postings={postings}");
+        let health = read_health(searcher).await?;
+        if health
+            != (protocol::Health {
+                terms: unique_terms_expected,
+                postings: postings_expected,
+                queries: 0,
+            })
+        {
+            return Err(format!("JVM index mismatch: {health:?}"));
+        }
         println!(
-            "[lab] ray 索引: terms={terms} postings={postings}（本地对账 unique_terms={expected_terms}）"
-        );
-        assert_eq!(terms as u64, expected_terms, "ray 词表数与 Rust 对账一致");
-        // jvm healthz：terms/postings/queries
-        let r = searcher.send(Box::new(Healthz(vec![]))).await.unwrap();
-        let json = String::from_utf8_lossy(&r.downcast_ref::<HealthzR>().unwrap().0).into_owned();
-        println!("[lab] jvm 倒排: {json}");
-        let jvm_terms = extract_json_u64(&json, "terms");
-        assert_eq!(
-            jvm_terms, expected_terms,
-            "jvm 倒排词数与 ray/Rust 三方一致"
-        );
-        let jvm_postings = extract_json_u64(&json, "postings");
-        assert_eq!(
-            jvm_postings, postings,
-            "jvm postings 与 ray postings 一致（双路索引收敛）"
+            "[lab] jvm 倒排: {}",
+            serde_json::to_string(&health).map_err(|e| e.to_string())?
         );
     }
 
@@ -725,69 +747,146 @@ async fn run_scenario(
         vec!["raft", "swim"],
     ];
     for q in &queries {
-        let r = searcher
+        let reply = searcher
             .send(Box::new(SearchQuery(enc_query(q))))
             .await
-            .unwrap();
-        let json =
-            String::from_utf8_lossy(&r.downcast_ref::<SearchResult>().unwrap().0).into_owned();
-        println!("[lab] search {:?} → {}", q, json);
-        assert!(!json.is_empty(), "搜索结果非空");
+            .map_err(|e| format!("JVM search: {e}"))?;
+        let SearchResult(raw) = expect_reply(reply)?;
+        let hits = protocol::decode_search(&raw)?;
+        let expected = reference_search(&reference_index, q);
+        if hits != expected {
+            return Err(format!(
+                "search {q:?} mismatch: {hits:?}, expected {expected:?}"
+            ));
+        }
+        println!(
+            "[lab] search {q:?} → {}",
+            serde_json::to_string(&hits).map_err(|e| e.to_string())?
+        );
     }
 
-    // healthz 终态
-    let r = searcher.send(Box::new(Healthz(vec![]))).await.unwrap();
-    let json = String::from_utf8_lossy(&r.downcast_ref::<HealthzR>().unwrap().0).into_owned();
-    println!("[lab] jvm healthz: {json}");
+    let health = read_health(searcher).await?;
+    if health
+        != (protocol::Health {
+            terms: unique_terms_expected,
+            postings: postings_expected,
+            queries: queries.len() as u64,
+        })
+    {
+        return Err(format!("final JVM health mismatch: {health:?}"));
+    }
+    println!(
+        "[lab] jvm healthz: {}",
+        serde_json::to_string(&health).map_err(|e| e.to_string())?
+    );
 
     // 终态指标
     m.progress("done");
-    client.shutdown().await.ok();
-    println!("\ncrawler-lab PASS（四运行时全链集成）");
-    0
+    Ok(reference_search(&reference_index, &["parrot", "actor"]))
 }
 
-/// 简易 JSON u64 抽取（healthz 返回 {"terms":N,"postings":M,"queries":K}）
-fn extract_json_u64(json: &str, key: &str) -> u64 {
-    let pat = format!("\"{key}\":");
-    let i = json
-        .find(&pat)
-        .unwrap_or_else(|| panic!("json 缺 {key}: {json}"));
-    let rest = &json[i + pat.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().unwrap()
+fn expect_frontier_ack(reply: BoxedMessage) -> Result<(), String> {
+    let FrontierAck(raw) = expect_reply(reply)?;
+    if protocol::decode_ack(&raw).map_err(|e| e.to_string())? != 1 {
+        return Err("frontier did not acknowledge push".into());
+    }
+    Ok(())
+}
+
+fn expect_ray_ack(reply: BoxedMessage, pages: u32, terms: u32) -> Result<(), String> {
+    let IndexAck(raw) = expect_reply(reply)?;
+    if protocol::decode_index_ack(&raw).map_err(|e| e.to_string())?
+        != (protocol::IndexAcknowledgement::Ray { pages, terms })
+    {
+        return Err(format!(
+            "Ray IndexAck has wrong shape/count; expected ({pages}, {terms})"
+        ));
+    }
+    Ok(())
+}
+
+fn expect_jvm_ack(reply: BoxedMessage, count: u32) -> Result<(), String> {
+    let IndexAck(raw) = expect_reply(reply)?;
+    if protocol::decode_index_ack(&raw).map_err(|e| e.to_string())?
+        != protocol::IndexAcknowledgement::Jvm(count)
+    {
+        return Err(format!(
+            "JVM IndexAck has wrong shape/count; expected {count}"
+        ));
+    }
+    Ok(())
+}
+
+async fn read_health(searcher: &dyn ActorRef) -> Result<protocol::Health, String> {
+    let reply = searcher
+        .send(Box::new(Healthz(vec![])))
+        .await
+        .map_err(|e| format!("JVM health: {e}"))?;
+    let HealthzR(raw) = expect_reply(reply)?;
+    protocol::decode_health(&raw)
+}
+
+fn reference_search(
+    index: &std::collections::HashMap<String, std::collections::HashMap<u64, u32>>,
+    query: &[&str],
+) -> Vec<protocol::Hit> {
+    let mut scores = std::collections::HashMap::<i64, u64>::new();
+    for term in query {
+        if let Some(docs) = index.get(*term) {
+            for (doc, frequency) in docs {
+                *scores.entry(*doc as i64).or_default() += u64::from(*frequency);
+            }
+        }
+    }
+    let mut hits: Vec<_> = scores
+        .into_iter()
+        .map(|(doc, score)| protocol::Hit { doc, score })
+        .collect();
+    hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.doc.cmp(&b.doc)));
+    hits.truncate(5); // SearchComponent's configured top-k.
+    hits
 }
 
 async fn flush_index(
-    indexer: &parrot_remote::RemoteActorRef,
-    searcher: &parrot_remote::RemoteActorRef,
+    indexer: &dyn ActorRef,
+    searcher: &dyn ActorRef,
     pages: &mut Vec<(u64, Vec<u8>)>,
     terms: &mut Vec<(String, u64, u32)>,
     m: &Arc<Metrics>,
-) {
+) -> Result<(), String> {
     use std::sync::atomic::Ordering::Relaxed;
     if pages.is_empty() && terms.is_empty() {
-        return;
+        return Ok(());
     }
     // ray：整页 HTML（CPU 分词在 ray 侧做）
     if !pages.is_empty() {
         let n = pages.len() as u64;
-        indexer
+        let expected_words: usize = pages.iter().map(|(_, html)| tokenize(html).len()).sum();
+        let expected_pages = u32::try_from(pages.len()).map_err(|_| "page batch too large")?;
+        let expected_words = u32::try_from(expected_words).map_err(|_| "token count too large")?;
+        let reply = indexer
             .send(Box::new(IndexPage(enc_pages(pages))))
             .await
-            .unwrap();
+            .map_err(|e| format!("Ray index batch: {e}"))?;
+        expect_ray_ack(reply, expected_pages, expected_words)?;
         m.indexed_ray.fetch_add(n, Relaxed);
         pages.clear();
     }
     // jvm：Rust 侧词频 → 倒排条目
     if !terms.is_empty() {
         let n = terms.len() as u64;
-        searcher
+        let expected = u32::try_from(terms.len()).map_err(|_| "term batch too large")?;
+        let reply = searcher
             .send(Box::new(IndexTerms(enc_terms(terms))))
             .await
-            .unwrap();
+            .map_err(|e| format!("JVM index batch: {e}"))?;
+        expect_jvm_ack(reply, expected)?;
         m.indexed_jvm.fetch_add(n, Relaxed);
         m.terms_total.fetch_add(n, Relaxed);
         terms.clear();
     }
+    Ok(())
 }
+
+#[cfg(test)]
+mod protocol_tests;

@@ -1,7 +1,7 @@
 # ============================================================================
 #  parrot 网关运行时镜像——JVM/Akka 方言
 #
-#  职责：JDK17 + parrot-protocol-jvm（框架网关宿主 + akka 依赖，COPY 进镜像）
+#  职责：JDK21 + parrot-protocol-jvm（框架网关宿主 + akka 依赖，COPY 进镜像）
 #  app 制品（业务 jar）经 volume 挂载——镜像不含任何 app 代码。
 #
 #  app compose 引用契约：
@@ -26,10 +26,8 @@ FROM ${REGISTRY_PREFIX}eclipse-temurin:21-jdk
 WORKDIR /gw
 # 框架网关宿主 fat（协议层——单一真源）
 COPY interop/jvm/target/parrot-protocol-jvm-0.1.0.jar .
-# akka/scala 运行时依赖（cp.txt = 绝对路径清单——转 COPY 需相对化，改用
-# maven dependency 副本方案：构建期由 scripts 保证 libs/ 就绪）
-# 说明：libs/ 由本 Dockerfile 同目录 libs-prep.sh 在 context 外准备不可行，
-# 故采用 build-arg 传入宿主机 m2 坐标集合的替代——见下方 RUN。
+# prep-jvm-libs.sh validates every cp.txt JAR and atomically publishes this archive.
+# A custom LIBS_TAR also needs an entry in gw-jvm.Dockerfile.dockerignore.
 ARG LIBS_TAR=gw-jvm-libs.tar
 COPY ${LIBS_TAR} .
 RUN mkdir -p libs && tar xzf ${LIBS_TAR} -C libs && rm ${LIBS_TAR}

@@ -21,6 +21,8 @@ import struct
 
 TAG_ADMIN_CMD_V2 = 0x03
 TAG_ADMIN_REPLY_V2 = 0x04
+METRICS_ALL = (1 << 17) - 1
+METRICS_PROCESSES = 1 << 14
 
 # v2 错误码扩展段（0x0A00+）
 ERR_ARTIFACT_FETCH = 0x0A00
@@ -35,7 +37,9 @@ ERR_SPAWN_FAILED = 0x0A06
 # ---------------- varint ----------------
 
 
-def put_varint(v: int) -> bytes:
+def put_varint(v: int, *, bits: int = 64) -> bytes:
+    if type(v) is not int or not 0 <= v < (1 << bits):
+        raise ValueError(f"expected unsigned {bits}-bit integer")
     if v <= 250:
         return bytes([v])
     if v <= 0xFFFF:
@@ -45,17 +49,42 @@ def put_varint(v: int) -> bytes:
     return b"\xfd" + struct.pack("<Q", v)
 
 
-def read_varint(buf: memoryview, off: int) -> tuple[int, int]:
+def _require(buf: memoryview, off: int, size: int) -> None:
+    if off < 0 or size < 0 or off > len(buf) or size > len(buf) - off:
+        raise ValueError("truncated admin payload")
+
+
+def read_varint(buf: memoryview, off: int, *, bits: int = 64) -> tuple[int, int]:
+    _require(buf, off, 1)
     b0 = buf[off]
     if b0 <= 0xFA:
         return b0, off + 1
-    if b0 == 0xFB:
-        return struct.unpack_from("<H", buf, off + 1)[0], off + 3
-    if b0 == 0xFC:
-        return struct.unpack_from("<I", buf, off + 1)[0], off + 5
-    if b0 == 0xFD:
-        return struct.unpack_from("<Q", buf, off + 1)[0], off + 9
-    raise ValueError(f"bad varint prefix 0x{b0:02x} (0xFE/0xFF reserved)")
+    formats = {0xFB: ("<H", 2), 0xFC: ("<I", 4), 0xFD: ("<Q", 8)}
+    if b0 not in formats:
+        raise ValueError(f"bad varint prefix 0x{b0:02x}")
+    fmt, size = formats[b0]
+    if size * 8 > bits:
+        raise ValueError(f"integer representation exceeds u{bits}")
+    _require(buf, off + 1, size)
+    return struct.unpack_from(fmt, buf, off + 1)[0], off + 1 + size
+
+
+def _read_option_tag(buf: memoryview, off: int) -> tuple[bool, int]:
+    _require(buf, off, 1)
+    if buf[off] not in (0, 1):
+        raise ValueError("invalid Option discriminant")
+    return buf[off] == 1, off + 1
+
+
+def _read_opt_str(buf: memoryview, off: int) -> tuple[str | None, int]:
+    present, off = _read_option_tag(buf, off)
+    return read_str(buf, off) if present else (None, off)
+
+
+def _finish(result: dict, buf: memoryview, off: int) -> dict:
+    if off != len(buf):
+        raise ValueError("trailing admin payload bytes")
+    return result
 
 
 # ---------------- 基础 serde 形态 ----------------
@@ -68,6 +97,7 @@ def put_str(s: str) -> bytes:
 
 def read_str(buf: memoryview, off: int) -> tuple[str, int]:
     n, off = read_varint(buf, off)
+    _require(buf, off, n)
     s = bytes(buf[off : off + n]).decode()
     return s, off + n
 
@@ -79,11 +109,11 @@ def put_opt_bytes(b: bytes | None) -> bytes:
 
 
 def read_opt_bytes(buf: memoryview, off: int) -> tuple[bytes | None, int]:
-    tag = buf[off]
-    off += 1
-    if tag == 0:
+    present, off = _read_option_tag(buf, off)
+    if not present:
         return None, off
     n, off = read_varint(buf, off)
+    _require(buf, off, n)
     return bytes(buf[off : off + n]), off + n
 
 
@@ -121,7 +151,7 @@ def put_artifact(a: dict) -> bytes:
     if kind == "wasm":
         return b"\x04" + put_str(a["digest"]) + put_str(a["uri"])
     if kind == "dylib":
-        return b"\x05" + put_str(a["digest"]) + put_str(a["uri"]) + put_varint(a["abi"])
+        return b"\x05" + put_str(a["digest"]) + put_str(a["uri"]) + put_varint(a["abi"], bits=32)
     raise ValueError(f"unknown artifact kind {kind}")
 
 
@@ -132,37 +162,17 @@ def read_artifact(buf: memoryview, off: int) -> tuple[dict, int]:
         return {"kind": "props", "factory": f}, off
     if v == 1:
         app, off = read_str(buf, off)
-        uri = None
-        if buf[off] == 1:
-            uri, off = read_str(buf, off + 1)
-        else:
-            off += 1
+        uri, off = _read_opt_str(buf, off)
         return {"kind": "beam", "app": app, "uri": uri}, off
     if v == 2:
         m, off = read_str(buf, off)
-        env = None
-        if buf[off] == 1:
-            env, off = read_str(buf, off + 1)
-        else:
-            off += 1
-        uri = None
-        if buf[off] == 1:
-            uri, off = read_str(buf, off + 1)
-        else:
-            off += 1
+        env, off = _read_opt_str(buf, off)
+        uri, off = _read_opt_str(buf, off)
         return {"kind": "pymodule", "module": m, "runtime_env": env, "uri": uri}, off
     if v == 3:
         mc, off = read_str(buf, off)
-        coords = None
-        if buf[off] == 1:
-            coords, off = read_str(buf, off + 1)
-        else:
-            off += 1
-        uri = None
-        if buf[off] == 1:
-            uri, off = read_str(buf, off + 1)
-        else:
-            off += 1
+        coords, off = _read_opt_str(buf, off)
+        uri, off = _read_opt_str(buf, off)
         return {"kind": "jvm", "main_class": mc, "coords": coords, "uri": uri}, off
     if v == 4:
         d, off = read_str(buf, off)
@@ -171,7 +181,7 @@ def read_artifact(buf: memoryview, off: int) -> tuple[dict, int]:
     if v == 5:
         d, off = read_str(buf, off)
         u, off = read_str(buf, off)
-        abi, off = read_varint(buf, off)
+        abi, off = read_varint(buf, off, bits=32)
         return {"kind": "dylib", "digest": d, "uri": u, "abi": abi}, off
     raise ValueError(f"unknown artifact variant {v}")
 
@@ -254,6 +264,8 @@ def encode_admin_cmd_v2(cmd: dict) -> bytes:
         body = b"\x03" + put_varint(cmd["req_id"]) + put_str(cmd["path_prefix"])
     elif kind == "metrics":
         body = b"\x04" + put_varint(cmd["req_id"])
+    elif kind == "measured_metrics":
+        body = b"\x05" + put_varint(cmd["req_id"])
     else:
         raise ValueError(f"unknown cmd kind {kind}")
     return bytes([TAG_ADMIN_CMD_V2]) + body
@@ -261,29 +273,33 @@ def encode_admin_cmd_v2(cmd: dict) -> bytes:
 
 def decode_admin_cmd_v2(payload: bytes) -> dict:
     buf = memoryview(payload)
+    _require(buf, 0, 1)
     if buf[0] != TAG_ADMIN_CMD_V2:
         raise ValueError(f"bad tag 0x{buf[0]:02x} (expect 0x03)")
     v, off = read_varint(buf, 1)
     if v == 0:
         req_id, off = read_varint(buf, off)
         comp, off = read_component_deploy(buf, off)
-        return {"kind": "deploy", "req_id": req_id, "component": comp}
+        return _finish({"kind": "deploy", "req_id": req_id, "component": comp}, buf, off)
     if v == 1:
         req_id, off = read_varint(buf, off)
         prefix, off = read_str(buf, off)
         timeout_ms, off = read_varint(buf, off)
-        return {"kind": "drain", "req_id": req_id, "path_prefix": prefix, "timeout_ms": timeout_ms}
+        return _finish({"kind": "drain", "req_id": req_id, "path_prefix": prefix, "timeout_ms": timeout_ms}, buf, off)
     if v == 2:
         req_id, off = read_varint(buf, off)
         prefix, off = read_str(buf, off)
-        return {"kind": "stop", "req_id": req_id, "path_prefix": prefix}
+        return _finish({"kind": "stop", "req_id": req_id, "path_prefix": prefix}, buf, off)
     if v == 3:
         req_id, off = read_varint(buf, off)
         prefix, off = read_str(buf, off)
-        return {"kind": "status", "req_id": req_id, "path_prefix": prefix}
+        return _finish({"kind": "status", "req_id": req_id, "path_prefix": prefix}, buf, off)
     if v == 4:
         req_id, off = read_varint(buf, off)
-        return {"kind": "metrics", "req_id": req_id}
+        return _finish({"kind": "metrics", "req_id": req_id}, buf, off)
+    if v == 5:
+        req_id, off = read_varint(buf, off)
+        return _finish({"kind": "measured_metrics", "req_id": req_id}, buf, off)
     raise ValueError(f"unknown cmd variant {v}")
 
 
@@ -317,11 +333,17 @@ def encode_admin_reply_v2(r: dict) -> bytes:
         body = (
             b"\x04"
             + put_varint(r["req_id"])
-            + put_varint(r["code"])
+            + put_varint(r["code"], bits=16)
             + put_str(r["detail"])
         )
     elif kind == "metrics":
         body = b"\x05" + put_varint(r["req_id"]) + _put_snapshot(r["snapshot"])
+    elif kind == "measured_metrics":
+        metrics = r["metrics"]
+        validate_measured_metrics(metrics)
+        body = (b"\x06" + put_varint(r["req_id"]) + _put_snapshot(metrics["snapshot"])
+                + put_varint(metrics["available"]) + put_str(metrics["epoch"])
+                + put_str(metrics["process_kind"]))
     else:
         raise ValueError(f"unknown reply kind {kind}")
     return bytes([TAG_ADMIN_REPLY_V2]) + body
@@ -335,21 +357,21 @@ def encode_admin_reply_v2(r: dict) -> bytes:
 
 
 def _put_snapshot(s: dict) -> bytes:
-    out = put_varint(int(s.get("ts_ms", 0)))
+    out = put_varint(s.get("ts_ms", 0))
     out += put_str(str(s.get("runtime", "")))
     for f in (
         "connections", "handshakes_ok", "handshakes_failed",
         "asks_rx", "tells_rx", "replies_tx", "reply_errs",
         "bytes_rx", "bytes_tx", "heartbeats_rx",
     ):
-        out += put_varint(int(s.get(f, 0)))
+        out += put_varint(s.get(f, 0))
     states = list(s.get("component_states", []))
-    out += put_varint(len(states))  # components: u64 计数
+    out += put_varint(s.get("components", len(states)))  # components are not instance states
     out += put_varint(len(states))  # component_states: Vec len（serde 双字段）
     for st in states:
         out += put_str(st["path"]) + put_str(st["state"]) + put_str(st["version"])
     for f in ("processes", "memory_rss", "uptime_start_ms"):
-        out += put_varint(int(s.get(f, 0)))
+        out += put_varint(s.get(f, 0))
     return out
 
 
@@ -380,6 +402,7 @@ def _read_snapshot(buf: memoryview, off: int) -> tuple[dict, int]:
 
 def decode_admin_reply_v2(payload: bytes) -> dict:
     buf = memoryview(payload)
+    _require(buf, 0, 1)
     if buf[0] != TAG_ADMIN_REPLY_V2:
         raise ValueError(f"bad tag 0x{buf[0]:02x} (expect 0x04)")
     v, off = read_varint(buf, 1)
@@ -390,15 +413,15 @@ def decode_admin_reply_v2(payload: bytes) -> dict:
         for _ in range(n):
             inst, off = read_str(buf, off)
             instances.append(inst)
-        return {"kind": "deployed", "req_id": req_id, "instances": instances}
+        return _finish({"kind": "deployed", "req_id": req_id, "instances": instances}, buf, off)
     if v == 1:
         req_id, off = read_varint(buf, off)
         drained, off = read_varint(buf, off)
         aborted, off = read_varint(buf, off)
-        return {"kind": "drained", "req_id": req_id, "drained": drained, "aborted": aborted}
+        return _finish({"kind": "drained", "req_id": req_id, "drained": drained, "aborted": aborted}, buf, off)
     if v == 2:
         req_id, off = read_varint(buf, off)
-        return {"kind": "stopped", "req_id": req_id}
+        return _finish({"kind": "stopped", "req_id": req_id}, buf, off)
     if v == 3:
         req_id, off = read_varint(buf, off)
         n, off = read_varint(buf, off)
@@ -408,16 +431,26 @@ def decode_admin_reply_v2(payload: bytes) -> dict:
             state, off = read_str(buf, off)
             version, off = read_str(buf, off)
             states.append({"path": path, "state": state, "version": version})
-        return {"kind": "status", "req_id": req_id, "states": states}
+        return _finish({"kind": "status", "req_id": req_id, "states": states}, buf, off)
     if v == 4:
         req_id, off = read_varint(buf, off)
-        code, off = read_varint(buf, off)
+        code, off = read_varint(buf, off, bits=16)
         detail, off = read_str(buf, off)
-        return {"kind": "failed", "req_id": req_id, "code": code, "detail": detail}
+        return _finish({"kind": "failed", "req_id": req_id, "code": code, "detail": detail}, buf, off)
     if v == 5:
         req_id, off = read_varint(buf, off)
         snap, off = _read_snapshot(buf, off)
-        return {"kind": "metrics", "req_id": req_id, "snapshot": snap}
+        return _finish({"kind": "metrics", "req_id": req_id, "snapshot": snap}, buf, off)
+    if v == 6:
+        req_id, off = read_varint(buf, off)
+        snapshot, off = _read_snapshot(buf, off)
+        available, off = read_varint(buf, off)
+        epoch, off = read_str(buf, off)
+        process_kind, off = read_str(buf, off)
+        metrics = {"snapshot": snapshot, "available": available,
+                   "epoch": epoch, "process_kind": process_kind}
+        validate_measured_metrics(metrics)
+        return _finish({"kind": "measured_metrics", "req_id": req_id, "metrics": metrics}, buf, off)
     raise ValueError(f"unknown reply variant {v}")
 
 
@@ -427,3 +460,14 @@ def decode_tag(payload: bytes) -> int:
     if t in (TAG_ADMIN_CMD_V2, TAG_ADMIN_REPLY_V2):
         return t
     raise ValueError(f"not admin-v2 payload (tag=0x{t:02x})")
+
+
+def validate_measured_metrics(metrics: dict) -> None:
+    available = metrics["available"]
+    if type(available) is not int or available < 0 or available & ~METRICS_ALL:
+        raise ValueError("unknown metrics availability bit")
+    for field in ("epoch", "process_kind"):
+        if not isinstance(metrics[field], str) or len(metrics[field].encode()) > 128:
+            raise ValueError("invalid metrics identity")
+    if available & METRICS_PROCESSES and not metrics["process_kind"]:
+        raise ValueError("missing process metric unit")

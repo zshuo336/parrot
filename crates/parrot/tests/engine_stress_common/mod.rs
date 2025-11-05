@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+pub mod contracts;
+#[path = "../../../../bench/actix-bench/src/oracle.rs"]
+pub mod oracle;
+
 // ---------------------------------------------------------------------------
 // 消息类型（引擎无关）
 // ---------------------------------------------------------------------------
@@ -121,57 +125,49 @@ pub fn latency_stats(mut samples: Vec<u128>) -> LatencyStats {
 pub struct BenchResult {
     pub name: String,
     pub engine: &'static str,
+    pub unit: &'static str,
     pub total_messages: u64,
     pub elapsed: Duration,
     pub latencies: LatencyStats,
     pub correctness: bool,
     pub note: String,
-    /// 场景的标称 CPU 工作量（秒）。用于计算 worker 利用率 =
-    /// 标称总量 / (墙钟 × 可用核数)。None = 不适用。
-    pub cpu_work_secs: Option<f64>,
 }
 
 impl BenchResult {
-    pub fn throughput(&self) -> f64 {
-        self.elapsed.as_secs_f64().max(f64::EPSILON)
+    pub fn msg_per_sec(&self) -> Option<f64> {
+        (!self.elapsed.is_zero()).then(|| self.total_messages as f64 / self.elapsed.as_secs_f64())
     }
-
-    pub fn msg_per_sec(&self) -> f64 {
-        self.total_messages as f64 / self.throughput()
+    fn throughput_text(&self) -> String {
+        self.msg_per_sec()
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "n/a".into())
     }
-
+    fn latency_text(&self, micros: u128) -> String {
+        if self.latencies.count == 0 {
+            "n/a".into()
+        } else {
+            format!("{:.2}", micros as f64 / 1000.0)
+        }
+    }
     pub fn print(&self) {
-        let util = self
-            .cpu_work_secs
-            .map(|_w| format!(" | util={:.0}%", self.utilization() * 100.0))
-            .unwrap_or_default();
         println!(
-            "[{}] {} | msgs={} | wall={:.3}s | tput={:.0}/s | lat p50={:.1}ms p90={:.1}ms p99={:.1}ms max={:.1}ms{} | correct={}",
+            "[{}] {} | count={} ({}) | wall={:.3}s | tput={}/s | samples={} | lat(ms) p50={} p90={} p99={} max={} | correct={}",
             self.engine,
             self.name,
             self.total_messages,
+            self.unit,
             self.elapsed.as_secs_f64(),
-            self.msg_per_sec(),
-            self.latencies.p50_us as f64 / 1000.0,
-            self.latencies.p90_us as f64 / 1000.0,
-            self.latencies.p99_us as f64 / 1000.0,
-            self.latencies.max_us as f64 / 1000.0,
-            util,
-            self.correctness,
+            self.throughput_text(),
+            self.latencies.count,
+            self.latency_text(self.latencies.p50_us),
+            self.latency_text(self.latencies.p90_us),
+            self.latency_text(self.latencies.p99_us),
+            self.latency_text(self.latencies.max_us),
+            self.correctness
         );
         if !self.note.is_empty() {
             println!("        note: {}", self.note);
         }
-    }
-
-    /// 有效 CPU 利用率 = 标称工作量 / (墙钟 × 核数)。
-    pub fn utilization(&self) -> f64 {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8) as f64;
-        self.cpu_work_secs
-            .map(|w| w / (self.elapsed.as_secs_f64().max(f64::EPSILON) * cores))
-            .unwrap_or(0.0)
     }
 }
 
@@ -190,12 +186,8 @@ impl Sink {
     }
 }
 
-/// 实测 burn_cpu 速率（iters/sec）。
-///
-/// 标定环境：**release test profile**（`cargo test --release`），
-/// Apple Silicon。2G iters 实测 ~2.27s → ~0.88 G/s。
-/// （debug profile 约 0.194 G/s，若用 debug 跑请自行换算：场景时长 ×4.5。）
-pub const BURN_RATE: f64 = 880_000_000.0;
+/// Explicit bound for the full fixed-work experiment, including saturated queues.
+pub const STRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// 时长校准：按目标秒数求 burn_cpu 迭代数（对 llvm-cov 插桩/慢机鲁棒）。
 ///
@@ -217,19 +209,19 @@ pub fn calibrated_iters(secs: f64) -> u64 {
 /// CPU 工作负载：不可被优化器折叠的迭代混合运算。
 #[inline]
 pub fn burn_cpu(iterations: u64, salt: u64) -> u64 {
-    let mut x: u64 = salt | 1;
-    for i in 0..iterations {
-        // 乘加 + 异或混合，无除法（除法太慢导致单次时间不可控）
-        x = x
+    burn_cpu_range(0, iterations, salt | 1)
+}
+
+/// Continue the same recurrence using global iteration indices. Splitting a
+/// workload into cooperative chunks must not change its computation or result.
+pub fn burn_cpu_range(start: u64, iterations: u64, mut state: u64) -> u64 {
+    for i in start..start + iterations {
+        state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407)
             ^ i;
-        if x == 42 {
-            // 概率近乎为零，仅防分支消除
-            return x;
-        }
     }
-    x
+    state
 }
 
 // ---------------------------------------------------------------------------
@@ -240,13 +232,27 @@ use std::sync::Mutex;
 
 pub struct Report {
     pub results: Mutex<Vec<BenchResult>>,
+    run_id: uuid::Uuid,
+    started_unix_ms: u128,
+    runtime: String,
 }
 
 impl Report {
     pub fn new() -> Self {
         Self {
             results: Mutex::new(Vec::new()),
+            run_id: uuid::Uuid::new_v4(),
+            started_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            runtime: "unspecified (measurement fixture)".into(),
         }
+    }
+
+    pub fn with_runtime(mut self, runtime: String) -> Self {
+        self.runtime = runtime;
+        self
     }
 
     pub fn push(&self, r: BenchResult) {
@@ -254,34 +260,71 @@ impl Report {
         self.results.lock().unwrap().push(r);
     }
 
+    /// Every recorded correctness failure must fail the enclosing test, even
+    /// when individual scenarios collected errors instead of returning early.
+    pub fn verify(&self) -> anyhow::Result<()> {
+        let results = self.results.lock().unwrap();
+        anyhow::ensure!(!results.is_empty(), "stress suite recorded no scenarios");
+        let failures: Vec<_> = results
+            .iter()
+            .filter(|result| !result.correctness)
+            .map(|result| format!("{}: {}", result.name, result.note))
+            .collect();
+        anyhow::ensure!(
+            failures.is_empty(),
+            "stress correctness failures: {}",
+            failures.join("; ")
+        );
+        Ok(())
+    }
+
     /// 输出对比小结（markdown 表格行）。
     pub fn dump_markdown(&self) -> String {
-        let mut out = String::from(
-            "| 场景 | 引擎 | 消息数 | 耗时(s) | 吞吐(/s) | p50(ms) | p90(ms) | p99(ms) | max(ms) | util | 正确 |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
+        let mut out = format!(
+            "# Parrot stress report\n\nschema: 2\n\nrun_id: {}\n\nstarted_unix_ms: {}\n\nos/arch: {}/{}\n\navailable_parallelism: {:?}\n\ndebug_assertions: {}\n\nruntime: {}\n\nrequest_timeout_seconds: {}\n\nSingle host run; no cross-runtime performance certification.\n\n",
+            self.run_id,
+            self.started_unix_ms,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::thread::available_parallelism().ok(),
+            cfg!(debug_assertions),
+            self.runtime,
+            STRESS_REQUEST_TIMEOUT.as_secs(),
+        );
+        out.push_str(
+            "| 场景 | 引擎 | 数量 | 单位 | 耗时(s) | 吞吐(次/s) | p50(ms) | p90(ms) | p99(ms) | max(ms) | 样本数 | 正确 |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         );
         let mut rows = self.results.lock().unwrap().clone();
         rows.sort_by(|a, b| (&a.name, a.engine).cmp(&(&b.name, b.engine)));
         for r in rows {
-            let util = r
-                .cpu_work_secs
-                .map(|_w| format!("{:.0}%", r.utilization() * 100.0))
-                .unwrap_or_else(|| "-".into());
             out.push_str(&format!(
-                "| {} | {} | {} | {:.3} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} |\n",
+                "| {} | {} | {} | {} | {:.3} | {} | {} | {} | {} | {} | {} | {} |\n",
                 r.name,
                 r.engine,
                 r.total_messages,
+                r.unit,
                 r.elapsed.as_secs_f64(),
-                r.msg_per_sec(),
-                r.latencies.p50_us as f64 / 1000.0,
-                r.latencies.p90_us as f64 / 1000.0,
-                r.latencies.p99_us as f64 / 1000.0,
-                r.latencies.max_us as f64 / 1000.0,
-                util,
+                r.throughput_text(),
+                r.latency_text(r.latencies.p50_us),
+                r.latency_text(r.latencies.p90_us),
+                r.latency_text(r.latencies.p99_us),
+                r.latency_text(r.latencies.max_us),
+                r.latencies.count,
                 r.correctness,
             ));
         }
+        for r in self.results.lock().unwrap().iter() {
+            if !r.note.is_empty() {
+                out.push_str(&format!("\n- {}: {}\n", r.name, r.note));
+            }
+        }
         out
+    }
+
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
+        self.verify()?;
+        std::fs::write(path, self.dump_markdown())?;
+        Ok(())
     }
 }
 
@@ -298,4 +341,131 @@ pub async fn wait_until<F: Fn() -> bool>(cond: F, timeout: Duration, poll: Durat
         tokio::time::sleep(poll).await;
     }
     true
+}
+
+/// Deterministic timeout probe: the actor explicitly acknowledges entry and
+/// remains blocked until the request deadline has been observed by the caller.
+pub struct PauseForTimeout {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    released: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl PauseForTimeout {
+    pub fn execute(&self) -> parrot_api::types::ActorResult<()> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        match self
+            .released
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+        {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+            Err(_) => Err(parrot_api::errors::ActorError::TimeoutDetail(
+                "test failed to release timeout probe".into(),
+            )),
+        }
+    }
+}
+pub async fn exercise_request_timeout(
+    actor: parrot_api::types::BoxedActorRef,
+) -> anyhow::Result<bool> {
+    let (entered, receipt) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let blocking = actor.clone_boxed();
+    let task = tokio::spawn(async move {
+        blocking
+            .send_with_timeout(
+                Box::new(PauseForTimeout {
+                    entered: Mutex::new(Some(entered)),
+                    released: Mutex::new(released),
+                }),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), receipt).await??;
+    let reply = actor
+        .send_with_timeout(Box::new(Echo { value: 1 }), Some(Duration::from_millis(1)))
+        .await;
+    // Release before asserting or propagating any error; joining checks that
+    // the blocked request really completed and its resources were retired.
+    drop(release);
+    task.await??;
+    Ok(matches!(
+        reply,
+        Err(parrot_api::errors::ActorError::Timeout
+            | parrot_api::errors::ActorError::TimeoutDetail(_))
+    ))
+}
+
+/// Captured on the actor execution thread, immediately around the actual CPU work.
+pub struct TimedLongTask {
+    pub total_iterations: u64,
+}
+pub struct TimedWorkResult {
+    pub value: u64,
+    pub started: Instant,
+    pub completed: Instant,
+}
+pub fn timed_cpu(iterations: u64) -> TimedWorkResult {
+    let started = Instant::now();
+    let value = burn_cpu(iterations, 7);
+    let completed = Instant::now();
+    TimedWorkResult {
+        value,
+        started,
+        completed,
+    }
+}
+#[derive(Clone, Copy)]
+pub struct ProbeSample {
+    pub started: Instant,
+    pub completed: Instant,
+}
+pub struct ProbeWindowStats {
+    pub baseline: LatencyStats,
+    /// Whole round-trip latency for requests with positive overlap, including
+    /// requests stalled until after the heavy computation completed.
+    pub overlapping: LatencyStats,
+    /// Completion events in the half-open [start, end) computation interval.
+    pub completed: u64,
+}
+pub fn probe_window(
+    samples: &[ProbeSample],
+    started: Instant,
+    completed: Instant,
+) -> anyhow::Result<ProbeWindowStats> {
+    anyhow::ensure!(
+        started < completed,
+        "measurement window must have positive duration"
+    );
+    anyhow::ensure!(
+        samples
+            .iter()
+            .all(|sample| sample.started <= sample.completed),
+        "probe completion cannot precede its start"
+    );
+    let latency =
+        |sample: &ProbeSample| sample.completed.duration_since(sample.started).as_micros();
+    Ok(ProbeWindowStats {
+        baseline: latency_stats(
+            samples
+                .iter()
+                .filter(|sample| sample.completed <= started)
+                .map(latency)
+                .collect(),
+        ),
+        overlapping: latency_stats(
+            samples
+                .iter()
+                .filter(|sample| sample.started < completed && sample.completed > started)
+                .map(latency)
+                .collect(),
+        ),
+        completed: samples
+            .iter()
+            .filter(|sample| sample.completed >= started && sample.completed < completed)
+            .count() as u64,
+    })
 }

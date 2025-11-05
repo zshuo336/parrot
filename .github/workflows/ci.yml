@@ -7,8 +7,682 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
 
 jobs:
+  erlang-causal-contracts:
+    name: Erlang actual SDK and isolated guest tracing (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fixed SDK, actual TCP, serial handlers and guest retirement
+        env:
+          PARROT_ERLANG_CAUSAL_OUTPUT: ${{ runner.temp }}/erlang-causal
+        run: make test-erl-causal-rust
+      - name: Retain sources, SDK hashes, bytecode, commands and receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: erlang-causal-${{ matrix.os }}
+          path: ${{ runner.temp }}/erlang-causal
+          if-no-files-found: error
+
+  tokio-upstream-contracts:
+    name: Vendored Tokio upstream and minimal sync contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: Swatinem/rust-cache@v2
+      - name: Reject incomplete runtime reports and incorrect dependency resolution
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_tokio_upstream.py -v
+          python3 -O -m unittest discover -s scripts/tests -p test_tokio_upstream.py -v
+      - name: Actual pinned upstream suites and minimal sync consumer
+        env:
+          PARROT_TOKIO_OUTPUT: ${{ runner.temp }}/tokio-contracts
+        run: make check-tokio-upstream
+      - name: Retain commands, source hashes, lockfiles, binaries and test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokio-contracts-${{ matrix.os }}
+          path: ${{ runner.temp }}/tokio-contracts
+          if-no-files-found: error
+
+  cpp-sanitizers:
+    name: C++ ASan and UBSan contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install matching compiler and sanitizer runtimes
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-rt-dev
+          clang++ --version
+      - name: Sanitizer gate failure and evidence contracts
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_cpp_sanitizers.py -v
+          python3 -O -m unittest discover -s scripts/tests -p test_cpp_sanitizers.py -v
+      - name: Actual C++ suites and sanitizer fault controls
+        env:
+          PARROT_CPP_SANITIZER_OUTPUT: ${{ runner.temp }}/cpp-sanitizers
+        run: make check-cpp-sanitizers
+      - name: Retain source, compiler, binaries and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-sanitizers-${{ matrix.os }}
+          path: ${{ runner.temp }}/cpp-sanitizers
+          if-no-files-found: error
+
+  mailbox-notification-contracts:
+    name: Vendored mailbox notification and cancellation contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Original Flume suite and Parrot notification regressions
+        run: |
+          cargo test --locked --manifest-path vendor/flume/Cargo.toml --lib --tests
+          cargo test --locked --manifest-path vendor/flume/Cargo.toml --all-features --lib --tests
+          cargo test --locked --manifest-path vendor/flume/Cargo.toml --no-default-features --lib --tests
+          cargo test --locked --manifest-path vendor/flume/Cargo.toml --no-default-features --features async --lib --tests
+          cargo test --locked --release --manifest-path vendor/flume/Cargo.toml --lib --tests
+          cargo test --locked -p parrot-api --lib typed_channel::tests::
+          cargo test --locked -p parrot-remote --test mqtt_notification_reentrancy
+          cargo test --locked --release -p parrot-remote --test mqtt_notification_reentrancy
+
+  coverage-report-contracts:
+    name: DEV_09 coverage report checker contracts (not coverage acceptance)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reject unmeasured, incomplete and falsely rounded coverage
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_dev09_coverage.py -v
+          python3 -O -m unittest discover -s scripts/tests -p test_dev09_coverage.py -v
+
+  core-poc-reviewed:
+    name: Reviewed core POC contracts (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            runner: [ubuntu-24.04]
+          - platform: macOS
+            runner: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reviewed core POC quality and behavioral contracts
+        run: |
+          cargo fmt --manifest-path poc/Mx-poc/core-lab/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo test --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml --workspace
+          cargo test --locked --release --manifest-path poc/Mx-poc/core-lab/Cargo.toml --workspace
+          cargo run --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml -p beam-sched --example resumable
+          cargo run --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml -p supervision --example restart
+          cargo run --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml -p typed-static --example protocols
+          cargo run --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml -p derive-decouple --example neutral
+          RUSTDOCFLAGS='-D warnings' cargo doc --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml --workspace --no-deps
+          python3 poc/Mx-poc/core-lab/derive-decouple/tests/run_ui.py --target-dir poc/Mx-poc/core-lab/target --output-dir target/core-neutral-ui
+
+  ray-benchmark-contracts:
+    name: Ray benchmark correctness and owned cluster isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install pinned benchmark dependencies
+        run: python3 -m pip install -r bench/ray-bench/requirements.txt
+      - name: Failure, isolation and twenty small scenario contracts
+        run: make check-ray-bench
+
+  akka-benchmark-contracts:
+    name: Akka benchmark correctness and resource ownership
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Strict compilation, failure contracts and twenty small scenarios
+        run: make check-akka-bench
+
+  erlang-benchmark-contracts:
+    name: Erlang benchmark correctness and process ownership
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+      - name: Strict compilation, failure contracts and twenty small scenarios
+        run: make check-erlang-bench
+
+  native-actix-benchmark-contracts:
+    name: Native Actix benchmark measurement contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: Swatinem/rust-cache@v2
+      - name: Measurement and lifecycle contracts (not performance certification)
+        run: |
+          cargo fmt --manifest-path bench/actix-bench/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path bench/actix-bench/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path bench/actix-bench/Cargo.toml
+          cargo test --locked --release --manifest-path bench/actix-bench/Cargo.toml
+          python3 bench/actix-bench/tests/test_launcher.py
+
+  root-stress-contracts:
+    name: Root engine stress measurement contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Real engine measurement contracts in debug and release
+        run: |
+          cargo test --locked -p parrot --test engine_stress_actix --test engine_stress_thread --test test_stress_measurement_contract
+          cargo test --locked --release -p parrot --test engine_stress_actix --test engine_stress_thread --test test_stress_measurement_contract
+
+  core-poc-memory-safety:
+    name: Production and POC allocation Miri
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Interpret allocator contracts with strict provenance and leak detection
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: |
+          rustc -Vv
+          cargo miri test --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml -p erased-alloc
+          ./scripts/miri.sh
+
+  rust-dependency-security:
+    name: Locked Rust dependency security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Source workspace lockfile discovery and clean-checkout contracts
+        run: python3 -m unittest discover -s scripts/tests -p test_workspace_lockfiles.py -v
+      - name: Reject vulnerable, unsound and unmaintained dependencies without advisory exemptions
+        run: bash scripts/check_rust_dependencies.sh
+
+  remote-poc:
+    name: Independent remote POC wire, business and ownership contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install actual gateway runtimes
+        run: |
+          sh deploy/images/install-ray.sh
+          python3 -m pip install -e './interop/python[ray,test]'
+          python3 scripts/tests/test_ray_image_runtime.py -v
+          sudo apt-get update
+          sudo apt-get install -y erlang-base erlang-dev
+      - name: Independent POC quality and full test suite
+        run: |
+          cargo fmt --manifest-path poc/Mx-poc/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path poc/Mx-poc/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path poc/Mx-poc/Cargo.toml --no-fail-fast
+      - name: Real gateway streams, malformed input and process retirement
+        run: python3 poc/remote-poc/test_gateway_contracts.py -v
+
+  typescript-lite:
+    name: TypeScript protocol, bundle and dependency checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        node: ['18', '22']
+    defaults:
+      run:
+        working-directory: interop/typescript-lite
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: interop/typescript-lite/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:package
+      - run: npm audit --audit-level=moderate
+
+  typed-lifecycle-legacy:
+    name: Runtime contracts (${{ matrix.platform }}, ${{ matrix.profile }}, ${{ matrix.envelope }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        platform: [Linux, macOS]
+        profile: [debug, release]
+        envelope: [default, legacy]
+        include:
+          - platform: Linux
+            runner: [ubuntu-24.04]
+          - platform: macOS
+            runner: [self-hosted, macOS]
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: runtime-${{ matrix.profile }}-${{ matrix.envelope }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: interop/typescript-lite/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install C++ compiler on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+      - name: Prepare actual TypeScript and C++ interoperability tests
+        run: |
+          clang++ --version
+          npm ci --prefix interop/typescript-lite --ignore-scripts --no-audit --no-fund
+      - name: Gate selection and failure propagation contracts
+        if: matrix.profile == 'debug' && matrix.envelope == 'default'
+        run: python3 -m unittest discover -s scripts/tests -p test_runtime_gate.py -v
+      - name: Complete runtime package tests and strict lint
+        run: sh scripts/check_typed_lifecycle.sh '${{ matrix.profile }}' '${{ matrix.envelope }}'
+
+  mqtt-bridge:
+    name: MQTT bridge mTLS, ACL and durable recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install owned broker for the explicit integration gate
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mosquitto
+      - name: Deterministic bridge contracts
+        run: bash scripts/check_mqtt_bridge.sh
+      - name: Real Mosquitto TLS, ACL and reopen contract
+        run: bash scripts/check_mqtt_bridge.sh --broker
+
+  native-linux:
+    name: Native ABI and artifact scanning (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Native fixtures, scanner and ABI contracts
+        run: cargo test --locked -p parrot-abi --no-fail-fast
+      - name: ABI types without loader dependencies
+        run: cargo check --locked -p parrot-abi --no-default-features
+
+  native-external-consumers:
+    name: Native external consumers and runtime progress
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: Swatinem/rust-cache@v2
+      - name: External feature selection, lock migration and real native contracts
+        run: python3 scripts/check_native_runtime_dependency.py --output-dir '${{ runner.temp }}/native-consumer-contracts' --target-dir target
+      - name: Preserve external consumers and all positive and negative results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-external-consumers
+          path: ${{ runner.temp }}/native-consumer-contracts
+          if-no-files-found: error
+
+  wasm-linux:
+    name: Wasm sandbox and actor contracts (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Make recipe failure propagation
+        run: make check-make check-business-artifacts
+      - name: Crawler launcher process ownership
+        run: make check-crawler-launcher
+      - name: Native ABI and standalone fixture quality
+        run: |
+          cargo test --locked -p parrot-abi --features loader --no-fail-fast
+          cargo fmt --manifest-path crates/parrot-abi/tests/fixtures/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path crates/parrot-abi/tests/fixtures/Cargo.toml --all-targets -- -D warnings
+      - name: Runtime resource, recovery and host boundaries
+        run: cargo test --locked -p parrot-wasm --no-fail-fast
+      - name: Manifest Wasm/native hosts, TCP CLI, rollback and cancellation
+        run: cargo test --locked -p parrot-app --features wasm,dylib --test wasm_assembly --test dylib_assembly --test native_runtime_progress --test props_cancellation --test application_lifecycle
+      - name: Feature-disabled artifact rejection
+        run: cargo test --locked -p parrot-app --features host --test wasm_assembly --test dylib_assembly
+      - name: Node ownership, artifact limits, and real mTLS TCP/QUIC Wasm/native Admin
+        run: cargo test --locked -p parrot-node --features wasm,dylib --test wasm_actor_tests --test admin_v2_executor --test admin_ownership --test artifact_channel --test wasm_admin --test native_admin --test native_ownership --test native_runtime --test native_configuration
+      - name: Node default feature rejection and ownership
+        run: cargo test --locked -p parrot-node --no-default-features --test admin_ownership --test artifact_channel --test native_configuration
+
+      - name: Native-only Node and unsafe authorization documentation contracts
+        run: |
+          cargo test --locked -p parrot-node --features dylib --test native_admin --test native_ownership --test native_runtime --test native_configuration
+          cargo test --locked -p parrot-node --features dylib --doc
+
+  container:
+    name: Linux container build and runtime contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: scripts/tests/docker_context/go.sum
+      - name: Gateway image artifact and build-context contracts
+        run: |
+          make check-image-artifacts
+          python3 scripts/tests/test_app_image_artifacts.py -v
+          python3 scripts/tests/test_container_acceptance.py -v
+          python3 scripts/tests/test_owned_process.py -v
+          python3 -O scripts/tests/test_owned_process.py -v
+      - name: Development deployment defaults
+        run: |
+          python3 scripts/tests/test_deployment_defaults.py
+          python3 apps/websearch/tests/test_compose.py
+          python3 apps/websearch/tests/test_compose_config.py
+          python3 scripts/tests/test_websearch_images.py
+          python3 -O scripts/tests/test_websearch_images.py
+      - name: Build image, verify routing and graceful shutdown
+        run: python3 scripts/verify_container.py
+      - name: Prebuilt application image platform and execution
+        run: python3 scripts/verify_app_image.py
+      - name: Ray image offline deployment environments
+        run: python3 scripts/verify_ray_image.py
+
+  websearch-images:
+    name: Websearch four-image isolation and persistent replay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare native musl and JVM business artifacts
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools unzip
+          cargo build --locked --release -p websearch --target x86_64-unknown-linux-musl
+          make build-jvm
+          bash apps/websearch/jvm/build.sh
+          bash deploy/images/prep-jvm-libs.sh
+      - name: Build production images and verify exact business results
+        run: python3 scripts/verify_websearch_images.py --report-dir target/websearch-images-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: websearch-images-report
+          path: target/websearch-images-report
+          if-no-files-found: warn
+
+  jvm-gateway:
+    name: Polyglot integration and full workspace (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install TypeScript compiler for gateway and application interop
+        run: cd interop/typescript-lite && npm ci
+      - name: Mesh deployment generator contracts
+        run: python3 scripts/tests/test_mesh_generator.py
+      - name: Node process, runtime and JVM startup contracts
+        run: cargo test --locked -p parrot-node --tests
+      - name: Build and test real JVM gateway
+        run: make check-jvm test-jvm-gateway test-jvm-causal test-ts-jvm
+      - name: Application host and CLI business contracts
+        run: make test-app-host
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Python, Erlang and C++ gateway dependencies
+        run: |
+          sh deploy/images/install-ray.sh
+          python3 -m pip install -e './interop/python[ray,test]'
+          python3 scripts/tests/test_ray_image_runtime.py -v
+          sudo apt-get update
+          sudo apt-get install -y erlang-base erlang-dev clang unzip
+      - name: Install crawler Wasm build tools
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-tools --version 1.261.0 --locked
+      - name: Python, Erlang and component business contracts
+        run: make check-py check-erl test-app-polyglot test-crawler-app test-crawler-business test-crawler-manifest
+      - name: Generic CLI startup signal and retirement contracts
+        run: CARGO_BUILD_JOBS=2 python3 -O crates/parrot-app/tests/run_cli_shutdown.py --output /tmp/parrot-cli-shutdown
+      - name: Retain generic CLI startup signal evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parrot-cli-startup-shutdown
+          path: /tmp/parrot-cli-shutdown
+      - name: Ray gateway signal and network retirement
+        run: |
+          python3 apps/test_support/run_ray_shutdown.py
+          python3 apps/test_support/run_ray_network_shutdown.py
+          python3 apps/test_support/run_ray_gateway_retirement.py
+          python3 apps/test_support/run_ray_artifact_recovery.py
+          python3 apps/test_support/run_ray_setup_hooks.py
+          python3 apps/test_support/run_ray_task_retirement.py
+          python3 apps/test_support/run_ray_job_cancellation.py
+          python3 apps/test_support/run_ray_job_output.py
+      - name: Websearch build, launcher ownership and harness failure contracts
+        run: |
+          python3 -m unittest discover -s apps/websearch/tests -p 'test_*.py' -v
+          python3 -O -m unittest discover -s apps/websearch/tests -p test_launcher.py -v
+          python3 -O apps/websearch/tests/test_runner.py -v
+          python3 -O -m unittest discover -s apps/websearch/tests -p test_host_package.py -v
+      - name: Native host package and relocated application contracts
+        run: |
+          python3 apps/websearch/deploy/package_host.py --profile release --output /tmp/websearch-native-host.tar.gz
+          python3 apps/websearch/tests/run_portable_host.py --archive /tmp/websearch-native-host.tar.gz --report /tmp/websearch-portable-result.json
+      - name: Actual gateway process admission and rollback
+        run: |
+          CARGO_BUILD_JOBS=2 cargo build --locked -p websearch
+          python3 -O apps/websearch/tests/run_gateway_admission.py --report /tmp/websearch-admission-result.json
+      - name: Retain native host verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: websearch-native-host-report
+          path: |
+            /tmp/websearch-portable-result.json
+            /tmp/websearch-admission-result.json
+      - name: Websearch real application, indexing and replay contracts
+        run: |
+          python3 apps/websearch/tests/run_integration.py
+          python3 apps/websearch/tests/run_manifest_integration.py
+          python3 apps/websearch/tests/run_launcher_integration.py
+          python3 apps/websearch/tests/run_shutdown_integration.py
+          python3 apps/websearch/tests/run_component_lifecycle.py
+          python3 apps/websearch/tests/run_document_replay.py
+          python3 apps/websearch/tests/run_frontier_recovery.py
+          python3 apps/websearch/tests/run_journal_compaction.py --report /tmp/websearch-journal-compaction-result.json
+          python3 apps/websearch/tests/run_index_compaction.py --report /tmp/websearch-index-compaction-result.json
+          python3 apps/websearch/tests/run_index_history.py
+          python3 apps/websearch/tests/run_component_identity.py
+          python3 apps/websearch/tests/run_index_isolation.py
+          python3 apps/websearch/tests/run_distribution_integration.py
+          python3 apps/test_support/run_frontier_bfs.py
+      - name: Dashboard rendering and injection contracts
+        run: node --test tools/parrot-obs/tests/dashboard.test.cjs
+      - name: Gateway owner lifecycle and isolation contracts
+        run: |
+          python3 -m unittest discover -s tools/parrot-obs/tests -p 'test_gateway*.py' -v
+          python3 -O -m unittest discover -s tools/parrot-obs/tests -p 'test_gateway*.py' -v
+      - name: Observation CLI against owned Erlang, JVM and Ray gateways
+        run: |
+          cargo build --locked -p parrot-obs
+          python3 tools/parrot-obs/tests/run_gateways.py
+          python3 tools/parrot-obs/tests/run_owned_gateways.py
+          python3 tools/parrot-obs/tests/run_owner_retirement.py
+      - name: Full workspace with real gateway artifacts and native/Wasm hosts
+        run: cargo test --locked --workspace --features parrot-app/wasm,parrot-app/dylib,parrot-node/wasm,parrot-node/dylib,parrot-remote/mem --no-fail-fast
+      - name: Rust/JVM scalar boundaries and release RTT gate
+        run: make matrix
+      - name: Measured metrics over a real owned transport
+        run: cargo run --locked -p parrot-remote --example measured_metrics
+      - name: Cloud proxy five-minute TCP outage and recovery
+        run: cargo test --locked -p parrot-app --features host --test cloud_proxy cloud_proxy_offline_five_minutes -- --ignored --nocapture
+
   test:
     name: Test (debug)
     runs-on: [self-hosted, macOS]
@@ -19,17 +693,54 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: System Make recipe failure propagation
+        run: make check-make check-business-artifacts
+      - name: Crawler launcher process ownership
+        run: make check-crawler-launcher
       - name: Format check
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features parrot-app/wasm,parrot-app/dylib,parrot-node/wasm,parrot-node/dylib,parrot-remote/mem -- -D warnings
+      - name: Standalone native fixture quality
+        run: |
+          cargo fmt --manifest-path crates/parrot-abi/tests/fixtures/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path crates/parrot-abi/tests/fixtures/Cargo.toml --all-targets -- -D warnings
+      - name: Core, application, node and configuration public API documentation
+        env:
+          RUSTDOCFLAGS: '-D warnings'
+        run: cargo doc --locked -p parrot -p parrot-remote -p parrot-app -p parrot-node -p parrot-config --features parrot-app/dylib,parrot-node/wasm,parrot-node/dylib --no-deps
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build application gateway artifacts before workspace tests
+        run: |
+          npm ci --prefix interop/typescript-lite
+          sh deploy/images/install-ray.sh
+          python3 -m pip install --no-deps -e './interop/python'
+          command -v erl
+          command -v erlc
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-tools --version 1.261.0 --locked
+          make build-crawler-components build-ts build-crawler-business
       - name: Tests (debug)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace --features parrot-app/wasm,parrot-app/dylib,parrot-node/wasm,parrot-node/dylib,parrot-remote/mem --no-fail-fast
+      - name: Isolated C++ release throughput gate
+        run: make check-cpp-perf
       - name: Release-only threshold tests
-        run: cargo test --release -p parrot --test test_thread_advantages -- --include-ignored
+        run: make check-thread-perf
+      - name: M4 paired cross-thread release performance gate
+        run: make check-m4-perf
 
   macro-hygiene:
-    name: Derive macro engine-neutrality lint
+    name: Derive source checks and executable quickstart
     runs-on: [self-hosted, macOS]
     timeout-minutes: 30
     steps:
@@ -38,13 +749,21 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-expand
-        run: cargo install cargo-expand --locked || true
-      - name: Expand and lint
+      - name: API codec feature boundaries
         run: |
-          if command -v cargo-expand >/dev/null 2>&1; then
-            ./scripts/macro_lint.sh
-          else
-            echo "cargo-expand unavailable; falling back to source grep"
-            ! grep -rn 'parrot::actix' crates/parrot-api-derive/src/
-          fi
+          cargo check --locked -p parrot-api --no-default-features
+          cargo check --locked -p parrot-api --no-default-features --features remote
+          cargo check --locked -p parrot-api --no-default-features --features remote-protobuf
+          cargo check --locked -p parrot-wasm --lib --no-default-features
+      - name: Check derive source for literal engine paths
+        run: bash scripts/macro_lint.sh
+      - name: Compile and exercise macros without an engine dependency
+        run: cargo test --locked -p parrot-api-derive-tests
+      - name: Derive dispatch contracts
+        run: cargo test --locked -p parrot --test test_actor_macro --test test_derive_dispatch_paths
+      - name: Run README quickstart on both engines
+        run: cargo run --locked -p parrot --example quickstart
+      - name: Run bounded mirror example
+        run: cargo run --locked -p parrot --example mirror
+      - name: Actual Wire recording and fresh actor replay example
+        run: cargo run --locked -p parrot-app --example record_replay -- "$RUNNER_TEMP/parrot-example-capture.jsonl"

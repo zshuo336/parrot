@@ -3,7 +3,7 @@
 //! ## Key Concepts
 //! - ActorPath: Unique identifier and location for actors
 //! - ActorRef: Core message passing interface
-//! - WeakActorRef: Non-owning actor references
+//! - WeakActorRef: Legacy path wrapper retaining a shared target handle
 //!
 //! ## Design Principles
 //! - Type safety: Generic interfaces for type-safe message passing
@@ -15,7 +15,7 @@
 //! This module provides the addressing and message passing infrastructure
 //! for the actor system, enabling location-transparent communication.
 
-use crate::message::Message;
+use crate::message::{Message, MessageOptions};
 use crate::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage, WeakActorTarget};
 use async_trait::async_trait;
 use std::any::Any;
@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Unique identifier and location information for an actor in the system.
 ///
 /// ## Key Responsibilities
-/// - Maintains weak reference to actual actor
+/// - Retains a shared actor-reference handle
 /// - Provides hierarchical addressing
 /// - Supports path-based actor lookup
 ///
@@ -46,16 +46,17 @@ use std::time::Duration;
 /// ```rust
 /// use parrot_api::address::ActorPath;
 ///
-/// // Placeholder targets are weak refs to dropped refs; typical actors
-/// // construct their real path from a live target.
+/// // Placeholder targets are inert handles; managed actors construct their
+/// // real path from an engine-provided reference.
 /// let path = ActorPath::placeholder("local://system1/user/worker1");
 /// assert_eq!(path.path, "local://system1/user/worker1");
 /// ```
 #[derive(Debug, Clone)]
 pub struct ActorPath {
-    /// Weak reference to the actual actor implementation
-    /// - **Thread Safety**: Safe to share between threads
-    /// - **Lifecycle**: Does not prevent actor termination
+    /// Shared reference handle (`Arc<dyn ActorRef>`), despite the historical
+    /// `WeakActorTarget` alias. Cloning the path retains this handle and any
+    /// resources it owns. Actor termination follows the engine's lifecycle;
+    /// reference retention alone does not establish instance liveness.
     pub target: WeakActorTarget,
 
     /// String representation of the actor's path
@@ -69,11 +70,11 @@ impl ActorPath {
         Self { target, path }
     }
 
-    /// Creates a path with a dead placeholder target (never upgrades).
+    /// Creates a path with an inert target that rejects message delivery.
     ///
-    /// Useful for tests and for bootstrap phases where the real target
-    /// reference is created after the path. The placeholder is a weak
-    /// reference to a dropped dead ref, so `upgrade` always yields `None`.
+    /// Useful for tests and bootstrap metadata. The target is a shared
+    /// `DeadTargetRef`, not a weak pointer; it has no `upgrade` operation and
+    /// does not resolve automatically when an actor with this path is created.
     pub fn placeholder(path: impl Into<String>) -> Self {
         Self {
             target: Arc::new(DeadTargetRef) as WeakActorTarget,
@@ -180,6 +181,32 @@ pub trait ActorRef: Send + Sync + Debug {
         timeout: Option<Duration>,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
 
+    /// Sends a type-erased message while preserving its delivery metadata.
+    ///
+    /// Timeout bounds admission and response waiting, without undoing accepted
+    /// work. The default adapter enforces timeout and rejects unsupported high
+    /// priority and retry options before sending. Override to provide priority.
+    /// Retry requires an explicit replayable typed request; see `ask_retrying`.
+    fn send_with_options<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        let mut msg = crate::owned_input::Input::new(msg);
+        Box::pin(crate::trace::capture(async move {
+            let result = async {
+                options.validate_single_attempt()?;
+                options.validate_fifo()?;
+                let delegate = crate::owned_input::call(|| {
+                    self.send_with_timeout(msg.take(), options.timeout)
+                })?;
+                crate::owned_input::resolve(delegate).await
+            }
+            .await;
+            msg.finish(result)
+        }))
+    }
+
     /// Fire-and-forget delivery: enqueues the message and returns
     /// immediately after the mailbox accepts it.
     ///
@@ -189,6 +216,32 @@ pub trait ActorRef: Send + Sync + Debug {
     /// receipt. This is the explicit tell path; [`ActorRefExt::tell`] is
     /// built on it.
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>>;
+
+    /// Fire-and-forget delivery with preserved message metadata.
+    fn deliver_with_options<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        let mut msg = crate::owned_input::Input::new(msg);
+        Box::pin(crate::trace::capture(async move {
+            let result = async {
+                options.validate_single_attempt()?;
+                options.validate_fifo()?;
+                let delegate = crate::owned_input::resolve(crate::owned_input::call(|| {
+                    self.deliver(msg.take())
+                })?);
+                match options.timeout {
+                    Some(duration) => tokio::time::timeout(duration, delegate)
+                        .await
+                        .map_err(|_| crate::errors::ActorError::Timeout)?,
+                    None => delegate.await,
+                }
+            }
+            .await;
+            msg.finish(result)
+        }))
+    }
 
     /// Stops the actor
     ///
@@ -204,11 +257,12 @@ pub trait ActorRef: Send + Sync + Debug {
     /// String representation of actor location
     fn path(&self) -> String;
 
-    /// Checks actor liveness
+    /// Observes actor liveness/admission according to the reference's engine.
     ///
-    /// ## Returns
-    /// - `true`: Actor is processing messages
-    /// - `false`: Actor has terminated
+    /// This observation can change before the next operation. In managed local
+    /// engines, `false` may mean the mailbox is closed while owned cleanup is
+    /// still running. It is not a retirement receipt. Await `stop()` to join
+    /// cleanup and inspect its result; remote reachability is not termination.
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool>;
 
     /// Creates boxed clone of reference
@@ -219,6 +273,32 @@ pub trait ActorRef: Send + Sync + Debug {
 
     /// Returns a reference to the actor as a `dyn Any`
     fn as_any(&self) -> &dyn Any;
+
+    /// Generation-specific lifecycle capability. Raw or unsupported references
+    /// return None; engines must expose the same handle through every clone.
+    fn death_watch(&self) -> Option<crate::death_watch::DeathWatch> {
+        None
+    }
+
+    /// Register a managed watcher. Closed generations return Stopped; repeated
+    /// registrations coalesce. Notification delivery failures are observable
+    /// through the target handle. This does not imply durable delivery.
+    ///
+    /// The default adapter takes ownership immediately but invokes capability
+    /// callbacks only when polled. Callback and cleanup panics become errors;
+    /// cancellation also isolates watcher cleanup. An error from final cleanup
+    /// does not roll back a registration that already succeeded. Custom
+    /// implementations are responsible for their own cancellation guarantees.
+    fn watch<'a>(&'a self, watcher: BoxedActorRef) -> BoxedFuture<'a, ActorResult<()>> {
+        crate::watch_input::change(self, watcher, false)
+    }
+
+    /// Cancel a watch; an already admitted notification cannot be recalled.
+    /// The default adapter has the same input ownership and panic boundaries as
+    /// [`ActorRef::watch`]; a cleanup error does not restore a removed watch.
+    fn unwatch<'a>(&'a self, watcher: BoxedActorRef) -> BoxedFuture<'a, ActorResult<()>> {
+        crate::watch_input::change(self, watcher, true)
+    }
 
     /// Compares two actor references for equality
     ///
@@ -255,59 +335,163 @@ pub trait ActorRefExt: ActorRef {
     /// # Returns
     /// A future that resolves to the typed response or error
     fn ask<'a, M: Message>(&'a self, msg: M) -> BoxedFuture<'a, ActorResult<M::Result>> {
-        let this = self.clone_boxed();
-        Box::pin(async move {
-            let result = this.send(Box::new(msg) as BoxedMessage).await?;
-            M::extract_result(result)
-        })
+        let mut msg = crate::owned_input::Input::new(msg);
+        // Preserve eager clone/metadata evaluation, but keep both owned inputs
+        // outside the borrowed callback unwind boundary.
+        let prepared = crate::owned_input::call(|| self.clone_boxed())
+            .map(crate::owned_input::Input::new)
+            .and_then(|this| {
+                crate::owned_input::call(|| MessageOptions::for_message(msg.value()))
+                    .map(|options| (this, options))
+            });
+        Box::pin(crate::trace::capture(async move {
+            let result = match prepared {
+                Ok((this, options)) => {
+                    let result = async {
+                        let delegate = crate::owned_input::call(|| {
+                            this.value()
+                                .send_with_options(Box::new(msg.take()) as BoxedMessage, options)
+                        })?;
+                        let result = crate::owned_input::resolve(delegate).await?;
+                        crate::owned_input::call(|| M::extract_result(result))?
+                    }
+                    .await;
+                    this.finish(result)
+                }
+                Err(error) => Err(error),
+            };
+            msg.finish(result)
+        }))
     }
 
-    /// Sends a message without waiting for a response.
+    /// Ask with explicit replay consent. `MessageOptions::retry_policy` sets the
+    /// maximum number of *retries*, in addition to the initial attempt. Each
+    /// attempt gets its own timeout; delays use fixed, linear or capped
+    /// exponential backoff. The predicate decides which transport/handler errors
+    /// may be replayed. It is never called for response decoding errors.
     ///
-    /// Use this method for:
-    /// - Fire-and-forget operations
-    /// - Notifications
-    /// - Non-blocking message passing
+    /// Requires a Clone payload and a Tokio runtime. Cancellation prevents new
+    /// attempts, but previously admitted work may still run. A retry may repeat
+    /// side effects: callers must supply idempotency or explicitly accept that
+    /// risk. Actor supervision still applies to each failed attempt.
+    fn ask_retrying<'a, M, F>(
+        &'a self,
+        msg: M,
+        retry_if: F,
+    ) -> BoxedFuture<'a, ActorResult<M::Result>>
+    where
+        M: Message + Clone + Sync,
+        F: Fn(&crate::errors::ActorError) -> bool + Send + 'a,
+    {
+        let msg = crate::owned_input::Input::new(msg);
+        let mut retry_if = crate::owned_input::Input::new(retry_if);
+        Box::pin(crate::trace::capture(async move {
+            let result = async {
+                let mut options =
+                    crate::owned_input::call(|| MessageOptions::for_message(msg.value()))?;
+                let policy = options.retry_policy.take();
+                if let Some(policy) = &policy {
+                    tokio::runtime::Handle::try_current().map_err(|_| {
+                        crate::errors::ActorError::InternalError(
+                            "ask_retrying requires a Tokio runtime".into(),
+                        )
+                    })?;
+                    // Validate before any business side effect, including a base on
+                    // a zero-budget policy and clock overflow on the longest delay.
+                    policy.delay(1)?;
+                    if policy.max_attempts > 0
+                        && tokio::time::Instant::now()
+                            .checked_add(policy.delay(policy.max_attempts)?)
+                            .is_none()
+                    {
+                        return Err(crate::errors::ActorError::MessageHandlingError(
+                            "retry delay exceeds clock range".into(),
+                        ));
+                    }
+                }
+                let mut retries = 0;
+                loop {
+                    let attempt = crate::owned_input::call(|| msg.value().clone())?;
+                    let result = match crate::owned_input::call(|| {
+                        self.send_with_options(Box::new(attempt), options.clone())
+                    }) {
+                        Ok(delegate) => crate::owned_input::resolve(delegate).await,
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(reply) => return crate::owned_input::call(|| M::extract_result(reply))?,
+                        Err(error) => {
+                            let mut error = crate::owned_input::Input::new(error);
+                            let Some(policy) = &policy else {
+                                return Err(error.take());
+                            };
+                            if retries >= policy.max_attempts
+                                || !crate::owned_input::call(|| {
+                                    retry_if.value_mut()(error.value())
+                                })?
+                            {
+                                return Err(error.take());
+                            }
+                            error.retire()?;
+                            retries += 1;
+                            tokio::time::sleep(policy.delay(retries)?).await;
+                        }
+                    }
+                }
+            }
+            .await;
+            let result = msg.finish(result);
+            retry_if.finish(result)
+        }))
+    }
+
+    /// Delivers a typed message and awaits admission, not a business response.
     ///
-    /// # Type Parameters
-    /// * `M` - Message type that implements the `Message` trait
+    /// The returned future must be polled. It uses [`ActorRef::deliver_with_options`]
+    /// without spawning a task. A declared timeout requires a Tokio timer. The
+    /// underlying reference still determines executor requirements and admission
+    /// policy: a full mailbox may wait or return an error. For a remote reference,
+    /// success means admission to the local transport queue, not remote receipt.
     ///
-    /// # Parameters
-    /// * `msg` - The message to send
-    fn tell<M: Message>(&self, msg: M) {
-        let actor_ref = self.clone_boxed();
-        tokio::spawn(async move {
-            let _ = actor_ref.deliver(Box::new(msg) as BoxedMessage).await;
-        });
+    /// Sequential `tell(message).await?` calls preserve admission order through
+    /// this adapter. Concurrent futures have no call-order guarantee; mailbox
+    /// priority and remote routing retain their own ordering contracts.
+    /// Dropping an unpolled future does not deliver the message. Cancellation
+    /// while waiting follows `deliver`; it cannot undo an accepted message.
+    #[must_use = "tell must be awaited to deliver the message and observe admission errors"]
+    fn tell<'a, M: Message>(&'a self, msg: M) -> BoxedFuture<'a, ActorResult<()>> {
+        let mut msg = crate::owned_input::Input::new(msg);
+        let options = crate::owned_input::call(|| MessageOptions::for_message(msg.value()));
+        Box::pin(crate::trace::capture(async move {
+            let result = async {
+                let options = options?;
+                let delegate = crate::owned_input::call(|| {
+                    self.deliver_with_options(Box::new(msg.take()) as BoxedMessage, options)
+                })?;
+                crate::owned_input::resolve(delegate).await
+            }
+            .await;
+            msg.finish(result)
+        }))
     }
 }
 
 // Implement ActorRefExt for all types that implement ActorRef
 impl<T: ActorRef + ?Sized> ActorRefExt for T {}
 
-/// # Weak Actor Reference
+/// Legacy path wrapper retaining an [`ActorPath`] and its shared target handle.
 ///
-/// ## Overview
-/// Non-owning reference that doesn't prevent garbage collection
+/// Despite its historical name, this is not a `std::sync::Weak` pointer and
+/// does not break reference cycles. Cloning it clones the path's `Arc` target.
+/// There is no upgrade or automatic lookup operation. Use `Arc::downgrade`
+/// on an actual shared reference when weak ownership is required; resolve
+/// actor paths through the owning system when a fresh reference is needed.
 ///
-/// ## Key Responsibilities
-/// - Break reference cycles
-/// - Temporary references
-/// - Supervision without leaks
-///
-/// ## Thread Safety
-/// - Implements Send + Sync
-/// - Clone is thread-safe
-///
-/// ## Examples
 /// ```rust
 /// use parrot_api::address::{ActorPath, WeakActorRef};
 ///
-/// # async fn example() {
-/// let weak_ref = WeakActorRef::new(ActorPath::placeholder("local://sys/user/a"));
-/// // A weak ref carries the path even after the actor is gone.
-/// assert_eq!(weak_ref.path.path, "local://sys/user/a");
-/// # }
+/// let reference = WeakActorRef::new(ActorPath::placeholder("local://sys/user/a"));
+/// assert_eq!(reference.path.path, "local://sys/user/a");
 /// ```
 #[derive(Clone, Debug)]
 pub struct WeakActorRef {
@@ -318,7 +502,7 @@ pub struct WeakActorRef {
 }
 
 impl WeakActorRef {
-    /// Creates a new weak reference from an actor path.
+    /// Wraps an actor path without changing its target's ownership.
     ///
     /// # Parameters
     /// * `path` - The path of the actor to reference
@@ -409,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_path_placeholder_never_upgrades() {
+    fn actor_path_placeholder_uses_inert_target() {
         let p = ActorPath::placeholder("x://y");
         assert_eq!(p.target.path(), "dead://placeholder");
     }
@@ -585,11 +769,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_ref_ext_tell_is_fire_and_forget() {
+    async fn actor_ref_ext_tell_reports_admission() {
         let p = PingPong;
-        // tell 内部 tokio::spawn，不 panic 即通过；短暂让出确保任务执行
-        p.tell(PingMsg);
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        p.tell(PingMsg).await.unwrap();
     }
 
     #[tokio::test]

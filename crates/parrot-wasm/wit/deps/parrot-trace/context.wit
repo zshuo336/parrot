@@ -1,0 +1,14 @@
+package parrot:trace@0.1.0;
+
+interface context {
+    /// W3C byte order: exactly 16 trace bytes and 8 span bytes, both nonzero.
+    /// This metadata is not authentication, sampling state or a completed span.
+    record parent {
+        trace-id: list<u8>,
+        span-id: list<u8>,
+    }
+
+    /// Parent of the current message only. None outside a traced invocation,
+    /// including component initialization, on-start, on-drain and rebuild.
+    current-parent: func() -> option<parent>;
+}

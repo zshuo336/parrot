@@ -1,0 +1,240 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "sample-service"
+            }
+          },
+          {
+            "key": "parrot.recorder.id",
+            "value": {
+              "stringValue": "09090909090909090909090909090909"
+            }
+          },
+          {
+            "key": "parrot.recording.closed",
+            "value": {
+              "boolValue": true
+            }
+          },
+          {
+            "key": "parrot.recording.terminal",
+            "value": {
+              "boolValue": true
+            }
+          },
+          {
+            "key": "parrot.recording.counters_overflowed",
+            "value": {
+              "boolValue": false
+            }
+          },
+          {
+            "key": "parrot.recording.capacity",
+            "value": {
+              "stringValue": "8"
+            }
+          },
+          {
+            "key": "parrot.recording.retained",
+            "value": {
+              "stringValue": "0"
+            }
+          },
+          {
+            "key": "parrot.recording.exported",
+            "value": {
+              "stringValue": "2"
+            }
+          },
+          {
+            "key": "parrot.recording.unobserved_parents",
+            "value": {
+              "stringValue": "0"
+            }
+          },
+          {
+            "key": "parrot.recording.origin_unix_nano",
+            "value": {
+              "stringValue": "1700000000000000123"
+            }
+          },
+          {
+            "key": "parrot.recording.elapsed_nano",
+            "value": {
+              "stringValue": "20"
+            }
+          },
+          {
+            "key": "parrot.recording.started",
+            "value": {
+              "stringValue": "2"
+            }
+          },
+          {
+            "key": "parrot.recording.in_flight",
+            "value": {
+              "stringValue": "0"
+            }
+          },
+          {
+            "key": "parrot.recording.completed",
+            "value": {
+              "stringValue": "2"
+            }
+          },
+          {
+            "key": "parrot.recording.ok",
+            "value": {
+              "stringValue": "1"
+            }
+          },
+          {
+            "key": "parrot.recording.errors",
+            "value": {
+              "stringValue": "1"
+            }
+          },
+          {
+            "key": "parrot.recording.panicked",
+            "value": {
+              "stringValue": "0"
+            }
+          },
+          {
+            "key": "parrot.recording.cancelled",
+            "value": {
+              "stringValue": "0"
+            }
+          },
+          {
+            "key": "parrot.recording.overwritten",
+            "value": {
+              "stringValue": "0"
+            }
+          },
+          {
+            "key": "parrot.recording.drained",
+            "value": {
+              "stringValue": "2"
+            }
+          },
+          {
+            "key": "parrot.recording.rejected_after_close",
+            "value": {
+              "stringValue": "0"
+            }
+          },
+          {
+            "key": "parrot.recording.targets_truncated",
+            "value": {
+              "stringValue": "0"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "parrot",
+            "version": "0.1.0"
+          },
+          "spans": [
+            {
+              "traceId": "01010101010101010101010101010101",
+              "spanId": "0303030303030303",
+              "parentSpanId": "0202020202020202",
+              "name": "/child\n\"\\汉字",
+              "kind": 1,
+              "startTimeUnixNano": "1700000000000000125",
+              "endTimeUnixNano": "1700000000000000128",
+              "attributes": [
+                {
+                  "key": "parrot.span.sequence",
+                  "value": {
+                    "stringValue": "2"
+                  }
+                },
+                {
+                  "key": "parrot.span.kind",
+                  "value": {
+                    "stringValue": "dynamic_handler"
+                  }
+                },
+                {
+                  "key": "parrot.span.target",
+                  "value": {
+                    "stringValue": "/child\n\"\\汉字"
+                  }
+                },
+                {
+                  "key": "parrot.span.target_truncated",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "parrot.span.status",
+                  "value": {
+                    "stringValue": "error"
+                  }
+                }
+              ],
+              "status": {
+                "message": "error",
+                "code": 2
+              }
+            },
+            {
+              "traceId": "01010101010101010101010101010101",
+              "spanId": "0202020202020202",
+              "name": "/root",
+              "kind": 1,
+              "startTimeUnixNano": "1700000000000000124",
+              "endTimeUnixNano": "1700000000000000133",
+              "attributes": [
+                {
+                  "key": "parrot.span.sequence",
+                  "value": {
+                    "stringValue": "1"
+                  }
+                },
+                {
+                  "key": "parrot.span.kind",
+                  "value": {
+                    "stringValue": "application"
+                  }
+                },
+                {
+                  "key": "parrot.span.target",
+                  "value": {
+                    "stringValue": "/root"
+                  }
+                },
+                {
+                  "key": "parrot.span.target_truncated",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "parrot.span.status",
+                  "value": {
+                    "stringValue": "ok"
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

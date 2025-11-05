@@ -1,88 +1,37 @@
-// Logging System for Parrot
-//
-// This module provides a unified logging interface for the Parrot actor system.
-// It's built on top of the `tracing` ecosystem, which offers structured logging and
-// distributed tracing capabilities.
-//
-// # Usage Examples
-//
-// ## Basic Initialization
-// In a like main.rs file run initialization function
-//
-// ```rust
-// use parrot::logging;
-//
-// // Initialize with default settings (INFO level, console output)
-// logging::init_default();
-//
-// // Or initialize with custom settings
-// let config = logging::LogConfig {
-//     level: tracing::Level::DEBUG,
-//     json_format: false,
-//     ..Default::default()
-// };
-// logging::init(config);
-// ```
-//
-// ## Development Environment
-//
-// For development, use the dedicated initialization function:
-//
-// ```rust
-// use parrot::logging;
-//
-// // Initialize with development-friendly settings
-// // (DEBUG level, colored output, file/line info)
-// logging::init_development();
-// ```
-//
-// ## Production Environment
-//
-// For production, use the dedicated initialization function:
-//
-// ```rust
-// use parrot::logging;
-//
-// // Initialize with production-optimized settings
-// // (INFO level, JSON format, no file/line info for security)
-// logging::init_production();
-// ```
-//
-// ## File Logging
-//
-// To log to both console and file:
-//
-// ```rust
-// use parrot::logging;
-//
-// // Initialize with default settings plus file output
-// let config = logging::LogConfig::default();
-// logging::init_with_file(config, "/var/log/parrot/app.log").unwrap();
-// ```
-//
-// ## Using Log Macros
-//
-// ```rust
-// use parrot::logging;
-//
-// // First initialize logging
-// logging::init_default();
-//
-// // Then use the re-exported tracing macros
-// logging::info!("Application started");
-// logging::debug!("Processing item {}", item_id);
-// logging::error!("Failed to connect: {}", error);
-//
-// // Or use the specialized actor span macros
-// let span = logging::actor_span!("user_actor", "user-123");
-// let _guard = span.enter();
-//
-// // Or use the specialized lifecycle logging
-// logging::log_lifecycle!("user_actor", "user-123", "started");
-// ```
+//! Logging configuration shared by console and file output.
+//!
+//! Initialize once at process startup; subsequent successful Parrot initialization
+//! calls are no-ops. A failed file open can be retried. For recoverable startup
+//! errors, use [`init_with_file`] instead of the convenience functions that panic.
+//!
+//! ```rust
+//! use parrot::logging;
+//! logging::init_default(false);
+//! logging::info!("application started");
+//! ```
+//!
+//! Actor macros are exported at the crate root:
+//!
+//! ```rust
+//! use parrot::{actor_span, log_lifecycle};
+//! let span = actor_span!("worker", "worker-1");
+//! let _entered = span.enter();
+//! log_lifecycle!("worker", "worker-1", "started");
+//! ```
+//!
+//! File output follows the same format and filter configuration as console output:
+//!
+//! ```no_run
+//! use parrot::logging::{init_with_file, LogConfig};
+//! # fn main() -> std::io::Result<()> {
+//! init_with_file(LogConfig { json_format: true, ..Default::default() }, "service.log")?;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::io;
-use std::sync::Once;
+use std::io::IsTerminal;
+use std::sync::Mutex;
 use tracing::{Level, Subscriber};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -139,7 +88,7 @@ impl Default for LogConfig {
 }
 
 // Initialization guard to ensure we only initialize once
-static INIT: Once = Once::new();
+static INIT: Mutex<bool> = Mutex::new(false);
 
 /// Initialize the logging system with the given configuration
 ///
@@ -162,47 +111,70 @@ static INIT: Once = Once::new();
 /// init(config);
 /// ```
 pub fn init(config: LogConfig) {
-    INIT.call_once(|| {
-        let mut env_filter = EnvFilter::from_default_env().add_directive(config.level.into());
-
-        // Add any target-specific filters if provided
-        if let Some(filters) = config.target_filters {
-            for filter in filters.split(',') {
-                if let Ok(directive) = filter.parse() {
-                    env_filter = env_filter.add_directive(directive);
-                }
-            }
-        }
-
-        let fmt_layer = fmt::layer()
-            .with_ansi(atty::is(atty::Stream::Stdout))
-            .with_file(config.show_file_line)
-            .with_line_number(config.show_file_line)
-            .with_thread_names(config.show_thread_info)
-            .with_thread_ids(config.show_thread_info);
-
-        // init a basic registry
-        let registry = tracing_subscriber::registry().with(env_filter);
-
-        // add a formatting layer based on the config and convert to Box<dyn Subscriber>
-        let subscriber: Box<dyn Subscriber + Send + Sync> = if config.json_format {
-            Box::new(registry.with(fmt::layer().json().flatten_event(true)))
-        } else {
-            Box::new(registry.with(fmt_layer))
-        };
-
-        set_global_subscriber(subscriber);
-    });
+    if let Err(error) = initialize(config, None) {
+        eprintln!("Error setting global tracing subscriber: {error}");
+    }
 }
 
-// Helper function to set the global subscriber
-fn set_global_subscriber<S>(subscriber: S)
+fn format_layer<S, W>(
+    config: &LogConfig,
+    writer: W,
+    ansi: bool,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
 where
-    S: Subscriber + Send + Sync + 'static,
+    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + 'static,
+    W: for<'a> fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
-    if let Err(err) = tracing::subscriber::set_global_default(subscriber) {
-        eprintln!("Error setting global tracing subscriber: {}", err);
+    let layer = fmt::layer()
+        .with_writer(writer)
+        .with_ansi(ansi && !config.json_format)
+        .with_file(config.show_file_line)
+        .with_line_number(config.show_file_line)
+        .with_thread_names(config.show_thread_info)
+        .with_thread_ids(config.show_thread_info);
+    if config.json_format {
+        let layer = layer.json().flatten_event(true);
+        if config.show_time {
+            Box::new(layer)
+        } else {
+            Box::new(layer.without_time())
+        }
+    } else if config.show_time {
+        Box::new(layer)
+    } else {
+        Box::new(layer.without_time())
     }
+}
+
+fn initialize(config: LogConfig, log_file: Option<&str>) -> io::Result<()> {
+    let mut initialized = INIT
+        .lock()
+        .map_err(|_| io::Error::other("logging initialization lock poisoned"))?;
+    if *initialized {
+        return Ok(());
+    }
+    // Open once before reporting success. A failed open leaves initialization retryable.
+    let writer = log_file.map(file_writer).transpose()?;
+    let mut filter = EnvFilter::builder()
+        .with_default_directive(config.level.into())
+        .from_env_lossy();
+    if let Some(filters) = &config.target_filters {
+        for filter_text in filters.split(',') {
+            if let Ok(directive) = filter_text.parse() {
+                filter = filter.add_directive(directive);
+            }
+        }
+    }
+    let console = format_layer(&config, io::stdout, io::stdout().is_terminal());
+    let file = writer.map(|writer| format_layer(&config, Mutex::new(writer), false));
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(console)
+        .with(file);
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|error| io::Error::new(io::ErrorKind::AlreadyExists, error))?;
+    *initialized = true;
+    Ok(())
 }
 
 /// Utility function to create a file writer for logs
@@ -229,7 +201,11 @@ pub fn file_writer(path: &str) -> io::Result<Box<dyn io::Write + Send + Sync + '
 /// Initialize logging with both console and file output
 ///
 /// This function sets up logging to both console and a specified file path.
-/// Console output respects the ansi color setting, while file output is always plain.
+/// Both outputs use the requested format, timestamp, location and thread settings.
+/// The file never contains ANSI colors. It is opened once in append mode before
+/// success is returned; an open failure leaves initialization available for retry.
+/// After a successful Parrot initialization, subsequent calls are no-ops.
+/// A global subscriber installed by another library returns `AlreadyExists`.
 ///
 /// # Arguments
 /// * `config` - Base logging configuration
@@ -240,56 +216,26 @@ pub fn file_writer(path: &str) -> io::Result<Box<dyn io::Write + Send + Sync + '
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use parrot::logging::{self, LogConfig};
 ///
 /// let config = LogConfig::default();
 /// logging::init_with_file(config, "application.log").expect("Failed to set up file logging");
 /// ```
 pub fn init_with_file(config: LogConfig, log_file: &str) -> Result<(), io::Error> {
-    INIT.call_once(|| {
-        let env_filter = EnvFilter::from_default_env().add_directive(config.level.into());
-
-        // Console layer
-        let console_layer = fmt::layer()
-            .with_ansi(atty::is(atty::Stream::Stdout))
-            .with_file(config.show_file_line)
-            .with_line_number(config.show_file_line)
-            .with_thread_names(config.show_thread_info)
-            .with_thread_ids(config.show_thread_info);
-
-        // File layer - using a new file writer for each call
-        let log_file_path = log_file.to_string();
-
-        let file_layer = fmt::layer()
-            .with_ansi(false) // No ANSI colors in files
-            .with_writer(move || {
-                // Create a new file handle each time
-                match file_writer(&log_file_path) {
-                    Ok(writer) => writer,
-                    Err(_) => Box::new(std::io::stderr()),
-                }
-            })
-            .with_file(true) // Always include file info in the log file
-            .with_line_number(true)
-            .with_thread_names(true)
-            .with_thread_ids(true);
-
-        let subscriber = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(console_layer)
-            .with(file_layer);
-
-        set_global_subscriber(subscriber);
-    });
-
-    Ok(())
+    initialize(config, Some(log_file))
 }
 
 /// Initialize default logging for the Parrot system
 ///
 /// This sets up a reasonable default configuration that works well for most cases.
-/// It uses INFO level logging with human-readable console output.
+/// It uses INFO level logging with human-readable console output. If `use_file`
+/// is true, it also appends to [`DEFAULT_LOG_FILE`] in the current directory.
+/// For an explicit path or recoverable errors, use [`init_with_file`].
+///
+/// # Panics
+/// Panics if requested file initialization fails. Subsequent calls after successful
+/// Parrot initialization are no-ops, including changes to `use_file`.
 ///
 /// # Examples
 ///
@@ -303,9 +249,15 @@ pub fn init_with_file(config: LogConfig, log_file: &str) -> Result<(), io::Error
 /// logging::info!("Application started");
 /// ```
 pub fn init_default(use_file: bool) {
-    let _ = use_file; // reserved: file output toggle, not yet wired
-    init(LogConfig::default());
+    if use_file {
+        init_default_with_file(DEFAULT_LOG_FILE);
+    } else {
+        init(LogConfig::default());
+    }
 }
+
+/// File used by [`init_default(true)`](init_default), relative to the current directory.
+pub const DEFAULT_LOG_FILE: &str = "parrot.log";
 
 /// Initialize logging with default settings and a file output
 ///
@@ -317,7 +269,7 @@ pub fn init_default(use_file: bool) {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use parrot::logging;
 ///
 /// logging::init_default_with_file("application.log");
@@ -346,15 +298,7 @@ pub fn init_default_with_file(path: &str) {
 /// logging::init_development();
 /// ```
 pub fn init_development() {
-    let config = LogConfig {
-        level: Level::DEBUG,
-        json_format: false,
-        show_file_line: true,
-        show_thread_info: true,
-        show_time: true,
-        target_filters: Some("parrot=debug,parrot::thread=trace".to_string()),
-    };
-    init(config);
+    init(development_config());
 }
 
 /// Initialize logging with development settings and a file output
@@ -367,14 +311,14 @@ pub fn init_development() {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use parrot::logging;
 ///
 /// // Initialize with development-friendly settings and a file output
 /// logging::init_development_with_file("application.log");
 /// ```
 pub fn init_development_with_file(path: &str) {
-    let config = LogConfig::default();
+    let config = development_config();
     init_with_file(config, path).unwrap();
 }
 
@@ -397,15 +341,7 @@ pub fn init_development_with_file(path: &str) {
 /// logging::init_production();
 /// ```
 pub fn init_production() {
-    let config = LogConfig {
-        level: Level::INFO,
-        json_format: true,
-        show_file_line: false,
-        show_thread_info: true,
-        show_time: true,
-        target_filters: None,
-    };
-    init(config);
+    init(production_config());
 }
 
 /// Initialize logging with production settings and a file output
@@ -418,14 +354,14 @@ pub fn init_production() {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use parrot::logging;
 ///
 /// // Initialize with production-optimized settings and a file output
 /// logging::init_production_with_file("application.log");
 /// ```
 pub fn init_production_with_file(path: &str) {
-    let config = LogConfig::default();
+    let config = production_config();
     init_with_file(config, path).unwrap();
 }
 
@@ -441,26 +377,13 @@ pub fn init_production_with_file(path: &str) {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```rust
 /// use parrot::logging;
-///
-/// // In test modules, initialize like this
-/// #[test]
-/// fn my_test() {
-///     logging::init_test();
-///     // Your test code...
-/// }
+/// logging::init_test();
+/// logging::warn!("test diagnostic");
 /// ```
 pub fn init_test() {
-    let config = LogConfig {
-        level: Level::WARN,
-        json_format: false,
-        show_file_line: true,
-        show_thread_info: false,
-        show_time: false,
-        target_filters: None,
-    };
-    init(config);
+    init(test_config());
 }
 
 /// Initialize logging for testing with a file output
@@ -473,18 +396,13 @@ pub fn init_test() {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```no_run
 /// use parrot::logging;
-///
-/// // In test modules, initialize like this
-/// #[test]
-/// fn my_test() {
-///     logging::init_test();
-///     // Your test code...
-/// }
+/// logging::init_test_with_file("test.log");
+/// logging::warn!("test diagnostic");
 /// ```
 pub fn init_test_with_file(path: &str) {
-    let config = LogConfig::default();
+    let config = test_config();
     init_with_file(config, path).unwrap();
 }
 
@@ -508,10 +426,10 @@ pub fn init_test_with_file(path: &str) {
 #[macro_export]
 macro_rules! actor_span {
     ($actor_type:expr, $actor_id:expr) => {
-        tracing::info_span!("actor", type = $actor_type, id = $actor_id)
+        $crate::logging::info_span!("actor", type = $actor_type, id = $actor_id)
     };
     ($actor_type:expr, $actor_id:expr, $($fields:tt)*) => {
-        tracing::info_span!("actor", type = $actor_type, id = $actor_id, $($fields)*)
+        $crate::logging::info_span!("actor", type = $actor_type, id = $actor_id, $($fields)*)
     };
 }
 
@@ -534,10 +452,10 @@ macro_rules! actor_span {
 #[macro_export]
 macro_rules! message_span {
     ($message_type:expr) => {
-        tracing::debug_span!("message", type = $message_type)
+        $crate::logging::debug_span!("message", type = $message_type)
     };
     ($message_type:expr, $($fields:tt)*) => {
-        tracing::debug_span!("message", type = $message_type, $($fields)*)
+        $crate::logging::debug_span!("message", type = $message_type, $($fields)*)
     };
 }
 
@@ -560,10 +478,10 @@ macro_rules! message_span {
 #[macro_export]
 macro_rules! system_span {
     ($operation:expr) => {
-        tracing::info_span!("system", operation = $operation)
+        $crate::logging::info_span!("system", operation = $operation)
     };
     ($operation:expr, $($fields:tt)*) => {
-        tracing::info_span!("system", operation = $operation, $($fields)*)
+        $crate::logging::info_span!("system", operation = $operation, $($fields)*)
     };
 }
 
@@ -583,10 +501,10 @@ macro_rules! system_span {
 #[macro_export]
 macro_rules! log_lifecycle {
     ($actor_type:expr, $actor_id:expr, $event:expr) => {
-        tracing::info!(actor_type = $actor_type, actor_id = $actor_id, event = $event);
+        $crate::logging::info!(actor_type = $actor_type, actor_id = $actor_id, event = $event);
     };
     ($actor_type:expr, $actor_id:expr, $event:expr, $($fields:tt)*) => {
-        tracing::info!(actor_type = $actor_type, actor_id = $actor_id, event = $event, $($fields)*);
+        $crate::logging::info!(actor_type = $actor_type, actor_id = $actor_id, event = $event, $($fields)*);
     };
 }
 
@@ -606,10 +524,10 @@ macro_rules! log_lifecycle {
 #[macro_export]
 macro_rules! log_message {
     ($message_type:expr, $status:expr) => {
-        tracing::debug!(message_type = $message_type, status = $status);
+        $crate::logging::debug!(message_type = $message_type, status = $status);
     };
     ($message_type:expr, $status:expr, $($fields:tt)*) => {
-        tracing::debug!(message_type = $message_type, status = $status, $($fields)*);
+        $crate::logging::debug!(message_type = $message_type, status = $status, $($fields)*);
     };
 }
 
@@ -629,10 +547,10 @@ macro_rules! log_message {
 #[macro_export]
 macro_rules! log_system {
     ($operation:expr, $status:expr) => {
-        tracing::info!(operation = $operation, status = $status);
+        $crate::logging::info!(operation = $operation, status = $status);
     };
     ($operation:expr, $status:expr, $($fields:tt)*) => {
-        tracing::info!(operation = $operation, status = $status, $($fields)*);
+        $crate::logging::info!(operation = $operation, status = $status, $($fields)*);
     };
 }
 
@@ -653,10 +571,10 @@ macro_rules! log_system {
 #[macro_export]
 macro_rules! log_error {
     ($error:expr) => {
-        tracing::error!(error = %$error);
+        $crate::logging::error!(error = %$error);
     };
     ($error:expr, $($fields:tt)*) => {
-        tracing::error!(error = %$error, $($fields)*);
+        $crate::logging::error!(error = %$error, $($fields)*);
     };
 }
 
@@ -676,10 +594,10 @@ macro_rules! log_error {
 #[macro_export]
 macro_rules! log_scheduler {
     ($scheduler:expr, $event:expr) => {
-        tracing::debug!(scheduler = $scheduler, event = $event);
+        $crate::logging::debug!(scheduler = $scheduler, event = $event);
     };
     ($scheduler:expr, $event:expr, $($fields:tt)*) => {
-        tracing::debug!(scheduler = $scheduler, event = $event, $($fields)*);
+        $crate::logging::debug!(scheduler = $scheduler, event = $event, $($fields)*);
     };
 }
 
@@ -707,7 +625,7 @@ macro_rules! log_scheduler {
 ///     let _guard = tracing::dispatcher::set_default(&dispatcher);
 ///     // Logs in this thread will use the same configuration
 ///     tracing::info!("Worker thread started");
-/// });
+/// }).join().unwrap();
 /// ```
 #[inline]
 pub fn current_subscriber() -> tracing::Dispatch {
@@ -715,4 +633,37 @@ pub fn current_subscriber() -> tracing::Dispatch {
 }
 
 // Re-export the most commonly used tracing macros for convenience
-pub use tracing::{debug, error, info, trace, warn};
+pub use tracing::{debug, debug_span, error, info, info_span, trace, warn};
+
+fn development_config() -> LogConfig {
+    LogConfig {
+        level: Level::DEBUG,
+        json_format: false,
+        show_file_line: true,
+        show_thread_info: true,
+        show_time: true,
+        target_filters: Some("parrot=debug,parrot::thread=trace".to_string()),
+    }
+}
+
+fn production_config() -> LogConfig {
+    LogConfig {
+        level: Level::INFO,
+        json_format: true,
+        show_file_line: false,
+        show_thread_info: true,
+        show_time: true,
+        target_filters: None,
+    }
+}
+
+fn test_config() -> LogConfig {
+    LogConfig {
+        level: Level::WARN,
+        json_format: false,
+        show_file_line: true,
+        show_thread_info: false,
+        show_time: false,
+        target_filters: None,
+    }
+}

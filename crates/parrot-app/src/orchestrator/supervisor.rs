@@ -65,41 +65,7 @@ use parrot_remote::admin_v2::{ComponentDeploy, ComponentStateReport};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// desired 状态持久化（E1：提交即持久——崩溃恢复 / Raft 共识由此承载）。
-pub trait DesiredStateStore: Send + Sync {
-    /// 追加新版本 desired（单调递增 rev）。
-    fn persist(&self, rev: u64, m: &AppManifest) -> Result<(), String>;
-    /// 读最新持久版本（None = 从未提交）。
-    fn latest(&self) -> Result<Option<(u64, AppManifest)>, String>;
-}
-
-/// 内存实现（测试 / 单机非持久形态）。
-#[derive(Default)]
-pub struct MemStateStore {
-    inner: std::sync::Mutex<BTreeMap<u64, AppManifest>>,
-}
-
-impl MemStateStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl DesiredStateStore for MemStateStore {
-    fn persist(&self, rev: u64, m: &AppManifest) -> Result<(), String> {
-        self.inner.lock().unwrap().insert(rev, m.clone());
-        Ok(())
-    }
-    fn latest(&self) -> Result<Option<(u64, AppManifest)>, String> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .iter()
-            .next_back()
-            .map(|(r, m)| (*r, m.clone())))
-    }
-}
+pub use super::state::{DesiredStateRecord, DesiredStateStore, MemStateStore, PendingUpgrade};
 
 /// 调和动作（diff 产物——宿主按序执行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,13 +88,29 @@ pub struct ReconcileReport {
     pub converged: bool,
 }
 
+/// Placement metadata supplied by the authenticated host discovery layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedNode {
+    pub engine: crate::EngineKind,
+    pub role: String,
+    pub realm: String,
+    pub labels: Vec<String>,
+}
+
 /// observed 视图（E3 喂入 / 手动注入）。
 #[derive(Debug, Clone, Default)]
 pub struct ObservedState {
-    /// path 前缀 → 实例报告（parrot: /user/comp；方言网关各自映射）。
+    /// Complete component reports (parrot: /user/comp). In network mode a
+    /// missing entry is unknown; an empty entry with matching node provenance
+    /// records one successful status query that found no instances.
     pub components: BTreeMap<String, Vec<ComponentStateReport>>,
+    /// Authenticated node source of each complete component cohort.
+    pub component_nodes: BTreeMap<String, String>,
     /// 存活节点（placement 过滤数据源；空 = 不过滤——本地单机形态）。
     pub live_nodes: Vec<String>,
+    /// True after an actual links snapshot, including an empty snapshot.
+    pub links_known: bool,
+    pub node_metadata: BTreeMap<String, ObservedNode>,
 }
 
 impl ObservedState {
@@ -165,16 +147,25 @@ pub fn default_node(spec: &ComponentSpec) -> String {
 
 /// AppSupervisor（desired/observed 差分调和——无内部循环，测试逐形态驱动）。
 pub struct AppSupervisor {
-    desired: AppManifest,
+    limits: crate::limits::ApplicationLimits,
+    pub(super) state: DesiredStateRecord,
+    mirror_executor: bool,
     store: Arc<dyn DesiredStateStore>,
     /// 注入时钟（时间纪律——协调/超时判定数据源；E1 首版未消费，
     /// 保留为协议位：RolloutTracker 超时与调和周期将读取）。
     #[allow(dead_code)]
     clock: Arc<dyn Clock>,
-    /// 提交修订号（每次 submit 递增——持久化键）。
-    rev: u64,
-    /// 升级在途标记（RolloutTracker 驱动——Drain/Deploy 间隙的 Wait 来源）。
-    in_flight: std::collections::BTreeMap<String, UpgradePolicy>,
+}
+
+// ComponentDeploy has no application policy ownership/receipt protocol yet.
+// Local AssemblingContext supports mirrors; cluster reconciliation must reject
+// them before persistence instead of reporting component-only convergence.
+fn require_mirror_executor(manifest: &AppManifest) -> Result<(), String> {
+    if manifest.mirrors.is_empty() {
+        Ok(())
+    } else {
+        Err("cluster mirror reconciliation is not implemented; use local application assembly for mirror policies".into())
+    }
 }
 
 impl AppSupervisor {
@@ -182,46 +173,187 @@ impl AppSupervisor {
         manifest: AppManifest,
         store: Arc<dyn DesiredStateStore>,
         clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self {
-            desired: manifest,
+    ) -> Result<Self, String> {
+        Self::new_with_limits(
+            manifest,
             store,
             clock,
-            rev: 0,
-            in_flight: BTreeMap::new(),
-        }
+            crate::limits::ApplicationLimits::default(),
+        )
+    }
+    /// The same host policy applies to initial desired state and later submits.
+    pub fn new_with_limits(
+        manifest: AppManifest,
+        store: Arc<dyn DesiredStateStore>,
+        clock: Arc<dyn Clock>,
+        limits: crate::limits::ApplicationLimits,
+    ) -> Result<Self, String> {
+        Self::with_executor(manifest, store, clock, limits, false)
+    }
+    pub(super) fn with_executor(
+        manifest: AppManifest,
+        store: Arc<dyn DesiredStateStore>,
+        clock: Arc<dyn Clock>,
+        limits: crate::ApplicationLimits,
+        mirror_executor: bool,
+    ) -> Result<Self, String> {
+        let state = match store.latest()? {
+            Some(state) => {
+                if state.manifest.name != manifest.name {
+                    return Err("stored application identity differs from bootstrap".into());
+                }
+                state.validate(&limits)?;
+                if !mirror_executor {
+                    require_mirror_executor(&state.manifest)?;
+                    if !state.mirrors.is_empty() {
+                        return Err("mirror retirement requires MirrorSupervisor".into());
+                    }
+                }
+                state
+            }
+            None => {
+                let state = DesiredStateRecord {
+                    mirrors: Default::default(),
+                    revision: 1,
+                    manifest,
+                    pending: BTreeMap::new(),
+                };
+                state.validate(&limits)?;
+                if !mirror_executor {
+                    require_mirror_executor(&state.manifest)?;
+                    if !state.mirrors.is_empty() {
+                        return Err("mirror retirement requires MirrorSupervisor".into());
+                    }
+                }
+                store.commit(None, &state)?;
+                state
+            }
+        };
+        Ok(Self {
+            mirror_executor,
+            limits,
+            state,
+            store,
+            clock,
+        })
     }
 
-    /// 新版本 desired（升级入口——提交即持久化）。
+    /// Commit complete desired state and pending rollout ownership atomically.
     pub fn submit(&mut self, m: AppManifest) -> Result<(), String> {
-        m.validate_or_err()?;
-        self.rev += 1;
-        self.store.persist(self.rev, &m)?;
-        // 在途升级登记（版本变化的组件——RolloutTracker 协同）
-        for c in &m.components {
-            if let Some(old) = self.desired.components.iter().find(|o| o.name == c.name) {
-                if old.artifact != c.artifact || old.instances != c.instances {
-                    self.in_flight.insert(c.name.clone(), c.upgrade.clone());
+        crate::manifest::validate_with_limits(&m, &self.limits).map_err(|e| format!("{e:?}"))?;
+        if !self.mirror_executor {
+            require_mirror_executor(&m)?;
+        }
+        if m.name != self.state.manifest.name {
+            return Err("cannot change application identity".into());
+        }
+        self.require_current()?;
+        if canonical(&m)? == canonical(&self.state.manifest)? {
+            return Ok(());
+        }
+        let revision = self.next_revision()?;
+        let mut pending = self.state.pending.clone();
+        pending.retain(|name, _| m.component(name).is_some());
+        let global_change = m.version != self.state.manifest.version
+            || m.config_overlay.as_ref().map(canonical).transpose()?
+                != self
+                    .state
+                    .manifest
+                    .config_overlay
+                    .as_ref()
+                    .map(canonical)
+                    .transpose()?
+            || m.wiring != self.state.manifest.wiring;
+        for component in &m.components {
+            if let Some(old) = self.state.manifest.component(&component.name) {
+                if global_change || canonical(component)? != canonical(old)? {
+                    pending.insert(
+                        component.name.clone(),
+                        PendingUpgrade {
+                            generation: revision,
+                            policy: component.upgrade.clone(),
+                        },
+                    );
                 }
             }
         }
-        self.desired = m;
+        let next = DesiredStateRecord {
+            mirrors: self.state.mirrors.clone(),
+            revision,
+            manifest: m,
+            pending,
+        };
+        next.validate(&self.limits)?;
+        if !self.mirror_executor {
+            require_mirror_executor(&next.manifest)?;
+            if !next.mirrors.is_empty() {
+                return Err("mirror retirement requires MirrorSupervisor".into());
+            }
+        }
+        self.store.commit(Some(self.state.revision), &next)?;
+        self.state = next;
         Ok(())
     }
 
-    /// 当前 desired（只读——测试断言 / RolloutTracker 输入）。
     pub fn desired(&self) -> &AppManifest {
-        &self.desired
+        &self.state.manifest
     }
-
-    /// 在途升级策略（RolloutTracker 协同查询）。
+    pub fn revision(&self) -> u64 {
+        self.state.revision
+    }
     pub fn upgrade_in_flight(&self, comp: &str) -> Option<&UpgradePolicy> {
-        self.in_flight.get(comp)
+        self.state.pending.get(comp).map(|p| &p.policy)
     }
-
-    /// 升级完成清记（RolloutTracker Done 后调用）。
-    pub fn finish_upgrade(&mut self, comp: &str) {
-        self.in_flight.remove(comp);
+    pub fn upgrade_generation(&self, comp: &str) -> Option<u64> {
+        self.state.pending.get(comp).map(|p| p.generation)
+    }
+    /// The executor must acknowledge the generation it actually deployed.
+    /// Late completions cannot clear newer work. Completion is itself persisted.
+    pub fn finish_upgrade(&mut self, comp: &str, generation: u64) -> Result<bool, String> {
+        self.require_current()?;
+        if self.upgrade_generation(comp) != Some(generation) {
+            return Ok(false);
+        }
+        let mut next = self.state.clone();
+        next.revision = self.next_revision()?;
+        next.pending.remove(comp);
+        self.store.commit(Some(self.state.revision), &next)?;
+        self.state = next;
+        Ok(true)
+    }
+    pub fn refresh(&mut self) -> Result<(), String> {
+        let next = self
+            .store
+            .latest()?
+            .ok_or("committed desired state disappeared")?;
+        if next.manifest.name != self.state.manifest.name || next.revision < self.state.revision {
+            return Err("invalid desired state recovery identity or revision".into());
+        }
+        next.validate(&self.limits)?;
+        if !self.mirror_executor {
+            require_mirror_executor(&next.manifest)?;
+            if !next.mirrors.is_empty() {
+                return Err("mirror retirement requires MirrorSupervisor".into());
+            }
+        }
+        self.state = next;
+        Ok(())
+    }
+    fn next_revision(&self) -> Result<u64, String> {
+        self.state
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "desired revision exhausted".into())
+    }
+    pub(super) fn require_current(&self) -> Result<(), String> {
+        let revision = self
+            .store
+            .current_revision()?
+            .ok_or("committed desired state disappeared")?;
+        if revision != self.state.revision {
+            return Err("desired state revision conflict; refresh required".into());
+        }
+        Ok(())
     }
 
     /// 调和一步：desired vs observed diff → 动作清单。
@@ -234,114 +366,361 @@ impl AppSupervisor {
     /// 4. 实例数不符 → Deploy（补齐）/ Drain 缺口
     /// 5. 状态退化（非 running 且应有）→ Wait（监督自愈预期）
     pub fn reconcile_once(&self, observed: &ObservedState) -> ReconcileReport {
+        if !self.state.manifest.mirrors.is_empty() || !self.state.mirrors.is_empty() {
+            return ReconcileReport {
+                actions: vec![ReconcileAction::Wait {
+                    comp: self.state.manifest.name.clone(),
+                    reason: "mirror executor receipt required".into(),
+                }],
+                converged: false,
+            };
+        }
+        self.reconcile_components(observed)
+    }
+    pub(super) fn commit_mirrors(
+        &mut self,
+        mirrors: BTreeMap<String, super::mirror::MirrorIntent>,
+    ) -> Result<(), String> {
+        self.require_current()?;
+        let mut next = self.state.clone();
+        next.revision = self.next_revision()?;
+        next.mirrors = mirrors;
+        next.validate(&self.limits)?;
+        self.store.commit(Some(self.state.revision), &next)?;
+        self.state = next;
+        Ok(())
+    }
+    pub(super) fn reconcile_components(&self, observed: &ObservedState) -> ReconcileReport {
+        if let Err(reason) = self
+            .require_current()
+            .and_then(|_| check_observed(observed, &self.limits))
+        {
+            return ReconcileReport {
+                actions: vec![ReconcileAction::Wait {
+                    comp: self.state.manifest.name.clone(),
+                    reason,
+                }],
+                converged: false,
+            };
+        }
         let mut actions = Vec::new();
-        let mut converged = true;
-        for spec in &self.desired.components {
-            let node = Self::node_for(spec, observed);
-            let want = desired_instances(&spec.instances);
-            let have = observed.instance_count(&spec.name);
-            let versions = observed.versions_of(&spec.name);
-            if have == 0 {
-                // 形态 1：缺失
-                actions.push(ReconcileAction::Deploy {
-                    comp: spec.name.clone(),
-                    node,
-                });
-                converged = false;
-                continue;
-            }
-            if self.in_flight.contains_key(&spec.name) {
-                // 升级在途——RolloutTracker 驱动（reconcile 不抢跑）
+        for spec in &self.state.manifest.components {
+            if self.state.pending.contains_key(&spec.name) {
                 actions.push(ReconcileAction::Wait {
                     comp: spec.name.clone(),
                     reason: "upgrade in flight".into(),
                 });
-                converged = false;
                 continue;
             }
-            if !versions.iter().all(|v| v == "1") {
-                // 形态 3：版本不符（desired 部署版本约定 "1"——
-                // deploy_payload 同约定；无在途登记走同步重建弧）
-                actions.push(ReconcileAction::Drain {
-                    comp: spec.name.clone(),
-                });
-                actions.push(ReconcileAction::Deploy {
-                    comp: spec.name.clone(),
-                    node,
-                });
-                converged = false;
-                continue;
-            }
-            if have < want {
-                // 形态 4a：实例不足
-                actions.push(ReconcileAction::Deploy {
-                    comp: spec.name.clone(),
-                    node,
-                });
-                converged = false;
-            } else if have > want {
-                // 形态 4b：实例过剩
-                actions.push(ReconcileAction::Drain {
-                    comp: spec.name.clone(),
-                });
-                converged = false;
-            } else if !observed.any_running(&spec.name) {
-                // 形态 5：全实例非 running（starting 等）——等监督
+            if spec.deps.iter().any(|name| {
+                self.state.pending.contains_key(name)
+                    || !Self::healthy_observation(
+                        self.state
+                            .manifest
+                            .component(name)
+                            .expect("validated dependency"),
+                        &self.state.manifest.version,
+                        observed,
+                    )
+            }) {
                 actions.push(ReconcileAction::Wait {
                     comp: spec.name.clone(),
-                    reason: "instances not running".into(),
+                    reason: "dependencies not ready".into(),
                 });
-                converged = false;
+                continue;
+            }
+            let reports = observed
+                .components
+                .get(&spec.name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut unique = std::collections::BTreeSet::new();
+            if reports
+                .iter()
+                .any(|r| !owned_root(&spec.name, &r.path) || !unique.insert(r.path.as_str()))
+            {
+                actions.push(ReconcileAction::Wait {
+                    comp: spec.name.clone(),
+                    reason: "ambiguous or foreign instance reports".into(),
+                });
+                continue;
+            }
+            let Some(node) = Self::node_for(spec, observed) else {
+                actions.push(ReconcileAction::Wait {
+                    comp: spec.name.clone(),
+                    reason: "no eligible live node".into(),
+                });
+                continue;
+            };
+            // No observation is not a negative status receipt. In particular,
+            // link loss and generation invalidation deliberately erase stale
+            // cohorts; they must not authorize a duplicate deployment elsewhere.
+            // An empty report is useful only for the node we intend to mutate.
+            if observed.links_known
+                && reports.is_empty()
+                && (!observed.components.contains_key(&spec.name)
+                    || observed.component_nodes.get(&spec.name) != Some(&node))
+            {
+                actions.push(ReconcileAction::Wait {
+                    comp: spec.name.clone(),
+                    reason: "target component absence has not been observed".into(),
+                });
+                continue;
+            }
+            if observed.links_known
+                && !reports.is_empty()
+                && !observed
+                    .component_nodes
+                    .get(&spec.name)
+                    .is_some_and(|node| Self::eligible_node(spec, node, observed))
+            {
+                actions.push(ReconcileAction::Wait {
+                    comp: spec.name.clone(),
+                    reason: "component source node is missing, offline or ineligible".into(),
+                });
+                continue;
+            }
+            if Self::healthy_observation(spec, &self.state.manifest.version, observed) {
+                continue;
+            }
+            if reports
+                .iter()
+                .any(|r| !matches!(r.state.as_str(), "running" | "failed" | "stopped"))
+            {
+                actions.push(ReconcileAction::Wait {
+                    comp: spec.name.clone(),
+                    reason: "instances transitioning".into(),
+                });
+                continue;
+            }
+
+            // The component admin protocol deploys a complete policy, not one
+            // missing index. Retire the old cohort before replacing a partial,
+            // failed, scaled or wrong-version cohort.
+            if !reports.is_empty() {
+                actions.push(ReconcileAction::Drain {
+                    comp: spec.name.clone(),
+                });
+                actions.push(ReconcileAction::Stop {
+                    comp: spec.name.clone(),
+                });
+            }
+            actions.push(ReconcileAction::Deploy {
+                comp: spec.name.clone(),
+                node,
+            });
+        }
+        for (comp, reports) in &observed.components {
+            if self.state.manifest.component(comp).is_none() && !reports.is_empty() {
+                if reports.iter().any(|r| !owned_root(comp, &r.path))
+                    || (observed.links_known
+                        && !observed
+                            .component_nodes
+                            .get(comp)
+                            .is_some_and(|node| observed.live_nodes.contains(node)))
+                {
+                    actions.push(ReconcileAction::Wait {
+                        comp: comp.clone(),
+                        reason: "foreign removal reports".into(),
+                    });
+                } else {
+                    actions.push(ReconcileAction::Drain { comp: comp.clone() });
+                    actions.push(ReconcileAction::Stop { comp: comp.clone() });
+                }
             }
         }
-        // 形态 2：多余组件（desired 无 / observed 有）
-        for comp in observed.components.keys() {
-            if !self.desired.components.iter().any(|c| &c.name == comp) {
-                actions.push(ReconcileAction::Drain { comp: comp.clone() });
-                actions.push(ReconcileAction::Stop { comp: comp.clone() });
-                converged = false;
-            }
+        ReconcileReport {
+            converged: actions.is_empty(),
+            actions,
         }
-        ReconcileReport { actions, converged }
     }
 
     /// placement 解析目标节点（live_nodes 空 → 默认节点名）。
-    fn node_for(spec: &ComponentSpec, observed: &ObservedState) -> String {
+    fn node_for(spec: &ComponentSpec, observed: &ObservedState) -> Option<String> {
         let wants = &spec.placement;
-        if observed.live_nodes.is_empty() {
-            return default_node(spec);
+        // One component-wide Deploy cannot spread a pool across hosts. Never
+        // silently degrade an anti-affinity request to one host.
+        if wants.anti_affinity && spec.instances.instance_count() > 1 {
+            return None;
         }
-        // 首版规则：engine 匹配的首个存活节点（anti_affinity 由多组件
-        // 展开时的宿主分配层处理——此处单节点选择）
-        let engine_prefix = spec.engine.as_str();
+        if observed.live_nodes.is_empty() && !observed.links_known && *wants == Default::default() {
+            return Some(default_node(spec));
+        }
         observed
             .live_nodes
             .iter()
-            .find(|n| n.starts_with(engine_prefix) || wants.matches(n))
+            .filter(|node| Self::eligible_node(spec, node, observed))
+            .min()
             .cloned()
-            .unwrap_or_else(|| default_node(spec))
+    }
+    fn eligible_node(spec: &ComponentSpec, node: &str, observed: &ObservedState) -> bool {
+        let wants = &spec.placement;
+        observed.live_nodes.iter().any(|n| n == node)
+            && if let Some(metadata) = observed.node_metadata.get(node) {
+                metadata.engine == spec.engine
+                    && wants.role.as_ref().is_none_or(|v| v == &metadata.role)
+                    && wants.realm.as_ref().is_none_or(|v| v == &metadata.realm)
+                    && wants
+                        .label
+                        .as_ref()
+                        .is_none_or(|v| metadata.labels.contains(v))
+            } else {
+                *wants == Default::default()
+                    && node.starts_with(&format!("{}-", spec.engine.as_str()))
+            }
+    }
+    pub(super) fn healthy_observation(
+        spec: &ComponentSpec,
+        version: &str,
+        observed: &ObservedState,
+    ) -> bool {
+        if observed.links_known
+            && spec.placement.anti_affinity
+            && desired_instances(&spec.instances) > 1
+        {
+            return false;
+        }
+        healthy(
+            spec,
+            version,
+            observed
+                .components
+                .get(&spec.name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ) && (!observed.links_known
+            || observed
+                .component_nodes
+                .get(&spec.name)
+                .is_some_and(|node| Self::eligible_node(spec, node, observed)))
     }
 
     /// ComponentDeploy 生成（Deploy 动作的载荷——宿主下发 admin-v2）。
-    pub fn deploy_payload(spec: &ComponentSpec) -> ComponentDeploy {
-        ComponentDeploy {
-            name: spec.name.clone(),
-            version: "1".into(),
-            artifact: spec.artifact.clone().into_admin(),
-            instances: match &spec.instances {
-                InstancePolicy::Singleton | InstancePolicy::Ephemeral => {
-                    parrot_remote::admin_v2::AdminInstancePolicy::Singleton
-                }
-                InstancePolicy::Pool(n) => {
-                    parrot_remote::admin_v2::AdminInstancePolicy::Pool { count: *n }
-                }
-                InstancePolicy::Sharded(n) => {
-                    parrot_remote::admin_v2::AdminInstancePolicy::Sharded { count: *n }
-                }
-            },
-            config: None,
-        }
+    pub fn deploy_payload(&self, spec: &ComponentSpec) -> Result<ComponentDeploy, String> {
+        spec.deployment(&self.state.manifest.version)
     }
+}
+
+fn canonical(value: &impl serde::Serialize) -> Result<String, String> {
+    toml::to_string(value).map_err(|e| e.to_string())
+}
+pub(super) fn owned_root(comp: &str, path: &str) -> bool {
+    let Some(root) = path.strip_prefix("/user/") else {
+        return false;
+    };
+    if !crate::manifest::valid_path_segment(comp) {
+        return false;
+    }
+    if root == comp {
+        return true;
+    }
+    root.strip_prefix(comp)
+        .and_then(|s| s.strip_prefix('-'))
+        .is_some_and(|s| {
+            !s.is_empty()
+                && (s == "0" || !s.starts_with('0'))
+                && s.bytes().all(|b| b.is_ascii_digit())
+                && s.parse::<u32>().is_ok()
+        })
+}
+fn healthy(spec: &ComponentSpec, version: &str, reports: &[ComponentStateReport]) -> bool {
+    if reports.len() != desired_instances(&spec.instances) {
+        return false;
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    reports.iter().all(|r| {
+        r.state == "running"
+            && r.version == version
+            && owned_root(&spec.name, &r.path)
+            && !r.path[6..].contains('/')
+            && spec.owns_wire_path(&r.path)
+            && paths.insert(r.path.as_str())
+    })
+}
+fn check_observed(
+    observed: &ObservedState,
+    limits: &crate::ApplicationLimits,
+) -> Result<(), String> {
+    use crate::limits::{add, check};
+    let check_all = || -> Result<(), crate::AdmissionError> {
+        check(
+            "observed components",
+            observed.components.len() as u64,
+            limits.max_components,
+        )?;
+        check(
+            "observed live nodes",
+            observed.live_nodes.len() as u64,
+            limits.max_candidates,
+        )?;
+        let (mut rows, mut bytes) = (0, 0);
+        for (name, reports) in &observed.components {
+            add(
+                "observed instances",
+                &mut rows,
+                reports.len() as u64,
+                limits.max_instances,
+            )?;
+            add(
+                "observed bytes",
+                &mut bytes,
+                name.len() as u64,
+                limits.max_metadata_bytes,
+            )?;
+            for r in reports {
+                add(
+                    "observed bytes",
+                    &mut bytes,
+                    (r.path.len()
+                        + r.state.len()
+                        + r.version.len()
+                        + std::mem::size_of::<ComponentStateReport>()) as u64,
+                    limits.max_metadata_bytes,
+                )?;
+            }
+        }
+        check(
+            "observed node metadata",
+            observed.node_metadata.len() as u64,
+            limits.max_candidates,
+        )?;
+        for (node, metadata) in &observed.node_metadata {
+            for value in std::iter::once(node)
+                .chain([&metadata.role, &metadata.realm])
+                .chain(metadata.labels.iter())
+            {
+                add(
+                    "observed bytes",
+                    &mut bytes,
+                    (value.len() + std::mem::size_of::<String>()) as u64,
+                    limits.max_metadata_bytes,
+                )?;
+            }
+        }
+        check(
+            "observed component sources",
+            observed.component_nodes.len() as u64,
+            limits.max_components,
+        )?;
+        for (comp, node) in &observed.component_nodes {
+            add(
+                "observed bytes",
+                &mut bytes,
+                (comp.len() + node.len() + 2 * std::mem::size_of::<String>()) as u64,
+                limits.max_metadata_bytes,
+            )?;
+        }
+        for node in &observed.live_nodes {
+            add(
+                "observed bytes",
+                &mut bytes,
+                node.len() as u64,
+                limits.max_metadata_bytes,
+            )?;
+        }
+        Ok(())
+    };
+    check_all().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -356,6 +735,7 @@ mod tests {
             version: "1.0.0".into(),
             components: comps,
             wiring: vec![],
+            mirrors: Vec::new(),
             config_overlay: None,
         }
     }
@@ -383,6 +763,7 @@ mod tests {
             Arc::new(MemStateStore::new()),
             Arc::new(FakeClock::new(1_000)),
         )
+        .unwrap()
     }
 
     fn report(comp: &str, state: &str, version: &str) -> ObservedState {
@@ -417,15 +798,17 @@ mod tests {
     #[test]
     fn diff_converged_empty_actions() {
         let s = sup(manifest("app", vec![spec("a")]));
-        let r = s.reconcile_once(&report("a", "running", "1"));
+        let r = s.reconcile_once(&report("a", "running", "1.0.0"));
         assert!(r.actions.is_empty());
         assert!(r.converged);
     }
 
     #[test]
     fn diff_extra_drains_then_stops() {
-        let s = sup(manifest("app", vec![]));
-        let o = report("orphan", "running", "1");
+        let s = sup(manifest("app", vec![spec("a")]));
+        let mut o = report("orphan", "running", "1.0.0");
+        o.components
+            .extend(report("a", "running", "1.0.0").components);
         let r = s.reconcile_once(&o);
         assert_eq!(
             r.actions,
@@ -449,6 +832,7 @@ mod tests {
             r.actions,
             vec![
                 ReconcileAction::Drain { comp: "a".into() },
+                ReconcileAction::Stop { comp: "a".into() },
                 ReconcileAction::Deploy {
                     comp: "a".into(),
                     node: "parrot-gw-1".into()
@@ -460,7 +844,7 @@ mod tests {
     #[test]
     fn diff_not_running_waits() {
         let s = sup(manifest("app", vec![spec("a")]));
-        let r = s.reconcile_once(&report("a", "starting", "1"));
+        let r = s.reconcile_once(&report("a", "starting", "1.0.0"));
         assert!(matches!(r.actions[0], ReconcileAction::Wait { .. }));
         assert!(!r.converged);
     }
@@ -480,13 +864,22 @@ mod tests {
                 .map(|i| ComponentStateReport {
                     path: format!("/user/p-{i}"),
                     state: "running".into(),
-                    version: "1".into(),
+                    version: "1.0.0".into(),
                 })
                 .collect(),
         );
         let r = s.reconcile_once(&o);
-        assert_eq!(r.actions.len(), 1);
-        assert!(matches!(r.actions[0], ReconcileAction::Deploy { .. }));
+        assert_eq!(
+            r.actions,
+            vec![
+                ReconcileAction::Drain { comp: "p".into() },
+                ReconcileAction::Stop { comp: "p".into() },
+                ReconcileAction::Deploy {
+                    comp: "p".into(),
+                    node: "parrot-gw-1".into()
+                },
+            ]
+        );
         // 4/3 → Drain 减
         let mut o4 = ObservedState::default();
         o4.components.insert(
@@ -495,14 +888,21 @@ mod tests {
                 .map(|i| ComponentStateReport {
                     path: format!("/user/p-{i}"),
                     state: "running".into(),
-                    version: "1".into(),
+                    version: "1.0.0".into(),
                 })
                 .collect(),
         );
         let r4 = s.reconcile_once(&o4);
         assert_eq!(
             r4.actions,
-            vec![ReconcileAction::Drain { comp: "p".into() }]
+            vec![
+                ReconcileAction::Drain { comp: "p".into() },
+                ReconcileAction::Stop { comp: "p".into() },
+                ReconcileAction::Deploy {
+                    comp: "p".into(),
+                    node: "parrot-gw-1".into()
+                }
+            ]
         );
     }
 
@@ -512,13 +912,13 @@ mod tests {
     fn reconcile_idempotent_when_converged() {
         let s = sup(manifest("app", vec![spec("a"), spec("b")]));
         let o = {
-            let mut o = report("a", "running", "1");
+            let mut o = report("a", "running", "1.0.0");
             o.components.insert(
                 "b".into(),
                 vec![ComponentStateReport {
                     path: "/user/b".into(),
                     state: "running".into(),
-                    version: "1".into(),
+                    version: "1.0.0".into(),
                 }],
             );
             o
@@ -538,15 +938,16 @@ mod tests {
             manifest("app", vec![spec("a")]),
             store.clone(),
             Arc::new(FakeClock::new(0)),
-        );
+        )
+        .unwrap();
         let mut v2 = spec("a");
         v2.artifact = ArtifactRef::Props {
             factory: "f-a-v2".into(),
         };
         s.submit(manifest("app", vec![v2])).unwrap();
-        let (rev, m) = store.latest().unwrap().unwrap();
-        assert_eq!(rev, 1);
-        assert_eq!(m.components.len(), 1);
+        let committed = store.latest().unwrap().unwrap();
+        assert_eq!(committed.revision, 2); // bootstrap is the first durable commit
+        assert_eq!(committed.manifest.components.len(), 1);
         // 版本变化组件已登记在途
         assert!(s.upgrade_in_flight("a").is_some());
     }
@@ -559,6 +960,7 @@ mod tests {
             version: "not-semver".into(), // 校验失败
             components: vec![],
             wiring: vec![],
+            mirrors: Vec::new(),
             config_overlay: None,
         };
         assert!(s.submit(bad).is_err());
@@ -572,10 +974,12 @@ mod tests {
             factory: "v2".into(),
         };
         s.submit(manifest("app", vec![v2])).unwrap();
-        let r = s.reconcile_once(&report("a", "running", "1"));
+        let r = s.reconcile_once(&report("a", "running", "1.0.0"));
         assert!(matches!(r.actions[0], ReconcileAction::Wait { .. }));
         // 完成 → 清记 → 下轮走重建弧（旧版本报文触发）
-        s.finish_upgrade("a");
+        assert!(s
+            .finish_upgrade("a", s.upgrade_generation("a").unwrap())
+            .unwrap());
         let r2 = s.reconcile_once(&report("a", "running", "0"));
         assert!(matches!(r2.actions[0], ReconcileAction::Drain { .. }));
     }
@@ -600,7 +1004,9 @@ mod tests {
     fn deploy_payload_maps_fields() {
         let mut pool = spec("p");
         pool.instances = InstancePolicy::Sharded(4);
-        let d = AppSupervisor::deploy_payload(&pool);
+        let d = sup(manifest("app", vec![pool.clone()]))
+            .deploy_payload(&pool)
+            .unwrap();
         assert_eq!(d.name, "p");
         assert!(matches!(
             d.instances,
@@ -627,18 +1033,25 @@ mod tests {
     }
 
     #[test]
-    fn empty_desired_no_actions_on_empty_observed() {
-        let s = sup(manifest("app", vec![]));
-        let r = s.reconcile_once(&ObservedState::default());
-        assert!(r.actions.is_empty());
-        assert!(r.converged);
+    fn empty_desired_rejected_at_initialization_and_submit() {
+        let store = Arc::new(MemStateStore::new());
+        assert!(AppSupervisor::new(
+            manifest("app", vec![]),
+            store.clone(),
+            Arc::new(FakeClock::new(0))
+        )
+        .is_err());
+        let mut s = sup(manifest("app", vec![spec("a")]));
+        assert!(s.submit(manifest("app", vec![])).is_err());
+        assert_eq!(s.desired().components.len(), 1);
+        assert!(store.latest().unwrap().is_none());
     }
 
     #[test]
     fn missing_and_extra_in_same_pass() {
         // 形态 1+2 并存：desired{a} observed{b} → Deploy a + Drain/Stop b
         let s = sup(manifest("app", vec![spec("a")]));
-        let o = report("b", "running", "1");
+        let o = report("b", "running", "1.0.0");
         let r = s.reconcile_once(&o);
         assert_eq!(r.actions.len(), 3);
         assert!(matches!(&r.actions[0], ReconcileAction::Deploy { comp, .. } if comp == "a"));
@@ -697,7 +1110,11 @@ mod tests {
     fn deploy_payload_all_artifact_kinds() {
         let mk = |a: ArtifactRef| ComponentSpec {
             name: "c".into(),
-            engine: EngineKind::Parrot,
+            engine: if matches!(a, ArtifactRef::Beam { .. }) {
+                EngineKind::Erlang
+            } else {
+                EngineKind::Parrot
+            },
             artifact: a,
             alt_artifact: None,
             ..spec("c")
@@ -726,7 +1143,13 @@ mod tests {
             ),
         ];
         for (spec, want) in cases {
-            assert_eq!(AppSupervisor::deploy_payload(&spec).artifact, want);
+            assert_eq!(
+                sup(manifest("app", vec![spec.clone()]))
+                    .deploy_payload(&spec)
+                    .unwrap()
+                    .artifact,
+                want
+            );
         }
     }
 
@@ -752,9 +1175,36 @@ mod tests {
     fn store_roundtrip() {
         let st = MemStateStore::new();
         assert!(st.latest().unwrap().is_none());
-        st.persist(1, &manifest("app", vec![])).unwrap();
-        st.persist(2, &manifest("app2", vec![])).unwrap();
-        let (rev, m) = st.latest().unwrap().unwrap();
-        assert_eq!((rev, m.name.as_str()), (2, "app2"));
+        let mut state = DesiredStateRecord {
+            mirrors: Default::default(),
+            revision: 1,
+            manifest: manifest("app", vec![spec("a")]),
+            pending: BTreeMap::new(),
+        };
+        st.commit(None, &state).unwrap();
+        state.revision = 2;
+        state.manifest.version = "2.0.0".into();
+        st.commit(Some(1), &state).unwrap();
+        let latest = st.latest().unwrap().unwrap();
+        assert_eq!(
+            (latest.revision, latest.manifest.version.as_str()),
+            (2, "2.0.0")
+        );
+    }
+    #[test]
+    fn deployment_preserves_nested_component_configuration() {
+        let mut component = spec("configured");
+        component.config = Some(
+            toml::from_str("limit = 7\nlabel = '中文'\n[nested]\nenabled = true\nitems = [1, 2]")
+                .unwrap(),
+        );
+        let deployment = sup(manifest("app", vec![component.clone()]))
+            .deploy_payload(&component)
+            .unwrap();
+        let bytes = deployment
+            .config
+            .expect("component config must reach the executor");
+        let actual: toml::Table = toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(Some(actual), component.config);
     }
 }

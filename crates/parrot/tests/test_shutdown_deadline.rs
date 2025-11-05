@@ -107,7 +107,15 @@ async fn shutdown_cancels(mode: SchedulingMode, wait_in_stop: bool) {
         matches!(result, Ok(Err(SystemError::Timeout(_)))),
         "shutdown must report its deadline: {result:?}"
     );
-    assert_eq!(system.actor_count(), 0);
+    // The deadline is a caller receipt, not proof of resource disposal.
+    // Wait for cooperative cancellation and the owned retirement operation.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while system.actor_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(!actor.is_alive().await);
     assert!(actor.deliver(Box::new(7_u64)).await.is_err());
     tokio::time::timeout(Duration::from_secs(1), cancelled.notified())

@@ -7,61 +7,89 @@ import scala.util.Using
 /** golden vectors 逐字节断言（读 docs/vectors/wire1.json——Rust 冻结件）。 */
 class WireFrameSpec extends AnyFunSuite {
 
-  case class Vector(name: String, frameType: String, path: String, typeKey: String, payloadHex: String, bytesHex: String)
-
-  private def loadVectors(): List[Vector] = {
-    // 多候选路径：模块根 ../.. / 环境变量 / 系统属性（surefire cwd 差异兜底）
-    val candidates = List(
-      sys.env.get("PARROT_REPO").map(_ + "/docs/vectors/wire1.json"),
-      sys.props.get("parrot.repo").map(_ + "/docs/vectors/wire1.json"),
-      Some("../..").map(_ + "/docs/vectors/wire1.json"),
-      Some("../../docs/vectors/wire1.json"),
-      Some("docs/vectors/wire1.json"),
-      Some("/Users/biluochun/work/error.d/library/parrot/docs/vectors/wire1.json")
-    ).flatten
-    val path = candidates.find(p => new java.io.File(p).exists())
-      .getOrElse(fail(s"wire1.json not found in any of: ${candidates.mkString(", ")}"))
-    val json = Using.resource(Source.fromFile(path))(_.mkString)
-    // 最小 JSON 解析（无外部依赖、无正则）：按 '{' 切块，块内按名取字段（不依赖顺序）
-    def field(obj: String, key: String): Option[String] = {
-      val k = "\"" + key + "\":"
-      val i = obj.indexOf(k)
-      if (i < 0) return None
-      var p = i + k.length
-      while (p < obj.length && obj(p) != '"') p += 1
-      if (p >= obj.length) return None
-      val sb = new StringBuilder
-      p += 1
-      var esc = false
-      var done = false
-      while (p < obj.length && !done) {
-        val c = obj(p)
-        if (esc) { sb += c; esc = false }
-        else if (c == '\\') esc = true
-        else if (c == '"') done = true
-        else sb += c
-        p += 1
+  test("shared error payload corpus") {
+    val path = java.nio.file.Paths.get(sys.props.getOrElse("parrot.repo", "../.."), "docs/vectors/error-payloads.tsv")
+    val rows = Using.resource(Source.fromFile(path.toFile))(_.getLines().filterNot(_.startsWith("#")).toVector)
+    assert(rows.size == 30)
+    def bytes(hex: String): Array[Byte] = hex.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
+    rows.foreach { row =>
+      val fields = row.split("\t", -1)
+      assert(fields.length == 5)
+      val payload = bytes(fields(2))
+      if (fields(1) == "reject") intercept[IllegalArgumentException] { WireFrame.decodeErrPayload(payload) }
+      else {
+        assert(fields(1) == "accept")
+        val (code, detail) = WireFrame.decodeErrPayload(payload)
+        assert(code == fields(3).toInt, fields(0))
+        assert(detail.getBytes(java.nio.charset.StandardCharsets.UTF_8).sameElements(bytes(fields(4))), fields(0))
+        assert(WireFrame.encodeErrPayload(code, detail).sameElements(payload), fields(0))
       }
-      Some(sb.toString)
     }
-    json.split('{').flatMap { chunk =>
-      if (!chunk.contains("\"bytes_hex\"")) None
-      else
-        for {
-          name <- field(chunk, "name")
-          ft   <- field(chunk, "frame_type")
-          p    <- field(chunk, "path")
-          tk   <- field(chunk, "type_key")
-          ph   <- field(chunk, "payload_hex")
-          bh   <- field(chunk, "bytes_hex")
-        } yield Vector(name, ft, p, tk, ph, bh)
-    }.toList
   }
 
-  test("golden vectors load and are frozen set of 4") {
+  test("error encoder rejects unknown codes and invalid Unicode") {
+    Seq(0, 14, -1, 65536).foreach(code => intercept[IllegalArgumentException] { WireFrame.encodeErrPayload(code, "error") })
+    intercept[IllegalArgumentException] { WireFrame.encodeErrPayload(3, "\ud800") }
+  }
+
+  private def loadVectors(): List[SharedWireVectors.Vector] = SharedWireVectors.load()
+
+  test("shared golden vectors retain the original four names") {
     val vs = loadVectors()
-    assert(vs.size == 4, s"expected 4 frozen vectors, got ${vs.size}: ${vs.map(_.name)}")
-    assert(vs.map(_.name).toSet == Set("ask-basic", "tell-basic", "reply-err-stopped", "heartbeat"))
+    assert(vs.size >= 4, s"missing frozen vectors: ${vs.map(_.name)}")
+    assert(Set("ask-basic", "tell-basic", "reply-err-stopped", "heartbeat").subsetOf(vs.map(_.name).toSet))
+  }
+
+  test("every shared vector encodes and decodes all independently stated fields") {
+    val vectors = loadVectors()
+    vectors.foreach { v =>
+      withClue(v.name + ": ") {
+        val expected = new WireFrame.Frame(1, v.frameType, v.flags, v.correlationId,
+          v.hopCount, v.hopLimit, v.path, v.typeKey, hex(v.payloadHex), null, v.sequence)
+        val bytes = hex(v.bytesHex)
+        assert(expected.encode().sameElements(bytes), "independent field encoding differs from shared bytes")
+        val decoded = WireFrame.decode(bytes)
+        assert(decoded.nonEmpty, "shared complete frame must decode")
+        val (actual, consumed) = decoded.get
+        assert(consumed == bytes.length, "shared vector has trailing bytes")
+        assert(actual == expected, "decoded fields differ from independent expectations")
+      }
+    }
+    println(s"JVM_SHARED_WIRE_JSON_OK vectors=${vectors.size}")
+  }
+
+  test("every shared vector split preserves complete header and following frame") {
+    loadVectors().foreach { vector =>
+      val bytes = hex(vector.bytesHex)
+      val expected = new WireFrame.Frame(1, vector.frameType, vector.flags, vector.correlationId,
+        vector.hopCount, vector.hopLimit, vector.path, vector.typeKey, hex(vector.payloadHex), null, vector.sequence)
+      (0 until bytes.length).foreach { cut =>
+        withClue(s"${vector.name} cut=$cut: ") {
+          val prefix = bytes.take(cut)
+          val preserved = prefix.clone()
+          assert(WireFrame.decode(prefix).isEmpty)
+          assert(prefix.sameElements(preserved), "partial input mutated")
+          val combined = prefix ++ bytes.drop(cut) ++ bytes
+          val (actual, consumed) = WireFrame.decode(combined).get
+          assert(consumed == bytes.length && actual == expected)
+          assert(combined.drop(consumed).sameElements(bytes), "following frame changed")
+        }
+      }
+    }
+  }
+
+  test("shared vector pipeline preserves order and all independently stated fields") {
+    val vectors = loadVectors()
+    var remaining = vectors.flatMap(v => hex(v.bytesHex)).toArray
+    vectors.foreach { vector =>
+      val expected = new WireFrame.Frame(1, vector.frameType, vector.flags, vector.correlationId,
+        vector.hopCount, vector.hopLimit, vector.path, vector.typeKey, hex(vector.payloadHex), null, vector.sequence)
+      val (actual, consumed) = WireFrame.decode(remaining).get
+      assert(actual == expected, vector.name)
+      assert(consumed == hex(vector.bytesHex).length, vector.name)
+      remaining = remaining.drop(consumed)
+    }
+    assert(remaining.isEmpty)
   }
 
   test("ask-basic byte-level identity with Rust frozen vector") {
@@ -122,7 +150,7 @@ class WireFrameSpec extends AnyFunSuite {
     // capabilities = bin 位（0x01）
     val caps = tlvs.collectFirst { case (t, v) if t == WireFrame.TlvTag.CAPABILITIES => v }
     assert(caps.exists(_.sameElements(Array(1.toByte, 0.toByte, 0.toByte, 0.toByte))))
-    // ACK 专有 chosen_codec=bin（tag 8）
+    // ACK 专有 chosen_codec=bin（tag 9；tag 8 为 direct_addr）
     val ack = WireFrame.handshakeAckBody("jvm-gw-1")
     val ackTlvs = WireFrame.parseTlv(ack)
     assert(ackTlvs.size == 6)

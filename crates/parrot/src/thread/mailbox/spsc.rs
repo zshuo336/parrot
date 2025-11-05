@@ -145,7 +145,9 @@ impl Mailbox for SpscMailbox {
                 Err(TrySendError::Full(_))
                     if matches!(strategy, BackpressureStrategy::DropNewest) =>
                 {
-                    return Ok(());
+                    return Err(MailboxError::Dropped {
+                        capacity: self.capacity,
+                    });
                 }
                 Err(TrySendError::Full(_)) => {
                     return Err(MailboxError::Full {
@@ -360,8 +362,8 @@ mod tests {
         let msg2 = Box::new("Second message") as BoxedMessage;
         let result = mailbox.push(msg2, BackpressureStrategy::DropNewest).await;
 
-        // The push should succeed (message was dropped)
-        assert!(result.is_ok());
+        // The discarded message must report a rejected admission
+        assert!(matches!(result, Err(MailboxError::Dropped { capacity: 1 })));
 
         // Verify only one message is in the mailbox
         assert_eq!(mailbox.len().await, 1);

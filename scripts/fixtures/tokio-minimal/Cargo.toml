@@ -1,0 +1,13 @@
+[package]
+name = "parrot-minimal-sync-contract"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+tokio = { version = "=1.53.3", default-features = false, features = ["sync", "parking_lot"] }
+
+[patch.crates-io]
+tokio = { path = "../../../vendor/tokio" }

@@ -20,9 +20,21 @@ pub struct CallbackRegistry {
     pending: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Frame>>>,
 }
 
+impl Default for CallbackRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CallbackRegistry {
     pub fn new() -> Self {
-        Self { next: AtomicU64::new(1), pending: Mutex::new(HashMap::new()) }
+        Self {
+            next: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap().len()
     }
     pub fn next_cid(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed)
@@ -52,9 +64,27 @@ impl CallbackRegistry {
     }
 }
 
+/// Removing a pending request is mandatory even when its caller is cancelled.
+pub(crate) struct PendingRequest<'a> {
+    callbacks: &'a CallbackRegistry,
+    cid: u64,
+}
+impl<'a> PendingRequest<'a> {
+    pub(crate) fn new(callbacks: &'a CallbackRegistry, cid: u64) -> Self {
+        Self { callbacks, cid }
+    }
+}
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.callbacks.remove(self.cid);
+    }
+}
+
 impl std::fmt::Debug for RemoteActorRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteActorRef").field("path", &self.path).finish()
+        f.debug_struct("RemoteActorRef")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -66,8 +96,16 @@ pub struct RemoteActorRef {
 }
 
 impl RemoteActorRef {
-    pub fn new(path: impl Into<String>, sender: FrameSender, callbacks: Arc<CallbackRegistry>) -> Self {
-        Self { path: path.into(), sender, callbacks }
+    pub fn new(
+        path: impl Into<String>,
+        sender: FrameSender,
+        callbacks: Arc<CallbackRegistry>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            sender,
+            callbacks,
+        }
     }
 }
 
@@ -84,42 +122,40 @@ impl ActorRef for RemoteActorRef {
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             // 1. 编码出口（NotRemotable 在此立即失败，不发帧）
-            let (key, payload) = CodecRegistry::encode_outgoing(&msg)
-                .map_err(|e| ActorError::MessageHandlingError(e))?;
+            let (key, payload) =
+                CodecRegistry::encode_outgoing(&msg).map_err(ActorError::MessageHandlingError)?;
             // 2. 注册回调 + 发帧
             let cid = self.callbacks.next_cid();
             let (tx, rx) = tokio::sync::oneshot::channel::<Frame>();
             self.callbacks.insert(cid, tx);
-            self.sender
-                .send(Frame::ask(cid, &self.path, key, payload))
-                .await
-                .map_err(|e| {
-                    self.callbacks.remove(cid);
-                    ActorError::InternalError(format!("remote send: {e}"))
-                })?;
-            // 3. 等回包（无界 / 带超时——ADR-10 语义）
-            match timeout {
-                None => match rx.await {
+            let _pending = PendingRequest::new(&self.callbacks, cid);
+            let exchange = async {
+                self.sender
+                    .send(Frame::ask(cid, &self.path, key, payload))
+                    .await
+                    .map_err(|e| ActorError::InternalError(format!("remote send: {e}")))?;
+                match rx.await {
                     Ok(f) => reply_to_result(f),
                     Err(_) => Err(ActorError::InternalError("connection lost".into())),
-                },
-                Some(d) => match tokio::time::timeout(d, rx).await {
-                    Ok(Ok(f)) => reply_to_result(f),
-                    Ok(Err(_)) => Err(ActorError::InternalError("connection lost".into())),
-                    Err(_) => {
-                        // 调用方放弃：清回调；迟到 REPLY 将查表 miss 被 drop
-                        self.callbacks.remove(cid);
-                        Err(ActorError::TimeoutDetail(format!("remote ask {} after {:?}", self.path, d)))
-                    }
-                },
+                }
+            };
+            // The deadline includes admission, not just the reply wait.
+            match timeout {
+                None => exchange.await,
+                Some(d) => tokio::time::timeout(d, exchange).await.unwrap_or_else(|_| {
+                    Err(ActorError::TimeoutDetail(format!(
+                        "remote ask {} after {:?}",
+                        self.path, d
+                    )))
+                }),
             }
         })
     }
 
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
-            let (key, payload) = CodecRegistry::encode_outgoing(&msg)
-                .map_err(ActorError::MessageHandlingError)?;
+            let (key, payload) =
+                CodecRegistry::encode_outgoing(&msg).map_err(ActorError::MessageHandlingError)?;
             self.sender
                 .send(Frame::tell(&self.path, key, payload))
                 .await
@@ -130,7 +166,13 @@ impl ActorRef for RemoteActorRef {
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             self.sender
-                .send(Frame { frame_type: frame_type::STOP, correlation_id: 0, path: self.path.clone(), type_key: String::new(), payload: bytes::Bytes::new() })
+                .send(Frame {
+                    frame_type: frame_type::STOP,
+                    correlation_id: 0,
+                    path: self.path.clone(),
+                    type_key: String::new(),
+                    payload: bytes::Bytes::new(),
+                })
                 .await
                 .map_err(|e| ActorError::InternalError(format!("remote stop: {e}")))
         })
@@ -179,6 +221,8 @@ fn reply_to_result(f: Frame) -> ActorResult<BoxedMessage> {
                 Err(ActorError::MessageHandlingError(text))
             }
         }
-        other => Err(ActorError::InternalError(format!("expected REPLY, got {other:#x}"))),
+        other => Err(ActorError::InternalError(format!(
+            "expected REPLY, got {other:#x}"
+        ))),
     }
 }

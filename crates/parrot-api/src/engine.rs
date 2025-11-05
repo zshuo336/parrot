@@ -22,9 +22,31 @@
 //! 两者经 `ErasedActor` 边界对接；引擎侧扩展（如 actix 的
 //! `receive_message_with_engine` 快路径）归属引擎 crate 的扩展 trait，
 //! **不再进入规范 trait**（M6 语义变更 #5：旧位置直接移除）。
+//!
+//! Production asynchronous actors use [`AsyncEngineRuntime`] and [`AsyncEngineCatalog`].
+//! Thread/Actix implement that boundary using their real managed registries,
+//! references and lifecycle owners. The synchronous erased face below is opt-in.
+//! Production actix/thread ActorSystems
+//! do not currently implement it; their asynchronous Actor and lifecycle APIs
+//! cannot be converted losslessly merely by registering a name here. The
+//! independent core-lab contracts are separate types. [`EngineCatalog`] manages
+//! discovery/registration ownership, not engine shutdown or actor supervision.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
+
+mod catalog;
+pub use catalog::{EngineCatalog, EngineRegistration, RegistrationError};
+mod local_runtime;
+pub use local_runtime::{
+    AsyncLocalActorSpawner, AsyncLocalRuntime, LocalActor, LocalRuntimeActor, LocalRuntimeFactory,
+};
+mod async_runtime;
+pub use async_runtime::{
+    AsyncActorSpawner, AsyncEngineRuntime, AsyncFactoryRuntime, FactoryOptions, InstanceConfig,
+    RuntimeActor, RuntimeFactory, SpawnOptions,
+};
+mod async_catalog;
+pub use async_catalog::{AsyncEngineCatalog, AsyncEngineRegistration};
 
 use crate::types::BoxedMessage;
 
@@ -56,29 +78,42 @@ pub trait EngineRuntime: Send + Sync {
     ) -> Result<BoxedActorRefErased, String>;
 }
 
-// ---------------- 全局引擎注册表（规范层，无引擎符号） ----------------
+// ---------------- Global convenience catalog ----------------
 
-static ENGINE_REGISTRY: Mutex<Option<HashMap<String, Arc<dyn EngineRuntime>>>> = Mutex::new(None);
+fn global_catalog() -> &'static EngineCatalog {
+    static CATALOG: OnceLock<EngineCatalog> = OnceLock::new();
+    CATALOG.get_or_init(EngineCatalog::new)
+}
 
-/// 注册一个引擎运行时（幂等：同名覆盖）。
+/// Persistently register a runtime, replacing the same name as before.
+/// The old runtime is released outside the catalog lock. User name/Drop panics
+/// may propagate, but cannot poison the catalog; a replacement is already visible
+/// before the old runtime is released. Use scoped registration for owned cleanup.
 pub fn register_engine(runtime: Arc<dyn EngineRuntime>) {
-    let mut g = ENGINE_REGISTRY.lock().unwrap();
-    g.get_or_insert_with(HashMap::new)
-        .insert(runtime.name().to_string(), runtime);
+    drop(global_catalog().insert(runtime));
 }
 
-/// 按名查引擎。
+/// Register a runtime until its token is dropped; duplicate names are rejected.
+pub fn register_engine_scoped(
+    runtime: Arc<dyn EngineRuntime>,
+) -> Result<EngineRegistration, RegistrationError> {
+    global_catalog().register(runtime)
+}
+
+/// Remove a name, returning ownership of the runtime without shutting it down.
+/// Previously captured runtime and actor references remain valid.
+pub fn unregister_engine(name: &str) -> Option<Arc<dyn EngineRuntime>> {
+    global_catalog().remove(name)
+}
+
+/// Capture the current runtime. No catalog lock is held by the returned handle.
 pub fn lookup_engine(name: &str) -> Option<Arc<dyn EngineRuntime>> {
-    let g = ENGINE_REGISTRY.lock().unwrap();
-    g.as_ref().and_then(|m| m.get(name).cloned())
+    global_catalog().lookup(name)
 }
 
-/// 已注册引擎列表（诊断用）。
+/// List registered engine names in deterministic lexical order.
 pub fn list_engines() -> Vec<String> {
-    let g = ENGINE_REGISTRY.lock().unwrap();
-    g.as_ref()
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default()
+    global_catalog().list()
 }
 
 #[cfg(test)]

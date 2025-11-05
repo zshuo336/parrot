@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# miri 门禁（M5 unsafe 前置）：
-# 只对 unsafe 密集模块相关测试跑 miri（全 workspace 跑不现实）。
-# 用法：./scripts/miri.sh [test_filter]
-#
-# 注意：macOS 上 tokio runtime 依赖 kqueue，miri 不支持该系统调用——
-# 需要 runtime 的测试（envelope 回复路径等）无法在 miri 下运行。
-# 因此门禁聚焦 unsafe 密集的 single_alloc（单块信封裸指针操作）。
+# Miri checks the actual production envelope source and shared unwind contracts.
+# Usage: ./scripts/miri.sh [test_filter]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-# rustup +nightly 切换；无 nightly 时给出明确指引
+if (( $# > 1 )); then
+    echo "Usage: $0 [test_filter]" >&2
+    exit 2
+fi
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 if ! rustup toolchain list | grep -q nightly; then
-    echo "需要 nightly 工具链：rustup toolchain install nightly"
+    echo "需要 nightly 工具链与 miri/rust-src 组件" >&2
     exit 1
 fi
-
-FILTER="${1:-single_alloc}"
-
-cargo +nightly miri test -p parrot --lib -- "$FILTER"
-echo "miri gate done"
+export MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-strict-provenance"
+miri_command=(cargo +nightly miri test --locked --manifest-path poc/envelope-safety/Cargo.toml --all-targets)
+listing="$("${miri_command[@]}" -- --list "$@")"
+if ! printf '%s\n' "$listing" | grep -q ': test$'; then
+    echo "ERROR: Miri filter selected no tests" >&2
+    exit 1
+fi
+"${miri_command[@]}" -- "$@"

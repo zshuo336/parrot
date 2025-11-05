@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum MailboxError {
     #[error("Mailbox is full (capacity: {capacity})")]
     Full { capacity: usize },
+    #[error("Newest message dropped because mailbox is full (capacity: {capacity})")]
+    Dropped { capacity: usize },
     #[error("Mailbox is closed")]
     Closed,
     #[error("Failed to push message: {0}")]
@@ -44,6 +46,12 @@ pub enum AskError {
 /// Errors related to spawning actors.
 #[derive(Error, Debug, Clone)]
 pub enum SpawnError {
+    #[error("Factory output disposal failed: {0}")]
+    DisposalFailed(String),
+    #[error("Actor creation was cancelled")]
+    Cancelled,
+    #[error("Actor creation timed out: {0}")]
+    Timeout(String),
     #[error("Actor path already exists: {0}")]
     ActorPathAlreadyExists(String), // Assuming ActorPath implements Display
     #[error("Failed to initialize actor: {0}")]
@@ -54,6 +62,18 @@ pub enum SpawnError {
     InvalidConfig(String),
     #[error("System is shutting down")]
     SystemShutdown,
+}
+
+impl From<SpawnError> for parrot_api::errors::ActorError {
+    fn from(error: SpawnError) -> Self {
+        match error {
+            SpawnError::Cancelled | SpawnError::SystemShutdown => Self::Stopped,
+            SpawnError::Timeout(message) => Self::TimeoutDetail(message),
+            SpawnError::InitializationFailed(message) => Self::InitializationError(message),
+            SpawnError::DisposalFailed(message) => Self::Panic(message),
+            error => Self::InitializationError(error.to_string()),
+        }
+    }
 }
 
 /// Errors related to the Actor System itself.
@@ -67,6 +87,8 @@ pub enum SystemError {
     ShuttingDown,
     #[error("Failed during shutdown: {0}")]
     ShutdownError(String),
+    #[error("Actor panicked: {0}")]
+    Panic(String),
     #[error("Actor creation failed: {0}")]
     ActorCreationError(String),
     #[error("Actor not found: {0}")]
@@ -83,10 +105,21 @@ pub enum SystemError {
     Other(#[from] anyhow::Error),
 }
 
+impl SystemError {
+    /// Keep a known policy destructor panic distinct in lifecycle receipts.
+    pub(crate) fn policy_disposal(error: parrot_api::errors::ActorError) -> Self {
+        match error {
+            parrot_api::errors::ActorError::Panic(message) => Self::Panic(message),
+            error => Self::Other(anyhow::Error::new(error)),
+        }
+    }
+}
+
 impl From<SystemError> for parrot_api::errors::ActorError {
     fn from(error: SystemError) -> Self {
         match error {
             SystemError::Timeout(message) => Self::TimeoutDetail(message),
+            SystemError::Panic(message) => Self::Panic(message),
             SystemError::ActorNotFound(path) => Self::ActorNotFound(path),
             error => Self::Other(anyhow::Error::new(error)),
         }

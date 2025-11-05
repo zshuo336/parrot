@@ -1,5 +1,5 @@
 [workspace]
-members = ["testcomp", "violating"]
+members = ["testcomp", "violating", "hostcomp"]
 resolver = "2"
 
 [profile.release]

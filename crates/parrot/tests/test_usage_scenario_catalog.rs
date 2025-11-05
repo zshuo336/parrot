@@ -16,13 +16,13 @@
 //!  C20 many-small-actors fan-out/fan-in diamond
 
 use parrot::actix as __parrot_engine;
-use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
+use parrot::thread::config::ThreadActorSystemConfig;
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
-use parrot_api::message::{Message, MessagePriority};
+use parrot_api::message::MessagePriority;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
 use std::sync::Arc;
@@ -247,9 +247,17 @@ impl Actor for Worker {
 
 async fn mk(ts: &Arc<ThreadActorSystem>, path: &str) -> Box<dyn ActorRef> {
     Box::new(
-        ts.spawn_at::<Worker>(Worker::default(), path, None, ThreadActorConfig::default())
-            .await
-            .expect("spawn worker"),
+        ts.spawn_at::<Worker>(
+            Worker::default(),
+            path,
+            None,
+            parrot::thread::ThreadActorConfig {
+                supervisor_strategy: Some(parrot::thread::SupervisorStrategy::Resume),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn worker"),
     )
 }
 
@@ -282,19 +290,11 @@ async fn c1_ask_request_response() {
 async fn c2_tell_fire_and_forget() {
     let ts = system().await;
     let w = mk(&ts, "/c2").await;
-    for i in 0..10u64 {
-        w.tell(Inc(1));
-        let _ = i;
+    for _ in 0..10u64 {
+        w.tell(Inc(1)).await.unwrap();
     }
-    // Eventually visible (tell is async delivery).
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if timed!(Duration::from_secs(5), w.ask(Get)).unwrap() >= 10 {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "tell messages lost");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Reading state behind the admitted messages must observe every increment.
+    assert_eq!(timed!(Duration::from_secs(5), w.ask(Get)).unwrap(), 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -762,7 +762,13 @@ fn c19_derive_actor_spot_checks() {
             .await
             .expect("system");
         let w = sys
-            .spawn_root_typed(DeriveWorker { value: 0 }, EmptyConfig)
+            .spawn_root_typed_with_strategy(
+                DeriveWorker { value: 0 },
+                EmptyConfig,
+                parrot_api::supervisor::SupervisorStrategyType::Default(
+                    parrot_api::supervisor::DefaultStrategy::ResumeOnFailure,
+                ),
+            )
             .await
             .expect("spawn");
 

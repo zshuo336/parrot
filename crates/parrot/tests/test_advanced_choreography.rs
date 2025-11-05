@@ -68,6 +68,10 @@ struct CbState;
 
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
+struct CbProbe;
+
+#[derive(Clone, Debug, Message)]
+#[message(result = "String")]
 struct SagaExec {
     step: u64,
     ok: bool,
@@ -429,7 +433,7 @@ impl Actor for CircuitBreaker {
                         if c.fail {
                             self.transition("open");
                             self.consec_fail = self.threshold;
-                            Ok(Box::new("fail@half-open") as BoxedMessage)
+                            Ok(Box::new("fail@half-open".to_owned()) as BoxedMessage)
                         } else {
                             self.success_seen += 1;
                             if self.success_seen >= 2 {
@@ -437,11 +441,17 @@ impl Actor for CircuitBreaker {
                                 self.consec_fail = 0;
                                 self.success_seen = 0;
                             }
-                            Ok(Box::new("ok@half-open") as BoxedMessage)
+                            Ok(Box::new("ok@half-open".to_owned()) as BoxedMessage)
                         }
                     }
                     _ => Err(ActorError::MessageHandlingError("bad state".into())),
                 }
+            } else if msg.is::<CbProbe>() {
+                if self.state == "open" {
+                    self.success_seen = 0;
+                    self.transition("half-open");
+                }
+                Ok(Box::new(self.state.clone()) as BoxedMessage)
             } else if msg.downcast_ref::<CbState>().is_some() {
                 Ok(Box::new(self.state.clone()) as BoxedMessage)
             } else {
@@ -490,14 +500,29 @@ async fn a4_circuit_breaker() {
         cb.ask(CbCall { fail: false, id: 4 }).await.unwrap(),
         "rejected@open"
     );
-    // Operator forces half-open (simulated recovery probe path).
-    cb.send(Box::new(FsmEvent("half-open".into())) as BoxedMessage)
-        .await
-        .ok();
-    // FsmEvent is unknown to the breaker — use a real recovery: the actor
-    // has no admin message, so emulate via threshold reset by sending
-    // success (still rejected while open).
+    // Exercise the actual probe protocol, including a failed half-open probe.
+    assert_eq!(cb.ask(CbProbe).await.unwrap(), "half-open");
+    assert_eq!(
+        cb.ask(CbCall { fail: true, id: 5 }).await.unwrap(),
+        "fail@half-open"
+    );
     assert_eq!(cb.ask(CbState).await.unwrap(), "open");
+    assert_eq!(cb.ask(CbProbe).await.unwrap(), "half-open");
+    assert_eq!(
+        cb.ask(CbCall { fail: false, id: 6 }).await.unwrap(),
+        "ok@half-open"
+    );
+    assert_eq!(cb.ask(CbState).await.unwrap(), "half-open");
+    assert_eq!(
+        cb.ask(CbCall { fail: false, id: 7 }).await.unwrap(),
+        "ok@half-open"
+    );
+    assert_eq!(cb.ask(CbState).await.unwrap(), "closed");
+    assert_eq!(
+        cb.ask(CbCall { fail: false, id: 8 }).await.unwrap(),
+        "ok@closed"
+    );
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +831,10 @@ impl Actor for RetryWorker {
 
 #[tokio::test]
 async fn a8_retry_backoff() {
-    let ts = sys();
+    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig {
+        default_supervisor_strategy: parrot::thread::SupervisorStrategy::Resume,
+        ..Default::default()
+    });
     // Succeeds on 3rd attempt (fails until 2).
     let w = spawn::<RetryWorker>(
         &ts,

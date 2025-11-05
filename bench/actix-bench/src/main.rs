@@ -1,177 +1,23 @@
-//! 纯 Actix 基准（零 parrot 依赖）。
+//! Native Actix fixed-work experiments, without a Parrot dependency.
 //!
-//! 目的：量化 parrot 包装层对 actix 的性能损耗（wrapper tax）。与
-//! `parrot/tests/engine_stress_actix.rs`（经 parrot 适配层的 actix 引擎）
-//! 场景**逐字节对等**：
-//!   - 相同消息语义/数量/每条 CPU 迭代数（burn_cpu 同 LCG 常数）
-//!   - 相同分位数算法（ceil 索引）
-//!   - 相同 arbiter 拓扑（num_cpus 个 worker arbiter，round-robin 分配）
-//!   - 相同调用语义：parrot `send()`/`send_with_timeout(None)` = `addr.send().await`
-//!     （ask 往返）；parrot `deliver()`/`tell()` = `addr.do_send`。本基准逐一对齐。
-//!
-//! 唯一差异：**不经过 parrot**——原生 `actix::Actor`/`Handler<M>` 静态分发，
-//! 无 BoxedMessage 装箱、无 MessageEnvelope/Uuid、无 AtomicResponse 回复装箱、
-//! 无 downcast 链、无注册表写锁。
-//!
-//! 运行（位于 bench/ 基准目录，与 akka-bench 平级）：
-//! ```sh
-//! cd bench/actix-bench && cargo run --release   # 或 ./run.sh
-//! ```
-//! 报告写入 /tmp/parrot_bench_actix_raw.md，与 /tmp/parrot_bench_actix.md
-//! （parrot 包装版）逐行相减即为包装税。
+//! Run `./run.sh [report-path]` from this directory. Successful output requires
+//! verified replies, completed workloads and joined arbiter threads. The native
+//! and Parrot suites have different startup/registry/admission instrumentation;
+//! their rows cannot simply be subtracted to infer a universal wrapper tax.
+//! See README.md for the measurement boundaries.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use actix::prelude::*;
 
-// ===========================================================================
-// 负载内核（与 parrot 版 engine_stress_common::burn_cpu 逐字节一致）
-// ===========================================================================
-
-#[inline]
-fn burn_cpu(iterations: u64, salt: u64) -> u64 {
-    let mut x: u64 = salt | 1;
-    for i in 0..iterations {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) ^ i;
-        if x == 42 {
-            return x;
-        }
-    }
-    x
-}
-
-/// 实测 burn_cpu 速率（iters/sec，与 parrot 版一致）。
-const BURN_RATE: f64 = 880_000_000.0;
-
-// ===========================================================================
-// 统计（与 parrot 版 latency_stats 一致：ceil 索引分位）
-// ===========================================================================
-
-#[derive(Debug, Clone)]
-struct LatencyStats {
-    count: u64,
-    p50_us: u128,
-    p90_us: u128,
-    p99_us: u128,
-    max_us: u128,
-    mean_us: f64,
-}
-
-fn latency_stats(mut samples: Vec<u128>) -> LatencyStats {
-    if samples.is_empty() {
-        return LatencyStats { count: 0, p50_us: 0, p90_us: 0, p99_us: 0, max_us: 0, mean_us: 0.0 };
-    }
-    samples.sort_unstable();
-    let n = samples.len();
-    let pick = |q: f64| -> u128 {
-        let idx = (((q / 100.0) * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
-        samples[idx]
-    };
-    let sum: u128 = samples.iter().sum();
-    LatencyStats {
-        count: n as u64,
-        p50_us: pick(50.0),
-        p90_us: pick(90.0),
-        p99_us: pick(99.0),
-        max_us: *samples.last().unwrap(),
-        mean_us: sum as f64 / n as f64,
-    }
-}
-
-// ===========================================================================
-// 报告（与 parrot 版 Report 对齐；engine 列 = "actix-raw"）
-// ===========================================================================
-
-#[derive(Clone)]
-struct BenchResult {
-    name: String,
-    engine: &'static str, // "actix-raw"
-    total_messages: u64,
-    elapsed: Duration,
-    latencies: LatencyStats,
-    correctness: bool,
-    note: String,
-    cpu_work_secs: Option<f64>,
-}
-
-impl BenchResult {
-    fn msg_per_sec(&self) -> f64 {
-        self.total_messages as f64 / self.elapsed.as_secs_f64().max(f64::EPSILON)
-    }
-
-    fn utilization(&self) -> f64 {
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) as f64;
-        self.cpu_work_secs
-            .map(|w| w / (self.elapsed.as_secs_f64().max(f64::EPSILON) * cores))
-            .unwrap_or(0.0)
-    }
-}
-
-struct Report {
-    results: Mutex<Vec<BenchResult>>,
-}
-
-impl Report {
-    fn new() -> Self {
-        Self { results: Mutex::new(Vec::new()) }
-    }
-
-    fn push(&self, r: BenchResult) {
-        let util = r
-            .cpu_work_secs
-            .map(|_| format!(" | util={:.0}%", r.utilization() * 100.0))
-            .unwrap_or_default();
-        println!(
-            "[{}] {} | msgs={} | wall={:.3}s | tput={:.0}/s | lat p50={:.1}ms p90={:.1}ms p99={:.1}ms max={:.1}ms{} | correct={}",
-            r.engine,
-            r.name,
-            r.total_messages,
-            r.elapsed.as_secs_f64(),
-            r.msg_per_sec(),
-            r.latencies.p50_us as f64 / 1000.0,
-            r.latencies.p90_us as f64 / 1000.0,
-            r.latencies.p99_us as f64 / 1000.0,
-            r.latencies.max_us as f64 / 1000.0,
-            util,
-            r.correctness,
-        );
-        if !r.note.is_empty() {
-            println!("        note: {}", r.note);
-        }
-        self.results.lock().unwrap().push(r);
-    }
-
-    fn dump_markdown(&self) -> String {
-        let mut out = String::from(
-            "| 场景 | 引擎 | 消息数 | 耗时(s) | 吞吐(/s) | p50(ms) | p90(ms) | p99(ms) | max(ms) | util | 正确 |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
-        );
-        let mut rows = self.results.lock().unwrap().clone();
-        rows.sort_by(|a, b| (&a.name, a.engine).cmp(&(&b.name, b.engine)));
-        for r in rows {
-            let util = r
-                .cpu_work_secs
-                .map(|_| format!("{:.0}%", r.utilization() * 100.0))
-                .unwrap_or_else(|| "-".into());
-            out.push_str(&format!(
-                "| {} | {} | {} | {:.3} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} |\n",
-                r.name,
-                r.engine,
-                r.total_messages,
-                r.elapsed.as_secs_f64(),
-                r.msg_per_sec(),
-                r.latencies.p50_us as f64 / 1000.0,
-                r.latencies.p90_us as f64 / 1000.0,
-                r.latencies.p99_us as f64 / 1000.0,
-                r.latencies.max_us as f64 / 1000.0,
-                util,
-                r.correctness,
-            ));
-        }
-        out
-    }
-}
+mod contracts;
+mod measurement;
+mod oracle;
+use contracts::*;
+use measurement::*;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 
 async fn wait_until<F: Fn() -> bool>(cond: F, timeout: Duration, poll: Duration) -> bool {
     let start = Instant::now();
@@ -231,6 +77,10 @@ struct LongRun {
 #[rtype(u64)]
 struct GetCount;
 
+#[derive(Message)]
+#[rtype(u64)]
+struct GetEchoSum;
+
 /// 停止指令（对等 parrot StopMessage 拦截 → ctx.stop()）
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -238,8 +88,9 @@ struct StopNow;
 
 /// 分片长任务（对等 parrot ChunkedLongTask：async handler + 片间让出）
 #[derive(Message)]
-#[rtype(u64)]
+#[rtype(result = "WorkResult")]
 struct ChunkedLong {
+    gate: StartGate,
     total: u64,
     chunk: u64,
     salt: u64,
@@ -247,10 +98,12 @@ struct ChunkedLong {
 
 // ===========================================================================
 // 同步路径 BenchActor（对等 parrot 版 BenchActor 的负载逻辑；
-// ops 计数点位与 parrot 版完全一致）
+// ops increments at handler entry/completion, as in the Parrot workload）
 // ===========================================================================
 
 struct RawBenchActor {
+    _life: ActorLifetime,
+    echo_sum: u64,
     ops: Arc<AtomicU64>,
     cpu_sink: Arc<AtomicU64>,
 }
@@ -262,7 +115,8 @@ impl Actor for RawBenchActor {
 impl Handler<Echo> for RawBenchActor {
     type Result = u64;
     fn handle(&mut self, m: Echo, _ctx: &mut Self::Context) -> Self::Result {
-        self.ops.fetch_add(1, Ordering::Relaxed);
+        self.echo_sum = self.echo_sum.wrapping_add(m.v);
+        self.ops.fetch_add(1, Ordering::Release);
         m.v
     }
 }
@@ -321,6 +175,13 @@ impl Handler<LongRun> for RawBenchActor {
     }
 }
 
+impl Handler<GetEchoSum> for RawBenchActor {
+    type Result = u64;
+    fn handle(&mut self, _: GetEchoSum, _: &mut Self::Context) -> u64 {
+        self.echo_sum
+    }
+}
+
 impl Handler<GetCount> for RawBenchActor {
     type Result = u64;
     fn handle(&mut self, _m: GetCount, _ctx: &mut Self::Context) -> Self::Result {
@@ -341,6 +202,7 @@ impl Handler<StopNow> for RawBenchActor {
 // ===========================================================================
 
 struct RawIoActor {
+    _life: ActorLifetime,
     done: Arc<AtomicU64>,
 }
 
@@ -349,15 +211,17 @@ impl Actor for RawIoActor {
 }
 
 impl Handler<Echo> for RawIoActor {
-    type Result = ResponseActFuture<Self, u64>;
+    type Result = AtomicResponse<Self, u64>;
     fn handle(&mut self, _m: Echo, _ctx: &mut Self::Context) -> Self::Result {
         let done = self.done.clone();
-        Box::pin(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            done.fetch_add(1, Ordering::Relaxed);
-            1u64
-        }
-        .into_actor(self))
+        AtomicResponse::new(Box::pin(
+            async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                done.fetch_add(1, Ordering::Relaxed);
+                1u64
+            }
+            .into_actor(self),
+        ))
     }
 }
 
@@ -365,31 +229,39 @@ impl Handler<Echo> for RawIoActor {
 // 分片长任务 actor（对等 parrot ChunkAsyncActor：片间 tokio yield）
 // ===========================================================================
 
-struct RawChunkActor;
+struct RawChunkActor {
+    _life: ActorLifetime,
+}
 
 impl Actor for RawChunkActor {
     type Context = actix::Context<Self>;
 }
 
 impl Handler<ChunkedLong> for RawChunkActor {
-    type Result = ResponseActFuture<Self, u64>;
+    type Result = AtomicResponse<Self, WorkResult>;
     fn handle(&mut self, m: ChunkedLong, _ctx: &mut Self::Context) -> Self::Result {
-        Box::pin(
+        m.gate.wait();
+        AtomicResponse::new(Box::pin(
             async move {
                 let total = m.total;
                 let chunk = m.chunk.max(1);
-                let mut acc: u64 = m.salt;
+                let started = Instant::now();
+                let mut acc: u64 = m.salt | 1;
                 let mut done = 0u64;
                 while done < total {
                     let take = chunk.min(total - done);
-                    acc = acc.wrapping_add(burn_cpu(take, acc));
+                    acc = burn_cpu_range(done, take, acc);
                     done += take;
                     tokio::task::yield_now().await;
                 }
-                acc
+                WorkResult {
+                    value: acc,
+                    started,
+                    completed: Instant::now(),
+                }
             }
             .into_actor(self),
-        )
+        ))
     }
 }
 
@@ -402,18 +274,27 @@ impl Handler<TinyTask> for RawChunkActor {
 
 // ===========================================================================
 // Arbiter 池：复刻 parrot ActixActorSystem::ArbiterPool（round-robin），
-// 保证拓扑对等（否则包装税会混入拓扑差异）。
+// Pool size matches CPU parallelism; startup and registry costs still differ.
 // ===========================================================================
 
 struct ArbiterPool {
     handles: Vec<ArbiterHandle>,
+    arbiters: Vec<Arbiter>,
+    live: Arc<AtomicU64>,
     next: AtomicU64,
 }
 
 impl ArbiterPool {
     fn new(size: usize) -> Self {
-        let handles = (0..size).map(|_| Arbiter::new().handle()).collect();
-        Self { handles, next: AtomicU64::new(0) }
+        assert!(size > 0);
+        let arbiters: Vec<_> = (0..size).map(|_| Arbiter::new()).collect();
+        let handles = arbiters.iter().map(Arbiter::handle).collect();
+        Self {
+            handles,
+            arbiters,
+            live: Arc::new(AtomicU64::new(0)),
+            next: AtomicU64::new(0),
+        }
     }
 
     fn next_arbiter(&self) -> ArbiterHandle {
@@ -422,8 +303,59 @@ impl ArbiterPool {
     }
 }
 
-fn spawn_in_pool(pool: &ArbiterPool, ops: Arc<AtomicU64>, cpu_sink: Arc<AtomicU64>) -> Addr<RawBenchActor> {
-    actix::Actor::start_in_arbiter(&pool.next_arbiter(), move |_| RawBenchActor { ops, cpu_sink })
+struct ActorLifetime(Arc<AtomicU64>);
+impl Drop for ActorLifetime {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl ArbiterPool {
+    fn lifetime(&self) -> ActorLifetime {
+        self.live.fetch_add(1, Ordering::SeqCst);
+        ActorLifetime(self.live.clone())
+    }
+    async fn drain(&self) {
+        assert!(
+            wait_until(
+                || self.live.load(Ordering::SeqCst) == 0,
+                Duration::from_secs(10),
+                Duration::from_millis(1)
+            )
+            .await,
+            "actors from the previous experiment were not destroyed"
+        );
+    }
+    fn shutdown(&mut self) -> bool {
+        for handle in &self.handles {
+            handle.stop();
+        }
+        let mut ok = true;
+        for arbiter in self.arbiters.drain(..) {
+            ok &= arbiter.join().is_ok();
+        }
+        ok && self.live.load(Ordering::SeqCst) == 0
+    }
+}
+impl Drop for ArbiterPool {
+    fn drop(&mut self) {
+        if !self.shutdown() {
+            eprintln!("arbiter cleanup failed during unwind");
+        }
+    }
+}
+
+fn spawn_in_pool(
+    pool: &ArbiterPool,
+    ops: Arc<AtomicU64>,
+    cpu_sink: Arc<AtomicU64>,
+) -> Addr<RawBenchActor> {
+    let life = pool.lifetime();
+    actix::Actor::start_in_arbiter(&pool.next_arbiter(), move |_| RawBenchActor {
+        ops,
+        cpu_sink,
+        _life: life,
+        echo_sum: 0,
+    })
 }
 
 // ===========================================================================
@@ -431,13 +363,37 @@ fn spawn_in_pool(pool: &ArbiterPool, ops: Arc<AtomicU64>, cpu_sink: Arc<AtomicU6
 // ===========================================================================
 
 fn main() {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
+        println!("Usage: actix-bench [report-path]\nRuns the full fixed-work experiment (several minutes). Use a release build.\nDefault output: /tmp/parrot_bench_actix_raw.md");
+        return;
+    }
+    assert!(
+        args.len() <= 1,
+        "expected at most one report path; use --help"
+    );
+    if cfg!(debug_assertions) {
+        eprintln!("full benchmark requires --release");
+        std::process::exit(2);
+    }
+    let output = args
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "/tmp/parrot_bench_actix_raw.md".into());
+    let run_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     System::new().block_on(async {
         let report = Report::new();
         println!("==================== ACTIX RAW (no parrot wrapper) ====================");
 
+        println!("Preparing independent CPU reference outputs (outside measurements)...");
+        let expected = oracle::prepare(num_cpus());
+        println!("Reference outputs ready: {} cases", expected.len());
         let cpu_sink = Arc::new(AtomicU64::new(0));
         // 与 parrot ActixActorSystem::new() 默认一致：arbiter 数 = CPU 数
-        let pool = ArbiterPool::new(num_cpus());
+        let mut pool = ArbiterPool::new(num_cpus());
 
         // ---------- 1. Echo ask 基线 ----------
         {
@@ -447,7 +403,7 @@ fn main() {
             let start = Instant::now();
             for i in 0..1_000u64 {
                 let t0 = Instant::now();
-                let r = a1.send(Echo { v: i }).await.unwrap();
+                let r = a1.send(Echo { v: i }).timeout(REQUEST_TIMEOUT).await.unwrap();
                 assert_eq!(r, i);
                 samples.push(t0.elapsed().as_micros());
             }
@@ -459,7 +415,7 @@ fn main() {
                 latencies: latency_stats(samples),
                 correctness: true,
                 note: String::new(),
-                cpu_work_secs: None,
+
             });
         }
         for (name, conc, per) in [
@@ -477,7 +433,7 @@ fn main() {
                     let mut local = Vec::with_capacity(per as usize);
                     for i in 0..per {
                         let t0 = Instant::now();
-                        let r = ar.send(Echo { v: i + c as u64 }).await.unwrap();
+                        let r = ar.send(Echo { v: i + c as u64 }).timeout(REQUEST_TIMEOUT).await.unwrap();
                         assert_eq!(r, i + c as u64);
                         local.push(t0.elapsed().as_micros());
                     }
@@ -499,18 +455,19 @@ fn main() {
                 latencies: latency_stats(samples),
                 correctness: correct,
                 note: format!("concurrency={}", conc),
-                cpu_work_secs: None,
+
             });
         }
 
-        // ---------- 2. tell 吞透（对齐 parrot 语义：send().await 逐条等待）----------
+        pool.drain().await;
+        // ---------- 2. Sequential request/reply throughput----------
         {
             let ops = Arc::new(AtomicU64::new(0));
             let a4 = spawn_in_pool(&pool, ops.clone(), cpu_sink.clone());
             let n = 100_000u64;
             let start = Instant::now();
             for i in 0..n {
-                let _ = a4.send(Echo { v: i }).await;
+                assert_eq!(a4.send(Echo { v: i }).timeout(REQUEST_TIMEOUT).await.unwrap(), i);
             }
             let ok = wait_until(
                 || ops.load(Ordering::Relaxed) >= n,
@@ -519,14 +476,14 @@ fn main() {
             )
             .await;
             report.push(BenchResult {
-                name: "tell-echo-100k".into(),
+                name: "request-echo-100k".into(),
                 engine: "actix-raw",
                 total_messages: n,
                 elapsed: start.elapsed(),
                 latencies: latency_stats(vec![]),
                 correctness: ok,
                 note: if ok { String::new() } else { "DRAIN TIMEOUT".into() },
-                cpu_work_secs: None,
+
             });
         }
         // 附加：原生 do_send 纯投递（actix 原生 fire-and-forget 上限参考）
@@ -545,18 +502,22 @@ fn main() {
                 Duration::from_millis(5),
             )
             .await;
+            let elapsed = start.elapsed();
+            let checksum = a4.send(GetEchoSum).timeout(REQUEST_TIMEOUT).await.unwrap();
+            let ok = ok && ops.load(Ordering::Acquire) == n && checksum == n * (n - 1) / 2;
             report.push(BenchResult {
                 name: "tell-echo-100k-dosend".into(),
                 engine: "actix-raw",
                 total_messages: n,
-                elapsed: start.elapsed(),
+                elapsed,
                 latencies: latency_stats(vec![]),
                 correctness: ok,
                 note: format!("do_send fired in {:.3}s (native fire-and-forget)", sent_elapsed.as_secs_f64()),
-                cpu_work_secs: None,
+
             });
         }
 
+        pool.drain().await;
         // ---------- 3. CPU 密集 ----------
         {
             let ops = Arc::new(AtomicU64::new(0));
@@ -565,9 +526,10 @@ fn main() {
             let start = Instant::now();
             for i in 0..200u64 {
                 let t0 = Instant::now();
-                let r = a5.send(CpuTask { iters: 200_000, salt: i }).await.unwrap();
-                assert!(r > 0);
-                samples.push(t0.elapsed().as_micros());
+                let r = a5.send(CpuTask { iters: 200_000, salt: i }).timeout(REQUEST_TIMEOUT).await.unwrap();
+                let completed = Instant::now();
+                assert_eq!(r, expected[&(200_000, i)]);
+                samples.push(completed.duration_since(t0).as_micros());
             }
             report.push(BenchResult {
                 name: "cpu-serial-200x200k".into(),
@@ -576,8 +538,8 @@ fn main() {
                 elapsed: start.elapsed(),
                 latencies: latency_stats(samples),
                 correctness: true,
-                note: "~200µs work/msg".into(),
-                cpu_work_secs: None,
+                note: "200000 fixed iterations per message".into(),
+
             });
         }
         {
@@ -589,13 +551,14 @@ fn main() {
             let start = Instant::now();
             let mut handles = Vec::new();
             for (i, r) in addrs.into_iter().enumerate() {
+                let expected = expected.clone();
                 handles.push(tokio::spawn(async move {
                     let mut samples = Vec::new();
                     for k in 0..25u64 {
                         let t0 = Instant::now();
-                        let v = r.send(CpuTask { iters: 200_000, salt: i as u64 * 1000 + k }).await.unwrap();
+                        let v = r.send(CpuTask { iters: 200_000, salt: i as u64 * 1000 + k }).timeout(REQUEST_TIMEOUT).await.unwrap();
                         samples.push(t0.elapsed().as_micros());
-                        assert!(v > 0);
+                        assert_eq!(v, expected[&(200_000, i as u64 * 1000 + k)]);
                     }
                     samples
                 }));
@@ -605,17 +568,18 @@ fn main() {
                 all.extend(h.await.unwrap());
             }
             report.push(BenchResult {
-                name: "cpu-parallel-8actors-200k".into(),
+                name: "cpu-parallel-64actors-200k".into(),
                 engine: "actix-raw",
                 total_messages: 64 * 25,
                 elapsed: start.elapsed(),
                 latencies: latency_stats(all),
                 correctness: true,
                 note: "64 actors × 25 msgs × 200k iters (pooled arbiters)".into(),
-                cpu_work_secs: None,
+
             });
         }
 
+        pool.drain().await;
         // ---------- 4. 洪泛（对齐 parrot：4 任务并发 send().await 往返）----------
         {
             let ops_flood = Arc::new(AtomicU64::new(0));
@@ -627,7 +591,7 @@ fn main() {
                 let ar = af.clone();
                 jhs.push(tokio::spawn(async move {
                     for i in 0..(n / 4) {
-                        let _ = ar.send(Echo { v: i + p }).await;
+                        assert_eq!(ar.send(Echo { v: i + p }).timeout(REQUEST_TIMEOUT).await.unwrap(), i + p);
                     }
                 }));
             }
@@ -645,7 +609,7 @@ fn main() {
             )
             .await;
             report.push(BenchResult {
-                name: "flood-500k-tell".into(),
+                name: "flood-500k-requests".into(),
                 engine: "actix-raw",
                 total_messages: n,
                 elapsed: start.elapsed(),
@@ -656,7 +620,7 @@ fn main() {
                     sent_elapsed.as_secs_f64(),
                     if drained { "drained" } else { "TIMEOUT" }
                 ),
-                cpu_work_secs: None,
+
             });
         }
         // 附加：原生 do_send 洪泛
@@ -687,11 +651,16 @@ fn main() {
                 Duration::from_millis(20),
             )
             .await;
+            let elapsed = start.elapsed();
+            let checksum = af.send(GetEchoSum).timeout(REQUEST_TIMEOUT).await.unwrap();
+            let per = n / 4;
+            let drained = drained && ops_flood.load(Ordering::Acquire) == n
+                && checksum == 4 * per * (per - 1) / 2 + 6 * per;
             report.push(BenchResult {
                 name: "flood-500k-dosend".into(),
                 engine: "actix-raw",
                 total_messages: n,
-                elapsed: start.elapsed(),
+                elapsed,
                 latencies: latency_stats(vec![]),
                 correctness: drained && ok,
                 note: format!(
@@ -699,78 +668,57 @@ fn main() {
                     sent_elapsed.as_secs_f64(),
                     if drained { "drained" } else { "TIMEOUT" }
                 ),
-                cpu_work_secs: None,
+
             });
         }
 
-        // ---------- 5. ask 超时边界 ----------
+        pool.drain().await;
+        // ---------- 5. Deadline after acknowledged handler entry ----------
         {
-            let ops_t = Arc::new(AtomicU64::new(0));
-            let at = spawn_in_pool(&pool, ops_t.clone(), cpu_sink.clone());
-            for s in 1..=2u64 {
-                at.do_send(CpuTask { iters: 50_000_000, salt: s });
-            }
-            let started = wait_until(
-                || ops_t.load(Ordering::Relaxed) >= 1,
-                Duration::from_secs(10),
-                Duration::from_millis(1),
-            )
-            .await;
-            assert!(started, "heavy task must start");
-            // 独立 OS 线程 + current-thread runtime 探测 1ms 超时
-            let probe_addr = at.clone();
-            let probe = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .unwrap();
-                rt.block_on(async move {
-                    probe_addr
-                        .send(Echo { v: 1 })
-                        .timeout(Duration::from_millis(1))
-                        .await
-                })
-            });
-            let r = probe.join().expect("probe thread");
-            let correct = r.is_err();
+            let at = spawn_in_pool(&pool, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
+            let start = Instant::now();
+            let (gate, entered, release) = start_gate();
+            let pending = at.send(GatedCpu { gate, iters: 1, salt: 1 });
+            tokio::time::timeout(Duration::from_secs(5), entered).await.unwrap().unwrap();
+            let r = at.send(Echo { v: 1 }).timeout(Duration::from_millis(1)).await;
+            drop(release);
+            pending.timeout(REQUEST_TIMEOUT).await.unwrap();
             report.push(BenchResult {
-                name: "ask-timeout-short".into(),
-                engine: "actix-raw",
-                total_messages: 2,
-                elapsed: Duration::from_millis(0),
-                latencies: latency_stats(vec![]),
-                correctness: correct,
-                note: format!("short-timeout ask result err: {:?}", r.err().map(|e| e.to_string())),
-                cpu_work_secs: None,
+                name: "ask-timeout-short".into(), engine: "actix-raw", total_messages: 2,
+                elapsed: start.elapsed(), latencies: latency_stats(vec![]),
+                correctness: matches!(r, Err(MailboxError::Timeout)),
+                note: "1ms deadline while the acknowledged handler is held by a gate".into(),
             });
         }
 
+        pool.drain().await;
         // ---------- 6. 停止后发送 ----------
         {
             let ops_s = Arc::new(AtomicU64::new(0));
             let asref = spawn_in_pool(&pool, ops_s.clone(), cpu_sink.clone());
             let alive_before = asref.connected();
-            asref.do_send(StopNow);
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            asref.send(StopNow).timeout(REQUEST_TIMEOUT).await.unwrap();
+            assert!(wait_until(|| !asref.connected(), Duration::from_secs(5), Duration::from_millis(1)).await);
             let alive_after = asref.connected();
-            let r = asref.send(Echo { v: 1 }).await;
+            let r = asref.send(Echo { v: 1 }).timeout(REQUEST_TIMEOUT).await;
             report.push(BenchResult {
                 name: "send-after-stop".into(),
                 engine: "actix-raw",
                 total_messages: 1,
                 elapsed: Duration::from_millis(0),
                 latencies: latency_stats(vec![]),
-                correctness: r.is_err(),
+                correctness: matches!(r, Err(MailboxError::Closed)) && alive_before && !alive_after,
                 note: format!(
                     "alive before={}, after={}; send => {:?}",
                     alive_before,
                     alive_after,
                     r.err().map(|e| e.to_string())
                 ),
-                cpu_work_secs: None,
+
             });
         }
 
+        pool.drain().await;
         // ---------- 7. 大量 actor ----------
         {
             let start = Instant::now();
@@ -783,7 +731,7 @@ fn main() {
             for r in addrs {
                 let a = r.clone();
                 jhs.push(tokio::spawn(async move {
-                    a.send(Echo { v: 1 }).await.is_ok()
+                    a.send(Echo { v: 1 }).timeout(REQUEST_TIMEOUT).await == Ok(1)
                 }));
             }
             let mut ok = 0u64;
@@ -796,23 +744,24 @@ fn main() {
                 name: "herd-20000-actors".into(),
                 engine: "actix-raw",
                 total_messages: 20_000,
-                elapsed: spawn_elapsed,
+                elapsed: start.elapsed(),
                 latencies: latency_stats(vec![]),
                 correctness: ok == 20_000,
                 note: format!(
                     "spawned 20000 in {:.3}s; all accepted send",
                     spawn_elapsed.as_secs_f64()
                 ),
-                cpu_work_secs: None,
+
             });
         }
 
+        pool.drain().await;
         // ---------- 8. 长时程 ----------
         {
             let ops_l = Arc::new(AtomicU64::new(0));
             let al = spawn_in_pool(&pool, ops_l.clone(), cpu_sink.clone());
             let start = Instant::now();
-            let r = al.send(LongRun { iters: 2_000_000_000 }).await.unwrap();
+            let r = al.send(LongRun { iters: 2_000_000_000 }).timeout(REQUEST_TIMEOUT).await.unwrap();
             let elapsed = start.elapsed();
             report.push(BenchResult {
                 name: "longrun-2G-iters".into(),
@@ -820,122 +769,71 @@ fn main() {
                 total_messages: 1,
                 elapsed,
                 latencies: latency_stats(vec![elapsed.as_micros()]),
-                correctness: r > 0,
+                correctness: r == expected[&(2_000_000_000, 7)] && ops_l.load(Ordering::Relaxed) == 2,
                 note: "single 2G-iteration compute".into(),
-                cpu_work_secs: None,
+
             });
         }
 
-        // ---------- 9. 饥饿交叉验证（ticker 探测法） ----------
+        pool.drain().await;
+        // ---------- 9. Probes overlapping the actual CPU interval ----------
         {
-            let ops_a = Arc::new(AtomicU64::new(0));
-            let ops_b = Arc::new(AtomicU64::new(0));
-            let aa = spawn_in_pool(&pool, ops_a.clone(), cpu_sink.clone());
-            let ab = spawn_in_pool(&pool, ops_b.clone(), cpu_sink.clone());
-
+            let aa = spawn_in_pool(&pool, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
+            let ab = spawn_in_pool(&pool, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
             let stop = Arc::new(AtomicU64::new(0));
-            let t_origin = Instant::now();
-            let samples = Arc::new(Mutex::new(Vec::<(u128, u128)>::new()));
-            let ticker = {
-                let ab = ab.clone();
-                let stop = stop.clone();
-                let samples = samples.clone();
-                tokio::spawn(async move {
-                    let mut i = 0u64;
-                    while stop.load(Ordering::Relaxed) == 0 {
-                        let t0 = Instant::now();
-                        if let Ok(v) = ab.send(Echo { v: i }).await {
-                            assert_eq!(v, i);
-                            samples.lock().unwrap().push((t_origin.elapsed().as_millis(), t0.elapsed().as_micros()));
-                        }
-                        i += 1;
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                })
-            };
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            let baseline: Vec<u128> = samples.lock().unwrap().iter().map(|(_, l)| *l).collect();
-            let base_stats = latency_stats(baseline);
-
-            let heavy_start = Instant::now();
-            let heavy = tokio::spawn({
-                let ar = aa.clone();
-                async move {
-                    let _ = ar.send(LongRun { iters: 1_000_000_000 }).await;
+            let (ready, received) = tokio::sync::oneshot::channel();
+            let ticker_stop = stop.clone();
+            let ticker = tokio::spawn(async move {
+                let mut ready = Some(ready);
+                let mut samples = Vec::new();
+                while ticker_stop.load(Ordering::Relaxed) == 0 {
+                    let started = Instant::now();
+                    assert_eq!(ab.send(Echo { v: 9 }).timeout(REQUEST_TIMEOUT).await.unwrap(), 9);
+                    samples.push(ProbeSample { started, completed: Instant::now() });
+                    if let Some(ready) = ready.take() { ready.send(()).unwrap(); }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
+                samples
             });
-            let started = wait_until(
-                || ops_a.load(Ordering::Relaxed) > 0,
-                Duration::from_secs(10),
-                Duration::from_millis(1),
-            )
-            .await;
-            let compute_t0_ms = t_origin.elapsed().as_millis();
-            let compute_window_start = Instant::now();
-
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            let compute_t1_ms = t_origin.elapsed().as_millis();
-            let in_window: Vec<u128> = samples
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(ts, _)| *ts >= compute_t0_ms && *ts <= compute_t1_ms)
-                .map(|(_, l)| *l)
-                .collect();
-            let in_window_stats = latency_stats(in_window);
-
-            let during: Vec<u128> = samples.lock().unwrap().iter().map(|(_, l)| *l).collect();
-            let during_new: Vec<u128> = if during.len() > base_stats.count as usize {
-                during[base_stats.count as usize..].to_vec()
-            } else {
-                during.clone()
-            };
-            let during_stats = latency_stats(during_new);
-
-            let _ = heavy.await;
-            let compute_elapsed = heavy_start.elapsed();
+            received.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let (gate, entered, release) = start_gate();
+            let work = aa.send(GatedCpu { gate, iters: 1_000_000_000, salt: 7 });
+            entered.await.unwrap();
+            drop(release);
+            let work = work.timeout(REQUEST_TIMEOUT).await.unwrap();
             stop.store(1, Ordering::Relaxed);
-            let _ = ticker.await;
-
+            let samples = ticker.await.unwrap();
+            let window = probe_window(&samples, work.started, work.completed).unwrap();
             report.push(BenchResult {
-                name: "starve-echo-during-longrun".into(),
-                engine: "actix-raw",
-                total_messages: during_stats.count,
-                elapsed: compute_window_start.elapsed(),
-                latencies: during_stats.clone(),
-                correctness: true,
-                note: format!(
-                    "heavy={:.1}s; probes-in-window={} (p99={:.2}ms max={:.2}ms); baseline p99={:.2}ms; started_observed={}",
-                    compute_elapsed.as_secs_f64(),
-                    in_window_stats.count,
-                    in_window_stats.p99_us as f64 / 1000.0,
-                    in_window_stats.max_us as f64 / 1000.0,
-                    base_stats.p99_us as f64 / 1000.0,
-                    started,
-                ),
-                cpu_work_secs: None,
+                name: "starve-echo-during-longrun".into(), engine: "actix-raw",
+                total_messages: window.completed, elapsed: work.completed.duration_since(work.started),
+                latencies: window.overlapping.clone(), correctness: window.baseline.count > 0 && work.value == expected[&(1_000_000_000, 7)],
+                note: format!("CPU interval recorded inside handler; {} completions in interval; {} overlapping round trips, including late completions; baseline n={}. Zero progress is an outcome, not a harness failure.", window.completed, window.overlapping.count, window.baseline.count),
             });
         }
 
+        pool.drain().await;
         // ---------- 10. IO 密集：handler 内真实 await sleep(10ms) ----------
         {
             let io_done = Arc::new(AtomicU64::new(0));
             let mut addrs = Vec::new();
             for _ in 0..64 {
                 let done = io_done.clone();
-                addrs.push(actix::Actor::start_in_arbiter(&pool.next_arbiter(), move |_| RawIoActor { done }));
+                let life = pool.lifetime();
+                addrs.push(actix::Actor::start_in_arbiter(&pool.next_arbiter(), move |_| RawIoActor { done, _life: life }));
             }
             let start = Instant::now();
             let mut handles = Vec::new();
             for r in addrs {
                 handles.push(tokio::spawn(async move {
                     for _ in 0..20u64 {
-                        let _ = r.send(Echo { v: 1 }).await;
+                        assert_eq!(r.send(Echo { v: 1 }).timeout(REQUEST_TIMEOUT).await.unwrap(), 1);
                     }
                 }));
             }
             for h in handles {
-                let _ = h.await;
+                h.await.unwrap();
             }
             let drained = wait_until(
                 || io_done.load(Ordering::Relaxed) >= 64 * 20,
@@ -960,20 +858,18 @@ fn main() {
                     serial_expected,
                     serial_expected / elapsed.as_secs_f64(),
                 ),
-                cpu_work_secs: None,
+
             });
         }
 
+        pool.drain().await;
         // ---------- M1. 分钟级任务 + 持续加入 + 短探测 ----------
         {
             const LONG_ACTORS: usize = 8;
             const BACKUP_ACTORS: usize = 4;
-            const LONG_ITERS: u64 = 57_200_000_000;   // ~65s @release
-            const MEDIUM_ITERS: u64 = 2_400_000_000;  // ~2.7s @release
+            const LONG_ITERS: u64 = 57_200_000_000;   // fixed iterations
+            const MEDIUM_ITERS: u64 = 2_400_000_000;  // fixed iterations
             const MEDIUM_PER_BACKUP: u64 = 10;
-            let nominal = (LONG_ACTORS as f64 * LONG_ITERS as f64
-                + BACKUP_ACTORS as f64 * MEDIUM_PER_BACKUP as f64 * MEDIUM_ITERS as f64)
-                / BURN_RATE;
 
             let mut long_refs = Vec::new();
             for _ in 0..LONG_ACTORS {
@@ -988,19 +884,22 @@ fn main() {
             let start = Instant::now();
             let mut handles = Vec::new();
             for (i, r) in long_refs.into_iter().enumerate() {
+                let expected = expected.clone();
                 handles.push(tokio::spawn(async move {
                     let t0 = Instant::now();
-                    let v = r.send(MinuteCpu { iters: LONG_ITERS, salt: 0xD00D + i as u64 }).await.unwrap();
-                    vec![t0.elapsed().as_micros(), v as u128]
+                    let v = r.send(MinuteCpu { iters: LONG_ITERS, salt: 0xD00D + i as u64 }).timeout(REQUEST_TIMEOUT).await.unwrap();
+                    { let elapsed = t0.elapsed().as_micros(); assert_eq!(v, expected[&(LONG_ITERS, 0xD00D + i as u64)]); vec![elapsed] }
                 }));
             }
             for (i, r) in backup_refs.into_iter().enumerate() {
+                let expected = expected.clone();
                 handles.push(tokio::spawn(async move {
                     let mut lats = Vec::new();
                     for k in 0..MEDIUM_PER_BACKUP {
                         let t0 = Instant::now();
-                        let _ = r.send(MediumCpu { iters: MEDIUM_ITERS, salt: 0xBACC + i as u64 * 100 + k }).await.unwrap();
+                        let value = r.send(MediumCpu { iters: MEDIUM_ITERS, salt: 0xBACC + i as u64 * 100 + k }).timeout(REQUEST_TIMEOUT).await.unwrap();
                         lats.push(t0.elapsed().as_micros());
+                        assert_eq!(value, expected[&(MEDIUM_ITERS, 0xBACC + i as u64 * 100 + k)]);
                     }
                     lats
                 }));
@@ -1009,12 +908,15 @@ fn main() {
             let probe_handle = {
                 let pr = probe.clone();
                 let st = probe_stop.clone();
+                let expected_probe = expected[&(1_000, 0xE)];
                 tokio::spawn(async move {
                     let mut lats = Vec::new();
                     while st.load(Ordering::Relaxed) == 0 {
                         let t0 = Instant::now();
-                        let _ = pr.send(TinyTask { salt: 0xE }).await;
-                        lats.push(t0.elapsed().as_micros());
+                        let value = pr.send(TinyTask { salt: 0xE }).timeout(REQUEST_TIMEOUT).await.unwrap();
+                        let completed = Instant::now();
+                        assert_eq!(value, expected_probe);
+                        lats.push(completed.duration_since(t0).as_micros());
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                     lats
@@ -1030,19 +932,21 @@ fn main() {
                 }
             }
             probe_stop.store(1, Ordering::Relaxed);
-            let probe_lats = probe_handle.await.unwrap_or_default();
+            let probe_lats = probe_handle.await.unwrap();
             let elapsed = start.elapsed();
-            let ps = latency_stats(probe_lats.clone());
+            correct &= all_lats.len() == LONG_ACTORS + BACKUP_ACTORS * MEDIUM_PER_BACKUP as usize;
+            correct &= !probe_lats.is_empty();
+            let ps = latency_stats(probe_lats);
             report.push(BenchResult {
                 name: "mixed-minute-cpu-plus-incoming".into(),
                 engine: "actix-raw",
-                total_messages: (LONG_ACTORS + BACKUP_ACTORS * MEDIUM_PER_BACKUP as usize) as u64,
+                total_messages: (LONG_ACTORS + BACKUP_ACTORS * MEDIUM_PER_BACKUP as usize) as u64 + ps.count,
                 elapsed,
                 latencies: ps.clone(),
                 correctness: correct,
-                cpu_work_secs: Some(nominal),
+
                 note: format!(
-                    "8×65s long + 40×2.7s medium concurrent; probe(tiny ask) p99={:.1}ms max={:.1}ms over {} probes",
+                    "48 work replies (8×57.2G iterations + 40×2.4G iterations) plus probes; probe(tiny ask) p99={:.1}ms max={:.1}ms over {} probes",
                     ps.p99_us as f64 / 1000.0,
                     ps.max_us as f64 / 1000.0,
                     ps.count,
@@ -1050,124 +954,67 @@ fn main() {
             });
         }
 
-        // ---------- M2. 同一 actor 混合负载 FIFO ----------
+        pool.drain().await;
+        // ---------- M2. Same actor backlog, confirmed before release ----------
         {
-            const LONG_ITERS: u64 = 30_000_000_000;  // ~34s @release
+            const LONG_ITERS: u64 = 30_000_000_000;
             const MEDIUM: u64 = 6;
-            const MEDIUM_ITERS: u64 = 2_400_000_000; // ~2.7s
+            const MEDIUM_ITERS: u64 = 2_400_000_000;
             const TINY: u64 = 4_000;
-            let nominal = (LONG_ITERS as f64 + MEDIUM as f64 * MEDIUM_ITERS as f64
-                + TINY as f64 * 1_000.0) / BURN_RATE;
-
-            let shared = spawn_in_pool(&pool, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
+            let ops = Arc::new(AtomicU64::new(0));
+            let shared = spawn_in_pool(&pool, ops.clone(), cpu_sink.clone());
             let start = Instant::now();
-            let mut jhs = Vec::new();
-            {
-                let sr = shared.clone();
-                jhs.push(tokio::spawn(async move {
-                    let _ = sr.send(MinuteCpu { iters: LONG_ITERS, salt: 1 }).await;
-                }));
-            }
+            let (gate, entered, release) = start_gate();
+            let long = shared.send(GatedCpu { gate, iters: LONG_ITERS, salt: 1 });
+            entered.await.unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
             for k in 0..MEDIUM {
-                let sr = shared.clone();
-                jhs.push(tokio::spawn(async move {
-                    let _ = sr.send(MediumCpu { iters: MEDIUM_ITERS, salt: 100 + k }).await;
-                }));
+                let r = shared.clone();
+                let expected = expected.clone();
+                tasks.spawn(async move { assert_eq!(r.send(MediumCpu { iters: MEDIUM_ITERS, salt: 100 + k }).timeout(REQUEST_TIMEOUT).await.unwrap(), expected[&(MEDIUM_ITERS, 100 + k)]); });
             }
             for k in 0..TINY {
-                let sr = shared.clone();
-                jhs.push(tokio::spawn(async move {
-                    let _ = sr.send(TinyTask { salt: k }).await;
-                }));
+                let r = shared.clone();
+                let expected_tiny = expected[&(1_000, k)];
+                tasks.spawn(async move { assert_eq!(r.send(TinyTask { salt: k }).timeout(REQUEST_TIMEOUT).await.unwrap(), expected_tiny); });
             }
-            for jh in jhs {
-                let _ = jh.await;
-            }
-            // 哨兵 ask：长超时覆盖整条队列
-            let t_probe = Instant::now();
-            let _ = shared.send(TinyTask { salt: 0x5 }).await;
-            let tail_latency = t_probe.elapsed();
-            let elapsed = start.elapsed();
-
+            // This request is enqueued while the first handler is gated. It is
+            // not asserted to follow every concurrent producer in FIFO order.
+            let probe_start = Instant::now();
+            let probe = shared.send(TinyTask { salt: 5 });
+            drop(release);
+            let probe_value = probe.timeout(REQUEST_TIMEOUT).await.unwrap();
+            let probe_latency = probe_start.elapsed();
+            let work = long.timeout(REQUEST_TIMEOUT).await.unwrap();
+            assert_eq!(work.value, expected[&(LONG_ITERS, 1)]);
+            while let Some(result) = tasks.join_next().await { result.unwrap(); }
+            assert_eq!(probe_value, expected[&(1_000, 5)]);
             report.push(BenchResult {
-                name: "mixed-same-actor-fifo".into(),
-                engine: "actix-raw",
-                total_messages: 1 + MEDIUM + TINY,
-                elapsed,
-                latencies: latency_stats(vec![]),
-                correctness: true,
-                cpu_work_secs: Some(nominal),
-                note: format!(
-                    "1×34s + 6×2.7s + 4000 tiny FIFO on ONE actor; tail-probe ask lat={:.0}ms (≈queued-behind time)",
-                    tail_latency.as_secs_f64() * 1000.0,
-                ),
+                name: "mixed-same-actor-backlog-probe".into(), engine: "actix-raw",
+                total_messages: 2 + MEDIUM + TINY, elapsed: start.elapsed(),
+                latencies: latency_stats(vec![probe_latency.as_micros()]),
+                correctness: ops.load(Ordering::Relaxed) == 2 + MEDIUM * 2 + TINY + 1,
+                note: format!("1×30G + 6×2.4G + 4000 tiny requests; probe submitted before long work released, not a FIFO-tail assertion; actual long CPU interval={:.3}s", work.completed.duration_since(work.started).as_secs_f64()),
             });
         }
 
-        // ---------- M3. 分片长任务 vs 连续长任务 ----------
+        pool.drain().await;
+        // ---------- M3. Same computation, serialized actor, queued probe ----------
         {
-            const TOTAL: u64 = 30_000_000_000;   // ~34s @release each variant
-            const CHUNK: u64 = 1_500_000_000;    // ~20 片
-
-            let solid = spawn_in_pool(&pool, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
-            let chunked: Addr<RawChunkActor> =
-                actix::Actor::start_in_arbiter(&pool.next_arbiter(), |_| RawChunkActor);
-
-            // A) 连续（solid，同步 handler）
-            let t0 = Instant::now();
-            solid.send(MinuteCpu { iters: TOTAL, salt: 3 }).await.unwrap();
-            let solid_probe = {
-                let sr = solid.clone();
-                tokio::spawn(async move {
-                    let tp = Instant::now();
-                    let v = sr.send(TinyTask { salt: 1 }).await.unwrap();
-                    (tp.elapsed(), v)
-                })
-            };
-            let (solid_wait, _) = solid_probe.await.unwrap();
-            let solid_long = t0.elapsed();
-
-            // B) 分片（async + yield）
-            let t1 = Instant::now();
-            let chunk_handle = {
-                let cr = chunked.clone();
-                tokio::spawn(async move {
-                    let _ = cr.send(ChunkedLong { total: TOTAL, chunk: CHUNK, salt: 3 }).await;
-                })
-            };
-            let chunk_probe = {
-                let cr2 = chunked.clone();
-                tokio::spawn(async move {
-                    let tp = Instant::now();
-                    let v = cr2.send(TinyTask { salt: 2 }).await.unwrap();
-                    (tp.elapsed(), v)
-                })
-            };
-            let _ = chunk_handle.await;
-            let (chunk_wait, _) = chunk_probe.await.unwrap();
-            let chunk_long = t1.elapsed();
-
-            let nominal = TOTAL as f64 / BURN_RATE;
-            let yield_overhead_pct = (chunk_long.as_secs_f64() / solid_long.as_secs_f64() - 1.0) * 100.0;
+            const TOTAL: u64 = 30_000_000_000;
+            const CHUNK: u64 = 1_500_000_000;
+            let measured = compare_chunked(&pool, TOTAL, CHUNK).await;
             report.push(BenchResult {
-                name: "chunked-vs-solid-longrun".into(),
-                engine: "actix-raw",
-                total_messages: 2,
-                elapsed: solid_long + chunk_long,
-                latencies: latency_stats(vec![solid_wait.as_micros(), chunk_wait.as_micros()]),
-                correctness: true,
-                cpu_work_secs: Some(nominal * 2.0),
-                note: format!(
-                    "solid={:.1}s (tiny queued {:.0}ms) vs chunked×20 (tiny wait {:.0}ms); yield overhead {:.1}%",
-                    solid_long.as_secs_f64(),
-                    solid_wait.as_secs_f64() * 1000.0,
-                    chunk_wait.as_secs_f64() * 1000.0,
-                    yield_overhead_pct,
-                ),
+                name: "chunked-vs-solid-longrun".into(), engine: "actix-raw", total_messages: 4,
+                elapsed: measured.elapsed,
+                latencies: latency_stats(vec![measured.solid_probe.as_micros(), measured.chunk_probe.as_micros()]),
+                correctness: measured.solid_value == measured.chunk_value && measured.solid_value == expected[&(TOTAL, 3)],
+                note: format!("same 30G recurrence; atomic async handler serializes messages; work intervals solid={:.3}s chunked={:.3}s, probes queued before computation; this does not measure reentrant message handling", measured.solid.as_secs_f64(), measured.chunked.as_secs_f64()),
             });
         }
 
-        // ---------- E1. 乒乓 RTT ----------
+        pool.drain().await;
+        // ---------- E1. Caller-mediated sequential request pair ----------
         {
             let pa = spawn_in_pool(&pool, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
             let pb = spawn_in_pool(&pool, Arc::new(AtomicU64::new(0)), cpu_sink.clone());
@@ -1177,10 +1024,10 @@ fn main() {
             let mut i = 0u64;
             while i < BOUNCES {
                 let t0 = Instant::now();
-                let va = pa.send(Echo { v: i }).await.unwrap();
-                let vb = pb.send(Echo { v: va }).await.unwrap();
+                let va = pa.send(Echo { v: i }).timeout(REQUEST_TIMEOUT).await.unwrap();
+                let vb = pb.send(Echo { v: va }).timeout(REQUEST_TIMEOUT).await.unwrap();
                 assert_eq!(vb, i);
-                if i % 10 == 0 {
+                if i.is_multiple_of(10) {
                     samples.push(t0.elapsed().as_micros());
                 }
                 i += 1;
@@ -1192,12 +1039,13 @@ fn main() {
                 elapsed: start.elapsed(),
                 latencies: latency_stats(samples),
                 correctness: true,
-                note: "2-hop ask RTT (A→B), sampled every 10th".into(),
-                cpu_work_secs: None,
+                note: "caller→A then caller→B sequential request pair, sampled every 10th".into(),
+
             });
         }
 
-        // ---------- E2. 背靠背自传递 ----------
+        pool.drain().await;
+        // ---------- E2. Back-to-back requests to one actor ----------
         {
             let ops_c = Arc::new(AtomicU64::new(0));
             let ca = spawn_in_pool(&pool, ops_c.clone(), cpu_sink.clone());
@@ -1205,8 +1053,9 @@ fn main() {
             let start = Instant::now();
             let mut i = 0u64;
             while i < CHAIN_TICKS {
-                let v = ca.send(Echo { v: i }).await.unwrap();
-                let _ = ca.send(Echo { v: v + 1 }).await;
+                let v = ca.send(Echo { v: i }).timeout(REQUEST_TIMEOUT).await.unwrap();
+                assert_eq!(v, i);
+                assert_eq!(ca.send(Echo { v: v + 1 }).timeout(REQUEST_TIMEOUT).await.unwrap(), i + 1);
                 i += 1;
             }
             let ok = wait_until(
@@ -1216,23 +1065,23 @@ fn main() {
             )
             .await;
             report.push(BenchResult {
-                name: "self-chain-ask-tell-20k".into(),
+                name: "back-to-back-requests-20k".into(),
                 engine: "actix-raw",
                 total_messages: CHAIN_TICKS * 2,
                 elapsed: start.elapsed(),
                 latencies: latency_stats(vec![]),
                 correctness: ok,
-                note: "back-to-back ask→tell to same actor (degenerate chain)".into(),
-                cpu_work_secs: None,
+                note: "caller sends two sequential request/reply messages to the same actor".into(),
+
             });
         }
 
+        pool.drain().await;
         // ---------- E3. 慢消费者 + 快生产者 ----------
         {
             const PRODUCERS: usize = 8;
             const PER_PRODUCER: u64 = 5_000;
             let iters_per_msg: u64 = 170_000;
-            let nominal = (PRODUCERS as f64 * PER_PRODUCER as f64 * iters_per_msg as f64) / BURN_RATE;
 
             let ops_cons = Arc::new(AtomicU64::new(0));
             let consumer = spawn_in_pool(&pool, ops_cons.clone(), cpu_sink.clone());
@@ -1241,9 +1090,10 @@ fn main() {
             let mut jhs = Vec::new();
             for pid in 0..PRODUCERS {
                 let cr = consumer.clone();
+                let expected = expected.clone();
                 jhs.push(tokio::spawn(async move {
                     for k in 0..PER_PRODUCER {
-                        if cr.send(CpuTask { iters: iters_per_msg, salt: pid as u64 * 10_000 + k }).await.is_err() {
+                        if cr.send(CpuTask { iters: iters_per_msg, salt: pid as u64 * 10_000 + k }).timeout(REQUEST_TIMEOUT).await != Ok(expected[&(iters_per_msg, pid as u64 * 10_000 + k)]) {
                             return Err(());
                         }
                     }
@@ -1266,21 +1116,22 @@ fn main() {
             .await;
             let elapsed = start.elapsed();
             report.push(BenchResult {
-                name: "slow-consumer-8prod-40k".into(),
+                name: "slow-consumer-8prod-40k-requests".into(),
                 engine: "actix-raw",
                 total_messages: target,
                 elapsed,
                 latencies: latency_stats(vec![]),
                 correctness: drained && send_ok,
-                cpu_work_secs: Some(nominal),
+
                 note: format!(
-                    "8 producers × 5000 × ~200µs msgs into ONE consumer; send-all={:.2}s; drain={}",
+                    "8 producers × 5000 × 170000-iteration requests into ONE consumer; send-all={:.2}s; drain={}",
                     send_elapsed.as_secs_f64(),
                     if drained { "ok" } else { "TIMEOUT" },
                 ),
             });
         }
 
+        pool.drain().await;
         // ---------- E4. 创建/销毁风暴 ----------
         {
             const WAVES: usize = 5;
@@ -1293,36 +1144,45 @@ fn main() {
                     addrs.push(spawn_in_pool(&pool, Arc::new(AtomicU64::new(0)), cpu_sink.clone()));
                 }
                 for (idx, r) in addrs.iter().take(10).enumerate() {
-                    if r.send(Echo { v: idx as u64 }).await.is_ok() {
+                    if r.send(Echo { v: idx as u64 }).timeout(REQUEST_TIMEOUT).await == Ok(idx as u64) {
                         alive_checks += 1;
                     }
                 }
                 for r in &addrs {
-                    r.do_send(StopNow);
+                    r.send(StopNow).timeout(REQUEST_TIMEOUT).await.unwrap();
                 }
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(wait_until(|| addrs.iter().all(|r| !r.connected()), Duration::from_secs(5), Duration::from_millis(1)).await);
+                drop(addrs);
+                pool.drain().await;
             }
             let elapsed = start.elapsed();
             report.push(BenchResult {
                 name: "spawn-stop-storm-5k".into(),
                 engine: "actix-raw",
-                total_messages: (WAVES * PER_WAVE) as u64,
+                total_messages: (WAVES * (PER_WAVE + 10)) as u64,
                 elapsed,
                 latencies: latency_stats(vec![]),
                 correctness: alive_checks == (WAVES * 10) as u64,
-                note: format!("5 waves × 1000 spawn+ask+stop; alive spot-checks {}/50", alive_checks),
-                cpu_work_secs: None,
+                note: format!("5000 spawn/stop cycles; 5050 messages = 5000 stop requests + 50 echo spot-checks; correct spot-checks {}/50", alive_checks),
+
             });
         }
 
+        pool.drain().await;
+        assert!(pool.shutdown(), "all arbiters must join and all actors must drop");
+        assert_eq!(report.results.lock().unwrap().len(), 22, "all planned scenarios must run");
+        report.verify().expect("benchmark correctness");
         println!("==================== ACTIX RAW REPORT ====================");
         println!("{}", report.dump_markdown());
-        std::fs::write("/tmp/parrot_bench_actix_raw.md", report.dump_markdown()).ok();
+        let metadata = format!("# Native Actix fixed-work measurement\n\nRun start (Unix seconds): {run_unix_seconds}. Schema: 231. OS: {}. Architecture: {}. Workers: {}. Build: {}.\n\nAll requests and joins checked; all actor owners retired. CPU references computed before measurement; validation lookups are included in scenario wall time. CPU utilization is not measured.\n\n", std::env::consts::OS, std::env::consts::ARCH, num_cpus(), if cfg!(debug_assertions) { "debug (not a performance result)" } else { "release" });
+        std::fs::write(output, metadata + &report.dump_markdown()).expect("write benchmark report");
 
         System::current().stop();
     });
 }
 
 fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
 }

@@ -1,6 +1,7 @@
 package parrot.protocol.jvm
 
 import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.charset.{CharacterCodingException, CodingErrorAction}
 
 /** admin-v2 wire 编解码（DEV_09 B1/B5——与 Rust `admin_v2.rs` / Python
   * `admin_v2.py` / Erlang `parrot_gw.erl` 逐字节对齐）。
@@ -58,6 +59,7 @@ object AdminV2Codec {
     final case class Stop(reqId: Long, pathPrefix: String) extends AdminCommandV2
     final case class Status(reqId: Long, pathPrefix: String) extends AdminCommandV2
     final case class MetricsReport(reqId: Long) extends AdminCommandV2
+    final case class MeasuredMetricsReport(reqId: Long) extends AdminCommandV2
   }
 
   final case class ComponentState(path: String, state: String, version: String)
@@ -74,6 +76,16 @@ object AdminV2Codec {
     def uptimeSecs: Long = if (uptimeStartMs == 0) 0 else (tsMs - uptimeStartMs) / 1000
   }
 
+  final case class MeasuredMetrics(snapshot: MetricsSnapshot, available: Long, epoch: String, processKind: String) {
+    def validate(): Unit = {
+      if ((available & ~0x1ffffL) != 0) throw new CodecException("unknown metric availability bits")
+      if (epoch.getBytes(UTF_8).length > 128 || processKind.getBytes(UTF_8).length > 128)
+        throw new CodecException("metric identity exceeds 128 bytes")
+      if ((available & (1L << 14)) != 0 && processKind.isEmpty)
+        throw new CodecException("process metric requires a unit")
+    }
+  }
+
   sealed trait AdminReplyV2 { def reqId: Long }
   object AdminReplyV2 {
     final case class Deployed(reqId: Long, instances: Vector[String]) extends AdminReplyV2
@@ -82,6 +94,7 @@ object AdminV2Codec {
     final case class StatusReply(reqId: Long, states: Vector[ComponentState]) extends AdminReplyV2
     final case class Failed(reqId: Long, code: Int, detail: String) extends AdminReplyV2
     final case class Metrics(reqId: Long, snapshot: MetricsSnapshot) extends AdminReplyV2
+    final case class Measured(reqId: Long, metrics: MeasuredMetrics) extends AdminReplyV2
   }
 
   // ---------------- varint writer ----------------
@@ -99,7 +112,18 @@ object AdminV2Codec {
       else { b += 0xFD.toByte; u64(v) }
     }
     def bytes(a: Array[Byte]): Unit = { varint(a.length); b ++= a }
-    def str(s: String): Unit = bytes(s.getBytes(UTF_8))
+    def str(s: String): Unit = {
+      val encoded = try UTF_8.newEncoder().onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT).encode(java.nio.CharBuffer.wrap(s))
+      catch { case _: CharacterCodingException => throw new CodecException("invalid Unicode") }
+      val value = new Array[Byte](encoded.remaining())
+      encoded.get(value)
+      bytes(value)
+    }
+    def bounded(v: Long, max: Long): Unit = {
+      if (v < 0 || v > max) throw new CodecException(s"integer exceeds $max")
+      varint(v)
+    }
     def optStr(o: Option[String]): Unit = o match {
       case None    => b += 0.toByte
       case Some(s) => b += 1.toByte; str(s)
@@ -115,12 +139,14 @@ object AdminV2Codec {
 
   private final class R(buf: Array[Byte], var pos: Int = 0) {
     private def need(n: Int): Unit =
-      if (pos + n > buf.length)
+      if (n < 0 || n > buf.length - pos)
         throw new CodecException(s"truncated at $pos (need $n, have ${buf.length - pos})")
     def byte(): Byte = { need(1); val v = buf(pos); pos += 1; v }
-    def varint(): Long = {
+    def varint(maxWidth: Int = 8): Long = {
       need(1)
       val b0 = buf(pos) & 0xFF
+      if ((b0 == 0xFC && maxWidth < 4) || (b0 == 0xFD && maxWidth < 8))
+        throw new CodecException("varint prefix exceeds integer width")
       if (b0 <= 0xFA) { pos += 1; b0.toLong }
       else if (b0 == 0xFB) {
         need(3)
@@ -139,12 +165,22 @@ object AdminV2Codec {
       } else throw new CodecException(f"bad varint prefix 0x$b0%02x (0xFE/0xFF reserved)")
     }
     def bytes(): Array[Byte] = {
-      val n = varint().toInt
+      val n = count(1)
       need(n)
       val a = java.util.Arrays.copyOfRange(buf, pos, pos + n)
       pos += n; a
     }
-    def str(): String = new String(bytes(), UTF_8)
+    // Check the unsigned length before narrowing or constructing a collection.
+    def count(minBytes: Int): Int = {
+      val n = varint()
+      if (n < 0 || n > (buf.length - pos) / minBytes)
+        throw new CodecException("length exceeds remaining payload")
+      n.toInt
+    }
+    def str(): String =
+      try UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT).decode(java.nio.ByteBuffer.wrap(bytes())).toString
+      catch { case _: CharacterCodingException => throw new CodecException("invalid UTF-8") }
     def optStr(): Option[String] = byte() match {
       case 0 => None
       case 1 => Some(str())
@@ -173,10 +209,10 @@ object AdminV2Codec {
     case ArtifactRef.Wasm(digest, uri) =>
       w.varint(4); w.str(digest); w.str(uri)
     case ArtifactRef.Dylib(digest, uri, abi) =>
-      w.varint(5); w.str(digest); w.str(uri); w.varint(abi)
+      w.varint(5); w.str(digest); w.str(uri); w.bounded(abi, 0xffffffffL)
   }
 
-  private def readArtifact(r: R): ArtifactRef = r.varint() match {
+  private def readArtifact(r: R): ArtifactRef = r.varint(4) match {
     case 0 => ArtifactRef.Props(r.str())
     case 1 => val a = r.str(); ArtifactRef.Beam(a, r.optStr())
     case 2 => val m = r.str(); val e = r.optStr(); ArtifactRef.PyModule(m, e, r.optStr())
@@ -184,7 +220,7 @@ object AdminV2Codec {
     case 4 => val d = r.str(); ArtifactRef.Wasm(d, r.str())
     case 5 =>
       val d = r.str(); val u = r.str()
-      ArtifactRef.Dylib(d, u, r.varint())
+      ArtifactRef.Dylib(d, u, r.varint(4))
     case v => throw new CodecException(s"unknown artifact variant $v")
   }
 
@@ -194,7 +230,7 @@ object AdminV2Codec {
     case InstancePolicy.Sharded(count)    => w.varint(2); w.varint(count)
   }
 
-  private def readPolicy(r: R): InstancePolicy = r.varint() match {
+  private def readPolicy(r: R): InstancePolicy = r.varint(4) match {
     case 0 => InstancePolicy.Singleton
     case 1 => InstancePolicy.Pool(r.varint())
     case 2 => InstancePolicy.Sharded(r.varint())
@@ -230,6 +266,8 @@ object AdminV2Codec {
         w.varint(3); w.varint(reqId); w.str(pathPrefix)
       case AdminCommandV2.MetricsReport(reqId) =>
         w.varint(4); w.varint(reqId)
+      case AdminCommandV2.MeasuredMetricsReport(reqId) =>
+        w.varint(5); w.varint(reqId)
     }
     w.out()
   }
@@ -239,7 +277,7 @@ object AdminV2Codec {
     if ((payload(0) & 0xFF) != TagAdminCmdV2)
       throw new CodecException(f"bad tag 0x${payload(0) & 0xFF}%02x (expect 0x03)")
     val r = new R(payload, 1)
-    val out = r.varint() match {
+    val out = r.varint(4) match {
       case 0 =>
         val reqId = r.varint()
         AdminCommandV2.Deploy(reqId, readComponent(r))
@@ -254,6 +292,7 @@ object AdminV2Codec {
         AdminCommandV2.Status(reqId, r.str())
       case 4 =>
         AdminCommandV2.MetricsReport(r.varint())
+      case 5 => AdminCommandV2.MeasuredMetricsReport(r.varint())
       case v => throw new CodecException(s"unknown cmd variant $v")
     }
     r.done()
@@ -279,9 +318,13 @@ object AdminV2Codec {
         w.varint(states.length)
         states.foreach { s => w.str(s.path); w.str(s.state); w.str(s.version) }
       case AdminReplyV2.Failed(reqId, code, detail) =>
-        w.varint(4); w.varint(reqId); w.varint(code.toLong); w.str(detail)
+        w.varint(4); w.varint(reqId); w.bounded(code.toLong, 0xffffL); w.str(detail)
       case AdminReplyV2.Metrics(reqId, s) =>
         w.varint(5); w.varint(reqId); putSnapshot(w, s)
+      case AdminReplyV2.Measured(reqId, metrics) =>
+        metrics.validate()
+        w.varint(6); w.varint(reqId); putSnapshot(w, metrics.snapshot)
+        w.varint(metrics.available); w.str(metrics.epoch); w.str(metrics.processKind)
     }
     w.out()
   }
@@ -303,7 +346,7 @@ object AdminV2Codec {
     val asks = r.varint(); val tells = r.varint(); val rep = r.varint(); val rerr = r.varint()
     val brx = r.varint(); val btx = r.varint(); val hb = r.varint()
     val comps = r.varint()
-    val n = r.varint().toInt
+    val n = r.count(3)
     val states = (0 until n).map { _ =>
       val p = r.str(); val s = r.str()
       ComponentState(p, s, r.str())
@@ -317,10 +360,10 @@ object AdminV2Codec {
     if ((payload(0) & 0xFF) != TagAdminReplyV2)
       throw new CodecException(f"bad tag 0x${payload(0) & 0xFF}%02x (expect 0x04)")
     val r = new R(payload, 1)
-    val out = r.varint() match {
+    val out = r.varint(4) match {
       case 0 =>
         val reqId = r.varint()
-        val n = r.varint().toInt
+        val n = r.count(1)
         val instances = (0 until n).map(_ => r.str()).toVector
         AdminReplyV2.Deployed(reqId, instances)
       case 1 =>
@@ -330,17 +373,22 @@ object AdminV2Codec {
         AdminReplyV2.Stopped(r.varint())
       case 3 =>
         val reqId = r.varint()
-        val n = r.varint().toInt
+        val n = r.count(3)
         val states = (0 until n).map { _ =>
           val p = r.str(); val s = r.str()
           ComponentState(p, s, r.str())
         }.toVector
         AdminReplyV2.StatusReply(reqId, states)
       case 4 =>
-        val reqId = r.varint(); val code = r.varint()
+        val reqId = r.varint(); val code = r.varint(2)
         AdminReplyV2.Failed(reqId, code.toInt, r.str())
       case 5 =>
         AdminReplyV2.Metrics(r.varint(), readSnapshot(r))
+      case 6 =>
+        val reqId = r.varint()
+        val metrics = MeasuredMetrics(readSnapshot(r), r.varint(), r.str(), r.str())
+        metrics.validate()
+        AdminReplyV2.Measured(reqId, metrics)
       case v => throw new CodecException(s"unknown reply variant $v")
     }
     r.done()

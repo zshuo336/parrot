@@ -1,2 +1,0 @@
-PROBE repeated handshake registrations: [ 1, 2, 4, 8 ]
-PROBE TS SYSTEM_EVENT=0x5; Rust/Python/JVM/Erlang=0x20

@@ -17,6 +17,9 @@ use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use parrot_remote::system::{RemoteActorSystem, RemoteConfig};
 
+#[path = "support/crawler_contract.rs"]
+mod crawler_contract;
+
 use parrot_app::assemble::{AssemblingContext, LocalDeployer};
 use parrot_app::host::{HostLookup, ProcessGatewayFactory, ThreadPropsSpawner};
 use parrot_app::manifest::{
@@ -27,7 +30,12 @@ use parrot_app::planner::{plan, LocalTopology};
 
 // ---------------- 测试用 parrot 组件（inventory PropsFactory） ----------------
 
-pub struct AppEchoActor;
+type HookJournal = Arc<std::sync::Mutex<Vec<u8>>>;
+struct ObserveHooks;
+#[derive(Default)]
+pub struct AppEchoActor {
+    hooks: HookJournal,
+}
 
 impl Actor for AppEchoActor {
     type Config = EmptyConfig;
@@ -37,18 +45,34 @@ impl Actor for AppEchoActor {
         msg: BoxedMessage,
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async { Ok(msg) })
+        Box::pin(async move {
+            if msg.is::<ObserveHooks>() {
+                return Ok(Box::new(self.hooks.clone()) as BoxedMessage);
+            }
+            if let Some(hook) = msg.downcast_ref::<parrot_app::ParrotAppHook>() {
+                self.hooks.lock().unwrap().push(hook.0);
+            }
+            Ok(msg)
+        })
     }
     fn state(&self) -> ActorState {
         ActorState::Running
     }
 }
 
-fn spawn_app_echo(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-    let path = path.to_string();
+fn spawn_app_echo(
+    ts: Arc<ThreadActorSystem>,
+    path: String,
+    _config: Option<toml::Table>,
+) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
     Box::pin(async move {
-        let r = thread_system()
-            .spawn_at(AppEchoActor, &path, None, ThreadActorConfig::default())
+        let r = ts
+            .spawn_at(
+                AppEchoActor::default(),
+                &path,
+                None,
+                ThreadActorConfig::default(),
+            )
             .await
             .map_err(|e| parrot_api::errors::ActorError::InternalError(format!("spawn: {e}")))?;
         Ok(Box::new(r) as BoxedActorRef)
@@ -56,32 +80,15 @@ fn spawn_app_echo(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>
 }
 
 parrot_api::message::inventory::submit! {
-    parrot_remote::admin::PropsFactory {
+    parrot_app::host::ThreadPropsFactory {
         name: "app.tests.echo",
         spawn: spawn_app_echo,
     }
 }
 
-/// 共享 thread 引擎（同进程多测试复用——set_self_weak 坑规避：shared() 已 init）。
-///
-/// 坑：若绑到首个调用者的 #[tokio::test] runtime，该测试结束时 runtime
-/// drop 会连带杀掉全部 scheduler worker——后续测试的 thread 引擎 ask 永
-/// 远无人处理（ask_unbounded 无超时→挂死）。解法：绑定进程级专用
-/// runtime（Box::leak 保活到测试二进制退出）。
-static TS: std::sync::OnceLock<Arc<ThreadActorSystem>> = std::sync::OnceLock::new();
-
+/// Each test owns its engine; factories receive that engine explicitly.
 fn thread_system() -> Arc<ThreadActorSystem> {
-    TS.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .expect("dedicated engine runtime");
-        let handle = rt.handle().clone();
-        Box::leak(Box::new(rt)); // 进程级保活（worker/timer 永生）
-        ThreadActorSystem::shared_with_handle(Default::default(), handle)
-    })
-    .clone()
+    ThreadActorSystem::shared(Default::default())
 }
 
 fn repo_root() -> std::path::PathBuf {
@@ -147,6 +154,7 @@ async fn scenario_parrot_only_assemble_and_smoke() {
             },
         )],
         wiring: vec![],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
     let plan = plan(&m, &LocalTopology).unwrap();
@@ -177,7 +185,8 @@ async fn scenario_parrot_only_assemble_and_smoke() {
     assert_eq!(*r.downcast_ref::<String>().unwrap(), "hello");
 
     ctx.teardown(&deployer).await.expect("teardown");
-    remote.shutdown().await.ok();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ---------------- 场景 2：erlang 真实子进程网关 ----------------
@@ -190,20 +199,34 @@ async fn scenario_erlang_gateway_real_subprocess() {
     let m = AppManifest {
         name: "erl-app".into(),
         version: "1.0.0".into(),
-        components: vec![comp(
-            "frontier",
-            EngineKind::Erlang,
-            // R3+R4：制品 = app 构建产物（apps/crawler-lab/erlang/
-            // frontier.beam）——uri 直发目录，网关 add_patha + load_file。
-            ArtifactRef::Beam {
-                app: "frontier".into(),
-                uri: Some(format!(
-                    "file://{}",
-                    repo_root().join("apps/crawler-lab/erlang").display()
-                )),
-            },
-        )],
-        wiring: vec![],
+        components: vec![
+            comp(
+                "frontier",
+                EngineKind::Erlang,
+                // R3+R4：制品 = app 构建产物（apps/crawler-lab/erlang/
+                // frontier.beam）——URI 指定目录，网关复制制品并启动独立 BEAM 宿主。
+                ArtifactRef::Beam {
+                    app: "frontier".into(),
+                    uri: Some(format!(
+                        "file://{}",
+                        repo_root().join("apps/crawler-lab/erlang").display()
+                    )),
+                },
+            ),
+            comp(
+                "driver",
+                EngineKind::Parrot,
+                ArtifactRef::Props {
+                    factory: "app.tests.echo".into(),
+                },
+            ),
+        ],
+        wiring: vec![WireSpec {
+            from: "driver:/user/service".into(),
+            to: "frontier:/user/frontier".into(),
+            qos: "lan".into(),
+        }],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
     let plan = plan(&m, &LocalTopology).unwrap();
@@ -224,139 +247,104 @@ async fn scenario_erlang_gateway_real_subprocess() {
     .await
     .expect("assemble (erl escript 子进程注册)");
 
-    // 冒烟：组件业务键 bin:crawl/FrontierPush（1 条目 → ack n=1——与
-    // frontier.erl 协议一致；网关探针 bin:u:* 保留但不再是业务载荷）。
-    let mut push = Vec::new();
-    push.extend_from_slice(&1u32.to_le_bytes());
-    push.extend_from_slice(&7u64.to_le_bytes());
-    let url = b"https://parrot.dev/".to_vec();
-    push.extend_from_slice(&(url.len() as u32).to_le_bytes());
-    push.extend_from_slice(&url);
-    push.extend_from_slice(&0u16.to_le_bytes());
-    let r = ctx
-        .component_ref("frontier")
+    let gateway_node = gw.component_node("frontier").unwrap();
+    let measured_before = remote.measured_metrics(&gateway_node).await;
+    let service = ctx
+        .wired_ref("driver:/user/service")
+        .expect("declared service connection");
+    crawler_contract::frontier(&service).await;
+    use parrot_api::address::ActorRef;
+    let target = remote
+        .remote_ref(&format!("parrot://{gateway_node}/user/frontier"))
+        .unwrap();
+    let url = b"https://completion.parrot.dev/";
+    let entry = [
+        77u64.to_le_bytes().to_vec(),
+        (url.len() as u32).to_le_bytes().to_vec(),
+        url.to_vec(),
+        2u16.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    let completion = target
+        .deliver_with_ack(
+            Box::new(crawler_contract::FrontierPush(
+                [1u32.to_le_bytes().to_vec(), entry.clone()].concat(),
+            )),
+            Duration::from_secs(5),
+        )
+        .await;
+    // Next transfers one layer at a time. The earlier depth-zero URL must
+    // remain ahead of the depth-two effect confirmed by the receipt.
+    // The receipt itself carries no FrontierAck business payload.
+    let shallow_effect = target
+        .send_with_timeout(
+            Box::new(crawler_contract::FrontierNext(
+                100u32.to_le_bytes().to_vec(),
+            )),
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+    let completed_effect = target
+        .send_with_timeout(
+            Box::new(crawler_contract::FrontierNext(
+                100u32.to_le_bytes().to_vec(),
+            )),
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+    let rejected_completion = target
+        .deliver_with_ack(
+            Box::new(crawler_contract::IndexStats(vec![])),
+            Duration::from_secs(5),
+        )
+        .await;
+    let measured_after = remote.measured_metrics(&gateway_node).await;
+
+    ctx.teardown(&deployer).await.unwrap();
+    gw.procs().kill_all().await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
+
+    // Assert after teardown so a capability failure still retires owned processes.
+    completion.expect("real Rust-to-Erlang handler completion receipt");
+    let shallow = shallow_effect.expect("query preserves the earlier shallow layer");
+    let shallow = &shallow
+        .downcast_ref::<crawler_contract::FrontierBatch>()
         .unwrap()
-        .send(Box::new(FrontierPushWire(push)))
-        .await
-        .expect("erl ask");
-    let w = r
-        .downcast_ref::<FrontierAckWire>()
-        .expect("FrontierAck wire bytes");
-    assert_eq!(w.0, 1u32.to_le_bytes().to_vec(), "frontier ack n=1");
-
-    ctx.teardown(&deployer).await.ok();
-    gw.procs().kill_all();
-    remote.shutdown().await.ok();
-}
-
-/// erl/ray 线上字节容器（裸 LE——与 crawler-lab wire_msg 同构；方言键探测用）。
-/// 注册为 bin:crawl/IndexStats（payload=空——index_builder 协议），
-/// 回执按 bin:crawl/IndexStatsR 解码：[terms u32][postings u64] LE。
-#[derive(Debug, Clone, PartialEq)]
-pub struct ErlWireBytes(pub Vec<u8>);
-
-parrot_api::message::inventory::submit! {
-    parrot_api::message::CodecRegistration {
-        type_key: "bin:crawl/IndexStats",
-        type_id: std::any::TypeId::of::<ErlWireBytes>(),
-        encode: |msg: &BoxedMessage| {
-            let m = msg.downcast_ref::<ErlWireBytes>().ok_or("downcast fail")?;
-            Ok(m.0.clone())
-        },
-        decode: |b: &[u8]| {
-            Ok(Box::new(ErlWireBytes(b.to_vec())) as BoxedMessage)
-        },
-    }
-}
-
-/// FrontierPush 载荷：[n u32][{id u64|len u32|url|depth u16}...]（payload 纯业务字节）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct FrontierPushWire(pub Vec<u8>);
-
-parrot_api::message::inventory::submit! {
-    parrot_api::message::CodecRegistration {
-        type_key: "bin:crawl/FrontierPush",
-        type_id: std::any::TypeId::of::<FrontierPushWire>(),
-        encode: |msg: &BoxedMessage| {
-            let m = msg.downcast_ref::<FrontierPushWire>().ok_or("downcast fail")?;
-            Ok(m.0.clone())
-        },
-        decode: |b: &[u8]| {
-            Ok(Box::new(FrontierPushWire(b.to_vec())) as BoxedMessage)
-        },
-    }
-}
-
-/// FrontierAck 回执：[n u32] LE。
-#[derive(Debug, Clone, PartialEq)]
-pub struct FrontierAckWire(pub Vec<u8>);
-
-parrot_api::message::inventory::submit! {
-    parrot_api::message::CodecRegistration {
-        type_key: "bin:crawl/FrontierAck",
-        type_id: std::any::TypeId::of::<FrontierAckWire>(),
-        encode: |msg: &BoxedMessage| {
-            let m = msg.downcast_ref::<FrontierAckWire>().ok_or("downcast fail")?;
-            Ok(m.0.clone())
-        },
-        decode: |b: &[u8]| {
-            Ok(Box::new(FrontierAckWire(b.to_vec())) as BoxedMessage)
-        },
-    }
-}
-
-/// IndexStatsR 回执容器：[terms u32][postings u64] LE（payload 纯业务字节）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct IndexStatsRWire(pub Vec<u8>);
-
-parrot_api::message::inventory::submit! {
-    parrot_api::message::CodecRegistration {
-        type_key: "bin:crawl/IndexStatsR",
-        type_id: std::any::TypeId::of::<IndexStatsRWire>(),
-        encode: |msg: &BoxedMessage| {
-            let m = msg.downcast_ref::<IndexStatsRWire>().ok_or("downcast fail")?;
-            Ok(m.0.clone())
-        },
-        decode: |b: &[u8]| {
-            Ok(Box::new(IndexStatsRWire(b.to_vec())) as BoxedMessage)
-        },
-    }
-}
-
-/// u:Ping（+3 erl / +2 ray 方言键——run-lab 同款语义探针）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnitPing(pub u64);
-
-parrot_api::message::inventory::submit! {
-    parrot_api::message::CodecRegistration {
-        type_key: "bin:u:Ping",
-        type_id: std::any::TypeId::of::<UnitPing>(),
-        encode: |msg: &BoxedMessage| {
-            let m = msg.downcast_ref::<UnitPing>().ok_or("downcast fail")?;
-            Ok(m.0.to_le_bytes().to_vec())
-        },
-        decode: |b: &[u8]| {
-            Ok(Box::new(UnitPing(u64::from_le_bytes(b[0..8].try_into().unwrap()))) as BoxedMessage)
-        },
-    }
-}
-
-/// u:Pong（方言偏移回执）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnitPong(pub u64);
-
-parrot_api::message::inventory::submit! {
-    parrot_api::message::CodecRegistration {
-        type_key: "bin:u:Pong",
-        type_id: std::any::TypeId::of::<UnitPong>(),
-        encode: |msg: &BoxedMessage| {
-            let m = msg.downcast_ref::<UnitPong>().ok_or("downcast fail")?;
-            Ok(m.0.to_le_bytes().to_vec())
-        },
-        decode: |b: &[u8]| {
-            Ok(Box::new(UnitPong(u64::from_le_bytes(b[0..8].try_into().unwrap()))) as BoxedMessage)
-        },
-    }
+        .0;
+    let original_url = b"https://parrot.dev/";
+    let expected_shallow = [
+        1u32.to_le_bytes().to_vec(),
+        7u64.to_le_bytes().to_vec(),
+        (original_url.len() as u32).to_le_bytes().to_vec(),
+        original_url.to_vec(),
+        0u16.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    assert_eq!(*shallow, expected_shallow);
+    let effect = completed_effect.expect("query after successful completion");
+    let effect = &effect
+        .downcast_ref::<crawler_contract::FrontierBatch>()
+        .unwrap()
+        .0;
+    assert_eq!(*effect, [1u32.to_le_bytes().to_vec(), entry].concat());
+    assert!(matches!(rejected_completion,
+        Err(parrot_api::errors::ActorError::MessageHandlingError(ref detail))
+            if detail.contains("unknown type key")));
+    let before = measured_before.expect("real Erlang gateway measured metrics before business");
+    let after = measured_after.expect("real Erlang gateway measured metrics after business");
+    use parrot_remote::metrics::field;
+    assert!(before.has(field::TRANSPORT | field::COMPONENTS | field::COMPONENT_STATES));
+    assert_eq!(before.value(field::COMPONENTS), Some(1));
+    assert_eq!(before.value(field::CONNECTIONS), Some(1));
+    assert_eq!(before.component_states.len(), 1);
+    assert_eq!(before.process_kind, "erlang_processes");
+    assert!(before.value(field::PROCESSES).unwrap() > 0);
+    assert!(!before.epoch.is_empty());
+    assert_eq!(before.epoch, after.epoch);
+    assert!(after.value(field::ASKS_RX).unwrap() > before.value(field::ASKS_RX).unwrap());
+    assert!(after.value(field::BYTES_RX).unwrap() > before.value(field::BYTES_RX).unwrap());
+    assert!(after.value(field::BYTES_TX).unwrap() > before.value(field::BYTES_TX).unwrap());
 }
 
 // ---------------- 场景 3：ray 真实子进程网关 ----------------
@@ -369,21 +357,35 @@ async fn scenario_ray_gateway_real_subprocess() {
     let m = AppManifest {
         name: "ray-app".into(),
         version: "1.0.0".into(),
-        components: vec![comp(
-            "indexer",
-            EngineKind::Ray,
-            // R1：组件制品 = app 源码（apps/crawler-lab/python），网关
-            // deploy 时以 uri 为 working_dir 载入 parrot_entry 起组件。
-            ArtifactRef::PyModule {
-                module: "index_builder".into(),
-                runtime_env: None,
-                uri: Some(format!(
-                    "file://{}",
-                    repo_root().join("apps/crawler-lab/python").display()
-                )),
-            },
-        )],
-        wiring: vec![],
+        components: vec![
+            comp(
+                "indexer",
+                EngineKind::Ray,
+                // R1：组件制品 = app 源码（apps/crawler-lab/python），网关
+                // deploy 时以 uri 为 working_dir 载入 parrot_entry 起组件。
+                ArtifactRef::PyModule {
+                    module: "index_builder".into(),
+                    runtime_env: None,
+                    uri: Some(format!(
+                        "file://{}",
+                        repo_root().join("apps/crawler-lab/python").display()
+                    )),
+                },
+            ),
+            comp(
+                "driver",
+                EngineKind::Parrot,
+                ArtifactRef::Props {
+                    factory: "app.tests.echo".into(),
+                },
+            ),
+        ],
+        wiring: vec![WireSpec {
+            from: "driver:/user/service".into(),
+            to: "indexer:/user/indexer".into(),
+            qos: "lan".into(),
+        }],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
     let plan = plan(&m, &LocalTopology).unwrap();
@@ -404,26 +406,106 @@ async fn scenario_ray_gateway_real_subprocess() {
     .await
     .expect("assemble (python ray 子进程注册)");
 
-    // 冒烟：组件业务键 bin:crawl/IndexStats（空索引 → terms=0 postings=0）。
-    let r = ctx
-        .component_ref("indexer")
-        .unwrap()
-        .send(Box::new(ErlWireBytes(vec![])))
-        .await
-        .expect("ray ask");
-    let w = r
-        .downcast_ref::<IndexStatsRWire>()
-        .expect("IndexStatsR wire bytes");
-    // [terms u32][postings u64] LE——空索引全零。
-    assert_eq!(&w.0[0..4], &0u32.to_le_bytes(), "terms=0");
-    assert_eq!(&w.0[4..12], &0u64.to_le_bytes(), "postings=0");
+    let gateway_node = gw.component_node("indexer").unwrap();
+    let measured_before = remote.measured_metrics(&gateway_node).await;
+    let service = ctx
+        .wired_ref("driver:/user/service")
+        .expect("declared service connection");
+    crawler_contract::ray_index(&service).await;
+    let measured_after = remote.measured_metrics(&gateway_node).await;
 
-    ctx.teardown(&deployer).await.ok();
-    gw.procs().kill_all();
-    remote.shutdown().await.ok();
+    ctx.teardown(&deployer).await.unwrap();
+    gw.procs().kill_all().await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
+
+    // Preserve process cleanup even when an older gateway lacks the capability.
+    let before = measured_before.expect("real Ray gateway measured metrics before business");
+    let after = measured_after.expect("real Ray gateway measured metrics after business");
+    use parrot_remote::metrics::field;
+    assert!(before.has(field::TRANSPORT | field::COMPONENTS | field::COMPONENT_STATES));
+    assert_eq!(before.value(field::COMPONENTS), Some(1));
+    assert_eq!(before.value(field::CONNECTIONS), Some(1));
+    assert_eq!(before.component_states.len(), 1);
+    assert_eq!(before.process_kind, "python_threads");
+    assert!(before.value(field::PROCESSES).unwrap() > 0);
+    assert!(!before.epoch.is_empty());
+    assert_eq!(before.epoch, after.epoch);
+    assert!(after.value(field::ASKS_RX).unwrap() > before.value(field::ASKS_RX).unwrap());
+    assert!(after.value(field::BYTES_RX).unwrap() > before.value(field::BYTES_RX).unwrap());
+    assert!(after.value(field::BYTES_TX).unwrap() > before.value(field::BYTES_TX).unwrap());
 }
 
 // ---------------- 场景 4：jvm(akka) 真实子进程网关 ----------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_ray_cancelled_deploy_and_stop_keep_retirement_ownership() {
+    use parrot_app::assemble::GatewayFactory;
+    let _gw_guard = gw_lock().await;
+    let ts = thread_system();
+    let remote = make_remote(ts.clone(), alloc_port()).await;
+    let gateway = ProcessGatewayFactory::new(repo_root(), remote.clone());
+    let artifact = tempfile::tempdir().unwrap();
+    let entered = artifact.path().join("entered");
+    std::fs::write(artifact.path().join("blocked.py"), format!(
+        "from pathlib import Path\nimport time\ndef parrot_entry(ctx):\n Path({}).write_text('entered')\n time.sleep(120)\n",
+        serde_json::to_string(&entered).unwrap()
+    )).unwrap();
+    let mut component = comp(
+        "cancelled-ray",
+        EngineKind::Ray,
+        ArtifactRef::PyModule {
+            module: "blocked".into(),
+            runtime_env: None,
+            uri: Some(format!("file://{}", artifact.path().display())),
+        },
+    );
+    let factory = gateway.clone();
+    let spec = component.clone();
+    let deploy = tokio::spawn(async move {
+        factory
+            .start_gateway(&spec, &["/user/cancelled-ray".into()], "1.0.0")
+            .await
+    });
+    let reached_entry = tokio::time::timeout(Duration::from_secs(60), async {
+        while !entered.exists() {
+            assert!(
+                !deploy.is_finished(),
+                "deploy ended before entering the actual Ray component"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    deploy.abort();
+    let result = deploy.await;
+    // The unpublished gateway must remain awaitable through the component's
+    // retirement receipt, even though component_node was never populated.
+    gateway.stop_gateway(&component).await.unwrap();
+    reached_entry.unwrap();
+    assert!(result.unwrap_err().is_cancelled());
+    component.artifact = ArtifactRef::PyModule {
+        module: "index_builder".into(),
+        runtime_env: None,
+        uri: Some(format!(
+            "file://{}",
+            repo_root().join("apps/crawler-lab/python").display()
+        )),
+    };
+    let actors = gateway
+        .start_gateway(&component, &["/user/cancelled-ray".into()], "2.0.0")
+        .await
+        .unwrap();
+    crawler_contract::ray_index(&actors[0]).await;
+    let mut stop = Box::pin(gateway.stop_gateway(&component));
+    assert!(futures::poll!(&mut stop).is_pending());
+    assert!(gateway.component_node(&component.name).is_none());
+    drop(stop);
+    gateway.stop_gateway(&component).await.unwrap();
+    gateway.procs().kill_all().await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_jvm_gateway_real_subprocess() {
@@ -438,21 +520,35 @@ async fn scenario_jvm_gateway_real_subprocess() {
     let m = AppManifest {
         name: "jvm-app".into(),
         version: "1.0.0".into(),
-        components: vec![comp(
-            "search",
-            EngineKind::Akka,
-            ArtifactRef::Jvm {
-                main_class: "crawler.search.SearchComponent".into(),
-                coords: None,
-                uri: Some(format!(
-                    "file://{}",
-                    repo_root()
-                        .join("apps/crawler-lab/jvm/target/crawler-lab-jvm-1.0.0.jar")
-                        .display()
-                )),
-            },
-        )],
-        wiring: vec![],
+        components: vec![
+            comp(
+                "search",
+                EngineKind::Akka,
+                ArtifactRef::Jvm {
+                    main_class: "crawler.search.SearchComponent".into(),
+                    coords: None,
+                    uri: Some(format!(
+                        "file://{}",
+                        repo_root()
+                            .join("apps/crawler-lab/jvm/target/crawler-lab-jvm-1.0.0.jar")
+                            .display()
+                    )),
+                },
+            ),
+            comp(
+                "driver",
+                EngineKind::Parrot,
+                ArtifactRef::Props {
+                    factory: "app.tests.echo".into(),
+                },
+            ),
+        ],
+        wiring: vec![WireSpec {
+            from: "driver:/user/service".into(),
+            to: "search:/user/search".into(),
+            qos: "lan".into(),
+        }],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
     let plan = plan(&m, &LocalTopology).unwrap();
@@ -473,34 +569,34 @@ async fn scenario_jvm_gateway_real_subprocess() {
     .await
     .expect("assemble (java 子进程注册)");
 
-    // 冒烟：jvm 链路探针（UnitPing 经 wire 达 JVM——回执或方言错误均证明链路）
-    let r = ctx
-        .component_ref("search")
-        .unwrap()
-        .send(Box::new(UnitPing(1)))
-        .await;
-    // R4 语义：deploy 已在 JVM 网关内 spawn SearchComponent（ComponentRoutes
-    // 路由命中——akka://parrot-gw/system/search）。UnitPing 非其消息集
-    // （crawl/IndexTerms 族）——ask 超时/回执均证明链路已通；组件级语义
-    // 由 crawler-lab 回归（run_regression.sh）与 mg_multiengine 承载。
-    match r {
-        Ok(_) => {}
-        Err(e) => {
-            let msg = format!("{e:?}");
-            assert!(
-                msg.contains("not found")
-                    || msg.contains("NotFound")
-                    || msg.contains("unknown")
-                    || msg.contains("Timeout")
-                    || msg.contains("timed out"),
-                "链路应达 JVM：{msg}"
-            );
-        }
-    }
+    let gateway_node = gw.component_node("search").unwrap();
+    let measured_before = remote.measured_metrics(&gateway_node).await;
+    let service = ctx
+        .wired_ref("driver:/user/service")
+        .expect("declared service connection");
+    crawler_contract::jvm_search(&service).await;
+    let measured_after = remote.measured_metrics(&gateway_node).await;
 
-    ctx.teardown(&deployer).await.ok();
-    gw.procs().kill_all();
-    remote.shutdown().await.ok();
+    ctx.teardown(&deployer).await.unwrap();
+    gw.procs().kill_all().await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
+
+    // Preserve process cleanup even when an older gateway lacks the capability.
+    let before = measured_before.expect("real JVM gateway measured metrics before business");
+    let after = measured_after.expect("real JVM gateway measured metrics after business");
+    use parrot_remote::metrics::field;
+    assert!(before.has(field::TRANSPORT | field::COMPONENTS | field::COMPONENT_STATES));
+    assert_eq!(before.value(field::COMPONENTS), Some(1));
+    assert_eq!(before.value(field::CONNECTIONS), Some(1));
+    assert_eq!(before.component_states.len(), 1);
+    assert_eq!(before.process_kind, "jvm_threads");
+    assert!(before.value(field::PROCESSES).unwrap() > 0);
+    assert!(!before.epoch.is_empty());
+    assert_eq!(before.epoch, after.epoch);
+    assert!(after.value(field::ASKS_RX).unwrap() > before.value(field::ASKS_RX).unwrap());
+    assert!(after.value(field::BYTES_RX).unwrap() > before.value(field::BYTES_RX).unwrap());
+    assert!(after.value(field::BYTES_TX).unwrap() > before.value(field::BYTES_TX).unwrap());
 }
 
 // ---------------- 场景 5：装配失败回滚（网关进程被杀清理） ----------------
@@ -510,7 +606,7 @@ async fn scenario_failure_kills_gateway_procs() {
     let _gw_guard = gw_lock().await;
     let ts = thread_system();
     let remote = make_remote(ts.clone(), alloc_port()).await;
-    let m = AppManifest {
+    let mut m = AppManifest {
         name: "fail-app".into(),
         version: "1.0.0".into(),
         components: vec![
@@ -519,7 +615,10 @@ async fn scenario_failure_kills_gateway_procs() {
                 EngineKind::Erlang,
                 ArtifactRef::Beam {
                     app: "frontier".into(),
-                    uri: None,
+                    uri: Some(format!(
+                        "file://{}",
+                        repo_root().join("apps/crawler-lab/erlang").display()
+                    )),
                 },
             ),
             comp(
@@ -531,9 +630,18 @@ async fn scenario_failure_kills_gateway_procs() {
             ),
         ],
         wiring: vec![],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
+    m.components[1].deps = vec!["erl1".into()];
     let plan = plan(&m, &LocalTopology).unwrap();
+    assert_eq!(
+        plan.order
+            .iter()
+            .map(|c| c.spec.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["erl1", "bad"]
+    );
     let gw = ProcessGatewayFactory::new(repo_root(), remote.clone());
     let spawner = ThreadPropsSpawner::new(ts.clone());
     let deployer = LocalDeployer {
@@ -556,8 +664,14 @@ async fn scenario_failure_kills_gateway_procs() {
     );
     assert!(ctx.started().is_empty(), "回滚清空");
     // 网关进程清理（防泄漏）
-    gw.procs().kill_all();
-    remote.shutdown().await.ok();
+    assert_eq!(
+        gw.procs().child_count(),
+        0,
+        "assembly rollback must reap the previously started gateway"
+    );
+    gw.procs().kill_all().await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ---------------- 场景 6：sharded parrot 组件 + wiring 校验 ----------------
@@ -583,6 +697,7 @@ async fn scenario_sharded_with_wiring() {
             to: "pool:/user/pool-1".into(),
             qos: "lan".into(),
         }],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
     let plan = plan(&m, &LocalTopology).unwrap();
@@ -605,6 +720,12 @@ async fn scenario_sharded_with_wiring() {
     assert_eq!(ctx.component_refs("pool").unwrap().len(), 3);
     assert_eq!(ctx.component_paths("pool").unwrap()[1], "/user/pool-1");
 
+    let wired = ctx
+        .wired_ref("pool:/user/pool-0")
+        .expect("declared pool connection");
+    let reply = wired.send(Box::new("wired".to_string())).await.unwrap();
+    assert_eq!(reply.downcast_ref::<String>().unwrap(), "wired");
+
     // 三实例各自可达
     for i in 0..3 {
         let r = ctx.component_refs("pool").unwrap()[i]
@@ -613,8 +734,9 @@ async fn scenario_sharded_with_wiring() {
             .unwrap();
         assert_eq!(*r.downcast_ref::<String>().unwrap(), format!("m{i}"));
     }
-    ctx.teardown(&deployer).await.ok();
-    remote.shutdown().await.ok();
+    ctx.teardown(&deployer).await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ---------------- 场景 7：hooks 全生命周期（on_start/on_stop） ----------------
@@ -633,13 +755,14 @@ async fn scenario_hooks_lifecycle() {
     c.hooks = ComponentHooks {
         on_start: Some("/user/hooked".into()),
         on_stop: Some("/user/hooked".into()),
-        on_drain: None,
+        on_drain: Some("/user/hooked".into()),
     };
     let m = AppManifest {
         name: "hooks".into(),
         version: "1.0.0".into(),
         components: vec![c],
         wiring: vec![],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
     let plan = plan(&m, &LocalTopology).unwrap();
@@ -661,16 +784,24 @@ async fn scenario_hooks_lifecycle() {
     )
     .await
     .expect("assemble with hooks");
-    ctx.teardown(&deployer).await.ok();
-    remote.shutdown().await.ok();
+    let reply = ctx
+        .component_ref("hooked")
+        .unwrap()
+        .send(Box::new(ObserveHooks))
+        .await
+        .unwrap();
+    let events = reply.downcast_ref::<HookJournal>().unwrap();
+    assert_eq!(*events.lock().unwrap(), vec![0]);
+    ctx.teardown(&deployer).await.unwrap();
+    assert_eq!(*events.lock().unwrap(), vec![0, 2, 1]);
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ---------------- 场景 8：overlay 注入远程配置（Y3 端到端） ----------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_config_overlay_flows() {
-    let ts = thread_system();
-    let remote = make_remote(ts.clone(), alloc_port()).await;
     let m = AppManifest {
         name: "ov".into(),
         version: "1.0.0".into(),
@@ -682,6 +813,7 @@ async fn scenario_config_overlay_flows() {
             },
         )],
         wiring: vec![],
+        mirrors: Vec::new(),
         config_overlay: Some(
             [(
                 "remote".to_string(),
@@ -702,6 +834,19 @@ async fn scenario_config_overlay_flows() {
             .collect(),
         ),
     };
+    let base = parrot_config::ParrotConfig::builder()
+        .remote_node_id("overlay-scenario")
+        .remote_bind("127.0.0.1:0");
+    let resolved = parrot_app::assemble::effective_config(&m, &base).unwrap();
+    let ts = ThreadActorSystem::shared(
+        parrot::thread::config::ThreadActorSystemConfig::from_resolved(&resolved),
+    );
+    let remote = RemoteActorSystem::new(
+        RemoteConfig::from_resolved(&resolved).unwrap(),
+        Arc::new(HostLookup { ts: ts.clone() }),
+    )
+    .unwrap();
+    remote.start().await.unwrap();
     let plan = plan(&m, &LocalTopology).unwrap();
     let gw = ProcessGatewayFactory::new(repo_root(), remote.clone());
     let spawner = ThreadPropsSpawner::new(ts.clone());
@@ -712,15 +857,18 @@ async fn scenario_config_overlay_flows() {
     };
     let mut ctx = AssemblingContext::new();
     // overlay 合法（键已知）——装配成功
-    ctx.assemble(
-        &plan,
-        &deployer,
-        &m,
-        &parrot_config::ParrotConfig::default(),
-    )
-    .await
-    .expect("overlay applied");
-    ctx.teardown(&deployer).await.ok();
-    remote.shutdown().await.ok();
+    ctx.assemble(&plan, &deployer, &m, &base)
+        .await
+        .expect("overlay applied");
+    let reply = ctx
+        .component_ref("ov-echo")
+        .unwrap()
+        .send(Box::new("configured".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(reply.downcast_ref::<String>().unwrap(), "configured");
+    ctx.teardown(&deployer).await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 }

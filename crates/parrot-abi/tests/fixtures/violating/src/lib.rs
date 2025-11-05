@@ -7,11 +7,13 @@
 //! 检出路径：`std::thread` 内部引用 pthread_create；`thread_local!` with
 //! destructor 引用 `__tlv_atexit`（macOS）。两者均为静态可扫引用。
 
-use parrot_abi::{AbiComponent, AbiHooks, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, AbiVt, ABI_OK, PARROT_ABI_VERSION};
+use parrot_abi::{
+    AbiComponent, AbiHooks, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, AbiVt, ABI_OK, PARROT_ABI_VERSION,
+};
 
 thread_local! {
     /// 带析构的 TLS（dtor 引用 __tlv_atexit——禁止清单目标）。
-    static MARK: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+    static MARK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// 保引用：链接器不可剥离 TLS dtor 路径（BD-2——仅静态引用形态）。
@@ -65,13 +67,16 @@ unsafe extern "C" fn on_drain(_self_: *mut ()) -> u32 {
     ABI_OK
 }
 
-static VT: AbiVt = AbiVt { handle_msg, on_drain };
+static VT: AbiVt = AbiVt {
+    handle_msg,
+    on_drain,
+};
 
 #[no_mangle]
 pub static PARROT_ABI_META: AbiMeta = AbiMeta {
     abi_version: PARROT_ABI_VERSION,
     parrot_min: 1,
-    name: b"violating\0".as_ptr(),
+    name: c"violating".as_ptr().cast(),
     name_len: 9,
     hooks: AbiHooks { construct, destroy },
 };

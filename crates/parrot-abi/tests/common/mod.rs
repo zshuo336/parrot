@@ -17,13 +17,23 @@ fn fixtures_root() -> PathBuf {
 fn build_fixtures() -> PathBuf {
     let root = fixtures_root();
     let ext = dylib_ext();
-    let good = root.join(format!("target/release/libparrot_abi_testcomp.{ext}"));
-    let bad = root.join(format!("target/release/libparrot_abi_violating.{ext}"));
-    if good.is_file() && bad.is_file() && std::env::var_os("PARROT_ABI_REBUILD").is_none() {
-        return root;
+    if let Some(directory) = std::env::var_os("PARROT_ABI_FIXTURE_DIR") {
+        let directory = PathBuf::from(directory);
+        for name in ["testcomp", "violating"] {
+            assert!(
+                directory
+                    .join(format!("libparrot_abi_{name}.{ext}"))
+                    .is_file(),
+                "missing prebuilt fixture {name}"
+            );
+        }
+        return directory;
     }
+    // Always let Cargo check source/dependency freshness. Existing binaries do
+    // not prove they were built from the current fixture and ABI source.
     let out = std::process::Command::new("cargo")
-        .args(["build", "--release"])
+        .args(["build", "--locked", "--release", "--target-dir"])
+        .arg(root.join("target"))
         .current_dir(&root)
         .output()
         .expect("spawn cargo for fixture build");
@@ -32,7 +42,7 @@ fn build_fixtures() -> PathBuf {
         "fixture build failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    root
+    root.join("target/release")
 }
 
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -52,14 +62,14 @@ pub fn load_mutex() -> std::sync::MutexGuard<'static, ()> {
 /// 规范 fixture 路径。
 pub fn testcomp() -> std::path::PathBuf {
     let ext = dylib_ext();
-    root().join(format!("target/release/libparrot_abi_testcomp.{ext}"))
+    root().join(format!("libparrot_abi_testcomp.{ext}"))
 }
 
 /// 违规 fixture 路径。（loader_tests 消费——lifecycle 场景不用）
 #[allow(dead_code)]
 pub fn violating() -> std::path::PathBuf {
     let ext = dylib_ext();
-    root().join(format!("target/release/libparrot_abi_violating.{ext}"))
+    root().join(format!("libparrot_abi_violating.{ext}"))
 }
 
 /// testcomp 的 sha256（digest 校验测试）。

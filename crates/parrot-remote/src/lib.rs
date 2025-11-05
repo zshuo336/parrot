@@ -6,9 +6,12 @@
 //! `RemoteGatewayImpl`（应用层组装注入）。所有布局/语义以 07 协议 1.0 为准。
 
 pub mod acl;
+mod actor_path;
 pub mod admin;
+pub mod admin_pending;
 pub mod admin_v2;
 pub mod cache;
+pub mod capture;
 pub mod codec;
 pub mod codec_registry;
 pub mod durable;
@@ -18,6 +21,9 @@ pub mod frame;
 pub mod handshake;
 pub mod ingress;
 pub mod livekit;
+pub mod metrics;
+pub mod mirror;
+pub mod mirror_control;
 pub mod mqtt;
 pub mod node;
 pub mod pb;
@@ -25,13 +31,18 @@ pub mod raft;
 pub mod receptionist;
 pub mod ref_;
 pub mod registry;
+pub mod resolve;
 pub mod roles;
+pub mod security;
 pub mod sharding;
 pub mod singleton;
 pub mod swim;
 pub mod system;
 pub mod tls;
+pub use security::{ControlPolicy, PeerAuthentication, RemoteSecurity};
 pub mod topology;
+mod trace_attachment;
+pub use trace_attachment::{IncomingTracePolicy, TraceRecorderAttachment};
 pub mod transport;
 
 pub mod transport_mem {
@@ -44,10 +55,15 @@ pub use error::{ErrCode, RemoteError};
 pub use frame::{golden_vectors, Frame, FrameError, FrameHeader, GoldenVector};
 pub use handshake::{negotiate_caps, HandshakeAckBody, HandshakeBody, TopologyRole};
 pub use ingress::{LocalLookup, RelayMetrics, DEAD_TELL_DROPPED};
-pub use node::{NodeAddr, NodeId, NodeState, NodeStatus, NodeTable};
+pub use node::{NodeAddr, NodeEndpoint, NodeId, NodeState, NodeStatus, NodeTable};
 pub use ref_::{RemoteActorRef, RemoteInner};
 pub use registry::{CallbackRegistry, ReplyPayload};
 pub use system::{RemoteActorSystem, RemoteConfig, RemoteGatewayImpl};
 pub use transport::{
     FrameSender, Transport, HEARTBEAT_INTERVAL, HEARTBEAT_MAX_LOSS, LATE_REPLY_DROPPED,
 };
+
+/// Shared internal process ownership for workspace launchers.
+#[doc(hidden)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod process_group;

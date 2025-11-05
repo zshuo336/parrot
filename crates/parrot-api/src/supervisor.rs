@@ -56,6 +56,8 @@ pub enum DeathReason {
     Normal,
     /// The actor panicked; the payload message is the formatted panic.
     Panic(String),
+    /// Initialization or lifecycle cleanup returned an ordinary error.
+    Failed(String),
     /// The actor was killed by the system (forced removal).
     Killed,
     /// The actor was stopped as part of an escalation cascade; the payload
@@ -68,6 +70,7 @@ impl std::fmt::Display for DeathReason {
         match self {
             DeathReason::Normal => write!(f, "normal"),
             DeathReason::Panic(m) => write!(f, "panic: {m}"),
+            DeathReason::Failed(m) => write!(f, "failed: {m}"),
             DeathReason::Killed => write!(f, "killed"),
             DeathReason::Escalated(m) => write!(f, "escalated: {m}"),
         }

@@ -1,8 +1,8 @@
 use darling::{FromAttributes, FromMeta};
 use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{parse_macro_input, parse_str, Attribute, DeriveInput, Ident, Type};
+use syn::{parse_macro_input, Attribute, DeriveInput, Ident, Type};
 
 /// Actor attribute options for customizing actor behavior
 #[derive(Debug, Default, FromMeta)]
@@ -18,17 +18,15 @@ pub struct ActorOptions {
 
     /// Configuration type for actor
     #[darling(default)]
-    config: Option<String>,
+    config: Option<syn::LitStr>,
 
     /// Supervision strategy
-    ///（向前兼容占位：M6 后无生成物消费，保留解析能力）
+    /// Recognized legacy option, rejected until runtime wiring is implemented.
     #[darling(default)]
-    #[allow(dead_code)]
     supervision: Option<String>,
 
-    /// Dispatcher type (for future use)
+    /// Recognized legacy option, rejected until runtime wiring is implemented.
     #[darling(default)]
-    #[allow(dead_code)]
     dispatcher: Option<String>,
 
     /// Opt this actor into the async dispatch path (`use_async_handler`).
@@ -47,7 +45,7 @@ pub struct ActorOptions {
 pub enum EngineValue {
     /// Named engine (e.g., "actix", "thread")
     Named(String),
-    /// Identifier reference to an engine constant
+    /// Engine label such as ACTIX or THREAD, not evaluation of a Rust constant.
     Ident(String),
 }
 
@@ -78,13 +76,6 @@ impl EngineKind {
             // Historical alias: early docs used "tokio" for the thread engine.
             "tokio" => Some(EngineKind::Thread),
             _ => None,
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            EngineKind::Actix => "actix",
-            EngineKind::Thread => "thread",
         }
     }
 }
@@ -124,10 +115,8 @@ pub struct ActorArgs {
 }
 
 /// Parse actor attributes to extract options
-pub fn parse_actor_attrs(attrs: &[Attribute]) -> ActorOptions {
-    ActorArgs::from_attributes(attrs)
-        .map(|a| a.opts)
-        .unwrap_or_default()
+pub fn parse_actor_attrs(attrs: &[Attribute]) -> darling::Result<ActorOptions> {
+    ActorArgs::from_attributes(attrs).map(|a| a.opts)
 }
 
 /// Implementation of the ParrotActor derive macro.
@@ -153,10 +142,25 @@ pub fn parse_actor_attrs(attrs: &[Attribute]) -> ActorOptions {
 /// same code shape for every engine; engines are plug-compatible via the
 /// alias, and `parrot-api-derive` compiles without any engine dependency.
 pub(crate) fn derive_actor_impl(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+    expand(parse_macro_input!(input as DeriveInput))
+        .unwrap_or_else(darling::Error::write_errors)
+        .into()
+}
 
+fn expand(input: DeriveInput) -> darling::Result<TokenStream2> {
     // Parse the actor attributes into an ActorOptions struct
-    let options: ActorOptions = parse_actor_attrs(&input.attrs);
+    let options = parse_actor_attrs(&input.attrs)?;
+    for (name, present) in [
+        ("supervision", options.supervision.is_some()),
+        ("dispatcher", options.dispatcher.is_some()),
+    ] {
+        if present {
+            return Err(darling::Error::custom(format!(
+                "ParrotActor {name} is not wired to runtime configuration; configure the engine/system explicitly"
+            ))
+            .with_span(&input.ident));
+        }
+    }
 
     // Extract actor name
     let actor_name = &input.ident;
@@ -177,19 +181,19 @@ pub(crate) fn derive_actor_impl(input: TokenStream) -> TokenStream {
                  (bind the engine with `use parrot::{} as __parrot_engine;`)",
                 engine, engine
             );
-            return syn::Error::new(Span::call_site(), error_message)
-                .to_compile_error()
-                .into();
+            return Err(darling::Error::custom(error_message).with_span(&input.ident));
         }
     };
 
     // Parse the configuration type
     let config_type = if let Some(ref config_type) = options.config {
-        parse_str::<Type>(config_type)
-            .unwrap_or_else(|_| parse_str("parrot_api::actor::EmptyConfig").unwrap())
+        config_type.parse::<Type>().map_err(|error| {
+            darling::Error::custom(format!("invalid actor config type: {error}"))
+                .with_span(config_type)
+        })?
     } else {
         // If configuration type is not specified, use EmptyConfig instead of ()
-        parse_str("parrot_api::actor::EmptyConfig").unwrap()
+        syn::parse_quote!(::parrot_api::actor::EmptyConfig)
     };
 
     // Whether the generated impl opts into the async dispatch path.
@@ -205,7 +209,7 @@ pub(crate) fn derive_actor_impl(input: TokenStream) -> TokenStream {
         engine_kind,
     );
 
-    implementation.into()
+    Ok(implementation)
 }
 
 /// Generate the engine-neutral Actor implementation.
@@ -220,8 +224,8 @@ pub(crate) fn derive_actor_impl(input: TokenStream) -> TokenStream {
 ///   Actix path; test/prod semantics are now identical.
 /// - `receive_message_with_engine` still forwards to the user's
 ///   `handle_message_engine` (sync, Actix-only fast path). Returning `None`
-///   there means "not handled" and the adapter falls back to
-///   `handle_message` instead of dropping the message.
+///   there means "not handled" and the synchronous adapter returns an error.
+///   `async_handler = true` selects the asynchronous handler directly.
 ///
 /// Engine-neutral symbols used by the generated code (bound at use site):
 ///
@@ -250,54 +254,70 @@ fn generate_engine_neutral_implementation(
     };
 
     // M6: `receive_message_with_engine` moved from the spec `Actor` trait
-    // to the actix-side extension trait `ActixEngineExt` (blanket-impl'd
-    // with a `None` default). The derive emits a separate extension impl
+    // to the actix-side extension trait `ActixEngineExt`. The derive emits an impl
     // for the actix engine (forwarding to the user's
-    // `handle_message_engine`); the thread engine needs none (blanket
-    // default applies).
-
-    let _ = engine_kind.as_str(); // available for diagnostics if needed
+    // `handle_message_engine`); the thread engine needs no extension impl.
 
     // M6: actix 扩展 trait（ActixEngineExt）单独立 impl 块——
     // `receive_message_with_engine` 已从规范 Actor trait 移出。
     let engine_ext_impl = match engine_kind {
         EngineKind::Actix => quote! {
-            impl #impl_generics parrot_api::actor::ActixEngineExt for #actor_name #ty_generics #where_clause {
+            impl #impl_generics ::parrot_api::actor::ActixEngineExt for #actor_name #ty_generics #where_clause {
                 // Actix sync fast path: forward to the user's
-                // `handle_message_engine`. (The blanket impl defaults to
-                // `None`; this override exists so user handlers wire up.)
-                fn receive_message_with_engine<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut __parrot_engine::EngineContext<Self>, engine_ctx: parrot_api::actor::EngineContextHandle)
-                    -> Option<parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
+                // `handle_message_engine`.
+                fn receive_message_with_engine<'a>(&'a mut self, msg: ::parrot_api::types::BoxedMessage, ctx: &'a mut __parrot_engine::EngineContext<Self>, engine_ctx: ::parrot_api::actor::EngineContextHandle)
+                    -> ::std::option::Option<::parrot_api::types::ActorResult<::parrot_api::types::BoxedMessage>> {
                     self.handle_message_engine(msg, ctx, engine_ctx)
                 }
             }
         },
         EngineKind::Thread => quote! {
-            // Thread engine never probes the sync fast path; the blanket
-            // impl default (`None`) applies. No extension impl emitted.
+            // Thread engine never probes the sync fast path. No extension impl.
         },
     };
 
     quote! {
-        impl #impl_generics parrot_api::actor::Actor for #actor_name #ty_generics #where_clause {
+        impl #impl_generics ::parrot_api::actor::Actor for #actor_name #ty_generics #where_clause {
             type Context = __parrot_engine::EngineContext<Self>;
             type Config = #config_type;
 
-            fn receive_message<'a>(&'a mut self, msg: parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context)
-                -> parrot_api::types::BoxedFuture<'a, parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
-                Box::pin(async move {
+            fn receive_message<'a>(&'a mut self, msg: ::parrot_api::types::BoxedMessage, ctx: &'a mut Self::Context)
+                -> ::parrot_api::types::BoxedFuture<'a, ::parrot_api::types::ActorResult<::parrot_api::types::BoxedMessage>> {
+                ::std::boxed::Box::pin(async move {
                     self.handle_message(msg, ctx).await
                 })
             }
 
             #use_async_handler_override
 
-            fn state(&self) -> parrot_api::actor::ActorState {
+            fn state(&self) -> ::parrot_api::actor::ActorState {
                 // Default implementation returns Running
-                parrot_api::actor::ActorState::Running
+                ::parrot_api::actor::ActorState::Running
             }
         }
 
         #engine_ext_impl
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_actor_options_do_not_reset_engine_or_config() {
+        for attr in [
+            "#[ParrotActor(engine = 1)]",
+            "#[ParrotActor(engine = \"thread\", asyn_handler = true)]",
+            "#[ParrotActor(engine = \"thread\")] #[ParrotActor(engine = \"actix\")]",
+            "#[ParrotActor(config = \"Vec<\")]",
+            "#[ParrotActor(async_handler = \"yes\")]",
+            "#[ParrotActor(engine = \"unknown\")]",
+            "#[ParrotActor(supervision = \"OneForOne\")]",
+            "#[ParrotActor(dispatcher = \"default\")]",
+        ] {
+            let input = syn::parse_str(&format!("{attr} struct Worker;")).unwrap();
+            assert!(expand(input).is_err(), "accepted {attr}");
+        }
     }
 }

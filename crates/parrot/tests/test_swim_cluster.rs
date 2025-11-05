@@ -1,11 +1,10 @@
-//! K1 SWIM 集成测试（DEV_02 §2.4）：三节点 mem 集群收敛性。
+//! Membership state-machine contracts and real three-node memory gossip.
+//! No process kill or network-partition timing claim is made by the pure tests.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
-use parrot_remote::swim::{
-    Member, MemberEvent, MemberStatus, Membership, MembershipGossip, NodeAddrWire,
-};
+use parrot_remote::swim::{Member, MemberEvent, MemberStatus, Membership, NodeAddrWire};
 use parrot_remote::{LocalLookup, RemoteActorSystem, RemoteConfig};
 
 struct NopLookup;
@@ -37,13 +36,10 @@ fn member(id: &str, alive: bool) -> Member {
     }
 }
 
-/// `swim_convergence_kill9`：3 节点 kill 1 → ≤3.5s 多数派标 Dead（门禁）。
-///
-/// 集群形态：mem 双联（A-B、A-C），kill C 后 A/B 的 probe 失败 → Suspect →
-/// 3s 超时 → Dead。此处以状态机直接驱动（probe 失败注入）验证收敛预算：
-/// probe_interval=500ms 首次失败 + suspect_timeout=3s → 最坏 3.5s。
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn swim_convergence_kill9() {
+/// The local state machine changes Suspect to Dead at its configured deadline.
+/// This injects logical time; it does not measure failure-detection latency.
+#[test]
+fn swim_suspicion_deadline_state_machine() {
     let mut m = Membership::new(0);
     for id in ["a", "b", "c"] {
         m.merge_event(&MemberEvent::Upsert(member(id, true)));
@@ -51,14 +47,12 @@ async fn swim_convergence_kill9() {
     assert_eq!(m.alive_nodes().len(), 3);
 
     // kill c：T+0 起 probe 失败（第一轮 probe_interval 内即标记）
-    let t0 = Instant::now();
     m.set_clock(500); // 首轮 probe tick
     assert!(m.mark_suspect("c"), "first failed probe marks Suspect");
 
     // suspect_timeout=3s：T+3.5s（500 首检 + 3000 超时）内多数派（a,b）标 c=Dead
     m.set_clock(500 + 3000);
     let (changed, _) = m.tick();
-    let elapsed = t0.elapsed();
     assert!(
         changed
             .iter()
@@ -67,15 +61,11 @@ async fn swim_convergence_kill9() {
     );
     // 多数派视角：alive = {a, b}（c 不在 alive_nodes）
     assert_eq!(m.alive_nodes().len(), 2);
-    // 语义门禁（状态机时间预算——真实集群测试在 K6 复跑）：
-    // probe 500ms + 间接 3s = 最坏 3.5s
-    let _ = elapsed; // 真实运行时间毫秒级（状态机驱动）
 }
 
-/// `swim_partition_heal`：分区 30s → 愈合后合并收敛、无人工介入。
-/// （双向 Suspect 不互杀：refute +inc 打破对称）
+/// Pure merge/refute contract. No transport partition or wall-clock claim.
 #[test]
-fn swim_partition_heal() {
+fn swim_refute_merge_state_machine() {
     let mut a = Membership::new(0); // 节点 A 视角
     let mut b = Membership::new(0); // 节点 B 视角
     // 分区前：双方互见 Alive
@@ -84,7 +74,7 @@ fn swim_partition_heal() {
     b.merge_event(&MemberEvent::Upsert(member("a", true)));
     b.merge_event(&MemberEvent::Upsert(member("b", true)));
 
-    // 分区 30s：A 视角 B Suspect→Dead(inc=0)；B 视角 A Suspect(inc=0)；
+    // 注入不同视图：A 视角 B Suspect→Dead(inc=0)；B 视角 A Suspect(inc=0)；
     // 且互相收到对方的 Suspect 事件（本人表里自己也 Suspect——refute 触发条件）
     a.mark_suspect("b");
     a.set_clock(3100);
@@ -141,27 +131,33 @@ async fn swim_gossip_propagation_mem3() {
     a.connect_mem_pair(&b).await.unwrap();
     a.connect_mem_pair(&c).await.unwrap();
 
-    // C 侧注入一条成员事件（模拟 C 视角自身 Alive）→ gossip 语义经 A 到 B：
-    // 这里直接验证 gossip 载荷可经 SYSTEM_EVENT 帧走通（帧层透传不解析）
-    let g = MembershipGossip {
-        events: vec![MemberEvent::Upsert(member("sw-c", true))],
-        seen_from: "sw-c".into(),
-        digest: 7,
-        full_sync: None,
-    };
-    let payload = parrot_remote::swim::encode_gossip(&g);
-    // 帧层解码（ingress sys_event 分流）
-    let ev = parrot_remote::admin::decode_sys_event(&payload).unwrap();
-    match ev {
-        parrot_remote::admin::SysEvent::MembershipGossip(body) => {
-            let got = parrot_remote::swim::decode_gossip(&body).unwrap();
-            assert_eq!(got.seen_from, "sw-c");
-            assert_eq!(got.events.len(), 1);
-            assert_eq!(got.digest, 7);
+    // No handcrafted payloads or direct merge calls: B must learn C through
+    // the running transport, system hook and periodic gossip tasks via A.
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let from_b = b.membership.lock().await;
+            let from_c = c.membership.lock().await;
+            if from_b
+                .members
+                .get("sw-c")
+                .is_some_and(|m| m.status == MemberStatus::Alive)
+                && from_c
+                    .members
+                    .get("sw-b")
+                    .is_some_and(|m| m.status == MemberStatus::Alive)
+                && from_b.members.len() == 3
+                && from_b.digest() == from_c.digest()
+            {
+                break;
+            }
+            drop(from_b);
+            drop(from_c);
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        other => panic!("wrong variant: {other:?}"),
-    }
+    })
+    .await;
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
     c.shutdown().await.unwrap();
+    result.expect("periodic gossip must reach the non-adjacent node and converge");
 }

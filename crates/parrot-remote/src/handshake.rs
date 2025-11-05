@@ -1,7 +1,7 @@
 //! 职责：TLV 握手体编解码 + 能力协商规则（07 §2.4，X3 裁定：一次定死）。
 //!
 //! payload = TLV 序列 `[u8 tag][u16 len][bytes]`。未知 tag **跳过不报错**
-//! （前向兼容）；重复 tag / 必填缺失（node_id/capabilities/max_frame_len/
+//! （前向兼容，包括重复未知字段）；已知重复 tag / 必填缺失（node_id/capabilities/max_frame_len/
 //! topology_role）→ HandshakeError。
 
 use bytes::{BufMut, BytesMut};
@@ -23,6 +23,7 @@ pub mod tlv_tag {
     /// 可选："host:port"（方案 A 直连学习——spoke 声明可被直拨的监听地址；
     /// 缺省/空 = 不可直拨，hub 不注入 ROUTE_HINT）。
     pub const DIRECT_ADDR: u8 = 8;
+    pub const CHOSEN_CODEC: u8 = 9;
 }
 
 pub mod caps {
@@ -38,10 +39,36 @@ pub mod caps {
     pub const WASM: u32 = 1 << 6;
     /// D 阶段 feature gate：cdylib 动态加载（节点如实上报——未启用不发）。
     pub const DYLIB: u32 = 1 << 7;
+    /// Completion-acknowledged TELL, including bounded relay return mapping.
+    pub const TELL_COMPLETION: u32 = 1 << 8;
+    /// Versioned identity envelope and durable receiver completion.
+    pub const DURABLE_DELIVERY: u32 = 1 << 9;
+    /// Availability-aware measured metrics, admin command 5 / reply 6.
+    pub const MEASURED_METRICS: u32 = 1 << 10;
+    /// Runtime SWIM membership gossip/control frames. Peers that do not
+    /// advertise this bit still receive ordinary transport heartbeats and
+    /// application traffic, but are never sent unsolicited gossip frames.
+    pub const MEMBERSHIP_GOSSIP: u32 = 1 << 11;
+    /// Correlated direct and indirect membership probes on authorized cluster links.
+    pub const MEMBERSHIP_PROBES: u32 = 1 << 12;
+    /// Versioned causal parent prefix on business ASK/TELL payloads.
+    pub const TRACE_CONTEXT: u32 = 1 << 13;
+    /// Generation-owned remote Mirror sessions and retirement receipts.
+    pub const MIRROR_CONTROL: u32 = 1 << 14;
+    /// Fenced compare-and-create mirror allocation, appended protocol variants.
+    pub const MIRROR_ALLOCATION: u32 = 1 << 15;
+    /// Direct, non-forwardable shadow TELL with raw mailbox admission receipt.
+    pub const MIRROR_SHADOW: u32 = 1 << 16;
+    /// Owner-bound receptionist snapshots on authorized direct cluster links.
+    pub const RECEPTIONIST_SYNC: u32 = 1 << 17;
+    /// Lossless native Actix service paths inside receptionist snapshots.
+    pub const RECEPTIONIST_NATIVE_PATHS: u32 = 1 << 18;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HandshakeError {
+    #[error("tag {0} has an invalid value")]
+    InvalidValue(u8),
     #[error("必填 tag {0} 缺失")]
     MissingRequired(u8),
     #[error("tag {0} 重复出现")]
@@ -120,14 +147,73 @@ pub struct HandshakeAckBody {
     pub chosen_codec: String,
 }
 
-fn put_tlv(buf: &mut BytesMut, tag: u8, bytes: &[u8]) {
+fn put_tlv(buf: &mut BytesMut, tag: u8, bytes: &[u8]) -> Result<(), HandshakeError> {
+    let len = u16::try_from(bytes.len()).map_err(|_| HandshakeError::BadLen(tag, bytes.len()))?;
     buf.put_u8(tag);
-    buf.put_u16_le(bytes.len() as u16);
+    buf.put_u16_le(len);
     buf.put_slice(bytes);
+    Ok(())
 }
 
-fn read_tlv(payload: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, HandshakeError> {
-    let mut out = Vec::new();
+fn validate_common(
+    node_id: &str,
+    realm: Option<&str>,
+    cluster: Option<&str>,
+    direct_addr: Option<&str>,
+    max_frame_len: u32,
+    hop_limit: u8,
+) -> Result<(), HandshakeError> {
+    for (tag, value) in [
+        (tlv_tag::NODE_ID, Some(node_id)),
+        (tlv_tag::REALM, realm),
+        (tlv_tag::CLUSTER, cluster),
+        (tlv_tag::DIRECT_ADDR, direct_addr),
+    ] {
+        if let Some(value) = value {
+            if value.len() > u16::MAX as usize {
+                return Err(HandshakeError::BadLen(tag, value.len()));
+            }
+        }
+    }
+    if node_id.is_empty() || node_id.contains('\0') {
+        return Err(HandshakeError::InvalidValue(tlv_tag::NODE_ID));
+    }
+    if max_frame_len < crate::frame::BODY_FIXED_OVERHEAD as u32 {
+        return Err(HandshakeError::InvalidValue(tlv_tag::MAX_FRAME_LEN));
+    }
+    if hop_limit == 0 {
+        return Err(HandshakeError::InvalidValue(tlv_tag::HOP_LIMIT));
+    }
+    Ok(())
+}
+
+fn validate_chosen(codec: &str, capabilities: u32) -> Result<(), HandshakeError> {
+    if codec.len() > u16::MAX as usize {
+        return Err(HandshakeError::BadLen(tlv_tag::CHOSEN_CODEC, codec.len()));
+    }
+    let chosen_cap = match codec {
+        "bin" => caps::BIN,
+        "pb" => caps::PB,
+        _ => return Err(HandshakeError::InvalidValue(tlv_tag::CHOSEN_CODEC)),
+    };
+    if capabilities & chosen_cap == 0 {
+        return Err(HandshakeError::InvalidValue(tlv_tag::CHOSEN_CODEC));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Default)]
+struct TlvField<'a> {
+    value: Option<&'a [u8]>,
+    duplicate: bool,
+}
+
+// Only tags 1..=9 are defined. Storage is independent of untrusted TLV count;
+// unknown fields are validated and skipped without copying their payloads.
+type TlvFields<'a> = [TlvField<'a>; tlv_tag::CHOSEN_CODEC as usize + 1];
+
+fn read_tlv(payload: &[u8]) -> Result<TlvFields<'_>, HandshakeError> {
+    let mut out = [TlvField::default(); tlv_tag::CHOSEN_CODEC as usize + 1];
     let mut i = 0usize;
     while i < payload.len() {
         let tag = payload[i];
@@ -139,83 +225,98 @@ fn read_tlv(payload: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, HandshakeError> {
         if start + len > payload.len() {
             return Err(HandshakeError::Truncated(tag, len, payload.len() - start));
         }
-        out.push((tag, payload[start..start + len].to_vec()));
+        if (tlv_tag::NODE_ID..=tlv_tag::CHOSEN_CODEC).contains(&tag) {
+            let field = &mut out[tag as usize];
+            if field.value.is_some() {
+                field.duplicate = true;
+            } else {
+                field.value = Some(&payload[start..start + len]);
+            }
+        }
         i = start + len;
     }
     Ok(out)
 }
 
-/// 取 tag 首个出现项；重复出现 → DuplicateTag。
-fn take_one(tlvs: &[(u8, Vec<u8>)], tag: u8) -> Result<Option<&(u8, Vec<u8>)>, HandshakeError> {
-    let mut it = tlvs.iter().filter(|(t, _)| *t == tag);
-    let first = it.next();
-    if first.is_some() && it.next().is_some() {
+// Defer duplicate reporting until after the full structural scan, preserving
+// truncated-tail precedence and the decoder's established field-check order.
+fn take_one<'a>(tlvs: &TlvFields<'a>, tag: u8) -> Result<Option<&'a [u8]>, HandshakeError> {
+    let field = &tlvs[tag as usize];
+    if field.duplicate {
         return Err(HandshakeError::DuplicateTag(tag));
     }
-    Ok(first)
+    Ok(field.value)
 }
 
-fn decode_common(tlvs: &[(u8, Vec<u8>)]) -> Result<HandshakeBody, HandshakeError> {
+fn decode_string(bytes: &[u8], tag: u8) -> Result<String, HandshakeError> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| HandshakeError::Utf8(tag))
+}
+
+fn decode_common(tlvs: &TlvFields<'_>) -> Result<HandshakeBody, HandshakeError> {
     let node_id = take_one(tlvs, tlv_tag::NODE_ID)?
         .ok_or(HandshakeError::MissingRequired(tlv_tag::NODE_ID))?;
-    let node_id =
-        String::from_utf8(node_id.1.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::NODE_ID))?;
+    let node_id = decode_string(node_id, tlv_tag::NODE_ID)?;
+    if node_id.is_empty() || node_id.contains('\0') {
+        return Err(HandshakeError::InvalidValue(tlv_tag::NODE_ID));
+    }
     let capabilities = take_one(tlvs, tlv_tag::CAPABILITIES)?
         .ok_or(HandshakeError::MissingRequired(tlv_tag::CAPABILITIES))?;
-    if capabilities.1.len() != 4 {
+    if capabilities.len() != 4 {
         return Err(HandshakeError::BadLen(
             tlv_tag::CAPABILITIES,
-            capabilities.1.len(),
+            capabilities.len(),
         ));
     }
     let capabilities = u32::from_le_bytes([
-        capabilities.1[0],
-        capabilities.1[1],
-        capabilities.1[2],
-        capabilities.1[3],
+        capabilities[0],
+        capabilities[1],
+        capabilities[2],
+        capabilities[3],
     ]);
     let max_frame_len = take_one(tlvs, tlv_tag::MAX_FRAME_LEN)?
         .ok_or(HandshakeError::MissingRequired(tlv_tag::MAX_FRAME_LEN))?;
-    if max_frame_len.1.len() != 4 {
+    if max_frame_len.len() != 4 {
         return Err(HandshakeError::BadLen(
             tlv_tag::MAX_FRAME_LEN,
-            max_frame_len.1.len(),
+            max_frame_len.len(),
         ));
     }
     let max_frame_len = u32::from_le_bytes([
-        max_frame_len.1[0],
-        max_frame_len.1[1],
-        max_frame_len.1[2],
-        max_frame_len.1[3],
+        max_frame_len[0],
+        max_frame_len[1],
+        max_frame_len[2],
+        max_frame_len[3],
     ]);
+    if max_frame_len < crate::frame::BODY_FIXED_OVERHEAD as u32 {
+        return Err(HandshakeError::InvalidValue(tlv_tag::MAX_FRAME_LEN));
+    }
     let role = take_one(tlvs, tlv_tag::TOPOLOGY_ROLE)?
         .ok_or(HandshakeError::MissingRequired(tlv_tag::TOPOLOGY_ROLE))?;
-    if role.1.len() != 1 {
-        return Err(HandshakeError::BadLen(tlv_tag::TOPOLOGY_ROLE, role.1.len()));
+    if role.len() != 1 {
+        return Err(HandshakeError::BadLen(tlv_tag::TOPOLOGY_ROLE, role.len()));
     }
-    let topology_role = TopologyRole::from_u8(role.1[0])
-        .ok_or(HandshakeError::BadLen(tlv_tag::TOPOLOGY_ROLE, 99))?;
+    let topology_role =
+        TopologyRole::from_u8(role[0]).ok_or(HandshakeError::BadLen(tlv_tag::TOPOLOGY_ROLE, 99))?;
     let realm = match take_one(tlvs, tlv_tag::REALM)? {
-        Some((_, v)) => {
-            Some(String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::REALM))?)
-        }
+        Some(v) => Some(decode_string(v, tlv_tag::REALM)?),
         None => None,
     };
     let cluster = match take_one(tlvs, tlv_tag::CLUSTER)? {
-        Some((_, v)) => {
-            Some(String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::CLUSTER))?)
-        }
+        Some(v) => Some(decode_string(v, tlv_tag::CLUSTER)?),
         None => None,
     };
     let hop_limit = match take_one(tlvs, tlv_tag::HOP_LIMIT)? {
-        Some((_, v)) if v.len() == 1 => v[0],
-        Some((_, v)) => return Err(HandshakeError::BadLen(tlv_tag::HOP_LIMIT, v.len())),
+        Some(v) if v.len() == 1 => v[0],
+        Some(v) => return Err(HandshakeError::BadLen(tlv_tag::HOP_LIMIT, v.len())),
         None => crate::frame::DEFAULT_HOP_LIMIT,
     };
+    if hop_limit == 0 {
+        return Err(HandshakeError::InvalidValue(tlv_tag::HOP_LIMIT));
+    }
     let direct_addr = match take_one(tlvs, tlv_tag::DIRECT_ADDR)? {
-        Some((_, v)) if !v.is_empty() => Some(
-            String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(tlv_tag::DIRECT_ADDR))?,
-        ),
+        Some(v) if !v.is_empty() => Some(decode_string(v, tlv_tag::DIRECT_ADDR)?),
         _ => None,
     };
     Ok(HandshakeBody {
@@ -230,36 +331,64 @@ fn decode_common(tlvs: &[(u8, Vec<u8>)]) -> Result<HandshakeBody, HandshakeError
     })
 }
 
-fn encode_common(b: &HandshakeBody, buf: &mut BytesMut) {
-    put_tlv(buf, tlv_tag::NODE_ID, b.node_id.as_bytes());
+fn encode_common(b: &HandshakeBody, buf: &mut BytesMut) -> Result<(), HandshakeError> {
+    put_tlv(buf, tlv_tag::NODE_ID, b.node_id.as_bytes())?;
     if let Some(r) = &b.realm {
-        put_tlv(buf, tlv_tag::REALM, r.as_bytes());
+        put_tlv(buf, tlv_tag::REALM, r.as_bytes())?;
     }
     if let Some(c) = &b.cluster {
-        put_tlv(buf, tlv_tag::CLUSTER, c.as_bytes());
+        put_tlv(buf, tlv_tag::CLUSTER, c.as_bytes())?;
     }
-    put_tlv(buf, tlv_tag::CAPABILITIES, &b.capabilities.to_le_bytes());
-    put_tlv(buf, tlv_tag::MAX_FRAME_LEN, &b.max_frame_len.to_le_bytes());
-    put_tlv(buf, tlv_tag::TOPOLOGY_ROLE, &[b.topology_role as u8]);
-    put_tlv(buf, tlv_tag::HOP_LIMIT, &[b.hop_limit]);
+    put_tlv(buf, tlv_tag::CAPABILITIES, &b.capabilities.to_le_bytes())?;
+    put_tlv(buf, tlv_tag::MAX_FRAME_LEN, &b.max_frame_len.to_le_bytes())?;
+    put_tlv(buf, tlv_tag::TOPOLOGY_ROLE, &[b.topology_role as u8])?;
+    put_tlv(buf, tlv_tag::HOP_LIMIT, &[b.hop_limit])?;
     if let Some(d) = &b.direct_addr {
-        put_tlv(buf, tlv_tag::DIRECT_ADDR, d.as_bytes());
+        put_tlv(buf, tlv_tag::DIRECT_ADDR, d.as_bytes())?;
     }
+    Ok(())
 }
 
 impl HandshakeBody {
-    pub fn encode_tlv(&self, buf: &mut BytesMut) {
-        encode_common(self, buf);
+    /// Validate the local HELLO before connection I/O or output allocation.
+    pub fn validate(&self) -> Result<(), HandshakeError> {
+        validate_common(
+            &self.node_id,
+            self.realm.as_deref(),
+            self.cluster.as_deref(),
+            self.direct_addr.as_deref(),
+            self.max_frame_len,
+            self.hop_limit,
+        )
+    }
+
+    /// Append a complete HELLO. On validation failure `buf` is unchanged.
+    pub fn encode_tlv(&self, buf: &mut BytesMut) -> Result<(), HandshakeError> {
+        self.validate()?;
+        encode_common(self, buf)
     }
 
     pub fn decode_tlv(payload: &[u8]) -> Result<Self, HandshakeError> {
         let tlvs = read_tlv(payload)?;
+        if take_one(&tlvs, tlv_tag::CHOSEN_CODEC)?.is_some() {
+            return Err(HandshakeError::InvalidValue(tlv_tag::CHOSEN_CODEC));
+        }
         decode_common(&tlvs)
     }
 }
 
 impl HandshakeAckBody {
-    pub fn encode_tlv(&self, buf: &mut BytesMut) {
+    /// Append a complete ACK. All fields are checked before modifying `buf`.
+    pub fn encode_tlv(&self, buf: &mut BytesMut) -> Result<(), HandshakeError> {
+        validate_common(
+            &self.node_id,
+            self.realm.as_deref(),
+            self.cluster.as_deref(),
+            self.direct_addr.as_deref(),
+            self.max_frame_len,
+            self.hop_limit,
+        )?;
+        validate_chosen(&self.chosen_codec, self.capabilities)?;
         encode_common(
             &HandshakeBody {
                 node_id: self.node_id.clone(),
@@ -272,18 +401,19 @@ impl HandshakeAckBody {
                 direct_addr: self.direct_addr.clone(),
             },
             buf,
-        );
+        )?;
         // ACK 专有：chosen_codec（tag 9——8 已被 DIRECT_ADDR 占用）
-        put_tlv(buf, 9, self.chosen_codec.as_bytes());
+        put_tlv(buf, tlv_tag::CHOSEN_CODEC, self.chosen_codec.as_bytes())
     }
 
     pub fn decode_tlv(payload: &[u8]) -> Result<Self, HandshakeError> {
         let tlvs = read_tlv(payload)?;
         let common = decode_common(&tlvs)?;
-        let mut chosen = "bin".to_string();
-        if let Some((_, v)) = tlvs.iter().find(|(t, _)| *t == 9) {
-            chosen = String::from_utf8(v.clone()).map_err(|_| HandshakeError::Utf8(9))?;
-        }
+        let chosen = match take_one(&tlvs, tlv_tag::CHOSEN_CODEC)? {
+            Some(v) => decode_string(v, tlv_tag::CHOSEN_CODEC)?,
+            None => "bin".to_owned(),
+        };
+        validate_chosen(&chosen, common.capabilities)?;
         Ok(Self {
             node_id: common.node_id,
             realm: common.realm,
@@ -328,7 +458,7 @@ mod tests {
     fn handshake_tlv_roundtrip() {
         let b = sample();
         let mut buf = BytesMut::new();
-        b.encode_tlv(&mut buf);
+        b.encode_tlv(&mut buf).unwrap();
         let decoded = HandshakeBody::decode_tlv(&buf).unwrap();
         assert_eq!(decoded, b);
         // ACK
@@ -344,7 +474,7 @@ mod tests {
             chosen_codec: "bin".into(),
         };
         let mut buf2 = BytesMut::new();
-        ack.encode_tlv(&mut buf2);
+        ack.encode_tlv(&mut buf2).unwrap();
         assert_eq!(HandshakeAckBody::decode_tlv(&buf2).unwrap(), ack);
     }
 
@@ -352,9 +482,9 @@ mod tests {
     fn handshake_unknown_tag_skipped() {
         let b = sample();
         let mut buf = BytesMut::new();
-        b.encode_tlv(&mut buf);
+        b.encode_tlv(&mut buf).unwrap();
         // 追加未知 tag 99（前向兼容：跳过）
-        put_tlv(&mut buf, 99, b"future");
+        put_tlv(&mut buf, 99, b"future").unwrap();
         let decoded = HandshakeBody::decode_tlv(&buf).unwrap();
         assert_eq!(decoded, b);
     }
@@ -363,7 +493,7 @@ mod tests {
     fn handshake_missing_required() {
         // 只有 node_id——缺 capabilities/max_frame_len/topology_role
         let mut buf = BytesMut::new();
-        put_tlv(&mut buf, tlv_tag::NODE_ID, b"x");
+        put_tlv(&mut buf, tlv_tag::NODE_ID, b"x").unwrap();
         assert!(matches!(
             HandshakeBody::decode_tlv(&buf),
             Err(HandshakeError::MissingRequired(tlv_tag::CAPABILITIES))
@@ -374,8 +504,8 @@ mod tests {
     fn handshake_duplicate_rejected() {
         let b = sample();
         let mut buf = BytesMut::new();
-        b.encode_tlv(&mut buf);
-        put_tlv(&mut buf, tlv_tag::NODE_ID, b"again");
+        b.encode_tlv(&mut buf).unwrap();
+        put_tlv(&mut buf, tlv_tag::NODE_ID, b"again").unwrap();
         assert!(matches!(
             HandshakeBody::decode_tlv(&buf),
             Err(HandshakeError::DuplicateTag(tlv_tag::NODE_ID))

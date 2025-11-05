@@ -20,6 +20,14 @@ pub struct RemoteEndpoint {
     pub(crate) sender: FrameSender,
     /// P4：前缀路由表（普通端点为 None）。
     pub router: Option<Arc<PrefixRouter>>,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RemoteEndpoint {
+    fn drop(&mut self) {
+        self.pump.abort();
+        self.callbacks.fail_all("endpoint dropped");
+    }
 }
 
 impl RemoteEndpoint {
@@ -89,13 +97,26 @@ async fn spawn_endpoint_inner(
     let sender_c = link.sender.clone();
     let router_c = router.clone();
 
-    tokio::spawn(async move {
-        while let Some(f) = link.incoming.recv().await {
-            handle_frame_routed(f, &local_c, &cb_c, &sender_c, router_c.as_ref()).await;
+    let pump = tokio::spawn(async move {
+        let dispatch = async {
+            while let Some(f) = link.incoming.recv().await {
+                handle_frame_routed(f, &local_c, &cb_c, &sender_c, router_c.as_ref()).await;
+            }
+        };
+        tokio::select! {
+            _ = dispatch => {},
+            _ = sender_c.closed() => {},
         }
+        cb_c.fail_all("connection lost");
     });
 
-    RemoteEndpoint { local, callbacks, sender: link.sender, router }
+    RemoteEndpoint {
+        local,
+        callbacks,
+        sender: link.sender,
+        router,
+        pump,
+    }
 }
 
 /// 快速组装内存双节点（测试用）。

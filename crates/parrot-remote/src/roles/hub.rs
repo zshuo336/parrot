@@ -31,26 +31,36 @@ impl CidMap {
     }
 
     pub fn insert(&mut self, new_cid: u64, orig: (u64, String)) {
+        if self.cap == 0 {
+            return;
+        }
+        if let Some(previous) = self.map.get_mut(&new_cid) {
+            *previous = orig;
+            self.touch(&new_cid);
+            return;
+        }
         if self.map.len() >= self.cap {
             // LRU 淘汰最老
             if let Some(old) = self.order.pop_front() {
                 self.map.remove(&old);
             }
         }
-        if self.map.insert(new_cid, orig).is_none() {
-            self.order.push_back(new_cid);
-        }
+        self.map.insert(new_cid, orig);
+        self.order.push_back(new_cid);
     }
 
     pub fn get(&mut self, new_cid: &u64) -> Option<&(u64, String)> {
         if self.map.contains_key(new_cid) {
-            // LRU touch（移到尾——最近使用）
-            if let Some(pos) = self.order.iter().position(|c| c == new_cid) {
-                let c = self.order.remove(pos).unwrap_or(*new_cid);
-                self.order.push_back(c);
-            }
+            self.touch(new_cid);
         }
         self.map.get(new_cid)
+    }
+
+    fn touch(&mut self, cid: &u64) {
+        if let Some(position) = self.order.iter().position(|stored| stored == cid) {
+            self.order.remove(position);
+            self.order.push_back(*cid);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -181,29 +191,92 @@ mod tests {
     #[test]
     fn relay_hop_gate() {
         let mut hub = hub_with_routes();
-        assert_eq!(
-            hub.relay_ask(1, "parrot://eu-1/x", b"", "", 7, 8),
-            Err(RelayError::HopExceeded)
-        );
+        let (_, retained, _) = hub
+            .relay_ask(777, "parrot://eu-1/x", b"original", "origin", 0, 8)
+            .unwrap();
+        let next_cid = hub.next_cid;
+        for limit in 0..=u8::MAX {
+            for count in 0..=u8::MAX {
+                if u16::from(count) + 1 < u16::from(limit) {
+                    continue;
+                }
+                assert_eq!(
+                    hub.relay_ask(999, "parrot://eu-1/x", b"rejected", "wrong", count, limit),
+                    Err(RelayError::HopExceeded),
+                    "rejected hop changed relay admission: count={count}, limit={limit}"
+                );
+                assert_eq!(hub.next_cid, next_cid, "rejection consumed a CID");
+                assert_eq!(hub.cid_map.len(), 1, "rejection published a return mapping");
+                assert_eq!(hub.relay_reply(retained), Some((777, "origin".into())));
+            }
+        }
+        let (next, accepted, hop) = hub
+            .relay_ask(888, "parrot://eu-1/x", b"next", "next-origin", 253, 255)
+            .unwrap();
+        assert_eq!(next, "node-eu-gw");
+        assert_eq!(accepted, next_cid + 1);
+        assert_eq!(hop, 254);
+        assert_eq!(hub.relay_reply(accepted), Some((888, "next-origin".into())));
+        assert_eq!(hub.relay_reply(retained), Some((777, "origin".into())));
     }
 
     // F3：cid_map LRU 有界（E2.2——容量 4 淘汰最老）
     #[test]
     fn cid_map_bounded_lru() {
-        let mut m = CidMap::new(4);
-        for i in 0..4u64 {
-            m.insert(i, (1000 + i, "r".into()));
+        for capacity in 0..=3 {
+            for sequence in 0..6u64.pow(6) {
+                let mut actual = CidMap::new(capacity);
+                let mut model: Vec<(u64, (u64, String))> = Vec::new();
+                let mut remaining = sequence;
+                for step in 0..6 {
+                    let operation = remaining % 6;
+                    remaining /= 6;
+                    let cid = operation % 3;
+                    if operation < 3 {
+                        let value = (sequence * 10 + step, format!("return-{sequence}-{step}"));
+                        actual.insert(cid, value.clone());
+                        if let Some(position) = model.iter().position(|entry| entry.0 == cid) {
+                            model.remove(position);
+                        }
+                        if capacity > 0 {
+                            if model.len() == capacity {
+                                model.remove(0);
+                            }
+                            model.push((cid, value));
+                        }
+                    } else {
+                        let expected =
+                            model
+                                .iter()
+                                .position(|entry| entry.0 == cid)
+                                .map(|position| {
+                                    let entry = model.remove(position);
+                                    let value = entry.1.clone();
+                                    model.push(entry);
+                                    value
+                                });
+                        assert_eq!(actual.get(&cid).cloned(), expected,
+                            "lookup disagrees with LRU model: cap={capacity}, sequence={sequence}, step={step}");
+                    }
+                    assert!(actual.len() <= capacity, "LRU exceeded configured capacity");
+                    assert_eq!(
+                        actual.len(),
+                        model.len(),
+                        "LRU lost a live mapping: cap={capacity}, sequence={sequence}, step={step}"
+                    );
+                    assert_eq!(actual.order.iter().copied().collect::<Vec<_>>(),
+                        model.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+                        "LRU recency disagrees with model: cap={capacity}, sequence={sequence}, step={step}");
+                    for (cid, value) in &model {
+                        assert_eq!(
+                            actual.map.get(cid),
+                            Some(value),
+                            "LRU changed return identity"
+                        );
+                    }
+                }
+            }
         }
-        assert_eq!(m.len(), 4);
-        m.insert(4, (1004, "r".into()));
-        assert_eq!(m.len(), 4, "容量界");
-        assert!(m.get(&0).is_none(), "最老被 LRU 淘汰");
-        assert!(m.get(&4).is_some());
-        // touch 1 后插入 5 → 淘汰 2（非 1）
-        m.get(&1);
-        m.insert(5, (1005, "r".into()));
-        assert!(m.get(&1).is_some(), "touched 存活");
-        assert!(m.get(&2).is_none(), "未 touch 被淘汰");
     }
 
     // F3：迟到 REPLY（映射已淘汰）→ None 丢弃

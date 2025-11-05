@@ -2,15 +2,15 @@
 //! 全链路 ask 走新路径的回归）。
 //!
 //! 分层策略（计划 M5 节）：
-//! - ≤16B 小消息：SSO inline（`ask_inline`）—— asker 侧 1 分配（oneshot cell）
-//! - >16B 消息：`push_ask` 按值信封 —— asker 侧 2 分配（payload Box + oneshot cell）
+//! - 构造内联信封：1 次分配（oneshot cell），不包含完整 ask 的运行时工作。
+//! - 构造装箱信封：2 次分配（payload Box + oneshot cell），不包含响应载荷。
 //! - 历史：3 分配（payload Box + envelope Box + oneshot cell）
 //!
 //! 本文件验证：
 //! 1. 单块信封裸操作（POC 三测试语义已在 lib 单测覆盖，此处验证全链路）
 //! 2. ask 全链路走 `push_ask` 按值路径（信封不装箱）
 //! 3. inline ask（SSO 档）
-//! 4. 计数分配器量化：ask_inline vs ask 的实际分配次数
+//! 4. 线程局部计数器分别验证 inline/boxed 信封构造，不冒称端到端分配。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,27 +22,66 @@ use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 use parrot_api::system::ActorSystemConfig;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 
-// ============ 计数分配器（本测试 binary 全局；文件即独立 crate） ============
+// ============ 全局分配器，按线程启用独立计数窗口 ============
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-
+thread_local! {
+    // Const TLS initialization cannot recurse through the allocator.
+    static LOCAL_ALLOCS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+fn record_allocation(ptr: *mut u8) {
+    if !ptr.is_null() {
+        let _ = LOCAL_ALLOCS.try_with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value.saturating_add(1)));
+            }
+        });
+    }
+}
 struct CountingAlloc;
-
+// SAFETY: all requests are forwarded unchanged to System. Recording only touches
+// const-initialized TLS and cannot allocate, panic, or change allocation ownership.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        record_allocation(ptr);
+        ptr
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        record_allocation(ptr);
+        ptr
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        record_allocation(ptr);
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
 }
-
 #[global_allocator]
 static GLOBAL_ALLOC: CountingAlloc = CountingAlloc;
+struct AllocationScope;
+impl Drop for AllocationScope {
+    fn drop(&mut self) {
+        LOCAL_ALLOCS.with(|count| count.set(None));
+    }
+}
+fn measure_allocations<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+    LOCAL_ALLOCS.with(|count| {
+        assert!(count.get().is_none(), "allocation scopes must not nest");
+        count.set(Some(0));
+    });
+    let guard = AllocationScope;
+    let result = operation();
+    let allocations = LOCAL_ALLOCS.with(|count| count.get().unwrap());
+    drop(guard);
+    (result, allocations)
+}
 
 // ============ Echo actor（动态轨） ============
 
@@ -161,48 +200,36 @@ fn m5_inline_ask_sso_lane() {
     });
 }
 
-/// 计数分配器：量化 SSO 档 vs 装箱档的信封层分配差。
-///
-/// POC `alloc_count.rs` 移植（适配并行测试环境）：全局分配计数在并行
-/// 测试下有 harness 噪声，无法测绝对值；改用**差分法**——两档各构造
-/// N 次取总分配差。门禁：boxed 总数 - inline 总数 ≥ N（每条消息至少
-/// 省 1 次 payload Box 分配）。
+/// Measure envelope construction on the calling thread, not full actor requests.
+/// Keep each result alive past its independent window so cleanup is excluded.
 #[test]
 fn m5_allocation_counter_inline_vs_boxed() {
-    const N: usize = 1_000;
-
-    // 差分窗口：两档交替构造，环境噪声对两者均摊
-    let before = ALLOCS.load(Ordering::Relaxed);
-    let mut inline_rx_keep = Vec::with_capacity(N);
-    let mut boxed_rx_keep = Vec::with_capacity(N);
-    for _ in 0..N {
-        let (_env, rx) = parrot::thread::envelope::AskEnvelope::new_inline(7u64);
-        inline_rx_keep.push(rx);
-        let (_env2, rx2) = parrot::thread::envelope::AskEnvelope::with_boxed(Box::new(7u64));
-        boxed_rx_keep.push(rx2);
+    use parrot::thread::envelope::AskEnvelope;
+    let mut inline_total = 0;
+    let mut boxed_total = 0;
+    for value in 0..1_000_u64 {
+        let (inline, inline_allocations) = measure_allocations(|| {
+            std::hint::black_box(AskEnvelope::new_inline(std::hint::black_box(value)))
+        });
+        let (boxed, boxed_allocations) = measure_allocations(|| {
+            std::hint::black_box(AskEnvelope::with_boxed(Box::new(std::hint::black_box(
+                value,
+            ))))
+        });
+        assert_eq!(
+            inline_allocations, 1,
+            "inline needs only a reply channel allocation"
+        );
+        assert_eq!(
+            boxed_allocations, 2,
+            "boxed needs a payload plus reply channel"
+        );
+        assert_eq!(boxed_allocations - inline_allocations, 1);
+        inline_total += inline_allocations;
+        boxed_total += boxed_allocations;
+        drop((inline, boxed));
     }
-    let total = ALLOCS.load(Ordering::Relaxed) - before;
-    drop(inline_rx_keep);
-    drop(boxed_rx_keep);
-
-    // 每对（inline + boxed）的预算：inline ≤1（oneshot）+ boxed ≤2
-    // （payload Box + oneshot）= 3N 上限；差分门禁：boxed 比 inline
-    // 每条多 ≥1 次（payload Box），即 total ≥ N × 2（保守下限）。
-    assert!(
-        total >= N,
-        "N 对信封构造总分配 {} 应 ≥ N={}（boxed 档每条至少 1 次 payload Box）",
-        total,
-        N
-    );
-
-    // 上限防泄漏式回归（信封结构膨胀告警）：每对 ≤4 次分配
-    // （inline oneshot ≤1 + boxed payload Box 1 + oneshot ≤1 + 容器均摊）。
-    assert!(
-        total <= N * 4,
-        "N 对信封构造总分配 {} 超上限 {}（结构膨胀或泄漏）",
-        total,
-        N * 4
-    );
+    assert_eq!((inline_total, boxed_total), (1_000, 2_000));
 }
 
 /// 28 集成测试全走新路径的抽样回归：双车道 + 死亡通知 + ask/tell
@@ -269,4 +296,79 @@ fn m5_semantics_preserved_under_new_envelope() {
             .unwrap();
         assert_eq!(*out.downcast::<u64>().unwrap(), 2);
     });
+}
+
+#[test]
+fn m5_counter_excludes_other_threads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Atomics avoid platform-dependent lazy allocations in OS wait primitives.
+    let phase = Arc::new(AtomicUsize::new(0));
+    let worker_phase = phase.clone();
+    let worker = std::thread::spawn(move || {
+        while worker_phase.load(Ordering::Acquire) == 0 {
+            std::hint::spin_loop();
+        }
+        struct Signal(Arc<AtomicUsize>);
+        impl Drop for Signal {
+            fn drop(&mut self) {
+                self.0.store(2, Ordering::Release);
+            }
+        }
+        let finished = Signal(worker_phase);
+        let ((), count) = measure_allocations(|| {
+            for value in 0..1_000_u64 {
+                drop(std::hint::black_box(Box::new(value)));
+            }
+        });
+        drop(finished);
+        count
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (completed, local) = measure_allocations(|| {
+        phase.store(1, Ordering::Release);
+        while phase.load(Ordering::Acquire) != 2 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
+    });
+    assert!(completed, "allocation worker must finish within its budget");
+    let remote = worker.join().unwrap();
+    assert_eq!(remote, 1_000, "the worker really allocated");
+    assert_eq!(
+        local, 0,
+        "unrelated thread allocations must not enter the local budget"
+    );
+}
+
+#[test]
+fn m5_counter_restores_scope_after_unwind() {
+    let failed = std::panic::catch_unwind(|| {
+        measure_allocations(|| {
+            drop(std::hint::black_box(Box::new(7_u64)));
+            panic!("counter scope unwind");
+        });
+    });
+    assert!(failed.is_err());
+    let (value, allocations) = measure_allocations(|| std::hint::black_box(Box::new(9_u64)));
+    assert_eq!(allocations, 1);
+    assert_eq!(*value, 9);
+}
+
+#[test]
+fn m5_counter_counts_zeroed_and_reallocation() {
+    let (bytes, allocations) = measure_allocations(|| {
+        let mut bytes = std::hint::black_box(vec![0_u8; 32]);
+        bytes.reserve_exact(64);
+        std::hint::black_box(bytes)
+    });
+    assert_eq!(
+        allocations, 2,
+        "zeroed allocation and realloc are distinct calls"
+    );
+    assert_eq!(bytes.len(), 32);
+    assert!(bytes.iter().all(|v| *v == 0));
+    assert!(bytes.capacity() >= 96);
 }

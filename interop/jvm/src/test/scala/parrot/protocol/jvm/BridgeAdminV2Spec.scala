@@ -49,10 +49,14 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   private def askAdmin(port: ActorRef[AdminPort.Msg], payload: Array[Byte]): AdminReplyV2 = {
-    val q = new ConcurrentLinkedQueue[Array[Byte]]()
-    port ! AdminPort.CmdIn(1L, "/_admin", payload, (_, _, out) => q.add(out))
+    val q = new ConcurrentLinkedQueue[(Long, Array[Byte])]()
+    val cid = Try(decodeCommand(payload).reqId).getOrElse(1L)
+    port ! AdminPort.CmdIn(cid, "/_admin", payload, (outer, _, out) => q.add((outer, out)))
     deadlineLoop(() => !q.isEmpty)
-    decodeReply(q.poll())
+    val (outer, out) = q.poll()
+    val reply = decodeReply(out)
+    assert(outer == cid && reply.reqId == cid)
+    reply
   }
 
   // ---------------- 1. 冻结向量 ----------------
@@ -219,6 +223,9 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
       case Drained(22, 1, 0) => // ok
       case other => fail(s"unexpected: $other")
     }
+    assert(askAdmin(port, encodeCommand(Status(25, "/user/fast"))) ==
+      Failed(25, ErrComponentNotFound, "no component under /user/fast"))
+    assert(ComponentRoutes(sys).get("fast").isEmpty, "drained component retained a route")
     // 慢 drain：钩子 300ms > 50ms deadline → aborted=1（实例保留可 stop 清）
     askAdmin(port, encodeCommand(Deploy(23, ComponentDeploy(
       "slow", "1.0.0", ArtifactRef.Jvm(classOf[BridgeAdminV2Spec.LocalSlowSpi].getName, None),
@@ -294,6 +301,28 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
     }
   }
 
+  test("Stop acknowledges actual subtree retirement before same-name redeploy") {
+    val port = sys.systemActorOf(AdminPort(sys), s"admin-retire-${System.nanoTime()}")
+    val state = BridgeAdminV2Spec
+    state.retireEntered = new java.util.concurrent.CountDownLatch(1)
+    state.retireRelease = new java.util.concurrent.CountDownLatch(1)
+    val component = ComponentDeploy("retire", "1.0.0",
+      ArtifactRef.Jvm(classOf[BridgeAdminV2Spec.RetiringSpi].getName, None), InstancePolicy.Singleton, None)
+    assert(askAdmin(port, encodeCommand(Deploy(800, component))).isInstanceOf[Deployed])
+    val replies = new java.util.concurrent.LinkedBlockingQueue[Array[Byte]]()
+    port ! AdminPort.CmdIn(801, "/_admin", encodeCommand(Stop(801, "/user/retire")), (_, _, bytes) => { replies.add(bytes); () })
+    try {
+      assert(state.retireEntered.await(5, java.util.concurrent.TimeUnit.SECONDS), "child did not enter PostStop")
+      assert(replies.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS) == null,
+        "Stop replied while the component child was still retiring")
+    } finally state.retireRelease.countDown()
+    assert(decodeReply(replies.poll(5, java.util.concurrent.TimeUnit.SECONDS)) == Stopped(801))
+    for (n <- 1 to 20) {
+      assert(askAdmin(port, encodeCommand(Deploy(802 + n, component))).isInstanceOf[Deployed])
+      assert(askAdmin(port, encodeCommand(Stop(902 + n, "/user/retire"))).isInstanceOf[Stopped])
+    }
+  }
+
   // ---------------- 5. child-first loader 隔离 ----------------
 
   test("child-first loader: two versions of same class name coexist") {
@@ -359,6 +388,28 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
     } finally deleteRecursively(dir)
   }
 
+  test("file URI decoding loads actual classes from reserved and Unicode paths") {
+    val dir = Files.createTempDirectory("parrot artifact 中文 #?% ")
+    try {
+      val jar = compileSpiJar(dir, "encoded #?% 中文", 731)
+      for (uri <- Seq(jar.toURI.toASCIIString, dir.toUri.toASCIIString)) {
+        val loader = buildLoader(ArtifactRef.Jvm("parrot.demo.DemoSpi", None, Some(uri))).get
+        try assert(magicOf(loader.loadClass("parrot.demo.DemoSpi")) == 731)
+        finally loader.close()
+      }
+    } finally deleteRecursively(dir)
+  }
+
+  test("explicit invalid or missing artifact cannot fall back to parent classes") {
+    for (uri <- Seq("https://invalid.test/app.jar", "file:relative.jar", "file:///missing.jar",
+                    "file:///tmp/a.jar?query", "file:///tmp/a.jar#fragment", "file://remote/tmp/a.jar", "file:///tmp/%ZZ.jar")) {
+      val error = intercept[AdminException] {
+        buildLoader(ArtifactRef.Jvm(classOf[ComponentSpi].getName, None, Some(uri)))
+      }
+      assert(error.code == ErrArtifactFetch, uri)
+    }
+  }
+
   test("buildLoader dialect mismatch and bad uri") {
     assert(Try(buildLoader(ArtifactRef.Props("f"))).isFailure) // 0x0A02
     Try(buildLoader(ArtifactRef.Props("f"))).failed.get match {
@@ -386,7 +437,9 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
       try {
         conn.send(WireFrame.Frame(1, WireFrame.FrameType.HANDSHAKE, 0, 0, 0, 8, "",
           "__handshake__", WireFrame.handshakeBody("b5-test")))
-        assert(conn.expect(_.frameType == WireFrame.FrameType.HANDSHAKE_ACK) != null)
+        val ack = conn.expect(_.frameType == WireFrame.FrameType.HANDSHAKE_ACK)
+        assert(ack != null)
+        assert((WireFrame.decodeHandshake(ack.payload, acknowledgement = true).capabilities & WireFrame.CAPS_MEASURED) != 0)
 
         val deployCmd = Deploy(61, ComponentDeploy(
           "netecho", "1.0.0", ArtifactRef.Jvm(classOf[BridgeAdminV2Spec.LocalStubSpi].getName, None),
@@ -398,6 +451,19 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
           case other => fail(s"unexpected: $other")
         }
 
+        conn.send(WireFrame.Frame(1, WireFrame.FrameType.SYSTEM_EVENT, 0, 701, 0, 8,
+          "/reply", "", encodeCommand(Stop(702, "/user/netecho"))))
+        conn.expectAdminReply(701) match {
+          case Failed(701, ErrDialectMismatch, _) => ()
+          case other => fail(s"mismatched TCP command executed: $other")
+        }
+        conn.send(WireFrame.Frame(1, WireFrame.FrameType.SYSTEM_EVENT, 0, 703, 0, 8,
+          "/reply", "", encodeCommand(Status(703, "/user/netecho"))))
+        conn.expectAdminReply(703) match {
+          case StatusReply(703, states) => assert(states.map(_.path).toSet == Set("/user/netecho-0", "/user/netecho-1"))
+          case other => fail(s"mismatched Stop retired actual instances: $other")
+        }
+
         // 非 admin tag SYSTEM_EVENT → 吞帧不崩（gossip 前向兼容）
         conn.send(WireFrame.Frame(1, WireFrame.FrameType.SYSTEM_EVENT, 0, 99, 0, 8, "", "",
           Array(0x05.toByte, 0x01.toByte)))
@@ -407,6 +473,38 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
         conn.expectAdminReply(62) match {
           case StatusReply(62, states) => assert(states.length == 2)
           case other => fail(s"unexpected: $other")
+        }
+
+        conn.send(WireFrame.Frame(1, WireFrame.FrameType.SYSTEM_EVENT, 0, 66, 0, 8,
+          "parrot://b5-test/_admin", "", Array[Byte](3, 5, 66)))
+        val measured = conn.expect(fr => fr.frameType == WireFrame.FrameType.SYSTEM_EVENT && fr.correlationId == 66)
+        assert(measured != null)
+        assert(measured.payload.take(2).sameElements(Array[Byte](4, 6)), "gateway does not serve measured metrics")
+        val sample = decodeReply(measured.payload).asInstanceOf[AdminReplyV2.Measured].metrics
+        assert(sample.snapshot.components == 1 && sample.snapshot.componentStates.size == 2)
+        assert(sample.processKind == "jvm_threads" && sample.snapshot.processes > 0)
+        assert(sample.epoch.nonEmpty && (sample.available & (1L << 14)) != 0)
+
+
+        // The forged unsigned length has the same low 32 bits as the real path.
+        // It must fail before Stop executes; both deployed instances must survive.
+        val stopPath = "/user/netecho".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        val forgedLength = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+          .putLong(0x100000000L + stopPath.length).array()
+        val malformedStop = Array[Byte](3, 2, 64, 0xfd.toByte) ++ forgedLength ++ stopPath
+        conn.send(WireFrame.Frame(1, WireFrame.FrameType.SYSTEM_EVENT, 0, 64, 0, 8,
+          "parrot://b5-test/_admin", "", malformedStop))
+        conn.expectAdminReply(64) match {
+          case Failed(64, ErrDialectMismatch, _) => // malformed command never reaches Stop
+          case other => fail(s"malformed stop executed: $other")
+        }
+        conn.send(WireFrame.Frame(1, WireFrame.FrameType.SYSTEM_EVENT, 0, 65, 0, 8,
+          "parrot://b5-test/_admin", "", encodeCommand(Status(65, "/user/netecho"))))
+        conn.expectAdminReply(65) match {
+          case StatusReply(65, states) =>
+            assert(states.map(_.path).sorted == Vector("/user/netecho-0", "/user/netecho-1"))
+            assert(states.forall(_.state == "running"))
+          case other => fail(s"malformed stop changed deployment: $other")
         }
 
         conn.send(WireFrame.Frame(1, WireFrame.FrameType.SYSTEM_EVENT, 0, 63, 0, 8,
@@ -480,7 +578,6 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
       gwSys = ActorSystem(Behaviors.setup[Any] { ctx =>
         val bridge = ctx.spawn(BridgeActor(_ => None), "bridge")
         val admin = ctx.spawn(AdminPort(ctx.system), "admin-port")
-        ParrotServerHandler.initSystem(ctx.system)
         ext = new ParrotTransportExtension(ctx.system, bridge, "b5-gw", Some(admin))
         ext.listen(0)
         port = ext.port
@@ -540,6 +637,7 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
         fr.payload.nonEmpty && (fr.payload(0) & 0xFF) == TagAdminReplyV2 &&
         Try(decodeReply(fr.payload)).toOption.exists(_.reqId == reqId), ms)
       assert(f != null, s"admin reply $reqId not received")
+      assert(f.correlationId == reqId, "reply payload and frame IDs must agree")
       decodeReply(f.payload)
     }
 
@@ -581,6 +679,19 @@ class BridgeAdminV2Spec extends AnyFunSuite with BeforeAndAfterAll {
 }
 
 object BridgeAdminV2Spec {
+  @volatile var retireEntered = new java.util.concurrent.CountDownLatch(1)
+  @volatile var retireRelease = new java.util.concurrent.CountDownLatch(1)
+  class RetiringSpi extends ComponentSpi {
+    override def behavior(ctx: ComponentContext): akka.actor.typed.Behavior[Any] =
+      Behaviors.receiveMessage[Any](_ => Behaviors.same).receiveSignal {
+        case (_, akka.actor.typed.PostStop) =>
+          retireEntered.countDown()
+          if (!retireRelease.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            throw new AssertionError("test did not release retiring child")
+          Behaviors.same
+      }
+  }
+
   // 父链直载桩：置于伴生 object（静态）——反射 getDeclaredConstructor()
   // 需无参构造；spec 实例内部类隐式持外部引用会致 spawn 失败。
   class LocalStubSpi extends ComponentSpi {

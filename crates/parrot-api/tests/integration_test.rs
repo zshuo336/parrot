@@ -1,3 +1,6 @@
+//! API composition tests using in-process mock references. These do not prove
+//! engine scheduling, supervision, hierarchy, configuration enforcement or
+//! throughput; real-engine contracts live in crates/parrot/tests.
 use async_trait::async_trait;
 use parrot_api::actor::{Actor, ActorConfig, ActorFactory, ActorState};
 use parrot_api::address::{ActorPath, ActorRef, ActorRefExt};
@@ -49,10 +52,6 @@ impl Message for Greet {
                 "Failed to extract greeting result".to_string(),
             ))
         }
-    }
-
-    fn priority(&self) -> MessagePriority {
-        MessagePriority::HIGH
     }
 }
 
@@ -310,7 +309,6 @@ mod tests {
     use super::*;
     use futures::future::join_all;
 
-    use std::time::Instant;
     use tokio::runtime::Runtime;
     use tokio::time::sleep;
 
@@ -352,7 +350,7 @@ mod tests {
 
     // Test basic Actor interaction
     #[test]
-    fn test_actor_interaction() {
+    fn test_mock_actor_interaction() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -379,11 +377,7 @@ mod tests {
                     name: "World".to_string(),
                 })
                 .await;
-            assert!(result.is_ok());
-
-            if let Ok(greeting) = result {
-                assert!(greeting.contains("World"));
-            }
+            assert_eq!(result.unwrap(), "Hello World!");
 
             // Send error message
             let error_result = greeter_ref.ask(FailingCommand).await;
@@ -397,7 +391,7 @@ mod tests {
 
     // Test Actor lifecycle
     #[test]
-    fn test_actor_lifecycle() {
+    fn test_mock_reference_stop_state() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -412,7 +406,7 @@ mod tests {
                 name: "Tester".to_string(),
             };
             let result = actor_ref.ask(msg).await;
-            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "Hello Tester!");
 
             // Stop Actor
             let stop_result = actor_ref.stop().await;
@@ -441,15 +435,16 @@ mod tests {
 
     // Test message priorities and options
     #[test]
-    fn test_message_priorities() {
+    fn test_envelope_metadata_and_fifo_reference_rejection() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
-            // Create message with priority
+            // Ordinary mock requests use FIFO. Metadata storage alone must
+            // not be interpreted as proof of a priority scheduler.
             let msg = Greet {
                 name: "VIP".to_string(),
             };
-            assert_eq!(msg.priority(), MessagePriority::HIGH);
+            assert_eq!(msg.priority(), MessagePriority::NORMAL);
 
             // Create message envelope
             let options = MessageOptions {
@@ -468,6 +463,48 @@ mod tests {
             let payload = envelope.payload::<Greet>();
             assert!(payload.is_some());
             assert_eq!(payload.unwrap().name, "VIP");
+
+            struct HighRequest;
+            impl Message for HighRequest {
+                type Result = ();
+                fn priority(&self) -> MessagePriority {
+                    MessagePriority::HIGH
+                }
+            }
+            let reference = MockActorRef::new("fifo-only".into());
+            let ask_error = reference.ask(HighRequest).await.unwrap_err();
+            let tell_error = reference.tell(HighRequest).await.unwrap_err();
+            assert!(ask_error
+                .to_string()
+                .contains("high message priority is unsupported"));
+            assert!(tell_error
+                .to_string()
+                .contains("high message priority is unsupported"));
+            let explicit_error = reference
+                .send_with_options(
+                    Box::new(Greet {
+                        name: "rejected".into(),
+                    }),
+                    MessageOptions {
+                        priority: MessagePriority::HIGH,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(explicit_error
+                .to_string()
+                .contains("high message priority is unsupported"));
+            assert!(reference.last_message.read().unwrap().is_none());
+            assert_eq!(
+                reference
+                    .ask(Greet {
+                        name: "accepted".into()
+                    })
+                    .await
+                    .unwrap(),
+                "Hello accepted!"
+            );
         });
     }
 
@@ -506,7 +543,7 @@ mod tests {
 
     // Test concurrent message handling
     #[test]
-    fn test_concurrent_message_handling() {
+    fn test_mock_reference_concurrent_replies() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -543,18 +580,21 @@ mod tests {
             // Wait for all futures to complete
             let results = join_all(futures).await;
 
-            // Verify all messages were processed
-            let success_count = results.iter().filter(|r| r.is_ok()).count();
-            assert_eq!(success_count, 100);
+            assert_eq!(results.len(), 100);
+            // join_all preserves submission order. Success alone cannot detect
+            // a duplicated or misrouted reply, so check every unique request.
+            for (i, result) in results.into_iter().enumerate() {
+                assert_eq!(result.unwrap(), format!("Hello Concurrent-{i}!"));
+            }
 
             // Shutdown system
-            let _ = system.shutdown().await;
+            system.shutdown().await.unwrap();
         });
     }
 
     // Test error recovery
     #[test]
-    fn test_error_recovery() {
+    fn test_mock_reference_remains_usable_after_handler_error() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -586,10 +626,10 @@ mod tests {
                 .unwrap();
 
             // Send failing command followed by normal message
-            let _ = greeter_ref.ask(FailingCommand).await; // This should fail
-
-            // Wait a moment for recovery
-            sleep(Duration::from_millis(100)).await;
+            assert!(matches!(
+                greeter_ref.ask(FailingCommand).await,
+                Err(ActorError::MessageHandlingError(message)) if message == "Simulated failure"
+            ));
 
             // Send normal message after failure
             let result = greeter_ref
@@ -598,17 +638,17 @@ mod tests {
                 })
                 .await;
 
-            // Verify system recovered
-            assert!(result.is_ok());
+            // This mock stays usable after an error; no restart runs here.
+            assert_eq!(result.unwrap(), "Hello After-Failure!");
 
             // Shutdown system
-            let _ = system.shutdown().await;
+            system.shutdown().await.unwrap();
         });
     }
 
     // Test system configuration impact
     #[test]
-    fn test_system_configuration() {
+    fn test_configuration_values_build_mock_system() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -697,17 +737,17 @@ mod tests {
                         name: "Config-Test".to_string(),
                     })
                     .await;
-                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), "Hello Config-Test!");
 
                 // Shutdown system
-                let _ = system.shutdown().await;
+                system.shutdown().await.unwrap();
             }
         });
     }
 
     // Test message routing patterns
     #[test]
-    fn test_message_routing() {
+    fn test_manual_mock_reference_selection() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -742,7 +782,7 @@ mod tests {
                         name: "Broadcast".to_string(),
                     })
                     .await;
-                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), "Hello Broadcast!");
             }
 
             // 2. Round-robin routing
@@ -754,7 +794,7 @@ mod tests {
                         name: format!("Round-Robin-{}", i),
                     })
                     .await;
-                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), format!("Hello Round-Robin-{i}!"));
             }
 
             // 3. Content-based routing (simplified)
@@ -776,17 +816,17 @@ mod tests {
                         name: msg.to_string(),
                     })
                     .await;
-                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), format!("Hello {msg}!"));
             }
 
             // Shutdown system
-            let _ = system.shutdown().await;
+            system.shutdown().await.unwrap();
         });
     }
 
-    // Test performance benchmarking
+    // Repeated mock responses exercise extraction and request integrity only.
     #[test]
-    fn test_performance_benchmarking() {
+    fn test_mock_reference_sequential_response_integrity() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -807,9 +847,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Measure throughput - how many messages can be processed per second
             let message_count = 1000;
-            let start_time = Instant::now();
 
             // Send messages sequentially
             for i in 0..message_count {
@@ -818,35 +856,23 @@ mod tests {
                         name: format!("Perf-{}", i),
                     })
                     .await;
-                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), format!("Hello Perf-{i}!"));
             }
-
-            let elapsed = start_time.elapsed();
-            let throughput = message_count as f64 / elapsed.as_secs_f64();
-
-            // Log performance metrics (in a real test, we might assert against expected values)
-            println!("Sequential throughput: {:.2} messages/sec", throughput);
-
-            // Measure latency
-            let start_time = Instant::now();
             let result = greeter_ref
                 .ask(Greet {
                     name: "Latency-Test".to_string(),
                 })
                 .await;
-            let latency = start_time.elapsed();
-            assert!(result.is_ok());
-
-            println!("Message latency: {:?}", latency);
+            assert_eq!(result.unwrap(), "Hello Latency-Test!");
 
             // Shutdown system
-            let _ = system.shutdown().await;
+            system.shutdown().await.unwrap();
         });
     }
 
     // Test actor hierarchy and supervision
     #[test]
-    fn test_actor_hierarchy() {
+    fn test_multiple_mock_references_preserve_replies() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -883,7 +909,7 @@ mod tests {
                     name: "Child".to_string(),
                 };
                 let result = child_ref.ask(msg).await;
-                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), "Hello Child!");
             }
 
             // 2. Children report to parent
@@ -891,30 +917,32 @@ mod tests {
                 name: "Parent".to_string(),
             };
             let result = parent_ref.ask(parent_msg).await;
-            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "Hello Parent!");
 
-            // 3. Test child failure and supervision
-            // Simulate child failure
+            // 3. A failed request does not stop this mock reference.
             let failing_child = child_refs[0].clone();
-            let _ = failing_child.ask(FailingCommand).await;
+            assert!(matches!(
+                failing_child.ask(FailingCommand).await,
+                Err(ActorError::MessageHandlingError(message)) if message == "Simulated failure"
+            ));
 
-            // Verify child was "restarted" (in a mock way)
+            // No supervision or restart executes in this fixture.
             let new_message = Greet {
                 name: "After-Restart".to_string(),
             };
             let result = failing_child.ask(new_message).await;
 
             // In our mock, the actor won't really restart but we can check basic functionality
-            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "Hello After-Restart!");
 
             // Shutdown system
-            let _ = system.shutdown().await;
+            system.shutdown().await.unwrap();
         });
     }
 
     // Test error conditions
     #[test]
-    fn test_error_conditions() {
+    fn test_mock_reference_errors() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -932,7 +960,7 @@ mod tests {
             assert!(matches!(timeout_result, Err(ActorError::Timeout)));
 
             // Test invalid state error
-            let _ = actor_ref.stop().await;
+            actor_ref.stop().await.unwrap();
             let result = actor_ref
                 .ask(Greet {
                     name: "Invalid".to_string(),
@@ -980,7 +1008,7 @@ mod tests {
 
     // Test custom message handling
     #[test]
-    fn test_custom_message_types() {
+    fn test_mock_reference_and_envelope_types() {
         let rt = Runtime::new().unwrap();
 
         rt.block_on(async {
@@ -992,7 +1020,7 @@ mod tests {
                 name: "Structure".to_string(),
             };
             let result = actor_ref.ask(greet_msg).await;
-            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "Hello Structure!");
 
             // Create wrapped message
             let envelope = MessageEnvelope::new(
@@ -1011,7 +1039,7 @@ mod tests {
             assert_eq!(envelope.options.priority, MessagePriority::HIGH);
 
             // Stop Actor
-            let _ = actor_ref.stop().await;
+            actor_ref.stop().await.unwrap();
         });
     }
 }

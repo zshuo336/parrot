@@ -17,42 +17,79 @@
 # ============================================================================
 set -euo pipefail
 
+if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
+  echo "start-remote.sh erl|ray|jvm HOST:PORT [--root ABSOLUTE_RELEASE_DIR] [--data DIR]"
+  exit 0
+fi
 ROLE="${1:?用法：$0 erl|ray|jvm <应用IP:PORT> [--root DIR] [--data DIR]}"
 APP_TARGET="${2:?缺应用地址（应用 --bind 的对外 IP:端口）}"
 shift 2
 NODE_ROOT="/opt/parrot/websearch"
 DATA_DIR="/var/lib/websearch"
+SEEN_ROOT=0
+SEEN_DATA=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --root) NODE_ROOT="$2"; shift 2 ;;
-    --data) DATA_DIR="$2"; shift 2 ;;
+    --root) [ "$#" -ge 2 ] && [ -n "$2" ] && [ "$SEEN_ROOT" -eq 0 ] || { echo "--root requires one directory" >&2; exit 2; }; NODE_ROOT="$2"; SEEN_ROOT=1; shift 2 ;;
+    --data) [ "$#" -ge 2 ] && [ -n "$2" ] && [ "$SEEN_DATA" -eq 0 ] || { echo "--data requires one directory" >&2; exit 2; }; DATA_DIR="$2"; SEEN_DATA=1; shift 2 ;;
     *) echo "未知参数 $1"; exit 1 ;;
   esac
 done
+
+case "$NODE_ROOT" in /*) ;; *) echo "--root must be absolute" >&2; exit 2 ;; esac
+case "$DATA_DIR" in /*) ;; *) DATA_DIR="$PWD/$DATA_DIR" ;; esac
+# Parse data as data, before compiling or creating storage. Every remote node
+# already requires Python 3 for the verified bundle receiver.
+python3 - "$APP_TARGET" <<'PY_TARGET'
+import sys
+from urllib.parse import urlsplit
+try:
+    text = sys.argv[1]
+    address = urlsplit('//'+text)
+    if (not address.hostname or not address.port or address.username is not None or
+            address.password is not None or address.path or address.query or address.fragment or
+            any(c.isspace() or ord(c) < 32 for c in text)):
+        raise ValueError('expected HOST:PORT with a nonzero port')
+except ValueError as error:
+    print('invalid application target: '+str(error), file=sys.stderr)
+    raise SystemExit(2)
+PY_TARGET
 
 case "$ROLE" in
   erl)
     command -v erl >/dev/null || { echo "缺 erl"; exit 1; }
     echo "==> erl frontier 网关 → 注册 $APP_TARGET"
     # 宿主网关源码编译（distribute.sh 分发的是 .erl——目标机 OTP 版本自洽）
-    (cd "$NODE_ROOT/gw_erl" && erlc parrot_gw.erl) 2>/dev/null \
-      || erlc "$NODE_ROOT/gw_erl/parrot_gw.erl" -o "$NODE_ROOT/gw_erl"
+    erlc -o "$NODE_ROOT/gw_erl" "$NODE_ROOT/gw_erl/parrot_gw.erl" \
+      "$NODE_ROOT/gw_erl/parrot_trace.erl" "$NODE_ROOT/gw_erl/parrot_component_runtime.erl" "$NODE_ROOT/gw_erl/parrot_beam_snapshot.erl" "$NODE_ROOT/gw_erl/parrot_beam_guest.erl" "$NODE_ROOT/gw_erl/parrot_beam_host.erl"
     # 业务 beam 同理（OTP 版本对齐——容器形态踩过 badfile）
-    erlc "$NODE_ROOT/erlang/frontier.erl" -o "$NODE_ROOT/erlang" 2>/dev/null || true
-    exec erl -noshell -pa "$NODE_ROOT/erlang" "$NODE_ROOT/gw_erl" \
-      -eval 'parrot_gw:main([0, "parrot='"$APP_TARGET"'"])'
+    erlc -o "$NODE_ROOT/erlang" "$NODE_ROOT/erlang/frontier.erl"
+    exec env WS_APP_TARGET="$APP_TARGET" PARROT_NODE_ID=erl-gw-1 erl -noshell -pa "$NODE_ROOT/erlang" "$NODE_ROOT/gw_erl" \
+      -eval 'parrot_gw:main([0, "parrot=" ++ os:getenv("WS_APP_TARGET")]).'
     ;;
   ray)
     command -v python3 >/dev/null || { echo "缺 python3"; exit 1; }
     python3 -c "import jieba, ray" 2>/dev/null || { echo "缺 jieba/ray"; exit 1; }
     echo "==> ray tokenizer 网关 → 注册 $APP_TARGET"
     # ray_gw 参数形态：端口0 + parrot= 注册目标
-    cd "$NODE_ROOT/gw_py" 2>/dev/null || cd "$NODE_ROOT"
-    exec env PYTHONPATH="$NODE_ROOT/gw_py:$NODE_ROOT/python" \
-      python3 -m parrot_protocol.ray_gw 0 "parrot=$APP_TARGET"
+    cd "$NODE_ROOT/gw_py"
+    RAY_DIRECTORY="$(mktemp -d /tmp/ws-remote-ray.XXXXXX)"
+    exec env PARROT_NODE_ID=ray-gw-1 PYTHONPATH="$NODE_ROOT/gw_py:$NODE_ROOT/python" \
+      python3 "$NODE_ROOT/remote-ray.py" "$RAY_DIRECTORY" "$APP_TARGET"
     ;;
   jvm)
     command -v java >/dev/null || { echo "缺 java"; exit 1; }
+    # The installed classpath is relative to gw and includes every dependency.
+    python3 - "$NODE_ROOT/gw" <<'PY_CP'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+entries = (root/'cp.txt').read_text().strip().split(':')
+if not entries or any(not name or Path(name).is_absolute() or '..' in Path(name).parts or not (root/name).is_file() for name in entries):
+    raise SystemExit('invalid or incomplete portable JVM classpath; redistribute a complete release')
+if not (root/'parrot-protocol-jvm-0.1.0.jar').is_file():
+    raise SystemExit('missing JVM gateway jar')
+PY_CP
     mkdir -p "$DATA_DIR/index"
     echo "==> jvm search 网关（WS_DATA=$DATA_DIR）→ 注册 $APP_TARGET"
     cd "$NODE_ROOT/gw"

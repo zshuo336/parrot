@@ -1,18 +1,19 @@
 use darling::{FromAttributes, FromMeta};
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 
 use quote::quote;
-use syn::{parse_macro_input, parse_str, Attribute, DeriveInput, Type};
+use syn::{parse_macro_input, Attribute, DeriveInput, Type};
 
 /// Message attribute options for customizing message behavior
 #[derive(Debug, Default, FromMeta)]
 pub struct MessageOptions {
     /// Custom result type for the message
     #[darling(default)]
-    result: Option<String>,
+    result: Option<syn::LitStr>,
     /// Validation expression
     #[darling(default)]
-    validate: Option<String>,
+    validate: Option<syn::LitStr>,
     /// Message priority - either a number (0-100) or a named priority
     #[darling(default)]
     priority: Option<PriorityValue>,
@@ -50,6 +51,11 @@ impl FromMeta for PriorityValue {
         match value {
             syn::Lit::Int(lit_int) => {
                 let value = lit_int.base10_parse::<u8>()?;
+                if value > 100 {
+                    return Err(
+                        darling::Error::custom("priority must be in 0..=100").with_span(lit_int)
+                    );
+                }
                 Ok(PriorityValue::Numeric(value))
             }
             syn::Lit::Str(lit_str) => {
@@ -84,10 +90,8 @@ pub struct MessageArgs {
 }
 
 /// Parse message attributes to extract options
-pub fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
-    MessageArgs::from_attributes(attrs)
-        .map(|a| a.opts)
-        .unwrap_or_default()
+pub fn parse_message_attrs(attrs: &[Attribute]) -> darling::Result<MessageOptions> {
+    MessageArgs::from_attributes(attrs).map(|a| a.opts)
 }
 
 /// Derives the Message trait for a type with extended functionality.
@@ -203,179 +207,205 @@ pub fn parse_message_attrs(attrs: &[Attribute]) -> MessageOptions {
 /// - `priority(&self) -> MessagePriority`: Returns the message priority
 /// - `extract_result(result: Box<dyn Any + Send>) -> Result<Self::Result, ActorError>`: Extracts the result from a boxed Any type
 pub fn derive_message_impl(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+    expand(parse_macro_input!(input as DeriveInput))
+        .unwrap_or_else(darling::Error::write_errors)
+        .into()
+}
 
-    // Check if the input is a struct
-    match input.data {
-        syn::Data::Struct(_) => (),
-        _ => {
-            return syn::Error::new_spanned(input.ident, "Message can only be derived for structs")
-                .to_compile_error()
-                .into();
-        }
+fn expand(input: DeriveInput) -> darling::Result<TokenStream2> {
+    if !matches!(input.data, syn::Data::Struct(_)) {
+        return Err(
+            darling::Error::custom("Message can only be derived for structs")
+                .with_span(&input.ident),
+        );
     }
-
     let name = &input.ident;
-    // Parse the message attributes into a MessageOptions struct
-    let options: MessageOptions = parse_message_attrs(&input.attrs);
-
-    // Parse the result type from the attribute or use () as default
-    let result_type = if let Some(ref result_type) = options.result {
-        parse_str::<Type>(result_type).unwrap_or_else(|_| parse_str("()").unwrap())
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let options = parse_message_attrs(&input.attrs)?;
+    let result_type = if let Some(literal) = &options.result {
+        literal.parse::<Type>().map_err(|error| {
+            darling::Error::custom(format!("invalid message result type: {error}"))
+                .with_span(literal)
+        })?
     } else {
-        parse_str("()").unwrap()
+        syn::parse_quote!(())
     };
 
-    // Parse priority or use Normal as default
-    let priority = if let Some(priority_value) = &options.priority {
-        match priority_value {
-            PriorityValue::Numeric(value) => {
-                quote! { parrot_api::MessagePriority::new_unchecked(#value) }
-            }
-            PriorityValue::Named(name) => {
-                match name.to_uppercase().as_str() {
-                    "BACKGROUND" => quote! { parrot_api::MessagePriority::BACKGROUND },
-                    "LOW" => quote! { parrot_api::MessagePriority::LOW },
-                    "NORMAL" => quote! { parrot_api::MessagePriority::NORMAL },
-                    "HIGH" => quote! { parrot_api::MessagePriority::HIGH },
-                    "CRITICAL" => quote! { parrot_api::MessagePriority::CRITICAL },
-                    _ => {
-                        // Default to NORMAL if an invalid name is provided
-                        quote! { parrot_api::MessagePriority::NORMAL }
+    let priority = match &options.priority {
+        None => quote! { ::parrot_api::MessagePriority::NORMAL },
+        Some(PriorityValue::Numeric(value)) => {
+            quote! { ::parrot_api::MessagePriority::new_unchecked(#value) }
+        }
+        Some(PriorityValue::Named(value) | PriorityValue::Ident(value)) => {
+            match value.to_uppercase().as_str() {
+                "BACKGROUND" => quote! { ::parrot_api::MessagePriority::BACKGROUND },
+                "LOW" => quote! { ::parrot_api::MessagePriority::LOW },
+                "NORMAL" => quote! { ::parrot_api::MessagePriority::NORMAL },
+                "HIGH" => quote! { ::parrot_api::MessagePriority::HIGH },
+                "CRITICAL" => quote! { ::parrot_api::MessagePriority::CRITICAL },
+                _ if matches!(&options.priority, Some(PriorityValue::Ident(_))) => {
+                    let ident = syn::parse_str::<syn::Ident>(value)?;
+                    quote! {
+                        ::parrot_api::MessagePriority::new_unchecked(const {
+                            ::std::assert!(#ident <= 100, "priority must be in 0..=100");
+                            #ident
+                        })
                     }
                 }
-            }
-            PriorityValue::Ident(ident) => {
-                match ident.to_uppercase().as_str() {
-                    "BACKGROUND" => {
-                        quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::BACKGROUND) }
-                    }
-                    "LOW" => quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::LOW) },
-                    "NORMAL" => {
-                        quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::NORMAL) }
-                    }
-                    "HIGH" => {
-                        quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::HIGH) }
-                    }
-                    "CRITICAL" => {
-                        quote! { parrot_api::MessagePriority::new_unchecked(parrot_api::CRITICAL) }
-                    }
-                    _ => {
-                        // For other identifiers, assume they are constants
-                        let ident_token = syn::Ident::new(ident, proc_macro2::Span::call_site());
-                        quote! { parrot_api::MessagePriority::new_unchecked(#ident_token) }
-                    }
+                _ => {
+                    return Err(darling::Error::custom(format!(
+                    "unknown priority {value:?}; expected BACKGROUND, LOW, NORMAL, HIGH or CRITICAL"
+                ))
+                    .with_span(name))
                 }
             }
         }
-    } else {
-        quote! { parrot_api::MessagePriority::NORMAL }
     };
 
-    // Generate validation code
-    // NOTE: the validation expression is evaluated inside `fn validate(&self)`,
-    // so field accesses must be qualified with `self.` (e.g. `self.amount > 0.0`).
-    let validate_impl = if let Some(validate_expr) = options.validate {
-        let expr_str = validate_expr;
-        let expr = parse_str::<syn::Expr>(&expr_str).unwrap();
+    let validate_impl = if let Some(literal) = &options.validate {
+        let expr = literal.parse::<syn::Expr>().map_err(|error| {
+            darling::Error::custom(format!("invalid validation expression: {error}"))
+                .with_span(literal)
+        })?;
+        let text = literal.value();
         quote! {
             if #expr {
-                Ok(())
+                ::std::result::Result::Ok(())
             } else {
-                Err(parrot_api::errors::ActorError::MessageHandlingError(
-                    format!("Validation failed for {}: {}", std::any::type_name::<Self>(), #expr_str)
+                ::std::result::Result::Err(::parrot_api::errors::ActorError::MessageHandlingError(
+                    ::std::format!("Validation failed for {}: {}", ::std::any::type_name::<Self>(), #text)
                 ))
             }
         }
     } else {
-        quote! { Ok(()) }
+        quote! { ::std::result::Result::Ok(()) }
     };
 
-    let timeout = options.timeout;
-    let retry_max_attempts = options.retry_max_attempts;
-    let retry_interval = options.retry_interval;
-    let retry_strategy = options.retry_strategy.as_deref();
-
-    // Modify Option<T> handling
-    let timeout_opt = if let Some(timeout) = timeout {
-        quote! { Some(std::time::Duration::from_secs(#timeout)) }
+    if options.retry_max_attempts.is_none()
+        && (options.retry_interval.is_some() || options.retry_strategy.is_some())
+    {
+        return Err(darling::Error::custom(
+            "retry_interval and retry_strategy require retry_max_attempts",
+        )
+        .with_span(name));
+    }
+    let timeout_opt = if let Some(timeout) = options.timeout {
+        quote! { ::std::option::Option::Some(::std::time::Duration::from_secs(#timeout)) }
     } else {
-        quote! { None }
+        quote! { ::std::option::Option::None }
     };
-
-    let retry_policy_opt = if let Some(retry_max) = retry_max_attempts {
-        let max_attempts = retry_max;
-        let interval = retry_interval.unwrap_or(1);
-        let strategy = match retry_strategy {
-            Some("Fixed") => quote! { parrot_api::message::BackoffStrategy::Fixed },
-            Some("Linear") => quote! { parrot_api::message::BackoffStrategy::Linear },
+    let retry_policy_opt = if let Some(max_attempts) = options.retry_max_attempts {
+        let interval = options.retry_interval.unwrap_or(1);
+        let strategy = match options.retry_strategy.as_deref() {
+            None | Some("Fixed") => quote! { ::parrot_api::message::BackoffStrategy::Fixed },
+            Some("Linear") => quote! { ::parrot_api::message::BackoffStrategy::Linear },
             Some("Exponential") => quote! {
-                parrot_api::message::BackoffStrategy::Exponential {
+                ::parrot_api::message::BackoffStrategy::Exponential {
                     base: 2.0,
-                    max_interval: std::time::Duration::from_secs(60),
+                    max_interval: ::std::time::Duration::from_secs(60),
                 }
             },
-            _ => quote! { parrot_api::message::BackoffStrategy::Fixed },
+            Some(other) => {
+                return Err(darling::Error::custom(format!(
+                    "unknown retry_strategy {other:?}; expected Fixed, Linear or Exponential"
+                ))
+                .with_span(name))
+            }
         };
-
         quote! {
-            Some(parrot_api::message::RetryPolicy {
+            ::std::option::Option::Some(::parrot_api::message::RetryPolicy {
                 max_attempts: #max_attempts,
-                retry_interval: std::time::Duration::from_secs(#interval),
+                retry_interval: ::std::time::Duration::from_secs(#interval),
                 backoff_strategy: #strategy,
             })
         }
     } else {
-        quote! { None }
+        quote! { ::std::option::Option::None }
     };
 
-    // Generate the implementation
-    let expanded = quote! {
-        impl parrot_api::Message for #name {
+    Ok(quote! {
+        impl #impl_generics ::parrot_api::Message for #name #ty_generics #where_clause {
             type Result = #result_type;
 
-            fn extract_result(result: Box<dyn std::any::Any + Send>) -> Result<Self::Result, parrot_api::errors::ActorError> {
-                result
-                    .downcast::<Self::Result>()
-                    .map(|b| *b)
-                    .map_err(|_| parrot_api::errors::ActorError::MessageHandlingError(
-                        format!("Failed to downcast message result for {}", std::any::type_name::<Self>())
-                    ))
+            fn extract_result(result: ::parrot_api::types::BoxedMessage) -> ::parrot_api::types::ActorResult<Self::Result> {
+                result.downcast::<Self::Result>().map(|b| *b).map_err(|_| {
+                    ::parrot_api::errors::ActorError::MessageHandlingError(
+                        ::std::format!("Failed to downcast message result for {}", ::std::any::type_name::<Self>())
+                    )
+                })
             }
 
             fn message_type(&self) -> &'static str {
-                std::any::type_name::<Self>()
+                ::std::any::type_name::<Self>()
             }
 
-            fn priority(&self) -> parrot_api::MessagePriority {
+            fn priority(&self) -> ::parrot_api::MessagePriority {
                 #priority
             }
 
-            fn validate(&self) -> Result<(), parrot_api::errors::ActorError> {
+            fn validate(&self) -> ::parrot_api::types::ActorResult<()> {
                 #validate_impl
             }
 
-            fn message_options(&self) -> Option<parrot_api::MessageOptions> {
-                Some(parrot_api::MessageOptions {
+            fn message_options(&self) -> ::std::option::Option<::parrot_api::MessageOptions> {
+                ::std::option::Option::Some(::parrot_api::MessageOptions {
                     timeout: #timeout_opt,
                     retry_policy: #retry_policy_opt,
-                    priority: self.priority(),
+                    priority: <Self as ::parrot_api::Message>::priority(self),
                 })
             }
         }
 
-        impl #name {
-            pub fn new(msg: Self) -> Result<Self, parrot_api::errors::ActorError> {
-                msg.validate()?;
-                Ok(msg)
+        impl #impl_generics #name #ty_generics #where_clause {
+            pub fn new(msg: Self) -> ::parrot_api::types::ActorResult<Self> {
+                <Self as ::parrot_api::Message>::validate(&msg)?;
+                ::std::result::Result::Ok(msg)
             }
 
-            pub fn into_envelope(self) -> parrot_api::MessageEnvelope {
-                let options = self.message_options();
-                parrot_api::MessageEnvelope::new(self, None, options)
+            pub fn into_envelope(self) -> ::parrot_api::MessageEnvelope {
+                let options = <Self as ::parrot_api::Message>::message_options(&self);
+                ::parrot_api::MessageEnvelope::new(self, ::std::option::Option::None, options)
             }
         }
-    };
+    })
+}
 
-    TokenStream::from(expanded)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_validation_reports_an_error_without_macro_panic() {
+        for expr in ["self.", "(", "if", ""] {
+            let result = std::panic::catch_unwind(|| {
+                let input: DeriveInput =
+                    syn::parse_str(&format!("#[message(validate = {expr:?})] struct Msg;"))
+                        .unwrap();
+                expand(input)
+            });
+            let error = result
+                .expect("malformed validation must not panic")
+                .unwrap_err();
+            assert!(error.to_string().contains("validation expression"));
+        }
+    }
+
+    #[test]
+    fn invalid_message_options_are_errors_instead_of_default_metadata() {
+        for attr in [
+            "#[message(result = 1)]",
+            "#[message(result = \"Vec<\")]",
+            "#[message(priority = 101)]",
+            "#[message(priority = 256)]",
+            "#[message(priority = \"HGIH\")]",
+            "#[message(unknown = true)]",
+            "#[message(timeout = 1, timeout = 2)]",
+            "#[message(retry_strategy = \"Fixed\")]",
+            "#[message(retry_interval = 3)]",
+            "#[message(retry_max_attempts = 2, retry_strategy = \"bad\")]",
+        ] {
+            let input = syn::parse_str(&format!("{attr} struct Msg;")).unwrap();
+            assert!(expand(input).is_err(), "accepted {attr}");
+        }
+    }
 }

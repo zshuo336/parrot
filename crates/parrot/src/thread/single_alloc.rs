@@ -1,15 +1,18 @@
-//! M5 Phase B：单块信封（`SingleAllocEnvelope`）—— POC `erased-alloc` 移植。
+//! 公开的独立单块信封工具（`SingleAllocEnvelope`），来自 `erased-alloc` POC。
+//!
+//! 当前 Thread 邮箱使用 `AskEnvelope` / `AskPayload`，没有接入此类型。
+//! 本模块的分配计数不代表实际 actor ASK 全链路成本。
 //!
 //! 一次堆分配同时容纳【擦除头 + payload】，payload 按对齐摆放在同一块
 //! 内存上；downcast 只做 TypeId 比较 + 指针运算，零额外分配。
 //!
 //! 与 POC 的差异：
-//! - header 额外容纳 **inline oneshot::Sender**（ADR-13 叠加：ask 全链路
-//!   1 分配）。drop 顺序审计：**payload → oneshot → dealloc**（payload
+//! - header 内联存储 **oneshot::Sender 句柄**；channel 状态另有一次分配，
+//!   `new_ask` 共两次，不含消息内部资源。drop 顺序：**payload → oneshot → dealloc**（payload
 //!   drop 可能引用 oneshot 之外的资源，必须先于内存释放；oneshot drop
 //!   唤醒等待者，必须在 dealloc 之前完成发送语义）。
 //! - POC `downcast` 后 `mem::forget(self)` 的双释放坑已随迁修正：本实现
-//!   的 `into_payload` 用 `ManuallyDrop` 包装 self，确保 Drop 不会对已
+//!   的 `take_payload` 用 `ManuallyDrop` 包装 self，确保 Drop 不会对已
 //!   取走的块二次 dealloc。
 //!
 //! ## 布局
@@ -22,8 +25,9 @@
 //!
 //! ## 门禁
 //!
-//! miri 全绿（`scripts/miri.sh`）+ 计数分配器常驻测试
-//! （`test_m5_single_alloc.rs`）。
+//! `scripts/miri.sh` 对本文件的实际源码与共享 unwind/分配契约执行 Miri。
+//! 正式 Cargo 回归使用 `test_single_alloc_unwind.rs`；它不代替实际邮箱的
+//! `test_m5_single_alloc.rs` 全链路与信封构造测试。
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::any::{Any, TypeId};
@@ -47,12 +51,27 @@ struct Header {
 
 /// 单分配消息信封。
 ///
-/// 构造 `new`（tell）/ `new_ask`（ask，带 inline oneshot）各一次分配。
+/// `new` 分配一个消息块；`new_ask` 还分配一个 oneshot channel 状态，共两次。
+/// 这些计数不包含消息自身可能拥有的堆内存。
 pub struct SingleAllocEnvelope {
     ptr: NonNull<u8>,
 }
 
 unsafe impl Send for SingleAllocEnvelope {}
+
+// The allocation must outlive payload and reply disposal, including unwinding.
+// This guard owns only the backing storage; neither field is dropped twice.
+struct EnvelopeAllocation {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+impl Drop for EnvelopeAllocation {
+    fn drop(&mut self) {
+        // SAFETY: created once from the envelope's original allocation/layout,
+        // after ownership of the envelope itself has been disabled or retired.
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
 
 impl SingleAllocEnvelope {
     /// 单块构造（tell 语义，无回复通道）。
@@ -60,7 +79,7 @@ impl SingleAllocEnvelope {
         Self::alloc_with(msg, None)
     }
 
-    /// 单块构造（ask 语义，inline oneshot 回复通道）。
+    /// 单块构造（ask 语义），块内存储回复句柄，channel 状态另行分配。
     ///
     /// 返回 (envelope, reply_receiver)：asker 持 receiver 等回复。
     pub fn new_ask<M: Any + Send>(
@@ -139,26 +158,22 @@ impl SingleAllocEnvelope {
 
     /// 不检查类型直接取 payload（消费侧已确认类型的快路径）。
     fn take_payload<M: Any + Send>(self) -> M {
+        let envelope = std::mem::ManuallyDrop::new(self);
         unsafe {
-            let hdr = self.ptr.as_ptr() as *mut Header;
-            let payload_ptr = self.ptr.as_ptr().add((*hdr).payload_off);
-            let m = std::ptr::read(payload_ptr as *const M);
-
-            // drop 审计（修正 POC 的 mem::forget 双释放坑）：
-            // 1. payload 已 read 走 → 块内无 M 需 drop
-            // 2. reply（若存在）read 走 → 唤醒语义归调用方
-            // 3. ManuallyDrop 防 Drop::drop 二次 dealloc
-            let reply = (*hdr).reply.take();
-            let layout = (*hdr).layout;
-            let raw = self.ptr.as_ptr();
-            let _ = std::mem::ManuallyDrop::new(self);
-            // 显式释放整块；reply 已 take，不会被 Drop 触发
-            if let Some(reply) = reply {
-                // reply 未被消费：drop 之（发送取消信号给等待者）
-                drop(reply);
-            }
-            dealloc(raw, layout);
-            m
+            let header = envelope.ptr.as_ptr() as *mut Header;
+            let storage = EnvelopeAllocation {
+                ptr: envelope.ptr,
+                layout: (*header).layout,
+            };
+            // Move both owned fields out before retiring the reply sender.
+            // If waking a receiver panics, the moved payload and storage still
+            // have stack owners and retire while unwinding.
+            let reply = (*header).reply.take();
+            let payload =
+                std::ptr::read(envelope.ptr.as_ptr().add((*header).payload_off) as *const M);
+            drop(reply);
+            drop(storage);
+            payload
         }
     }
 
@@ -181,16 +196,18 @@ impl SingleAllocEnvelope {
 impl Drop for SingleAllocEnvelope {
     fn drop(&mut self) {
         unsafe {
-            let hdr = self.ptr.as_ptr() as *mut Header;
-            let payload_ptr = self.ptr.as_ptr().add((*hdr).payload_off);
-            // drop 顺序审计：payload → oneshot → dealloc。
-            // payload 的 Drop 可能执行任意用户代码（包括 panic），此时
-            // 内存尚未释放——顺序保证 1/3 两步异常安全。
-            ((*hdr).drop_fn)(payload_ptr);
-            if let Some(reply) = (*hdr).reply.take() {
-                drop(reply); // 2: oneshot drop 唤醒等待者（RecvError）
-            }
-            dealloc(self.ptr.as_ptr(), (*hdr).layout); // 3
+            let header = self.ptr.as_ptr() as *mut Header;
+            // Establish storage ownership before either user-controlled drop.
+            // Locals retire in reverse order: payload, reply, backing storage.
+            let storage = EnvelopeAllocation {
+                ptr: self.ptr,
+                layout: (*header).layout,
+            };
+            let reply = (*header).reply.take();
+            let payload_ptr = self.ptr.as_ptr().add((*header).payload_off);
+            ((*header).drop_fn)(payload_ptr);
+            drop(reply);
+            drop(storage);
         }
     }
 }

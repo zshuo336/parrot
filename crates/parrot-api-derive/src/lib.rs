@@ -106,145 +106,101 @@ mod typed;
 /// # Ok(())
 /// # }
 /// ```
-/// Derives the remote-messaging contract for a message type (DEV_01 §3.4).
+/// Invalid option types, unknown/duplicate fields, invalid result/validation
+/// syntax, unknown named priorities/retry strategies and literal priorities
+/// outside 0..=100 are compile errors. Retry interval/strategy options require
+/// `retry_max_attempts`. Custom priority constant identifiers are range-checked
+/// in a const expression when their generated priority method is instantiated.
+/// Generic parameters and where clauses are preserved; callers must supply
+/// the Send and static bounds required by Message and its Result.
 ///
-/// Generates:
-/// - `impl RemoteMessage for T` with `TYPE_KEY` (default `bin:{crate}::{T}#v1`)
-/// - an `inventory::submit!` CodecRegistration entry (bincode wrappers)
+/// `new` invokes validation. Generated options are metadata; deriving them
+/// alone does not install runtime retry/deadline enforcement.
+#[proc_macro_derive(Message, attributes(message))]
+pub fn derive_message(input: TokenStream) -> TokenStream {
+    message::derive_message_impl(input)
+}
+
+/// Derives a concrete message's remote identity and inventory codec.
 ///
-/// Override the key with `#[remote(key = "pb:pkg.Msg")]`.
+/// Default key: `bin:{module_path}::{Type}#v1`. This includes the crate and modules
+/// at the expansion site. Use an explicit stable key across module/crate renames;
+/// function-local types with the same name in one module also need explicit keys.
+/// Generic messages must be wrapped in concrete types for static registration.
 ///
-/// ```ignore
-/// // Requires: serde::Serialize + serde::DeserializeOwned + parrot-api "remote" feature.
-/// #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, RemoteMessage)]
+/// `bin:` uses serde + bincode. `pb:` uses prost::Message + Default and requires
+/// parrot-api's `remote-protobuf` feature (enabled by parrot-remote).
+/// Unknown, malformed, and duplicate remote options are compile errors.
+///
+/// ```
+/// use parrot_api_derive::RemoteMessage;
+/// #[derive(serde::Serialize, serde::Deserialize, RemoteMessage)]
 /// #[remote(key = "bin:myapp::Echo#v2")]
 /// struct Echo(u64);
+/// impl parrot_api::Message for Echo { type Result = (); }
+/// assert_eq!(<Echo as parrot_api::message::RemoteMessage>::TYPE_KEY, "bin:myapp::Echo#v2");
+/// ```
+///
+/// Protobuf fields carry explicit schema tags; serde alone cannot encode protobuf:
+///
+/// ```
+/// use parrot_api_derive::RemoteMessage;
+/// #[derive(Clone, PartialEq, prost::Message, RemoteMessage)]
+/// #[remote(key = "pb:myapp.Echo")]
+/// struct Echo { #[prost(uint64, tag = "1")] value: u64 }
+/// impl parrot_api::Message for Echo { type Result = (); }
+/// ```
+///
+/// ```compile_fail
+/// use parrot_api_derive::RemoteMessage;
+/// #[derive(serde::Serialize, serde::Deserialize, RemoteMessage)]
+/// #[remote(kee = "bin:myapp::Echo#v1")]
+/// struct Echo(u64);
+/// impl parrot_api::Message for Echo { type Result = (); }
+/// ```
+///
+/// ```compile_fail
+/// use parrot_api_derive::RemoteMessage;
+/// #[derive(serde::Serialize, serde::Deserialize, RemoteMessage)]
+/// #[remote(key = "pb:myapp.Echo")]
+/// struct Echo(u64); // Does not implement prost::Message.
+/// impl parrot_api::Message for Echo { type Result = (); }
 /// ```
 #[proc_macro_derive(RemoteMessage, attributes(remote))]
 pub fn derive_remote_message(input: TokenStream) -> TokenStream {
     remote::derive_remote_message_impl(input)
 }
 
-#[proc_macro_derive(Message, attributes(message))]
-pub fn derive_message(input: TokenStream) -> TokenStream {
-    message::derive_message_impl(input)
-}
-
-/// Derives the ParrotActor trait for a type with engine-specific implementations.
+/// Implements `parrot_api::Actor` and, for Actix, `ActixEngineExt`.
 ///
-/// This macro automatically implements the Actor trait for the specified engine:
-/// - Implements necessary interface for the chosen actor system backend
-/// - Handles message routing and conversion
-/// - Manages actor lifecycle
+/// Bind the chosen runtime as `__parrot_engine` at the use site. Set
+/// `#[ParrotActor(engine = "actix")]` or `#[ParrotActor(engine = "thread")]`
+/// to select the generated context/dispatch shape; `"tokio"` is a historical
+/// alias for `"thread"`. The default is Actix. Identifier labels such as
+/// `ACTIX` and `THREAD` are recognized by their spelling; the macro does not
+/// evaluate the value of a Rust constant.
 ///
-/// # Features
+/// `config = "MyConfig"` selects an `ActorConfig` type, defaulting to
+/// `parrot_api::actor::EmptyConfig`. `async_handler = true` opts Actix into
+/// the async `handle_message` path. Actix derives also require
+/// `handle_message_engine`; synchronous mode uses this method and reports
+/// unhandled messages when it returns `None`. Thread derives need only the
+/// async handler. Context signatures use `__parrot_engine::EngineContext<Self>`.
 ///
-/// ## 1. Engine Selection
+/// Malformed, unknown and duplicate options, unknown engines and invalid
+/// configuration type syntax are compilation errors. Legacy `supervision`
+/// and `dispatcher` attributes are rejected because they have no runtime
+/// wiring; configure the engine/system explicitly. Their future support is
+/// separate from the dispatch implementation, not silently enabled here.
 ///
-/// Using a string literal:
-/// ```ignore
-/// #[derive(ParrotActor)]
-/// #[ParrotActor(engine = "actix")]  // Use Actix as the actor backend
-/// struct MyActor {
-///     counter: u32,
-/// }
+/// Lifecycle management belongs to the selected runtime. Switching runtimes
+/// also requires the corresponding constructor and context/handler shape;
+/// changing the module alias alone is insufficient. For a complete executable
+/// example on both engines, run from the repository root:
+///
+/// ```text
+/// cargo run --locked -p parrot --example quickstart
 /// ```
-///
-/// Using a constant:
-/// ```ignore
-/// #[derive(ParrotActor)]
-/// #[ParrotActor(engine = ACTIX)]  // Use Actix as the actor backend
-/// struct MyActor {
-///     counter: u32,
-/// }
-/// ```
-///
-/// Supported engine values:
-/// - "actix" (or ACTIX constant)
-/// - Future engines will be supported as they are implemented
-///
-/// ## 2. Other Configuration Options
-///
-/// ```ignore
-/// #[derive(ParrotActor)]
-/// #[ParrotActor(
-///     engine = "actix",
-///     config = "MyActorConfig",
-///     supervision = "OneForOne",
-///     dispatcher = "default"
-/// )]
-/// struct MyActor {
-///     counter: u32,
-/// }
-/// ```
-///
-/// ## 3. Complete Example
-/// ```ignore
-/// use parrot_api::actor::Actor;
-/// use parrot_api::message::Message;
-///
-/// // M1 derive-decouple: bind the engine once at the use site.
-/// // The macro-generated code references `__parrot_engine::*` only.
-/// use parrot::actix as __parrot_engine;
-///
-/// // Define a message
-/// #[derive(Message)]
-/// #[message(result = "u32")]
-/// struct Increment(u32);
-///
-/// // Define the actor
-/// #[derive(ParrotActor)]
-/// #[ParrotActor(engine = "actix")]
-/// struct CounterActor {
-///     value: u32,
-/// }
-///
-/// // Implement message handling (use the same engine alias in signatures)
-/// impl CounterActor {
-///     async fn handle_message(&mut self, msg: BoxedMessage, ctx: &mut __parrot_engine::EngineContext<Self>)
-///         -> ActorResult<BoxedMessage> {
-///         if let Some(increment) = msg.downcast_ref::<Increment>() {
-///             self.value += increment.0;
-///             return Ok(Box::new(self.value));
-///         }
-///
-///         Err(ActorError::UnknownMessage)
-///     }
-/// }
-///
-/// // Usage in main()
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let system = ParrotActorSystem::start(ActorSystemConfig::default()).await?;
-///
-/// // Register Actix backend
-/// let actix_system = ActixActorSystem::new().await?;
-/// system.register_actix_system("actix", actix_system, true).await?;
-///
-/// // Create actor
-/// let actor = CounterActor { value: 0 };
-/// let actor_ref = system.spawn_root_typed(actor, ()).await?;
-///
-/// // Send message and get response
-/// let result = actor_ref.send(Increment(5)).await?;
-/// assert_eq!(result, 5);
-/// # Ok(())
-/// # }
-/// ```
-///
-/// ## 4. Engine Switching (M1)
-///
-/// Switching engines is a one-line change at the binding site:
-///
-/// ```ignore
-/// use parrot::actix as __parrot_engine;   // actix engine
-/// // ... or ...
-/// use parrot::thread as __parrot_engine;  // thread engine
-/// ```
-///
-/// The derive attribute (`engine = "actix"` / `engine = "thread"`) only
-/// shapes small codegen details (e.g. the actix sync fast path); all type
-/// references flow through the alias, so the macro crate never depends on
-/// any engine crate.
 #[proc_macro_derive(ParrotActor, attributes(ParrotActor))]
 pub fn derive_parrot_actor(input: TokenStream) -> TokenStream {
     actor::derive_actor_impl(input)
@@ -257,20 +213,35 @@ pub fn derive_parrot_actor(input: TokenStream) -> TokenStream {
 /// `ParrotMsgVariant`（inject/extract 类型级映射）。配合 thread 引擎的
 /// `ThreadActorSystem::spawn_typed` 使用；动态轨完全不受影响。
 ///
-/// ```ignore
+/// ```rust
+/// use parrot_api::{Message, ParrotTypedActor};
+/// use parrot_api::typed::{ParrotMsgVariant, ParrotTypedDispatch, TypedReceive};
+/// use parrot_api::types::{ActorResult, BoxedFuture};
+///
+/// pub struct Add(u64);
+/// impl Message for Add { type Result = u64; }
+/// pub struct Get;
+/// impl Message for Get { type Result = u64; }
+///
 /// #[derive(ParrotTypedActor)]
 /// #[ParrotTypedActor(msgs(Add, Get))]
 /// struct Calc { n: u64 }
 ///
 /// impl TypedReceive<Add> for Calc {
-///     async fn receive_typed(&mut self, msg: Add) -> ActorResult<u64> {
-///         self.n += msg.0; Ok(self.n)
+///     fn receive_typed<'a>(&'a mut self, msg: Add) -> BoxedFuture<'a, ActorResult<u64>> {
+///         Box::pin(async move { self.n += msg.0; Ok(self.n) })
+///     }
+/// }
+/// impl TypedReceive<Get> for Calc {
+///     fn receive_typed<'a>(&'a mut self, _: Get) -> BoxedFuture<'a, ActorResult<u64>> {
+///         Box::pin(async move { Ok(self.n) })
 ///     }
 /// }
 ///
-/// // spawn_typed(Calc::default(), "/calc") -> TypedActorRef<Calc, Add>
-/// // r.ask(Add(41)).await -> u64（零 Any）
-/// // r.ref_for::<Get>().ask(Get).await -> u64（同一 actor 多协议）
+/// // The protocol compiles independently of any engine.
+/// fn check_protocol<A: ParrotTypedDispatch, M: ParrotMsgVariant<A>>() {}
+/// check_protocol::<Calc, Add>();
+/// check_protocol::<Calc, Get>();
 /// ```
 #[proc_macro_derive(ParrotTypedActor, attributes(ParrotTypedActor))]
 pub fn derive_parrot_typed_actor(input: TokenStream) -> TokenStream {

@@ -4,7 +4,7 @@ use parrot::thread::{context::ThreadContext, system::ThreadActorSystem};
 use parrot_api::{
     actor::{Actor, ActorState, EmptyConfig},
     address::ActorRef,
-    context::ActorContext,
+    context::{ActorContext, ActorContextScheduler, ScheduledTask},
     errors::ActorError,
     message::CloneableMessage,
     types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage},
@@ -25,6 +25,8 @@ struct Sink {
     changed: Arc<tokio::sync::Notify>,
     pending: bool,
     panic_on_poll: bool,
+    panic_on_delivery_drop: bool,
+    delivery_drops: Arc<AtomicUsize>,
     callback_drops: Arc<AtomicUsize>,
     delivery_delay: Duration,
     delivery_times: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
@@ -46,7 +48,7 @@ impl ActorRef for Sink {
         self.send(msg)
     }
     fn deliver<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
+        let future = Box::pin(async move {
             let _payload = message;
             let _callback = Payload(self.callback_drops.clone());
             self.delivered.fetch_add(1, Ordering::SeqCst);
@@ -63,6 +65,11 @@ impl ActorRef for Sink {
                 tokio::time::sleep(self.delivery_delay).await;
             }
             Ok(())
+        });
+        Box::pin(DeliveryOwner {
+            future,
+            panic_on_drop: self.panic_on_delivery_drop,
+            drops: self.delivery_drops.clone(),
         })
     }
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
@@ -255,6 +262,156 @@ impl Actor for ThreadTimers {
         Box::pin(schedule(message, ctx))
     }
 }
+
+enum TraitTimerCommand {
+    Cancel,
+}
+struct ThreadTraitTimer {
+    task: Option<ScheduledTask>,
+    ticks: Arc<AtomicUsize>,
+    changed: Arc<tokio::sync::Notify>,
+}
+impl Actor for ThreadTraitTimer {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+    fn init<'a>(&'a mut self, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            self.task = Some(
+                ctx.schedule(Tick, Duration::ZERO, Some(Duration::from_millis(15)))
+                    .await?,
+            );
+            Ok(())
+        })
+    }
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            if msg.downcast_ref::<Tick>().is_some() {
+                self.ticks.fetch_add(1, Ordering::SeqCst);
+                self.changed.notify_waiters();
+            } else if msg.downcast_ref::<TraitTimerCommand>().is_some()
+                && let Some(task) = self.task.take()
+            {
+                ctx.cancel_schedule(task);
+            }
+            Ok(Box::new(()) as BoxedMessage)
+        })
+    }
+}
+
+struct ActixTraitTimer {
+    task: Option<ScheduledTask>,
+    ticks: Arc<AtomicUsize>,
+    changed: Arc<tokio::sync::Notify>,
+}
+impl parrot_api::actor::ActixEngineExt for ActixTraitTimer {}
+impl Actor for ActixTraitTimer {
+    type Config = EmptyConfig;
+    type Context = ActixContext<ActixActor<Self>>;
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+    fn use_async_handler(&self) -> bool {
+        true
+    }
+    fn init<'a>(&'a mut self, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            self.task = Some(
+                ctx.schedule(Tick, Duration::ZERO, Some(Duration::from_millis(15)))
+                    .await?,
+            );
+            Ok(())
+        })
+    }
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            if msg.downcast_ref::<Tick>().is_some() {
+                self.ticks.fetch_add(1, Ordering::SeqCst);
+                self.changed.notify_waiters();
+            } else if msg.downcast_ref::<TraitTimerCommand>().is_some()
+                && let Some(task) = self.task.take()
+            {
+                ctx.cancel_schedule(task);
+            }
+            Ok(Box::new(()) as BoxedMessage)
+        })
+    }
+}
+
+#[actix::test]
+async fn public_scheduler_trait_supports_periodic_cancel_on_thread_and_actix() {
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let system = ThreadActorSystem::shared(Default::default());
+    let actor = system
+        .spawn_at(
+            ThreadTraitTimer {
+                task: None,
+                ticks: ticks.clone(),
+                changed: changed.clone(),
+            },
+            "/trait-timer",
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ticks.load(Ordering::SeqCst) < 2 {
+            changed.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    actor
+        .send(Box::new(TraitTimerCommand::Cancel))
+        .await
+        .unwrap();
+    let stopped_at = ticks.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(ticks.load(Ordering::SeqCst), stopped_at);
+    system.shutdown_internal().await.unwrap();
+
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let system = ActixActorSystem::with_arbiter_count(1).await.unwrap();
+    let actor = system
+        .spawn_root_typed(
+            ActixTraitTimer {
+                task: None,
+                ticks: ticks.clone(),
+                changed: changed.clone(),
+            },
+            EmptyConfig,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ticks.load(Ordering::SeqCst) < 2 {
+            changed.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    actor
+        .send(Box::new(TraitTimerCommand::Cancel))
+        .await
+        .unwrap();
+    let stopped_at = ticks.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(ticks.load(Ordering::SeqCst), stopped_at);
+    system.shutdown().await.unwrap();
+}
 struct ActixTimers;
 impl parrot_api::actor::ActixEngineExt for ActixTimers {}
 impl Actor for ActixTimers {
@@ -289,11 +446,25 @@ impl Backend {
     async fn actor(&self) -> BoxedActorRef {
         match self {
             Self::Actix(system) => system
-                .spawn_root_typed(ActixTimers, EmptyConfig)
+                .spawn_root_typed_with_strategy(
+                    ActixTimers,
+                    EmptyConfig,
+                    parrot_api::supervisor::SupervisorStrategyType::Default(
+                        parrot_api::supervisor::DefaultStrategy::ResumeOnFailure,
+                    ),
+                )
                 .await
                 .unwrap(),
             Self::Thread(system) => system
-                .spawn_at(ThreadTimers, "/timers", None, Default::default())
+                .spawn_at(
+                    ThreadTimers,
+                    "/timers",
+                    None,
+                    parrot::thread::ThreadActorConfig {
+                        supervisor_strategy: Some(parrot::thread::SupervisorStrategy::Resume),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap()
                 .clone_boxed(),
@@ -323,7 +494,15 @@ async fn file_and_builder_task_limits_control_actual_admission() {
             parrot::thread::config::ThreadActorSystemConfig::from_resolved(&resolved),
         );
         let actor = system
-            .spawn_at(ThreadTimers, "/timers", None, Default::default())
+            .spawn_at(
+                ThreadTimers,
+                "/timers",
+                None,
+                parrot::thread::ThreadActorConfig {
+                    supervisor_strategy: Some(parrot::thread::SupervisorStrategy::Resume),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let limit = override_limit.unwrap_or(1);
@@ -911,6 +1090,22 @@ async fn blocking_timer_disposal_does_not_block_shutdown_deadline() {
         tokio::time::timeout(Duration::from_secs(1), finished.notified())
             .await
             .unwrap();
+        // Payload disposal happens inside owned cleanup, before the monitor
+        // receives its completion. Wait for retirement, not a scheduling guess.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let registered = match &system {
+                    Backend::Actix(system) => system.get_actor(&actor.path()).await.is_some(),
+                    Backend::Thread(system) => system.get_actor_ref(&actor.path()).is_some(),
+                };
+                if !registered {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup must retire actor registration");
         system.shutdown().await;
     }
 }
@@ -931,7 +1126,15 @@ async fn thread_all_scheduler_modes_join_owned_timers() {
             ..Default::default()
         });
         let actor = system
-            .spawn_at(ThreadTimers, "/timers", None, Default::default())
+            .spawn_at(
+                ThreadTimers,
+                "/timers",
+                None,
+                parrot::thread::ThreadActorConfig {
+                    supervisor_strategy: Some(parrot::thread::SupervisorStrategy::Resume),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -946,5 +1149,226 @@ async fn thread_all_scheduler_modes_join_owned_timers() {
         actor.stop().await.unwrap();
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         system.shutdown_internal().await.unwrap();
+    }
+}
+
+struct DeliveryOwner<'a> {
+    future: BoxedFuture<'a, ActorResult<()>>,
+    panic_on_drop: bool,
+    drops: Arc<AtomicUsize>,
+}
+impl std::future::Future for DeliveryOwner<'_> {
+    type Output = ActorResult<()>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.future.as_mut().poll(cx)
+    }
+}
+impl Drop for DeliveryOwner<'_> {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.panic_on_drop,
+            "independent timer delivery destructor panic"
+        );
+    }
+}
+fn independent_schedule_panics(actix: bool, periodic: bool, name: &str) {
+    const FLAG: &str = "PARROT_NATIVE_SCHEDULE_PANICS";
+    if std::env::var(FLAG).as_deref() == Ok(name) {
+        ::actix::System::new().block_on(async {
+            let system = Backend::configured(actix, 1, Duration::from_secs(2)).await;
+            let actor = system.actor().await;
+            let sink = Sink {
+                panic_on_poll: true,
+                panic_on_delivery_drop: true,
+                ..Default::default()
+            };
+            let command = if periodic {
+                Schedule::Periodic(
+                    sink.clone_boxed(),
+                    Duration::ZERO,
+                    Duration::from_millis(10),
+                )
+            } else {
+                Schedule::Once(sink.clone_boxed(), Box::new(()), Duration::ZERO)
+            };
+            actor.send(Box::new(command)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while sink.delivery_drops.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("delivery storage not retired");
+            let replacement = Sink::default();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match actor
+                        .send(Box::new(Schedule::Once(
+                            replacement.clone_boxed(),
+                            Box::new(()),
+                            Duration::ZERO,
+                        )))
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(ActorError::InternalError(message))
+                            if message.contains("task limit") =>
+                        {
+                            tokio::task::yield_now().await
+                        }
+                        Err(error) => panic!("actor cannot accept replacement timer: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("task capacity not reused");
+            replacement.wait_for(1).await;
+            assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+            assert_eq!(sink.delivery_drops.load(Ordering::SeqCst), 1);
+            let first = tokio::time::timeout(Duration::from_secs(2), actor.stop())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                first.contains("timer delivery panic"),
+                "lost first failure: {first}"
+            );
+            let second = tokio::time::timeout(Duration::from_secs(2), actor.stop())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                first,
+                second.to_string(),
+                "every waiter must retain the timer's original failure after retirement"
+            );
+            assert!(!actor.is_alive().await);
+            system.shutdown().await;
+        });
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(FLAG, name)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "isolated native timer: {status}");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("native timer timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+#[test]
+fn thread_once_independent_schedule_panics() {
+    independent_schedule_panics(false, false, "thread_once_independent_schedule_panics");
+}
+#[test]
+fn thread_periodic_independent_schedule_panics() {
+    independent_schedule_panics(false, true, "thread_periodic_independent_schedule_panics");
+}
+#[test]
+fn actix_once_independent_schedule_panics() {
+    independent_schedule_panics(true, false, "actix_once_independent_schedule_panics");
+}
+#[test]
+fn actix_periodic_independent_schedule_panics() {
+    independent_schedule_panics(true, true, "actix_periodic_independent_schedule_panics");
+}
+
+#[actix::test]
+async fn actual_thread_and_actix_timers_record_admission_to_cleanup() {
+    use parrot_api::trace::{SpanKind, SpanStatus, TraceRecorder};
+    for actix in [false, true] {
+        for mode in 0..3 {
+            let system = Backend::new(actix).await;
+            let actor = system.actor().await;
+            let recorder = TraceRecorder::new(16).unwrap();
+            let root = recorder.root();
+            let sink = Sink::default();
+            let message = match mode {
+                0 => Schedule::Once(sink.clone_boxed(), Box::new(()), Duration::ZERO),
+                1 => Schedule::Once(sink.clone_boxed(), Box::new(()), Duration::from_secs(3600)),
+                _ => Schedule::Periodic(
+                    sink.clone_boxed(),
+                    Duration::from_secs(3600),
+                    Duration::from_secs(1),
+                ),
+            };
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                root.in_scope(|| actor.send(Box::new(message))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if mode == 0 {
+                sink.wait_for(1).await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !recorder
+                        .snapshot()
+                        .records
+                        .iter()
+                        .any(|r| r.kind == SpanKind::ManagedTask)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                assert_eq!(recorder.snapshot().counts.in_flight, 1);
+                assert_eq!(sink.delivered.load(Ordering::SeqCst), 0);
+            }
+            actor.stop().await.unwrap();
+            system.shutdown().await;
+            recorder.close();
+            let snapshot = recorder.drain();
+            assert!(snapshot.terminal);
+            assert_eq!(snapshot.records.len(), 2);
+            let handler = snapshot
+                .records
+                .iter()
+                .find(|r| r.kind == SpanKind::DynamicHandler)
+                .unwrap();
+            let task = snapshot
+                .records
+                .iter()
+                .find(|r| r.kind == SpanKind::ManagedTask)
+                .unwrap();
+            assert_eq!(handler.parent_span_id, Some(root.span_id()));
+            assert_eq!(task.parent_span_id, Some(handler.span_id));
+            assert_eq!(task.trace_id, root.trace_id());
+            assert_ne!(task.span_id, handler.span_id);
+            assert_eq!(
+                task.status,
+                if mode == 0 {
+                    SpanStatus::Ok
+                } else {
+                    SpanStatus::Cancelled
+                }
+            );
+            assert_eq!(
+                task.target,
+                if mode == 2 {
+                    "context.schedule.periodic"
+                } else {
+                    "context.schedule.once"
+                }
+            );
+            assert_eq!(sink.asked.load(Ordering::SeqCst), 0);
+        }
     }
 }

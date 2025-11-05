@@ -34,16 +34,19 @@ pub struct AbiStr {
 impl AbiStr {
     /// 从 Rust &str 构造（宿主侧——生命周期由调用方保证）。
     /// （命名 of_str——避免与 FromStr trait 混淆）
+    /// # Panics
+    /// Panics if the UTF-8 byte length cannot be represented by the ABI's u32.
     pub fn of_str(s: &str) -> Self {
         Self {
             ptr: s.as_ptr(),
-            len: s.len() as u32,
+            len: u32::try_from(s.len()).expect("ABI string length exceeds u32"),
         }
     }
 
     /// 读回 Rust &str（dylib 侧传入自身静态数据时安全）。
     /// # Safety
-    /// ptr 必须指向 len 字节有效内存。
+    /// `ptr` must be non-null and reference `len` initialized, valid UTF-8 bytes
+    /// for the returned lifetime. That memory must not be mutated while borrowed.
     pub unsafe fn as_str<'a>(&self) -> &'a str {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.ptr, self.len as usize))
     }
@@ -61,18 +64,22 @@ pub struct AbiMsg {
 
 impl AbiMsg {
     /// 从 Rust 视图构造（宿主侧）。
+    /// # Panics
+    /// Panics if either byte length cannot be represented by the ABI's u32.
     pub fn new(type_key: &str, payload: &[u8]) -> Self {
         Self {
             type_key: type_key.as_ptr(),
-            key_len: type_key.len() as u32,
+            key_len: u32::try_from(type_key.len()).expect("ABI message key length exceeds u32"),
             payload: payload.as_ptr(),
-            payload_len: payload.len() as u32,
+            payload_len: u32::try_from(payload.len())
+                .expect("ABI message payload length exceeds u32"),
         }
     }
 
     /// type_key 读回。
     /// # Safety
-    /// type_key 必须指向 key_len 字节有效内存。
+    /// `type_key` must be non-null and reference `key_len` initialized, valid
+    /// UTF-8 bytes for the returned lifetime, without mutation while borrowed.
     pub unsafe fn key<'a>(&self) -> &'a str {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(
             self.type_key,
@@ -82,7 +89,8 @@ impl AbiMsg {
 
     /// payload 读回。
     /// # Safety
-    /// payload 必须指向 payload_len 字节有效内存。
+    /// `payload` must be non-null and reference `payload_len` initialized bytes
+    /// for the returned lifetime, without mutation while borrowed.
     pub unsafe fn bytes<'a>(&self) -> &'a [u8] {
         std::slice::from_raw_parts(self.payload, self.payload_len as usize)
     }
@@ -99,17 +107,21 @@ pub struct AbiReplyBuf {
 
 impl AbiReplyBuf {
     /// 宿主侧构造（buf 生存期由调用方保证）。
+    /// # Panics
+    /// Panics if the capacity cannot be represented by the ABI's u32.
     pub fn new(buf: &mut [u8]) -> Self {
         Self {
             buf: buf.as_mut_ptr(),
-            cap: buf.len() as u32,
+            cap: u32::try_from(buf.len()).expect("ABI reply capacity exceeds u32"),
             written: 0,
         }
     }
 
     /// 组件侧写入回复（返回是否容纳）。
     /// # Safety
-    /// buf 必须指向 cap 字节可写内存。
+    /// `buf` must be non-null and valid for writes to `cap` bytes in one live
+    /// allocation and exclusively writable during the copy. The destination
+    /// range must not overlap `data`.
     pub unsafe fn write(&mut self, data: &[u8]) -> bool {
         if data.len() > self.cap as usize {
             return false;
@@ -121,7 +133,9 @@ impl AbiReplyBuf {
 
     /// 宿主侧读回已写段。
     /// # Safety
-    /// written ≤ cap 且 buf 有效。
+    /// `written` must not exceed `cap`. `buf` must be non-null and reference
+    /// `written` initialized bytes in one live allocation for the returned
+    /// lifetime, without mutation while borrowed.
     pub unsafe fn written_slice<'a>(&self) -> &'a [u8] {
         std::slice::from_raw_parts(self.buf, self.written as usize)
     }
@@ -133,6 +147,42 @@ pub struct AbiVt {
     pub handle_msg: unsafe extern "C" fn(self_: *mut (), msg: AbiMsg, out: *mut AbiReplyBuf) -> u32,
     pub on_drain: unsafe extern "C" fn(self_: *mut ()) -> u32,
 }
+
+/// Optional causal parent passed to a native message invocation. Identifiers
+/// have the same byte order as W3C trace/span IDs; neither may be all zero.
+/// This metadata is not authentication, sampling state or a completed span.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbiTraceParentV1 {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+}
+impl AbiTraceParentV1 {
+    pub fn is_valid(&self) -> bool {
+        self.trace_id != [0; 16] && self.span_id != [0; 8]
+    }
+}
+
+/// Optional extension exported as a static `PARROT_ABI_TRACE_V1`. The versioned
+/// symbol freezes this layout independently of ABI v1's metadata and vtable.
+/// Older hosts ignore it; hosts without this symbol use the original vtable.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AbiTraceV1 {
+    /// Replaces `AbiVt::handle_msg` for this call, with identical ownership,
+    /// exclusivity, return-code and non-unwinding obligations. `parent` is null
+    /// for an untraced call, otherwise a valid borrowed parent for this call
+    /// only. The guest must not retain the pointer or install ambient context
+    /// beyond the invocation. To record guest work, create a child of this ID.
+    pub handle_msg: unsafe extern "C" fn(
+        self_: *mut (),
+        msg: AbiMsg,
+        out: *mut AbiReplyBuf,
+        parent: *const AbiTraceParentV1,
+    ) -> u32,
+}
+
+pub const ABI_TRACE_V1_SYMBOL: &str = "PARROT_ABI_TRACE_V1";
 
 /// 组件实例（vt + 不透明自指针——宿主只透传 self_）。
 #[repr(C)]
@@ -162,7 +212,8 @@ pub struct AbiMeta {
 impl AbiMeta {
     /// name 读回（dylib 侧静态数据）。
     /// # Safety
-    /// name 必须指向 name_len 字节有效内存。
+    /// `name` must be non-null and reference `name_len` initialized, valid UTF-8
+    /// bytes for the returned lifetime, without mutation while borrowed.
     pub unsafe fn name_str<'a>(&self) -> &'a str {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(
             self.name,
@@ -184,7 +235,8 @@ pub mod loader;
 
 #[cfg(feature = "loader")]
 pub use loader::{
-    DylibHandle, DylibLoader, InFlightGuard, LoadError, UnloadError, UnloadReport, Violation,
+    DylibHandle, DylibLoader, InFlightGuard, LoadError, NativeArtifact, NativeArtifactLimits,
+    UnloadError, UnloadReport, Violation,
 };
 
 // ─────────────────────────────────────────────────────────────

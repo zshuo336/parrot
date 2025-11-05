@@ -1,0 +1,12 @@
+[package]
+name = "parrot-abi-hostcomp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "parrot_abi_hostcomp"
+crate-type = ["cdylib"]
+
+[dependencies]
+parrot-abi = { path = "../../../", default-features = false }
+toml = "0.8"

@@ -2,18 +2,22 @@
 //!
 //! - `DylibLoader::load`：dlopen + `PARROT_ABI_META` 符号 + abi_version 强
 //!   校验 + sha256 digest 校验 + **禁止清单扫描**（violation = 拒载）
-//! - `construct`：catch_unwind 双保险（dylib 侧 + 宿主侧）
+//! - `construct`：借用有效配置字符串；插件必须在自身内部捕获panic
 //! - `unload`：四步协议 Quarantine→Drain→Destroy→Dlclose
-//!   （in-flight 计数 + drain_timeout 兜底 → force dlclose 告警）
-//! - `scan_violations`：TLS 析构注册/线程创建/signal 安装（nm/otool 扫描）
+//!   （独立线程持有清理；超时/取消等待不会卸载仍在执行的代码）
+//! - `scan_violations`：直接解析ELF/Mach-O；扫描错误不得当作无违例
 
 use crate::{
-    AbiComponent, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, ABI_META_SYMBOL, ABI_OK, PARROT_ABI_VERSION,
+    AbiComponent, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, AbiTraceParentV1, AbiTraceV1,
+    ABI_META_SYMBOL, ABI_OK, ABI_TRACE_V1_SYMBOL, PARROT_ABI_VERSION,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod artifact;
+pub use artifact::NativeArtifact;
 
 /// 加载错误（拒载语义——禁止清单 violation 也走这里）。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -28,18 +32,112 @@ pub enum LoadError {
     ParrotMin { min: u32, host: u32 },
     #[error("sha256 mismatch: want {want}, got {got}")]
     Digest { want: String, got: String },
+    #[error("native artifact scan failed: {0}")]
+    Scan(String),
     #[error("forbidden-list violation: {0:?}")]
     Forbidden(Vec<Violation>),
     #[error("construct failed: code={code} ({detail})")]
     Construct { code: u32, detail: String },
     #[error("handle not found: {0}")]
     NoSuchHandle(String),
+    #[error("invalid native artifact limits: {0}")]
+    InvalidConfig(String),
+    #[error("native artifact resource limit: {0}")]
+    ResourceLimit(String),
+}
+
+/// File and static-analysis budgets, independent of native runtime allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeArtifactLimits {
+    /// Maximum artifact bytes read/hashed/scanned; default 64 MiB.
+    pub max_file_bytes: usize,
+    /// Maximum symbol entries visited across static and dynamic tables.
+    pub max_scan_symbols: usize,
+    /// Maximum sum of visited raw symbol-name lengths, including duplicates.
+    pub max_scan_name_bytes: usize,
+    /// Maximum object sections inspected.
+    pub max_scan_sections: usize,
+}
+impl Default for NativeArtifactLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 64 * 1024 * 1024,
+            max_scan_symbols: 262_144,
+            max_scan_name_bytes: 32 * 1024 * 1024,
+            max_scan_sections: 16_384,
+        }
+    }
+}
+impl NativeArtifactLimits {
+    fn validate(self) -> Result<(), LoadError> {
+        if self.max_file_bytes == 0 || self.max_file_bytes >= isize::MAX as usize {
+            return Err(LoadError::InvalidConfig("max_file_bytes must be positive and leave room for a detection byte within isize::MAX".into()));
+        }
+        if [
+            self.max_scan_symbols,
+            self.max_scan_name_bytes,
+            self.max_scan_sections,
+        ]
+        .iter()
+        .any(|&limit| limit == 0 || limit >= isize::MAX as usize)
+        {
+            return Err(LoadError::InvalidConfig(
+                "scan budgets must be positive and below isize::MAX".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn read(self, reader: impl std::io::Read) -> Result<Vec<u8>, LoadError> {
+        use std::io::Read;
+        self.validate()?;
+        let mut bytes = Vec::new();
+        reader
+            .take(self.max_file_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| LoadError::Open(format!("read: {e}")))?;
+        if bytes.len() > self.max_file_bytes {
+            return Err(self.exceeded());
+        }
+        Ok(bytes)
+    }
+    fn exceeded(self) -> LoadError {
+        LoadError::ResourceLimit(format!("artifact exceeds {} bytes", self.max_file_bytes))
+    }
+}
+
+fn read_artifact(path: &Path, limits: NativeArtifactLimits) -> Result<Vec<u8>, LoadError> {
+    limits.validate()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Opening a FIFO must not wait for a writer before we can reject its
+        // file type. Validate the opened descriptor, not a racy path stat.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| LoadError::Open(format!("open: {e}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| LoadError::Open(format!("metadata: {e}")))?;
+    if !metadata.is_file() {
+        return Err(LoadError::Open(
+            "expected a regular native artifact file".into(),
+        ));
+    }
+    if metadata.len() > limits.max_file_bytes as u64 {
+        return Err(limits.exceeded());
+    }
+    // The read bound also applies if the file grows after metadata inspection.
+    limits.read(file)
 }
 
 /// 禁止清单违例（09 §4.3：violation = 加载拒绝）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Violation {
-    /// TLS 析构注册（`__tls_dtor` / `tlv_atexit` 引用）。
+    /// 组件TLS存储（保守拒绝；静态符号不证明已经注册析构）。
     TlsDestructor { symbol: String },
     /// pthread_create 引用库内符号（自有线程持有组件函数指针）。
     ThreadSpawn { symbol: String },
@@ -62,17 +160,32 @@ impl std::fmt::Display for Violation {
 pub struct UnloadReport {
     /// 正常排空的实例数。
     pub drained: usize,
-    /// 超时中止的实例数（DRAIN_ABORTED 计数）。
+    /// Reserved for compatibility; native hooks cannot be safely aborted (always zero).
     pub aborted: usize,
-    /// 是否强制 dlclose（栅栏未归零——诚实边界：接受潜在 UB，告警）。
+    /// Always false: executing native code is never force-unmapped.
     pub force_closed: bool,
 }
 
 /// 卸载错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UnloadError {
-    #[error("instance registry not empty after destroy: {0} alive")]
+    #[error("refusing native cleanup: {0} instances have active calls; library retained")]
     InstancesAlive(usize),
+    #[error("native drain failed with codes {codes:?}; all instances destroyed: {report:?}")]
+    DrainFailed {
+        codes: Vec<u32>,
+        report: UnloadReport,
+    },
+    #[error("native cleanup deadline elapsed; owned cleanup continues in the background")]
+    TimedOut,
+    #[error("native cleanup timeout exceeds the monotonic clock range; cleanup continues")]
+    InvalidTimeout,
+    #[error("waiting for native cleanup requires a Tokio runtime with time enabled")]
+    NoRuntime,
+    #[error("could not start native cleanup worker: {0}")]
+    WorkerStart(String),
+    #[error("native cleanup worker exited without a result")]
+    WorkerLost,
 }
 
 /// 活跃实例登记（drain 计数与 destroy 追踪）。
@@ -80,6 +193,7 @@ pub enum UnloadError {
 struct InstanceRegistry {
     /// 存活实例（addr → in-flight 计数——Arc 便于句柄表共享递增）。
     alive: Mutex<std::collections::HashMap<usize, Arc<AtomicUsize>>>,
+    drained: Mutex<std::collections::HashMap<usize, u32>>,
 }
 
 /// 已加载 dylib 句柄（libloading::Library + 实例登记 + 状态机）。
@@ -87,16 +201,20 @@ pub struct DylibHandle {
     /// 库名（诊断）。
     pub name: String,
     path: PathBuf,
-    lib: libloading::Library,
+    lib: Option<libloading::Library>,
+    staged: Option<Arc<artifact::StagedFile>>,
     meta: *const AbiMeta,
+    trace_v1: Option<AbiTraceV1>,
     registry: Arc<InstanceRegistry>,
     /// Quarantine 后为 true（新消息拒绝进入）。
     quarantined: std::sync::atomic::AtomicBool,
-    /// dlclose 是否已执行（幂等保护）。
+    /// Cleanup has started (idempotence guard), not proof of completed dlclose.
     closed: std::sync::atomic::AtomicBool,
 }
 
-// Safety：AbiMeta 指向库内静态（库生存期 = self）；registry 纯同步原语。
+// Safety: load requires immutable metadata and thread-independent native hooks;
+// the library outlives all instances and every native call. Message exclusivity
+// remains the responsibility of the unsafe handle_msg caller.
 unsafe impl Send for DylibHandle {}
 unsafe impl Sync for DylibHandle {}
 
@@ -106,12 +224,17 @@ impl std::fmt::Debug for DylibHandle {
             .field("name", &self.name)
             .field("path", &self.path)
             .field("quarantined", &self.quarantined.load(Ordering::Relaxed))
-            .field("closed", &self.closed.load(Ordering::Relaxed))
+            .field("cleanup_started", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
 impl DylibHandle {
+    /// Whether this library accepts per-message causal parents. A false result
+    /// means messages use ABI v1 without guest-visible causal metadata.
+    pub fn supports_trace_v1(&self) -> bool {
+        self.trace_v1.is_some()
+    }
     /// 测试钩子：直接置/清 quarantine（状态机断言用）。
     #[doc(hidden)]
     pub fn set_quarantined(&self, v: bool) {
@@ -119,18 +242,107 @@ impl DylibHandle {
     }
 }
 
+impl DylibHandle {
+    /// Synchronous fallback shared by Drop and the owned unload worker.
+    fn cleanup(&mut self) -> Result<UnloadReport, UnloadError> {
+        self.quarantined.store(true, Ordering::Release);
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(UnloadReport::default());
+        }
+        let mut registry = self
+            .registry
+            .alive
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let busy = registry
+            .values()
+            .filter(|c| c.load(Ordering::Acquire) != 0)
+            .count();
+        if busy != 0 {
+            // Consuming ownership normally rules this out. If the invariant is
+            // violated, pin both code and instances; never destroy active state.
+            if let Some(lib) = self.lib.take() {
+                std::mem::forget(lib);
+            }
+            if let Some(staged) = self.staged.take() {
+                std::mem::forget(staged);
+            }
+            return Err(UnloadError::InstancesAlive(busy));
+        }
+        let instances: Vec<_> = registry.drain().map(|(addr, _)| addr).collect();
+        drop(registry);
+        let drained = std::mem::take(
+            &mut *self
+                .registry
+                .drained
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        let mut report = UnloadReport::default();
+        let mut codes = Vec::new();
+        // SAFETY: load's trust contract guarantees valid unique instances,
+        // non-unwinding hooks, and destroy validity even after a drain error.
+        unsafe {
+            for &addr in &instances {
+                let comp = addr as *mut AbiComponent;
+                let code = drained
+                    .get(&addr)
+                    .copied()
+                    .unwrap_or_else(|| ((*(*comp).vt).on_drain)((*comp).self_));
+                if code == ABI_OK {
+                    report.drained += 1;
+                } else {
+                    codes.push(code);
+                }
+            }
+            // Complete the drain phase before destroying any instance: another
+            // instance's drain hook may still need shared library-owned state.
+            for addr in instances {
+                ((*self.meta).hooks.destroy)(addr as *mut AbiComponent);
+            }
+        }
+        // Release this handle after destroying its instances. Finalizers invoked
+        // by this dlclose finish before it returns; the platform may retain the
+        // image for other handles or runtime state. This is not proof of unmapping.
+        drop(self.lib.take());
+        drop(self.staged.take());
+        if codes.is_empty() {
+            Ok(report)
+        } else {
+            Err(UnloadError::DrainFailed { codes, report })
+        }
+    }
+}
+
+impl Drop for DylibHandle {
+    fn drop(&mut self) {
+        // Drop cannot return drain failures. Call unload to observe them.
+        // Hooks may block: applications requiring a deadline must use unload.
+        let _ = self.cleanup();
+    }
+}
+
 /// in-flight 消息守卫（drop 归零——drain 栅栏数据源）。
 pub struct InFlightGuard {
-    registry: Arc<InstanceRegistry>,
-    addr: usize,
+    counter: Arc<AtomicUsize>,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        if let Some(c) = self.registry.alive.lock().unwrap().get(&self.addr) {
-            c.fetch_sub(1, Ordering::Release);
-        }
+        self.counter.fetch_sub(1, Ordering::Release);
     }
+}
+
+/// Defensively keep lookup and increment in the same registry critical section.
+/// Normal callers cannot race cleanup: it requires exclusive handle ownership,
+/// while native calls borrow that handle. If an internal invariant is violated,
+/// cleanup observes the active counter and permanently retains the native image
+/// instead of destroying active state.
+fn acquire_inflight(registry: &InstanceRegistry, addr: usize) -> Option<InFlightGuard> {
+    let entries = registry.alive.lock().unwrap();
+    let counter = entries.get(&addr).cloned()?;
+    counter.fetch_add(1, Ordering::AcqRel);
+    Some(InFlightGuard { counter })
 }
 
 /// dylib 加载器（宿主侧）。
@@ -142,13 +354,47 @@ impl DylibLoader {
     ///
     /// `digest`：`sha256:<hex64>` 或裸 hex64；空 = 跳过（测试便利——
     /// 生产路径 manifest 强制非空）。
-    pub fn load(path: &Path, digest: &str) -> Result<DylibHandle, LoadError> {
-        // 禁止清单扫描在 dlopen 之前（静态文件分析——拒载不带副作用）
-        let violations = Self::scan_violations(path);
+    /// # Safety
+    /// Loading runs native initializers before ABI validation. The caller must
+    /// trust this artifact and its dependencies, keep the path unchanged during
+    /// loading, and guarantee valid ABI metadata and hooks. Hooks must not unwind
+    /// across extern C, retain borrowed call buffers, or leave callbacks/threads
+    /// referencing the library after unload. Metadata must remain valid for the
+    /// library lifetime; constructors must return unique owned instances on
+    /// success and clean their allocations on failure. They must be
+    /// safe to call concurrently and from any host thread. All instances must
+    /// have valid vtables and support moving between host threads. Drain and
+    /// destroy run exclusively per instance, possibly on a cleanup worker;
+    /// destroy must remain valid after a non-OK drain. Hooks must not require
+    /// the loading thread or a Tokio runtime. If exported, `PARROT_ABI_TRACE_V1`
+    /// must be immutable valid `AbiTraceV1` data for the library lifetime, and
+    /// its message hook has all the same obligations as the original vtable.
+    /// Static scanning is
+    /// not a sandbox and a matching digest does not establish these guarantees.
+    ///
+    /// ```compile_fail
+    /// use parrot_abi::DylibLoader;
+    /// // Native code loading requires an explicit unsafe trust decision.
+    /// let _ = DylibLoader::load(std::path::Path::new("plugin.so"), "");
+    /// ```
+    pub unsafe fn load(path: &Path, digest: &str) -> Result<DylibHandle, LoadError> {
+        unsafe { Self::load_with_limits(path, digest, NativeArtifactLimits::default()) }
+    }
+
+    /// Load a trusted regular artifact with an explicit input byte budget.
+    /// The budget limits file reads, not mapped-library/dependency/native-heap size.
+    /// # Safety
+    /// All trust, path stability, ABI and hook obligations of [`Self::load`] apply.
+    pub unsafe fn load_with_limits(
+        path: &Path,
+        digest: &str,
+        limits: NativeArtifactLimits,
+    ) -> Result<DylibHandle, LoadError> {
+        let bytes = read_artifact(path, limits)?;
+        let violations = scan_bytes(&bytes, limits)?;
         if !violations.is_empty() {
             return Err(LoadError::Forbidden(violations));
         }
-        let bytes = std::fs::read(path).map_err(|e| LoadError::Open(format!("read: {e}")))?;
         if !digest.is_empty() {
             use sha2::{Digest, Sha256};
             let got = hex::encode(Sha256::digest(&bytes));
@@ -160,6 +406,13 @@ impl DylibLoader {
                 return Err(LoadError::Digest { want, got });
             }
         }
+        unsafe { Self::open(path, None) }
+    }
+
+    unsafe fn open(
+        path: &Path,
+        staged: Option<Arc<artifact::StagedFile>>,
+    ) -> Result<DylibHandle, LoadError> {
         unsafe {
             let lib = libloading::Library::new(path).map_err(|e| LoadError::Open(e.to_string()))?;
             let meta: libloading::Symbol<*const AbiMeta> = lib
@@ -179,11 +432,18 @@ impl DylibLoader {
                 });
             }
             let name = (*meta).name_str().to_string();
+            let trace_v1 = lib
+                .get::<*const AbiTraceV1>(ABI_TRACE_V1_SYMBOL.as_bytes())
+                .ok()
+                .filter(|extension| same_symbol_image(meta.cast(), (**extension).cast()))
+                .map(|extension| **extension);
             Ok(DylibHandle {
                 name,
                 path: path.to_path_buf(),
-                lib,
+                lib: Some(lib),
+                staged,
                 meta,
+                trace_v1,
                 registry: Arc::new(InstanceRegistry::default()),
                 quarantined: std::sync::atomic::AtomicBool::new(false),
                 closed: std::sync::atomic::AtomicBool::new(false),
@@ -191,8 +451,33 @@ impl DylibLoader {
         }
     }
 
-    /// construct（catch_unwind 双保险——dylib 侧已 catch，宿主再包一层）。
-    pub fn construct(&self, h: &DylibHandle, cfg: AbiStr) -> Result<*mut AbiComponent, LoadError> {
+    /// Construct using a borrowed configuration valid throughout the native call.
+    /// The trusted plugin must catch panics internally: unwinding through an
+    /// extern C boundary aborts before a host catch_unwind can recover it.
+    ///
+    /// ```compile_fail
+    /// use parrot_abi::{AbiStr, DylibHandle, DylibLoader};
+    /// fn forged_config(handle: &DylibHandle) {
+    ///     let raw = AbiStr { ptr: std::ptr::null(), len: 100 };
+    ///     let _ = DylibLoader.construct(handle, raw);
+    /// }
+    /// ```
+    pub fn construct(&self, h: &DylibHandle, cfg: &str) -> Result<*mut AbiComponent, LoadError> {
+        if h.quarantined.load(Ordering::Acquire) {
+            return Err(LoadError::Construct {
+                code: crate::ABI_ERR_STATE,
+                detail: "quarantined: no new instances".into(),
+            });
+        }
+        let len = u32::try_from(cfg.len()).map_err(|_| LoadError::Construct {
+            code: crate::ABI_ERR_OVERFLOW,
+            detail: "configuration exceeds ABI length limit".into(),
+        })?;
+        // Borrowed input remains alive until the synchronous native call returns.
+        let cfg = AbiStr {
+            ptr: cfg.as_ptr(),
+            len,
+        };
         unsafe {
             let out: *mut AbiComponent = std::ptr::null_mut();
             let mut out = out;
@@ -221,7 +506,12 @@ impl DylibLoader {
     /// 消息处理入口（in-flight 计数 + catch_unwind）。
     ///
     /// # Safety
-    /// comp 必须来自本 handle 的 construct 且未 destroy。
+    /// `comp` must be a live instance constructed by this handle. The caller
+    /// must ensure exclusive access to its state throughout this synchronous
+    /// call. Message pointers must remain readable for their stated lengths
+    /// (type_key is UTF-8); the output must point to exclusively writable
+    /// capacity bytes, disjoint from input/state, throughout the call. Native
+    /// code must honor these bounds and must not retain any borrowed buffers.
     pub unsafe fn handle_msg(
         &self,
         h: &DylibHandle,
@@ -229,26 +519,43 @@ impl DylibLoader {
         msg: AbiMsg,
         out: &mut AbiReplyBuf,
     ) -> Result<(), (u32, String)> {
+        self.handle_msg_with_trace(h, comp, msg, out, None)
+    }
+
+    /// Invoke the optional trace v1 message hook, or the original vtable when
+    /// unsupported. No process/thread-local context is inferred. A null parent
+    /// explicitly marks an untraced invocation, including legacy API calls.
+    /// Invalid all-zero IDs are rejected before invoking either hook.
+    ///
+    /// # Safety
+    /// All pointer, exclusivity and buffer requirements of [`Self::handle_msg`]
+    /// apply. The extension may borrow `parent` only until this call returns.
+    pub unsafe fn handle_msg_with_trace(
+        &self,
+        h: &DylibHandle,
+        comp: *mut AbiComponent,
+        msg: AbiMsg,
+        out: &mut AbiReplyBuf,
+        parent: Option<&AbiTraceParentV1>,
+    ) -> Result<(), (u32, String)> {
+        if parent.is_some_and(|parent| !parent.is_valid()) {
+            return Err((crate::ABI_ERR_STATE, "invalid trace parent".into()));
+        }
         if h.quarantined.load(Ordering::Acquire) {
             return Err((crate::ABI_ERR_STATE, "quarantined: no new messages".into()));
         }
-        // in-flight +1（登记在案才计——外来指针拒）
-        let counter = h
-            .registry
-            .alive
+        // Preserve atomic registry admission as a defensive invariant in
+        // addition to the shared-borrow/exclusive-ownership lifecycle boundary.
+        let _guard = acquire_inflight(&h.registry, comp as usize)
+            .ok_or((crate::ABI_ERR_STATE, "component not registered".into()))?;
+        if h.registry
+            .drained
             .lock()
             .unwrap()
-            .get(&(comp as usize))
-            .cloned();
-        let counter = match counter {
-            Some(c) => c,
-            None => return Err((crate::ABI_ERR_STATE, "component not registered".into())),
-        };
-        let _guard = InFlightGuard {
-            registry: h.registry.clone(),
-            addr: comp as usize,
-        };
-        counter.fetch_add(1, Ordering::AcqRel);
+            .contains_key(&(comp as usize))
+        {
+            return Err((crate::ABI_ERR_STATE, "component is drained".into()));
+        }
         let vt = (*comp).vt;
         if vt.is_null() || (*comp).self_.is_null() {
             return Err((crate::ABI_ERR_STATE, "null vtable or self".into()));
@@ -256,7 +563,16 @@ impl DylibLoader {
         let f = (*vt).handle_msg;
         let self_ = (*comp).self_;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f(self_, msg, out as *mut AbiReplyBuf)
+            if let Some(extension) = h.trace_v1 {
+                (extension.handle_msg)(
+                    self_,
+                    msg,
+                    out as *mut AbiReplyBuf,
+                    parent.map_or(std::ptr::null(), std::ptr::from_ref),
+                )
+            } else {
+                f(self_, msg, out as *mut AbiReplyBuf)
+            }
         }));
         match r {
             Ok(code) if code == ABI_OK => Ok(()),
@@ -265,144 +581,382 @@ impl DylibLoader {
         }
     }
 
-    /// 四步卸载（09 §4.3 ②）：Quarantine→Drain→Destroy→Dlclose。
+    /// Close an instance to business calls and run its drain hook once. Repeated
+    /// calls return the original code, including failure. Later unload destroys
+    /// it without repeating the hook; sibling instances remain usable.
     ///
-    /// `drain_timeout`：in-flight 归零等待上限；超时实例计入 aborted，
-    /// destroy 后仍不归零 → force_closed=true（诚实边界：接受潜在 UB，
-    /// 调用方告警 + digest 审计兜底）。
-    pub async fn unload(
+    /// # Safety
+    /// `comp` must be live and constructed by `h`. The caller must ensure
+    /// exclusive access to that instance across message and drain calls. All
+    /// native trust obligations of [`Self::load`] continue to apply.
+    pub unsafe fn drain_instance(
         &self,
-        h: DylibHandle,
-        drain_timeout: Duration,
-    ) -> Result<UnloadReport, UnloadError> {
-        // 1. Quarantine：新消息拒绝
-        h.quarantined.store(true, Ordering::Release);
-        // 2. Drain：等 in-flight 归零（每实例上限 timeout——总量 2× 防级联）
-        let deadline = Instant::now() + drain_timeout + drain_timeout;
-        let mut report = UnloadReport::default();
-        loop {
-            let busy = h
-                .registry
-                .alive
-                .lock()
-                .unwrap()
-                .values()
-                .map(|c| c.load(Ordering::Acquire))
-                .filter(|&n| n > 0)
-                .count();
-            if busy == 0 {
-                break;
+        h: &DylibHandle,
+        comp: *mut AbiComponent,
+    ) -> Result<(), (u32, String)> {
+        let addr = comp as usize;
+        let _guard = acquire_inflight(&h.registry, addr)
+            .ok_or((crate::ABI_ERR_STATE, "component not registered".into()))?;
+        let cached = h.registry.drained.lock().unwrap().get(&addr).copied();
+        let code = match cached {
+            Some(code) => code,
+            None => {
+                let code = unsafe { ((*(*comp).vt).on_drain)((*comp).self_) };
+                h.registry.drained.lock().unwrap().insert(addr, code);
+                code
             }
-            if Instant::now() >= deadline {
-                report.aborted = busy;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        if code == ABI_OK {
+            Ok(())
+        } else {
+            Err((code, format!("on_drain code={code}")))
         }
-        // 3. Destroy：逐实例 destroy + 摘登记
-        unsafe {
-            let destroy_fn = (*h.meta).hooks.destroy;
-            let keys: Vec<usize> = h.registry.alive.lock().unwrap().keys().copied().collect();
-            for k in keys.iter().copied() {
-                let c = h.registry.alive.lock().unwrap().remove(&k);
-                if c.is_some() {
-                    let comp = k as *mut AbiComponent;
-                    if !comp.is_null() {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            destroy_fn(comp)
-                        }));
-                    }
+    }
+
+    /// Quarantine, call each on_drain, destroy each instance, then close the library.
+    /// This synchronous variant is intended for an already owned native worker.
+    /// It can block indefinitely in trusted native code.
+    pub fn unload_blocking(&self, mut h: DylibHandle) -> Result<UnloadReport, UnloadError> {
+        h.cleanup()
+    }
+
+    /// Quarantine, call each on_drain, destroy each instance, then close the library.
+    ///
+    /// Cleanup starts on an owned OS thread immediately, even if the returned
+    /// future is never polled. Dropping it or reaching the deadline only stops
+    /// waiting; cleanup retains the library until native calls have returned.
+    /// A stuck native hook therefore retains its worker and resources. Use a
+    /// process boundary when hard termination of untrusted code is required.
+    ///
+    /// The deadline covers the entire cleanup, starting at this call. Await
+    /// inside a Tokio runtime **with time enabled**. A handle dropped directly
+    /// instead runs the same cleanup synchronously, without a runtime.
+    ///
+    /// Ownership prevents unloading while a native caller still borrows the handle:
+    ///
+    /// ```compile_fail,E0505
+    /// use parrot_abi::{DylibHandle, DylibLoader};
+    /// fn unload_during_borrow(handle: DylibHandle) {
+    ///     let borrowed = &handle;
+    ///     let _cleanup = DylibLoader.unload(handle, std::time::Duration::from_secs(1));
+    ///     let _ = DylibLoader.construct(borrowed, "{}");
+    /// }
+    /// ```
+    pub fn unload(
+        &self,
+        mut h: DylibHandle,
+        drain_timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<UnloadReport, UnloadError>> + Send + 'static {
+        h.quarantined.store(true, Ordering::Release);
+        let deadline = Instant::now().checked_add(drain_timeout);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let worker = std::thread::Builder::new()
+            .name("parrot-native-cleanup".into())
+            .spawn(move || {
+                let result = h.cleanup();
+                let _ = sender.send(result);
+            });
+        async move {
+            // If spawning failed, dropping the closure already ran RAII cleanup.
+            let _worker = worker.map_err(|e| UnloadError::WorkerStart(e.to_string()))?;
+            let deadline = deadline.ok_or(UnloadError::InvalidTimeout)?;
+            tokio::runtime::Handle::try_current().map_err(|_| UnloadError::NoRuntime)?;
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), receiver).await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(UnloadError::WorkerLost),
+                Err(_) => Err(UnloadError::TimedOut),
+            }
+        }
+    }
+
+    /// Inspect ELF/Mach-O symbols without executing code or spawning `nm`.
+    /// A missing, malformed, unsupported or insufficiently inspectable artifact
+    /// is an error, never a clean result. This conservative diagnostic rejects
+    /// component TLS storage; it cannot prove whether a destructor is registered.
+    /// Rust std's own named TLS is exempt. Native code still requires trust.
+    pub fn scan_violations(path: &Path) -> Result<Vec<Violation>, LoadError> {
+        Self::scan_violations_with_limits(path, NativeArtifactLimits::default())
+    }
+
+    /// Scan a regular file using an explicit input byte budget.
+    pub fn scan_violations_with_limits(
+        path: &Path,
+        limits: NativeArtifactLimits,
+    ) -> Result<Vec<Violation>, LoadError> {
+        let bytes = read_artifact(path, limits).map_err(|e| match e {
+            LoadError::Open(message) => LoadError::Scan(message),
+            other => other,
+        })?;
+        scan_bytes(&bytes, limits)
+    }
+}
+
+// Ordering preserves the public diagnostic order without allocating sort keys.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ViolationKind {
+    Signal,
+    Thread,
+    Tls,
+}
+
+// Unix dlsym also searches dependencies. Only the component that owns the ABI
+// metadata can opt in; the hook's code may intentionally live in a dependency.
+#[cfg(unix)]
+unsafe fn same_symbol_image(first: *const (), second: *const ()) -> bool {
+    let mut first_info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    let mut second_info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    if libc::dladdr(first.cast(), first_info.as_mut_ptr()) == 0
+        || libc::dladdr(second.cast(), second_info.as_mut_ptr()) == 0
+    {
+        return false;
+    }
+    let first_base = first_info.assume_init().dli_fbase;
+    !first_base.is_null() && first_base == second_info.assume_init().dli_fbase
+}
+
+// Windows GetProcAddress resolves exports from the specified module only.
+#[cfg(not(unix))]
+unsafe fn same_symbol_image(_first: *const (), _second: *const ()) -> bool {
+    true
+}
+
+fn is_std_tls(name: &str) -> bool {
+    use std::fmt::Write;
+    struct Prefix {
+        bytes: [u8; 6],
+        used: usize,
+    }
+    impl std::fmt::Write for Prefix {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let n = (6 - self.used).min(text.len());
+            self.bytes[self.used..self.used + n].copy_from_slice(&text.as_bytes()[..n]);
+            self.used += n;
+            if self.used == 6 {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut prefix = Prefix {
+        bytes: [0; 6],
+        used: 0,
+    };
+    // Deliberately stop formatting after six bytes. No expanded owned string
+    // is needed merely to recognize std's root path. rustc-demangle validates
+    // v0 backrefs without expanding their targets before formatting.
+    let _ = write!(
+        &mut prefix,
+        "{:#}",
+        rustc_demangle::demangle(name.strip_suffix("$tlv$init").unwrap_or(name))
+    );
+    prefix.bytes[..5] == *b"std::" || prefix.bytes == *b"<std::"
+}
+
+fn scan_bytes(bytes: &[u8], limits: NativeArtifactLimits) -> Result<Vec<Violation>, LoadError> {
+    use object::{Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
+    let file = object::File::parse(bytes).map_err(|error| LoadError::Scan(error.to_string()))?;
+    let mut violations = std::collections::BTreeSet::new();
+    let mut tls_symbols = std::collections::HashSet::new();
+    let mut tls_sections = std::collections::HashSet::new();
+    for (index, section) in file.sections().enumerate() {
+        if index >= limits.max_scan_sections {
+            return Err(LoadError::ResourceLimit(
+                "section analysis budget exhausted".into(),
+            ));
+        }
+        if section.size() > 0
+            && matches!(
+                section.kind(),
+                SectionKind::Tls | SectionKind::UninitializedTls | SectionKind::TlsVariables
+            )
+        {
+            tls_sections.insert(section.index());
+        }
+    }
+    let mut name_bytes_left = limits.max_scan_name_bytes;
+    for (index, symbol) in file.symbols().chain(file.dynamic_symbols()).enumerate() {
+        if index >= limits.max_scan_symbols {
+            return Err(LoadError::ResourceLimit(
+                "symbol analysis budget exhausted".into(),
+            ));
+        }
+        let name = symbol
+            .name()
+            .map_err(|error| LoadError::Scan(error.to_string()))?;
+        name_bytes_left = name_bytes_left.checked_sub(name.len()).ok_or_else(|| {
+            LoadError::ResourceLimit("symbol-name analysis budget exhausted".into())
+        })?;
+        if name.is_empty() {
+            continue;
+        }
+        // ELF symbol version suffixes and Mach-O's C underscore are decoration.
+        let base = name.split('@').next().unwrap_or(name);
+        let base = if file.format() == object::BinaryFormat::MachO {
+            base.strip_prefix('_').unwrap_or(base)
+        } else {
+            base
+        };
+        if symbol.is_undefined() {
+            let violation = match base {
+                "pthread_create" => Some(ViolationKind::Thread),
+                "signal" | "sigaction" | "sigsetjmp" | "__sigsetjmp" => Some(ViolationKind::Signal),
+                _ => None,
+            };
+            if let Some(violation) = violation {
+                violations.insert((violation, name));
+            }
+        } else {
+            let section_tls = symbol
+                .section_index()
+                .map(|index| {
+                    file.section_by_index(index).map(|section| {
+                        matches!(
+                            section.kind(),
+                            SectionKind::Tls
+                                | SectionKind::UninitializedTls
+                                | SectionKind::TlsVariables
+                        )
+                    })
+                })
+                .transpose()
+                .map_err(|error| LoadError::Scan(error.to_string()))?
+                .unwrap_or(false);
+            // ELF section/mapping labels (e.g. AArch64 $d) are not variables.
+            // The zero-sized TLS module base denotes the whole TLS block, not
+            // an additional user-owned TLS allocation.
+            let storage = matches!(symbol.kind(), SymbolKind::Data | SymbolKind::Tls)
+                && !(symbol.size() == 0
+                    && (name == "_TLS_MODULE_BASE_"
+                        || (matches!(
+                            file.architecture(),
+                            object::Architecture::Aarch64 | object::Architecture::Arm
+                        ) && (name == "$d" || name.starts_with("$d.")))));
+            if storage
+                && (symbol.kind() == SymbolKind::Tls || section_tls || name.contains("$tlv$init"))
+            {
+                if let Some(index) = symbol.section_index() {
+                    tls_symbols.insert(index);
+                }
+                if !is_std_tls(name) {
+                    // Borrow names while scanning; copy only distinct findings
+                    // after all budgets and parse checks have succeeded.
+                    violations.insert((ViolationKind::Tls, name));
                 }
             }
-            report.drained = keys.len().saturating_sub(report.aborted);
         }
-        // 栅栏复查（destroy 后仍 busy = 违反清单泄漏——force）
-        let still = h
-            .registry
+    }
+    // A stripped TLS section cannot be classified as runtime-owned. Fail closed
+    // instead of treating the absence of local symbol names as proof of safety.
+    if !tls_sections.is_subset(&tls_symbols) {
+        return Err(LoadError::Scan(
+            "TLS storage has no inspectable owner symbols".into(),
+        ));
+    }
+    Ok(violations
+        .into_iter()
+        .map(|(kind, name)| match kind {
+            ViolationKind::Signal => Violation::SignalHandler {
+                symbol: name.into(),
+            },
+            ViolationKind::Thread => Violation::ThreadSpawn {
+                symbol: name.into(),
+            },
+            ViolationKind::Tls => Violation::TlsDestructor {
+                symbol: name.into(),
+            },
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod artifact_read_tests {
+    use super::*;
+    #[test]
+    fn bounded_read_handles_growth_without_consuming_the_rest() {
+        struct Infinite {
+            read: usize,
+        }
+        impl std::io::Read for Infinite {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0);
+                self.read += buf.len();
+                Ok(buf.len())
+            }
+        }
+        for max_file_bytes in [1, 2, 31, 4096] {
+            let limits = NativeArtifactLimits {
+                max_file_bytes,
+                ..Default::default()
+            };
+            let mut source = Infinite { read: 0 };
+            assert!(matches!(
+                limits.read(&mut source),
+                Err(LoadError::ResourceLimit(_))
+            ));
+            assert_eq!(source.read, max_file_bytes + 1);
+            let exact = vec![42; max_file_bytes];
+            assert_eq!(limits.read(exact.as_slice()).unwrap(), exact);
+        }
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::*;
+
+    #[test]
+    fn standard_library_method_tls_is_distinguished_from_component_tls() {
+        let symbol = "__RNvNCNKNvNvMNtNtCs82bWklYMk3w_3std4hash6randomNtBa_11RandomState3new4KEYS0s_023___RUST_STD_INTERNAL_VAL";
+        assert!(is_std_tls(symbol), "{:#}", rustc_demangle::demangle(symbol));
+        assert!(is_std_tls(&format!("{symbol}$tlv$init")));
+        for name in [
+            "guest::std::TLS",
+            "<guest::Foo as std::Trait>::TLS",
+            "std_like::TLS",
+            "<std_like::Foo>::TLS",
+        ] {
+            assert!(!is_std_tls(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn cleanup_observes_an_admitted_call_before_draining() {
+        let registry = InstanceRegistry::default();
+        let addr = 7usize;
+        registry
             .alive
             .lock()
             .unwrap()
-            .values()
-            .map(|c| c.load(Ordering::Acquire))
-            .filter(|&n| n > 0)
-            .count();
-        if still > 0 {
-            report.force_closed = true;
-        }
-        // 4. Dlclose（幂等）
-        if !h.closed.swap(true, Ordering::AcqRel) {
-            // drop(h.lib) 即 dlclose——显式 drop 强调时序
-            drop(h.lib);
-        }
-        let _ = h.path; // 诊断字段保留
-        Ok(report)
+            .insert(addr, Arc::new(AtomicUsize::new(0)));
+        let guard = acquire_inflight(&registry, addr).expect("registered instance");
+        let entries = registry.alive.lock().unwrap();
+        assert_eq!(entries.get(&addr).unwrap().load(Ordering::Acquire), 1);
+        drop(entries);
+        drop(guard);
+        assert_eq!(
+            registry
+                .alive
+                .lock()
+                .unwrap()
+                .get(&addr)
+                .unwrap()
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
-    /// 禁止清单扫描（静态文件分析——不执行库代码）。
-    ///
-    /// 09 §4.3：不注册 TLS 析构 / 不 spawn 自有线程 / 不 install signal。
-    ///
-    /// 实现口径（施工裁定 BD-3，macOS/Linux 双平台）：
-    /// - **TLS**：扫描 **库自身定义** 的 TLS 变量（macOS：`nm` 定义表中
-    ///   `$tlv$init` 符号；Linux：`__thread_vars`/TLS section）。std 自身
-    ///   的 TLS（`std::thread::current` 等）**豁免**——那是 Rust 运行时
-    ///   固有形态，非库自身注册；符号 mangled 名含 crate 哈希区分。
-    /// - **线程**：未定义符号表含 `pthread_create` 引用即违例
-    ///   （std 正常路径不引用——仅显式 spawn 才有）。
-    /// - **signal**：未定义 `signal`/`sigaction`/`sigsetjmp`（精确匹配）。
-    ///
-    /// 工具缺失（无 nm）→ 返回空（诚实边界：扫描失败 ≠ 无违例——
-    /// load 侧 digest + 运行时 drain 栅栏双保险兜底）。
-    pub fn scan_violations(path: &Path) -> Vec<Violation> {
-        let mut v = Vec::new();
-        // ── 1) 未定义符号（线程/signal）──
-        if let Ok(o) = std::process::Command::new("nm")
-            .arg("-u")
-            .arg(path)
-            .output()
-        {
-            if o.status.success() {
-                for line in String::from_utf8_lossy(&o.stdout).lines() {
-                    let sym = line.trim();
-                    if sym == "pthread_create" || sym == "_pthread_create" {
-                        v.push(Violation::ThreadSpawn {
-                            symbol: sym.to_string(),
-                        });
-                    } else if sym == "signal"
-                        || sym == "_signal"
-                        || sym == "sigaction"
-                        || sym == "_sigaction"
-                        || sym == "sigsetjmp"
-                        || sym == "_sigsetjmp"
-                    {
-                        v.push(Violation::SignalHandler {
-                            symbol: sym.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-        // ── 2) 库自身 TLS 变量（macOS $tlv$init；Linux TLS section 符号）──
-        if let Ok(o) = std::process::Command::new("nm").arg(path).output() {
-            if o.status.success() {
-                for line in String::from_utf8_lossy(&o.stdout).lines() {
-                    // 形态：addr t _<mangled>$tlv$init（定义表）
-                    if let Some(idx) = line.find("$tlv$init") {
-                        let sym = line[..idx].split_whitespace().last().unwrap_or("");
-                        // std 的 TLS mangled 名含 crate 哈希 NtNt...Cs<hash>_3std
-                        // ——库自身 crate 名不含。粗判：包含 "3std"（Rust
-                        // mangling：crate 名长度前缀）即 std 豁免。
-                        let owner_std = sym.contains("Cs") && sym.contains("3std");
-                        if !owner_std && !sym.is_empty() {
-                            v.push(Violation::TlsDestructor {
-                                symbol: sym.trim_start_matches('_').to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        v.dedup();
-        v
+    #[test]
+    fn cleanup_removal_wins_before_a_late_admission() {
+        let registry = InstanceRegistry::default();
+        let addr = 9usize;
+        registry
+            .alive
+            .lock()
+            .unwrap()
+            .insert(addr, Arc::new(AtomicUsize::new(0)));
+        registry.alive.lock().unwrap().remove(&addr);
+        assert!(acquire_inflight(&registry, addr).is_none());
     }
 }

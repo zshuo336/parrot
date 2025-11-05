@@ -59,6 +59,9 @@ struct TellRemote {
 }
 
 struct GetSeen;
+impl Message for GetSeen {
+    type Result = Vec<u64>;
+}
 
 // ===========================================================================
 // thread 引擎侧 actor
@@ -104,11 +107,13 @@ impl Actor for ThreadSide {
                 self.seen.lock().unwrap().push(pong.echo);
                 Ok(Box::new(pong.echo) as BoxedMessage)
             } else if let Some(t) = m.downcast_ref::<TellRemote>() {
-                // X4：tell 远端（不等待）
-                t.remote.tell(Ping {
-                    hop: 98,
-                    payload: t.value,
-                });
+                // X4：等待远端邮箱准入，不等待业务响应
+                t.remote
+                    .tell(Ping {
+                        hop: 98,
+                        payload: t.value,
+                    })
+                    .await?;
                 Ok(Box::new(()) as BoxedMessage)
             } else if m.downcast_ref::<GetSeen>().is_some() {
                 let snapshot = self.seen.lock().unwrap().clone();
@@ -209,6 +214,10 @@ impl parrot_api::actor::ActixEngineExt for ActixSide {
                 hop: p.hop,
                 echo: p.payload,
             }) as BoxedMessage))
+        } else if m.downcast_ref::<GetSeen>().is_some() {
+            Some(Ok(
+                Box::new(self.seen.lock().unwrap().clone()) as BoxedMessage
+            ))
         } else if m.downcast_ref::<OnlyActix>().is_some() {
             Some(Ok(Box::new(42u64) as BoxedMessage))
         } else {
@@ -245,11 +254,9 @@ fn cross_engine_poc() {
             Box::new(typed)
         };
         let a_ref: BoxedActorRef = {
-            use futures::FutureExt;
             asys
-                .spawn_root_typed(ActixSide { seen: Default::default() }, EmptyConfig)
-                .now_or_never()
-                .expect("spawn ready")
+                .spawn_root_typed_with_strategy(ActixSide { seen: Default::default() }, EmptyConfig, parrot_api::supervisor::SupervisorStrategyType::Default(parrot_api::supervisor::DefaultStrategy::ResumeOnFailure))
+                .await
                 .expect("spawn ok")
         };
 
@@ -275,11 +282,11 @@ fn cross_engine_poc() {
         assert_eq!(nested, 21u64, "嵌套跨引擎 ask 的业务值穿透正确");
 
         // X4：thread handler 内 tell actix（不等待）
-        t_ref.tell(TellRemote { remote: a_ref.clone_boxed(), value: 31 });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // actix 侧应收到（无法直接查询 actix 内部状态，改为向其 ask 验证活性 + 消息队列已处理）
-        let alive_probe = a_ref.ask(Ping { hop: 4, payload: 41 }).await;
-        assert!(alive_probe.is_ok(), "actix 侧在 tell 后仍可响应");
+        t_ref.tell(TellRemote { remote: a_ref.clone_boxed(), value: 31 }).await.unwrap();
+        // The first barrier waits for the sender actor to finish forwarding;
+        // the second reads actual receiver state, not unrelated liveness.
+        t_ref.ask(GetSeen).await.unwrap();
+        assert_eq!(a_ref.ask(GetSeen).await.unwrap(), vec![11, 21, 31]);
 
         // X5：跨引擎消息类型不匹配 → 类型化业务错误（B6 契约）
         let wrong = a_ref.send(Box::new("nonsense".to_string()) as BoxedMessage).await;
@@ -314,5 +321,111 @@ fn cross_engine_poc() {
 
         let _ = ts.shutdown_internal().await;
         let _ = parrot.internal_shutdown().await;
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thread_tell_fifo_across_boxed_clones() {
+    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    let actor = ts
+        .spawn_at::<ThreadSide>(
+            ThreadSide {
+                remote: None,
+                seen: Default::default(),
+            },
+            "/tell-fifo",
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    use parrot_api::address::ActorRef;
+    let other = actor.clone_boxed();
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        for value in 0..20_000 {
+            let target: &dyn ActorRef = if value % 2 == 0 { &actor } else { &*other };
+            target
+                .tell(Ping {
+                    hop: 0,
+                    payload: value,
+                })
+                .await
+                .unwrap();
+        }
+        ActorRefExt::ask(&actor, GetSeen).await.unwrap()
+    })
+    .await;
+    ts.shutdown_internal().await.unwrap();
+    assert_eq!(result.unwrap(), (0..20_000).collect::<Vec<_>>());
+    assert!(
+        actor
+            .tell(Ping {
+                hop: 0,
+                payload: 20_001
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn actix_tell_fifo_across_boxed_clones() {
+    actix::System::new().block_on(async {
+        const WINDOW: u64 = 16;
+        let system = parrot::actix::system::ActixActorSystem::with_settings(
+            parrot::actix::ActixSystemSettings {
+                mailbox_capacity: 32,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let actor = system
+            .spawn_root_typed_with_strategy(
+                ActixSide {
+                    seen: Default::default(),
+                },
+                EmptyConfig,
+                parrot_api::supervisor::SupervisorStrategyType::Default(
+                    parrot_api::supervisor::DefaultStrategy::ResumeOnFailure,
+                ),
+            )
+            .await
+            .unwrap();
+        let other = actor.clone_boxed();
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            for value in 0..2_000 {
+                let target = if value % 2 == 0 { &actor } else { &other };
+                target
+                    .tell(Ping {
+                        hop: 0,
+                        payload: value,
+                    })
+                    .await
+                    .unwrap();
+                // tell reports admission, not processing. A local yield does
+                // not guarantee progress on the other arbiter. Keep each burst
+                // below the configured capacity and await a real FIFO barrier.
+                if (value + 1) % WINDOW == 0 {
+                    assert_eq!(
+                        actor.ask(GetSeen).await.unwrap(),
+                        (0..=value).collect::<Vec<_>>()
+                    );
+                }
+            }
+            actor.ask(GetSeen).await.unwrap()
+        })
+        .await;
+        system.shutdown().await.unwrap();
+        assert_eq!(result.unwrap(), (0..2_000).collect::<Vec<_>>());
+        assert!(
+            actor
+                .tell(Ping {
+                    hop: 0,
+                    payload: 2_001
+                })
+                .await
+                .is_err()
+        );
     });
 }

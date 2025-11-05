@@ -72,19 +72,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_broadcast_drop_push_works() {
         // Sanity check that the shared-pool mailbox handles DropNewest under
-        // load without error (basic liveness of the queue path).
+        // load, reporting exactly which messages were rejected.
         let path = parrot_api::address::ActorPath::placeholder("test/drop");
         let mailbox = MpscMailbox::new(2, path);
 
         for i in 0..10 {
             let msg: BoxedMessage = Box::new(i);
-            mailbox
+            let result = mailbox
                 .push(
                     msg,
                     parrot::thread::config::BackpressureStrategy::DropNewest,
                 )
-                .await
-                .unwrap();
+                .await;
+            if i < 2 {
+                result.unwrap();
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(parrot::thread::error::MailboxError::Dropped { capacity: 2 })
+                ));
+            }
         }
 
         // Capacity bounded

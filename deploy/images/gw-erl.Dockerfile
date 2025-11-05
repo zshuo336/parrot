@@ -21,8 +21,8 @@ FROM ${REGISTRY_PREFIX}erlang:27-slim
 
 WORKDIR /gw
 # 框架网关宿主（协议层——单一真源，随框架升级）
-COPY interop/erlang/parrot_gw.erl .
-RUN erlc parrot_gw.erl
+COPY interop/erlang/parrot_gw.erl interop/erlang/parrot_trace.erl interop/erlang/parrot_component_runtime.erl interop/erlang/parrot_beam_snapshot.erl interop/erlang/parrot_beam_guest.erl interop/erlang/parrot_beam_host.erl ./
+RUN erlc parrot_trace.erl parrot_gw.erl parrot_component_runtime.erl parrot_beam_snapshot.erl parrot_beam_guest.erl parrot_beam_host.erl
 
 # app beam 只读挂载点（deploy uri: file:///app/erlang）
 RUN mkdir -p /app/erlang

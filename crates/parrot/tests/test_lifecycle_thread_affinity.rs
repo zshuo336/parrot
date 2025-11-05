@@ -25,6 +25,11 @@ impl AffinityActor {
             .push((event, std::thread::current().id()));
     }
 }
+impl Drop for AffinityActor {
+    fn drop(&mut self) {
+        self.record("actor dropped");
+    }
+}
 impl Actor for AffinityActor {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
@@ -105,6 +110,7 @@ async fn check(mode: SchedulingMode, whole_system: bool, inherited_mode: bool) {
             "stop construction",
             "stop poll",
             "stop resumed",
+            "actor dropped",
         ]
     );
     let owner = events[0].1;

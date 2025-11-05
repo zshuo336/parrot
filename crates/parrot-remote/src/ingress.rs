@@ -1,20 +1,26 @@
 //! 职责：入站帧分发——ASK/TELL/STOP → 本地 actor；REPLY → 回调表（05 §6.1）。
 //!
-//! I2（06）：入站 ASK 并发化——每帧 spawn 独立任务处理（慢 actor 不再
+//! I2（06）：入站 ASK 在系统级容量/编码长度预算内并发处理（慢 actor 不再
 //! 阻塞同连接的后续帧；REPLY 乱序经 cid 配对天然支持）。TELL 保持串行
 //! deliver（05 §6.3 背压贯通语义——对端过载时读循环挂起是有意行为）。
 //! 本地解析经 LocalLookup trait 倒置（parrot-remote 不依赖 parrot crate，
 //! E5.2 分层铁律）。
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::codec_registry::CodecRegistry;
+use crate::durable::timing::{Phase, TARGET};
 use crate::error::{decode_err_payload, ErrCode};
 use crate::frame::{frame_type, Frame};
 use crate::node::NodeState;
 use crate::registry::{CallbackRegistry, ReplyPayload};
 use crate::transport::FrameSender;
+use tracing::Instrument;
+
+pub(crate) mod unwind;
+use unwind::Cleanup;
 
 /// TELL 重排：迟到帧（缺口超时放行后到达）丢弃计数。
 pub static LATE_TELL_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -22,7 +28,7 @@ pub static LATE_TELL_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub static REORDER_GAP_FLUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// TELL 重排：实际缓冲过的帧数（乱序真正发生才 >0——切换点观测指标）。
 pub static REORDER_BUFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// TELL 重排：系统关闭时 Ingress 已亡、缓冲帧无法投递的计数（观测点）。
+/// TELL 重排：关闭时尚在接收队列或重排缓冲区、未投递的帧数。
 pub static REORDER_DROPPED_ON_SHUTDOWN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// TELL 重排：重排任务空闲自清次数（idle GC——防任务累积）。
@@ -34,6 +40,51 @@ pub static REORDER_TASK_RECYCLED: std::sync::atomic::AtomicU64 =
 pub trait LocalLookup: Send + Sync + 'static {
     /// 路径 → 本地 ActorRef（miss 返回 None → REPLY_ERR ActorNotFound）。
     async fn lookup(&self, path: &str) -> Option<Box<dyn parrot_api::address::ActorRef>>;
+
+    /// Explicit durable endpoint. Ordinary actors are never treated as atomic
+    /// durable receivers just because they can return a successful handler result.
+    fn durable_receiver(&self, _path: &str) -> Option<Arc<dyn crate::durable::DurableReceiver>> {
+        None
+    }
+
+    /// Explicit fixed-membership Directory endpoint. Ingress authenticates
+    /// the direct peer before admitting any Raft bytes to its owner thread.
+    fn directory_receiver(&self) -> Option<crate::roles::directory::network::DirectoryHandle> {
+        None
+    }
+
+    /// Resolve a node/prefix through the locally assembled Directory. The
+    /// default implementation is intentionally linearizable and bounded; an
+    /// application may override it for a border proxy or another authority.
+    async fn resolve_directory(
+        &self,
+        key: &str,
+        min_version: u64,
+    ) -> Result<Option<crate::roles::directory::DirEntry>, String> {
+        let Some(handle) = self.directory_receiver() else {
+            return Err("directory unavailable".to_owned());
+        };
+        let query = crate::roles::directory::DirQuery::Resolve {
+            prefix_or_node: key.to_owned(),
+        };
+        let read = handle
+            .query_linearizable(&query, std::time::Duration::from_secs(2))
+            .await
+            .map_err(|e| e.to_string())?;
+        match read.entry {
+            Some(entry) if entry.version < min_version => Err(format!(
+                "directory version {} is older than required {}",
+                entry.version, min_version
+            )),
+            other => Ok(other),
+        }
+    }
+
+    /// Optional alias to a node-qualified remote actor path. Ordinary requests
+    /// preserve opaque payloads; durable destinations cannot be rewritten.
+    fn forwarding_target(&self, _path: &str) -> Option<String> {
+        None
+    }
 }
 
 /// 死信计数（TELL miss 目标——无回程信道，只记 metric + debug 日志）。
@@ -60,7 +111,7 @@ impl RelayMetrics {
 /// hub 路由（07 §6）核心结构：入站 ASK 目标节点非本节点时，分配新 cid
 /// 转发到目标节点；REPLY/REPLY_ERR 回来按新 cid 查表还原 orig_cid，经
 /// 保存的回源 sender 送回发起方。容量 65536，65s TTL；系统每秒清理，
-/// 目标断连时按目标节点清理。
+/// 来源/目标断连时按实际连接清理；同节点其他连接不受牵连。
 pub struct RelayTable {
     slots: std::sync::Mutex<std::collections::HashMap<u64, RelaySlot>>,
     ttl: std::time::Duration,
@@ -70,8 +121,18 @@ pub struct RelayTable {
 struct RelaySlot {
     orig_cid: u64,
     back: FrameSender,
-    target: String,
+    target: FrameSender,
     created: std::time::Instant,
+}
+
+enum RelayReply {
+    Missing,
+    WrongSource,
+    Matched {
+        original_cid: u64,
+        back: FrameSender,
+        expired: bool,
+    },
 }
 
 impl RelayTable {
@@ -84,9 +145,19 @@ impl RelayTable {
     }
 
     /// Register before making the forwarded request visible to its destination.
-    pub fn insert(&self, forward_cid: u64, orig_cid: u64, back: FrameSender, target: &str) -> bool {
+    pub fn insert(
+        &self,
+        forward_cid: u64,
+        orig_cid: u64,
+        back: FrameSender,
+        target: &FrameSender,
+    ) -> bool {
         let mut slots = self.slots.lock().unwrap();
-        if slots.len() >= self.capacity || slots.contains_key(&forward_cid) {
+        if slots.len() >= self.capacity
+            || slots.contains_key(&forward_cid)
+            || back.is_closed()
+            || target.is_closed()
+        {
             return false;
         }
         slots.insert(
@@ -94,7 +165,7 @@ impl RelayTable {
             RelaySlot {
                 orig_cid,
                 back,
-                target: target.into(),
+                target: target.clone(),
                 created: std::time::Instant::now(),
             },
         );
@@ -110,11 +181,50 @@ impl RelayTable {
             .map(|slot| (slot.orig_cid, slot.back))
     }
 
+    /// Validate before consuming. Even an expired slot has a terminal reply;
+    /// taking it must not prevent the expiry worker from notifying its source.
+    fn take_from(&self, cid: u64, source: &FrameSender) -> RelayReply {
+        let mut slots = self.slots.lock().unwrap();
+        let Some(slot) = slots.get(&cid) else {
+            return RelayReply::Missing;
+        };
+        if !slot.target.same_connection(source) {
+            crate::registry::WRONG_REPLY_SOURCE.fetch_add(1, Ordering::Relaxed);
+            return RelayReply::WrongSource;
+        }
+        let slot = slots.remove(&cid).expect("slot checked under lock");
+        RelayReply::Matched {
+            original_cid: slot.orig_cid,
+            back: slot.back,
+            expired: slot.created.elapsed() >= self.ttl,
+        }
+    }
+
+    /// Reclaim source-owned slots and fail only requests using this destination.
+    /// Return replies after releasing the table lock.
+    pub fn fail_connection(&self, connection: &FrameSender) -> Vec<(u64, FrameSender)> {
+        let mut slots = self.slots.lock().unwrap();
+        let ids: Vec<_> = slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.back.same_connection(connection) || slot.target.same_connection(connection)
+            })
+            .map(|(cid, _)| *cid)
+            .collect();
+        ids.into_iter()
+            .filter_map(|cid| {
+                let slot = slots.remove(&cid).expect("slot checked under lock");
+                (!slot.back.same_connection(connection)).then_some((slot.orig_cid, slot.back))
+            })
+            .collect()
+    }
+
+    /// Explicit node-wide failure for administrative callers.
     pub fn fail_target(&self, target: &str) -> Vec<(u64, u64, FrameSender)> {
         let mut slots = self.slots.lock().unwrap();
         let ids: Vec<_> = slots
             .iter()
-            .filter(|(_, slot)| slot.target == target)
+            .filter(|(_, slot)| slot.target.node_id() == target)
             .map(|(cid, _)| *cid)
             .collect();
         ids.into_iter()
@@ -154,8 +264,25 @@ impl Default for RelayTable {
 }
 
 pub struct Ingress {
+    control_policy: crate::security::ControlPolicy,
+    durable_relays: std::sync::RwLock<std::collections::BTreeSet<String>>,
+    // Admission and tracker registration share a fence with close: no task can
+    // appear after close has observed an empty tracker.
+    ask_open: std::sync::Mutex<bool>,
+    ask_slots: Arc<tokio::sync::Semaphore>,
+    ask_bytes: Arc<tokio::sync::Semaphore>,
+    ask_tasks: tokio_util::task::TaskTracker,
+    ask_cancel: tokio_util::sync::CancellationToken,
     pub local: Arc<dyn LocalLookup>,
+    mirrors: crate::mirror::WireMirrorRegistry,
+    mirror_control: crate::mirror_control::MirrorControlStore,
     pub callbacks: Arc<CallbackRegistry>,
+    trace_recorder: crate::trace_attachment::TraceRecorderSlot,
+    /// Remote cache keys include authenticated authority identity.
+    resolve_cache: std::sync::Mutex<crate::cache::ResolveCache>,
+    /// Bound concurrent Directory lookups independently from actor ASK work.
+    resolve_slots: Arc<tokio::sync::Semaphore>,
+    resolve_pending: Arc<std::sync::Mutex<HashMap<u64, ResolvePending>>>,
     /// P2：SYSTEM_EVENT 分流钩子（admin/gossip/receptionist——system.rs 注入；
     /// None 时吞帧防御式丢弃）。
     sys_event: std::sync::RwLock<Option<Arc<dyn SysEventHook>>>,
@@ -171,9 +298,72 @@ pub struct Ingress {
     /// hub 中转帧多源复用同一连接，seq 流不可归因 → 不进重排（bypass）。
     reorder_tx:
         Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>>,
+    reorder_tasks: tokio_util::task::TaskTracker,
+    reorder_cancel: tokio_util::sync::CancellationToken,
     /// 重排旋钮（配置切面 [remote.reorder]——默认=原写死值 250ms/1024）。
     reorder_gap_timeout: std::sync::Mutex<std::time::Duration>,
     reorder_buffer_cap: std::sync::Mutex<usize>,
+}
+
+struct ResolvePending {
+    tx: tokio::sync::oneshot::Sender<ReplyPayload>,
+    connection: FrameSender,
+    key: String,
+    cache_key: String,
+    min_version: u64,
+    invalidated: bool,
+    identity: Arc<()>,
+}
+
+fn resolve_cache_key(source: &FrameSender, key: &str) -> String {
+    let authority = source.node_id();
+    format!(
+        "{:?}:{}:{authority}{key}",
+        source.authentication(),
+        authority.len()
+    )
+}
+
+/// Owns one resolve registration and removes it if the caller future is
+/// cancelled at any await point. Replies may remove the slot first; Drop is
+/// intentionally idempotent.
+struct ResolvePendingLease {
+    table: Arc<std::sync::Mutex<HashMap<u64, ResolvePending>>>,
+    cid: u64,
+    identity: Arc<()>,
+}
+impl Drop for ResolvePendingLease {
+    fn drop(&mut self) {
+        let mut table = self.table.lock().unwrap();
+        if table
+            .get(&self.cid)
+            .is_some_and(|slot| Arc::ptr_eq(&slot.identity, &self.identity))
+        {
+            table.remove(&self.cid);
+        }
+    }
+}
+
+// A stale worker must never remove a newer worker for the same source.
+struct ReorderRegistration {
+    map: std::sync::Weak<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>,
+    >,
+    source: String,
+    sender: tokio::sync::mpsc::WeakSender<Frame>,
+}
+impl Drop for ReorderRegistration {
+    fn drop(&mut self) {
+        if let (Some(map), Some(sender)) = (self.map.upgrade(), self.sender.upgrade()) {
+            let mut map = map.lock().unwrap();
+            if map
+                .get(&self.source)
+                .is_some_and(|current| current.same_channel(&sender))
+            {
+                map.remove(&self.source);
+            }
+        }
+    }
 }
 
 /// hub 转发出口（system.rs 注入——按 node 查出站 sender + 分配转发 cid）。
@@ -195,17 +385,125 @@ pub trait RelayRouter: Send + Sync + 'static {
 impl Ingress {
     /// 构造（P1 兼容：无钩子、无转发）。
     pub fn new(local: Arc<dyn LocalLookup>, callbacks: Arc<CallbackRegistry>) -> Self {
-        Self {
+        Self::with_ask_limits(
             local,
             callbacks,
+            parrot_config::Defaults::inbound_ask_capacity(),
+            parrot_config::Defaults::inbound_ask_bytes(),
+        )
+        .expect("valid default ASK limits")
+    }
+
+    /// Bound accepted ASK/completion-TELL futures and their encoded path, key and
+    /// payload lengths. This is not a bound on decoded application memory.
+    pub fn with_ask_limits(
+        local: Arc<dyn LocalLookup>,
+        callbacks: Arc<CallbackRegistry>,
+        capacity: usize,
+        bytes: usize,
+    ) -> Result<Self, crate::error::RemoteError> {
+        let max = tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize);
+        if capacity == 0 || capacity > max || bytes == 0 || bytes > max {
+            return Err(crate::error::RemoteError::Transport(
+                "invalid inbound ASK limits".into(),
+            ));
+        }
+        Ok(Self {
+            control_policy: Default::default(),
+            durable_relays: Default::default(),
+            ask_open: std::sync::Mutex::new(true),
+            ask_slots: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            ask_bytes: Arc::new(tokio::sync::Semaphore::new(bytes)),
+            ask_tasks: tokio_util::task::TaskTracker::new(),
+            ask_cancel: tokio_util::sync::CancellationToken::new(),
+            mirrors: crate::mirror::WireMirrorRegistry::new(&local),
+            mirror_control: crate::mirror_control::MirrorControlStore::new(),
+            local,
+            callbacks,
+            trace_recorder: crate::trace_attachment::TraceRecorderSlot::default(),
+            resolve_cache: std::sync::Mutex::new(crate::cache::ResolveCache::new()),
+            resolve_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            resolve_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sys_event: std::sync::RwLock::new(None),
             relay: std::sync::RwLock::new(None),
             relay_table: Arc::new(RelayTable::new()),
             learned: std::sync::Mutex::new(Default::default()),
             reorder_tx: Arc::new(std::sync::Mutex::new(Default::default())),
+            reorder_tasks: tokio_util::task::TaskTracker::new(),
+            reorder_cancel: tokio_util::sync::CancellationToken::new(),
             reorder_gap_timeout: std::sync::Mutex::new(std::time::Duration::from_millis(250)),
             reorder_buffer_cap: std::sync::Mutex::new(1024),
+        })
+    }
+
+    pub fn with_control_policy(mut self, policy: crate::security::ControlPolicy) -> Self {
+        self.control_policy = policy;
+        self
+    }
+
+    /// Authorize these authenticated nodes to vouch for durable origins on
+    /// forwarded frames. Empty by default; HELLO roles never grant this authority.
+    pub fn set_durable_relays(
+        &self,
+        nodes: std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        if nodes.len() > 4096 {
+            return Err("durable relay budget exceeded".into());
         }
+        let mut bytes = 0usize;
+        for node in &nodes {
+            parrot_config::endpoint::validate_node_id(node)?;
+            bytes = bytes
+                .checked_add(node.len())
+                .ok_or("durable relay byte overflow")?;
+            if node.len() > 1024 || bytes > 1024 * 1024 {
+                return Err("durable relay identity byte budget exceeded".into());
+            }
+        }
+        *self
+            .durable_relays
+            .write()
+            .map_err(|_| "durable relay policy poisoned")? = nodes;
+        Ok(())
+    }
+
+    /// Fence admission synchronously, then cancel all accepted ASK futures.
+    pub fn close_asks(&self) {
+        let mut open = self.ask_open.lock().unwrap();
+        *open = false;
+        self.ask_cancel.cancel();
+        self.ask_tasks.close();
+    }
+
+    /// Wait until every accepted ASK future has been dropped. Call close first.
+    pub async fn wait_for_asks(&self) {
+        self.ask_tasks.wait().await;
+    }
+
+    /// Close ASK and TELL admission and cancel all owned asynchronous work.
+    pub fn close(&self) {
+        self.mirror_control.close();
+        self.mirrors.close();
+        self.close_asks();
+        let pending = std::mem::take(&mut *self.resolve_pending.lock().unwrap());
+        for slot in pending.into_values() {
+            let _ = slot.tx.send(ReplyPayload::Err(
+                ErrCode::Stopped,
+                "resolve ingress closed".into(),
+            ));
+        }
+        // This is also the registration fence used by reorder_tx_of.
+        let mut map = self.reorder_tx.lock().unwrap();
+        self.reorder_cancel.cancel();
+        self.reorder_tasks.close();
+        map.clear();
+    }
+
+    /// Completion barrier for close; no retained reorder future remains afterwards.
+    pub async fn wait_closed(&self) {
+        self.wait_for_asks().await;
+        self.reorder_tasks.wait().await;
+        self.mirrors.wait_closed().await;
     }
 
     /// 配置切面：重排旋钮注入（RemoteActorSystem 构造时下发）。
@@ -229,15 +527,29 @@ impl Ingress {
     }
 }
 
-/// SYSTEM_EVENT 入站钩子（返回 false = 未处理，ingress 记日志）。
+/// SYSTEM_EVENT 入站钩子；处理与回执由实现负责。
 #[async_trait::async_trait]
 pub trait SysEventHook: Send + Sync + 'static {
+    /// Legacy REPLY_ERR compatibility. Return true only after consuming a
+    /// connection-bound administrative slot; default hooks handle no such slots.
+    fn on_reply_error(
+        &self,
+        _id: u64,
+        _code: ErrCode,
+        _detail: &str,
+        _source: &FrameSender,
+    ) -> bool {
+        false
+    }
     async fn on_event(&self, event: crate::admin::SysEvent, back: &FrameSender, from: &str);
 }
 
 /// 帧路径 → 本地查找路径：剥 parrot://{node}/ 前缀（节点寻址已在连接层完成，
-/// 本地表只存 /system/... 形态——05 §3.1 一文法两形态）。
+/// Native Actix tails are restored to the engine's exact `actix://...` key.
 fn local_path(path: &str) -> &str {
+    if let Some((_, local)) = crate::actor_path::split(path) {
+        return local;
+    }
     if let Some(rest) = path.strip_prefix("parrot://") {
         if let Some(idx) = rest.find('/') {
             return &rest[idx..];
@@ -253,39 +565,174 @@ fn target_node(path: &str) -> Option<&str> {
     Some(&rest[..idx])
 }
 
+/// Reject commands on the originating connection using only the outer CID.
+/// Malformed replies must not become commands or consume a pending request.
+fn reject_admin_command(frame: &Frame, back: &FrameSender, detail: &str) {
+    use crate::admin::{reply_frame, sys_event_tag, AdminReply};
+    use crate::admin_v2::{reply_frame_v2, v2_err, AdminReplyV2};
+    let req_id = frame.header.correlation_id;
+    let reply = match frame.payload.first() {
+        Some(&sys_event_tag::ADMIN_CMD) => reply_frame(
+            req_id,
+            "",
+            &AdminReply::Failed {
+                req_id,
+                code: ErrCode::ProtocolViolation as u16,
+                detail: detail.into(),
+            },
+        ),
+        Some(&sys_event_tag::ADMIN_CMD_V2) => reply_frame_v2(
+            req_id,
+            "",
+            &AdminReplyV2::Failed {
+                req_id,
+                code: v2_err::DIALECT_MISMATCH,
+                detail: detail.into(),
+            },
+        ),
+        _ => return,
+    };
+    back.send_reply(reply);
+}
+
 impl Ingress {
     /// 处理一帧入站（来自 ConnectionTask 的 inbound 队列）。
     /// `back` 是该连接的回程发送端（REPLY 用）。
     ///
     /// I2：ASK 并发分发——spawn 独立任务（慢 actor 不阻塞同连接的后续帧；
     /// REPLY 乱序经 cid 配对天然支持）。FrameSender 是 Clone，move 安全。
-    /// TELL 保持串行 deliver（05 §6.3 背压贯通——对端过载时读循环挂起
-    /// 是有意语义，不并发化）。
+    /// This low-level entry point awaits TELL/STOP/control work. The system
+    /// calls it through bounded per-connection lanes; direct callers own their
+    /// own ordering, admission and cancellation. ASK remains independently owned.
     pub async fn dispatch(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
+        if frame.validate_payload_flags().is_err()
+            || (frame.header.flags & crate::frame::flags::TRACE_CONTEXT != 0
+                && !back.supports_trace_context())
+            || (frame.header.flags & crate::frame::flags::MIRROR_SHADOW != 0
+                && (!back.supports_mirror_shadow() || !self.control_policy.allows(back)))
+        {
+            back.close();
+            return;
+        }
+        if frame.header.flags & crate::frame::flags::BATCH != 0 {
+            let Ok(members) = frame.batch_frames() else {
+                back.close();
+                return;
+            };
+            for member in members {
+                if back.is_closed() {
+                    break;
+                }
+                tokio::task::consume_budget().await;
+                self.dispatch_one(member, back, from_node).await;
+            }
+        } else {
+            self.dispatch_one(frame, back, from_node).await;
+        }
+    }
+    async fn dispatch_one(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
         match frame.header.frame_type {
             frame_type::ASK => {
-                let back = back.clone();
-                let this = self.clone();
-                tokio::spawn(async move {
-                    this.on_ask(frame, &back).await;
-                });
+                self.admit_request(frame, back);
+            }
+            frame_type::TELL if frame.header.flags & crate::frame::flags::TELL_ACK != 0 => {
+                // Completion TELL shares bounded request ownership, panic/close
+                // handling and connection-bound return routing with ASK.
+                self.admit_request(frame, back);
             }
             frame_type::TELL => self.on_tell(frame, back, from_node).await,
-            frame_type::STOP => self.on_stop(frame).await,
-            frame_type::REPLY | frame_type::REPLY_ERR => self.on_reply(frame),
+            frame_type::STOP => {
+                if self.control_policy.allows(back) {
+                    self.on_stop(frame).await;
+                } else {
+                    back.close();
+                }
+            }
+            frame_type::REPLY | frame_type::REPLY_ERR => self.on_reply(frame, back),
+            frame_type::RESOLVE_Q => self.on_resolve_query(frame, back).await,
+            frame_type::RESOLVE_R => self.on_resolve_response(frame, back),
+            frame_type::INVALIDATE => self.on_invalidate(frame, back),
             frame_type::SYSTEM_EVENT => {
                 // P2 管理通道：admin/gossip/receptionist 同帧不同标签
                 match crate::admin::decode_sys_event(&frame.payload) {
                     Ok(event) => {
+                        if matches!(
+                            event,
+                            crate::admin::SysEvent::MembershipGossip(_)
+                                | crate::admin::SysEvent::MembershipProbe(_)
+                                | crate::admin::SysEvent::ReceptionistSync(_)
+                        ) && !self.control_policy.allows_cluster(back)
+                        {
+                            back.close();
+                            return;
+                        }
+                        if let crate::admin::SysEvent::MembershipProbe(probe) = &event {
+                            if probe.request_id() != frame.header.correlation_id
+                                || back.peer_capabilities()
+                                    & crate::handshake::caps::MEMBERSHIP_PROBES
+                                    == 0
+                                || frame.header.flags != 0
+                                || !frame.path.is_empty()
+                                || !frame.type_key.is_empty()
+                            {
+                                back.close();
+                                return;
+                            }
+                        }
+                        if matches!(event, crate::admin::SysEvent::ReceptionistSync(_))
+                            && (back.peer_capabilities()
+                                & crate::handshake::caps::RECEPTIONIST_SYNC
+                                == 0
+                                || frame.header.correlation_id != 0
+                                || frame.header.flags != 0
+                                || frame.header.seq != crate::frame::SEQ_NONE
+                                || !frame.path.is_empty()
+                                || !frame.type_key.is_empty())
+                        {
+                            back.close();
+                            return;
+                        }
+                        let req_id = match &event {
+                            crate::admin::SysEvent::AdminCommand(cmd) => Some(cmd.req_id()),
+                            crate::admin::SysEvent::AdminCommandV2(cmd) => Some(cmd.req_id()),
+                            crate::admin::SysEvent::AdminReply(reply) => Some(reply.req_id()),
+                            crate::admin::SysEvent::AdminReplyV2(reply) => Some(reply.req_id()),
+                            _ => None,
+                        };
+                        if req_id.is_some_and(|id| id != frame.header.correlation_id) {
+                            tracing::warn!(
+                                "admin frame correlation_id disagrees with payload req_id"
+                            );
+                            reject_admin_command(
+                                &frame,
+                                back,
+                                "admin frame correlation_id disagrees with payload req_id",
+                            );
+                            return;
+                        }
                         let hook = self.sys_event.read().unwrap().clone();
                         if let Some(hook) = hook {
-                            hook.on_event(event, back, from_node).await;
+                            let cleanup = Cleanup::default();
+                            // A hook may already have sent a response. On failure,
+                            // close only its connection; never fabricate another.
+                            let _close = cleanup.close_on_failure(back);
+                            let mut hook = cleanup.owned(hook);
+                            let _ = unwind::run(&cleanup, || {
+                                hook.value().on_event(event, back, from_node)
+                            })
+                            .await;
+                            hook.retire();
                         } else {
                             tracing::debug!("SYSTEM_EVENT ignored (no hook installed)");
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(err = %e, "malformed SYSTEM_EVENT dropped");
+                        tracing::warn!(err = %e, "malformed SYSTEM_EVENT rejected");
+                        if matches!(frame.payload.first(), Some(0x11..=0x14)) {
+                            back.close();
+                            return;
+                        }
+                        reject_admin_command(&frame, back, "malformed administrative command");
                     }
                 }
             }
@@ -293,8 +740,13 @@ impl Ingress {
                 let (code, detail) = decode_err_payload(&frame.payload)
                     .unwrap_or((ErrCode::ProtocolViolation, "<undecodable>".into()));
                 tracing::warn!(node = %from_node, code = code.name(), %detail, "remote ERROR frame");
+                back.close();
             }
             frame_type::ROUTE_HINT => {
+                if !self.control_policy.allows_cluster(back) {
+                    back.close();
+                    return;
+                }
                 // 方案 A 学习通道（07 §6.2）：hub 告知目标直连地址 → 记入
                 // 学习缓存，由 direct_dialer 后台拨号（不阻塞分发循环）。
                 match Frame::parse_route_hint(&frame.payload) {
@@ -307,7 +759,7 @@ impl Ingress {
                     }
                 }
             }
-            // 心跳/握手由 ConnectionTask 处理；集群帧在连接层已断连——防御式吞掉
+            // 心跳/握手由 ConnectionTask 处理；其余已知帧交给 ingress。
             _ => {
                 tracing::debug!(
                     ft = frame.header.frame_type,
@@ -315,6 +767,429 @@ impl Ingress {
                 );
             }
         }
+    }
+
+    fn allows_resolve(&self, frame: &Frame, back: &FrameSender) -> bool {
+        self.control_policy.allows_cluster(back)
+            && (matches!(
+                self.control_policy,
+                crate::security::ControlPolicy::InsecureDevelopment
+            ) || back.authentication() != crate::security::PeerAuthentication::Unauthenticated)
+            && frame.header.hop_count == 0
+    }
+
+    /// Cached view scoped to this authenticated peer authority. This API does
+    /// not infer a consensus group shared by several directory nodes.
+    pub fn cached_resolve(
+        &self,
+        authority: &FrameSender,
+        key: &str,
+        now: std::time::Instant,
+    ) -> Option<(Vec<String>, crate::cache::CacheState)> {
+        if !self.control_policy.allows_cluster(authority) {
+            return None;
+        }
+        self.resolve_cache
+            .lock()
+            .unwrap()
+            .get(&resolve_cache_key(authority, key), now)
+            .map(|(endpoints, state)| (endpoints.to_vec(), state))
+    }
+
+    /// Outstanding outgoing lookups (hard limit: 64 per ingress).
+    pub fn pending_resolves(&self) -> usize {
+        self.resolve_pending.lock().unwrap().len()
+    }
+
+    async fn on_resolve_query(&self, frame: Frame, back: &FrameSender) {
+        let cleanup = Cleanup::default();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let permit = match self.resolve_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    back.send(Frame::reply_err(
+                        frame.header.correlation_id,
+                        &frame.path,
+                        ErrCode::Overloaded,
+                        "resolve concurrency limit reached",
+                    )),
+                )
+                .await;
+                return;
+            }
+        };
+        let result = async {
+            let _permit = permit;
+            if !self.allows_resolve(&frame, back) {
+                return Err((
+                    ErrCode::Forbidden,
+                    "resolve requires a direct authenticated peer".to_owned(),
+                ));
+            }
+            let query = crate::resolve::decode_query(&frame.payload)
+                .map_err(|e| (ErrCode::ProtocolViolation, e.to_string()))?;
+            if frame.path != query.key
+                || frame.type_key != crate::resolve::RESPONSE_KEY
+                || frame.header.flags != 0
+                || frame.header.seq != crate::frame::SEQ_NONE
+                || frame.header.correlation_id == 0
+            {
+                return Err((
+                    ErrCode::ProtocolViolation,
+                    "resolve frame path/type key is not bound to its payload".to_owned(),
+                ));
+            }
+            let entry = tokio::time::timeout_at(
+                deadline,
+                unwind::run(&cleanup, || {
+                    self.local.resolve_directory(&query.key, query.min_version)
+                }),
+            )
+            .await
+            .map_err(|_| {
+                (
+                    ErrCode::Timeout,
+                    "directory resolver deadline elapsed".to_owned(),
+                )
+            })?
+            .map_err(|()| {
+                (
+                    ErrCode::ProtocolViolation,
+                    "directory resolver panicked".to_owned(),
+                )
+            })?
+            .map_err(|detail| (ErrCode::DirectoryStale, detail))?;
+            // Retain an explicit application error or deadline, but do not
+            // publish a successful resolution before future cleanup completes.
+            if cleanup.failed() {
+                return Err((
+                    ErrCode::ProtocolViolation,
+                    "directory resolver cleanup panicked".into(),
+                ));
+            }
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.version < query.min_version)
+            {
+                return Err((
+                    ErrCode::DirectoryStale,
+                    "resolver returned an obsolete version".into(),
+                ));
+            }
+            Ok(crate::resolve::Response {
+                key: query.key,
+                entry,
+            })
+        }
+        .await;
+        let response = match result {
+            Ok(value) => match crate::resolve::encode_response(&value) {
+                Ok(payload) => Frame {
+                    header: crate::frame::FrameHeader {
+                        frame_len: 0,
+                        version: crate::frame::PROTOCOL_VERSION,
+                        frame_type: frame_type::RESOLVE_R,
+                        flags: 0,
+                        correlation_id: frame.header.correlation_id,
+                        hop_count: 0,
+                        hop_limit: frame.header.hop_limit,
+                        seq: crate::frame::SEQ_NONE,
+                    },
+                    path: frame.path,
+                    type_key: crate::resolve::RESPONSE_KEY.to_owned(),
+                    payload: bytes::Bytes::from(payload),
+                },
+                Err(e) => Frame::reply_err(
+                    frame.header.correlation_id,
+                    &frame.path,
+                    ErrCode::ProtocolViolation,
+                    &e.to_string(),
+                ),
+            },
+            Err((code, detail)) => {
+                Frame::reply_err(frame.header.correlation_id, &frame.path, code, &detail)
+            }
+        };
+        // An immediately ready send can report the timeout result even if the
+        // resolver consumed its budget. Capacity waits use the same deadline.
+        let _ = tokio::time::timeout_at(deadline, back.send(response)).await;
+    }
+
+    fn on_resolve_response(&self, frame: Frame, source: &FrameSender) {
+        if !self.allows_resolve(&frame, source) {
+            source.close();
+            return;
+        }
+        // Invalidation and response acceptance share this fence, including the
+        // cache write. No invalidation can fall between consuming the ticket
+        // and publishing its result into the cache.
+        let mut pending_map = self.resolve_pending.lock().unwrap();
+        let Some(slot) = pending_map.get(&frame.header.correlation_id) else {
+            return;
+        };
+        if !slot.connection.same_connection(source) {
+            return;
+        }
+        let response = crate::resolve::decode_response(&frame.payload);
+        let valid = response.as_ref().is_ok_and(|response| {
+            frame.path == response.key
+                && frame.type_key == crate::resolve::RESPONSE_KEY
+                && slot.key == response.key
+                && frame.header.flags == 0
+                && frame.header.seq == crate::frame::SEQ_NONE
+                && frame.header.correlation_id != 0
+        });
+        let pending = pending_map
+            .remove(&frame.header.correlation_id)
+            .expect("slot checked under lock");
+        if !valid {
+            let _ = pending.tx.send(ReplyPayload::Err(
+                ErrCode::ProtocolViolation,
+                "invalid resolve response or request binding".into(),
+            ));
+            return;
+        }
+        let response = response.unwrap();
+        if pending.invalidated
+            || response
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.version < pending.min_version)
+        {
+            let _ = pending.tx.send(ReplyPayload::Err(
+                ErrCode::DirectoryStale,
+                "resolve result invalidated or older than requested version".into(),
+            ));
+            return;
+        }
+        let mut cache = self.resolve_cache.lock().unwrap();
+        if let Some(entry) = &response.entry {
+            cache.put_with_ttl(
+                pending.cache_key,
+                entry.endpoints.clone(),
+                entry.version,
+                std::time::Duration::from_secs(entry.ttl_s as u64),
+                std::time::Instant::now(),
+            );
+        } else {
+            // An authoritative absence must not leave an earlier route usable.
+            cache.invalidate(&pending.cache_key);
+        }
+        let _ = pending.tx.send(ReplyPayload::Ok(
+            frame.payload,
+            crate::resolve::RESPONSE_KEY.to_owned(),
+        ));
+    }
+
+    fn fail_resolve(&self, cid: u64, source: &FrameSender, code: ErrCode, detail: &str) -> bool {
+        let mut pending_map = self.resolve_pending.lock().unwrap();
+        let Some(pending) = pending_map.get(&cid) else {
+            return false;
+        };
+        if !pending.connection.same_connection(source) {
+            return false;
+        }
+        let pending = pending_map
+            .remove(&cid)
+            .expect("pending checked under lock");
+        let _ = pending.tx.send(ReplyPayload::Err(code, detail.to_owned()));
+        true
+    }
+
+    fn on_invalidate(&self, frame: Frame, source: &FrameSender) {
+        if !self.allows_resolve(&frame, source) {
+            source.close();
+            return;
+        }
+        match crate::resolve::decode_invalidate(&frame.payload) {
+            Ok(value) => {
+                if frame.path != value.key || frame.type_key != crate::resolve::RESPONSE_KEY {
+                    tracing::warn!("INVALIDATE path does not match payload key");
+                    return;
+                }
+                if frame.header.flags != 0
+                    || frame.header.seq != crate::frame::SEQ_NONE
+                    || frame.header.correlation_id != 0
+                {
+                    return;
+                }
+                let cache_key = resolve_cache_key(source, &value.key);
+                let mut pending = self.resolve_pending.lock().unwrap();
+                for slot in pending
+                    .values_mut()
+                    .filter(|slot| slot.cache_key == cache_key)
+                {
+                    slot.invalidated = true;
+                }
+                self.resolve_cache
+                    .lock()
+                    .unwrap()
+                    .invalidate_versioned(&cache_key, value.version);
+            }
+            Err(error) => tracing::warn!(err = %error, "malformed INVALIDATE dropped"),
+        }
+    }
+
+    /// Issue one authenticated resolve request and update the shared cache.
+    /// The callback is bound to the exact connection, so a reply from another
+    /// peer cannot satisfy the query.
+    pub async fn resolve_remote(
+        &self,
+        sender: &FrameSender,
+        key: &str,
+        min_version: u64,
+        timeout: std::time::Duration,
+    ) -> Result<Option<crate::roles::directory::DirEntry>, crate::RemoteError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .filter(|_| !timeout.is_zero())
+            .ok_or_else(|| {
+                crate::RemoteError::Transport(
+                    "resolve timeout must be positive and representable".into(),
+                )
+            })?;
+        if !self.control_policy.allows_cluster(sender) {
+            return Err(crate::RemoteError::Transport(
+                "resolve peer is not authorized".into(),
+            ));
+        }
+        let payload = crate::resolve::encode_query(&crate::resolve::Query {
+            key: key.to_owned(),
+            min_version,
+        })
+        .map_err(|e| crate::RemoteError::Codec(e.to_string()))?;
+        let cid = self.callbacks.next_cid();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let identity = Arc::new(());
+        {
+            let mut pending = self.resolve_pending.lock().unwrap();
+            if self.ask_cancel.is_cancelled() {
+                return Err(crate::RemoteError::Transport(
+                    "resolve ingress closed".into(),
+                ));
+            }
+            if pending.len() >= 64 || pending.contains_key(&cid) || cid == 0 {
+                return Err(crate::RemoteError::Transport(
+                    "resolve pending limit or correlation collision".into(),
+                ));
+            }
+            pending.insert(
+                cid,
+                ResolvePending {
+                    tx,
+                    connection: sender.clone(),
+                    key: key.to_owned(),
+                    cache_key: resolve_cache_key(sender, key),
+                    min_version,
+                    invalidated: false,
+                    identity: identity.clone(),
+                },
+            );
+        }
+        let _lease = ResolvePendingLease {
+            table: self.resolve_pending.clone(),
+            cid,
+            identity,
+        };
+        let frame = Frame {
+            header: crate::frame::FrameHeader {
+                frame_len: 0,
+                version: crate::frame::PROTOCOL_VERSION,
+                frame_type: frame_type::RESOLVE_Q,
+                flags: 0,
+                correlation_id: cid,
+                hop_count: 0,
+                hop_limit: crate::frame::DEFAULT_HOP_LIMIT,
+                seq: crate::frame::SEQ_NONE,
+            },
+            path: key.to_owned(),
+            type_key: crate::resolve::RESPONSE_KEY.to_owned(),
+            payload: bytes::Bytes::from(payload),
+        };
+        let sent = tokio::select! {
+            biased;
+            _ = self.ask_cancel.cancelled() => return Err(crate::RemoteError::Transport("resolve ingress closed".into())),
+            result = tokio::time::timeout_at(deadline, sender.send(frame)) => result,
+        };
+        match sent {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(crate::RemoteError::Transport(format!(
+                    "resolve send failed: {error}"
+                )))
+            }
+            Err(_) => return Err(crate::RemoteError::Transport("resolve send timeout".into())),
+        }
+        let received = tokio::select! {
+            biased;
+            _ = self.ask_cancel.cancelled() => return Err(crate::RemoteError::Transport("resolve ingress closed".into())),
+            _ = sender.closed() => return Err(crate::RemoteError::Transport("resolve connection closed".into())),
+            result = tokio::time::timeout_at(deadline, rx) => result,
+        };
+        let reply = match received {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(_)) => {
+                return Err(crate::RemoteError::Transport(
+                    "resolve connection closed".into(),
+                ))
+            }
+            Err(_) => return Err(crate::RemoteError::Transport("resolve timeout".into())),
+        };
+        match reply {
+            ReplyPayload::Ok(bytes, _) => {
+                let response = crate::resolve::decode_response(&bytes)
+                    .map_err(|e| crate::RemoteError::Codec(e.to_string()))?;
+                if response.key != key {
+                    return Err(crate::RemoteError::Codec(
+                        "resolve response key does not match request".into(),
+                    ));
+                }
+                Ok(response.entry)
+            }
+            ReplyPayload::Err(code, detail) => Err(crate::RemoteError::Codec(format!(
+                "{}: {}",
+                code.name(),
+                detail
+            ))),
+        }
+    }
+
+    /// Push a versioned invalidation over an authenticated cluster link.
+    pub async fn invalidate_remote(
+        &self,
+        sender: &FrameSender,
+        key: &str,
+        version: u64,
+    ) -> Result<(), crate::RemoteError> {
+        if !self.control_policy.allows_cluster(sender) {
+            return Err(crate::RemoteError::Transport(
+                "invalidate peer is not authorized".into(),
+            ));
+        }
+        let payload = crate::resolve::encode_invalidate(&crate::resolve::Invalidate {
+            key: key.to_owned(),
+            version,
+        })
+        .map_err(|e| crate::RemoteError::Codec(e.to_string()))?;
+        sender
+            .send(Frame {
+                header: crate::frame::FrameHeader {
+                    frame_len: 0,
+                    version: crate::frame::PROTOCOL_VERSION,
+                    frame_type: frame_type::INVALIDATE,
+                    flags: 0,
+                    correlation_id: 0,
+                    hop_count: 0,
+                    hop_limit: crate::frame::DEFAULT_HOP_LIMIT,
+                    seq: crate::frame::SEQ_NONE,
+                },
+                path: key.to_owned(),
+                type_key: crate::resolve::RESPONSE_KEY.to_owned(),
+                payload: bytes::Bytes::from(payload),
+            })
+            .await
     }
 
     fn is_remote_target(&self, path: &str) -> bool {
@@ -327,16 +1202,281 @@ impl Ingress {
         })
     }
 
-    async fn on_ask(&self, frame: Frame, back: &FrameSender) {
+    /// Mirror ingress to a raw local actor with independent, bounded admission.
+    pub fn register_wire_mirror(
+        &self,
+        policy: crate::mirror::WireMirrorPolicy,
+        options: crate::mirror::WireMirrorOptions,
+    ) -> Result<crate::mirror::WireMirrorHandle, crate::mirror::WireMirrorError> {
+        self.mirrors.register(policy, options)
+    }
+
+    pub(crate) fn attach_mirror_system(&self, system: std::sync::Weak<crate::RemoteActorSystem>) {
+        self.mirrors.attach_remote(system);
+    }
+
+    pub(crate) async fn control_mirror(
+        &self,
+        command: crate::mirror_control::MirrorControl,
+    ) -> Result<crate::mirror_control::MirrorControlReply, String> {
+        self.mirror_control.execute(&self.mirrors, command).await
+    }
+
+    /// Atomically install an owned policy group; existing sources are never replaced.
+    pub fn register_wire_mirror_group(
+        &self,
+        policies: Vec<(
+            crate::mirror::WireMirrorPolicy,
+            crate::mirror::WireMirrorOptions,
+        )>,
+    ) -> Result<crate::mirror::WireMirrorGroup, crate::mirror::WireMirrorError> {
+        self.mirrors.register_group(policies)
+    }
+
+    pub fn remove_wire_mirror(&self, prefix: &str) -> Option<crate::mirror::WireMirrorHandle> {
+        self.mirrors.remove(prefix)
+    }
+
+    fn mirror_application(&self, frame: &Frame) {
+        if !self.mirrors.is_enabled()
+            || frame.header.flags & crate::frame::flags::MIRROR_SHADOW != 0
+        {
+            return;
+        }
+        // A qualified destination is eligible only when an installed router
+        // proves it is this node. Transit/unknown authorities are not local.
+        if let Some(node) = target_node(&frame.path) {
+            if !self
+                .relay
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|r| r.self_node() == node)
+            {
+                return;
+            }
+        }
+        if matches!(
+            frame.type_key.as_str(),
+            crate::durable::DURABLE_KEY
+                | crate::roles::directory::client::READ_KEY
+                | crate::roles::directory::client::CLIENT_KEY
+                | crate::roles::directory::network::RAFT_KEY
+        ) {
+            return;
+        }
+        if frame.header.frame_type == frame_type::ASK {
+            if let Ok(payload) = frame.borrowed_ask_payload() {
+                self.mirrors
+                    .offer(local_path(&frame.path), &frame.type_key, payload);
+            }
+        } else {
+            self.mirrors
+                .offer(local_path(&frame.path), &frame.type_key, &frame.payload);
+        }
+    }
+
+    fn resolve_application_path(&self, frame: &mut Frame) {
+        if !self.is_remote_target(&frame.path) {
+            if let Some(target) = self.local.forwarding_target(local_path(&frame.path)) {
+                // A bad resolver must not redirect a local actor to another local
+                // alias or silently decode its payload at the wrong destination.
+                if self.is_remote_target(&target) {
+                    frame.path = target;
+                }
+            }
+        }
+    }
+
+    fn admit_request(self: &Arc<Self>, frame: Frame, back: &FrameSender) {
+        let open = self.ask_open.lock().unwrap();
+        if back.is_closed() {
+            return;
+        }
+        let bytes = frame
+            .payload
+            .len()
+            .checked_add(frame.path.len())
+            .and_then(|n| n.checked_add(frame.type_key.len()))
+            .and_then(|n| u32::try_from(n).ok());
+        let permits = if *open {
+            self.ask_slots
+                .clone()
+                .try_acquire_owned()
+                .ok()
+                .and_then(|slot| {
+                    let bytes = self.ask_bytes.clone().try_acquire_many_owned(bytes?).ok()?;
+                    Some((slot, bytes))
+                })
+        } else {
+            None
+        };
+        let Some(permits) = permits else {
+            let code = if *open {
+                ErrCode::Overloaded
+            } else {
+                ErrCode::Stopped
+            };
+            // Do not create a waiting task for rejection. If even the error
+            // cannot fit, disconnect this exact connection so callers observe
+            // failure and a full writer cannot block the global dispatcher.
+            if back
+                .send_frame_sync(Frame::reply_err(
+                    frame.header.correlation_id,
+                    &frame.path,
+                    code,
+                    "inbound request admission closed or at capacity",
+                ))
+                .is_err()
+            {
+                back.close();
+            }
+            return;
+        };
+        let back = back.clone();
+        let this = self.clone();
+        self.ask_tasks.spawn(async move {
+            let _permits = permits;
+            tokio::select! {
+                biased;
+                _ = this.ask_cancel.cancelled() => {},
+                _ = back.closed() => {},
+                _ = async {
+                    // Cover lookup, synchronous ActorRef::send construction,
+                    // codecs and reply encoding as well as polling the actor.
+                    let cid = frame.header.correlation_id;
+                    let path = frame.path.clone();
+                    let cleanup = Cleanup::default();
+                    if unwind::run(&cleanup, || Box::pin(this.on_request(frame, &back))).await.is_err() {
+                        let _ = back.send(Frame::reply_err(cid, &path,
+                            ErrCode::ProtocolViolation, "inbound request handler panicked")).await;
+                    }
+                } => {},
+            }
+        });
+    }
+
+    /// Attach a local recorder to future requests carrying a negotiated causal
+    /// parent. Existing operations retain their recorder; None disables capture
+    /// without disabling metadata propagation. This does not authenticate peers.
+    pub fn set_trace_recorder(&self, recorder: Option<parrot_api::trace::TraceRecorder>) {
+        self.trace_recorder.set(recorder);
+    }
+
+    pub(crate) fn attach_trace_recorder(
+        &self,
+        recorder: parrot_api::trace::TraceRecorder,
+        policy: crate::IncomingTracePolicy,
+    ) -> crate::TraceRecorderAttachment {
+        self.trace_recorder.attach(recorder, policy)
+    }
+
+    fn request_context(
+        &self,
+        frame: &mut Frame,
+    ) -> Result<Option<parrot_api::trace::TraceContext>, crate::frame::FrameError> {
+        let parent = frame.take_trace_parent()?;
+        Ok(self.trace_recorder.context(parent))
+    }
+
+    async fn on_request(&self, mut frame: Frame, back: &FrameSender) {
+        let Ok(context) = self.request_context(&mut frame) else {
+            back.close();
+            return;
+        };
+        let shadow = frame.header.flags & crate::frame::flags::MIRROR_SHADOW != 0;
+        if shadow {
+            // Validated by dispatch. A relative receiver budget bounds pending
+            // lookup/admission even when the source times out or disconnects.
+            let millis = u32::from_le_bytes(
+                frame.payload[..4]
+                    .try_into()
+                    .expect("validated shadow budget"),
+            );
+            frame.payload = frame.payload.slice(4..);
+            let cid = frame.header.correlation_id;
+            let path = frame.path.clone();
+            parrot_api::trace::scope(context, async {
+                if tokio::time::timeout(
+                    std::time::Duration::from_millis(millis.into()),
+                    self.on_request_scoped(frame, back),
+                )
+                .await
+                .is_err()
+                {
+                    back.send_reply(Frame::reply_err(
+                        cid,
+                        &path,
+                        ErrCode::Timeout,
+                        "shadow admission deadline elapsed; admission may have occurred",
+                    ));
+                }
+            })
+            .await;
+        } else {
+            parrot_api::trace::scope(context, self.on_request_scoped(frame, back)).await;
+        }
+    }
+
+    async fn on_request_scoped(&self, mut frame: Frame, back: &FrameSender) {
+        if frame.type_key == crate::roles::directory::client::READ_KEY {
+            self.on_directory_read(frame, back).await;
+            return;
+        }
+        if frame.type_key == crate::roles::directory::client::CLIENT_KEY {
+            self.on_directory_client(frame, back).await;
+            return;
+        }
+        if frame.type_key == crate::roles::directory::network::RAFT_KEY {
+            self.on_directory_request(frame, back).await;
+            return;
+        }
+        if frame.type_key == crate::durable::DURABLE_KEY {
+            self.on_durable_request(frame, back).await;
+            return;
+        }
+        let shadow = frame.header.flags & crate::frame::flags::MIRROR_SHADOW != 0;
+        if shadow {
+            let path = local_path(&frame.path);
+            let local = target_node(&frame.path).is_none_or(|node| {
+                self.relay
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|r| r.self_node() == node)
+            });
+            if !local
+                || !crate::mirror::canonical(path)
+                || path == "/"
+                || self.local.forwarding_target(path).is_some()
+            {
+                back.send_reply(Frame::reply_err(
+                    frame.header.correlation_id,
+                    &frame.path,
+                    ErrCode::ProtocolViolation,
+                    "shadow destination must be a raw actor on this node",
+                ));
+                return;
+            }
+        } else {
+            self.mirror_application(&frame);
+            self.resolve_application_path(&mut frame);
+        }
         let cid = frame.header.correlation_id;
+        let completion = frame.header.frame_type == frame_type::TELL;
         // Node identity precedes local lookup and codec dispatch. A router
         // can forward opaque payloads and cannot capture a remote namesake.
         if self.is_remote_target(&frame.path) {
-            self.try_relay_ask(&frame, back, cid).await;
+            self.try_relay_request(&frame, back, cid).await;
             return;
         }
         // 剥 reply_to 前缀（DEV_01 §3.1 约定）
-        let (reply_to, payload) = match frame.split_reply_to() {
+        let decoded_payload = if completion {
+            Ok((None, frame.payload.clone()))
+        } else {
+            frame.split_reply_to()
+        };
+        let (reply_to, payload) = match decoded_payload {
             Ok(v) => v,
             Err(e) => {
                 let _ = back
@@ -350,29 +1490,43 @@ impl Ingress {
                 return;
             }
         };
-        // 解码
-        let decoded = match CodecRegistry::global().decode_incoming(&frame.type_key, &payload) {
-            Ok(m) => m,
-            Err(code) => {
+        let cleanup = Cleanup::default();
+        let decoded = match cleanup
+            .call(|| CodecRegistry::global().decode_incoming(&frame.type_key, &payload))
+        {
+            Ok(Ok(message)) => message,
+            outcome => {
+                let (code, detail) = match outcome {
+                    Ok(Err(code)) => (code, format!("type_key={}", frame.type_key)),
+                    _ => (
+                        ErrCode::ProtocolViolation,
+                        "inbound request decoder panicked".into(),
+                    ),
+                };
                 let _ = back
-                    .send(Frame::reply_err(
-                        cid,
-                        &frame.path,
-                        code,
-                        &format!("type_key={}", frame.type_key),
-                    ))
+                    .send(Frame::reply_err(cid, &frame.path, code, &detail))
                     .await;
                 return;
             }
         };
-        // 本地解析（facade 注入）；miss 且目标是其他 parrot 节点 → hub 转发
-        let local_ref = match self.local.lookup(local_path(&frame.path)).await {
-            Some(r) => r,
-            None => {
-                // hub 路由（07 §6）：parrot://{other}/... 由本节点中转。
-                // RouteUnreachable/ConnectionLost 的错误帧 try_relay_ask 已
-                // 自行回源；这里只兜底 ActorNotFound（常规 miss 语义）。
-                if self.try_relay_ask(&frame, back, cid).await == Some(ErrCode::ActorNotFound) {
+        let mut decoded = cleanup.owned(decoded);
+        let target = unwind::run(&cleanup, || self.local.lookup(local_path(&frame.path))).await;
+        let target = match target {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                decoded.retire();
+                if cleanup.failed() {
+                    let _ = back
+                        .send(Frame::reply_err(
+                            cid,
+                            &frame.path,
+                            ErrCode::ProtocolViolation,
+                            "inbound lookup/input cleanup panicked",
+                        ))
+                        .await;
+                    return;
+                }
+                if self.try_relay_request(&frame, back, cid).await == Some(ErrCode::ActorNotFound) {
                     let _ = back
                         .send(Frame::reply_err(
                             cid,
@@ -384,47 +1538,385 @@ impl Ingress {
                 }
                 return;
             }
+            Err(()) => {
+                decoded.retire();
+                let _ = back
+                    .send(Frame::reply_err(
+                        cid,
+                        &frame.path,
+                        ErrCode::ProtocolViolation,
+                        "inbound lookup panicked",
+                    ))
+                    .await;
+                return;
+            }
         };
-        // 远端不二次超时（07 §7 双超时竞态规避）：send() 无界。
-        // panic 隔离：本地引擎 panic 不能杀分发循环（连接存活优先）
-        let send_fut = local_ref.send(decoded);
-        let outcome = std::panic::AssertUnwindSafe(send_fut);
-        let outcome = futures::FutureExt::catch_unwind(outcome).await;
-        let outcome: Result<parrot_api::types::BoxedMessage, parrot_api::errors::ActorError> =
-            match outcome {
-                Ok(r) => r,
-                Err(p) => Err(parrot_api::errors::ActorError::Panic(
-                    p.downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| p.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "local actor panicked".into()),
-                )),
-            };
-        match outcome {
-            Ok(reply) => {
-                // 回复类型编码（回复也必须 RemoteMessage）
-                let (key, payload) = match CodecRegistry::global().encode_outgoing(&reply) {
-                    Ok(v) => v,
-                    Err(code) => {
-                        let _ = back
-                            .send(Frame::reply_err(
-                                cid,
-                                &frame.path,
-                                code,
-                                "reply type not remotable",
-                            ))
-                            .await;
-                        return;
+        let mut target = cleanup.owned(target);
+        if cleanup.failed() {
+            target.retire();
+            decoded.retire();
+            let _ = back
+                .send(Frame::reply_err(
+                    cid,
+                    &frame.path,
+                    ErrCode::ProtocolViolation,
+                    "lookup cleanup panicked",
+                ))
+                .await;
+            return;
+        }
+        // Construct, poll and retire the user future independently. Both owners
+        // also remain guarded if connection or system cancellation drops us.
+        let outcome = unwind::run(&cleanup, || {
+            if shadow {
+                let admission = target.value().deliver(decoded.take());
+                Box::pin(async move {
+                    admission.await?;
+                    Ok(Box::new(()) as parrot_api::types::BoxedMessage)
+                })
+                    as parrot_api::types::BoxedFuture<
+                        '_,
+                        parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>,
+                    >
+            } else if frame.header.flags & crate::frame::flags::URGENT != 0 {
+                target.value().send_with_options(
+                    decoded.take(),
+                    parrot_api::message::MessageOptions {
+                        priority: parrot_api::message::MessagePriority::HIGH,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                target.value().send(decoded.take())
+            }
+        })
+        .await;
+        let mut response = match outcome {
+            Ok(Ok(reply)) => {
+                let mut reply = cleanup.owned(reply);
+                let response = if shadow {
+                    Frame::reply(
+                        cid,
+                        "",
+                        crate::frame::MIRROR_ADMISSION_KEY,
+                        bytes::Bytes::new(),
+                    )
+                } else if completion {
+                    Frame::tell_completed(cid)
+                } else {
+                    match cleanup.call(|| CodecRegistry::global().encode_outgoing(reply.value())) {
+                        Ok(Ok((key, payload))) => Frame::reply(
+                            cid,
+                            &reply_to.unwrap_or_default(),
+                            &key,
+                            bytes::Bytes::from(payload),
+                        ),
+                        Ok(Err(code)) => {
+                            Frame::reply_err(cid, &frame.path, code, "reply type not remotable")
+                        }
+                        Err(()) => Frame::reply_err(
+                            cid,
+                            &frame.path,
+                            ErrCode::ProtocolViolation,
+                            "reply encoder panicked",
+                        ),
                     }
                 };
-                // REPLY.path = reply_to 回程路径（cid 配对走回调表）
-                let path = reply_to.unwrap_or_default();
-                let _ = back
-                    .send(Frame::reply(cid, &path, &key, bytes::Bytes::from(payload)))
-                    .await;
+                reply.retire();
+                response
             }
-            Err(e) => {
-                let (code, detail) = ErrCode::from_actor_error(&e);
+            Ok(Err(error)) => {
+                let mut error = cleanup.owned(error);
+                let (code, detail) = cleanup
+                    .call(|| ErrCode::from_actor_error(error.value()))
+                    .unwrap_or((
+                        ErrCode::ProtocolViolation,
+                        "error formatter panicked".into(),
+                    ));
+                error.retire();
+                Frame::reply_err(cid, &frame.path, code, &detail)
+            }
+            Err(()) => Frame::reply_err(
+                cid,
+                &frame.path,
+                ErrCode::ProtocolViolation,
+                "inbound actor invocation panicked",
+            ),
+        };
+        target.retire();
+        decoded.retire();
+        // Keep an already failed request's stable error; never acknowledge a
+        // successful operation before its independently owned inputs retire.
+        if cleanup.failed() && response.header.frame_type == frame_type::REPLY {
+            response = Frame::reply_err(
+                cid,
+                &frame.path,
+                ErrCode::ProtocolViolation,
+                "inbound request cleanup panicked",
+            );
+        }
+        let _ = back.send(response).await;
+    }
+
+    fn authorize_directory_client(
+        &self,
+        frame: &Frame,
+        back: &FrameSender,
+        path: &str,
+    ) -> Result<(), crate::roles::directory::network::NetworkDirectoryError> {
+        use crate::roles::directory::network::NetworkDirectoryError;
+        if !self.control_policy.allows(back)
+            || !matches!(
+                back.authentication(),
+                crate::PeerAuthentication::MutualTls | crate::PeerAuthentication::InProcess
+            )
+            || frame.header.hop_count != 0
+        {
+            return Err(NetworkDirectoryError::Forbidden);
+        }
+        let node = self
+            .relay
+            .read()
+            .ok()
+            .and_then(|r| r.as_ref().map(|r| r.self_node().to_owned()));
+        if frame.header.frame_type != frame_type::ASK
+            || node.is_none_or(|node| frame.path != format!("parrot://{node}{path}"))
+        {
+            return Err(NetworkDirectoryError::Invalid(
+                "Directory client requires an ASK bound to this node".into(),
+            ));
+        }
+        Ok(())
+    }
+    async fn on_directory_read(&self, frame: Frame, back: &FrameSender) {
+        use crate::roles::directory::{client, network::NetworkDirectoryError};
+        let result = async {
+            self.authorize_directory_client(&frame, back, client::READ_PATH)?;
+            let endpoint = self
+                .local
+                .directory_receiver()
+                .ok_or(NetworkDirectoryError::Closed)?;
+            let (_, bytes) = frame
+                .split_reply_to()
+                .map_err(|e| NetworkDirectoryError::Invalid(e.to_string()))?;
+            client::receive_read(&endpoint, &bytes).await
+        }
+        .await;
+        let reply = match bincode::serde::encode_to_vec(result, bincode::config::standard()) {
+            Ok(bytes) => Frame::reply(
+                frame.header.correlation_id,
+                "",
+                client::READ_REPLY_KEY,
+                bytes::Bytes::from(bytes),
+            ),
+            Err(e) => Frame::reply_err(
+                frame.header.correlation_id,
+                &frame.path,
+                ErrCode::CodecError,
+                &e.to_string(),
+            ),
+        };
+        let _ = back.send(reply).await;
+    }
+    async fn on_directory_client(&self, frame: Frame, back: &FrameSender) {
+        use crate::roles::directory::{client, network::NetworkDirectoryError};
+        let result = async {
+            self.authorize_directory_client(&frame, back, client::CLIENT_PATH)?;
+            let endpoint = self
+                .local
+                .directory_receiver()
+                .ok_or(NetworkDirectoryError::Closed)?;
+            let (_, payload) = frame
+                .split_reply_to()
+                .map_err(|e| NetworkDirectoryError::Invalid(e.to_string()))?;
+            client::receive(&endpoint, back.node_id(), payload).await
+        }
+        .await;
+        let reply = match bincode::serde::encode_to_vec(result, bincode::config::standard()) {
+            Ok(bytes) => Frame::reply(
+                frame.header.correlation_id,
+                "",
+                client::CLIENT_REPLY_KEY,
+                bytes::Bytes::from(bytes),
+            ),
+            Err(e) => Frame::reply_err(
+                frame.header.correlation_id,
+                &frame.path,
+                ErrCode::CodecError,
+                &e.to_string(),
+            ),
+        };
+        let _ = back.send(reply).await;
+    }
+    async fn on_directory_request(&self, frame: Frame, back: &FrameSender) {
+        use crate::roles::directory::network::{RAFT_ACK_KEY, RAFT_PATH};
+        use crate::security::PeerAuthentication;
+        let result = async {
+            if !matches!(
+                back.authentication(),
+                PeerAuthentication::MutualTls | PeerAuthentication::InProcess
+            ) || frame.header.hop_count != 0
+            {
+                return Err((
+                    ErrCode::Forbidden,
+                    "Raft requires a direct authenticated peer".into(),
+                ));
+            }
+            let node = self
+                .relay
+                .read()
+                .ok()
+                .and_then(|r| r.as_ref().map(|r| r.self_node().to_owned()));
+            if frame.header.frame_type != frame_type::ASK
+                || node.is_none_or(|node| frame.path != format!("parrot://{node}{RAFT_PATH}"))
+            {
+                return Err((
+                    ErrCode::ProtocolViolation,
+                    "Raft requires an ASK bound to this node".into(),
+                ));
+            }
+            let endpoint = self
+                .local
+                .directory_receiver()
+                .ok_or((ErrCode::ActorNotFound, "no Directory owner".into()))?;
+            let (_, payload) = frame
+                .split_reply_to()
+                .map_err(|e| (ErrCode::ProtocolViolation, e.to_string()))?;
+            endpoint
+                .receive(back.node_id(), payload)
+                .await
+                .map_err(|e| (e.code(), e.to_string()))
+        }
+        .await;
+        let response = match result {
+            Ok(()) => Frame::reply(
+                frame.header.correlation_id,
+                "",
+                RAFT_ACK_KEY,
+                bytes::Bytes::new(),
+            ),
+            Err((code, detail)) => {
+                Frame::reply_err(frame.header.correlation_id, &frame.path, code, &detail)
+            }
+        };
+        let _ = back.send(response).await;
+    }
+
+    async fn on_durable_request(&self, frame: Frame, back: &FrameSender) {
+        use crate::durable::{DurableEnvelope, InboxError, DURABLE_RECEIPT_KEY};
+        let cid = frame.header.correlation_id;
+        let cleanup = Cleanup::default();
+        let mut span = tracing::Span::none();
+        let result = async {
+            if !self.control_policy.allows_cluster(back) {
+                return Err((
+                    ErrCode::Forbidden,
+                    "durable origin requires an authenticated connection".into(),
+                ));
+            }
+            let envelope = DurableEnvelope::decode(frame.payload.clone())
+                .map_err(|e| (ErrCode::ProtocolViolation, e))?;
+            let authorized = if frame.header.hop_count == 0 {
+                back.node_id() == envelope.source
+            } else {
+                self.durable_relays
+                    .read()
+                    .map(|nodes| nodes.contains(back.node_id()))
+                    .unwrap_or(false)
+            };
+            if !authorized {
+                return Err((
+                    ErrCode::Forbidden,
+                    "durable source/relay identity not authorized".into(),
+                ));
+            }
+            if frame.path != envelope.target_path() {
+                return Err((
+                    ErrCode::ProtocolViolation,
+                    "durable destination differs from bound envelope".into(),
+                ));
+            }
+            span = tracing::trace_span!(target: TARGET, "durable.ingress",
+                source = %envelope.source, session = %envelope.session,
+                receiver = %envelope.receiver, path = %envelope.path,
+                sequence = envelope.sequence, cid);
+            if self.is_remote_target(&frame.path) {
+                self.try_relay_request(&frame, back, cid).await;
+                return Ok(None);
+            }
+            let self_node = self
+                .relay
+                .read()
+                .ok()
+                .and_then(|r| r.as_ref().map(|r| r.self_node().to_owned()));
+            if self_node.as_deref() != Some(envelope.receiver.as_str()) {
+                return Err((
+                    ErrCode::ProtocolViolation,
+                    "durable receiver node identity unavailable or mismatched".into(),
+                ));
+            }
+            let endpoint = cleanup
+                .call(|| self.local.durable_receiver(&envelope.path))
+                .map_err(|()| {
+                    (
+                        ErrCode::ProtocolViolation,
+                        "durable receiver lookup panicked".into(),
+                    )
+                })?
+                .ok_or((
+                    ErrCode::ActorNotFound,
+                    "no transactional receiver at this path".into(),
+                ))?;
+            let mut endpoint = cleanup.owned(endpoint);
+            let seq = envelope.sequence;
+            let timing = Phase::new(span.clone(), "ingress.receiver");
+            let result = unwind::run(&cleanup, || endpoint.value().receive(envelope))
+                .instrument(span.clone())
+                .await;
+            endpoint.retire();
+            timing.finish(matches!(&result, Ok(Ok(()))) && !cleanup.failed());
+            result
+                .map_err(|()| {
+                    (
+                        ErrCode::ProtocolViolation,
+                        "durable receiver invocation panicked".into(),
+                    )
+                })?
+                .map_err(|e| {
+                    let code = match &e {
+                        InboxError::Capacity => ErrCode::Overloaded,
+                        InboxError::Closed => ErrCode::Stopped,
+                        InboxError::Invalid(_) | InboxError::Gap { .. } => {
+                            ErrCode::ProtocolViolation
+                        }
+                        _ => ErrCode::CodecError,
+                    };
+                    (code, e.to_string())
+                })?;
+            if cleanup.failed() {
+                return Err((
+                    ErrCode::ProtocolViolation,
+                    "durable receiver cleanup panicked".into(),
+                ));
+            }
+            Ok(Some(seq))
+        }
+        .await;
+        match result {
+            Ok(Some(seq)) => {
+                let timing = Phase::new(span.clone(), "ingress.receipt_admission");
+                let result = back
+                    .send(Frame::reply(
+                        cid,
+                        "",
+                        DURABLE_RECEIPT_KEY,
+                        bytes::Bytes::copy_from_slice(&seq.to_le_bytes()),
+                    ))
+                    .await;
+                timing.finish(result.is_ok());
+            }
+            Ok(None) => {}
+            Err((code, detail)) => {
                 let _ = back
                     .send(Frame::reply_err(cid, &frame.path, code, &detail))
                     .await;
@@ -435,7 +1927,7 @@ impl Ingress {
     /// hub 转发 ASK：目标是其他节点且本节点有路由能力 → 转发 + 映射登记。
     /// 返回 Some(code) = 未转发（code 是应回源的错误码；ActorNotFound =
     /// 常规 miss 语义）；None = 已转发（等 REPLY 自动回源）。
-    async fn try_relay_ask(
+    async fn try_relay_request(
         &self,
         frame: &Frame,
         back: &FrameSender,
@@ -456,7 +1948,7 @@ impl Ingress {
             return Some(ErrCode::ActorNotFound);
         };
         if frame.header.hop_count.saturating_add(1) >= frame.header.hop_limit {
-            back.send_frame(Frame::reply_err(
+            back.send_reply(Frame::reply_err(
                 orig_cid,
                 &frame.path,
                 ErrCode::RouteUnreachable,
@@ -476,17 +1968,61 @@ impl Ingress {
                 .await;
             return Some(ErrCode::RouteUnreachable);
         };
+        if frame.header.flags & crate::frame::flags::TELL_ACK != 0
+            && sender.peer_capabilities() & crate::handshake::caps::TELL_COMPLETION == 0
+        {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                &frame.path,
+                ErrCode::ProtocolViolation,
+                "next hop does not support completion TELL",
+            ));
+            return Some(ErrCode::ProtocolViolation);
+        }
+        if frame.type_key == crate::durable::DURABLE_KEY
+            && sender.peer_capabilities() & crate::handshake::caps::DURABLE_DELIVERY == 0
+        {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                &frame.path,
+                ErrCode::ProtocolViolation,
+                "next hop does not support durable delivery",
+            ));
+            return Some(ErrCode::ProtocolViolation);
+        }
         // 转发：新 cid + hop_count+1（防环；≥hop_limit 由对端 Frame 校验拒收）
         let forward_cid = router.next_cid();
         let mut fwd = frame.clone();
         fwd.header.correlation_id = forward_cid;
         fwd.header.hop_count = fwd.header.hop_count.saturating_add(1);
+        let fwd = match sender.trace_request(fwd) {
+            Ok(frame) => frame,
+            Err(error) => {
+                back.send_reply(Frame::reply_err(
+                    orig_cid,
+                    &frame.path,
+                    ErrCode::ProtocolViolation,
+                    &error.to_string(),
+                ));
+                return Some(ErrCode::ProtocolViolation);
+            }
+        };
         // Reserve before registering, then publish without an intervening await:
         // fast replies and cancellation cannot race map insertion.
-        let permit = match tokio::time::timeout(self.relay_table.ttl, sender.tx.reserve()).await {
+        let permit = match tokio::time::timeout(self.relay_table.ttl, sender.reserve(&fwd)).await {
             Ok(Ok(permit)) => permit,
+            Ok(Err(crate::error::RemoteError::Frame(error))) => {
+                let code = error.to_errcode();
+                back.send_reply(Frame::reply_err(
+                    orig_cid,
+                    &frame.path,
+                    code,
+                    &error.to_string(),
+                ));
+                return Some(code);
+            }
             _ => {
-                back.send_frame(Frame::reply_err(
+                back.send_reply(Frame::reply_err(
                     orig_cid,
                     &frame.path,
                     ErrCode::ConnectionLost,
@@ -497,22 +2033,33 @@ impl Ingress {
         };
         if !self
             .relay_table
-            .insert(forward_cid, orig_cid, back.clone(), target)
+            .insert(forward_cid, orig_cid, back.clone(), &sender)
         {
-            back.send_frame(Frame::reply_err(
+            let code = if sender.is_closed() || back.is_closed() {
+                ErrCode::ConnectionLost
+            } else {
+                ErrCode::Overloaded
+            };
+            back.send_reply(Frame::reply_err(
                 orig_cid,
                 &frame.path,
-                ErrCode::Overloaded,
-                "relay capacity exhausted",
+                code,
+                "relay admission unavailable",
             ));
-            return Some(ErrCode::Overloaded);
+            return Some(code);
         }
         permit.send(fwd);
-        RELAYED_ASK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if frame.header.frame_type == frame_type::TELL {
+            RELAYED_TELL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            RELAYED_ASK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // 方案 A：目标可直拨 → 向源注入 ROUTE_HINT（源学直连，后续帧不再
         // 经 hub——try_send 队列满仅丢弃 hint，学习退化为继续中转，无害）
         if let Some(addr) = router.dial_addr_of(target) {
-            back.send_frame(Frame::route_hint(target, &addr));
+            if let Ok(hint) = Frame::try_route_hint(target, &addr) {
+                back.send_frame(hint);
+            }
         }
         tracing::debug!(%target, forward_cid, orig_cid, "relayed ask");
         None
@@ -520,16 +2067,32 @@ impl Ingress {
 
     /// REPLY 回源：先查转发映射（本节点作为 hub 中转的回程），命中则
     /// 还原 orig_cid 送回源连接；未命中走本地回调表（本节点发起的 ask）。
-    fn relay_reply(&self, frame: &Frame) -> bool {
+    fn relay_reply(&self, frame: &Frame, source: &FrameSender) -> bool {
         let cid = frame.header.correlation_id;
-        if let Some((orig_cid, back)) = self.relay_table.take(cid) {
-            let mut out = frame.clone();
-            out.header.correlation_id = orig_cid;
-            back.send_frame(out);
-            tracing::debug!(cid, orig_cid, "relayed reply");
-            return true;
+        match self.relay_table.take_from(cid, source) {
+            RelayReply::Missing => false,
+            RelayReply::WrongSource => true,
+            RelayReply::Matched {
+                original_cid,
+                back,
+                expired,
+            } => {
+                if expired {
+                    back.send_reply(Frame::reply_err(
+                        original_cid,
+                        "",
+                        ErrCode::Timeout,
+                        "relay expired",
+                    ));
+                } else {
+                    let mut out = frame.clone();
+                    out.header.correlation_id = original_cid;
+                    back.send_reply(out);
+                }
+                tracing::debug!(cid, original_cid, expired, "relayed reply finalized");
+                true
+            }
         }
-        false
     }
 
     /// ROUTE_HINT 学习（方案 A）：hub 背书的直连地址入缓存；地址变化
@@ -566,6 +2129,10 @@ impl Ingress {
     /// hub/直连切换的端到端 FIFO；等待窗口不能替代此保证。
     /// 背压：bounded channel 满则 dispatch 挂起 → 读循环挂起（RC8 贯通）。
     async fn on_tell(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
+        if self.reorder_cancel.is_cancelled() {
+            DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let seq = frame.header.seq;
         let self_node = self
             .relay
@@ -582,40 +2149,51 @@ impl Ingress {
             self.tell_deliver_or_relay(frame, back).await;
             return;
         }
-        // 直连 seq 帧 → per-from 重排任务
-        let tx = self.reorder_tx_of(from_node).await;
-        if let Err(e) = tx.send(frame).await {
-            // 重排任务已消亡（不该发生——仅 actor 系统关闭时）→ 直投兜底
-            self.tell_deliver_or_relay(e.0, back).await;
+        // An idle worker may retire between sender acquisition and enqueue.
+        // Retry through the registered worker, never bypass FIFO via direct delivery.
+        let mut pending = frame;
+        loop {
+            let Some(tx) = self.reorder_tx_of(from_node) else {
+                DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            tokio::select! {
+                biased;
+                _ = self.reorder_cancel.cancelled() => {
+                    DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                },
+                result = tx.send(pending) => match result {
+                    Ok(()) => return,
+                    Err(error) => pending = error.0,
+                },
+            }
         }
     }
 
-    /// 取/建 per-from 重排任务 sender。
-    ///
-    /// 循环引用断链（RB2 根因修复）：任务持 Weak<Ingress>——map 存 sender、
-    /// 任务不持 Arc，Ingress 析构 → sender 全 drop → rx.recv() None →
-    /// 冲刷缓冲后退出。Idle 复用（RA5）：静默源连接超时后任务自清 + map
-    /// 摘除，防长寿命系统累积空任务。
-    async fn reorder_tx_of(self: &Arc<Self>, from: &str) -> tokio::sync::mpsc::Sender<Frame> {
-        if let Some(tx) = self
-            .reorder_tx
-            .lock()
-            .ok()
-            .and_then(|g| g.get(from).cloned())
-        {
-            return tx;
+    /// Register at most one worker per source, atomically with the close fence.
+    fn reorder_tx_of(self: &Arc<Self>, from: &str) -> Option<tokio::sync::mpsc::Sender<Frame>> {
+        let mut map = self.reorder_tx.lock().unwrap();
+        if self.reorder_cancel.is_cancelled() {
+            return None;
+        }
+        if let Some(tx) = map.get(from).filter(|tx| !tx.is_closed()) {
+            return Some(tx.clone());
         }
         let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(256);
-        let from_owned = from.to_string();
+        let registration = ReorderRegistration {
+            map: Arc::downgrade(&self.reorder_tx),
+            source: from.to_owned(),
+            sender: tx.downgrade(),
+        };
         let this = Arc::downgrade(self);
-        let map = Arc::downgrade(&self.reorder_tx);
-        tokio::spawn(async move {
-            Ingress::reorder_loop(this, map, from_owned, rx).await;
+        let cancel = self.reorder_cancel.clone();
+        map.insert(from.to_owned(), tx.clone());
+        self.reorder_tasks.spawn(async move {
+            let _registration = registration;
+            Ingress::reorder_loop(this, &_registration, rx, cancel).await;
         });
-        if let Ok(mut g) = self.reorder_tx.lock() {
-            g.insert(from.to_string(), tx.clone());
-        }
-        tx
+        Some(tx)
     }
 
     /// per 源节点重排循环：expected/BTreeMap 状态机 + recv 超时冲刷。
@@ -624,19 +2202,15 @@ impl Ingress {
     /// 250ms 超时路径：超时放行最小 seq（跳缺口），expected 跳至其+1；
     /// 缓冲余帧若与放行帧连续则一并投递。丢帧绝不永久阻塞。
     ///
-    /// 生命周期（RB2）：任务只持 Weak<Ingress>——系统关闭时 Ingress 析构
-    /// → 所有 sender drop → recv None → 冲刷（或计数）后退出，无泄漏。
-    /// 空闲回收（RA5）：连续 30s 无帧（无缺口缓冲才计时）→ 自清退场 +
-    /// map 摘除；下帧到达重建（expected 重置 1——冷启动路径已有 250ms
-    /// 有界等待语义，正确性不受影响）。
+    /// Idle workers retire only when no dispatcher holds a sender and no frame
+    /// is queued. Cancellation also interrupts awaited local lookup/delivery.
     async fn reorder_loop(
         weak_ing: std::sync::Weak<Ingress>,
-        weak_map: std::sync::Weak<
-            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>,
-        >,
-        from: String,
+        registration: &ReorderRegistration,
         mut rx: tokio::sync::mpsc::Receiver<Frame>,
+        cancel: tokio_util::sync::CancellationToken,
     ) {
+        let from = &registration.source;
         let mut expected: u32 = 1;
         let mut buf: std::collections::BTreeMap<u32, Frame> = Default::default();
         // 旋钮启动时快照（任务生命周期内固定——避免运行中改配置引发
@@ -657,121 +2231,67 @@ impl Ingress {
             })
             .unwrap_or((std::time::Duration::from_millis(250), 1024));
         let idle_gc = tokio::time::Duration::from_secs(30);
-        loop {
-            let f = tokio::select! {
-                f = rx.recv() => match f {
-                    Some(f) => f,
-                    None => {
-                        // 通道关闭。可达路径只有 Ingress 析构（所有 map
-                        // sender 随之 drop）——此刻 upgrade 必然失败，缓冲
-                        // 帧按系统关闭语义终结计数。（保留 upgrade 探测只
-                        // 为防御 map 被外部清空而 Ingress 存活的假想路径。）
-                        if let Some(this) = weak_ing.upgrade() {
-                            debug_assert!(
-                                false,
-                                "channel closed while Ingress alive — map must hold a sender"
-                            );
-                            let _ = this; // 防御：不投递（状态机已无意义）
+        let work = async {
+            loop {
+                let f = tokio::select! {
+                    f = rx.recv() => match f {
+                        Some(f) => f,
+                        None => return,
+                    },
+                    _ = tokio::time::sleep(idle_gap), if !buf.is_empty() => {
+                        // 缺口超时：放行最小 seq（跳缺口）
+                        let min_seq = *buf.keys().next().unwrap();
+                        let f = buf.remove(&min_seq).unwrap();
+                        REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            from = %from, expected, got = min_seq,
+                            "reorder gap timeout: released buffered TELL (missing frame presumed lost)"
+                        );
+                        expected = min_seq.wrapping_add(1);
+                        // 连续后继一并放行
+                        let mut chain = vec![f];
+                        while let Some(&k) = buf.keys().next() {
+                            if k == expected {
+                                chain.push(buf.remove(&k).unwrap());
+                                expected = expected.wrapping_add(1);
+                            } else {
+                                break;
+                            }
                         }
-                        if !buf.is_empty() {
-                            tracing::debug!(from = %from, buffered = buf.len(),
-                                "reorder loop closed: buffered frames finalized on shutdown");
-                        }
-                        REORDER_DROPPED_ON_SHUTDOWN
-                            .fetch_add(buf.len() as u64, Ordering::Relaxed);
-                        return;
-                    }
-                },
-                _ = tokio::time::sleep(idle_gap), if !buf.is_empty() => {
-                    // 缺口超时：放行最小 seq（跳缺口）
-                    let min_seq = *buf.keys().next().unwrap();
-                    let f = buf.remove(&min_seq).unwrap();
-                    REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        from = %from, expected, got = min_seq,
-                        "reorder gap timeout: released buffered TELL (missing frame presumed lost)"
-                    );
-                    expected = min_seq.wrapping_add(1);
-                    // 连续后继一并放行
-                    let mut chain = vec![f];
-                    while let Some(&k) = buf.keys().next() {
-                        if k == expected {
-                            chain.push(buf.remove(&k).unwrap());
-                            expected = expected.wrapping_add(1);
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Some(this) = weak_ing.upgrade() {
-                        let back = FrameSender::detached();
-                        for fr in chain {
-                            this.tell_deliver_or_relay(fr, &back).await;
-                        }
-                    } else {
-                        REORDER_DROPPED_ON_SHUTDOWN
-                            .fetch_add(chain.len() as u64, Ordering::Relaxed);
-                    }
-                    continue;
-                },
-                _ = tokio::time::sleep(idle_gc), if buf.is_empty() => {
-                    // 空闲回收：30s 无帧且无缓冲 → 退场 + map 摘除。
-                    // 竞态安全：map 摘除与 reorder_tx_of 建任务互斥——
-                    // 若此刻恰有新帧已拿到旧 sender，其 send 走 Err 分支
-                    // 直投兜底（on_tell 已处理），不丢帧。
-                    if let Some(map) = weak_map.upgrade() {
-                        if let Ok(mut g) = map.lock() {
-                            g.remove(&from);
-                        }
-                    }
-                    REORDER_TASK_RECYCLED.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(from = %from, idle_secs = 30, "reorder task recycled (idle)");
-                    return;
-                }
-            };
-            let seq = f.header.seq;
-            if seq == expected {
-                if let Some(this) = weak_ing.upgrade() {
-                    let back = FrameSender::detached();
-                    this.tell_deliver_or_relay(f, &back).await;
-                }
-                expected = expected.wrapping_add(1);
-                // drain 连续后继
-                while let Some(&k) = buf.keys().next() {
-                    if k == expected {
-                        let fr = buf.remove(&k).unwrap();
                         if let Some(this) = weak_ing.upgrade() {
                             let back = FrameSender::detached();
-                            this.tell_deliver_or_relay(fr, &back).await;
+                            for fr in chain {
+                                this.tell_deliver_or_relay(fr, &back).await;
+                            }
+                        } else {
+                            REORDER_DROPPED_ON_SHUTDOWN
+                                .fetch_add(chain.len() as u64, Ordering::Relaxed);
                         }
-                        expected = expected.wrapping_add(1);
-                    } else {
-                        break;
+                        continue;
+                    },
+                    _ = tokio::time::sleep(idle_gc), if buf.is_empty() => {
+                        // A sender clone may have been handed to a concurrent
+                        // dispatcher. It and any queued frames must survive idle GC.
+                        let Some(map) = registration.map.upgrade() else { return; };
+                        let mut map = map.lock().unwrap();
+                        let idle = map.get(from).is_some_and(|tx| tx.strong_count() == 1 && rx.is_empty());
+                        if !idle { continue; }
+                        rx.close();
+                        map.remove(from);
+                        drop(map);
+                        REORDER_TASK_RECYCLED.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(from = %from, idle_secs = 30, "reorder task recycled (idle)");
+                        return;
                     }
-                }
-            } else if seq.wrapping_sub(expected) > u32::MAX / 2 {
-                // seq "小于" expected（回绕安全比较）→ 迟到帧，丢弃
-                LATE_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(from = %from, seq, expected, "late TELL dropped (gap already flushed)");
-            } else {
-                // seq "大于" expected → 缓冲（BTreeMap 去重天然幂等——
-                // 同 seq 重复帧只保一个，防对端 bug 打爆内存）
-                if buf.insert(seq, f).is_none() {
-                    REORDER_BUFFERED.fetch_add(1, Ordering::Relaxed);
-                }
-                if buf.len() > buffer_cap {
-                    // 防打爆上限：放行最小 seq（跳缺口）
-                    let min_seq = *buf.keys().next().unwrap();
-                    let f = buf.remove(&min_seq).unwrap();
-                    REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        from = %from, expected, got = min_seq, buffered = buf.len(),
-                        "reorder buffer overflow cap: released min seq"
-                    );
-                    expected = min_seq.wrapping_add(1);
+                };
+                let seq = f.header.seq;
+                if seq == expected {
                     if let Some(this) = weak_ing.upgrade() {
                         let back = FrameSender::detached();
                         this.tell_deliver_or_relay(f, &back).await;
                     }
+                    expected = expected.wrapping_add(1);
+                    // drain 连续后继
                     while let Some(&k) = buf.keys().next() {
                         if k == expected {
                             let fr = buf.remove(&k).unwrap();
@@ -784,42 +2304,147 @@ impl Ingress {
                             break;
                         }
                     }
+                } else if seq.wrapping_sub(expected) > u32::MAX / 2 {
+                    // seq "小于" expected（回绕安全比较）→ 迟到帧，丢弃
+                    LATE_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(from = %from, seq, expected, "late TELL dropped (gap already flushed)");
+                } else {
+                    // seq "大于" expected → 缓冲（BTreeMap 去重天然幂等——
+                    // 同 seq 重复帧只保一个，防对端 bug 打爆内存）
+                    if buf.insert(seq, f).is_none() {
+                        REORDER_BUFFERED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if buf.len() > buffer_cap {
+                        // 防打爆上限：放行最小 seq（跳缺口）
+                        let min_seq = *buf.keys().next().unwrap();
+                        let f = buf.remove(&min_seq).unwrap();
+                        REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            from = %from, expected, got = min_seq, buffered = buf.len(),
+                            "reorder buffer overflow cap: released min seq"
+                        );
+                        expected = min_seq.wrapping_add(1);
+                        if let Some(this) = weak_ing.upgrade() {
+                            let back = FrameSender::detached();
+                            this.tell_deliver_or_relay(f, &back).await;
+                        }
+                        while let Some(&k) = buf.keys().next() {
+                            if k == expected {
+                                let fr = buf.remove(&k).unwrap();
+                                if let Some(this) = weak_ing.upgrade() {
+                                    let back = FrameSender::detached();
+                                    this.tell_deliver_or_relay(fr, &back).await;
+                                }
+                                expected = expected.wrapping_add(1);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            _ = work => {},
         }
+        REORDER_DROPPED_ON_SHUTDOWN.fetch_add((buf.len() + rx.len()) as u64, Ordering::Relaxed);
     }
 
     /// TELL 实际投递（本地命中 / hub 中转 / 死信）——原 on_tell 主体。
     async fn tell_deliver_or_relay(&self, frame: Frame, back: &FrameSender) {
+        tokio::select! {
+            biased;
+            _ = self.reorder_cancel.cancelled() => {},
+            _ = async {
+                let cleanup = Cleanup::default();
+                if unwind::run(&cleanup, || Box::pin(self.tell_deliver_open(frame, back))).await.is_err() {
+                    DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
+            } => {},
+        }
+    }
+
+    async fn tell_deliver_open(&self, mut frame: Frame, back: &FrameSender) {
+        let Ok(context) = self.request_context(&mut frame) else {
+            back.close();
+            return;
+        };
+        parrot_api::trace::scope(context, self.tell_deliver_scoped(frame, back)).await;
+    }
+
+    async fn tell_deliver_scoped(&self, mut frame: Frame, back: &FrameSender) {
+        self.mirror_application(&frame);
+        self.resolve_application_path(&mut frame);
         if self.is_remote_target(&frame.path) {
             if !self.try_relay_tell(&frame, back) {
                 DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
-        let decoded = match CodecRegistry::global().decode_incoming(&frame.type_key, &frame.payload)
+        let cleanup = Cleanup::default();
+        let decoded = match cleanup
+            .call(|| CodecRegistry::global().decode_incoming(&frame.type_key, &frame.payload))
         {
-            Ok(m) => m,
-            Err(code) => {
-                // 边界观测：type_key 未注册=两端编解码表漂移（部署版本
-                // 不齐）；CodecError=载荷损坏。带 type_key 定位是哪个键。
-                tracing::debug!(
-                    type_key = %frame.type_key, path = %frame.path,
-                    code = code.name(), payload_len = frame.payload.len(),
-                    "TELL decode failed → dead letter (codec registry drift?)"
-                );
-                DEAD_TELL_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Ok(message)) => message,
+            outcome => {
+                let code = match outcome {
+                    Ok(Err(code)) => code,
+                    _ => ErrCode::ProtocolViolation,
+                };
+                let _ = cleanup.call(|| tracing::debug!(
+                    type_key = %frame.type_key, path = %frame.path, code = code.name(),
+                    payload_len = frame.payload.len(), "TELL decode failed → dead letter (codec registry drift?)"
+                ));
+                DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
-        if let Some(r) = self.local.lookup(local_path(&frame.path)).await {
-            // deliver 挂起 = 读循环挂起 = 对端背压贯通（05 §6.3，RC8）
-            let _ = r.deliver(decoded).await;
-        } else if self.try_relay_tell(&frame, back) {
-            // hub 中转（TELL 无回程——fire-and-forget 转发）
-        } else {
-            DEAD_TELL_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(path = %frame.path, "TELL to unknown actor (dead letter)");
+        let mut decoded = cleanup.owned(decoded);
+        let mut failed = false;
+        match unwind::run(&cleanup, || self.local.lookup(local_path(&frame.path))).await {
+            Ok(Some(target)) => {
+                let mut target = cleanup.owned(target);
+                let result = if cleanup.failed() {
+                    Err(())
+                } else {
+                    unwind::run(&cleanup, || {
+                        if frame.header.flags & crate::frame::flags::URGENT != 0 {
+                            target.value().deliver_with_options(
+                                decoded.take(),
+                                parrot_api::message::MessageOptions {
+                                    priority: parrot_api::message::MessagePriority::HIGH,
+                                    ..Default::default()
+                                },
+                            )
+                        } else {
+                            target.value().deliver(decoded.take())
+                        }
+                    })
+                    .await
+                };
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        failed = true;
+                        let mut error = cleanup.owned(error);
+                        let _ = cleanup.call(|| tracing::debug!(path = %frame.path, error = %error.value(), "TELL admission rejected"));
+                        error.retire();
+                    }
+                    Err(()) => failed = true,
+                }
+                target.retire();
+            }
+            Ok(None) => {
+                decoded.retire();
+                failed = cleanup.failed() || !self.try_relay_tell(&frame, back);
+            }
+            Err(()) => failed = true,
+        }
+        decoded.retire();
+        if failed || cleanup.failed() {
+            DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -849,39 +2474,86 @@ impl Ingress {
         };
         let mut fwd = frame.clone();
         fwd.header.hop_count = fwd.header.hop_count.saturating_add(1);
+        let Ok(fwd) = sender.trace_request(fwd) else {
+            return false;
+        };
         if sender.send_frame_sync(fwd).is_err() {
             return false;
         }
         RELAYED_TELL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // 方案 A：同 ask——向源注入直连 hint
         if let Some(addr) = router.dial_addr_of(target) {
-            back.send_frame(Frame::route_hint(target, &addr));
+            if let Ok(hint) = Frame::try_route_hint(target, &addr) {
+                back.send_frame(hint);
+            }
         }
         tracing::debug!(%target, "relayed tell");
         true
     }
 
-    async fn on_stop(&self, frame: Frame) {
-        if self.is_remote_target(&frame.path) {
-            self.try_relay_tell(&frame, &FrameSender::detached());
-            return;
+    async fn on_stop(&self, mut frame: Frame) {
+        let cleanup = Cleanup::default();
+        let _ = unwind::run(&cleanup, || {
+            Box::pin(async {
+                self.resolve_application_path(&mut frame);
+                if self.is_remote_target(&frame.path) {
+                    self.try_relay_tell(&frame, &FrameSender::detached());
+                    return;
+                }
+                if let Ok(Some(target)) =
+                    unwind::run(&cleanup, || self.local.lookup(local_path(&frame.path))).await
+                {
+                    let mut target = cleanup.owned(target);
+                    if !cleanup.failed() {
+                        if let Ok(result) = unwind::run(&cleanup, || target.value().stop()).await {
+                            cleanup.dispose(result);
+                        }
+                    }
+                    target.retire();
+                }
+            })
+        })
+        .await;
+    }
+
+    pub(crate) fn connection_closed(&self, connection: &FrameSender) {
+        self.callbacks
+            .fail_connection(connection, ErrCode::ConnectionLost, "connection lost");
+        let mut pending = self.resolve_pending.lock().unwrap();
+        let ids: Vec<u64> = pending
+            .iter()
+            .filter_map(|(cid, slot)| slot.connection.same_connection(connection).then_some(*cid))
+            .collect();
+        for cid in ids {
+            if let Some(slot) = pending.remove(&cid) {
+                let _ = slot.tx.send(ReplyPayload::Err(
+                    ErrCode::ConnectionLost,
+                    "connection lost".into(),
+                ));
+            }
         }
-        if let Some(r) = self.local.lookup(local_path(&frame.path)).await {
-            let _ = r.stop().await;
+        for (cid, back) in self.relay_table.fail_connection(connection) {
+            back.send_reply(Frame::reply_err(
+                cid,
+                "",
+                ErrCode::ConnectionLost,
+                "relay connection lost",
+            ));
         }
     }
 
-    fn on_reply(&self, frame: Frame) {
+    fn on_reply(&self, frame: Frame, source: &FrameSender) {
         // hub 中转回程优先（本节点转发的 ask 的 REPLY——还原 cid 回源）
-        if self.relay_reply(&frame) {
+        if self.relay_reply(&frame, source) {
             return;
         }
         let cid = frame.header.correlation_id;
         match frame.header.frame_type {
             frame_type::REPLY => {
-                if !self.callbacks.complete(
+                if !self.callbacks.complete_from(
                     cid,
                     ReplyPayload::Ok(frame.payload.clone(), frame.type_key.clone()),
+                    source,
                 ) {
                     // 边界观测：无主 REPLY 常见于①ask 已超时回收 ②重复
                     // REPLY ③cid 漂移（hub 转发表错乱）。带 cid 便于对账。
@@ -894,10 +2566,28 @@ impl Ingress {
             _ => {
                 let (code, detail) = decode_err_payload(&frame.payload)
                     .unwrap_or((ErrCode::ProtocolViolation, "<undecodable>".into()));
-                if !self
-                    .callbacks
-                    .complete(cid, ReplyPayload::Err(code, detail.clone()))
-                {
+                if self.fail_resolve(cid, source, code, &detail) {
+                    return;
+                }
+                let hook = self.sys_event.read().unwrap().clone();
+                if let Some(hook) = hook {
+                    let cleanup = Cleanup::default();
+                    let _close = cleanup.close_on_failure(source);
+                    let mut hook = cleanup.owned(hook);
+                    let consumed =
+                        cleanup.call(|| hook.value().on_reply_error(cid, code, &detail, source));
+                    hook.retire();
+                    // An uncertain or consuming hook must not accidentally
+                    // complete an ordinary actor callback with the same CID.
+                    if cleanup.failed() || consumed != Ok(false) {
+                        return;
+                    }
+                }
+                if !self.callbacks.complete_from(
+                    cid,
+                    ReplyPayload::Err(code, detail.clone()),
+                    source,
+                ) {
                     tracing::debug!(
                         cid, code = code.name(), %detail,
                         "REPLY_ERR completed no pending callback (timeout raced? duplicate?)"
@@ -909,13 +2599,15 @@ impl Ingress {
 }
 
 /// 断连清理钩子（RemoteActorSystem 注入 ConnectionTask）：
-/// callbacks.fail_node(ConnectionLost)（单链路隔离）+ NodeTable → Disconnected。
+/// Only callbacks bound to the closed connection fail; supplied statuses must
+/// belong exclusively to that connection.
 pub fn make_on_disconnect(
     callbacks: Arc<CallbackRegistry>,
     statuses: Vec<Arc<crate::node::NodeStatus>>,
-) -> Arc<dyn Fn(&str) + Send + Sync> {
-    Arc::new(move |node_id: &str| {
-        let n = callbacks.fail_node(node_id, ErrCode::ConnectionLost, "connection lost");
+) -> crate::transport::OnDisconnect {
+    Arc::new(move |connection: &FrameSender| {
+        let node_id = connection.node_id();
+        let n = callbacks.fail_connection(connection, ErrCode::ConnectionLost, "connection lost");
         if n > 0 {
             tracing::debug!(node = %node_id, pending = n, "callbacks failed on disconnect");
         }
@@ -1025,10 +2717,115 @@ mod tests {
         }
     }
 
+    struct ApplicationAliases;
+    #[async_trait]
+    impl LocalLookup for ApplicationAliases {
+        async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
+            panic!("opaque gateway requests must not enter local codec/actor dispatch")
+        }
+        fn forwarding_target(&self, path: &str) -> Option<String> {
+            (path == "/user/alias").then(|| "parrot://gateway/user/actual".into())
+        }
+    }
+    struct AliasRouter(FrameSender);
+    #[async_trait]
+    impl RelayRouter for AliasRouter {
+        fn sender_of(&self, node: &str) -> Option<FrameSender> {
+            (node == "gateway" || node == "other").then(|| self.0.clone())
+        }
+        fn next_cid(&self) -> u64 {
+            900
+        }
+        fn self_node(&self) -> &str {
+            "host"
+        }
+        fn dial_addr_of(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn on_hint(&self, _: &str, _: &str) {}
+    }
+    #[tokio::test]
+    async fn application_alias_forwards_opaque_ask_tell_stop_without_capturing_other_nodes() {
+        let ingress = Ingress::new(
+            Arc::new(ApplicationAliases),
+            Arc::new(CallbackRegistry::new(8)),
+        );
+        let (out, mut frames) = tokio::sync::mpsc::channel(8);
+        let destination = FrameSender::anon(out);
+        *ingress.relay_slot() = Some(Arc::new(AliasRouter(destination.clone())));
+        let (tx, mut replies) = tokio::sync::mpsc::channel(8);
+        let back = FrameSender::anon(tx);
+        let payload = Bytes::from_static(b"\0\xffopaque");
+        let request = Frame::ask(
+            7,
+            "parrot://host/user/alias",
+            "unknown:business",
+            payload.clone(),
+            None,
+        );
+        ingress.on_request(request.clone(), &back).await;
+        let forwarded = frames.recv().await.unwrap();
+        assert_eq!(forwarded.path, "parrot://gateway/user/actual");
+        assert_eq!(forwarded.type_key, request.type_key);
+        assert_eq!(forwarded.payload, request.payload);
+        assert_eq!(forwarded.header.hop_count, 1);
+        assert_eq!(forwarded.header.correlation_id, 900);
+        ingress.on_reply(
+            Frame::reply(900, "", "unknown:reply", payload.clone()),
+            &destination,
+        );
+        let reply = replies.recv().await.unwrap();
+        assert_eq!(reply.header.correlation_id, 7);
+        assert_eq!(reply.payload, payload);
+        assert!(ingress.relay_table.is_empty());
+        let mut exhausted = request;
+        exhausted.header.hop_limit = 1;
+        ingress.on_request(exhausted, &back).await;
+        assert_eq!(
+            replies.recv().await.unwrap().header.frame_type,
+            frame_type::REPLY_ERR
+        );
+        assert!(frames.try_recv().is_err());
+        for frame in [
+            Frame::tell("/user/alias", "unknown:business", payload.clone()),
+            Frame::stop("parrot://host/user/alias"),
+            Frame::tell(
+                "parrot://other/user/alias",
+                "unknown:business",
+                payload.clone(),
+            ),
+        ] {
+            let kind = frame.header.frame_type;
+            let expected_path = if frame.path.contains("other") {
+                "parrot://other/user/alias"
+            } else {
+                "parrot://gateway/user/actual"
+            };
+            if kind == frame_type::STOP {
+                ingress.on_stop(frame).await;
+            } else {
+                ingress.tell_deliver_or_relay(frame, &back).await;
+            }
+            let forwarded = frames.recv().await.unwrap();
+            assert_eq!(forwarded.path, expected_path);
+            assert_eq!(forwarded.header.frame_type, kind);
+            assert_eq!(forwarded.header.hop_count, 1);
+        }
+    }
+
     #[test]
     fn local_path_strips_node_prefix() {
         assert_eq!(local_path("parrot://node-b/user/echo"), "/user/echo");
         assert_eq!(local_path("/user/echo"), "/user/echo");
+        assert_eq!(
+            local_path("parrot://node-b/actix://Echo/id"),
+            "actix://Echo/id"
+        );
+        assert_eq!(local_path("actix://Echo/id"), "actix://Echo/id");
+        assert_eq!(
+            local_path("parrot://node-b/actix/Echo/id"),
+            "/actix/Echo/id"
+        );
     }
 
     fn ingress() -> (Arc<Ingress>, Arc<CallbackRegistry>) {
@@ -1499,8 +3296,10 @@ mod tests {
         let table = RelayTable::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let source = FrameSender::new(tx, "source");
-        assert!(table.insert(1, 101, source.clone(), "dest-a"));
-        assert!(table.insert(2, 102, source, "dest-b"));
+        let (a, _a_rx) = tokio::sync::mpsc::channel(4);
+        let (b, _b_rx) = tokio::sync::mpsc::channel(4);
+        assert!(table.insert(1, 101, source.clone(), &FrameSender::new(a, "dest-a")));
+        assert!(table.insert(2, 102, source, &FrameSender::new(b, "dest-b")));
         assert!(table.fail_target("source").is_empty());
         let failed = table.fail_target("dest-a");
         assert_eq!(failed.len(), 1);
@@ -1519,13 +3318,60 @@ mod tests {
             ttl: std::time::Duration::ZERO,
             capacity: 1,
         };
-        assert!(table.insert(1, 101, FrameSender::detached(), "dest"));
-        assert!(!table.insert(2, 102, FrameSender::detached(), "dest"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let source = FrameSender::anon(tx);
+        let (tx, _rx2) = tokio::sync::mpsc::channel(4);
+        let destination = FrameSender::new(tx, "dest");
+        assert!(table.insert(1, 101, source.clone(), &destination));
+        assert!(!table.insert(2, 102, source.clone(), &destination));
         let expired = table.expire();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].0, 101);
         assert!(table.is_empty());
-        assert!(table.insert(2, 102, FrameSender::detached(), "dest"));
+        assert!(table.insert(2, 102, source, &destination));
+    }
+
+    #[test]
+    fn expired_relay_reply_reports_timeout_instead_of_consuming_silently() {
+        let mut ingress = Ingress::new(Arc::new(TestLookup), Arc::new(CallbackRegistry::default()));
+        ingress.relay_table = Arc::new(RelayTable {
+            slots: Default::default(),
+            ttl: std::time::Duration::ZERO,
+            capacity: 2,
+        });
+        let (tx, mut replies) = tokio::sync::mpsc::channel(4);
+        let source = FrameSender::new(tx, "source");
+        let (tx, _target_rx) = tokio::sync::mpsc::channel(4);
+        let target = FrameSender::new(tx, "target");
+        assert!(ingress.relay_table.insert(1, 101, source, &target));
+        ingress.on_reply(Frame::reply(1, "", "bin:opaque#v1", Bytes::new()), &target);
+        let reply = replies
+            .try_recv()
+            .expect("expired request must have a terminal response");
+        assert_eq!(reply.header.correlation_id, 101);
+        assert_eq!(reply.header.frame_type, frame_type::REPLY_ERR);
+        assert_eq!(
+            decode_err_payload(&reply.payload).unwrap().0,
+            ErrCode::Timeout
+        );
+        assert!(ingress.relay_table.is_empty());
+    }
+
+    #[test]
+    fn full_relay_reply_queue_closes_source_instead_of_silently_losing_reply() {
+        let ingress = Ingress::new(Arc::new(TestLookup), Arc::new(CallbackRegistry::default()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let source = FrameSender::new(tx, "source");
+        let (tx, _target_rx) = tokio::sync::mpsc::channel(1);
+        let target = FrameSender::new(tx, "target");
+        assert!(ingress.relay_table.insert(1, 101, source.clone(), &target));
+        source.send_frame_sync(Frame::heartbeat()).unwrap();
+        ingress.on_reply(Frame::reply(1, "", "bin:opaque#v1", Bytes::new()), &target);
+        assert!(
+            source.is_closed(),
+            "a terminal response must not vanish on a full queue"
+        );
+        assert!(ingress.relay_table.is_empty());
     }
 
     // EG6：RelayMetrics 门面读数（不暴露 Atomic 原语的 API 契约）
@@ -1585,7 +3431,7 @@ mod tests {
 
         // ③ REPLY → 回调表完成
         let (tx_cb, rx_cb) = tokio::sync::oneshot::channel();
-        ch.insert(42, "n1", tx_cb).unwrap();
+        ch.insert_on(42, "n1", tx_cb, &back).unwrap();
         ig.dispatch(
             Frame::reply(42, "", "bin:t::R", Bytes::from_static(b"ok")),
             &back,
@@ -1597,7 +3443,7 @@ mod tests {
 
         // ④ REPLY_ERR → 回调表 Err
         let (tx_cb2, rx_cb2) = tokio::sync::oneshot::channel();
-        ch.insert(43, "n1", tx_cb2).unwrap();
+        ch.insert_on(43, "n1", tx_cb2, &back).unwrap();
         ig.dispatch(
             Frame::reply_err(43, "", ErrCode::Stopped, "stopped"),
             &back,
@@ -1608,24 +3454,26 @@ mod tests {
         assert!(matches!(got2, ReplyPayload::Err(ErrCode::Stopped, _)));
     }
 
-    // make_on_disconnect：fail_all + 状态置 Disconnected
+    // make_on_disconnect：仅当前连接的 bound callbacks + 专属状态置 Disconnected
     #[tokio::test]
-    async fn on_disconnect_hook_fails_all_and_flags_nodes() {
+    async fn on_disconnect_hook_fails_bound_callbacks_and_flags_its_statuses() {
         let callbacks = Arc::new(CallbackRegistry::new(64));
         let (tx, rx) = tokio::sync::oneshot::channel();
-        callbacks.insert(9, "n1", tx).unwrap();
+        let (writer, _reader) = tokio::sync::mpsc::channel(4);
+        let connection = FrameSender::new(writer, "n1");
+        callbacks.insert_on(9, "n1", tx, &connection).unwrap();
         let st = Arc::new(crate::node::NodeStatus::default());
         st.set(crate::node::NodeState::Connected);
         let hook = make_on_disconnect(callbacks.clone(), vec![st.clone()]);
-        hook("n1");
+        hook(&connection);
         let got = rx.await.unwrap();
         assert!(matches!(got, ReplyPayload::Err(ErrCode::ConnectionLost, _)));
         assert_eq!(st.get(), crate::node::NodeState::Disconnected);
     }
 
-    // ERROR 帧入站 → 仅日志（不 panic、不回帧）
+    // ERROR retires its connection without emitting a response.
     #[tokio::test]
-    async fn ingress_error_frame_swallowed() {
+    async fn ingress_error_frame_closes_connection_without_reply() {
         let (ig, _cb) = ingress();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(4);
         let back = FrameSender::anon(tx);
@@ -1633,6 +3481,10 @@ mod tests {
             .await;
         // 无回帧
         assert!(rx.try_recv().is_err());
+        assert!(
+            back.is_closed(),
+            "terminal ERROR left ingress connection active"
+        );
     }
 
     // 握手帧直入 ingress（防御式吞掉——正常路径连接层拦截）
@@ -1691,5 +3543,76 @@ mod tests {
         let f = rx.recv().await.unwrap();
         let (code, _) = decode_err_payload(&f.payload).unwrap();
         assert_eq!(code, ErrCode::UnknownTypeKey);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_reorder_registration_uses_one_queue() {
+        let (ingress, _) = recording_ingress();
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let ingress = ingress.clone();
+                let barrier = barrier.clone();
+                let runtime = tokio::runtime::Handle::current();
+                std::thread::spawn(move || {
+                    let _runtime = runtime.enter();
+                    barrier.wait();
+                    ingress.reorder_tx_of("concurrent-source").unwrap()
+                })
+            })
+            .collect();
+        let senders: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(
+            senders
+                .iter()
+                .all(|sender| sender.same_channel(&senders[0])),
+            "concurrent dispatch created multiple FIFO streams for one source"
+        );
+        ingress.close();
+        ingress.wait_closed().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_reorder_keeps_queue_held_by_dispatcher() {
+        let (ingress, sink) = recording_ingress();
+        let tx = ingress.reorder_tx_of("idle-held").unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !tx.is_closed(),
+            "idle GC invalidated a dispatcher-held sender"
+        );
+        tx.send(seq_tell(1, 1)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sink.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*sink.lock().unwrap(), vec![1]);
+        drop(tx);
+        ingress.close();
+        ingress.wait_closed().await;
+    }
+
+    #[tokio::test]
+    async fn retired_reorder_registration_cannot_remove_replacement() {
+        let (ingress, _) = recording_ingress();
+        let (old, _old_rx) = tokio::sync::mpsc::channel(1);
+        let old_registration = ReorderRegistration {
+            map: Arc::downgrade(&ingress.reorder_tx),
+            source: "same-source".into(),
+            sender: old.downgrade(),
+        };
+        let replacement = ingress.reorder_tx_of("same-source").unwrap();
+        drop(old_registration);
+        let current = ingress.reorder_tx_of("same-source").unwrap();
+        assert!(current.same_channel(&replacement));
+        ingress.close();
+        ingress.wait_closed().await;
     }
 }

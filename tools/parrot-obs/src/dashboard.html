@@ -1,0 +1,25 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<title>parrot-obs 控制台</title><style>
+body{font-family:-apple-system,"PingFang SC",monospace;margin:0;background:#0d1117;color:#c9d1d9}
+.hd{padding:14px 24px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center}
+.hd h1{font-size:18px;margin:0;color:#58a6ff}
+.meta{font-size:12px;color:#8b949e}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:8px 14px;border-bottom:1px solid #21262d;text-align:left}
+th{color:#8b949e;font-weight:600;background:#161b22;position:sticky;top:0}
+.ok{color:#3fb950}.err{color:#f85149}.num{color:#79c0ff}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px;padding:14px 24px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:14px}
+.card h3{margin:0 0 10px;font-size:14px;color:#58a6ff}
+.kv{display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-bottom:1px dashed #21262d}
+.kv b{color:#e6edf3;font-weight:500}
+.spark{font-size:11px;color:#8b949e;margin-top:8px;min-height:16px}
+.comps{font-size:12px;color:#8b949e;padding:2px 0}
+.comps code{color:#7ee787;background:#1b2a1f;padding:1px 6px;border-radius:4px;margin-right:6px}
+</style></head><body>
+<div class="hd"><h1>🦜 parrot-obs</h1><div class="meta" id="meta">connecting…</div></div>
+<table id="tbl"><thead><tr><th>节点</th><th>运行时</th><th>uptime</th><th>conn</th><th>asks</th>
+<th>tells</th><th>replies</th><th>errs</th><th>rx</th><th>tx</th><th>rss</th><th>速率 asks/s</th></tr></thead>
+<tbody id="rows"></tbody></table>
+<div class="grid" id="cards"></div>
+<script src="/dashboard.js" defer></script></body></html>

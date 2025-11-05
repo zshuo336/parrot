@@ -121,7 +121,11 @@ impl Mailbox for SpscRingbufMailbox {
             }
             if producer.is_full() {
                 match strategy {
-                    BackpressureStrategy::DropNewest => return Ok(()),
+                    BackpressureStrategy::DropNewest => {
+                        return Err(MailboxError::Dropped {
+                            capacity: self.capacity,
+                        });
+                    }
                     BackpressureStrategy::Error => {
                         return Err(MailboxError::Full {
                             capacity: self.capacity,
@@ -332,7 +336,7 @@ mod tests {
         let msg2 = Box::new("Second message") as BoxedMessage;
         let result = mailbox.push(msg2, BackpressureStrategy::DropNewest).await;
 
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(MailboxError::Dropped { capacity: 1 })));
         assert_eq!(mailbox.len().await, 1);
 
         let received = mailbox.pop().await.unwrap();

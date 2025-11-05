@@ -1,0 +1,24 @@
+# Run with the replay_cli example host, which registers example.replay-counter.
+name = "mirror-counter"
+version = "1.0.0"
+
+[[mirrors]]
+source = "primary"
+shadow = "shadow"
+
+[[components]]
+name = "primary"
+engine = "parrot"
+artifact = { Props = { factory = "example.replay-counter" } }
+[components.config]
+journal = "mirror-primary.log"
+
+[[components]]
+name = "shadow"
+engine = "parrot"
+artifact = { Props = { factory = "example.replay-counter" } }
+[components.config]
+journal = "mirror-shadow.log"
+
+[config_overlay.remote.node]
+bind = "127.0.0.1:0"

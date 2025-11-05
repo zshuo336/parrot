@@ -1,212 +1,128 @@
 import java.io.*;
 import java.net.*;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
-import java.util.concurrent.*;
+import java.nio.*;
+import java.nio.charset.*;
+import java.util.*;
 
-/**
- * Parrot Akka Gateway POC（纯 JDK 实现 Parrot Wire 协议）。
- *
- * 帧格式（LE）：
- *   [u32 frame_len][u8 ver][u8 frame_type][u16 flags][u64 cid][u64 reserved]
- *   [u32 path_len][path][u32 key_len][key][payload]
- *
- * 行为：
- *   - ASK(0x10)  → 查服务表 → 执行 → REPLY(0x11)/REPLY_ERR(0x12)
- *   - TELL(0x13) → 异步执行不回
- *   - REPLY/ERR  → 完成 pending Future
- *   - 启动 1s 后主动 ASK rust 侧 /user/rust_service（验证双向）
- *
- * akka 接入形态：services 表的 value 真实实现为
- *   payload -> actorRef.ask(new Cmd(payload), timeout) 的适配层。
+/** Historical class name; this fixture is pure JDK, not an Akka actor runtime.
+ * One connection, sequential business processing, bounded framing and pending.
  */
 public class AkkaGw {
     static final byte ASK = 0x10, REPLY = 0x11, REPLY_ERR = 0x12, TELL = 0x13;
-    static final ConcurrentHashMap<Long, CompletableFuture<byte[]>> pending = new ConcurrentHashMap<>();
-    /** service: type_key -> (reply_key, handler) */
-    static final ConcurrentHashMap<String, Map.Entry<String, java.util.function.Function<byte[], byte[]>>> services = new ConcurrentHashMap<>();
-    static long cidSeq = 0;
+    static final int MAX_BODY = 1024 * 1024;
+    record Frame(byte type, long cid, String path, String key, byte[] payload) {}
+    record Pending(long original, String expectedKey) {}
 
     public static void main(String[] args) throws Exception {
-        int port = args.length > 0 ? Integer.parseInt(args[0]) : 9801;
-
-        // "akka 服务"（POC：lambda；真实：ActorRef 适配）
-        services.put("bin:u:Ping", Map.entry("bin:u:Pong", payload -> {
-            long n = readU64(payload, 0);
-            return writeU64(n + 1);        // akka 方言：echo+1
-        }));
-        services.put("bin:u:Add", Map.entry("bin:u:AddR", payload -> {
-            long a = readU64(payload, 0), b = readU64(payload, 8);
-            return writeU64(a * 10 + b);   // akka 方言：a*10+b
-        }));
-
-        ServerSocket ss = new ServerSocket(port);
-        System.out.println("[akka-gw] listening on " + port);
-        Socket sock = ss.accept();
-        sock.setTcpNoDelay(true);
-        System.out.println("[akka-gw] rust node connected: " + sock.getRemoteSocketAddress());
-        ss.close();
-
-        DataInputStream in = new DataInputStream(new BufferedInputStream(sock.getInputStream()));
-        LinkedBlockingQueue<byte[]> outQ = new LinkedBlockingQueue<>();
-
-        Thread writer = new Thread(() -> {
-            try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(sock.getOutputStream()))) {
+        int port = args.length > 0 ? Integer.parseInt(args[0]) : 0;
+        String relay = args.length > 1 ? args[1] : null;
+        try (ServerSocket listener = new ServerSocket()) {
+            listener.bind(new InetSocketAddress("127.0.0.1", port));
+            System.out.println("POC_PORT " + listener.getLocalPort());
+            try (Socket sock = listener.accept()) {
+                sock.setTcpNoDelay(true);
+                var in = new DataInputStream(new BufferedInputStream(sock.getInputStream()));
+                var out = new DataOutputStream(new BufferedOutputStream(sock.getOutputStream()));
+                Map<Long, Pending> pending = new HashMap<>();
+                long next = 1, tells = 0;
                 while (true) {
-                    byte[] frame = outQ.take();
-                    out.write(frame);
-                    out.flush();
-                }
-            } catch (Exception e) { System.exit(0); }
-        });
-        writer.setDaemon(true);
-        writer.start();
-
-        // 主动 ask rust 侧（双向验证）
-        ScheduledExecutorService sched = Executors.newSingleThreadScheduledExecutor();
-        sched.schedule(() -> {
-            try {
-                long cid = ++cidSeq;
-                pending.put(cid, new CompletableFuture<>());
-                outQ.add(buildFrame(ASK, cid,
-                        "/user/rust_service".getBytes(StandardCharsets.UTF_8),
-                        "bin:u:Ping".getBytes(StandardCharsets.UTF_8),
-                        writeU64(100)));
-                byte[] reply = pending.get(cid).get(5, TimeUnit.SECONDS);
-                System.out.println("[akka-gw] ask rust /user/rust_service Ping(100) -> " + readU64(reply, 0));
-            } catch (Exception e) {
-                System.out.println("[akka-gw] ask rust failed: " + e);
-            }
-        }, 1, TimeUnit.SECONDS);
-
-        // P4 mesh 中继验证：args[1] = 中继目标路径（如 /erl/user/erlang_service）。
-        // 该 ask 经 parrot hub 前缀路由转发给另一个运行时，验证网关两两互访。
-        if (args.length > 1) {
-            String relayTarget = args[1];
-            sched.schedule(() -> {
-                try {
-                    long cid = ++cidSeq;
-                    pending.put(cid, new CompletableFuture<>());
-                    outQ.add(buildFrame(ASK, cid,
-                            relayTarget.getBytes(StandardCharsets.UTF_8),
-                            "bin:u:Ping".getBytes(StandardCharsets.UTF_8),
-                            writeU64(100)));
-                    byte[] reply = pending.get(cid).get(8, TimeUnit.SECONDS);
-                    System.out.println("[akka-gw] relay ask " + relayTarget + " Ping(100) -> " + readU64(reply, 0));
-                } catch (Exception e) {
-                    System.out.println("[akka-gw] relay ask failed: " + e);
-                }
-            }, 2, TimeUnit.SECONDS);
-        }
-
-        // 读循环
-        while (true) {
-            int frameLen = readU32LE(in);
-            byte[] body = new byte[frameLen];
-            in.readFully(body);
-            ByteBuffer bb = ByteBuffer.wrap(body);
-            byte ver = bb.get();               // ver（POC 只支持 1）
-            byte ft = bb.get();
-            /* short flags = */ readU16LE(bb);
-            long cid = readU64LE(bb);
-            /* long reserved = */ readU64LE(bb);
-            String path = getString(bb);
-            String key = getString(bb);
-            byte[] payload = new byte[bb.remaining()];
-            bb.get(payload);
-            if (ver != 1) { System.err.println("[akka-gw] bad ver " + ver); continue; }
-
-            switch (ft) {
-                case ASK -> {
-                    var svc = services.get(key);
-                    if (svc == null) {
-                        outQ.add(buildFrame(REPLY_ERR, cid, new byte[0], new byte[0],
-                                ("unknown service: " + key).getBytes(StandardCharsets.UTF_8)));
-                    } else {
-                        try {
-                            byte[] result = svc.getValue().apply(payload);
-                            outQ.add(buildFrame(REPLY, cid, new byte[0],
-                                    svc.getKey().getBytes(StandardCharsets.UTF_8), result));
-                        } catch (Exception e) {
-                            outQ.add(buildFrame(REPLY_ERR, cid, new byte[0], new byte[0],
-                                    String.valueOf(e).getBytes(StandardCharsets.UTF_8)));
+                    Frame f;
+                    try { f = readFrame(in); }
+                    catch (EOFException closed) { break; }
+                    switch (f.type) {
+                        case ASK -> {
+                            try {
+                                if (Set.of("bin:u:Probe", "bin:u:Relay", "bin:u:RelayTell").contains(f.key)) {
+                                    requireLength(f.payload, 0);
+                                    if (pending.size() >= 128) throw new IOException("pending limit");
+                                    String target = f.key.equals("bin:u:Probe") ? "/user/rust_service" : relay;
+                                    if (target == null) throw new IOException("relay not configured");
+                                    boolean tell = f.key.equals("bin:u:RelayTell");
+                                    if (tell) send(out, TELL, 0, target, "bin:u:Ping", writeU64(42));
+                                    String key = tell ? "bin:u:TellCount" : "bin:u:Ping";
+                                    pending.put(next, new Pending(f.cid, tell ? "bin:u:AddR" : "bin:u:Pong"));
+                                    send(out, ASK, next++, target, key, tell ? new byte[0] : writeU64(100));
+                                } else if (f.key.equals("bin:u:TellCount")) {
+                                    requireLength(f.payload, 0);
+                                    send(out, REPLY, f.cid, "", "bin:u:AddR", writeU64(tells));
+                                } else {
+                                    var result = service(f.key, f.payload);
+                                    send(out, REPLY, f.cid, "", result.getKey(), result.getValue());
+                                }
+                            } catch (Exception error) {
+                                send(out, REPLY_ERR, f.cid, "", "", String.valueOf(error).getBytes(StandardCharsets.UTF_8));
+                            }
                         }
+                        case TELL -> {
+                            try { service(f.key, f.payload); tells++; }
+                            catch (Exception rejected) { /* No receipt for invalid TELL. */ }
+                        }
+                        case REPLY, REPLY_ERR -> {
+                            Pending p = pending.remove(f.cid);
+                            if (p != null) {
+                                if (f.type == REPLY && f.key.equals(p.expectedKey) && f.payload.length == 8)
+                                    send(out, REPLY, p.original, "", "bin:u:AddR", f.payload);
+                                else send(out, REPLY_ERR, p.original, "", "", "invalid reverse reply".getBytes(StandardCharsets.UTF_8));
+                            }
+                        }
+                        default -> { /* STOP has no lifecycle meaning in this one-service fixture. */ }
                     }
                 }
-                case TELL -> {
-                    var svc = services.get(key);
-                    if (svc != null) CompletableFuture.runAsync(() -> svc.getValue().apply(payload));
-                }
-                case REPLY -> {
-                    var f = pending.remove(cid);
-                    if (f != null) f.complete(payload);
-                }
-                case REPLY_ERR -> {
-                    var f = pending.remove(cid);
-                    if (f != null) f.completeExceptionally(new RuntimeException(new String(payload, StandardCharsets.UTF_8)));
-                }
-                default -> System.out.println("[akka-gw] unknown ft " + ft);
             }
         }
     }
 
-    static String getString(ByteBuffer bb) {
-        int len = readU32LEBB(bb);
-        byte[] b = new byte[len];
-        bb.get(b);
-        return new String(b, StandardCharsets.UTF_8);
+    static Map.Entry<String, byte[]> service(String key, byte[] payload) throws IOException {
+        return switch (key) {
+            case "bin:u:Ping" -> {
+                requireLength(payload, 8);
+                yield Map.entry("bin:u:Pong", writeU64(readU64(payload, 0) + 1));
+            }
+            case "bin:u:Add" -> {
+                requireLength(payload, 16);
+                yield Map.entry("bin:u:AddR", writeU64(readU64(payload, 0) * 10 + readU64(payload, 8)));
+            }
+            default -> throw new IOException("unknown_service: " + key);
+        };
     }
-
-    // ---- 帧构造（LE） ----
-    // 头部实际布局（与 rust POC encode 一致）：
-    //   [u32 frame_len] + ver(1) ft(1) flags(2) cid(8) reserved(8) path_len(4) key_len(4)
-    //   = 28B 头 + path + key + payload
-    static byte[] buildFrame(byte ft, long cid, byte[] path, byte[] key, byte[] payload) {
-        int bodyLen = 28 + path.length + key.length + payload.length;
-        ByteBuffer buf = ByteBuffer.allocate(4 + bodyLen);
-        writeU32LE(buf, bodyLen);
-        buf.put((byte) 1);
-        buf.put(ft);
-        writeU16LE(buf, (short) 0);
-        writeU64LE(buf, cid);
-        writeU64LE(buf, 0L);                 // reserved
-        writeU32LE(buf, path.length); buf.put(path);
-        writeU32LE(buf, key.length);  buf.put(key);
-        buf.put(payload);
-        return buf.array();
+    static void requireLength(byte[] payload, int expected) throws IOException {
+        if (payload.length != expected) throw new IOException("invalid payload length");
     }
-
-    static void writeU32LE(ByteBuffer b, int v) {
-        b.put((byte) v); b.put((byte)(v >>> 8)); b.put((byte)(v >>> 16)); b.put((byte)(v >>> 24));
+    static String string(ByteBuffer body) throws IOException {
+        if (body.remaining() < 4) throw new IOException("missing string length");
+        int size = body.getInt();
+        if (size < 0 || size > body.remaining()) throw new IOException("invalid string length");
+        ByteBuffer value = body.slice(); value.limit(size);
+        body.position(body.position() + size);
+        return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT).decode(value).toString();
     }
-    static void writeU16LE(ByteBuffer b, short v) { b.put((byte) v); b.put((byte)(v >>> 8)); }
-    static void writeU64LE(ByteBuffer b, long v) { for (int i = 0; i < 8; i++) b.put((byte)(v >>> (8 * i))); }
-    static byte[] writeU64(long v) {
-        byte[] a = new byte[8];
-        for (int i = 0; i < 8; i++) a[i] = (byte)(v >>> (8 * i));
-        return a;
+    static Frame readFrame(DataInputStream in) throws IOException {
+        int size = Integer.reverseBytes(in.readInt());
+        if (size < 28 || size > MAX_BODY) throw new IOException("invalid frame length");
+        byte[] data = new byte[size]; in.readFully(data);
+        ByteBuffer body = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+        byte version = body.get(), type = body.get();
+        short flags = body.getShort(); long cid = body.getLong(), reserved = body.getLong();
+        if (version != 1 || type < ASK || type > 0x14 || flags != 0 || reserved != 0)
+            throw new IOException("unsupported frame header");
+        String path = string(body), key = string(body);
+        byte[] payload = new byte[body.remaining()]; body.get(payload);
+        return new Frame(type, cid, path, key, payload);
     }
-    static int readU32LE(DataInputStream in) throws IOException {
-        int b0 = in.readUnsignedByte(), b1 = in.readUnsignedByte(), b2 = in.readUnsignedByte(), b3 = in.readUnsignedByte();
-        return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+    static void send(DataOutputStream out, byte type, long cid, String path, String key, byte[] payload) throws IOException {
+        byte[] p = path.getBytes(StandardCharsets.UTF_8), k = key.getBytes(StandardCharsets.UTF_8);
+        long size = 28L + p.length + k.length + payload.length;
+        if (size > MAX_BODY) throw new IOException("frame exceeds limit");
+        ByteBuffer b = ByteBuffer.allocate((int) size + 4).order(ByteOrder.LITTLE_ENDIAN);
+        b.putInt((int) size).put((byte)1).put(type).putShort((short)0).putLong(cid).putLong(0);
+        b.putInt(p.length).put(p).putInt(k.length).put(k).put(payload);
+        out.write(b.array()); out.flush();
     }
-    static short readU16LE(ByteBuffer bb) {
-        int b0 = bb.get() & 0xFF, b1 = bb.get() & 0xFF;
-        return (short) ((b1 << 8) | b0);
+    static long readU64(byte[] payload, int offset) {
+        return ByteBuffer.wrap(payload, offset, 8).order(ByteOrder.LITTLE_ENDIAN).getLong();
     }
-    static long readU64LE(ByteBuffer bb) {
-        long v = 0;
-        for (int i = 0; i < 8; i++) v |= (bb.get() & 0xFFL) << (8 * i);
-        return v;
-    }
-    static int readU32LEBB(ByteBuffer bb) {
-        int b0 = bb.get() & 0xFF, b1 = bb.get() & 0xFF, b2 = bb.get() & 0xFF, b3 = bb.get() & 0xFF;
-        return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
-    }
-    static long readU64(byte[] a, int off) {
-        long v = 0;
-        for (int i = 0; i < 8; i++) v |= (a[off + i] & 0xFFL) << (8 * i);
-        return v;
+    static byte[] writeU64(long n) {
+        return ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(n).array();
     }
 }

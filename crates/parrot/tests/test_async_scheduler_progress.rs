@@ -74,6 +74,7 @@ fn run_chain(sharded: bool, init: bool) {
     rt.block_on(async {
         let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
             shared_pool_size: 1,
+            shared_queue_capacity: 1,
             shared_burst_workers_max: 0,
             ..Default::default()
         });

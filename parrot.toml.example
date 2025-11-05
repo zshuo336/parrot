@@ -4,6 +4,19 @@
 # 一致）。按需覆盖——只写想改的键。
 #
 # 环境变量展开：${VAR} / ${VAR:-default}（K8s ConfigMap 注入风格）。
+# 默认 parrot.toml 可不存在；PARROT_CONFIG 或 load_file 显式指定的文件必须存在。
+# 未知键、类型错误、非法角色/载体和不合法容量会报错，不会静默使用默认值。
+
+# ---------------------------------------------------------------------------
+# [topology] -- originating business traffic; roles remain under remote.node
+# ---------------------------------------------------------------------------
+[topology]
+# hub: prefer the live hub; mesh: direct only; hybrid: direct then optional relay
+#mode = "hybrid"
+# Hub: direct fallback when no live hub exists; hybrid: relay after direct failure.
+# Mesh never relays. A hub/border endpoint can send directly to its spokes.
+#relay_fallback = true
+# Administrative and mirror traffic always uses the named direct destination.
 
 # ---------------------------------------------------------------------------
 # [thread] —— ThreadActorSystem 调度域
@@ -18,6 +31,8 @@
 # 突发 worker 空闲多久回收，毫秒（默认 5000）
 #shared_burst_idle_timeout_ms = 5000
 # 共享调度队列容量（默认 10000）
+# 高/普通优先级共用的就绪队列容量；满时合并到已有 actor 注册状态等待调度。
+# 不限制 actor 数量；每个邮箱仍按自己的容量对生产者施加背压。
 #shared_queue_capacity = 10000
 # 专用线程上限（默认 32）
 #max_dedicated_threads = 32
@@ -44,7 +59,23 @@
 # 可直拨地址（方案 A——hub 据此注入 ROUTE_HINT 促成 spoke 两两直连）
 #direct_addr = "10.0.0.5:9801"
 # 种子节点 ["tcp://node-id@host:port", ...]（node-id@ 可省略）
-#seeds = ["tcp://127.0.0.1:9800"]
+# 种子载体须与 scheme 一致；域名使用 RemoteConfig::from_resolved_async 解析。
+# start 后自动尝试种子；本地启动成功不等于所有种子已经连通。
+#seeds = ["tcp://hub@127.0.0.1:9800"]
+
+# ---------------------------------------------------------------------------
+# [remote.receptionist] -- service-key authorization, separate from TLS identity
+# ---------------------------------------------------------------------------
+[remote.receptionist]
+# Unmatched node/key pairs are denied by default. Explicit false permits them.
+#default_deny = true
+# Grant local operations to this node and incoming snapshots to each publisher.
+# Prefixes match complete segments: edge/public does not grant edge/publicity.
+#roles = { spoke-a = ["edge/public"], spoke-b = ["edge/public"] }
+# Higher-priority maps replace the complete inherited map; roles = {} clears it.
+# default_deny inherits separately; clearing roles does not override false.
+# Network service sync still requires verified mTLS or explicit development mode.
+# These grants alone do not inject actor/message gateways into an application.
 
 # ---------------------------------------------------------------------------
 # [remote.transport] —— 连接层（原写死常量参数化）
@@ -56,6 +87,16 @@
 #heartbeat_max_loss = 5
 # 出站帧队列容量（默认 1024——满则反压）
 #outbound_queue = 1024
+# 系统级未完成入站 ASK 上限（含等待 lookup / actor / 回复队列）
+#inbound_ask_capacity = 1024
+# 上述 ASK 的 path + type_key + payload 编码长度总预算；不是节点 RSS 上限
+#inbound_ask_bytes = 67108864
+# 系统级慢入站操作上限（TELL / STOP / 管理等，含排队与在途）
+#inbound_dispatch_capacity = 1024
+# 每条实际连接的慢操作上限；超额关闭该连接而非全局等待
+#inbound_dispatch_per_connection = 64
+# 上述慢操作的 payload / path / type_key / 来源节点名长度总预算
+#inbound_dispatch_bytes = 67108864
 # 帧默认跳数上限 1..=64（默认 8）
 #default_hop_limit = 8
 
@@ -74,3 +115,14 @@
 [remote.codec]
 # 附加能力位（连 pb-only 对端时叠加 caps::PB；默认 0=纯 bin）
 #extra_caps = 0
+
+# Optional persistent Directory group. Also set remote.node.topology_role = "directory"
+# and configure mTLS for TCP/QUIC. The data directory must already exist.
+# Voting peers are independent from remote.node.seeds; [] explicitly means solo.
+# [remote.directory]
+# storage_dir = "/private/parrot/directory"
+# group = "control-plane"
+# peers = ["tcp://directory-b@127.0.0.1:9802", "tcp://directory-c@127.0.0.1:9803"]
+# election_ms = 2000
+# heartbeat_ms = 150
+# rpc_timeout_ms = 5000

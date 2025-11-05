@@ -110,6 +110,17 @@ async fn wait_for(events: &mut tokio::sync::mpsc::UnboundedReceiver<&'static str
     .await
     .unwrap();
 }
+async fn wait_for_retirement(system: &ActixActorSystem, path: &String) {
+    // A timeout receipt and an actor's Drop signal can both precede the
+    // lifecycle monitor observing disposal and removing the registration.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while system.get_actor(path).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed-out actor must eventually retire after disposal");
+}
 async fn spawn(
     system: &ActixActorSystem,
 ) -> (
@@ -240,7 +251,7 @@ async fn initialization_failure_and_cancellation_skip_dispatch_and_hook() {
     }
 }
 #[actix::test]
-async fn stop_reports_hook_errors_panics_and_deadlines_after_cleanup() {
+async fn stop_reports_hook_errors_panics_and_deadlines_with_owned_cleanup() {
     for behavior in [
         Behavior::Error,
         Behavior::Panic,
@@ -265,6 +276,7 @@ async fn stop_reports_hook_errors_panics_and_deadlines_after_cleanup() {
             _ => assert!(error.to_string().contains("hook rejected")),
         }
         wait_for(&mut events, "actor_drop").await;
+        wait_for_retirement(&system, &actor.path()).await;
         assert_eq!(system.status().active_actors, 0);
         system.shutdown().await.unwrap();
     }
@@ -284,11 +296,13 @@ async fn cancelled_stop_caller_does_not_cancel_cleanup() {
     let task = tokio::spawn(async move { stopping.stop().await });
     wait_for(&mut events, "hook").await;
     task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
     assert!(matches!(
         actor.stop().await,
         Err(ActorError::TimeoutDetail(_))
     ));
     wait_for(&mut events, "actor_drop").await;
+    wait_for_retirement(&system, &actor.path()).await;
     system.shutdown().await.unwrap();
 }
 #[actix::test]
@@ -390,7 +404,7 @@ async fn system_drop_stops_dynamic_actor_with_surviving_reference() {
 }
 
 #[actix::test]
-async fn managed_default_ask_timeout_and_post_shutdown_admission() {
+async fn managed_explicit_ask_timeout_and_post_shutdown_admission() {
     let system = ActixActorSystem::with_settings(parrot::actix::ActixSystemSettings {
         arbiter_count: 1,
         ask_timeout: Duration::from_millis(20),
@@ -399,9 +413,12 @@ async fn managed_default_ask_timeout_and_post_shutdown_admission() {
     .await
     .unwrap();
     let (actor, _events) = spawn(&system).await;
-    let result = tokio::time::timeout(Duration::from_millis(500), actor.send(Box::new(1u8)))
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        actor.send_with_timeout(Box::new(1u8), Some(Duration::from_millis(20))),
+    )
+    .await
+    .unwrap();
     assert!(matches!(result, Err(ActorError::TimeoutDetail(_))));
     system.clone().shutdown().await.unwrap();
     let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();

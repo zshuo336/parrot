@@ -82,6 +82,10 @@ def test_bad_tag_rejected():
 # ================= 2. 契约测试（ray 桩——无集群） =================
 
 
+class _StubActorDied(Exception):
+    pass
+
+
 class _StubHandle:
     """命名 actor 桩句柄：alive 标记 + kill 记录。"""
 
@@ -90,13 +94,21 @@ class _StubHandle:
         self.alive = True
         self._killed = killed
         self._drain_calls = drain_calls
+        self.__ray_ready__ = types.SimpleNamespace(remote=lambda: self.ready)
+        self.parrot_drain = types.SimpleNamespace(remote=lambda: self.parrot_drain_remote)
 
     def parrot_drain_remote(self):
         self._drain_calls.append(self.path)
 
+    def ready(self):
+        if not self.alive:
+            raise _StubActorDied()
+        return True
+
 
 class _StubRay:
     """ray API 桩：kill/get/remote 三入口（RayAdminExecutor 依赖面）。"""
+    exceptions = types.SimpleNamespace(ActorDiedError=_StubActorDied)
 
     def __init__(self):
         self.killed = []
@@ -106,7 +118,7 @@ class _StubRay:
         h.alive = False
         self.killed.append((h.path, no_restart))
 
-    def get(self, ref):
+    def get(self, ref, timeout=None):
         return ref() if callable(ref) else True
 
     def remote(self, fn):
@@ -302,7 +314,8 @@ class _Client:
             except OSError:
                 pass
 
-        threading.Thread(target=reader, daemon=True).start()
+        self._reader = threading.Thread(target=reader)
+        self._reader.start()
         self.s.sendall(wire.build_frame(
             wire.FT_HANDSHAKE, 1, "", "__handshake__", wire.handshake_body("py-test")))
         self._wait(lambda f: f.ft == wire.FT_HANDSHAKE_ACK)
@@ -328,7 +341,13 @@ class _Client:
         )
 
     def close(self):
+        try:
+            self.s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.s.close()
+        self._reader.join(6)
+        assert not self._reader.is_alive(), "client reader leaked"
 
 
 @pytest.fixture()
@@ -336,14 +355,29 @@ def gw(monkeypatch):
     """ray 桩 + serve 全链网关（端口 0 → 实际端口）。"""
     stub_ray = _StubRay()
     real_ray = types.ModuleType("ray")
+    ActorDied = _StubActorDied
 
     def remote_decorator(cls):
+        # This fixture controls Ray RPC only; process isolation is covered by
+        # the actual TCP/Ray artifact and lifecycle runners.
+        from parrot_protocol.ray_gw import _ComponentRuntime
+        if cls.__name__ == 'IsolatedRuntime':
+            class LocalRuntime(_ComponentRuntime):
+                def close(self):
+                    for owner in {entry['owner'] for entry in self._entries.values()}:
+                        paths = [path for path, entry in self._entries.items() if entry['owner'] == owner]
+                        self.retire_paths(owner, paths)
+                    pending = sorted({entry['owner'] for entry in self._entries.values()})
+                    return dict(ok=not pending, pending=pending)
+            cls = LocalRuntime
         def remote_ctor(*args, **kwargs):
             inst = cls(*args, **kwargs)
 
             class _H:
                 def __init__(self, inst):
                     self._inst = inst
+                    self.alive = True
+                    self.path = '/fixture/coordinator'
 
                 def __getattr__(self, name):
                     attr = getattr(self._inst, name)
@@ -351,22 +385,31 @@ def gw(monkeypatch):
                         # 方法级 remote 桩：handle.method.remote(*args) →
                         # callable ref（stub_ray.get 直接执行）
                         class _M:
-                            def remote(self, *a, **kw):
+                            def remote(method, *a, **kw):
+                                if not self.alive:
+                                    raise ActorDied()
                                 return lambda: attr(*a, **kw)
                         return _M()
                     return attr
 
             return _H(inst)
 
-        cls.remote = staticmethod(remote_ctor)
-        return cls
+        adapter = types.SimpleNamespace(remote=remote_ctor)
+        adapter.options = lambda **kwargs: adapter
+        return adapter
 
     real_ray.remote = remote_decorator
     real_ray.is_initialized = lambda: True
     real_ray.init = lambda **_: None
-    real_ray.get = lambda x: x() if callable(x) else x
+    real_ray.get = lambda x, timeout=None: x() if callable(x) else x
     real_ray.kill = stub_ray.kill
+    real_ray.exceptions = types.SimpleNamespace(ActorDiedError=ActorDied, GetTimeoutError=TimeoutError)
     monkeypatch.setitem(sys.modules, "ray", real_ray)
+    # This fixture replaces Ray initialization entirely. The private allocator
+    # compatibility boundary is exercised by test_ray_startup and the actual
+    # installed-Ray manifest matrix, not by a fake non-package ray module.
+    monkeypatch.setattr("parrot_protocol.ray_startup.initialize",
+                        lambda module, kwargs: module.init(**kwargs))
 
     mod = types.ModuleType("parrot_test_jobs")
     def parrot_entry(ctx):
@@ -374,25 +417,73 @@ def gw(monkeypatch):
     mod.parrot_entry = parrot_entry
     monkeypatch.setitem(sys.modules, "parrot_test_jobs", mod)
 
-    ports = []
-    orig_print = print
+    # Keep production serve/accept wiring, but own every fixture socket/thread.
+    import parrot_protocol.ray_gw as gateway
+    stopping, listening = threading.Event(), threading.Event()
+    sockets, connections, errors = [], [], []
+    original_driver = gateway._serve_connection_guarded
 
-    def cap(*args, **kw):
-        s = " ".join(str(a) for a in args)
-        if s.startswith("RAY_GW_PORT="):
-            ports.append(int(s.split("=", 1)[1]))
-        else:
-            orig_print(*args, **kw)
+    class FixtureStopped(BaseException):
+        pass
 
-    monkeypatch.setattr("builtins.print", cap)
-    d = ParrotDispatcher()
-    threading.Thread(target=lambda: serve(0, d), daemon=True).start()
-    deadline = time.time() + 5
-    while not ports and time.time() < deadline:
-        time.sleep(0.005)
-    monkeypatch.setattr("builtins.print", orig_print)
-    assert ports, "gateway did not report port"
-    return ports[0], stub_ray
+    class Listener(socket.socket):
+        def listen(self, backlog):
+            super().listen(backlog)
+            self.settimeout(0.1)
+            sockets.append(self)
+            listening.set()
+
+        def accept(self):
+            while not stopping.is_set():
+                try:
+                    sock, addr = super().accept()
+                    sockets.append(sock)
+                    return sock, addr
+                except socket.timeout:
+                    pass
+            raise FixtureStopped()
+
+    def driver(*args):
+        connections.append(threading.current_thread())
+        try:
+            original_driver(*args)
+        except BaseException as error:
+            errors.append(error)
+
+    proxy = types.SimpleNamespace(**{name: getattr(socket, name) for name in dir(socket)})
+    proxy.socket = Listener
+    monkeypatch.setattr(gateway, "socket", proxy)
+    monkeypatch.setattr(gateway, "_serve_connection_guarded", driver)
+
+    def run():
+        try:
+            serve(0, ParrotDispatcher())
+        except FixtureStopped:
+            pass
+        except BaseException as error:
+            errors.append(error)
+            listening.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert listening.wait(5), "gateway did not listen"
+        assert not errors, errors
+        yield sockets[0].getsockname()[1], stub_ray
+    finally:
+        stopping.set()
+        thread.join(6)
+        assert not thread.is_alive(), "listener leaked"
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        for connection in connections:
+            connection.join(6)
+            assert not connection.is_alive(), "connection leaked"
+        assert not errors, errors
 
 
 def test_frame_level_deploy_status_stop(gw):
@@ -429,14 +520,12 @@ def test_frame_level_non_admin_sys_event_ignored(gw):
 
 # ================= 3. 真 ray 子进程（集群本地形态） =================
 
-ray = pytest.importorskip("ray")
-
-
 @pytest.fixture(scope="module")
 def ray_ctx():
-    if not ray.is_initialized():
-        ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
-    yield
+    ray = pytest.importorskip("ray")
+    from ray_test_cluster import owned_ray_cluster
+    with owned_ray_cluster(ray, label='admin'):
+        yield
 
 
 def _make_real_entry(r):
@@ -463,7 +552,7 @@ class _RealEntryActor:
 def test_real_ray_deploy_lifecycle(ray_ctx, monkeypatch):
     """真 ray：parrot_entry 返回真 actor handle → kill/探活全链。"""
     import ray as r
-    from ray.cloudpickle import register_pickle_by_value
+    from ray.cloudpickle import register_pickle_by_value, unregister_pickle_by_value
 
     mod = types.ModuleType("parrot_real_jobs")
     register_pickle_by_value(sys.modules[__name__])  # 测试模块按值序列化
@@ -476,19 +565,49 @@ def test_real_ray_deploy_lifecycle(ray_ctx, monkeypatch):
     out = _OutQueue()
     ex = RayAdminExecutor(out)
 
-    r1 = _dispatch_sync(ex, _deploy_cmd(31, "recho", "parrot_real_jobs"))
-    assert r1["kind"] == "deployed"
-    assert r1["instances"] == ["/user/recho"]
+    try:
+        r1 = _dispatch_sync(ex, _deploy_cmd(31, "recho", "parrot_real_jobs"))
+        assert r1["kind"] == "deployed"
+        assert r1["instances"] == ["/user/recho"]
 
-    h = ex._components["recho"]["handles"][0]
-    got = r.get(h.ping.remote(100))
-    assert got == 105, "真 ray actor 行为（+5 方言辨识）"
+        h = ex._components["recho"]["handles"][0]
+        got = r.get(h.ping.remote(100), timeout=10)
+        assert got == 105, "真 ray actor 行为（+5 方言辨识）"
 
-    r2 = _dispatch_sync(ex, admin_v2.encode_admin_cmd_v2(
-        {"kind": "stop", "req_id": 32, "path_prefix": "/user/recho"}))
-    assert r2["kind"] == "stopped"
-    # kill 后 actor 不再响应（ray.kill 语义验证）
-    time.sleep(0.3)
-    with pytest.raises(Exception):
-        r.get(h.ping.remote(1), timeout=5)
+        r2 = _dispatch_sync(ex, admin_v2.encode_admin_cmd_v2(
+            {"kind": "stop", "req_id": 32, "path_prefix": "/user/recho"}))
+        assert r2["kind"] == "stopped"
+        # Timeout or a business exception does not establish actor death.
+        with pytest.raises(r.exceptions.ActorDiedError):
+            r.get(h.__ray_ready__.remote(), timeout=5)
+    finally:
+        try:
+            assert ex._runtime().retire_paths('recho', ['/user/recho']) == {'/user/recho': None}
+        finally:
+            unregister_pickle_by_value(sys.modules[__name__])
 
+
+
+def test_frame_level_registry_survives_connection_retirement(gw):
+    port, _ = gw
+    first = _Client(port)
+    try:
+        reply = admin_v2.decode_admin_reply_v2(first.admin(
+            _deploy_cmd(51, "retained", "parrot_test_jobs"), 51).payload)
+        assert reply["kind"] == "deployed"
+    finally:
+        first.close()
+    second = _Client(port)
+    try:
+        for req_id, kind in [(52, "status"), (53, "stop"), (54, "status")]:
+            reply = admin_v2.decode_admin_reply_v2(second.admin(
+                admin_v2.encode_admin_cmd_v2({"kind": kind, "req_id": req_id,
+                    "path_prefix": "/user/retained"}), req_id).payload)
+            if req_id == 52:
+                assert reply["states"][0]["path"] == "/user/retained"
+            elif req_id == 53:
+                assert reply["kind"] == "stopped"
+            else:
+                assert reply["code"] == admin_v2.ERR_COMPONENT_NOT_FOUND
+    finally:
+        second.close()

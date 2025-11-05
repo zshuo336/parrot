@@ -3,23 +3,24 @@
 //! for derive actors before the fix.
 //!
 //! Scenarios:
-//! 1. actor-to-actor messaging chains (ask/tell rings and fans);
+//! 1. actor-to-actor ASK forwarding through a registered relay's mailbox;
 //! 2. lifecycle: init → running → many messages → stop → post-stop send;
 //! 3. concurrent producers hammering one actor: no lost/duplicated updates;
-//! 4. mixed sync/async handler actors coexisting in one system;
-//! 5. derive actor semantics driven through the thread engine's real
-//!    processor path (manual twin proves the engine plumbing; derive impl
-//!    semantics are separately covered by the dispatch-matrix file).
+//! 4. mixed message kinds across multiple actors in one system;
+//! 5. panic receipts and continued service on the same shared worker;
+//! 6. derive and manual actors process identical requests through real mailboxes.
 
+use parrot::thread as __parrot_engine;
 use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 use parrot_api::address::ActorRefExt;
-use parrot_api::message::Message;
+use parrot_api::errors::ActorError;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
-use parrot_api_derive::Message;
+use parrot_api_derive::{Message, ParrotActor};
 use std::sync::Arc;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -36,6 +37,14 @@ struct Get;
 #[derive(Clone, Debug, Message)]
 #[message(result = "String")]
 struct Ping(String);
+
+#[derive(Clone, Debug, Message)]
+#[message(result = "u64")]
+struct Forward(u64);
+
+#[derive(Clone, Debug, Message)]
+#[message(result = "u64")]
+struct GetHops;
 
 // ---------------------------------------------------------------------------
 // Actors
@@ -86,20 +95,38 @@ impl Actor for Counter {
 
 /// Relay actor: forwards Add messages to a target actor (ask), proving
 /// actor-to-actor ask composition on the thread engine.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Relay {
+    target: Box<dyn parrot_api::address::ActorRef>,
     hops: u64,
 }
 
-impl Relay {
-    async fn forward(
-        &mut self,
-        target: &dyn parrot_api::address::ActorRef,
-        add: Add,
-    ) -> ActorResult<u64> {
-        use parrot_api::address::ActorRefExt;
-        self.hops += 1;
-        target.ask(add).await
+impl Actor for Relay {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+
+    fn receive_message<'a>(
+        &'a mut self,
+        message: BoxedMessage,
+        _ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            if let Some(Forward(value)) = message.downcast_ref::<Forward>() {
+                let reply = self.target.ask(Add(*value)).await?;
+                self.hops += 1;
+                return Ok(Box::new(reply) as BoxedMessage);
+            }
+            if message.is::<GetHops>() {
+                return Ok(Box::new(self.hops) as BoxedMessage);
+            }
+            Err(ActorError::MessageHandlingError(
+                "unknown relay message".into(),
+            ))
+        })
+    }
+
+    fn state(&self) -> ActorState {
+        ActorState::Running
     }
 }
 
@@ -119,44 +146,56 @@ async fn spawn(ts: &Arc<ThreadActorSystem>, path: &str) -> Box<dyn parrot_api::a
 // Scenarios
 // ---------------------------------------------------------------------------
 
-/// Typed ask helper returning Option (None on error/timeout paths).
-async fn victim_ask(r: &dyn parrot_api::address::ActorRef, m: Add) -> Option<u64> {
-    use parrot_api::address::ActorRefExt;
-    r.ask(m).await.ok()
-}
-
 /// Scenario 1: actor-to-actor ask chain (relay → counter).
 #[tokio::test]
 async fn scenario_actor_to_actor_ask_chain() {
-    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig {
+        shared_pool_size: 1,
+        shared_burst_workers_max: 0,
+        ..Default::default()
+    });
     let counter = spawn(&ts, "/scenario/counter").await;
-    let relay_ref = ts
-        .spawn_at::<Counter>(
-            Counter::default(),
-            "/scenario/relay-as-counter",
+    let relay: Box<dyn parrot_api::address::ActorRef> = Box::new(
+        ts.spawn_at::<Relay>(
+            Relay {
+                target: counter.clone_boxed(),
+                hops: 0,
+            },
+            "/scenario/relay",
             None,
             ThreadActorConfig::default(),
         )
         .await
-        .expect("spawn relay");
+        .expect("spawn relay"),
+    );
 
     // Direct asks establish the baseline.
     assert_eq!(counter.ask(Add(5)).await.unwrap(), 5);
 
     // Actor-to-actor: relay asks counter and returns the counter's reply.
-    let mut relay = Relay::default();
-    let v = relay.forward(counter.as_ref(), Add(10)).await.unwrap();
+    let v = tokio::time::timeout(Duration::from_secs(3), relay.ask(Forward(10)))
+        .await
+        .expect("relay request must complete")
+        .expect("relay must forward the request");
     assert_eq!(v, 15, "relay must observe counter's updated value");
-    assert_eq!(relay.hops, 1);
+    assert_eq!(relay.ask(GetHops).await.unwrap(), 1);
+    assert_eq!(counter.ask(Get).await.unwrap(), 15);
 
     // Second hop accumulates.
-    let v2 = relay.forward(counter.as_ref(), Add(10)).await.unwrap();
+    let v2 = tokio::time::timeout(Duration::from_secs(3), relay.ask(Forward(10)))
+        .await
+        .expect("second relay request must complete")
+        .expect("relay must forward the second request");
     assert_eq!(v2, 25);
-    drop(relay_ref);
+    assert_eq!(relay.ask(GetHops).await.unwrap(), 2);
+    assert_eq!(counter.ask(Get).await.unwrap(), 25);
+    ts.shutdown_internal()
+        .await
+        .expect("relay system shutdown must succeed");
 }
 
 /// Scenario 2: lifecycle — messages processed, stop, then post-stop send
-/// must not corrupt the system (error or benign, never a hang).
+/// must immediately report Stopped after successful retirement.
 #[tokio::test]
 async fn scenario_lifecycle_stop_semantics() {
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
@@ -167,18 +206,32 @@ async fn scenario_lifecycle_stop_semantics() {
     // Stop via the generic ActorRef trait.
     c.stop().await.expect("stop must succeed");
 
-    // Post-stop ask: must terminate with an error (or documented behavior),
-    // never hang. We bound it defensively with a timeout.
-    let r = tokio::time::timeout(std::time::Duration::from_secs(3), c.ask(Get)).await;
-    match r {
-        Err(_elapsed) => panic!("post-stop ask hung"),
-        Ok(Err(_e)) => { /* expected: actor gone */ }
-        Ok(Ok(v)) => {
-            // If the mailbox drains one last batch, the value must still be
-            // the final consistent state (55), proving no corruption.
-            assert_eq!(v, 55, "post-stop read must see final consistent state");
-        }
-    }
+    let result = tokio::time::timeout(Duration::from_secs(3), c.ask(Get))
+        .await
+        .expect("post-stop ask must terminate");
+    assert!(
+        matches!(result, Err(ActorError::Stopped)),
+        "post-stop ask must report Stopped, got {result:?}"
+    );
+    let delivery = tokio::time::timeout(Duration::from_secs(3), c.deliver(Box::new(Add(100))))
+        .await
+        .expect("post-stop delivery must terminate");
+    assert!(
+        matches!(delivery, Err(ActorError::Stopped)),
+        "post-stop delivery must report Stopped, got {delivery:?}"
+    );
+    assert!(
+        !c.is_alive().await,
+        "successful stop must retire the reference"
+    );
+    assert_eq!(
+        ts.actor_count(),
+        0,
+        "successful stop must unregister the actor"
+    );
+    ts.shutdown_internal()
+        .await
+        .expect("lifecycle system shutdown must succeed");
 }
 
 /// Scenario 3: 8 concurrent producers × 125 adds each = 1000 messages, no
@@ -213,6 +266,9 @@ async fn scenario_concurrent_no_lost_updates() {
         PRODUCERS * PER,
         "every add must be applied exactly once"
     );
+    ts.shutdown_internal()
+        .await
+        .expect("producer system shutdown must succeed");
 }
 
 /// Scenario 4: many actors, mixed load, interleaved — final states exact.
@@ -239,6 +295,9 @@ async fn scenario_multi_actor_mixed_load() {
     for r in &refs {
         assert_eq!(r.ask(Get).await.unwrap(), expect);
     }
+    ts.shutdown_internal()
+        .await
+        .expect("mixed-load system shutdown must succeed");
 }
 
 /// Scenario 5: panic isolation on the thread engine — a panicking actor
@@ -280,7 +339,11 @@ impl Actor for SometimesPanic {
 
 #[tokio::test]
 async fn scenario_thread_panic_isolation() {
-    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig {
+        shared_pool_size: 1,
+        shared_burst_workers_max: 0,
+        ..Default::default()
+    });
     let victim: Box<dyn parrot_api::address::ActorRef> = Box::new(
         ts.spawn_at::<SometimesPanic>(
             SometimesPanic::default(),
@@ -294,39 +357,116 @@ async fn scenario_thread_panic_isolation() {
     let bystander = spawn(&ts, "/panic/bystander").await;
 
     // Normal traffic before the panic.
-    assert_eq!(victim_ask(victim.as_ref(), Add(1)).await, Some(1));
+    assert_eq!(victim.ask(Add(1)).await.unwrap(), 1);
 
     // Trigger a panic inside the actor's handler (batch panic isolation in
-    // the processor catches it). The ask may error or time out — we only
-    // require the engine to stay alive.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        victim_ask(victim.as_ref(), Add(13)),
-    )
-    .await;
+    // the processor catches it). Preserve the actual panic receipt.
+    let failed = tokio::time::timeout(Duration::from_secs(3), victim.ask(Add(13)))
+        .await
+        .expect("panic request must produce a terminal receipt");
+    assert!(
+        matches!(&failed, Err(ActorError::Panic(message)) if message.contains("thread-engine boom")),
+        "handler panic must preserve its cause, got {failed:?}"
+    );
 
     // Bystander unaffected.
-    let v = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        victim_ask(bystander.as_ref(), Add(7)),
-    )
-    .await
-    .expect("engine must survive actor panic");
-    assert_eq!(v, Some(7));
+    let v = tokio::time::timeout(Duration::from_secs(3), bystander.ask(Add(7)))
+        .await
+        .expect("engine must survive actor panic");
+    assert_eq!(v.unwrap(), 7);
+    ts.shutdown_internal()
+        .await
+        .expect("panic-isolation system shutdown must succeed");
 }
 
-/// Scenario 6: derive-generated dispatch semantics hold under the thread
-/// engine's real processor path — a manual twin with identical handler
-/// logic (the derive impl's `Context` binding targets the actix engine, so
-/// the twin isolates *engine plumbing* from *codegen semantics*; codegen
-/// itself is covered in test_dispatch_matrix.rs).
+#[derive(Debug, Default, ParrotActor)]
+#[ParrotActor(engine = "thread", config = "EmptyConfig")]
+struct DerivedCounter {
+    value: u64,
+}
+
+impl DerivedCounter {
+    async fn handle_message(
+        &mut self,
+        message: BoxedMessage,
+        _ctx: &mut ThreadContext<Self>,
+    ) -> ActorResult<BoxedMessage> {
+        if let Some(Add(value)) = message.downcast_ref::<Add>() {
+            self.value += *value;
+            return Ok(Box::new(self.value));
+        }
+        if message.is::<Get>() {
+            return Ok(Box::new(self.value));
+        }
+        if let Some(Ping(value)) = message.downcast_ref::<Ping>() {
+            return Ok(Box::new(format!("pong:{value}")));
+        }
+        Err(ActorError::MessageHandlingError("unknown".into()))
+    }
+}
+
+/// Scenario 6: compare actual derive and manual actors, with an independent
+/// arithmetic reference so matching wrong outputs cannot establish equivalence.
 #[tokio::test]
 async fn scenario_dispatch_equivalence_manual_twin() {
-    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
+    // Continuing with the same state after a handler error is a Resume
+    // contract. Default Restart cannot reconstruct instance-spawned actors.
+    let ts = ThreadActorSystem::shared(ThreadActorSystemConfig {
+        default_supervisor_strategy: parrot::thread::config::SupervisorStrategy::Resume,
+        ..Default::default()
+    });
     let c = spawn(&ts, "/equiv/twin").await;
-    // Same ops as the derive matrix: Good→×10 lives in the async handler.
+    let derived: Box<dyn parrot_api::address::ActorRef> = Box::new(
+        ts.spawn_at::<DerivedCounter>(
+            DerivedCounter::default(),
+            "/equiv/derived",
+            None,
+            ThreadActorConfig::default(),
+        )
+        .await
+        .expect("spawn derived actor"),
+    );
     for i in 1..=25u64 {
-        assert_eq!(c.ask(Add(i)).await.unwrap(), (1..=i).sum::<u64>());
+        let manual = c.ask(Add(i)).await.unwrap();
+        let generated = derived
+            .ask(Add(i))
+            .await
+            .expect("derived actor must dispatch Add");
+        assert_eq!(manual, (1..=i).sum::<u64>());
+        assert_eq!(generated, manual, "derive and manual replies must agree");
+        let ping = format!("iteration-{i}");
+        assert_eq!(
+            derived.ask(Ping(ping.clone())).await.unwrap(),
+            format!("pong:{ping}")
+        );
+        assert_eq!(
+            c.ask(Ping(ping.clone())).await.unwrap(),
+            format!("pong:{ping}")
+        );
+        assert_eq!(derived.ask(Get).await.unwrap(), generated);
     }
     assert_eq!(c.ask(Get).await.unwrap(), 325);
+    assert_eq!(derived.ask(Get).await.unwrap(), 325);
+    for actor in [&c, &derived] {
+        let unknown = actor.ask(Forward(1000)).await;
+        assert!(
+            matches!(unknown, Err(ActorError::MessageHandlingError(ref cause)) if cause == "unknown")
+        );
+        assert_eq!(
+            actor
+                .ask(Get)
+                .await
+                .expect("Resume must keep actor available after rejected message"),
+            325,
+            "rejected message must preserve state"
+        );
+        assert_eq!(
+            actor.ask(Add(7)).await.unwrap(),
+            332,
+            "resumed actor must process subsequent work exactly once"
+        );
+    }
+    ts.shutdown_internal()
+        .await
+        .expect("dispatch system shutdown must succeed");
 }

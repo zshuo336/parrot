@@ -6,7 +6,7 @@
 //! 与 F2 RouteGossip 的关系：RouteGossip 是传播载体，RouteReflector
 //! 是拓扑策略——决定"谁向谁反射"（client→RR→client 扇出，client 间不直连）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::topology::{RouteEntry, RouteGossip};
 
@@ -15,16 +15,15 @@ use crate::topology::{RouteEntry, RouteGossip};
 /// - clients：本 RR 的客户端 border 集（配置注入——静态对等）；
 /// - 反射规则：从某 client 收到的路由 → 反射给其它 client（且加自己的
 ///   next_hop 改写可选——纯透传形态不改动）；
-/// - 自治防环：origin_id 记在 RouteEntry.version 之外（反射时携带
-///   cluster_id/origin——同 origin 不回灌）。
+/// - Only a strict route improvement is reflected. Replays cannot change the
+///   selected route, including those received through another client/origin.
+///   This helper does not implement network path-vector loop detection.
 #[derive(Debug)]
 pub struct RouteReflector {
     pub id: String,
     pub clients: Vec<String>,
     /// 本地最佳表（反射出去的视图）。
     pub table: HashMap<String, RouteEntry>,
-    /// 防环：prefix → 已见 origin 集。
-    seen_origins: HashMap<String, HashSet<String>>,
 }
 
 impl RouteReflector {
@@ -33,7 +32,6 @@ impl RouteReflector {
             id: id.into(),
             clients,
             table: HashMap::new(),
-            seen_origins: HashMap::new(),
         }
     }
 
@@ -45,33 +43,17 @@ impl RouteReflector {
         &mut self,
         client: &str,
         gossip: &RouteGossip,
-        origin: &str,
+        _origin: &str,
     ) -> Vec<(String, Vec<RouteEntry>)> {
         let mut accepted: Vec<RouteEntry> = Vec::new();
         for e in &gossip.entries {
-            // 最优合并（高 version 低 cost——同 F2 RouteTable 语义）先判
             let better = match self.table.get(&e.prefix) {
-                Some(cur) => {
-                    e.version > cur.version || (e.version == cur.version && e.cost < cur.cost)
-                }
+                Some(cur) => e.preferred_to(cur),
                 None => true,
             };
             if !better {
-                // 旧版本：记 origin（去重）但不反射
-                self.seen_origins
-                    .entry(e.prefix.clone())
-                    .or_default()
-                    .insert(origin.to_string());
                 continue;
             }
-            // 防环：同 origin 同 version 已见过 → 跳过（回灌抑制）
-            let origins = self.seen_origins.entry(e.prefix.clone()).or_default();
-            if origins.contains(origin)
-                && self.table.get(&e.prefix).map(|c| c.version) == Some(e.version)
-            {
-                continue;
-            }
-            origins.insert(origin.to_string());
             self.table.insert(e.prefix.clone(), e.clone());
             accepted.push(e.clone());
         }
@@ -88,10 +70,6 @@ impl RouteReflector {
 
     /// RR 本地路由通告（RR 自己也是 border——向 clients 广播）。
     pub fn advertise_local(&mut self, entry: RouteEntry) -> Vec<(String, Vec<RouteEntry>)> {
-        self.seen_origins
-            .entry(entry.prefix.clone())
-            .or_default()
-            .insert(self.id.clone());
         self.table.insert(entry.prefix.clone(), entry.clone());
         self.clients
             .iter()

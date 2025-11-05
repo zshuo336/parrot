@@ -1,7 +1,7 @@
 //! F4 · 自研 Raft 内核（DEV_05 §4——决策档严格边界）。
 //!
 //! **只做**：leader 选举 + 日志复制 + 单一 commit 点。
-//! **不做**：membership 变更协议（joint consensus——重启重配置替代）、
+//! **不做**：membership 变更协议（joint consensus；不可通过重启替代）、
 //! snapshot 压缩（条目量小全量重放）。
 //!
 //! 时钟注入（DEV_05 §10.2）：选举计时由 `Clock` 注入——测试确定性 /
@@ -9,7 +9,11 @@
 //!
 //! 传输（§10.6）：Raft RPC 复用 ASK/REPLY 帧承载（cid=proposal id）——
 //! 不新增帧类型码点（07 X2 纪律）。本内核是纯状态机：网络收发由宿主
-//! （DirectoryStore）驱动，`step()` 消费入站 RPC、`poll()` 产出出站 RPC。
+//! 驱动，`step()` 消费入站 RPC、`outbox()` 产出出站 RPC。
+//! 显式磁盘宿主见 [`DurableRaft`]；本内核自身不执行持久化。
+
+mod storage;
+pub use storage::{DurableRaft, RaftStorageError};
 
 use std::collections::HashMap;
 
@@ -48,6 +52,56 @@ pub enum RaftRpc {
     },
 }
 
+impl RaftRpc {
+    /// Check protocol shape without consulting or changing a node's state.
+    /// Term zero is the uninitialized sentinel, never an election/leader term.
+    pub(crate) fn validate_shape(&self) -> Result<(), &'static str> {
+        let position = |index: u64, entry_term: u64, term: u64| {
+            (index == 0) == (entry_term == 0) && entry_term <= term
+        };
+        match self {
+            Self::RequestVote {
+                term,
+                last_log_index,
+                last_log_term,
+                ..
+            } => {
+                if *term == 0 || !position(*last_log_index, *last_log_term, *term) {
+                    return Err("invalid vote term or last-log metadata");
+                }
+            }
+            Self::AppendEntries {
+                term,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                ..
+            } => {
+                if *term == 0 || !position(*prev_log_index, *prev_log_term, *term) {
+                    return Err("invalid append term or previous-log metadata");
+                }
+                let mut index = *prev_log_index;
+                let mut previous_term = *prev_log_term;
+                for entry in entries {
+                    if index.checked_add(1) != Some(entry.index)
+                        || entry.term == 0
+                        || entry.term > *term
+                        || entry.term < previous_term
+                    {
+                        return Err("invalid append entry index or term ordering");
+                    }
+                    index = entry.index;
+                    previous_term = entry.term;
+                }
+            }
+            // A fresh node can legitimately return a negative response at
+            // term zero. Response progress is checked against local state.
+            Self::RequestVoteResp { .. } | Self::AppendEntriesResp { .. } => {}
+        }
+        Ok(())
+    }
+}
+
 /// 日志条目（Cmd 泛型由宿主特化——Directory 的 Upsert/Remove 等）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
@@ -62,6 +116,11 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
     /// 本节点选举超时区间（随机化防活锁——论文 §5.2）。
     fn election_timeout_ms(&self) -> u64;
+    /// Per-election jitter window. Manual/model clocks retain the historical
+    /// 300 ms window; real hosts scale it to their election timeout.
+    fn election_jitter_ms(&self) -> u64 {
+        300
+    }
     /// 心跳周期（«选举超时）。
     fn heartbeat_ms(&self) -> u64;
 }
@@ -90,7 +149,10 @@ impl Clock for RealClock {
             .as_millis() as u64
     }
     fn election_timeout_ms(&self) -> u64 {
-        self.election_ms + (self.now_ms() % 300) // 抖动防同步选举
+        self.election_ms
+    }
+    fn election_jitter_ms(&self) -> u64 {
+        self.election_ms
     }
     fn heartbeat_ms(&self) -> u64 {
         self.heartbeat_ms
@@ -107,7 +169,8 @@ pub enum Role {
 
 /// 复制状态机（宿主实现——DirectoryStore 等）。
 pub trait StateMachine {
-    fn apply(&mut self, cmd: &[u8]);
+    type Error;
+    fn apply(&mut self, cmd: &[u8]) -> Result<(), Self::Error>;
 }
 
 /// 空状态机（选举/复制测试用）。
@@ -115,7 +178,10 @@ pub trait StateMachine {
 pub struct NullSm;
 
 impl StateMachine for NullSm {
-    fn apply(&mut self, _cmd: &[u8]) {}
+    type Error = std::convert::Infallible;
+    fn apply(&mut self, _cmd: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 // ── 内核 ────────────────────────────────────────────────
@@ -142,6 +208,11 @@ pub struct RaftNode {
     // leader 易失态
     next_index: HashMap<NodeId, LogIndex>,
     match_index: HashMap<NodeId, LogIndex>,
+    /// Highest log index included in the most recently emitted AppendEntries
+    /// for each follower.  A follower cannot acknowledge an index that was
+    /// never sent by this leader; keeping this bound also prevents a malformed
+    /// or stale response from manufacturing quorum progress.
+    sent_upper: HashMap<NodeId, LogIndex>,
 
     // candidate
     votes_received: Vec<NodeId>,
@@ -165,7 +236,7 @@ impl RaftNode {
         clock: std::sync::Arc<dyn Clock>,
     ) -> Self {
         let id = id.into();
-        let jitter = id_jitter(&id) % 300;
+        let jitter = id_jitter(&id) % clock.election_jitter_ms().max(1);
         let last_heartbeat_ms = clock.now_ms();
         let mut peers = peers;
         peers.retain(|peer| peer != &id);
@@ -183,6 +254,7 @@ impl RaftNode {
             leader_hint: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
+            sent_upper: HashMap::new(),
             votes_received: Vec::new(),
             clock,
             last_heartbeat_ms,
@@ -199,7 +271,10 @@ impl RaftNode {
         let now = self.clock.now_ms();
         match self.role {
             Role::Follower | Role::Candidate => {
-                let timeout = self.clock.election_timeout_ms() + self.timeout_jitter_ms;
+                let timeout = self
+                    .clock
+                    .election_timeout_ms()
+                    .saturating_add(self.timeout_jitter_ms);
                 if now.saturating_sub(self.last_heartbeat_ms) >= timeout {
                     self.start_election();
                 }
@@ -216,6 +291,32 @@ impl RaftNode {
 
     /// 入站 RPC（宿主收到后调用）。
     pub fn step(&mut self, from: NodeId, rpc: RaftRpc) {
+        if rpc.validate_shape().is_err() {
+            // Malformed requests must not advance term, reset election time,
+            // consume a vote, or revoke already queued valid work.
+            if self.peers.contains(&from) {
+                let reply = match &rpc {
+                    RaftRpc::RequestVote { candidate, .. } if candidate == &from => {
+                        Some(RaftRpc::RequestVoteResp {
+                            term: self.current_term,
+                            vote_granted: false,
+                        })
+                    }
+                    RaftRpc::AppendEntries { leader, .. } if leader == &from => {
+                        Some(RaftRpc::AppendEntriesResp {
+                            term: self.current_term,
+                            success: false,
+                            match_index: self.last_log_index(),
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(reply) = reply {
+                    self.outbox.push((from, reply));
+                }
+            }
+            return;
+        }
         match rpc {
             RaftRpc::RequestVote {
                 term,
@@ -276,6 +377,10 @@ impl RaftNode {
         std::mem::take(&mut self.outbox)
     }
 
+    pub(crate) fn pending_committed(&self) -> &[LogEntry] {
+        &self.pending_apply
+    }
+
     /// 已提交未应用的条目（宿主 apply 到状态机后丢弃）。
     pub fn committed(&mut self) -> Vec<LogEntry> {
         std::mem::take(&mut self.pending_apply)
@@ -298,8 +403,37 @@ impl RaftNode {
 
     // ── 选举 ──
 
+    /// Revoke obsolete leadership as one transition. A newer term alone does
+    /// not refresh the election timer: only granting a vote or hearing an
+    /// accepted leader does that. Persisted log/commit state is retained.
+    fn observe_term(&mut self, term: Term) {
+        if term <= self.current_term {
+            return;
+        }
+        self.current_term = term;
+        self.role = Role::Follower;
+        self.voted_for = None;
+        self.leader_hint = None;
+        self.votes_received.clear();
+        self.next_index.clear();
+        self.match_index.clear();
+        self.sent_upper.clear();
+        self.outbox.clear();
+    }
+
     fn start_election(&mut self) {
-        self.current_term += 1;
+        let Some(term) = self.current_term.checked_add(1) else {
+            return; // Exhausted terms must never wrap and reuse a prior election.
+        };
+        self.current_term = term;
+        // Redraw for every failed election. Fixed ID jitter can collide, making
+        // equally paced voters split forever even on a reliable network.
+        let mut hash = id_jitter(&self.id);
+        for byte in term.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        self.timeout_jitter_ms = hash % self.clock.election_jitter_ms().max(1);
         self.role = Role::Candidate;
         self.voted_for = Some(self.id.clone());
         self.leader_hint = None;
@@ -330,9 +464,11 @@ impl RaftNode {
         let ni = self.last_log_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
+        self.sent_upper.clear();
         for p in &self.peers {
             self.next_index.insert(p.clone(), ni);
             self.match_index.insert(p.clone(), 0);
+            self.sent_upper.insert(p.clone(), 0);
         }
         self.last_heartbeat_ms = self.clock.now_ms();
         self.broadcast_append(); // 立即心跳确立权威
@@ -359,13 +495,7 @@ impl RaftNode {
             ));
             return;
         }
-        if term > self.current_term {
-            // 高任期——无条件转 follower（论文 §5.1）
-            self.current_term = term;
-            self.role = Role::Follower;
-            self.voted_for = None;
-            self.last_heartbeat_ms = self.clock.now_ms();
-        }
+        self.observe_term(term);
         // 日志新旧检查（§5.4.1：candidate 日志至少一样新）
         let up_to_date = (last_log_term > self.last_log_term())
             || (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index());
@@ -389,9 +519,7 @@ impl RaftNode {
             return;
         }
         if term > self.current_term {
-            self.current_term = term;
-            self.role = Role::Follower;
-            self.voted_for = None;
+            self.observe_term(term);
             return;
         }
         if self.role != Role::Candidate || term != self.current_term || !granted {
@@ -409,28 +537,56 @@ impl RaftNode {
 
     fn broadcast_append(&mut self) {
         debug_assert_eq!(self.role, Role::Leader);
-        let (term, me, commit) = (self.current_term, self.id.clone(), self.commit_index);
         for p in self.peers.clone() {
-            let ni = *self.next_index.get(&p).unwrap_or(&1);
-            let (pli, plt) = if ni <= 1 {
-                (0, 0)
-            } else {
-                let e = &self.log[(ni - 2) as usize];
-                (e.index, e.term)
-            };
-            let entries: Vec<LogEntry> = self.log[(ni as usize).saturating_sub(1)..].to_vec();
-            self.outbox.push((
-                p,
-                RaftRpc::AppendEntries {
-                    term,
-                    leader: me.clone(),
-                    prev_log_index: pli,
-                    prev_log_term: plt,
-                    entries,
-                    leader_commit: commit,
-                },
-            ));
+            self.send_append(p);
         }
+    }
+
+    fn send_append(&mut self, p: NodeId) {
+        debug_assert_eq!(self.role, Role::Leader);
+        let (term, me, commit) = (self.current_term, self.id.clone(), self.commit_index);
+        let ni = *self.next_index.get(&p).unwrap_or(&1);
+        let (pli, plt) = if ni <= 1 {
+            (0, 0)
+        } else {
+            let e = &self.log[(ni - 2) as usize];
+            (e.index, e.term)
+        };
+        // Bound catch-up work before cloning it for every peer. A generic
+        // caller may submit a larger single command; include that first
+        // entry to preserve progress. Durable hosts cap commands at 1 MiB.
+        let suffix = &self.log[(ni as usize).saturating_sub(1)..];
+        let mut bytes = 0usize;
+        let count = suffix
+            .iter()
+            .take(1024)
+            .take_while(|entry| {
+                let next = bytes.saturating_add(entry.cmd.len()).saturating_add(32);
+                if bytes != 0 && next > 3 * 1024 * 1024 {
+                    return false;
+                }
+                bytes = next;
+                true
+            })
+            .count();
+        let entries = suffix[..count].to_vec();
+        let sent_end = pli.saturating_add(entries.len() as u64);
+        // Replace the window on every send.  A response from an older,
+        // wider batch may arrive after a retry with a smaller nextIndex;
+        // rejecting that stale response is safer than allowing it to
+        // skip the retry's consistency check.
+        self.sent_upper.insert(p.clone(), sent_end);
+        self.outbox.push((
+            p,
+            RaftRpc::AppendEntries {
+                term,
+                leader: me.clone(),
+                prev_log_index: pli,
+                prev_log_term: plt,
+                entries,
+                leader_commit: commit,
+            },
+        ));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -458,67 +614,26 @@ impl RaftNode {
             ));
             return;
         }
-        if term > self.current_term {
-            self.current_term = term;
-            self.voted_for = None;
-        }
+        self.observe_term(term);
         // 合法 leader——计时重置
         self.role = Role::Follower;
         self.leader_hint = Some(leader);
         self.last_heartbeat_ms = self.clock.now_ms();
 
-        // 一致性检查（§5.3）
-        let consistent = if prev_log_index == 0 {
-            true
-        } else {
-            match self.log.get((prev_log_index - 1) as usize) {
-                Some(e) => e.term == prev_log_term,
-                None => false,
-            }
+        let Some((keep, skip)) = self.append_plan(prev_log_index, prev_log_term, &entries) else {
+            self.outbox.push((
+                from,
+                RaftRpc::AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                },
+            ));
+            return;
         };
-        if !consistent {
-            self.outbox.push((
-                from,
-                RaftRpc::AppendEntriesResp {
-                    term: self.current_term,
-                    success: false,
-                    match_index: self.last_log_index(),
-                },
-            ));
-            return;
-        }
-        // Validate the complete batch before mutating the log. Gaps, index 0,
-        // future terms, or overwrites of a committed prefix are invalid RPCs.
-        let valid = entries.iter().enumerate().all(|(offset, entry)| {
-            prev_log_index.checked_add(offset as u64 + 1) == Some(entry.index)
-                && entry.term <= term
-                && (entry.index > self.commit_index
-                    || self.log.get((entry.index - 1) as usize) == Some(entry))
-        });
-        if !valid {
-            self.outbox.push((
-                from,
-                RaftRpc::AppendEntriesResp {
-                    term: self.current_term,
-                    success: false,
-                    match_index: self.last_log_index(),
-                },
-            ));
-            return;
-        }
         let matched = prev_log_index + entries.len() as u64;
-        // 追加/覆盖冲突（同 index 不同 term → 截断后重放）
-        for e in entries {
-            let slot = e.index as usize - 1;
-            if slot < self.log.len() {
-                if self.log[slot].term != e.term {
-                    self.log.truncate(slot); // 冲突截断（未提交的旧任期条目）
-                    self.log.push(e);
-                }
-            } else {
-                self.log.push(e);
-            }
-        }
+        self.log.truncate(keep);
+        self.log.extend(entries.into_iter().skip(skip));
         // commit 推进（min(leader_commit, 本地末尾)）
         let new_commit = leader_commit.min(matched);
         if new_commit > self.commit_index {
@@ -541,20 +656,62 @@ impl RaftNode {
         ));
     }
 
+    /// Plan a structurally validated append without mutation. Shared with the
+    /// durable host so capacity checks use precisely the log the core will keep.
+    /// Returns the retained local prefix length and matching input prefix length.
+    fn append_plan(
+        &self,
+        prev_log_index: LogIndex,
+        prev_log_term: Term,
+        entries: &[LogEntry],
+    ) -> Option<(usize, usize)> {
+        if prev_log_index != 0
+            && self
+                .log
+                .get(usize::try_from(prev_log_index - 1).ok()?)?
+                .term
+                != prev_log_term
+        {
+            return None;
+        }
+        let mut change = None;
+        for (offset, entry) in entries.iter().enumerate() {
+            let slot = usize::try_from(entry.index.checked_sub(1)?).ok()?;
+            let old = self.log.get(slot);
+            // Same index/term must identify one command, and committed entries
+            // cannot be replaced. Validate the entire batch before truncation.
+            if old.is_some_and(|old| old.term == entry.term && old != entry)
+                || (entry.index <= self.commit_index && old != Some(entry))
+            {
+                return None;
+            }
+            if change.is_none() && old.is_none_or(|old| old.term != entry.term) {
+                change = Some((slot, offset));
+            }
+        }
+        // A matching heartbeat/batch never truncates a longer local suffix.
+        Some(change.unwrap_or((self.log.len(), entries.len())))
+    }
+
     fn step_append_resp(&mut self, from: NodeId, term: Term, success: bool, match_index: LogIndex) {
         if !self.peers.iter().any(|p| p == &from) {
             return;
         }
         if term > self.current_term {
-            self.current_term = term;
-            self.role = Role::Follower;
-            self.voted_for = None;
+            self.observe_term(term);
             return;
         }
         if self.role != Role::Leader || term != self.current_term {
             return;
         }
-        if match_index > self.last_log_index() {
+        if success && match_index > self.last_log_index() {
+            return;
+        }
+        if success && match_index > self.sent_upper.get(&from).copied().unwrap_or_default() {
+            // Do not let an acknowledgement advance commit past the latest
+            // range this leader actually sent to the follower.  The transport
+            // is expected to authenticate the peer; this check is the local
+            // protocol guard against malformed or stale replies.
             return;
         }
         if success {
@@ -565,10 +722,25 @@ impl RaftNode {
             *ni = (*ni).max(match_index.saturating_add(1));
             self.advance_commit();
         } else {
-            // 回退重试（线性——简单正确；条目量小可接受）
-            let ni = self.next_index.entry(from).or_insert(1);
-            *ni = (*ni).saturating_sub(1).max(1);
-            self.broadcast_append();
+            // Replies can be reordered. A rejection cannot undo a prefix
+            // already acknowledged in this term. At the floor, a repeated
+            // refusal makes no progress; leave recovery to the heartbeat
+            // instead of producing an unbounded request/rejection loop.
+            let floor = self
+                .match_index
+                .get(&from)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let ni = self.next_index.entry(from.clone()).or_insert(1);
+            let retry = ni.saturating_sub(1).max(floor);
+            if retry >= *ni {
+                return;
+            }
+            *ni = retry;
+            // A lagging follower must not trigger cloning/sending the log to
+            // every other peer or overwrite their latest sent bounds.
+            self.send_append(from);
         }
     }
 
@@ -1061,10 +1233,12 @@ mod tests {
         #[derive(Default, Clone, PartialEq)]
         struct KV(Vec<(Vec<u8>, Vec<u8>)>);
         impl StateMachine for KV {
-            fn apply(&mut self, cmd: &[u8]) {
+            type Error = std::convert::Infallible;
+            fn apply(&mut self, cmd: &[u8]) -> Result<(), Self::Error> {
                 // cmd = key(1B) ++ value——upsert 语义
                 self.0.retain(|(k, _)| k.as_slice() != &cmd[..1]);
                 self.0.push((cmd[..1].to_vec(), cmd[1..].to_vec()));
+                Ok(())
             }
         }
         let clock = Arc::new(ManualClock::new());
@@ -1088,7 +1262,7 @@ mod tests {
         for (id, n) in net.nodes.iter_mut() {
             let sm = sms.entry(id.as_str()).or_default();
             for e in n.committed() {
-                sm.apply(&e.cmd);
+                sm.apply(&e.cmd).unwrap();
             }
         }
         let vals: Vec<KV> = sms.into_values().collect();

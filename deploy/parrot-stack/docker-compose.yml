@@ -1,5 +1,5 @@
 # ============================================================================
-#  Parrot 一键正式环境（docker compose）
+#  Parrot 本机开发验收环境（docker compose）
 #
 #  拉起一个 3 节点 Parrot 集群 + 1 个 Ray(Python) 网关：
 #    parrot-1 ──┐
@@ -9,7 +9,7 @@
 #
 #  用法：
 #    cd deploy/parrot-stack && docker compose up -d --build
-#    docker compose run --rm probe            # 全量验收（P1-P7）
+#    docker compose run --rm probe            # 部署专项验收（P1-P7，边界见 ../parrot-mesh/README.md）
 #    docker compose logs -f parrot-1
 #    docker compose down -v
 # ============================================================================
@@ -30,9 +30,10 @@ services:
     environment:
       PARROT_NODE_ID: parrot-1
       PARROT_BIND: 0.0.0.0:9801
+      PARROT_SECURITY_MODE: insecure-development
       PARROT_ACTORS: echo,counter,kv,slow
     ports:
-      - "19801:9801"
+      - "127.0.0.1:19801:9801"
 
   parrot-2:
     <<: *parrot-common
@@ -42,10 +43,11 @@ services:
     environment:
       PARROT_NODE_ID: parrot-2
       PARROT_BIND: 0.0.0.0:9801
+      PARROT_SECURITY_MODE: insecure-development
       PARROT_SEEDS: parrot-1=parrot-1:9801
       PARROT_ACTORS: echo,counter,kv,slow
     ports:
-      - "19802:9801"
+      - "127.0.0.1:19802:9801"
 
   parrot-3:
     <<: *parrot-common
@@ -55,43 +57,48 @@ services:
     environment:
       PARROT_NODE_ID: parrot-3
       PARROT_BIND: 0.0.0.0:9801
+      PARROT_SECURITY_MODE: insecure-development
       PARROT_SEEDS: parrot-2=parrot-2:9801,parrot-1=parrot-1:9801
       PARROT_ACTORS: echo,counter,kv,slow
     ports:
-      - "19803:9801"
+      - "127.0.0.1:19803:9801"
 
   # Ray 网关（Python 侧多 actor 运行环境——异构互操作面）。
   # Ray 属重依赖（~500MB），默认注释；启用方法：
   #   docker compose --profile ray up -d
   ray-gw:
-    image: python:3.11-slim
+    init: true
+    build:
+      context: ../..
+      dockerfile: deploy/images/gw-ray.Dockerfile
     container_name: parrot-ray-gw
     profiles: ["ray"]
     depends_on:
       - parrot-1
     working_dir: /gw
-    volumes:
-      - ../../interop/python:/gw:ro
     environment:
       PYTHONPATH: /gw
       PARROT_RAY_GW_WORKERS: "8"
-    command: >
-      bash -c "pip install --no-cache-dir -q 'ray>=2.9'
-               && python3 -m parrot_protocol.ray_gw 9851"
+    command: ["python3", "-m", "parrot_protocol.ray_gw", "9851"]
     ports:
-      - "19851:9851"
+      - "127.0.0.1:19851:9851"
 
   # 验收器（docker compose run --rm probe）
   probe:
     <<: *parrot-common
     container_name: parrot-probe
+    profiles: ["probe"]
     entrypoint: ["/usr/local/bin/parrot-probe"]
     command:
+      - --insecure-development
       - parrot-1=parrot-1:9801
       - parrot-2=parrot-2:9801
       - parrot-3=parrot-3:9801
     depends_on:
-      - parrot-1
-      - parrot-2
-      - parrot-3
+      parrot-1:
+        condition: service_healthy
+      parrot-2:
+        condition: service_healthy
+      parrot-3:
+        condition: service_healthy
     restart: "no"

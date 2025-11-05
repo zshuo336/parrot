@@ -10,14 +10,25 @@ name = "crawler-lab"
 path = "src/main.rs"
 
 [dependencies]
+parrot-config = { path = "../../crates/parrot-config" }
 parrot-api = { path = "../../crates/parrot-api" }
 parrot-remote = { path = "../../crates/parrot-remote" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crawler-lab-core = { path = "core" }
+parrot = { path = "../../crates/parrot" }
+parrot-app = { path = "../../crates/parrot-app", features = ["dylib", "wasm"] }
+parrot-wasm = { path = "../../crates/parrot-wasm" }
+toml = "0.8"
+url = "2"
 
 # 消息 codec 注册（inventory submit）走 parrot-api 公共面——应用自有键空间
 # bin:crawl/*（与框架注册表同进程合并，键不冲突）
 
-# G1 迁移门禁测试专用（应用本体仍零 parrot-app 依赖——框架/应用分离不破）
+# Component execution uses only the public application host APIs.
+
 [dev-dependencies]
-parrot-app = { path = "../../crates/parrot-app" }
+sha2 = "0.10"
+tempfile = "3"

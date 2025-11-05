@@ -1,51 +1,52 @@
-//! 规范层"引擎中立"注册点（POC 1 与 POC 3 共用的 parrot-api 侧形态）。
-//!
-//! 关键设计：规范层只定义"擦除后的 actor 运行时接口"，任何引擎
-//! （actix/thread/未来引擎/跨语言网关）都实现这一接口并注册。
-//! 规范层永远不知道引擎的名字与符号。
-
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
+//! Concrete runtimes implement this face without changing business actors.
+use std::sync::Arc;
+use std::time::Duration;
 pub type BoxedMessage = Box<dyn std::any::Any + Send>;
 pub type BoxedResult = Result<BoxedMessage, String>;
-pub type BoxedActorRef = Arc<dyn ActorRefErased + Send + Sync>;
-
-/// 擦除 actor：引擎看到的最小接口（receive 消息，返回结果）。
+pub type BoxedActorRef = Arc<dyn ActorRefErased>;
+pub struct SendError {
+    pub reason: String,
+    pub message: BoxedMessage,
+}
+impl std::fmt::Debug for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendError")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+/// Runtime hooks default to no-op. Implementations must call pre_start before
+/// publishing a ready address, and post_stop exactly once after any attempted
+/// initialization, including failure, before releasing the actor.
 pub trait ErasedActor: Send + 'static {
+    fn pre_start(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     fn receive(&mut self, msg: BoxedMessage) -> BoxedResult;
+    fn post_stop(&mut self) {}
 }
-
-/// 擦除 ref：用户侧拿到的最小接口。
 pub trait ActorRefErased: Send + Sync {
-    fn tell(&self, msg: BoxedMessage);
-    fn ask(&self, msg: BoxedMessage) -> BoxedResult;
+    fn tell(&self, msg: BoxedMessage) -> Result<(), SendError>;
+    fn ask(&self, msg: BoxedMessage) -> BoxedResult {
+        self.ask_with_timeout(msg, Duration::from_secs(5))
+    }
+    fn ask_with_timeout(&self, msg: BoxedMessage, timeout: Duration) -> BoxedResult;
     fn path(&self) -> String;
+    fn generation(&self) -> u64;
+    fn stop(&self);
+    fn wait_stopped(&self, timeout: Duration) -> Result<(), String>;
 }
-
-/// 引擎运行时（每个引擎实现一个，注册到全局表）。
+/// Successful spawn means pre_start succeeded. Failed initialization never
+/// dispatches receive, but still calls post_stop exactly once before releasing
+/// the actor, as required by ErasedActor. Shutdown closes admission and joins
+/// the runtime's workers; synchronous callbacks must return for shutdown to finish.
 pub trait EngineRuntime: Send + Sync {
     fn name(&self) -> &'static str;
-    fn spawn_erased(&self, actor: Box<dyn ErasedActor>, path: &str) -> Result<BoxedActorRef, String>;
-}
-
-// ---------------- 全局引擎注册表（规范层，无引擎符号） ----------------
-
-type BindingFactory = fn() -> Box<dyn ErasedActor>;
-
-static ENGINE_BINDINGS: Mutex<Option<HashMap<String, Vec<BindingFactory>>>> = Mutex::new(None);
-
-/// 宏生成的注册调用入口（derive 时按 #[engine] 属性生成对它的调用）。
-pub fn register_engine_binding(name: &str, factory: BindingFactory) {
-    let mut g = ENGINE_BINDINGS.lock().unwrap();
-    g.get_or_insert_with(HashMap::new)
-        .entry(name.to_string())
-        .or_default()
-        .push(factory);
-}
-
-/// 引擎枚举（测试用）。
-pub fn list_bindings() -> Vec<String> {
-    let g = ENGINE_BINDINGS.lock().unwrap();
-    g.as_ref().map(|m| m.keys().cloned().collect()).unwrap_or_default()
+    fn spawn_erased(
+        &self,
+        actor: Box<dyn ErasedActor>,
+        path: &str,
+    ) -> Result<BoxedActorRef, String>;
+    fn shutdown(&self) -> Result<(), String>;
+    fn worker_counts(&self) -> (usize, usize);
 }

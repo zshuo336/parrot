@@ -6,17 +6,22 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use std::sync::Mutex;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 use crate::error::RemoteError;
 use crate::handshake::HandshakeBody;
 use crate::node::NodeAddr;
 use crate::transport::{
-    run_connection, ConnParams, ConnSide, ConnectionHandle, OnDisconnect, Transport,
+    run_connection_captured, ConnParams, ConnSide, ConnectionHandle, ConnectionTasks, OnDisconnect,
+    Transport,
 };
 
 pub struct TcpTransport {
+    tasks: ConnectionTasks,
+    capture: Option<crate::capture::FrameCapture>,
+    security: crate::security::RemoteSecurity,
+    tls: Option<(tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector)>,
     handshake: HandshakeBody,
     inbound:
         tokio::sync::mpsc::Sender<(crate::frame::Frame, crate::transport::FrameSender, String)>,
@@ -26,7 +31,22 @@ pub struct TcpTransport {
     listener: Mutex<Option<Arc<TcpListener>>>,
 }
 
+impl Drop for TcpTransport {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl TcpTransport {
+    pub(crate) fn with_metrics(mut self, metrics: Arc<crate::metrics::TransportMetrics>) -> Self {
+        self.tasks.metrics = metrics;
+        self
+    }
+    pub fn with_capture(mut self, capture: Option<crate::capture::FrameCapture>) -> Self {
+        self.capture = capture;
+        self
+    }
+
     pub fn new(
         handshake: HandshakeBody,
         inbound: tokio::sync::mpsc::Sender<(
@@ -39,6 +59,10 @@ impl TcpTransport {
         knobs: Option<crate::transport::RuntimeKnobs>,
     ) -> Self {
         Self {
+            tasks: ConnectionTasks::default(),
+            capture: None,
+            security: Default::default(),
+            tls: None,
             handshake,
             inbound,
             on_disconnect,
@@ -49,67 +73,174 @@ impl TcpTransport {
     }
 }
 
+trait TcpIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TcpIo for T {}
+
+impl TcpTransport {
+    pub fn with_security(
+        mut self,
+        security: crate::security::RemoteSecurity,
+    ) -> Result<Self, RemoteError> {
+        security.validate(&self.handshake.node_id, "tcp", None)?;
+        self.tls = security
+            .credentials()
+            .map(|cfg| {
+                Ok::<_, RemoteError>((
+                    crate::tls::server_acceptor(cfg)?,
+                    crate::tls::client_connector(cfg)?,
+                ))
+            })
+            .transpose()?;
+        self.security = security;
+        Ok(self)
+    }
+
+    async fn establish(
+        &self,
+        stream: TcpStream,
+        side: ConnSide,
+        expected: Option<&str>,
+    ) -> Result<ConnectionHandle, RemoteError> {
+        stream.set_nodelay(true).ok();
+        let local = stream.local_addr().ok();
+        let address = stream
+            .peer_addr()
+            .map_err(|e| RemoteError::Transport(e.to_string()))?;
+        self.security.check_address(address)?;
+        let (io, trust): (Box<dyn TcpIo>, crate::security::PeerTrust) = match (&self.tls, side) {
+            (Some((_, connector)), ConnSide::Connect) => {
+                let name = rustls::pki_types::ServerName::try_from(expected.unwrap().to_owned())
+                    .map_err(|e| RemoteError::Transport(format!("TLS server name: {e}")))?;
+                let stream = connector
+                    .connect(name, stream)
+                    .await
+                    .map_err(|e| RemoteError::Transport(format!("TLS connect: {e}")))?;
+                let certs = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .unwrap_or_default()
+                    .to_vec();
+                (
+                    Box::new(stream),
+                    crate::security::PeerTrust::Certificates(certs),
+                )
+            }
+            (Some((acceptor, _)), ConnSide::Accept) => {
+                let stream = acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|e| RemoteError::Transport(format!("TLS accept: {e}")))?;
+                let certs = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .unwrap_or_default()
+                    .to_vec();
+                (
+                    Box::new(stream),
+                    crate::security::PeerTrust::Certificates(certs),
+                )
+            }
+            (None, _) => (
+                Box::new(stream),
+                crate::security::PeerTrust::Unauthenticated,
+            ),
+        };
+        let trust = if let Some(node) = expected {
+            trust.expecting(node)
+        } else {
+            trust
+        };
+        run_connection_captured(
+            io,
+            ConnParams {
+                side,
+                local_addr: local,
+                peer_addr: Some(address),
+                scheme: "tcp",
+                local_handshake: self.handshake.clone(),
+                inbound: self.inbound.clone(),
+                on_disconnect: self.on_disconnect.clone(),
+                shutdown: self.shutdown.subscribe(),
+                knobs: self.knobs,
+            },
+            Some(&self.tasks),
+            trust,
+            self.capture.as_ref(),
+        )
+        .await
+    }
+}
+
 #[async_trait::async_trait]
 impl Transport for TcpTransport {
     async fn connect(&self, addr: &NodeAddr) -> Result<ConnectionHandle, RemoteError> {
-        let stream = TcpStream::connect(addr.addr)
+        self.security.check_address(addr.addr)?;
+        if self.tls.is_some() && !addr.identity_is_explicit {
+            return Err(RemoteError::Transport(
+                "mTLS requires an explicit node ID in the endpoint".into(),
+            ));
+        }
+        self.tasks
+            .run(crate::security::handshake_deadline(async {
+                let stream = TcpStream::connect(addr.addr).await.map_err(|e| {
+                    RemoteError::Transport(format!("tcp connect {}: {e}", addr.addr))
+                })?;
+                self.establish(
+                    stream,
+                    ConnSide::Connect,
+                    addr.identity_is_explicit.then_some(addr.node_id.as_str()),
+                )
+                .await
+            }))
             .await
-            .map_err(|e| RemoteError::Transport(format!("tcp connect {}: {e}", addr.addr)))?;
-        stream.set_nodelay(true).ok();
-        let local = stream.local_addr().ok();
-        let peer = stream.peer_addr().ok();
-        run_connection(
-            stream,
-            ConnParams {
-                side: ConnSide::Connect,
-                local_addr: local,
-                peer_addr: peer,
-                scheme: "tcp",
-                local_handshake: self.handshake.clone(),
-                inbound: self.inbound.clone(),
-                on_disconnect: self.on_disconnect.clone(),
-                shutdown: self.shutdown.subscribe(),
-                knobs: self.knobs,
-            },
-        )
-        .await
     }
 
     async fn listen(&self, bind: SocketAddr) -> Result<(), RemoteError> {
-        let l = TcpListener::bind(bind)
+        self.security.check_address(bind)?;
+        self.tasks
+            .run(async {
+                let l = TcpListener::bind(bind)
+                    .await
+                    .map_err(|e| RemoteError::Transport(format!("tcp bind {bind}: {e}")))?;
+                let mut listener = self.listener.lock().unwrap();
+                if self.tasks.is_closed() {
+                    return Err(ConnectionTasks::error());
+                }
+                *listener = Some(Arc::new(l));
+                Ok(())
+            })
             .await
-            .map_err(|e| RemoteError::Transport(format!("tcp bind {bind}: {e}")))?;
-        *self.listener.lock().await = Some(Arc::new(l));
-        Ok(())
     }
 
     async fn accept(&self) -> Result<ConnectionHandle, RemoteError> {
-        let l = {
-            let g = self.listener.lock().await;
-            g.clone()
-                .ok_or_else(|| RemoteError::Transport("listen() not called".into()))?
-        };
-        let (stream, peer) = l
-            .accept()
+        self.tasks
+            .run(async {
+                let l = self
+                    .listener
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| RemoteError::Transport("listen() not called".into()))?;
+                let (stream, _) = l
+                    .accept()
+                    .await
+                    .map_err(|e| RemoteError::Transport(format!("tcp accept: {e}")))?;
+                crate::security::handshake_deadline(self.establish(stream, ConnSide::Accept, None))
+                    .await
+            })
             .await
-            .map_err(|e| RemoteError::Transport(format!("tcp accept: {e}")))?;
-        stream.set_nodelay(true).ok();
-        let local = stream.local_addr().ok();
-        run_connection(
-            stream,
-            ConnParams {
-                side: ConnSide::Accept,
-                local_addr: local,
-                peer_addr: Some(peer),
-                scheme: "tcp",
-                local_handshake: self.handshake.clone(),
-                inbound: self.inbound.clone(),
-                on_disconnect: self.on_disconnect.clone(),
-                shutdown: self.shutdown.subscribe(),
-                knobs: self.knobs,
-            },
-        )
-        .await
+    }
+
+    fn close(&self) {
+        self.tasks.close();
+        self.listener.lock().unwrap().take();
+    }
+
+    async fn shutdown(&self) {
+        self.close();
+        self.tasks.wait().await;
     }
 
     fn scheme(&self) -> &'static str {
@@ -118,10 +249,10 @@ impl Transport for TcpTransport {
 
     fn local_addr(&self) -> Option<SocketAddr> {
         self.listener
-            .try_lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|l| l.local_addr().ok()))
-            .flatten()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
     }
 }
 
@@ -170,20 +301,11 @@ mod tests {
         // bind → 公布端口 → 并行 accept/connect（POC 教训：勿串行阻塞）
         tb.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = {
-            let g = tb.listener.lock().await;
+            let g = tb.listener.lock().unwrap();
             g.as_ref().unwrap().local_addr().unwrap()
         };
-        let accept_fut = tokio::spawn(async move { tb.accept().await });
-        let mut connected = None;
-        for _ in 0..50 {
-            if let Ok(c) = ta.connect(&crate::node::NodeAddr::tcp("tcp-b", addr)).await {
-                connected = Some(c);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let conn_a = connected.expect("connect retries exhausted");
-        let conn_b = accept_fut.await.unwrap().unwrap();
+        let address = crate::node::NodeAddr::tcp("tcp-b", addr);
+        let (conn_b, conn_a) = tokio::try_join!(tb.accept(), ta.connect(&address)).unwrap();
         assert_eq!(conn_a.node_id, "tcp-b");
         assert_eq!(conn_b.node_id, "tcp-a");
 

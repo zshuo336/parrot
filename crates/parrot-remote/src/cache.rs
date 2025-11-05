@@ -27,6 +27,7 @@ pub struct CacheEntry {
     pub version: u64,
     pub state: CacheState,
     pub fetched_at: Instant,
+    pub ttl: Duration,
     /// S2 LRU 逻辑时钟（put/get 推进）。
     pub lru: u64,
 }
@@ -36,6 +37,8 @@ pub struct CacheEntry {
 /// S2（DEV_06 §2）：工作集管理——容量上限 + LRU 淘汰 + 命中/穿透统计。
 pub struct ResolveCache {
     entries: HashMap<String, CacheEntry>,
+    /// Version fences retained for keys invalidated while no value was cached.
+    invalidation_floor: HashMap<String, u64>,
     /// Fresh 窗口（TTL）。
     pub ttl: Duration,
     /// Stale 续服务窗口（Directory 全灭兜底——07 §9）。
@@ -53,6 +56,7 @@ impl Default for ResolveCache {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
+            invalidation_floor: HashMap::new(),
             ttl: Duration::from_secs(60),
             stale_window: Duration::from_secs(300),
             capacity: 65_536,
@@ -74,10 +78,11 @@ pub struct CacheStats {
 
 impl CacheStats {
     pub fn hit_ratio_percent(&self) -> f64 {
-        if self.hits + self.misses == 0 {
+        let total = self.hits as u128 + self.misses as u128;
+        if total == 0 {
             0.0
         } else {
-            self.hits as f64 * 100.0 / (self.hits + self.misses) as f64
+            self.hits as f64 * 100.0 / total as f64
         }
     }
 }
@@ -97,27 +102,35 @@ impl ResolveCache {
 
     /// S2：命中统计快照。
     pub fn stats(&self) -> CacheStats {
-        let total = self.hits + self.misses;
+        let total = self.hits as u128 + self.misses as u128;
         CacheStats {
             hits: self.hits,
             misses: self.misses,
-            hit_ratio_permille: self
-                .hits
-                .checked_mul(1000)
-                .and_then(|h| {
-                    if total == 0 {
-                        None
-                    } else {
-                        h.checked_div(total)
-                    }
-                })
-                .unwrap_or(0),
+            hit_ratio_permille: (self.hits as u128 * 1000).checked_div(total).unwrap_or(0) as u64,
         }
     }
 
     /// S2：LRU 驱动（put/get 推进逻辑时钟）。
     fn tick_lru(&mut self) -> u64 {
-        self.lru_clock += 1;
+        // Rebase before overflow: cache lookup is administrative data-plane
+        // work and must never panic after a long-lived process wraps its LRU.
+        if self.lru_clock == u64::MAX {
+            let mut order: Vec<(String, u64)> = self
+                .entries
+                .iter()
+                .map(|(k, e)| (k.clone(), e.lru))
+                .collect();
+            order.sort_by_key(|(_, lru)| *lru);
+            let mut next = 0u64;
+            for (key, _) in order {
+                next = next.saturating_add(1);
+                if let Some(entry) = self.entries.get_mut(&key) {
+                    entry.lru = next;
+                }
+            }
+            self.lru_clock = next;
+        }
+        self.lru_clock = self.lru_clock.saturating_add(1);
         self.lru_clock
     }
 
@@ -147,7 +160,7 @@ impl ResolveCache {
         let lru = self.tick_lru();
         // 真 miss（key 不存在）也计穿透——命中率观测完整
         let Some(e) = self.entries.get_mut(key) else {
-            self.misses += 1;
+            self.misses = self.misses.saturating_add(1);
             return None;
         };
         e.lru = lru;
@@ -155,8 +168,10 @@ impl ResolveCache {
         let st = match e.state {
             CacheState::Invalid => CacheState::Invalid,
             _ => {
-                let age = now.duration_since(e.fetched_at);
-                if age <= self.ttl {
+                // Restored timestamps or test clocks may move backwards.
+                // Treat a future timestamp as fresh instead of panicking.
+                let age = now.saturating_duration_since(e.fetched_at);
+                if age <= e.ttl {
                     CacheState::Fresh
                 } else if age <= self.stale_window {
                     CacheState::Stale
@@ -167,11 +182,11 @@ impl ResolveCache {
         };
         match st {
             CacheState::Fresh | CacheState::Stale => {
-                self.hits += 1;
+                self.hits = self.hits.saturating_add(1);
                 Some((&e.endpoints, st))
             }
             CacheState::Invalid => {
-                self.misses += 1;
+                self.misses = self.misses.saturating_add(1);
                 None
             }
         }
@@ -185,17 +200,50 @@ impl ResolveCache {
         version: u64,
         now: Instant,
     ) {
+        self.put_with_ttl(key, endpoints, version, self.ttl, now);
+    }
+
+    pub fn put_with_ttl(
+        &mut self,
+        key: impl Into<String>,
+        endpoints: Vec<String>,
+        version: u64,
+        ttl: Duration,
+        now: Instant,
+    ) {
+        let key = key.into();
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|existing| existing.version > version)
+        {
+            return;
+        }
+        if self
+            .invalidation_floor
+            .get(&key)
+            .is_some_and(|floor| version < *floor)
+        {
+            return;
+        }
+        if ttl.is_zero() {
+            self.entries.remove(&key);
+            self.invalidate_versioned(&key, version);
+            return;
+        }
         let lru = self.tick_lru();
         self.entries.insert(
-            key.into(),
+            key.clone(),
             CacheEntry {
                 endpoints,
                 version,
                 state: CacheState::Fresh,
                 fetched_at: now,
+                ttl,
                 lru,
             },
         );
+        self.invalidation_floor.remove(&key);
         self.evict_if_full();
     }
 
@@ -203,6 +251,29 @@ impl ResolveCache {
     pub fn invalidate(&mut self, key: &str) {
         if let Some(e) = self.entries.get_mut(key) {
             e.state = CacheState::Invalid;
+        }
+    }
+
+    /// Apply an invalidation only when it is at least as new as the cached
+    /// directory version. Older control frames can arrive after a newer
+    /// resolve response on a different connection and must not erase it.
+    pub fn invalidate_versioned(&mut self, key: &str, version: u64) {
+        if let Some(e) = self.entries.get_mut(key) {
+            if version >= e.version {
+                e.state = CacheState::Invalid;
+                e.version = version;
+            }
+        }
+        // Keep a fence even when an entry is present. Otherwise an
+        // INVALIDATE(v2) followed by a stale RESOLVE_R(v1) can resurrect the
+        // old value because the entry's version check only compares against
+        // the currently stored version.
+        let floor = self.invalidation_floor.entry(key.to_owned()).or_default();
+        *floor = (*floor).max(version);
+        if self.invalidation_floor.len() > self.capacity {
+            if let Some(oldest) = self.invalidation_floor.keys().next().cloned() {
+                self.invalidation_floor.remove(&oldest);
+            }
         }
     }
 
@@ -294,6 +365,22 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn clock_rollback_is_fresh_and_lru_overflow_rebases_without_panic() {
+        let mut c = ResolveCache::with_capacity(2);
+        let fetched = Instant::now() + Duration::from_secs(10);
+        c.put("future", vec!["tcp://future:1".into()], 1, fetched);
+        assert_eq!(
+            c.get("future", fetched - Duration::from_secs(1)).unwrap().1,
+            CacheState::Fresh
+        );
+        c.lru_clock = u64::MAX;
+        c.put("a", vec!["tcp://a:1".into()], 2, fetched);
+        c.put("b", vec!["tcp://b:1".into()], 3, fetched);
+        assert_eq!(c.len(), 2);
+        assert!(c.get("b", fetched).is_some());
+    }
+
     // F7：resolve_cache_hit_zero_rtt（命中零网络开销）
     #[test]
     fn resolve_cache_hit_zero_rtt() {
@@ -330,6 +417,35 @@ mod tests {
         assert!(matches!(
             resolve_decision(&mut c, "parrot://eu-1/user/svc", t0),
             ResolveAction::DirectCache { endpoint } if endpoint == "tcp://y:2"
+        ));
+    }
+
+    #[test]
+    fn older_invalidation_cannot_erase_newer_version() {
+        let mut c = ResolveCache::new();
+        let t0 = Instant::now();
+        c.put("service", vec!["tcp://x:1".into()], 9, t0);
+        c.invalidate_versioned("service", 8);
+        assert!(matches!(
+            resolve_decision(&mut c, "service", t0),
+            ResolveAction::DirectCache { .. }
+        ));
+        c.invalidate_versioned("service", 9);
+        assert!(matches!(
+            resolve_decision(&mut c, "service", t0),
+            ResolveAction::Resolve { .. }
+        ));
+    }
+
+    #[test]
+    fn older_resolve_response_cannot_replace_newer_entry() {
+        let mut c = ResolveCache::new();
+        let t0 = Instant::now();
+        c.put("service", vec!["tcp://new:1".into()], 9, t0);
+        c.put("service", vec!["tcp://old:1".into()], 8, t0);
+        assert!(matches!(
+            resolve_decision(&mut c, "service", t0),
+            ResolveAction::DirectCache { endpoint } if endpoint == "tcp://new:1"
         ));
     }
 
@@ -514,5 +630,54 @@ mod tests {
         assert!(c.get("k", t0).is_none());
         let s = c.stats();
         assert_eq!(s.misses, 1, "Invalid 视为穿透");
+    }
+
+    #[test]
+    fn invalidation_floor_blocks_late_response_after_cache_miss() {
+        let mut c = ResolveCache::with_capacity(2);
+        let t0 = Instant::now();
+        c.invalidate_versioned("gone", 9);
+        c.put("gone", vec!["old".into()], 8, t0);
+        assert!(c.get("gone", t0).is_none());
+        c.put("gone", vec!["new".into()], 10, t0);
+        assert_eq!(c.get("gone", t0).unwrap().0, &["new".to_owned()]);
+    }
+
+    #[test]
+    fn invalidation_floor_blocks_late_response_over_existing_entry() {
+        let mut c = ResolveCache::new();
+        let t0 = Instant::now();
+        c.put("node", vec!["v1".into()], 1, t0);
+        c.invalidate_versioned("node", 2);
+        // A response already in flight from version 1 must not resurrect the
+        // invalidated route merely because the old entry still exists.
+        c.put("node", vec!["stale".into()], 1, t0);
+        assert!(c.get("node", t0).is_none());
+        c.put("node", vec!["v3".into()], 3, t0);
+        assert_eq!(c.get("node", t0).unwrap().0, &["v3".to_owned()]);
+    }
+
+    #[test]
+    fn zero_ttl_retires_previous_value_and_equal_revision_can_be_revalidated() {
+        let mut c = ResolveCache::new();
+        let now = Instant::now();
+        c.put("node", vec!["old".into()], 1, now);
+        c.put_with_ttl("node", vec!["uncached".into()], 2, Duration::ZERO, now);
+        assert!(c.get("node", now).is_none());
+        c.put("node", vec!["obsolete".into()], 1, now);
+        assert!(c.get("node", now).is_none());
+        c.put("node", vec!["fresh-read".into()], 2, now);
+        assert_eq!(c.get("node", now).unwrap().0, &["fresh-read".to_owned()]);
+    }
+
+    #[test]
+    fn saturated_counters_preserve_exact_ratio_without_overflow() {
+        let c = ResolveCache {
+            hits: u64::MAX,
+            misses: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(c.stats().hit_ratio_permille, 500);
+        assert_eq!(c.stats().hit_ratio_percent(), 50.0);
     }
 }

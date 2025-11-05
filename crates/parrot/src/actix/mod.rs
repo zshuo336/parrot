@@ -5,7 +5,11 @@
 
 pub mod actor;
 pub mod context;
+mod disposal;
+mod factory;
 mod lifecycle;
+mod local_runtime;
+pub mod local_typed;
 pub mod message;
 pub mod reference;
 pub mod system;

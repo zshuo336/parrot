@@ -7,6 +7,7 @@
 #   crawler(parrot) reqwest 真实 HTTPS 漫爬 + 编排 + 百度式 Web 页
 #
 # 四服务独立运行（用户裁定）：
+#   清单：websearch --insecure-development --manifest websearch.app.toml <seed>
 #   全链：run.sh <seed> —— 爬取→分词→索引→Web 服务
 #   仅检索：websearch --serve-only —— 回放段文件独立服务（重启不丢）
 
@@ -18,33 +19,39 @@ version = "1.0.0"
 [[components]]
 name = "frontier"
 engine = "erlang"
-artifact = { Beam = { app = "frontier", uri = "file://erlang/" } }
+artifact = { Beam = { app = "frontier", uri = "erlang/" } }
 
 [[components]]
 name = "tokenizer"
 engine = "ray"
-artifact = { PyModule = { module = "tokenizer", uri = "file://python/" } }
+artifact = { PyModule = { module = "tokenizer", uri = "python/" } }
 deps = ["frontier"]
 
 [[components]]
 name = "search"
 engine = "akka"
-artifact = { Jvm = { main_class = "websearch.search.SearchComponent", uri = "file://jvm/target/websearch-jvm-1.0.0.jar" } }
+artifact = { Jvm = { main_class = "websearch.search.SearchComponent", uri = "jvm/target/websearch-jvm-1.0.0.jar" } }
 deps = ["tokenizer"]
 
 [[components]]
 name = "crawler"
 engine = "parrot"
-# 主进程直跑形态（tokio 编排器）——非 dylib/wasm（需网络栈与 reqwest）
-artifact = { Dylib = { uri = "file://bin/websearch", digest = "sha256:__BUILD__", abi = 1 } }
+# websearch --manifest embeds this real workflow actor; paths resolve relative to this file.
+artifact = { Props = { factory = "websearch.crawler" } }
 deps = ["frontier", "tokenizer", "search"]
+hooks = { on_start = ".", on_drain = ".", on_stop = "." }
+
+# 业务参数属于 crawler 组件配置，由 crawler 自己解释；config_overlay
+# 只接受 parrot-config 的框架字段（例如 [config_overlay.thread]）。
+[components.config]
+settings = '{"sites":100,"maxdepth":10,"pages":50000,"port":8080,"data":"./data"}'
 
 # ── 连接（WireSpec——组件间静态路由）─────────────────────────────────
 
 [[wiring]]
 from = "crawler:/user/frontier"
 to = "frontier:/user/frontier"
-qos = "wan"   # 真实外网爬取——wan 语义
+qos = "lan"   # 本地网关之间的接线；HTTP 外网抓取由 crawler 自身处理
 
 [[wiring]]
 from = "crawler:/user/tokenizer"
@@ -56,12 +63,7 @@ from = "crawler:/user/search"
 to = "search:/user/search"
 qos = "lan"
 
-# ── 配置（overlay——CLI 注入位）─────────────────────────────────────
-
-[config_overlay]
-# 站点目标制（用户裁定 3）：≥sites 个不同 host 且每站深度 ≥maxdepth 才停
-sites = 100      # 站点目标（不同 host 数）
-maxdepth = 10    # 每站爬取深度
-pages = 50000    # 安全页数上限（兜底——队列耗尽自然收尾）
-port = 8080
-data = "./data"
+# ── 框架 overlay（可选）────────────────────────────────────────────
+# 例如：
+# [config_overlay.thread]
+# shared_pool_size = 4

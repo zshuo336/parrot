@@ -1,17 +1,7 @@
-//! G1/M1（DEV_09 §3.7）：crawler-lab Manifest 迁移验证。
-//!
-//! crawler.app.toml 与手写装配（apps/crawler-lab/src/main.rs）行为等价：
-//! 1. Manifest 解析 + 校验通过（拓扑即依赖序）；
-//! 2. 拓扑序与 main.rs 装配序一致（frontier→index→search→crawler——
-//!    三网关先起，hub 最后织入）；
-//! 3. wiring 连接可解析（from/to 组件均在声明内）；
-//! 4. 配置 overlay 与 golden 录制参数一致（pages=60 depth=2 fanout=3
-//!    batch=32——行为等价的输入面）；
-//! 5. golden 关键断言锚定（迁移不触碰语义——本测试防回归漂移）。
-//!
-//! 四网关全链回归（cid 轨迹 vs golden/pre_migration_output.txt）由
-//! `deploy/crawler-lab/run-lab.sh --pages 60 --skip-ts` 承载——本测试
-//! 为其静态前置门禁。
+//! Static checks for the crawler manifest template. These do not load its
+//! artifacts, execute wiring or compare CID traces.
+//! Real component business and golden comparisons run in test-crawler-business;
+//! actual manifest scenarios run in run_manifest_integration.py.
 
 use parrot_app::manifest::AppManifest;
 use parrot_app::planner::{plan, LocalTopology};
@@ -26,13 +16,12 @@ fn manifest() -> AppManifest {
 fn manifest_parses_and_validates() {
     let m = manifest();
     assert_eq!(m.name, "crawler-lab");
-    assert_eq!(m.version, "2.0.0"); // R5 新形态（uri/alt_artifact 制品直发）
+    assert_eq!(m.version, "2.0.0"); // template version; not proof of deployment
     parrot_app::manifest::validate(&m).expect("manifest 合法");
 }
 
 #[test]
-fn topo_order_matches_manual_assembly() {
-    // main.rs 装配序：先三网关（frontier/index/search）后本体 hub（crawler）
+fn declared_dependency_order_is_frontier_index_search_crawler() {
     let m = manifest();
     let p = plan(&m, &LocalTopology).expect("plan");
     let order: Vec<&str> = p.order.iter().map(|c| c.spec.name.as_str()).collect();
@@ -53,14 +42,22 @@ fn wiring_endpoints_resolve() {
 }
 
 #[test]
-fn overlay_matches_golden_recording_params() {
+fn business_settings_are_not_framework_overlay() {
     let m = manifest();
-    let o = m.config_overlay.expect("overlay 存在");
-    // golden 录制参数（README：pages=60 depth=2 fanout=3 batch=32）
-    assert_eq!(o.get("pages").and_then(|v| v.as_integer()), Some(60));
-    assert_eq!(o.get("depth").and_then(|v| v.as_integer()), Some(2));
-    assert_eq!(o.get("fanout").and_then(|v| v.as_integer()), Some(3));
-    assert_eq!(o.get("batch").and_then(|v| v.as_integer()), Some(32));
+    let config = m.component("crawler").unwrap().config.as_ref().unwrap();
+    let settings =
+        crawler_lab_core::Config::from_json(config["settings"].as_str().unwrap().as_bytes())
+            .unwrap();
+    assert_eq!(
+        (
+            settings.pages,
+            settings.depth,
+            settings.fanout,
+            settings.batch
+        ),
+        (60, 2, 3, 32)
+    );
+    parrot_app::assemble::effective_config(&m, &Default::default()).unwrap();
 }
 
 #[test]
@@ -78,32 +75,14 @@ fn engines_match_topology() {
     assert_eq!(get("crawler"), "parrot");
 }
 
-/// golden 关键断言锚定（G1 迁移后 run-lab 输出必须重现——本测试保证
-/// golden 文件本身不被篡改，防"改基线凑通过"）。
+/// Pin the entire historical fixture. Semantic comparison to actual runs is
+/// separately performed by regression.compare; this alone proves no business.
 #[test]
-fn golden_file_anchored() {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../apps/crawler-lab/golden/pre_migration_output.txt");
-    let t = std::fs::read_to_string(&p).expect("golden 存在");
-    // README 声明的关键断言（字节级）
-    assert!(t.contains("fetched=60（去重后）pushed_total=99"));
-    assert!(t.contains("terms=33 postings=1746"));
-    assert!(t.contains("\"terms\":33,\"postings\":1746,\"queries\":0"));
-    assert!(t.contains("crawler-lab PASS（四运行时全链集成）"));
-}
-
-/// 编排 ≤50 行门禁（DEV_09 G1：crawler.app.toml 编排 ≤50 行）。
-#[test]
-fn manifest_under_50_lines() {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../apps/crawler-lab/crawler.app.toml");
-    let t = std::fs::read_to_string(&p).expect("manifest 存在");
-    let non_comment = t
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
-        .count();
-    assert!(
-        non_comment <= 50,
-        "编排声明 {non_comment} 行超 50 行门禁（注释不计）"
+fn golden_file_is_byte_for_byte_preserved() {
+    use sha2::{Digest, Sha256};
+    let bytes = include_bytes!("../golden/pre_migration_output.txt");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(bytes)),
+        "1537c00a3d93cb787b36e3c6abc3e00f55916f0197edbd3841fcaf0545dbe67c"
     );
 }

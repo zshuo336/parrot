@@ -1,148 +1,133 @@
-"""Parrot Ray Gateway POC.
-
-Rust 节点 <--Parrot Wire(LE 帧)--> 本网关 <--ray API--> Ray 集群 actor。
-
-帧格式（与 rust POC / Java AkkaGw 完全一致）：
-  [u32 frame_len][u8 ver][u8 ft][u16 flags][u64 cid][u64 reserved]
-  [u32 path_len][path][u32 key_len][key][payload]
-ASK=0x10 REPLY=0x11 REPLY_ERR=0x12 TELL=0x13
-
-用法：python3 ray_gw.py <port>
-"""
+"""Local POC wire gateway backed by a real, privately owned Ray worker."""
+import signal
 import socket
 import struct
 import sys
-import threading
-import time
-import queue
-
+from pathlib import Path
 import ray
 
 ASK, REPLY, REPLY_ERR, TELL = 0x10, 0x11, 0x12, 0x13
+MAX_BODY = 1024 * 1024
 
-# ---------------- Ray 侧 worker actor ----------------
 
 @ray.remote
 class EchoWorker:
-    """Ray actor：模拟云端任务执行体。"""
-    def __init__(self, node_id: str):
-        self.node_id = node_id
-        self.count = 0
+    def __init__(self):
+        self.tells = 0
 
-    def handle(self, type_key: str, payload: bytes) -> tuple[str, bytes]:
-        self.count += 1
-        if type_key == "bin:u:Ping":
-            n = struct.unpack("<Q", payload)[0]
-            # ray 方言：n+2（可辨识确实到了 ray）
-            return ("bin:u:Pong", struct.pack("<Q", n + 2))
-        if type_key == "bin:u:Add":
-            a, b = struct.unpack("<QQ", payload)
-            return ("bin:u:AddR", struct.pack("<Q", a + b + 1000))  # ray 方言 +1000
-        raise ValueError(f"unknown key {type_key}")
+    def handle(self, key, payload):
+        if key == 'bin:u:TellCount' and payload == b'':
+            return 'bin:u:AddR', struct.pack('<Q', self.tells)
+        if key == 'bin:u:Ping':
+            n, = struct.unpack('<Q', payload)
+            return 'bin:u:Pong', struct.pack('<Q', (n + 2) % (1 << 64))
+        if key == 'bin:u:Add':
+            a, b = struct.unpack('<QQ', payload)
+            return 'bin:u:AddR', struct.pack('<Q', (a + b + 1000) % (1 << 64))
+        raise ValueError(f'unknown_service: {key}')
 
-    def tell(self, type_key: str, payload: bytes) -> None:
-        self.count += 1
+    def tell(self, key, payload):
+        if key not in ('bin:u:Ping', 'bin:u:Add'):
+            raise ValueError('unknown_service')
+        self.handle(key, payload)
+        self.tells += 1
 
 
-# ---------------- 帧编解码（与 rust/Java 一致） ----------------
-
-def build_frame(ft: int, cid: int, path: bytes, key: bytes, payload: bytes) -> bytes:
+def build_frame(ft, cid, path, key, payload):
     body_len = 28 + len(path) + len(key) + len(payload)
-    return (
-        struct.pack("<I", body_len)
-        + struct.pack("<BBH", 1, ft, 0)
-        + struct.pack("<Q", cid)
-        + struct.pack("<Q", 0)            # reserved
-        + struct.pack("<I", len(path)) + path
-        + struct.pack("<I", len(key)) + key
-        + payload
-    )
+    if not 28 <= body_len <= MAX_BODY:
+        raise ValueError('invalid frame length')
+    return (struct.pack('<IBBHQQI', body_len, 1, ft, 0, cid, 0, len(path)) + path
+            + struct.pack('<I', len(key)) + key + payload)
 
-def recv_exact(sock, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("eof")
-        buf += chunk
-    return buf
+
+def recv_exact(sock, size):
+    buf = bytearray()
+    while len(buf) < size:
+        data = sock.recv(size - len(buf))
+        if not data:
+            raise EOFError('connection closed')
+        buf.extend(data)
+    return bytes(buf)
+
 
 def read_frame(sock):
-    (body_len,) = struct.unpack("<I", recv_exact(sock, 4))
-    body = recv_exact(sock, body_len)
-    ver, ft, _flags = struct.unpack("<BBH", body[:4])
-    (cid,) = struct.unpack("<Q", body[4:12])
-    struct.unpack("<Q", body[12:20])      # reserved
-    (path_len,) = struct.unpack("<I", body[20:24])
-    path = body[24:24 + path_len]
-    off = 24 + path_len
-    (key_len,) = struct.unpack("<I", body[off:off + 4])
-    key = body[off + 4:off + 4 + key_len]
-    payload = body[off + 4 + key_len:]
-    return ver, ft, cid, path.decode(), key.decode(), payload
+    size, = struct.unpack('<I', recv_exact(sock, 4))
+    if not 28 <= size <= MAX_BODY:
+        raise ValueError('invalid frame length')
+    body = recv_exact(sock, size)
+    ver, ft, flags, cid, reserved, path_size = struct.unpack_from('<BBHQQI', body)
+    if ver != 1 or not ASK <= ft <= 0x14 or flags or reserved:
+        raise ValueError('unsupported frame header')
+    if path_size > size - 28:
+        raise ValueError('invalid path length')
+    off = 24 + path_size
+    key_size, = struct.unpack_from('<I', body, off)
+    if key_size > size - off - 4:
+        raise ValueError('invalid key length')
+    return (ft, cid, body[24:off].decode('utf8'),
+            body[off+4:off+4+key_size].decode('utf8'), body[off+4+key_size:])
 
-# ---------------- 网关主体 ----------------
 
-def main(port: int):
-    ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
-    worker = EchoWorker.options(name="parrot_echo").remote("ray-node-1")
-    print(f"[ray-gw] ray ready, worker={worker}", flush=True)
+def main(port, runtime):
+    runtime = str(Path(runtime).resolve())
+    def stop(*_):
+        raise SystemExit(0)
+    try:
+        ray.init(address='local', _temp_dir=runtime, num_cpus=2,
+                 include_dashboard=False, log_to_driver=False)
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        worker = EchoWorker.remote()
+        # Actual worker round trip before advertising the bound listener.
+        ray.get(worker.handle.remote('bin:u:TellCount', b''), timeout=30)
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', port))
+            listener.listen(1)
+            print(f'POC_PORT {listener.getsockname()[1]}', flush=True)
+            sock, _ = listener.accept()
+            with sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                pending = {}
+                next_cid = 1
+                def send(ft, cid, key, payload, path=b''):
+                    sock.sendall(build_frame(ft, cid, path, key, payload))
+                while True:
+                    try:
+                        ft, cid, _, key, payload = read_frame(sock)
+                    except EOFError:
+                        break
+                    if ft == ASK:
+                        try:
+                            if key == 'bin:u:Probe' and payload == b'':
+                                if len(pending) >= 128:
+                                    raise ValueError('pending limit')
+                                pending[next_cid] = cid
+                                send(ASK, next_cid, b'bin:u:Ping', struct.pack('<Q', 100),
+                                     b'/user/rust_service')
+                                next_cid += 1
+                            else:
+                                reply_key, reply = ray.get(worker.handle.remote(key, payload), timeout=10)
+                                send(REPLY, cid, reply_key.encode(), reply)
+                        except Exception as error:
+                            send(REPLY_ERR, cid, b'', str(error).encode()[:4096])
+                    elif ft == TELL:
+                        try:
+                            # Wait for real worker completion. The next request
+                            # is a barrier and cannot overtake this operation.
+                            ray.get(worker.tell.remote(key, payload), timeout=10)
+                        except Exception:
+                            pass
+                    elif ft in (REPLY, REPLY_ERR):
+                        original = pending.pop(cid, None)
+                        if original is not None:
+                            if ft == REPLY and key == 'bin:u:Pong' and len(payload) == 8:
+                                send(REPLY, original, b'bin:u:AddR', payload)
+                            else:
+                                send(REPLY_ERR, original, b'', b'invalid reverse reply')
+    finally:
+        ray.shutdown()
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", port))
-    srv.listen(1)
-    print(f"[ray-gw] listening on {port}", flush=True)
 
-    sock, addr = srv.accept()
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    print(f"[ray-gw] rust node connected: {addr}", flush=True)
-    srv.close()
-
-    out_q: queue.Queue = queue.Queue()
-
-    def writer():
-        while True:
-            frame = out_q.get()
-            sock.sendall(frame)
-
-    threading.Thread(target=writer, daemon=True).start()
-
-    # 主动 ask rust 侧（双向验证）
-    def ask_rust():
-        time.sleep(1.0)
-        cid = int(time.time() * 1000) % (1 << 62)
-        out_q.put(build_frame(ASK, cid, b"/user/rust_service",
-                              b"bin:u:Ping", struct.pack("<Q", 100)))
-        deadline = time.time() + 5
-        while time.time() < deadline and cid not in done_map:
-            time.sleep(0.05)
-        if cid in done_map:
-            (n,) = struct.unpack("<Q", done_map[cid])
-            print(f"[ray-gw] ask rust /user/rust_service Ping(100) -> {n}", flush=True)
-        else:
-            print("[ray-gw] ask rust TIMEOUT", flush=True)
-
-    done_map: dict[int, bytes] = {}
-    threading.Thread(target=ask_rust, daemon=True).start()
-
-    while True:
-        ver, ft, cid, path, key, payload = read_frame(sock)
-        if ver != 1:
-            continue
-        if ft == ASK:
-            try:
-                reply_key, reply_payload = ray.get(worker.handle.remote(key, payload))
-                out_q.put(build_frame(REPLY, cid, b"", reply_key.encode(), reply_payload))
-            except Exception as e:  # noqa: BLE001
-                out_q.put(build_frame(REPLY_ERR, cid, b"", b"", str(e).encode()))
-        elif ft == TELL:
-            worker.tell.remote(key, payload)
-        elif ft == REPLY:
-            done_map[cid] = payload
-        elif ft == REPLY_ERR:
-            done_map[cid] = None
-            print(f"[ray-gw] reply_err cid={cid}", flush=True)
-
-if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 9841)
+if __name__ == '__main__':
+    main(int(sys.argv[1]), sys.argv[2])

@@ -293,23 +293,27 @@ async fn setup_dual(
 
 /// 在 actix 引擎上 spawn 一个 ActixDyn（动态轨），返回 BoxedActorRef。
 async fn spawn_actix_dyn(asys: &ActixActorSystem, seen_seed: Vec<u64>) -> BoxedActorRef {
-    use futures::FutureExt;
-    asys.spawn_root_typed(
+    asys.spawn_root_typed_with_strategy(
         ActixDyn {
             seen: std::sync::Mutex::new(seen_seed),
         },
         EmptyConfig,
+        parrot_api::supervisor::SupervisorStrategyType::Default(
+            parrot_api::supervisor::DefaultStrategy::ResumeOnFailure,
+        ),
     )
-    .now_or_never()
-    .expect("spawn ready")
+    .await
     .expect("spawn ok")
 }
 
-/// 关闭门面（Arc 包裹时经 try_unwrap 拿回所有权）。
-async fn shutdown_facade(parrot: &Arc<ParrotActorSystem>) {
-    if let Ok(p) = Arc::try_unwrap(parrot.clone()) {
-        let _ = p.internal_shutdown().await;
-    }
+/// 消费门面所有权并等待两个引擎实际关闭，任何关闭错误都使回归失败。
+async fn shutdown_facade(parrot: Arc<ParrotActorSystem>) {
+    let parrot = Arc::try_unwrap(parrot)
+        .unwrap_or_else(|_| panic!("test must release all facade clones before shutdown"));
+    parrot
+        .internal_shutdown()
+        .await
+        .expect("both engines shut down");
 }
 
 // ===========================================================================
@@ -331,7 +335,10 @@ fn v1_v2_v5_dual_engine_dyn_track_full_matrix() {
                 },
                 "/sr/thread-dyn",
                 None,
-                Default::default(),
+                parrot::thread::ThreadActorConfig {
+                    supervisor_strategy: Some(parrot::thread::SupervisorStrategy::Resume),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap(),
@@ -414,8 +421,7 @@ fn v1_v2_v5_dual_engine_dyn_track_full_matrix() {
         assert_eq!(resolved_a.unwrap().path(), a_path);
 
         println!("[SR] V1/V2/V5 动态轨全矩阵通过 ✓");
-        let _ = ts.shutdown_internal().await;
-        shutdown_facade(&parrot).await;
+        shutdown_facade(parrot).await;
     });
 }
 
@@ -459,8 +465,7 @@ fn v2_actix_to_thread_nested_ask() {
         );
 
         println!("[SR] V2 actix→thread 嵌套 ask 通过 ✓");
-        let _ = ts.shutdown_internal().await;
-        shutdown_facade(&_parrot).await;
+        shutdown_facade(_parrot).await;
     });
 }
 
@@ -550,8 +555,7 @@ fn v3_typed_track_cross_engine() {
         assert_eq!(moved, 111, "typed ref 跨任务/线程移动后 ask 语义不变");
 
         println!("[SR] V3 typed 轨跨引擎全部通过 ✓");
-        let _ = ts.shutdown_internal().await;
-        shutdown_facade(&parrot).await;
+        shutdown_facade(parrot).await;
     });
 }
 
@@ -657,8 +661,7 @@ fn v4_priority_semantics_across_engines() {
         );
 
         println!("[SR] V4 优先级语义跨引擎通过 ✓");
-        let _ = ts.shutdown_internal().await;
-        shutdown_facade(&parrot).await;
+        shutdown_facade(parrot).await;
     });
 }
 
@@ -729,7 +732,7 @@ fn v5b_supervision_isolation_across_engines() {
             .await
             .unwrap();
 
-        // 等待监督决策传播（panic hook → ChildFailure → 决策）
+        // 等待监督决策传播（panic hook → 实际代故障回执 → 决策）
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // actix 引擎完全不受影响
@@ -756,8 +759,7 @@ fn v5b_supervision_isolation_across_engines() {
         assert!(health.is_ok(), "thread 引擎在 panic 后仍可 spawn");
 
         println!("[SR] V5b 监督隔离跨引擎通过 ✓");
-        let _ = ts.shutdown_internal().await;
-        shutdown_facade(&parrot).await;
+        shutdown_facade(parrot).await;
     });
 }
 
@@ -803,7 +805,6 @@ fn v7_macro_neutrality_on_both_engines() {
         );
 
         println!("[SR] V7 宏中立性通过 ✓");
-        let _ = ts.shutdown_internal().await;
-        shutdown_facade(&parrot).await;
+        shutdown_facade(parrot).await;
     });
 }

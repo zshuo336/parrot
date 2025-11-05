@@ -1,9 +1,10 @@
 //! Rust ↔ TS(parrot-lite) 握手协商互测（DEV_03 §2.4——CI matrix 形态）。
 //!
-//! #[ignore] 手动门禁：spawn `node interop/typescript-lite/tests/interop_with_rust.mjs`
+//! 正式门禁：独立临时目录编译 TypeScript，再启动 Node 原生 TCP 客户端
 //! 对拉本测试内启动的 TCP echo 节点。
 //!
-//! 跑法：cargo test -p parrot --test test_lite_interop -- --ignored --nocapture
+//! 前置：cd interop/typescript-lite && npm ci
+//! 跑法：cargo test --locked -p parrot --test test_lite_interop -- --nocapture
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,8 +84,40 @@ impl LocalLookup for Lookup {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "manual gate: needs node + interop/typescript-lite built (DEV_00 §4.2 P3)"]
 async fn lite_handshake_negotiation_with_rust() {
+    struct OwnedBuild(std::path::PathBuf);
+    impl Drop for OwnedBuild {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interop/typescript-lite");
+    let build = OwnedBuild(
+        std::env::temp_dir().join(format!("parrot-ts-interop-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&build.0).expect("create owned TypeScript build directory");
+    std::fs::write(build.0.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    let compilation = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new("node")
+            .arg(source.join("node_modules/typescript/bin/tsc"))
+            .arg("-p")
+            .arg(source.join("tsconfig.json"))
+            .arg("--outDir")
+            .arg(&build.0)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("TypeScript compilation timed out")
+    .expect("Node and npm ci dependencies are required");
+    assert!(
+        compilation.status.success(),
+        "TypeScript compile failed: {}{}",
+        String::from_utf8_lossy(&compilation.stdout),
+        String::from_utf8_lossy(&compilation.stderr)
+    );
     let facade = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
             .await
@@ -107,7 +140,7 @@ async fn lite_handshake_negotiation_with_rust() {
     let port = server.local_addr().expect("bound").port();
     println!("PARROT_LITE_PORT={port}");
 
-    // spawn node 互测脚本（lite build 后 dist 存在）
+    // Run against this test's fresh build, never an existing dist artifact.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../interop/typescript-lite/tests/interop_with_rust.mjs");
     assert!(
@@ -115,18 +148,25 @@ async fn lite_handshake_negotiation_with_rust() {
         "lite interop script missing: {}",
         manifest.display()
     );
-    let out = std::process::Command::new("node")
-        .arg(manifest)
-        .arg(port.to_string())
-        .output()
-        .expect("spawn node");
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new("node")
+            .arg(manifest)
+            .arg(port.to_string())
+            .arg(&build.0)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("Node interop exceeded 30 seconds")
+    .expect("spawn node");
     let stdout = String::from_utf8_lossy(&out.stdout);
     print!("{stdout}");
     eprintln!("{}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "lite interop script failed");
     assert!(stdout.contains("LITE-INTEROP PASS"));
 
-    server.shutdown().await.ok();
+    server.shutdown().await.expect("retire Rust peer");
 }
 
 /// Rust 侧自环（不依赖 node——CI 基线）：echo 语义回归锚点。

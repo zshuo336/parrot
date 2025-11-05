@@ -1,12 +1,21 @@
-//! 职责：SWIM membership——成员表即路由表（DEV_02 §2 / 06 §2.1）。
+//! Membership merge, expiry and periodic gossip, independent of actor scheduling.
 //!
-//! SwimActor 不是 actor：membership 是基础设施（早于任何 actor 系统可用），
-//! 不能依赖引擎调度（自举悖论规避）。实现为 tokio 任务集：
-//! probe 循环 + gossip 循环 + 合并器；与 actor 系统的交互仅经 NodeTable。
+//! RemoteActorSystem owns the driver and supplies correlated network probes.
+//! The runtime also periodically projects accepted membership routes into its
+//! `NodeTable`; this module keeps that projection as an explicit helper so the
+//! state machine remains deterministic in isolation. The system injects bounded
+//! direct/indirect probes; this generic driver applies their versioned results.
+//! See docs/SWIM_RUNTIME.md for the runtime contract and verification scope.
+
+pub(crate) mod probe;
+pub use probe::{ProbeEvent, ProbeOutcome, ProbeReply, ProbeRequest};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+use futures::StreamExt;
+use tokio::time::Instant;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -83,6 +92,8 @@ pub enum MemberEvent {
 pub struct SwimConfig {
     pub probe_interval: Duration,
     pub probe_timeout: Duration,
+    /// Maximum authorized helpers per system probe (0 disables indirect probes).
+    /// Standalone Swim::run callers supply their own transport probe callback.
     pub indirect_probes: usize,
     pub suspect_timeout: Duration,
     pub gossip_interval: Duration,
@@ -145,6 +156,10 @@ pub struct Membership {
     pub members: HashMap<String, Member>,
     /// 单调时钟（ms）——由驱动循环注入（测试可注入假时钟）。
     now_ms: u64,
+    suspect_timeout: Duration,
+    dead_retention: Duration,
+    /// Canonical local metadata, independent of remote observations.
+    owner: Option<Member>,
 }
 
 impl Membership {
@@ -152,7 +167,60 @@ impl Membership {
         Self {
             members: HashMap::new(),
             now_ms,
+            suspect_timeout: SwimConfig::default().suspect_timeout,
+            dead_retention: SwimConfig::default().dead_retention,
+            owner: None,
         }
+    }
+
+    /// Publish this process's own endpoint before receiving peer observations.
+    /// Incarnation zero is reserved for provisional connection observations.
+    pub(crate) fn publish_local(&mut self, addr: NodeAddrWire) {
+        let member = Member {
+            node_id: addr.node_id.clone(),
+            addr,
+            status: MemberStatus::Alive,
+            incarnation: 1,
+            status_until_ms: 0,
+            metadata: Bytes::new(),
+        };
+        self.owner = Some(member.clone());
+        self.members.insert(member.node_id.clone(), member);
+    }
+
+    fn merge_owner(&mut self, incoming: &Member) -> bool {
+        let mut owner = self
+            .owner
+            .as_ref()
+            .expect("owner checked by caller")
+            .clone();
+        let current = self.members.get(&owner.node_id);
+        let incarnation =
+            current.map_or(owner.incarnation, |m| m.incarnation.max(owner.incarnation));
+        if incoming.incarnation < incarnation {
+            return false;
+        }
+        // A previous process or another peer may retain a higher version with
+        // obsolete metadata. The running owner must correct both its liveness
+        // and its endpoint, not adopt the observer's old/ephemeral address.
+        let conflict = incoming.status != MemberStatus::Alive
+            || incoming.addr != owner.addr
+            || incoming.metadata != owner.metadata;
+        owner.incarnation = if conflict {
+            let Some(next) = incoming.incarnation.checked_add(1) else {
+                tracing::warn!(node = %owner.node_id, "membership incarnation exhausted; refusing conflicting local view");
+                return false;
+            };
+            next
+        } else {
+            incoming.incarnation
+        };
+        let changed = current != Some(&owner);
+        if changed {
+            self.members.insert(owner.node_id.clone(), owner.clone());
+            self.owner = Some(owner);
+        }
+        changed
     }
 
     pub fn set_clock(&mut self, now_ms: u64) {
@@ -168,27 +236,62 @@ impl Membership {
         SwimConfig::default().effective_mode(self.members.len())
     }
 
+    fn local_member(&self, member: &Member) -> Member {
+        let mut member = member.clone();
+        // Monotonic timestamps from another process have a different origin.
+        // Start each newly accepted failure state on the receiving clock;
+        // duplicate/older gossip must not extend its deadline.
+        let timeout = match member.status {
+            MemberStatus::Alive => {
+                member.status_until_ms = 0;
+                return member;
+            }
+            MemberStatus::Suspect => self.suspect_timeout,
+            MemberStatus::Dead => self.dead_retention,
+        };
+        member.status_until_ms = self
+            .now_ms
+            .saturating_add(timeout.as_millis().min(u64::MAX as u128) as u64);
+        member
+    }
+
     /// 合并规则（偏序）：新事件仅在 (incarnation, status_rank) 偏序更大时
     /// 覆盖并继续传播；否则丢弃（防旧事件回环——gossip 合并幂等）。
     /// 返回 true = 状态有变（需继续 gossip）。
     pub fn merge_event(&mut self, ev: &MemberEvent) -> bool {
         match ev {
+            MemberEvent::Upsert(m)
+                if self
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.node_id == m.node_id) =>
+            {
+                self.merge_owner(m)
+            }
             MemberEvent::Upsert(m) => match self.members.get(&m.node_id) {
                 Some(cur) => {
                     let cur_key = (cur.incarnation, status_rank(cur.status));
                     let new_key = (m.incarnation, status_rank(m.status));
                     if new_key > cur_key {
-                        self.members.insert(m.node_id.clone(), m.clone());
+                        self.members.insert(m.node_id.clone(), self.local_member(m));
                         true
                     } else {
                         false
                     }
                 }
                 None => {
-                    self.members.insert(m.node_id.clone(), m.clone());
+                    self.members.insert(m.node_id.clone(), self.local_member(m));
                     true
                 }
             },
+            MemberEvent::Remove(id)
+                if self
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| &owner.node_id == id) =>
+            {
+                false
+            }
             MemberEvent::Remove(id) => self.members.remove(id).is_some(),
         }
     }
@@ -196,15 +299,26 @@ impl Membership {
     /// Suspect 超时 → Dead；Dead TTL 到期 → 移除（时钟驱动）。
     /// 返回 (状态变迁列表, 移除列表)——供 gossip/NodeTable 同步。
     pub fn tick(&mut self) -> (Vec<Member>, Vec<String>) {
+        self.tick_with_retention(Duration::from_secs(24 * 3600))
+    }
+
+    /// Advance failure-retention state using the caller's configured TTL.
+    ///
+    /// The old implementation hard-coded one day here, which meant a
+    /// `SwimConfig::dead_retention` value could never take effect. Keep the
+    /// no-argument method for the deterministic legacy state-machine API and
+    /// make the runtime call this explicit variant.
+    pub fn tick_with_retention(&mut self, dead_retention: Duration) -> (Vec<Member>, Vec<String>) {
         let mut changed = Vec::new();
         let mut removed = Vec::new();
         let ids: Vec<String> = self.members.keys().cloned().collect();
+        let retention_ms = dead_retention.as_millis().min(u64::MAX as u128) as u64;
         for id in ids {
             if let Some(m) = self.members.get_mut(&id) {
                 match m.status {
                     MemberStatus::Suspect if self.now_ms >= m.status_until_ms => {
                         m.status = MemberStatus::Dead;
-                        m.status_until_ms = self.now_ms + 24 * 3600 * 1000; // dead_retention
+                        m.status_until_ms = self.now_ms.saturating_add(retention_ms);
                         changed.push(m.clone());
                     }
                     MemberStatus::Dead if self.now_ms >= m.status_until_ms => {
@@ -220,10 +334,17 @@ impl Membership {
 
     /// 直接探活失败标记 Suspect（probe 循环调）。
     pub fn mark_suspect(&mut self, node_id: &str) -> bool {
+        self.mark_suspect_with_timeout(node_id, Duration::from_secs(3))
+    }
+
+    /// Mark a node suspect using the runtime's configured suspicion timeout.
+    pub fn mark_suspect_with_timeout(&mut self, node_id: &str, timeout: Duration) -> bool {
         match self.members.get_mut(node_id) {
             Some(m) if m.status == MemberStatus::Alive => {
                 m.status = MemberStatus::Suspect;
-                m.status_until_ms = self.now_ms + 3000; // suspect_timeout
+                m.status_until_ms = self
+                    .now_ms
+                    .saturating_add(timeout.as_millis().min(u64::MAX as u128) as u64);
                 true
             }
             _ => false,
@@ -234,9 +355,14 @@ impl Membership {
     pub fn refute(&mut self, node_id: &str) -> Option<Member> {
         match self.members.get_mut(node_id) {
             Some(m) if m.status != MemberStatus::Alive => {
-                m.incarnation += 1;
+                m.incarnation = m.incarnation.checked_add(1)?;
                 m.status = MemberStatus::Alive;
                 m.status_until_ms = 0;
+                if let Some(owner) = self.owner.as_mut().filter(|owner| owner.node_id == node_id) {
+                    m.addr = owner.addr.clone();
+                    m.metadata = owner.metadata.clone();
+                    *owner = m.clone();
+                }
                 Some(m.clone())
             }
             _ => None,
@@ -295,68 +421,138 @@ pub struct Swim {
 
 impl Swim {
     /// 驱动循环：probe（TCP/QUIC 层实际探活由 system 注入闭包）+ gossip + tick。
-    /// `probe` 返回 Ok(()) = 目标可达。
+    /// `probe` returns false on failure; timeout is also treated as failure.
     pub async fn run(
+        self: Arc<Self>,
+        probe: Box<dyn FnMut(String) -> BoxedProbeFut + Send>,
+        gossip_out: GossipOut,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        self.run_inner(probe, gossip_out, shutdown, false).await;
+    }
+
+    /// Network observers distinguish target failure from unavailable helpers.
+    /// Expiring the observer itself supplies no evidence about the target.
+    pub(crate) async fn run_observer(
+        self: Arc<Self>,
+        probe: Box<dyn FnMut(String) -> BoxedProbeFut + Send>,
+        gossip_out: GossipOut,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        self.run_inner(probe, gossip_out, shutdown, true).await;
+    }
+
+    async fn run_inner(
         self: Arc<Self>,
         mut probe: Box<dyn FnMut(String) -> BoxedProbeFut + Send>,
         gossip_out: GossipOut,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
+        observer_timeout_is_unknown: bool,
     ) {
-        let mut probe_ticker = tokio::time::interval(self.config.probe_interval);
-        let mut gossip_ticker = tokio::time::interval(self.config.gossip_interval);
+        let probe_interval = self.config.probe_interval.max(Duration::from_millis(1));
+        let gossip_interval = self.config.gossip_interval.max(Duration::from_millis(1));
+        let mut probe_ticker = tokio::time::interval(probe_interval);
+        let mut gossip_ticker = tokio::time::interval(gossip_interval);
+        let mut maintenance_ticker = tokio::time::interval(probe_interval.min(gossip_interval));
+        for ticker in [
+            &mut probe_ticker,
+            &mut gossip_ticker,
+            &mut maintenance_ticker,
+        ] {
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
+        let clock_origin = Instant::now();
+        let initial_clock = {
+            let mut membership = self.membership.lock().await;
+            membership.suspect_timeout = self.config.suspect_timeout;
+            membership.dead_retention = self.config.dead_retention;
+            membership.now()
+        };
+        let now = || {
+            initial_clock
+                .saturating_add(clock_origin.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        };
+        let mut probes = futures::stream::FuturesUnordered::new();
+        let mut probe_cursor = 0usize;
+        let mut gossip_cursor = 0usize;
+        // Wait a full period before unsolicited gossip on newly started nodes.
+        gossip_ticker.tick().await;
         loop {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                break;
+            }
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { break; }
-                }
-                _ = probe_ticker.tick() => {
-                    let targets = {
+                _ = shutdown.changed() => {},
+                _ = probe_ticker.tick(), if probes.is_empty() => {
+                    let target = {
                         let m = self.membership.lock().await;
-                        m.alive_nodes()
-                            .into_iter()
-                            .filter(|n| n != &self.self_node)
-                            .collect::<Vec<_>>()
-                    };
-                    for t in targets {
-                        let ok = probe(t.clone()).await;
-                        let mut m = self.membership.lock().await;
-                        if !ok {
-                            m.mark_suspect(&t);
+                        let mut targets = m.members.values()
+                            .filter(|member| member.status != MemberStatus::Dead
+                                && member.node_id != self.self_node).collect::<Vec<_>>();
+                        targets.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+                        if targets.is_empty() {
+                            None
+                        } else {
+                            Some(targets[probe_cursor % targets.len()].clone())
                         }
+                    };
+                    if let Some(target) = target {
+                        probe_cursor = probe_cursor.wrapping_add(1);
+                        let future = probe(target.node_id.clone());
+                        let timeout = self.config.probe_timeout;
+                        // A pending probe must not hold up maintenance, gossip
+                        // or shutdown. Only one probe is in flight at a time.
+                        probes.push(async move {
+                            (target, tokio::time::timeout(timeout, future).await.unwrap_or(observer_timeout_is_unknown))
+                        });
                     }
                 }
+                Some((target, ok)) = probes.next(), if !probes.is_empty() => {
+                    let mut m = self.membership.lock().await;
+                    m.set_clock(now());
+                    // A timeout or failed response describes the snapshot that
+                    // was probed, not a replacement learned while it was pending.
+                    if !ok && m.members.get(&target.node_id) == Some(&target) {
+                        m.mark_suspect_with_timeout(&target.node_id, self.config.suspect_timeout);
+                    }
+                }
+                _ = maintenance_ticker.tick() => {
+                    let mut m = self.membership.lock().await;
+                    m.set_clock(now());
+                    let _ = m.refute(&self.self_node);
+                    let _ = m.tick_with_retention(self.config.dead_retention);
+                }
                 _ = gossip_ticker.tick() => {
-                    // 两级 gossip（S1）：digest 探测（字节级增量）→
-                    // 指纹不匹配才 push/pull 全量（定向，非广播）。
                     let (gossip, targets) = {
                         let m = self.membership.lock().await;
                         let mode = self.config.effective_mode(m.members.len());
-                        let targets = m.alive_nodes();
-                        let gossip = match mode {
-                            GossipMode::Digest => MembershipGossip {
-                                // digest 帧：零事件（8B 指纹——≤10KB/s 门禁的基件）
-                                events: Vec::new(),
-                                seen_from: self.self_node.clone(),
-                                digest: m.digest(),
-                                full_sync: None,
-                            },
-                            GossipMode::Full | GossipMode::Auto => {
-                                let events: Vec<MemberEvent> = m
-                                    .members
-                                    .values()
-                                    .map(|mm| MemberEvent::Upsert(mm.clone()))
-                                    .collect();
-                                MembershipGossip {
-                                    events,
-                                    seen_from: self.self_node.clone(),
-                                    digest: m.digest(),
-                                    full_sync: None,
-                                }
-                            }
+                        // Keep retained dead peers eligible for reconciliation:
+                        // after reconnect they must be able to refute stale death.
+                        // The transport sends only to established direct links.
+                        let mut targets = m.members.keys()
+                            .filter(|&n| n != &self.self_node).cloned().collect::<Vec<_>>();
+                        targets.sort();
+                        if !targets.is_empty() {
+                            let offset = gossip_cursor % targets.len();
+                            targets.rotate_left(offset);
+                            gossip_cursor = gossip_cursor.wrapping_add(self.config.gossip_fanout);
+                        }
+                        targets.truncate(self.config.gossip_fanout);
+                        let events = if mode == GossipMode::Digest {
+                            Vec::new()
+                        } else {
+                            m.members.values().cloned().map(MemberEvent::Upsert).collect()
                         };
-                        (gossip, targets)
+                        (MembershipGossip {
+                            events,
+                            seen_from: self.self_node.clone(),
+                            digest: m.digest(),
+                            full_sync: None,
+                        }, targets)
                     };
-                    let _ = gossip_out.send((gossip, targets)).await;
+                    // Periodic state is replaceable: a full consumer queue
+                    // must not stop probing, failure expiry or cancellation.
+                    let _ = gossip_out.try_send((gossip, targets));
                 }
             }
         }
@@ -374,9 +570,10 @@ pub fn encode_gossip(g: &MembershipGossip) -> Bytes {
     b.freeze()
 }
 
+/// Decode exactly one complete body with the default remote byte/value/depth budgets.
+/// Trailing data and excessive declared lengths are rejected before allocating fields.
 pub fn decode_gossip(body: &[u8]) -> Result<MembershipGossip, crate::error::RemoteError> {
-    bincode::serde::decode_from_slice(body, bincode::config::standard())
-        .map(|(g, _)| g)
+    parrot_api::message::serde_remote_deserialize(body)
         .map_err(|e| crate::error::RemoteError::Codec(format!("gossip decode: {e}")))
 }
 
@@ -398,22 +595,70 @@ pub fn handle_gossip(membership: &mut Membership, g: &MembershipGossip) -> bool 
     g.digest != membership.digest()
 }
 
-/// NodeTable 同步：成员表 → 路由表（成员变更 → facade 路由自动生效）。
-pub async fn sync_to_node_table(membership: &tokio::sync::Mutex<Membership>, table: &NodeTable) {
-    let m = membership.lock().await;
-    for (id, member) in &m.members {
-        if member.status == MemberStatus::Dead {
-            continue; // Dead 不路由
-        }
-        let addr: NodeAddr = NodeAddr {
-            node_id: id.clone(),
-            scheme: member.addr.scheme.clone(),
-            addr: format!("{}:{}", member.addr.host, member.addr.port)
-                .parse()
-                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-        };
-        table.add_seed(addr);
+/// Preserve a valid discovered hostname without inventing a socket address.
+pub(crate) fn member_route(member: &Member) -> Option<crate::node::NodeEndpoint> {
+    use crate::node::NodeEndpoint;
+    if member.status == MemberStatus::Dead
+        || member.node_id != member.addr.node_id
+        || parrot_config::endpoint::validate_node_id(&member.node_id).is_err()
+    {
+        return None;
     }
+    match member.addr.scheme.as_str() {
+        "mem" => Some(NodeAddr::mem(&member.node_id).into()),
+        "tcp" | "quic" => {
+            if member.addr.port == 0 || member.addr.host.len() > 253 {
+                return None;
+            }
+            if let Ok(ip) = member.addr.host.parse::<std::net::IpAddr>() {
+                if ip.is_unspecified() {
+                    return None;
+                }
+                return Some(
+                    NodeAddr {
+                        node_id: member.node_id.clone(),
+                        identity_is_explicit: true,
+                        scheme: member.addr.scheme.clone(),
+                        addr: std::net::SocketAddr::new(ip, member.addr.port),
+                    }
+                    .into(),
+                );
+            }
+            // Reuse the configured-endpoint grammar, with an explicit identity.
+            let endpoint = parrot_config::endpoint::SeedEndpoint::parse(
+                &format!(
+                    "{}://{}@{}:{}",
+                    member.addr.scheme, member.node_id, member.addr.host, member.addr.port
+                ),
+                "tcp",
+            )
+            .ok()?;
+            let host = endpoint.host?;
+            if host != member.addr.host {
+                return None;
+            }
+            Some(NodeEndpoint::Dns {
+                node_id: member.node_id.clone(),
+                scheme: member.addr.scheme.clone(),
+                host,
+                port: member.addr.port,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Synchronize a complete endpoint snapshot without DNS. Static seeds and active
+/// connections keep their separate ownership when discovered routes retire.
+pub async fn sync_to_node_table(membership: &tokio::sync::Mutex<Membership>, table: &NodeTable) {
+    let routes = membership
+        .lock()
+        .await
+        .members
+        .values()
+        .filter_map(member_route)
+        .collect();
+    table.reconcile_membership(routes);
 }
 
 #[cfg(test)]
@@ -494,6 +739,254 @@ mod tests {
         assert_eq!(r.incarnation, 6);
         // 回 Alive 后再收到旧 Suspect(inc=5) 丢弃
         assert!(!m.merge_event(&MemberEvent::Upsert(member("a", MemberStatus::Suspect, 5))));
+    }
+
+    #[test]
+    fn configured_suspicion_and_dead_retention_are_used() {
+        let mut m = Membership::new(100);
+        m.merge_event(&MemberEvent::Upsert(member("a", MemberStatus::Alive, 0)));
+        assert!(m.mark_suspect_with_timeout("a", Duration::from_millis(7)));
+        m.set_clock(106);
+        assert!(m.tick_with_retention(Duration::from_millis(9)).0.is_empty());
+        m.set_clock(107);
+        let (changed, removed) = m.tick_with_retention(Duration::from_millis(9));
+        assert_eq!(changed.len(), 1);
+        assert!(removed.is_empty());
+        // Dead retention is relative to the transition time (107 + 9), not
+        // the historical hard-coded 24-hour value.
+        m.set_clock(115);
+        assert!(m.tick_with_retention(Duration::from_millis(9)).1.is_empty());
+        m.set_clock(116);
+        assert_eq!(m.tick_with_retention(Duration::from_millis(9)).1, vec!["a"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_enforces_probe_timeout_and_advances_failure_clock() {
+        let membership = Arc::new(tokio::sync::Mutex::new(Membership::new(0)));
+        membership
+            .lock()
+            .await
+            .merge_event(&MemberEvent::Upsert(member("peer", MemberStatus::Alive, 0)));
+        let config = SwimConfig {
+            probe_interval: Duration::from_millis(5),
+            probe_timeout: Duration::from_millis(5),
+            suspect_timeout: Duration::from_millis(100),
+            gossip_interval: Duration::from_millis(20),
+            gossip_fanout: 1,
+            dead_retention: Duration::from_secs(1),
+            ..SwimConfig::default()
+        };
+        let swim = Arc::new(Swim {
+            config,
+            membership: membership.clone(),
+            self_node: "self".into(),
+        });
+        let (gossip_tx, mut gossip_rx) = tokio::sync::mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(swim.run(
+            Box::new(|_| {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    true
+                })
+            }),
+            gossip_tx,
+            shutdown_rx,
+        ));
+        let (_, targets) = tokio::time::timeout(Duration::from_millis(100), gossip_rx.recv())
+            .await
+            .expect("gossip ticker did not run")
+            .expect("gossip channel closed");
+        assert_eq!(targets, vec!["peer"], "gossip_fanout must cap targets");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
+        assert_eq!(
+            membership.lock().await.members["peer"].status,
+            MemberStatus::Dead
+        );
+    }
+
+    #[test]
+    fn received_failure_deadlines_use_local_clock_without_duplicate_extension() {
+        let mut membership = Membership::new(100);
+        let mut remote = member("peer", MemberStatus::Suspect, 1);
+        remote.status_until_ms = u64::MAX;
+        assert!(membership.merge_event(&MemberEvent::Upsert(remote.clone())));
+        assert_eq!(membership.members["peer"].status_until_ms, 3100);
+        membership.set_clock(3000);
+        assert!(!membership.merge_event(&MemberEvent::Upsert(remote.clone())));
+        assert_eq!(membership.members["peer"].status_until_ms, 3100);
+        membership.set_clock(3100);
+        assert_eq!(membership.tick().0[0].status, MemberStatus::Dead);
+        remote.status = MemberStatus::Dead;
+        remote.incarnation = 2;
+        remote.status_until_ms = 0;
+        assert!(membership.merge_event(&MemberEvent::Upsert(remote)));
+        assert!(
+            membership.tick().1.is_empty(),
+            "remote process uptime is not our deadline"
+        );
+        membership.set_clock(3100 + 24 * 3600 * 1000);
+        assert_eq!(membership.tick().1, vec!["peer"]);
+    }
+
+    #[test]
+    fn refute_exhaustion_does_not_panic_or_wrap_incarnation() {
+        let mut membership = Membership::new(0);
+        membership.merge_event(&MemberEvent::Upsert(member(
+            "self",
+            MemberStatus::Suspect,
+            u64::MAX,
+        )));
+        assert!(membership.refute("self").is_none());
+        assert_eq!(membership.members["self"].incarnation, u64::MAX);
+        assert_eq!(membership.members["self"].status, MemberStatus::Suspect);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_probe_and_full_gossip_queue_do_not_block_maintenance_or_shutdown() {
+        let membership = Arc::new(tokio::sync::Mutex::new(Membership::new(1000)));
+        {
+            let mut m = membership.lock().await;
+            m.merge_event(&MemberEvent::Upsert(member("a", MemberStatus::Alive, 0)));
+            m.merge_event(&MemberEvent::Upsert(member("z", MemberStatus::Alive, 0)));
+            m.mark_suspect_with_timeout("z", Duration::from_millis(20));
+        }
+        let swim = Arc::new(Swim {
+            config: SwimConfig {
+                probe_interval: Duration::from_millis(10),
+                probe_timeout: Duration::from_secs(60),
+                gossip_interval: Duration::from_millis(10),
+                dead_retention: Duration::from_secs(1),
+                ..Default::default()
+            },
+            membership: membership.clone(),
+            self_node: "self".into(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let (started, notified) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let task = tokio::spawn(swim.run(
+            Box::new(move |_| {
+                if let Some(started) = started.take() {
+                    let _ = started.send(());
+                }
+                Box::pin(std::future::pending())
+            }),
+            tx,
+            stopped,
+        ));
+        notified.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            membership.lock().await.members["z"].status,
+            MemberStatus::Dead
+        );
+        assert_eq!(rx.len(), 1, "gossip progresses while a probe is pending");
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(10), task)
+            .await
+            .expect("shutdown must cancel a pending probe and a full gossip queue")
+            .unwrap();
+        assert!(rx.recv().await.is_some());
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gossip_fanout_rotates_without_sending_to_self() {
+        let membership = Arc::new(tokio::sync::Mutex::new(Membership::new(0)));
+        for id in ["a", "b", "c", "d", "e", "self"] {
+            membership
+                .lock()
+                .await
+                .merge_event(&MemberEvent::Upsert(member(id, MemberStatus::Alive, 0)));
+        }
+        let swim = Arc::new(Swim {
+            config: SwimConfig {
+                gossip_interval: Duration::from_millis(10),
+                gossip_fanout: 2,
+                ..Default::default()
+            },
+            membership,
+            self_node: "self".into(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(swim.run(Box::new(|_| Box::pin(async { true })), tx, stopped));
+        let mut targets = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let (_, batch) = tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(batch.len(), 2);
+            assert!(!batch.iter().any(|node| node == "self"));
+            targets.extend(batch);
+        }
+        assert_eq!(
+            targets,
+            ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        stop.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_shutdown_channel_terminates_driver() {
+        let swim = Arc::new(Swim {
+            config: Default::default(),
+            membership: Arc::new(tokio::sync::Mutex::new(Membership::new(0))),
+            self_node: "self".into(),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        drop(stop);
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            swim.run(Box::new(|_| Box::pin(async { true })), tx, stopped),
+        )
+        .await
+        .expect("dropping the owner must terminate the driver");
+    }
+
+    #[test]
+    fn local_owner_corrects_stale_alive_metadata_without_version_churn() {
+        let mut membership = Membership::new(0);
+        let mut local = member("owner", MemberStatus::Alive, 0);
+        local.addr.port = 9001;
+        membership.publish_local(local.addr.clone());
+        let mut stale = local.clone();
+        stale.addr.port = 8001;
+        stale.incarnation = 12;
+        stale.metadata = Bytes::from_static(b"old-process");
+        assert!(membership.merge_event(&MemberEvent::Upsert(stale.clone())));
+        let corrected = membership.members["owner"].clone();
+        assert_eq!(corrected.addr, local.addr);
+        assert_eq!(corrected.metadata, Bytes::new());
+        assert_eq!(corrected.incarnation, 13);
+        assert_eq!(corrected.status, MemberStatus::Alive);
+        assert!(!membership.merge_event(&MemberEvent::Upsert(stale)));
+        assert!(!membership.merge_event(&MemberEvent::Upsert(corrected.clone())));
+        assert_eq!(membership.members["owner"], corrected);
+    }
+
+    #[test]
+    fn local_owner_rejects_remove_and_exhausted_conflicting_version() {
+        let mut membership = Membership::new(0);
+        let local = member("owner", MemberStatus::Alive, 0);
+        membership.publish_local(local.addr.clone());
+        let before = membership.members["owner"].clone();
+        assert!(!membership.merge_event(&MemberEvent::Remove("owner".into())));
+        let mut exhausted = local;
+        exhausted.status = MemberStatus::Dead;
+        exhausted.incarnation = u64::MAX;
+        assert!(!membership.merge_event(&MemberEvent::Upsert(exhausted)));
+        assert_eq!(membership.members["owner"], before);
     }
 
     #[test]

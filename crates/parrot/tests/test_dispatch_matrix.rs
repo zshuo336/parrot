@@ -21,7 +21,6 @@ use parrot::actix::{ActixActor, ActixActorSystem, ActixContext};
 use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
-use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
 use std::time::Duration;
@@ -225,15 +224,33 @@ enum Kind {
 async fn spawn_kind(sys: &ActixActorSystem, kind: &Kind) -> Box<dyn ActorRef> {
     match kind {
         Kind::DeriveSync => sys
-            .spawn_root_typed(DeriveSync { calls: 0 }, EmptyConfig)
+            .spawn_root_typed_with_strategy(
+                DeriveSync { calls: 0 },
+                EmptyConfig,
+                parrot_api::supervisor::SupervisorStrategyType::Default(
+                    parrot_api::supervisor::DefaultStrategy::ResumeOnFailure,
+                ),
+            )
             .await
             .unwrap(),
         Kind::DeriveAsync => sys
-            .spawn_root_typed(DeriveAsync { calls: 0 }, EmptyConfig)
+            .spawn_root_typed_with_strategy(
+                DeriveAsync { calls: 0 },
+                EmptyConfig,
+                parrot_api::supervisor::SupervisorStrategyType::Default(
+                    parrot_api::supervisor::DefaultStrategy::ResumeOnFailure,
+                ),
+            )
             .await
             .unwrap(),
         Kind::Manual => sys
-            .spawn_root_typed(ManualMatrix { calls: 0 }, EmptyConfig)
+            .spawn_root_typed_with_strategy(
+                ManualMatrix { calls: 0 },
+                EmptyConfig,
+                parrot_api::supervisor::SupervisorStrategyType::Default(
+                    parrot_api::supervisor::DefaultStrategy::ResumeOnFailure,
+                ),
+            )
             .await
             .unwrap(),
     }

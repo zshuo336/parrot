@@ -1,0 +1,5 @@
+# Gateway runtime for CPython 3.11, Linux amd64/arm64.
+-c requirements-ray-build.lock
+ray==2.59.0
+jieba==0.42.1
+virtualenv!=20.21.1,>=20.0.24  # required by Ray runtime_env.pip

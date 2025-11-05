@@ -1,22 +1,39 @@
-//! parrot-node：标准单节点运行时进程（部署环境最小单元）。
+//! parrot-node: one process assembles a facade, thread engine and remote transport.
 //!
-//! 一个进程 = 一个 Parrot 节点（生产部署形态）：
-//! - 真实 ThreadActorSystem 引擎（非桩——消息经真实邮箱/调度器/监督）
-//! - RemoteActorSystem（TCP listen + 可选 seeds 组网）
-//! - K0 admin PropsFactory（远程 spawn：deploy.echo / deploy.counter /
-//!   deploy.kv / deploy.slow）
-//! - facade 三级路由（本地 default → 本地遍历 → parrot:// 远程出口）
+//! Configuration precedence: explicit environment > PARROT_CONFIG (required
+//! when set), otherwise optional ./parrot.toml > node defaults. The same resolved
+//! configuration constructs both engines. Environment overrides:
+//! - PARROT_NODE_ID: node identity (default node-1).
+//! - PARROT_BIND: numeric listen address (default 127.0.0.1:9801).
+//! - PARROT_SCHEME: tcp (default), quic or mem. QUIC requires mTLS or an
+//!   explicit insecure-development configuration.
+//! - PARROT_SEEDS: comma-separated id=host:port or scheme://id@host:port;
+//!   mem://node for in-process memory transport. Empty explicitly clears seeds.
+//! - PARROT_TOPOLOGY_ROLE: normal, hub, border, directory. Directory requires
+//!   explicit remote.directory storage/group/voting peers; see NETWORK_DIRECTORY.md.
+//! - PARROT_ACTORS: builtin names (default echo,counter,kv,slow); empty disables
+//!   all. Unknown names and empty interior entries are errors.
+//! - PARROT_READY_FILE: optional path for the complete actual endpoint record.
+//! - PARROT_WASM_EPOCH_TICKS: positive u32 host budget; requires wasm feature.
+//! - PARROT_TRUST_NATIVE_SHA256: executable-only, comma-separated trusted native
+//!   SHA-256 digests; requires dylib feature. This is operator authorization of
+//!   the complete unsafe ABI/dependency contract, not artifact authentication.
+//!   NodeSettings and safe default startup cannot grant native authority.
 //!
-//! 配置（环境变量，缺省安全）：
-//!   PARROT_NODE_ID     节点名（缺省 "node-1"）
-//!   PARROT_BIND        监听地址（缺省 0.0.0.0:9801）
-//!   PARROT_SEEDS       逗号分隔种子 "node_id=host:port"（缺省空——单节点）
-//!   PARROT_ACTORS      逗号分配置于 spawn 的内置 actor（缺省 echo,counter,kv,slow）
-//!   PARROT_READY_FILE  就绪后写入实际监听地址的文件（缺省不打）
+//! Invalid configuration fails before startup. Seed DNS has a shared five-second
+//! deadline; initial connection failures retry in the remote bootstrap task.
+//! Readiness prints `PARROT_NODE_READY=<actual endpoint>` only after local startup
+//! and a successful requested readiness-file write. It does not imply all seeds
+//! are connected. For mem, the endpoint is mem://node rather than a TCP address.
+//! Signal handlers are installed before readiness; shutdown awaits remote and
+//! local engine shutdown. One NODE singleton is supported per process.
 //!
-//! 就绪协议（编排器契约）：stdout 第一行 `PARROT_NODE_READY=<bind_addr>`。
-//! Docker healthcheck：`PARROT_HEALTHCHECK=1`——TCP 连自身监听端口即健康
-//! （比进程存活探针强：能证明 accept 循环在收连接）。
+//! PARROT_HEALTHCHECK=1 loads the same configuration and requires a Parrot
+//! handshake with the expected identity within two seconds (TCP or QUIC).
+//! Wildcard IPv4/IPv6 binds probe their corresponding loopback family. Port zero
+//! requires PARROT_READY_FILE; the file records an address, not current liveness.
+//! Cross-process mem probes fail explicitly. This tests protocol availability,
+//! not actor health, authorization, seed convergence or cluster consistency.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +47,17 @@ use parrot_api::address::ActorRef;
 use parrot_api::system::ActorSystem;
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use parrot_remote::admin::PropsFactory;
-use parrot_remote::{LocalLookup, NodeAddr};
+use parrot_remote::LocalLookup;
+
+pub mod configuration;
+pub mod directory;
+#[cfg(feature = "dylib")]
+pub mod native;
+pub mod runtime;
+#[cfg(feature = "dylib")]
+pub use native::NativeTrust;
+#[cfg(feature = "dylib")]
+pub use parrot_app::host::dylib::{DylibAsk, DylibReply, DylibTell};
 
 // ══════════════════════════════════════════════════════════════════════════
 // 消息
@@ -201,6 +228,19 @@ macro_rules! reg {
     };
 }
 
+reg!(
+    directory::QueryLocal,
+    "bin:parrot_node::directory::QueryLocal#v1"
+);
+reg!(
+    directory::LocalEntry,
+    "bin:parrot_node::directory::LocalEntry#v1"
+);
+reg!(directory::Inspect, "bin:parrot_node::directory::Inspect#v1");
+reg!(
+    directory::Observation,
+    "bin:parrot_node::directory::Observation#v1"
+);
 reg!(NEcho, "bin:deploy::NEcho#v1");
 reg!(NEchoed, "bin:deploy::NEchoed#v1");
 reg!(NInc, "bin:deploy::NInc#v1");
@@ -314,414 +354,7 @@ impl RemoteGateway for GatewayAdapter {
 //   NodeComponentExecutor（四命令接线）+ caps ARTIFACTS。
 // ══════════════════════════════════════════════════════════════════════════
 
-pub mod executor_v2 {
-    //! admin-v2 组件执行器（parrot 方言）。
-    //!
-    //! 职责边界：
-    //! - `ArtifactChannel`：artifact uri → 本地缓存（file:// 首期；http 后续）
-    //!   + sha256 校验。Wasm/Dylib 形态走同一条通道（C/D 阶段消费）。
-    //! - `exec_deploy_v2`：Props artifact → `find_factory` 按名 spawn
-    //!   （复用 K0 inventory 机制）；多实例按 `/user/{name}[-{i}]` 展开。
-    //! - `NodeComponentExecutor`：impl `ComponentExecutor`——Deploy/Drain/
-    //!   Stop/Status 四命令落到 thread 引擎 registry。
-
-    use std::sync::Arc;
-
-    use parrot::thread::system::ThreadActorSystem;
-    use parrot_remote::admin::find_factory;
-    use parrot_remote::admin_v2::{
-        failed_v2, v2_err, AdminArtifactRef, AdminCommandV2, AdminInstancePolicy, AdminReplyV2,
-        AdminReplyV2 as R, ComponentDeploy, ComponentExecutor, ComponentStateReport,
-        MetricsSnapshot,
-    };
-
-    // ─────────────────────────────────────────────────────────────
-    // ArtifactChannel
-    // ─────────────────────────────────────────────────────────────
-
-    /// artifact 获取/校验通道（目标节点侧）。
-    ///
-    /// 首期仅 `file://` 与裸路径（同机/挂载卷语义）；http(s) 后续阶段接入。
-    /// Props 形态无 artifact 传输需求（工厂已在进程内注册），直接放行。
-    #[derive(Debug, Clone, Default)]
-    pub struct ArtifactChannel;
-
-    impl ArtifactChannel {
-        /// 缓存根目录：`$PARROT_ARTIFACT_DIR` 或 `/tmp/parrot-artifacts`。
-        pub fn cache_dir() -> std::path::PathBuf {
-            std::env::var_os("PARROT_ARTIFACT_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/parrot-artifacts"))
-        }
-
-        /// uri → 本地路径（含校验）。`file://` / 裸路径 / `Props` 直通。
-        ///
-        /// Wasm/Dylib 带 digest → fetch 后 `verify`；不匹配按
-        /// `v2_err::ARTIFACT_DIGEST` 拒收（调用方映射回执码）。
-        pub fn fetch(
-            &self,
-            artifact: &AdminArtifactRef,
-        ) -> Result<std::path::PathBuf, (u16, String)> {
-            match artifact {
-                // Props 工厂已在进程内注册（inventory）——无 artifact 传输
-                AdminArtifactRef::Props { .. } => Ok(std::path::PathBuf::new()),
-                AdminArtifactRef::Wasm { digest, uri }
-                | AdminArtifactRef::Dylib { digest, uri, .. } => {
-                    let local = Self::materialize(uri).map_err(|e| (v2_err::ARTIFACT_FETCH, e))?;
-                    Self::verify(&local, digest).map_err(|e| (v2_err::ARTIFACT_DIGEST, e))?;
-                    Ok(local)
-                }
-                // 非本方言 artifact：Executor 侧应在路由前拒绝（DIALECT_MISMATCH）
-                AdminArtifactRef::Beam { .. }
-                | AdminArtifactRef::PyModule { .. }
-                | AdminArtifactRef::Jvm { .. } => Err((
-                    v2_err::DIALECT_MISMATCH,
-                    format!("parrot executor cannot fetch {artifact:?}"),
-                )),
-            }
-        }
-
-        /// uri → 本地路径。`file://host/path` 与 `file:///path` 均取 path 段；
-        /// 裸路径直取。非 file 协议首期报错（http 阶段接入）。
-        fn materialize(uri: &str) -> Result<std::path::PathBuf, String> {
-            if let Some(rest) = uri.strip_prefix("file://") {
-                // file://host/path → 跳过 host 段（localhost 语义）；空 host
-                // （file:///path）rest 首字符即 '/'
-                let p = if rest.starts_with('/') {
-                    rest
-                } else {
-                    rest.split_once('/').map(|(_, path)| path).unwrap_or(rest)
-                };
-                let path = std::path::PathBuf::from(format!("/{p}"));
-                if path.is_file() {
-                    return Ok(path);
-                }
-                return Err(format!("file uri not found: {uri}"));
-            }
-            // 裸路径（同机语义）
-            let path = std::path::PathBuf::from(uri);
-            if uri.starts_with('/') && path.is_file() {
-                return Ok(path);
-            }
-            Err(format!("unsupported or missing artifact uri: {uri}"))
-        }
-
-        /// sha256 校验：`sha256:<hex64>` 或裸 hex64；空 digest 跳过（测试便利）。
-        pub fn verify(path: &std::path::Path, digest: &str) -> Result<(), String> {
-            if digest.is_empty() {
-                return Ok(());
-            }
-            use sha2::{Digest, Sha256};
-            let bytes = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
-            let actual = hex::encode(Sha256::digest(&bytes));
-            let expect = digest
-                .strip_prefix("sha256:")
-                .unwrap_or(digest)
-                .to_ascii_lowercase();
-            if actual != expect {
-                return Err(format!(
-                    "sha256 mismatch: want {expect}, got {actual} ({path:?})"
-                ));
-            }
-            Ok(())
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // deploy 核心（Props → find_factory）
-    // ─────────────────────────────────────────────────────────────
-
-    /// 实例路径展开（与 parrot-app assemble 同规）：
-    /// Singleton → `/user/{name}`；Pool/Sharded(n) → `/user/{name}-{i}`。
-    pub fn instance_paths(name: &str, policy: AdminInstancePolicy) -> Vec<String> {
-        match policy {
-            AdminInstancePolicy::Singleton => vec![format!("/user/{name}")],
-            AdminInstancePolicy::Pool { count } | AdminInstancePolicy::Sharded { count } => {
-                (0..count).map(|i| format!("/user/{name}-{i}")).collect()
-            }
-        }
-    }
-
-    /// DeployComponent 执行（Props 方言核心）。
-    ///
-    /// 非 Props artifact → DIALECT_MISMATCH（ray/erl/jvm 网关各自处理）；
-    /// 工厂未注册 → FACTORY_NOT_FOUND；任一实例 spawn 失败 → SPAWN_FAILED
-    /// （已 spawn 的实例保留——StopComponent 按前缀清理，语义为"尽力而为"）。
-    ///
-    /// `ts` 必须是进程单例 `NODE` 的引擎（PropsFactory fn 指针经静态取
-    /// 引擎 spawn——K0 机制既定形态；不一致说明装配错误，按 SPAWN_FAILED 拒）。
-    pub async fn exec_deploy_v2(
-        ts: &Arc<ThreadActorSystem>,
-        cmd: ComponentDeploy,
-    ) -> Result<Vec<String>, (u16, String)> {
-        let factory_name = match &cmd.artifact {
-            AdminArtifactRef::Props { factory } => factory.clone(),
-            other => {
-                return Err((
-                    v2_err::DIALECT_MISMATCH,
-                    format!("parrot executor expects Props artifact, got {other:?}"),
-                ))
-            }
-        };
-        // artifact 通道统一过（Props 形态零成本直通——为 Wasm/Dylib 预留同路）
-        ArtifactChannel.fetch(&cmd.artifact)?;
-        // 装配一致性：PropsFactory 经 NODE 单例取引擎——ts 必须同源
-        let node_ts_ok = crate::NODE
-            .get()
-            .map(|n| Arc::<ThreadActorSystem>::ptr_eq(&n.ts, ts))
-            .unwrap_or(false);
-        if !node_ts_ok {
-            return Err((
-                v2_err::SPAWN_FAILED,
-                "engine mismatch: PropsFactory spawns on NODE singleton".into(),
-            ));
-        }
-        let factory = find_factory(&factory_name).ok_or_else(|| {
-            (
-                v2_err::FACTORY_NOT_FOUND,
-                format!("PropsFactory '{factory_name}' not registered"),
-            )
-        })?;
-        let paths = instance_paths(&cmd.name, cmd.instances);
-        let mut spawned = Vec::with_capacity(paths.len());
-        for p in &paths {
-            match (factory.spawn)(p).await {
-                Ok(_) => spawned.push(p.clone()),
-                Err(e) => {
-                    return Err((
-                        v2_err::SPAWN_FAILED,
-                        format!("spawn {p} failed: {e:?} (spawned {})", spawned.len()),
-                    ))
-                }
-            }
-        }
-        Ok(spawned)
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // NodeComponentExecutor（ComponentExecutor 实现）
-    // ─────────────────────────────────────────────────────────────
-
-    /// parrot 节点组件执行器：Deploy/Drain/Stop/Status → thread 引擎。
-    pub struct NodeComponentExecutor {
-        /// thread 引擎（spawn/stop/registry 查询）。
-        ts: Arc<ThreadActorSystem>,
-        /// 组件版本登记（Deploy 写入 / Status 报告 / Stop 清除）。
-        versions: std::sync::Mutex<std::collections::HashMap<String, String>>,
-    }
-
-    impl NodeComponentExecutor {
-        pub fn new(ts: Arc<ThreadActorSystem>) -> Self {
-            Self {
-                ts,
-                versions: std::sync::Mutex::new(std::collections::HashMap::new()),
-            }
-        }
-
-        /// 前缀匹配 registry 存活实例（`/user/comp` 前缀不误吞
-        /// `/user/comp2`——要求整段相等或后随 `-`）。
-        fn matching_paths(&self, prefix: &str) -> Vec<String> {
-            self.ts
-                .actor_paths()
-                .into_iter()
-                .filter(|p| {
-                    p == prefix
-                        || (p.starts_with(prefix) && p.as_bytes().get(prefix.len()) == Some(&b'-'))
-                })
-                .collect()
-        }
-
-        /// 路径 → 组件名（`/user/{name}` 或 `/user/{name}-{i}`）。
-        fn path_to_component(path: &str) -> String {
-            let rest = path.strip_prefix("/user/").unwrap_or(path);
-            // `-` 也可能是组件名自带字符：优先按已知版本表反查（status
-            // 已有路径集合；此处统一取最长匹配）。首版规则：rsplitonce
-            // 取 `-` 前段（多实例命名约定优先），无 `-` 整段即名。
-            match rest.rsplit_once('-') {
-                Some((name, tail))
-                    if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) =>
-                {
-                    name.to_string()
-                }
-                _ => rest.to_string(),
-            }
-        }
-
-        /// 清除路径集合覆盖的组件版本登记（实例全停后版本未知）。
-        fn forget_versions(&self, paths: &[String]) {
-            let comps: std::collections::HashSet<String> =
-                paths.iter().map(|p| Self::path_to_component(p)).collect();
-            self.versions
-                .lock()
-                .unwrap()
-                .retain(|k, _| !comps.contains(k));
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ComponentExecutor for NodeComponentExecutor {
-        async fn deploy(&self, req_id: u64, c: &ComponentDeploy) -> AdminReplyV2 {
-            match exec_deploy_v2(&self.ts, c.clone()).await {
-                Ok(instances) => {
-                    self.versions
-                        .lock()
-                        .unwrap()
-                        .insert(c.name.clone(), c.version.clone());
-                    R::Deployed { req_id, instances }
-                }
-                Err((code, detail)) => failed_v2(req_id, code, detail),
-            }
-        }
-
-        async fn drain(&self, req_id: u64, prefix: &str, timeout_ms: u64) -> AdminReplyV2 {
-            let paths = self.matching_paths(prefix);
-            if paths.is_empty() {
-                return failed_v2(
-                    req_id,
-                    v2_err::COMPONENT_NOT_FOUND,
-                    format!("no instances under prefix {prefix}"),
-                );
-            }
-            // 排空语义：逐实例等邮箱清空（在途消息处理完）再优雅停；
-            // deadline 共享（总预算 = timeout_ms，单实例不独占）。
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_millis(timeout_ms.min(60_000));
-            let mut drained = 0usize;
-            let mut aborted = 0usize;
-            for p in &paths {
-                let mb_empty = match self.ts.get_mailbox(p) {
-                    Some(mb) => loop {
-                        if mb.is_empty().await {
-                            break true;
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            break false;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    },
-                    None => false,
-                };
-                if mb_empty && self.ts.stop_actor(p).await.is_ok() {
-                    drained += 1;
-                } else {
-                    // 超时/邮箱无法排空 → 中止（保留实例——发起方决定 Stop 强停）
-                    aborted += 1;
-                }
-            }
-            if aborted == 0 {
-                self.forget_versions(&paths);
-            }
-            R::Drained {
-                req_id,
-                drained,
-                aborted,
-            }
-        }
-
-        async fn stop(&self, req_id: u64, prefix: &str) -> AdminReplyV2 {
-            let paths = self.matching_paths(prefix);
-            if paths.is_empty() {
-                return failed_v2(
-                    req_id,
-                    v2_err::COMPONENT_NOT_FOUND,
-                    format!("no instances under prefix {prefix}"),
-                );
-            }
-            for p in &paths {
-                let _ = self.ts.stop_actor(p).await;
-            }
-            self.forget_versions(&paths);
-            R::Stopped { req_id }
-        }
-
-        async fn status(&self, req_id: u64, prefix: &str) -> AdminReplyV2 {
-            let paths = self.matching_paths(prefix);
-            if paths.is_empty() {
-                return failed_v2(
-                    req_id,
-                    v2_err::COMPONENT_NOT_FOUND,
-                    format!("no instances under prefix {prefix}"),
-                );
-            }
-            let versions = self.versions.lock().unwrap().clone();
-            let states: Vec<ComponentStateReport> = paths
-                .into_iter()
-                .map(|p| {
-                    let name = Self::path_to_component(&p);
-                    ComponentStateReport {
-                        version: versions.get(&name).cloned().unwrap_or_default(),
-                        state: "running".into(),
-                        path: p,
-                    }
-                })
-                .collect();
-            R::Status { req_id, states }
-        }
-
-        /// 观测五件套：本地引擎指标快照（组件登记表 + actor 计数）。
-        async fn metrics(&self, req_id: u64) -> AdminReplyV2 {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let versions = self.versions.lock().unwrap().clone();
-            let states: Vec<ComponentStateReport> = versions
-                .iter()
-                .flat_map(|(name, ver)| {
-                    let prefix = format!("/user/{name}");
-                    self.matching_paths(&prefix)
-                        .into_iter()
-                        .map(move |p| ComponentStateReport {
-                            version: ver.clone(),
-                            state: "running".into(),
-                            path: p,
-                        })
-                })
-                .collect();
-            let snap = MetricsSnapshot {
-                ts_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
-                runtime: format!("parrot/{}", env!("CARGO_PKG_VERSION")),
-                connections: 1, // 进程内 executor——单一宿主
-                handshakes_ok: 1,
-                components: versions.len() as u64,
-                component_states: states,
-                processes: self.ts.actor_count() as u64,
-                uptime_start_ms: 0,
-                ..Default::default()
-            };
-            R::Metrics {
-                req_id,
-                snapshot: snap,
-            }
-        }
-    }
-
-    /// 命令直通辅助（handle_admin_command_v2 之外的进程内入口——
-    /// 测试与 bin 安装共用；回包已含 req_id）。
-    pub async fn exec_command_v2(ts: &Arc<ThreadActorSystem>, cmd: AdminCommandV2) -> AdminReplyV2 {
-        let ex = NodeComponentExecutor::new(ts.clone());
-        match cmd {
-            AdminCommandV2::DeployComponent { req_id, component } => {
-                ex.deploy(req_id, &component).await
-            }
-            AdminCommandV2::DrainComponent {
-                req_id,
-                path_prefix,
-                timeout_ms,
-            } => ex.drain(req_id, &path_prefix, timeout_ms).await,
-            AdminCommandV2::StopComponent {
-                req_id,
-                path_prefix,
-            } => ex.stop(req_id, &path_prefix).await,
-            AdminCommandV2::ComponentStatus {
-                req_id,
-                path_prefix,
-            } => ex.status(req_id, &path_prefix).await,
-            // 观测五件套：指标快照（ThreadActorSystem 方言——本地引擎状态）
-            AdminCommandV2::MetricsReport { req_id } => ex.metrics(req_id).await,
-        }
-    }
-}
+pub mod executor_v2;
 
 pub use executor_v2::{exec_command_v2, exec_deploy_v2, ArtifactChannel, NodeComponentExecutor};
 
@@ -729,96 +362,16 @@ pub use executor_v2::{exec_command_v2, exec_deploy_v2, ArtifactChannel, NodeComp
 // C 阶段（DEV_09 §3.3）：WasmActor——wasm 组件的引擎形态接线
 // ══════════════════════════════════════════════════════════════════════════
 
-/// wasm actor 消息（与 RemoteEnvelope 同构：type_key + bytes——codec_registry 惯例）。
+/// Shared Wasm host adapter; the application manifest runner and node embeddings
+/// use the same lifecycle and wire contracts, including Admin V2 Wasm deployment.
 #[cfg(feature = "wasm")]
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct WasmAsk {
-    pub type_key: String,
-    pub payload: Vec<u8>,
-}
-
-/// wasm actor 回复（handle 出参原样 bytes）。
-#[cfg(feature = "wasm")]
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct WasmReply(pub Vec<u8>);
-
-#[cfg(feature = "wasm")]
-impl parrot_api::message::Message for WasmAsk {
-    type Result = WasmReply;
-}
-
-/// wasm 组件 actor：每实例包一个 `WasmComponent`（fuel/epoch 沙箱内
-/// 执行 handle/tell）。消息 `WasmAsk` → 组件 handle → `WasmReply`；
-/// trap → `ActorError::OverQuota`（OutOfFuel）或 `MessageHandlingError`
-/// （其余 trap——监督层按常规重启策略处置）。
-#[cfg(feature = "wasm")]
-pub struct WasmActor {
-    component: parrot_wasm::runtime::WasmComponent,
-}
-
-#[cfg(feature = "wasm")]
-impl WasmActor {
-    /// 从已实例化组件构造（init 时 on_start）。
-    pub fn new(mut component: parrot_wasm::runtime::WasmComponent) -> ActorResult<Self> {
-        component.on_start().map_err(|e| {
-            parrot_api::errors::ActorError::InitializationError(format!("wasm on_start: {e}"))
-        })?;
-        Ok(Self { component })
-    }
-
-    /// 组件指标（take 语义——宿主监控用）。
-    pub fn take_metrics(&mut self) -> parrot_wasm::WasmMetrics {
-        self.component.take_metrics()
-    }
-
-    /// drain 钩子透传。
-    pub fn drain(&mut self) -> Result<(), parrot_wasm::ComponentError> {
-        self.component.on_drain()
-    }
-}
-
-#[cfg(feature = "wasm")]
-impl Actor for WasmActor {
-    type Config = EmptyConfig;
-    type Context = parrot::thread::ThreadContext<Self>;
-
-    fn receive_message<'a>(
-        &'a mut self,
-        msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async move {
-            if let Some(ask) = msg.downcast_ref::<WasmAsk>() {
-                return match self.component.handle(&ask.type_key, &ask.payload) {
-                    Ok(out) => Ok(Box::new(WasmReply(out)) as BoxedMessage),
-                    // fuel 耗尽 → OverQuota 语义（MessageHandlingError 带
-                    // 标记前缀——监督层可辨识限频）
-                    Err(parrot_wasm::ComponentError::OutOfFuel) => {
-                        Err(parrot_api::errors::ActorError::MessageHandlingError(
-                            "wasm OverQuota: out of fuel".into(),
-                        ))
-                    }
-                    Err(e) => Err(parrot_api::errors::ActorError::MessageHandlingError(
-                        format!("wasm trap: {e}"),
-                    )),
-                };
-            }
-            Err(parrot_api::errors::ActorError::MessageHandlingError(
-                "wasm actor: unhandled message".into(),
-            ))
-        })
-    }
-
-    fn state(&self) -> ActorState {
-        ActorState::Running
-    }
-}
+pub use parrot_app::host::wasm::{WasmActor, WasmAsk, WasmReply, WasmTell};
 
 // ══════════════════════════════════════════════════════════════════════════
 // bin 辅助
 // ══════════════════════════════════════════════════════════════════════════
 
-/// 内置 actor spawn（name: echo|counter|kv|slow → /user/<name>）。
+/// 内置 actor spawn（name: echo|counter|kv|slow → `/user/<name>`）。
 /// 内置组件清单（G2/M3 DEV_09）：builtin_app.toml 驱动 + PARROT_ACTORS
 /// overlay 过滤。
 ///
@@ -853,7 +406,10 @@ pub fn builtin_manifest_components_from(filter: Option<&str>) -> Vec<String> {
     }
 }
 
-pub async fn spawn_builtin(ts: &Arc<ThreadActorSystem>, which: &str) {
+pub async fn spawn_builtin(
+    ts: &Arc<ThreadActorSystem>,
+    which: &str,
+) -> Result<(), runtime::NodeError> {
     use parrot_api::types::BoxedActorRef as BRef;
     fn boxed<A>(r: parrot::thread::address::ThreadActorRef<A>) -> BRef
     where
@@ -885,76 +441,11 @@ pub async fn spawn_builtin(ts: &Arc<ThreadActorSystem>, which: &str) {
             .spawn_at(SlowActor, &path, None, ThreadActorConfig::default())
             .await
             .map(boxed),
-        _ => ts
+        "echo" => ts
             .spawn_at(EchoActor, &path, None, ThreadActorConfig::default())
             .await
             .map(boxed),
+        _ => return Err(format!("unknown builtin actor: {which}").into()),
     };
-    if let Err(e) = r {
-        panic!("builtin actor '{which}' spawn failed: {e}");
-    }
-}
-
-/// PARROT_SEEDS 解析："id=host:port,id=host:port"（host 可为域名——
-/// 异步 DNS 解析；解析失败的条目跳过并告警，不炸节点启动）。
-pub async fn parse_seeds(s: String) -> Vec<NodeAddr> {
-    use std::net::ToSocketAddrs;
-    let mut out = Vec::new();
-    for p in s.split(',').filter(|p| !p.is_empty()) {
-        let Some((id, addr)) = p.split_once('=') else {
-            continue;
-        };
-        let (id, addr) = (id.trim(), addr.trim());
-        let sa: Option<std::net::SocketAddr> = match addr.parse() {
-            Ok(ip) => Some(ip),
-            Err(_) => {
-                let hostport = addr.to_string();
-                tokio::task::spawn_blocking(move || {
-                    hostport.to_socket_addrs().ok().and_then(|mut i| i.next())
-                })
-                .await
-                .ok()
-                .flatten()
-            }
-        };
-        match sa {
-            Some(sa) => out.push(NodeAddr::tcp(id, sa)),
-            None => eprintln!("[parrot-node] WARN: seed '{id}' addr unresolved: {addr}"),
-        }
-    }
-    out
-}
-
-/// UNIX：SIGTERM + CTRL-C；其它平台：CTRL-C。
-pub async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = term.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await.expect("ctrl_c handler");
-    }
-}
-
-/// TCP 连自身监听端口成功即健康（accept 循环活着的最小证明；容器探针）。
-pub fn healthcheck() -> i32 {
-    let bind = std::env::var("PARROT_BIND").unwrap_or_else(|_| "0.0.0.0:9801".into());
-    let Ok(addr) = bind.parse::<std::net::SocketAddr>() else {
-        return 1;
-    };
-    let target = if addr.ip().is_unspecified() {
-        std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))
-    } else {
-        addr
-    };
-    match std::net::TcpStream::connect_timeout(&target, std::time::Duration::from_secs(2)) {
-        Ok(_) => 0,
-        Err(_) => 1,
-    }
+    r.map(|_| ()).map_err(Into::into)
 }

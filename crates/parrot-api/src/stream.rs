@@ -21,35 +21,29 @@
 //!
 //! ## Usage Example
 //!
-//! ```ignore
-//! use parrot_api::stream::{StreamHandler, StreamRegistry};
-//! use futures::stream::Stream;
-//!
-//! struct MyStreamHandler;
-//!
-//! #[async_trait]
-//! impl<S: Stream> StreamHandler<S, MyContext> for MyStreamHandler
-//! where
-//!     S::Item: Send + 'static,
-//! {
-//!     async fn handle(&mut self, item: S::Item, ctx: &mut MyContext) {
-//!         // Process stream item
-//!     }
-//!
-//!     async fn finished(&mut self, ctx: &mut MyContext) {
-//!         // Handle stream completion
-//!     }
-//! }
-//!
-//! // Register stream with actor
-//! actor.context.stream_registry().add_stream_with_handler(
-//!     my_stream,
-//!     MyStreamHandler::new()
-//! )?;
 //! ```
+//! use futures::stream;
+//! use parrot_api::{errors::ActorError, stream::{StreamRegistry, StreamRegistryExt}};
+//!
+//! // Call from actor initialization or a handler using ctx.stream_registry().
+//! fn register(registry: &mut dyn StreamRegistry) -> Result<(), ActorError> {
+//!     registry.add_stream(stream::iter([1_u32, 2, 3]))
+//! }
+//! ```
+//!
+//! Managed Thread and Actix backends execute stream hooks serially with actor
+//! messages and wait for each item's processing before polling the next item.
+//! Registration is bounded by the creator's context-task quota and stop owns
+//! cancellation/disposal. Detached contexts reject registration. Custom typed
+//! registrations preserve a callable handler through `StreamHandlerRegistration`;
+//! raw erased handlers must use that wrapper rather than arbitrary `Any`.
 
 use crate::actor::Actor;
 use crate::errors::ActorError;
+pub use crate::stream_dispatch::{
+    StreamCallback, StreamContextAccess, StreamContextView, StreamHandlerContext,
+    StreamHandlerRegistration,
+};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use std::any::Any;
@@ -146,7 +140,7 @@ pub trait StreamRegistry: Send {
     ///
     /// # Parameters
     /// * `stream` - Boxed stream with type-erased items
-    /// * `handler` - Boxed custom stream handler
+    /// * `handler` - Boxed `StreamHandlerRegistration` for runtime backends
     ///
     /// # Returns
     /// Result indicating success or failure of registration
@@ -186,7 +180,8 @@ pub trait StreamRegistryExt: StreamRegistry {
     /// # Type Parameters
     /// * `S` - Stream type
     /// * `H` - Handler type
-    /// * `C` - Context type
+    /// * `C` - Actual context type, or `dyn ActorContext`; other unsized
+    ///   interfaces must implement `StreamHandlerContext`
     ///
     /// # Parameters
     /// * `stream` - The stream to process
@@ -199,29 +194,17 @@ pub trait StreamRegistryExt: StreamRegistry {
         S: Stream + Send + 'static,
         S::Item: Send + 'static,
         H: StreamHandler<S, C> + 'static,
-        C: ?Sized + Send + 'static,
+        C: ?Sized + StreamHandlerContext + 'static,
     {
         let stream = Box::new(stream.map(|item| Box::new(item) as Box<dyn Any + Send>));
-        self.add_stream_with_handler_erased(stream, Box::new(handler))
+        self.add_stream_with_handler_erased(
+            stream,
+            Box::new(StreamHandlerRegistration::new::<S, H, C>(handler)),
+        )
     }
 }
 
 impl<T: StreamRegistry + ?Sized> StreamRegistryExt for T {}
-
-/// Internal message type for stream processing.
-///
-/// Used to communicate stream events between the stream
-/// processor and the actor system.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) enum StreamMessage<I> {
-    /// New item received from stream
-    Item(I),
-    /// Error occurred during processing
-    Error(ActorError),
-    /// Stream has completed
-    Completed,
-}
 
 /// Default stream handler implementation for actors.
 ///
@@ -255,11 +238,15 @@ where
     }
 
     async fn started(&mut self, ctx: &mut A::Context) {
-        self.actor.stream_started(ctx).await.ok();
+        if let Err(error) = self.actor.stream_started(ctx).await {
+            self.actor.stream_error(error, ctx).await.ok();
+        }
     }
 
     async fn finished(&mut self, ctx: &mut A::Context) {
-        self.actor.stream_finished(ctx).await.ok();
+        if let Err(error) = self.actor.stream_finished(ctx).await {
+            self.actor.stream_error(error, ctx).await.ok();
+        }
     }
 
     async fn handle_error(&mut self, err: ActorError, ctx: &mut A::Context) {
@@ -271,24 +258,21 @@ where
 mod tests {
     use super::*;
     use crate::actor::{Actor, ActorState, EmptyConfig};
-    use crate::context::ActorContext;
     use crate::types::{ActorResult, BoxedFuture, BoxedMessage};
     use futures::stream::{self, StreamExt};
 
-    // 最小 Actor：记录流事件（dead_code 允许：字段仅用于文档化形状）
     #[derive(Debug, Default)]
-    #[allow(dead_code)]
     struct RecActor {
         items: Vec<u64>,
         started: bool,
         finished: bool,
         errored: Option<String>,
+        fail_hooks: bool,
     }
 
-    // 占位 Context（Actor::Context 需要 dyn ActorContext）
     impl Actor for RecActor {
         type Config = EmptyConfig;
-        type Context = dyn ActorContext;
+        type Context = NullCtx;
         fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -297,10 +281,53 @@ mod tests {
             msg: BoxedMessage,
             _c: &'a mut Self::Context,
         ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-            Box::pin(async move { Ok(msg) })
+            Box::pin(async move {
+                let value = *msg.downcast::<u64>().unwrap();
+                if value == 0 {
+                    return Err(ActorError::MessageHandlingError("zero item".into()));
+                }
+                self.items.push(value);
+                Ok(Box::new(()) as BoxedMessage)
+            })
         }
         fn state(&self) -> ActorState {
             ActorState::Running
+        }
+        fn stream_started<'a>(
+            &'a mut self,
+            _: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move {
+                self.started = true;
+                if self.fail_hooks {
+                    Err(ActorError::InitializationError("start failure".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn stream_finished<'a>(
+            &'a mut self,
+            _: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move {
+                self.finished = true;
+                if self.fail_hooks {
+                    Err(ActorError::MessageHandlingError("finish failure".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn stream_error<'a>(
+            &'a mut self,
+            error: ActorError,
+            _: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move {
+                self.errored = Some(error.to_string());
+                Ok(())
+            })
         }
     }
 
@@ -468,25 +495,38 @@ mod tests {
         assert_eq!(*h.downcast::<u32>().unwrap(), 7);
     }
 
-    // ---------------- StreamMessage（内部消息形状） ----------------
-
-    #[test]
-    fn stream_message_variants_hold_payloads() {
-        let a: StreamMessage<u64> = StreamMessage::Item(42u64);
-        let b: StreamMessage<u64> = StreamMessage::Error(ActorError::Timeout);
-        let c: StreamMessage<u64> = StreamMessage::Completed;
-        // Debug 派生可用
-        assert!(format!("{:?}", a).contains("Item"));
-        assert!(format!("{:?}", b).contains("Error"));
-        assert!(format!("{:?}", c).contains("Completed"));
-    }
-
-    // ---------------- ActorStreamHandler（委托 Actor 流方法） ----------------
-
     #[tokio::test]
-    async fn actor_stream_handler_construction() {
-        // 构造 + 类型检查；handle 需要 dyn ActorContext 实例，
-        // 此处仅验证 new() 返回类型可用
-        let _h = ActorStreamHandler::new(RecActor::default());
+    async fn actor_stream_handler_delegates_items_and_all_hook_errors() {
+        type Source = futures::stream::Iter<std::vec::IntoIter<u64>>;
+        let mut handler = ActorStreamHandler::new(RecActor {
+            fail_hooks: true,
+            ..Default::default()
+        });
+        let mut ctx = NullCtx;
+        StreamHandler::<Source, NullCtx>::started(&mut handler, &mut ctx).await;
+        assert!(handler.actor.started);
+        assert!(handler
+            .actor
+            .errored
+            .as_ref()
+            .unwrap()
+            .contains("start failure"));
+        StreamHandler::<Source, NullCtx>::handle(&mut handler, 7, &mut ctx).await;
+        StreamHandler::<Source, NullCtx>::handle(&mut handler, 0, &mut ctx).await;
+        assert_eq!(handler.actor.items, vec![7]);
+        assert!(handler
+            .actor
+            .errored
+            .as_ref()
+            .unwrap()
+            .contains("zero item"));
+        StreamHandler::<Source, NullCtx>::finished(&mut handler, &mut ctx).await;
+        assert!(handler.actor.finished);
+        assert!(handler
+            .actor
+            .errored
+            .as_ref()
+            .unwrap()
+            .contains("finish failure"));
     }
 }

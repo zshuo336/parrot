@@ -32,23 +32,31 @@ pub enum BackpressureStrategy {
     Error,
     /// The oldest message currently in the mailbox will be dropped to make space.
     DropOldest,
-    /// The new message being pushed will be dropped.
+    /// The new message is discarded and `MailboxError::Dropped` is returned.
+    /// A dropped message must not be reported as successfully admitted.
     DropNewest,
 }
 
-/// Defines how a supervisor actor should react when a direct child actor fails (panics).
+/// Fallback failure policy selected by a managed Thread actor configuration.
+/// An explicit or inherited managed child policy takes precedence over this fallback.
+/// Instance creation does not implicitly supply a repeatable reconstruction factory.
 #[derive(Clone, Debug)]
 pub enum SupervisorStrategy {
-    /// Restart the child actor immediately.
+    /// Reconstruct from a repeatable factory after the old generation retires,
+    /// subject to the sliding restart budget.
     Restart {
         max_retries: usize,
         within: Duration,
     },
-    /// Resume the child actor (keep it running, message dropped).
+    /// Preserve the current generation after a recoverable handler failure or
+    /// descendant escalation. Do not replay the failed message or roll back effects.
+    /// A failed initialization cannot be activated by Resume.
     Resume,
-    /// Stop the child actor permanently.
+    /// Retire the failed actor without constructing a replacement.
     Stop,
-    /// Stop the child actor and escalate the failure by stopping the supervisor itself.
+    /// Retire the failed actor and signal its actual parent. The parent applies
+    /// its own policy and may Resume; escalation does not unconditionally stop it.
+    /// A root has no parent to receive the signal and terminates.
     Escalate,
 }
 
@@ -87,7 +95,9 @@ pub struct ThreadActorSystemConfig {
     /// How long a burst worker may idle before being reaped.
     pub shared_burst_idle_timeout_ms: u64,
 
-    /// The capacity of the shared scheduling queue.
+    /// Resident ready entries shared by both priority lanes; must be positive.
+    /// Saturation coalesces readiness in existing actor registrations, without
+    /// limiting actor count or bypassing the actors' bounded mailboxes.
     pub shared_queue_capacity: usize,
 
     /// The maximum number of dedicated threads allowed in the system.
@@ -99,7 +109,8 @@ pub struct ThreadActorSystemConfig {
     /// The default capacity for actor mailboxes if not specified.
     pub default_mailbox_capacity: usize,
 
-    /// Maximum outstanding timer tasks per actor. Zero disables scheduling.
+    /// Maximum outstanding user timers and streams per actor. Zero disables both.
+    /// One internal receive-timeout worker has a separate reserved slot.
     pub max_context_tasks: usize,
 
     /// The default timeout duration for `ask` operations.
@@ -146,7 +157,7 @@ impl Default for ThreadActorSystemConfig {
 }
 
 impl ThreadActorSystemConfig {
-    /// 配置切面：从 parrot-config 折叠结果生成（[thread] 节——文件层
+    /// 配置切面：从 parrot-config 折叠结果生成（`[thread]` 节——文件层
     /// 加载由 parrot-config 负责）。未覆盖字段保持 Default（与现行为一致）。
     pub fn from_resolved(r: &parrot_config::Resolved) -> Self {
         let d = Self::default();
@@ -189,6 +200,8 @@ impl ThreadActorSystemConfig {
             thread_stack_size: actor_config.thread_stack_size,
             yield_after_each_message: actor_config.yield_after_each_message,
             idle_sleep_duration: actor_config.idle_sleep_duration,
+            message_batch_size: actor_config.message_batch_size,
+            message_admission: actor_config.message_admission.clone(),
         }
     }
 }
@@ -198,6 +211,21 @@ impl ThreadActorSystemConfig {
 /// Configuration for individual actors, potentially overriding system defaults.
 #[derive(Clone, Debug, Default)]
 pub struct ThreadActorConfig {
+    /// Optional synchronous admission/normalization before mailbox waiting.
+    /// Runs on the producer, outside actor/mailbox locks. The actor must accept
+    /// the prepared message type. Engine control messages bypass this policy.
+    /// The logical actor owns a managed policy lease across restarts. Final
+    /// retirement closes admission and waits for callbacks already in progress
+    /// and disposal of the framework's original lease. Retaining a framework
+    /// mailbox, processor or its configuration does not postpone that disposal;
+    /// its policy proxy returns `MailboxError::Closed` after retirement.
+    /// Original policy Arcs retained by the caller remain caller-owned, so their
+    /// eventual final destructor is not part of the actor's stop receipt.
+    pub message_admission: Option<std::sync::Arc<dyn super::mailbox::admission::MessageAdmission>>,
+    /// Opt-in business batch size (1..=256). None/1 preserves single-message
+    /// dispatch. Also bounded by the scheduler's remaining per-run budget.
+    /// Only contiguous messages allowed by Actor::can_batch_message coalesce.
+    pub message_batch_size: Option<usize>,
     /// The scheduling mode for this actor.
     pub scheduling_mode: Option<SchedulingMode>,
 

@@ -6,9 +6,9 @@
 //
 // 覆盖：
 //   P1 后端选择：pl_pollset_create/backend 断言（macOS=kqueue / Linux=epoll）
-//   P2 解码器：10k 帧批量 feed+next 无 O(n²)（限时断言）+ 内容逐帧校验
-//   P3 并发 ask：8 线程 × 200 ask（同连接在途）——全部配对成功且总耗时
-//      < 串行基线的 1/2（帮助泵真并发证明）
+//   P2 解码器：10k 帧内容逐帧校验；时间只是观测值，不能单独证明复杂度。
+//   P3 并发 ask：8 线程 × 200 唯一载荷，逐请求精确配对。
+//      真正在途并发由 test_transport.py 的收齐八请求再回包屏障验证。
 //   P4 单线程 ask 往返延迟 p50（参考值打印）
 
 #include "parrot_lite.h"
@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cerrno>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -28,9 +31,26 @@
 
 using Clock = std::chrono::steady_clock;
 
+// Performance floors belong to an explicit isolated release gate. Shared debug
+// CI cannot infer in-flight concurrency from wall-clock throughput on one run.
+static void performance_limit(const char *name, double measured, bool minimum) {
+  const char *text = std::getenv(name);
+  if (!text) return;
+  errno = 0; char *end = nullptr;
+  const double limit = std::strtod(text, &end);
+  const bool valid = text[0] && end && !*end && errno == 0 && std::isfinite(limit) && limit > 0;
+  CHECK(valid, "performance limit must be a positive finite number");
+  if (!valid) return;
+  printf("PERF LIMIT %s=%.3f measured=%.3f\n", name, limit, measured);
+  CHECK(minimum ? measured >= limit : measured <= limit,
+        minimum ? "requested throughput floor" : "requested decoder time ceiling");
+}
+
 static void test_backend_probe() {
+  const int before = g_fail;
   pl_pollset *ps = pl_pollset_create();
   CHECK(ps != nullptr, "pollset create");
+  if (!ps) return;
   const char *be = pl_pollset_backend(ps);
   printf("backend: %s (compiled: %s)\n", be, pl_backend_name());
 #if defined(__APPLE__) || defined(__FreeBSD__)
@@ -40,7 +60,9 @@ static void test_backend_probe() {
 #endif
   // ctl/wait 冒烟（自 pipe 读端）
   int fds[2];
-  CHECK(pipe(fds) == 0, "pipe");
+  const int created = pipe(fds);
+  CHECK(created == 0, "pipe");
+  if (created != 0) { pl_pollset_destroy(ps); return; }
   CHECK(pl_pollset_ctl(ps, fds[0], true) == 0, "ctl add");
   char w = 'x';
   CHECK(::write(fds[1], &w, 1) == 1, "pipe write");
@@ -50,10 +72,11 @@ static void test_backend_probe() {
   ::close(fds[0]);
   ::close(fds[1]);
   pl_pollset_destroy(ps);
-  printf("P1 backend-select PASS\n");
+  printf("P1 backend-select %s\n", g_fail == before ? "PASS" : "FAIL");
 }
 
 static void test_decoder_bulk() {
+  const int before = g_fail;
   // 10k 小帧一次性 feed —— 游标式必须远快于 O(n²)
   parrot::lite::FrameDecoder dec;
   std::vector<uint8_t> wire;
@@ -75,16 +98,16 @@ static void test_decoder_bulk() {
   int err = 0;
   while (dec.next(&out, &err)) {
     CHECK(out.cid == static_cast<uint64_t>(got), "bulk cid order");
+    CHECK(out.ft == PL_FT_TELL && out.path == "/user/bench" && out.type_key == "bin:u:Tick" &&
+          out.payload == std::vector<uint8_t>(16, static_cast<uint8_t>(got & 0xff)), "bulk frame content");
     if (out.cid != static_cast<uint64_t>(got)) break;
     got++;
   }
   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
   CHECK(err == 0, "bulk decode err");
   CHECK(got == N, "bulk all frames");
-  // O(n²) 参考量级：旧实现在 10k×~90B 下通常 >300ms；游标式 <50ms。
-  // 门限取 300ms——防极端机器误报同时明确劣化回归。
-  CHECK(ms < 300, "bulk decode under 300ms");
-  printf("P2 decoder-bulk PASS (%d frames in %lldms)\n", got, (long long)ms);
+  performance_limit("PL_CPP_MAX_DECODE_MS", static_cast<double>(ms), false);
+  printf("P2 decoder-bulk %s (%d frames in %lldms)\n", g_fail == before ? "PASS" : "FAIL", got, (long long)ms);
 }
 
 static void test_concurrent_ask(int port) {
@@ -93,7 +116,8 @@ static void test_concurrent_ask(int port) {
   CHECK(pl_connect(url, "cpp-perf-1", nullptr) == 0, "connect");
 
   const int THREADS = 8;
-  const int PER = 200;
+  // Longer explicit performance samples amortize startup/scheduling noise.
+  const int PER = std::getenv("PL_CPP_MIN_QPS") ? 2000 : 200;
   std::atomic<int> ok{0};
   std::atomic<int> fail{0};
 
@@ -101,9 +125,9 @@ static void test_concurrent_ask(int port) {
   const auto t0 = Clock::now();
   std::vector<std::thread> ts;
   for (int t = 0; t < THREADS; t++) {
-    ts.emplace_back([&ok, &fail] {
+    ts.emplace_back([&ok, &fail, t, PER] {
       for (int i = 0; i < PER; i++) {
-        uint8_t req[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        uint8_t req[8] = {static_cast<uint8_t>(t), static_cast<uint8_t>(i), static_cast<uint8_t>(i >> 8), 4, 5, 6, 7, 8};
         uint8_t *out = nullptr;
         size_t out_len = 0;
         const int rc = pl_ask("/user/echo", "bin:u:Echo", req, sizeof(req),
@@ -122,28 +146,29 @@ static void test_concurrent_ask(int port) {
   const auto par_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
 
-  // ── 串行基线（同规模单线程）──────────────────────────────
+  // ── 串行基线（相同请求数，逐条验证）──────────────────────────────
   const auto t1 = Clock::now();
-  for (int i = 0; i < PER; i++) {
-    uint8_t req[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  for (int i = 0; i < THREADS * PER; i++) {
+    uint8_t req[8] = {0xff, static_cast<uint8_t>(i), static_cast<uint8_t>(i >> 8), 4, 5, 6, 7, 8};
     uint8_t *out = nullptr;
     size_t out_len = 0;
     const int rc = pl_ask("/user/echo", "bin:u:Echo", req, sizeof(req),
                           &out, &out_len, 10000);
-    if (rc == 0 && out_len == 8) pl_free(out);
+    CHECK(rc == 0 && out_len == sizeof(req) && out && std::memcmp(out, req, sizeof(req)) == 0, "serial echo exact payload");
+    pl_free(out);
   }
   const auto ser_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t1).count();
 
   CHECK(fail == 0, "concurrent ask zero fail");
   CHECK(ok == THREADS * PER, "concurrent ask all paired");
-  // 吞吐门限（DEV_08）：8 线程并发下总吞吐 ≥ 20k ask/s（回环 RTT ~35µs
-  // 时理论上限 ~28k/s——门限取 70% 覆盖调度抖动）。旧"全局锁内等回复"
-  // 实现串行化后吞吐 ≤ 单线程（~9k/s），本门限可分辨回归。
-  const double qps = (double)(THREADS * PER) / ((double)par_ms / 1000.0);
-  printf("P3 concurrent-ask PASS (parallel %lldms, %.0f ask/s, serial-base %lldms)\n",
-         (long long)par_ms, qps, (long long)ser_ms);
-  CHECK(qps >= 20000.0, "concurrent throughput >= 20k/s");
+  // Equal request counts and floating-point seconds avoid integer-ms division
+  // by zero. A measured rate is reported even when no release floor is set.
+  const double seconds = std::chrono::duration<double>(t1 - t0).count();
+  const double qps = seconds > 0 ? (THREADS * PER) / seconds : 0;
+  printf("P3 concurrent-ask %s (parallel %lldms, %.0f ask/s, serial-base %lldms)\n",
+         fail == 0 && ok == THREADS * PER ? "PASS" : "FAIL", (long long)par_ms, qps, (long long)ser_ms);
+  performance_limit("PL_CPP_MIN_QPS", qps, true);
 
   // ── p50 延迟参考（100 次单线程往返）──────────────────────
   std::vector<long long> lat;
@@ -154,14 +179,15 @@ static void test_concurrent_ask(int port) {
     const auto s = Clock::now();
     const int rc = pl_ask("/user/echo", "bin:u:Echo", req, sizeof(req), &out, &out_len, 5000);
     const auto e = Clock::now();
-    if (rc == 0) pl_free(out);
+    CHECK(rc == 0 && out_len == sizeof(req) && out && std::memcmp(out, req, sizeof(req)) == 0, "latency echo exact payload");
+    pl_free(out);
     lat.push_back(std::chrono::duration_cast<std::chrono::microseconds>(e - s).count());
   }
   std::sort(lat.begin(), lat.end());
   printf("P4 ask latency p50=%lldus p99=%lldus (ref)\n", lat[50], lat[99]);
 
   pl_close();
-  printf("CPP-LITE PERF PASS\n");
+  printf("CPP-LITE CHECKS %s\n", g_fail == 0 ? "PASS" : "FAIL");
 }
 
 int main(int argc, char **argv) {
@@ -169,7 +195,8 @@ int main(int argc, char **argv) {
   if (port == 0) {
     test_backend_probe();
     test_decoder_bulk();
-    printf("CPP-LITE PERF LOCAL PASS\n");
+    CHECK(!std::getenv("PL_CPP_MIN_QPS"), "throughput gate requires a live peer port");
+    printf("CPP-LITE CHECKS LOCAL %s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;
   }
   test_backend_probe();

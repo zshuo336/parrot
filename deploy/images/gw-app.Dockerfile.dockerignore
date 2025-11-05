@@ -1,0 +1,16 @@
+# Permit directly selectable release binaries for BIN/TRIPLE, excluding nested
+# compiler outputs. Root target metadata may accompany the required parents.
+**
+!deploy
+deploy/*
+!deploy/images
+deploy/images/*
+!deploy/images/validate_app_binary.py
+!target
+!target/*
+target/*/*
+!target/*/release
+!target/*/release/*
+target/*/release/*/*
+!target/release/*
+target/release/*/*

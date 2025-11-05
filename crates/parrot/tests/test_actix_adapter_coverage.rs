@@ -14,8 +14,7 @@ use actix::{Actor as ActixActorTrait, Addr};
 use parrot::actix as __parrot_engine;
 use parrot::actix::{ActixActor, ActixActorSystem, ActixContext, ActorBase, IntoActorBase};
 use parrot_api::actor::{Actor as ParrotActor, ActorState, EmptyConfig, EngineContextHandle};
-use parrot_api::address::ActorRefExt;
-use parrot_api::message::Message;
+use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::types::BoxedActorRef;
 use parrot_api::types::{ActorResult, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
@@ -91,16 +90,15 @@ fn actix_actor_state_accessor_lifecycle() {
         // handler (Handler<StopMessage> → ctx.stop()).
         aref.stop().await.expect("stop ok");
 
-        // Give the arbiter a beat to run the stop handler.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Post-stop ask must terminate (error), never hang.
-        let r = tokio::time::timeout(Duration::from_secs(2), aref.ask(Add(1))).await;
-        match r {
-            Err(_) => panic!("post-stop ask hung"),
-            Ok(Err(_)) => {} // expected
-            Ok(Ok(_)) => {}  // mailbox drained one last time; tolerated
-        }
+        let result = tokio::time::timeout(Duration::from_secs(2), aref.ask(Add(1)))
+            .await
+            .expect("post-stop ask must complete");
+        assert!(
+            matches!(result, Err(parrot_api::errors::ActorError::Stopped)),
+            "{result:?}"
+        );
+        assert!(!aref.is_alive().await);
+        sys.shutdown().await.unwrap();
     });
 }
 
@@ -205,15 +203,14 @@ fn actix_actor_ref_accessors_and_debug() {
 
         // create_envelope / do_send / try_send against the live addr.
         r.do_send(Box::new(Add(1)));
-        match r.try_send(Box::new(Add(2))) {
-            Ok(()) => {}
-            Err(actix::prelude::SendError::Closed(_)) => {
-                // Actor may already be stopped if System is winding down.
-            }
-            Err(e) => panic!("unexpected try_send error: {:?}", e),
-        }
-        // Give the arbiter a beat.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        r.try_send(Box::new(Add(2)))
+            .expect("live mailbox has capacity");
+        assert_eq!(
+            r.ask(Add(0)).await.unwrap(),
+            3,
+            "both admitted messages precede the query"
+        );
+        r.stop().await.unwrap();
     });
 }
 
@@ -229,7 +226,13 @@ fn native_stop_message_handler() {
         let r =
             parrot::actix::reference::ActixActorRef::new(addr.clone(), "t://native-stop".into());
         r.do_send(payload);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while addr.connected() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("enveloped stop closes mailbox");
         // Mailbox closed after stop → send errors.
         let envelope = parrot::actix::message::create_envelope(Add(1));
         let wrapper = parrot::actix::message::ActixMessageWrapper { envelope };
@@ -238,16 +241,9 @@ fn native_stop_message_handler() {
     });
 }
 
-/// The "context not initialized" defensive branch in the dispatch handler:
-/// delivering a message before `started` populated `self.ctx` would hit
-/// it. Reproducing that exactly requires racing the arbiter; instead we
-/// assert the branch's observable contract via a direct-handle variant:
-/// construct ActixActor (ctx = None) and invoke the Handler manually with
-/// a fabricated actix Context — covered via the nested test above using
-/// pre-started actors; here we at least ensure the message type plumbing
-/// (StopMessage interception) works through create_envelope + do_send.
+/// Managed stop completion seals the reference before any subsequent request.
 #[test]
-fn stop_message_via_envelope_interception() {
+fn managed_stop_rejects_subsequent_requests() {
     actix::System::new().block_on(async {
         let sys = ActixActorSystem::new().await.expect("system");
         let aref = sys
@@ -256,14 +252,14 @@ fn stop_message_via_envelope_interception() {
             .expect("spawn");
         aref.ask(Add(1)).await.expect("alive");
         aref.stop().await.expect("ActorRef::stop ok");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // After stop, sends fail fast (mailbox closed), never hang.
-        let r = tokio::time::timeout(Duration::from_secs(2), aref.ask(Add(1))).await;
-        match r {
-            Err(_) => panic!("post-stop ask hung"),
-            Ok(Err(_)) => {}
-            Ok(Ok(_)) => {}
-        }
+        let result = tokio::time::timeout(Duration::from_secs(2), aref.ask(Add(1)))
+            .await
+            .expect("post-stop ask must complete");
+        assert!(
+            matches!(result, Err(parrot_api::errors::ActorError::Stopped)),
+            "{result:?}"
+        );
+        sys.shutdown().await.unwrap();
     });
 }
 
@@ -300,12 +296,21 @@ fn native_stop_message_direct_handler() {
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
         // do_send requires Message + Send; native StopMessage qualifies.
         addr.do_send(StopMessage);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while addr.connected() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native stop closes mailbox");
         // After stop the mailbox is closed: further sends fail.
         let envelope = parrot::actix::message::create_envelope(Add(1));
         let wrapper = parrot::actix::message::ActixMessageWrapper { envelope };
         let r = addr.try_send(wrapper);
-        assert!(r.is_err(), "mailbox must be closed after native stop");
+        assert!(
+            matches!(r, Err(actix::prelude::SendError::Closed(_))),
+            "mailbox must be closed after native stop"
+        );
     });
 }
 
@@ -327,6 +332,7 @@ fn dispatch_before_started_reports_diagnostic() {
         // bypassing the arbiter's started() ordering.
         let mut raw_ctx = ActixRawContext::<ActixActor<Inner>>::new();
         let envelope = parrot_api::message::MessageEnvelope {
+            trace_context: None,
             id: uuid::Uuid::new_v4(),
             payload: Box::new(Add(1)),
             sender: None,
@@ -349,8 +355,6 @@ fn dispatch_before_started_reports_diagnostic() {
             Some(tx),
         );
         let addr = raw_ctx.run(unstarted);
-        let _ = &addr; // run() returns the actor's Addr; drive it implicitly
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let err = tokio::time::timeout(Duration::from_secs(1), rx)
             .await
             .expect("diagnostic must resolve")
@@ -358,6 +362,12 @@ fn dispatch_before_started_reports_diagnostic() {
             .expect("Some error reply")
             .expect_err("diagnostic error");
         assert!(err.to_string().contains("context not initialized"), "{err}");
+        // Starting the adapter to drive its response must not resurrect the
+        // rejected message. Only this newly admitted Add may mutate the state.
+        let reference =
+            parrot::actix::reference::ActixActorRef::new(addr, "test://pre-start-rejection".into());
+        assert_eq!(reference.ask(Add(1)).await.unwrap(), 1);
+        reference.stop().await.unwrap();
     });
 }
 
@@ -414,11 +424,15 @@ fn actix_context_full_surface() {
         );
         assert!(with_parent.parent().is_some());
 
-        // timers / supervision config (no-ops but must be callable)
+        // A detached context stores timeout configuration; real dispatch is covered
+        // by test_receive_timeout; managed supervision has its own contract suite.
         pctx.set_receive_timeout(Some(Duration::from_secs(1)));
+        assert_eq!(pctx.receive_timeout(), Some(Duration::from_secs(1)));
+        pctx.set_receive_timeout(None);
+        assert_eq!(pctx.receive_timeout(), None);
         pctx.set_supervisor_strategy(SupervisorStrategyType::default());
 
-        // watch/unwatch are explicit not-implemented errors (documented).
+        // Raw references do not expose a managed DeathWatch endpoint.
         assert!(pctx.watch(parent_ref.clone_boxed()).await.is_err());
         assert!(pctx.unwatch(parent_ref.clone_boxed()).await.is_err());
 
@@ -437,10 +451,18 @@ fn actix_context_full_surface() {
             .await
             .is_ok()
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // The target received Add(5) — observable via its state.
-        let r: u64 = target.ask(Add(0)).await.unwrap();
-        assert_eq!(r, 5);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let value: u64 = target.ask(Add(0)).await.unwrap();
+                match value {
+                    5 => break,
+                    0 => tokio::task::yield_now().await,
+                    unexpected => panic!("scheduled addition must occur once, got {unexpected}"),
+                }
+            }
+        })
+        .await
+        .expect("scheduled message must reach the actor");
         pctx.stop().await.unwrap();
         assert!(
             !addr.connected(),
@@ -500,6 +522,134 @@ fn actix_context_schedule_periodic_one_tick() {
     });
 }
 
+#[derive(Debug, Clone, ParrotActor)]
+#[ParrotActor(engine = "actix", config = "EmptyConfig")]
+struct DeathWatchObserver {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<parrot_api::context::ActorTerminated>>>,
+}
+
+impl DeathWatchObserver {
+    async fn handle_message(
+        &mut self,
+        _msg: BoxedMessage,
+        _ctx: &mut ActixContext<ActixActor<Self>>,
+    ) -> ActorResult<BoxedMessage> {
+        Err(parrot_api::errors::ActorError::MessageHandlingError(
+            "death-watch messages use the native Actix engine path".into(),
+        ))
+    }
+
+    fn handle_message_engine(
+        &mut self,
+        msg: BoxedMessage,
+        _ctx: &mut ActixContext<ActixActor<Self>>,
+        _engine_ctx: EngineContextHandle,
+    ) -> Option<ActorResult<BoxedMessage>> {
+        if let Ok(message) = msg.downcast::<parrot_api::context::ActorTerminated>() {
+            self.seen.lock().unwrap().push(*message);
+            return Some(Ok(Box::new(())));
+        }
+        Some(Err(parrot_api::errors::ActorError::MessageHandlingError(
+            "unexpected death-watch message".into(),
+        )))
+    }
+}
+
+#[test]
+fn actix_managed_watch_delivers_after_real_termination() {
+    actix::System::new().block_on(async {
+        let system = ActixActorSystem::new().await.expect("system");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = system
+            .spawn_root_typed(DeathWatchObserver { seen: seen.clone() }, EmptyConfig)
+            .await
+            .expect("observer");
+        let target = system
+            .spawn_root_typed(Inner { v: 0 }, EmptyConfig)
+            .await
+            .expect("target");
+
+        target
+            .watch(observer.clone_boxed())
+            .await
+            .expect("watch registration");
+        // Idempotent registration must not duplicate the notification.
+        target
+            .watch(observer.clone_boxed())
+            .await
+            .expect("duplicate watch registration");
+        target.stop().await.expect("target stop");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !seen.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("watch notification");
+        let (event_count, event_path, event_reason) = {
+            let events = seen.lock().unwrap();
+            (
+                events.len(),
+                events[0].path.clone(),
+                events[0].reason.clone(),
+            )
+        };
+        assert_eq!(event_count, 1, "duplicate watch must be coalesced");
+        assert_eq!(event_path, target.path());
+        assert_eq!(event_reason, parrot_api::DeathReason::Normal);
+
+        observer.stop().await.expect("observer stop");
+    });
+}
+
+#[test]
+fn actix_watch_unwatch_and_late_registration_are_deterministic() {
+    actix::System::new().block_on(async {
+        let system = ActixActorSystem::new().await.expect("system");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = system
+            .spawn_root_typed(DeathWatchObserver { seen: seen.clone() }, EmptyConfig)
+            .await
+            .expect("observer");
+        let target = system
+            .spawn_root_typed(Inner { v: 0 }, EmptyConfig)
+            .await
+            .expect("target");
+
+        target
+            .watch(observer.clone_boxed())
+            .await
+            .expect("watch registration");
+        target
+            .unwatch(observer.clone_boxed())
+            .await
+            .expect("unwatch registration");
+        target.stop().await.expect("target stop");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "unwatch must suppress delivery"
+        );
+
+        let late = system
+            .spawn_root_typed(Inner { v: 0 }, EmptyConfig)
+            .await
+            .expect("late target");
+        late.stop().await.expect("late stop");
+        let error = late
+            .watch(observer.clone_boxed())
+            .await
+            .expect_err("watching a sealed target must fail");
+        assert!(matches!(error, parrot_api::errors::ActorError::Stopped));
+
+        observer.stop().await.expect("observer stop");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // reference.rs: ask-timeout path & Full/Closed SendError mapping; types.rs
 // ---------------------------------------------------------------------------
@@ -521,7 +671,7 @@ fn actix_types_surface() {
 }
 
 #[test]
-fn actix_ref_ask_timeout_and_send_errors() {
+fn actix_ref_closed_try_send_and_envelope_delivery() {
     use parrot::actix::reference::ActixActorRef;
     use parrot_api::message::MessageOptions;
 
@@ -529,14 +679,11 @@ fn actix_ref_ask_timeout_and_send_errors() {
         // Closed-mailbox mapping: stop the actor then try_send.
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
         let r = ActixActorRef::new(addr.clone(), "t://closed".into());
-        // Native stop, then wait for mailbox close.
-        addr.do_send(parrot::actix::reference::StopMessage);
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        match r.try_send(Box::new(Add(1))) {
-            Err(actix::prelude::SendError::Closed(_)) => {}
-            Err(actix::prelude::SendError::Full(_)) => {}
-            Ok(()) => {}
-        }
+        r.stop().await.unwrap();
+        assert!(matches!(
+            r.try_send(Box::new(Add(1))),
+            Err(actix::prelude::SendError::Closed(_))
+        ));
 
         // create_envelope with sender + custom message_type/options.
         let addr2: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
@@ -552,12 +699,10 @@ fn actix_ref_ask_timeout_and_send_errors() {
             "Add",
         );
         assert_eq!(wrapper.envelope.message_type, "Add");
-        // Re-dispatch the same payload through the ref's do_send.
-        r2.do_send(wrapper.envelope.payload);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // Read back via the ref's ask.
-        let v: u64 = r2.ask(Add(0)).await.unwrap();
-        assert!(v >= 3, "delivered through create_envelope: {}", v);
+        let value = r2.get_addr().send(wrapper).await.unwrap().unwrap().unwrap();
+        assert_eq!(*value.downcast::<u64>().unwrap(), 3);
+        assert_eq!(r2.ask(Add(0)).await.unwrap(), 3);
+        r2.stop().await.unwrap();
     });
 }
 
@@ -592,7 +737,7 @@ fn actix_context_send_ask_and_child_branches() {
             .await
             .unwrap();
         let v = *r.downcast::<u64>().expect("u64 reply");
-        assert!(v >= 101, "context send+ask composed: {}", v);
+        assert_eq!(v, 101, "context send precedes ask on the same target");
 
         // add_child second time takes the push branch (children Some).
         pctx.add_child(target.clone_boxed());
@@ -612,71 +757,57 @@ fn actix_context_send_ask_and_child_branches() {
     });
 }
 
-/// stream_registry / spawner are documented unimplemented in the actix
-/// context; calling them panics deterministically.
 #[test]
-#[should_panic(expected = "stream_registry")]
-fn actix_context_stream_registry_panics() {
+fn detached_actix_context_rejects_stream_registration_without_dispatch_binding() {
     use parrot::actix::context::ActixContext;
     use parrot_api::context::ActorContext as _;
     actix::System::new().block_on(async {
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
         let mut pctx = ActixContext::new(addr, parrot_api::address::ActorPath::placeholder("sr"));
-        let _ = pctx.stream_registry();
+        let empty: Box<dyn futures::Stream<Item = Box<dyn std::any::Any + Send>> + Send> =
+            Box::new(futures::stream::empty());
+        let error = pctx.stream_registry().add_stream_erased(empty).unwrap_err();
+        assert!(error.to_string().contains("stream registry"));
     });
 }
 
 #[test]
-#[should_panic(expected = "spawner")]
-fn actix_context_spawner_panics() {
+fn actix_context_spawner_reports_capability_error() {
     use parrot::actix::context::ActixContext;
     use parrot_api::context::ActorContext as _;
     actix::System::new().block_on(async {
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
         let mut pctx = ActixContext::new(addr, parrot_api::address::ActorPath::placeholder("sp"));
-        let _ = pctx.spawner();
+        let error = pctx
+            .spawner()
+            .spawn(Box::new(()), Box::new(()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("spawner"));
     });
 }
 
-/// `ask` with a timeout hitting the "No response from actor" arm, and
-/// `as_any` identity for the boxed ref.
+/// A native closed mailbox maps to Stopped while preserving boxed-ref identity.
 #[test]
-fn actix_ref_send_error_paths_and_as_any() {
+fn actix_ref_closed_request_and_as_any() {
     use parrot::actix::reference::ActixActorRef;
-    use parrot_api::address::ActorRef as _;
-    use std::any::Any;
-    use std::time::Duration;
-
     actix::System::new().block_on(async {
-        // Slow handler: derive actor with async handler that sleeps.
-        // Reuse Inner but with a Slow payload it does not handle quickly:
-        // craft a stuck reply by asking a stopped actor's addr — the
-        // oneshot resolves to Err delivery, covering the error arm of ask.
         let addr: Addr<ActixActor<Inner>> = ActixActor::new(Inner { v: 0 }).start();
-        let r = ActixActorRef::new(addr.clone(), "t://ask-err".into());
-
-        // as_any identity.
-        let any_ref: &dyn Any = r.as_any();
-        assert!(any_ref.downcast_ref::<ActixActorRef<Inner>>().is_some());
-
-        // Stop the actor, then ask through the ref: delivery fails into
-        // the Err(e) arm ("Failed to deliver message").
-        addr.do_send(parrot::actix::reference::StopMessage);
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        match tokio::time::timeout(Duration::from_secs(2), r.ask(Add(1))).await {
-            Err(_) => panic!("ask on stopped actor hung"),
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("Failed to deliver")
-                        || msg.contains("No response")
-                        || msg.contains("closed"),
-                    "unexpected error text: {}",
-                    msg
-                );
-            }
-            Ok(Ok(v)) => panic!("ask on stopped actor unexpectedly answered: {}", v),
-        }
+        let reference = ActixActorRef::new(addr, "t://closed-request".into());
+        assert!(
+            reference
+                .as_any()
+                .downcast_ref::<ActixActorRef<Inner>>()
+                .is_some()
+        );
+        reference.stop().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), reference.ask(Add(1)))
+            .await
+            .expect("closed request must complete");
+        assert!(
+            matches!(result, Err(parrot_api::errors::ActorError::Stopped)),
+            "{result:?}"
+        );
     });
 }
 
@@ -704,20 +835,23 @@ fn actix_system_inspection_surface() {
         assert!(sys2.arbiter_size() >= 1);
         assert!(sys.arbiter_size() >= 1);
 
-        // spawn with an unnamed type resolves "unknown" name path.
+        // Spawn one named type and inspect this system independently.
         let aref = sys
             .spawn_root_typed(Inner { v: 0 }, EmptyConfig)
             .await
-            .expect("spawn unnamed path");
+            .expect("spawn inspected actor");
         let v: u64 = aref.ask(Add(2)).await.unwrap();
         assert_eq!(v, 2);
 
         // status snapshot.
         let st = sys.status();
         assert_eq!(format!("{:?}", st.state), "Running");
-        assert!(st.active_actors >= 1);
+        assert_eq!(st.active_actors, 1);
+        assert_eq!(sys2.status().active_actors, 0);
 
         // get_actor with a bogus path → None (read-lock path).
         assert!(sys.get_actor(&"nope/missing".to_string()).await.is_none());
+        sys.shutdown().await.unwrap();
+        sys2.shutdown().await.unwrap();
     });
 }

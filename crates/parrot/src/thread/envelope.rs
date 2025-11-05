@@ -1,3 +1,4 @@
+use parrot_api::message::MessageOptions;
 use parrot_api::types::BoxedMessage;
 use std::fmt;
 use std::fmt::Debug;
@@ -121,8 +122,12 @@ impl AskPayload {
 /// `parrot_envelope_legacy` feature 开启时，ask 入口走历史双装箱路径
 /// （payload Box + envelope Box）；供 M5 灰度期回退。
 pub struct AskEnvelope {
+    /// Causal parent captured at envelope construction.
+    pub trace_context: Option<parrot_api::trace::TraceContext>,
     /// The actual message being sent
     pub payload: AskPayload,
+    /// Delivery metadata captured at the typed reference boundary.
+    pub options: MessageOptions,
     /// Channel to send the reply back to the requester.
     ///
     /// `Option` 使 `take_reply` 可以零成本取走 sender（M5 单块消费路径），
@@ -151,6 +156,8 @@ impl AskEnvelope {
         (
             Self {
                 payload: AskPayload::Inline(msg.into_inline()),
+                options: MessageOptions::default(),
+                trace_context: parrot_api::trace::TraceContext::current(),
                 reply: Some(tx),
             },
             rx,
@@ -167,6 +174,8 @@ impl AskEnvelope {
         (
             Self {
                 payload: AskPayload::Boxed(Box::new(msg)),
+                options: MessageOptions::default(),
+                trace_context: parrot_api::trace::TraceContext::current(),
                 reply: Some(tx),
             },
             rx,
@@ -177,10 +186,20 @@ impl AskEnvelope {
     pub fn with_boxed(
         payload: BoxedMessage,
     ) -> (Self, oneshot::Receiver<ActorResult<BoxedMessage>>) {
+        Self::with_boxed_options(payload, MessageOptions::default())
+    }
+
+    /// Create an ask envelope with explicit delivery metadata.
+    pub fn with_boxed_options(
+        payload: BoxedMessage,
+        options: MessageOptions,
+    ) -> (Self, oneshot::Receiver<ActorResult<BoxedMessage>>) {
         let (tx, rx) = oneshot::channel();
         (
             Self {
                 payload: AskPayload::Boxed(payload),
+                options,
+                trace_context: parrot_api::trace::TraceContext::current(),
                 reply: Some(tx),
             },
             rx,
@@ -246,7 +265,8 @@ pub enum ControlMessage {
     Start,
     /// Stop the actor (graceful shutdown)
     Stop,
-    /// Notify of a child actor failure
+    /// Legacy path-only failure report. Managed actors reject it because it
+    /// carries no generation identity or proof of actual termination.
     ChildFailure {
         /// Path of the failed child actor
         path: String,
@@ -257,6 +277,47 @@ pub enum ControlMessage {
     SystemShutdown,
     /// Check if actor is healthy (for supervision)
     HealthCheck,
+}
+
+/// Local TELL metadata used by dynamic Thread references when tracing is active.
+/// Untraced messages retain their original allocation path. Custom mailbox
+/// consumers can use [`Self::unpack`] before handling the business payload.
+pub struct TraceEnvelope {
+    payload: BoxedMessage,
+    parent: parrot_api::trace::TraceContext,
+}
+impl TraceEnvelope {
+    pub(crate) fn capture(payload: BoxedMessage) -> BoxedMessage {
+        Self::with_parent(payload, parrot_api::trace::TraceContext::current())
+    }
+    pub(crate) fn with_parent(
+        payload: BoxedMessage,
+        parent: Option<parrot_api::trace::TraceContext>,
+    ) -> BoxedMessage {
+        match parent {
+            Some(parent) => Box::new(Self { payload, parent }),
+            None => payload,
+        }
+    }
+    /// Extract TELL payload and its captured parent; plain messages return None.
+    /// This does not create a span or set executor context. A custom consumer
+    /// must scope its handler with a child of the returned parent (including
+    /// explicit None isolation). ASK envelopes retain their separate metadata.
+    ///
+    /// ```
+    /// use parrot::thread::envelope::TraceEnvelope;
+    /// let (payload, parent) = TraceEnvelope::unpack(Box::new(42u64));
+    /// assert!(parent.is_none());
+    /// assert_eq!(*payload.downcast::<u64>().unwrap(), 42);
+    /// ```
+    pub fn unpack(
+        message: BoxedMessage,
+    ) -> (BoxedMessage, Option<parrot_api::trace::TraceContext>) {
+        match message.downcast::<Self>() {
+            Ok(envelope) => (envelope.payload, Some(envelope.parent)),
+            Err(message) => (message, None),
+        }
+    }
 }
 
 #[cfg(test)]

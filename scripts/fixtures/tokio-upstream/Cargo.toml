@@ -1,0 +1,38 @@
+[package]
+name = "parrot-tokio-upstream-contracts"
+version = "0.0.0"
+edition = "2021"
+publish = false
+autotests = false
+
+[workspace]
+
+[features]
+default = ["full", "sync"]
+full = ["tokio/full"]
+sync = ["tokio/sync"]
+
+[dependencies]
+tokio = { version = "=1.53.3", features = ["test-util", "parking_lot"] }
+
+[dev-dependencies]
+libc = "=0.2.191"
+futures = "=0.3.34"
+nix = { version = "=0.31.3", default-features = false, features = ["aio", "fs", "socket"] }
+tokio-test = "=0.4.6"
+tokio-stream = "=0.1.19"
+
+[[test]]
+name = "io_async_fd"
+path = "../../../vendor/tokio/tests/io_async_fd.rs"
+
+[[test]]
+name = "sync_mpsc"
+path = "../../../vendor/tokio/tests/sync_mpsc.rs"
+
+[[test]]
+name = "sync_oneshot"
+path = "../../../vendor/tokio/tests/sync_oneshot.rs"
+
+[patch.crates-io]
+tokio = { path = "../../../vendor/tokio" }

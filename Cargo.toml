@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/rumqttc", "vendor/tokio", "vendor/flume"]
 members = [
     "crates/parrot",
     "crates/parrot-api",
@@ -12,6 +13,7 @@ members = [
     "crates/parrot-wasm",
     "crates/parrot-abi",
     "apps/crawler-lab",
+    "apps/crawler-lab/core",
     "apps/crawler-lab/dylib",
     "apps/websearch",
     "tools/federation-lab",
@@ -19,12 +21,19 @@ members = [
 ]
 
 [workspace.dependencies]
+# Maintained bincode-2 standard implementation; wire compatibility is tested
+# against immutable bincode 2.0.1 fixtures. See DECISIONS_DEPENDENCIES section 7.
+bincode = { package = "cu-bincode", version = "=2.2.0", default-features = false, features = ["std", "serde"] }
 syn = { version = "2.0", features = ["full", "extra-traits"] }
 quote = "1.0"
 proc-macro2 = "1.0"
 darling = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 async-trait = "0.1"
 thiserror = "2.0"
+
+[patch.crates-io]
+# Retain runtime progress while native finalizers hold glibc loader locks.
+tokio = { path = "vendor/tokio" }

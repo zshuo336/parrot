@@ -1,27 +1,23 @@
-//! Chase-Lev work-stealing deque（无锁，原论文 SPAA'95 / Le et al. PPoPP'13）。
+//! Bounded FIFO queues for local consumption and stealing.
 //!
-//! 每个 worker 拥有本地双端队列：owner 从 **bottom** LIFO push/pop（缓存热），
-//! 其他 worker 从 **top** FIFO steal（窃取最老任务 = 大粒度窃取）。
-//! 全局无锁：owner 操作与 steal 用 CAS 竞争 top。
-//!
-//! 用 `ArrayQueue<AtomicU64>` 环形槽位实现（槽位是 raw index 编码，
-//! 避免 SegQueue 的节点分配）。
+//! ArrayQueue supports concurrent producers and consumers; both `pop` and
+//! `steal` remove from the FIFO head. This is not a Chase-Lev owner-only LIFO
+//! deque. The ring is a public utility, not the current SharedPool scheduler's
+//! production work-distribution path.
 
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[allow(dead_code)] // 预留：关闭哨兵值
 const CLOSED: u64 = u64::MAX;
 
-/// 无锁 chase-lev 变体：环形数组槽位 + top/bottom 索引。
-/// 槽位值编码：低 32 位 = 环形下标，高 32 位 = stamp（防 ABA）。
-/// 简化实现：用 ArrayQueue 存 (stamp, value) 的组合 u64，由 owner push、
-/// thief steal；吞吐实测已远超 SegQueue 集中队列。
+/// Bounded concurrent FIFO; producer rejection drops the submitted item.
+/// Length and emptiness are snapshots from the same underlying queue, not
+/// an independently updated counter. Concurrent operations can change them
+/// immediately after a call returns.
 pub struct StealDeque<T: Send + 'static> {
     slots: ArrayQueue<T>,
-    /// 近似长度（owner 维护，窃取者 CAS 递减）
-    len: AtomicUsize,
     closed: AtomicU64,
 }
 
@@ -29,49 +25,34 @@ impl<T: Send + 'static> StealDeque<T> {
     pub fn new(cap: usize) -> Self {
         Self {
             slots: ArrayQueue::new(cap.max(4)),
-            len: AtomicUsize::new(0),
             closed: AtomicU64::new(0),
         }
     }
 
-    /// Owner push（LIFO 端）。永不阻塞：满时丢弃（背压由上层邮箱控制）。
+    /// Push at the FIFO tail. Full or closed queues reject and drop the item.
     pub fn push(&self, item: T) -> bool {
         if self.closed.load(Ordering::Relaxed) == 1 {
             return false;
         }
-        let ok = self.slots.push(item).is_ok();
-        if ok {
-            self.len.fetch_add(1, Ordering::Release);
-        }
-        ok
+        self.slots.push(item).is_ok()
     }
 
-    /// Owner pop（LIFO 端，与 push 同端——缓存最热路径）。
+    /// Remove the oldest accepted item, competing with other consumers.
     pub fn pop(&self) -> Option<T> {
-        // 先试 FIFO 出口（ArrayQueue 限制）；语义上 owner 也从同一端取，
-        // 与 steal 竞争——对本用途（mailbox 调度）公平性足够。
-        let item = self.slots.pop();
-        if item.is_some() {
-            self.len.fetch_sub(1, Ordering::AcqRel);
-        }
-        item
+        self.slots.pop()
     }
 
-    /// Thief steal：与 owner 同结构竞争（ArrayQueue 内部 CAS）。
+    /// Steal uses the same FIFO head as local consumption.
     pub fn steal(&self) -> Option<T> {
-        let item = self.slots.pop();
-        if item.is_some() {
-            self.len.fetch_sub(1, Ordering::AcqRel);
-        }
-        item
+        self.slots.pop()
     }
 
     pub fn len(&self) -> usize {
-        self.len.load(Ordering::Acquire)
+        self.slots.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.slots.is_empty()
     }
 
     pub fn close(&self) {
@@ -81,8 +62,8 @@ impl<T: Send + 'static> StealDeque<T> {
 
 /// 一组 worker 本地队列 + 窃取拓扑。
 ///
-/// `worker i`：先 pop 自己的 local[i]，空则随机挑两个 victim steal，
-/// 再空则退回全局（全局仍由调用者提供）。
+/// `worker i` can consume `local[i]` and scan other queues from a clock-derived
+/// starting index. Any global fallback is supplied by its caller.
 pub struct StealRing {
     deques: Vec<Arc<StealDeque<Arc<dyn crate::thread::mailbox::Mailbox + Send + Sync>>>>,
 }

@@ -24,7 +24,6 @@ use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::{ActorRef, ActorRefExt};
 use parrot_api::errors::ActorError;
-use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
 use std::sync::Arc;

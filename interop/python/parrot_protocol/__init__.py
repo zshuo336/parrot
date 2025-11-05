@@ -20,7 +20,11 @@ from .wire import (
     parse_tlv,
     split_reply_to,
     with_reply_to_prefix,
+    trace_request,
+    CAPS_TRACE_CONTEXT,
+    FLAG_TRACE_CONTEXT,
 )
+from .trace import TraceParent, TraceActor, AsyncTraceActor, current_parent, capture_parent, parent_scope, transferred_scope
 
 __all__ = [
     "FT_ASK",
@@ -42,4 +46,6 @@ __all__ = [
     "parse_tlv",
     "split_reply_to",
     "with_reply_to_prefix",
+    "TraceParent", "TraceActor", "AsyncTraceActor", "current_parent", "capture_parent",
+    "parent_scope", "transferred_scope", "trace_request", "CAPS_TRACE_CONTEXT", "FLAG_TRACE_CONTEXT",
 ]

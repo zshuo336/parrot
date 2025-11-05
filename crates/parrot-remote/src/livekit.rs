@@ -312,6 +312,7 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
         let Some(sup) = rooms.get_mut(room) else {
             return n; // 房间未开——事件丢弃
         };
+        let mut downlinks = Vec::new();
         for ev in events {
             match ev {
                 SignalEvent::ParticipantJoin {
@@ -320,12 +321,12 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
                     can_publish,
                 } => {
                     if sup.join(&identity, can_subscribe, can_publish).is_ok() {
-                        self.signal.send_downlink(room, &identity, b"joined");
+                        downlinks.push((identity, b"joined".to_vec()));
                     }
                 }
                 SignalEvent::ParticipantLeave { identity } => {
                     if sup.leave(&identity).is_ok() {
-                        self.signal.send_downlink(room, &identity, b"left");
+                        downlinks.push((identity, b"left".to_vec()));
                     }
                 }
                 SignalEvent::TrackPublished {
@@ -335,20 +336,25 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
                 } => {
                     if let Ok(key) = sup.publish_track(&publisher, &sid, kind) {
                         // Track actor 注册回执（Receptionist key 下发）
-                        self.signal.send_downlink(room, &publisher, key.as_bytes());
+                        downlinks.push((publisher, key.into_bytes()));
                     }
                 }
                 SignalEvent::Subscribe {
                     subscriber,
                     track_sid,
                 } => match sup.can_subscribe(&subscriber, &track_sid) {
-                    Ok(()) => self.signal.send_downlink(room, &subscriber, b"subscribed"),
+                    Ok(()) => downlinks.push((subscriber, b"subscribed".to_vec())),
                     Err(e) => {
                         let msg = format!("denied:{e:?}");
-                        self.signal.send_downlink(room, &subscriber, msg.as_bytes());
+                        downlinks.push((subscriber, msg.into_bytes()));
                     }
                 },
             }
+        }
+        // External callbacks may inspect or update this bridge.
+        drop(rooms);
+        for (to, payload) in downlinks {
+            self.signal.send_downlink(room, &to, &payload);
         }
         n
     }

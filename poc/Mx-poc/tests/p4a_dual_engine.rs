@@ -8,14 +8,12 @@
 //! actix 引擎 actor 的路径是 `actix://{Name}/{uuid}`（`spawn_root_typed`
 //! 自动生成），本测试先取回路径再远程访问。
 
-use parrot::actix as __parrot_engine;
-use parrot::actix::{ActixActorSystem, ActixContext, ActixActor};
+use parrot::actix::{ActixActor, ActixActorSystem, ActixContext};
 use parrot::thread::context::ThreadContext;
-use parrot_api::actor::{Actor, ActorState, EmptyConfig, ActixEngineExt, EngineContextHandle};
+use parrot_api::actor::{ActixEngineExt, Actor, ActorState, EmptyConfig, EngineContextHandle};
 use parrot_api::address::ActorRef as _;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use remote_poc::*;
-use std::sync::Arc;
 
 // ---------- thread 引擎 actor（方言 *2） ----------
 
@@ -35,7 +33,9 @@ impl Actor for RustService {
             if let Some(Ping(n)) = m.downcast_ref::<Ping>() {
                 Ok(Box::new(Pong(n * 2)) as BoxedMessage)
             } else {
-                Err(parrot_api::errors::ActorError::MessageHandlingError("unsupported".into()))
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unsupported".into(),
+                ))
             }
         })
     }
@@ -66,7 +66,9 @@ impl Actor for ActixService {
             if let Some(Ping(n)) = m.downcast_ref::<Ping>() {
                 Ok(Box::new(Pong(n + 1000)) as BoxedMessage)
             } else {
-                Err(parrot_api::errors::ActorError::MessageHandlingError("unsupported".into()))
+                Err(parrot_api::errors::ActorError::MessageHandlingError(
+                    "unsupported".into(),
+                ))
             }
         })
     }
@@ -97,7 +99,6 @@ impl ActixEngineExt for ActixService {
 fn p4a_dual_engine_node_remotely_reachable() {
     // actix 需要 System runner；ingress 泵与 tokio runtime 共存。
     actix::System::new().block_on(async {
-        CodecRegistry::reset();
         install_poc_messages();
 
         // 双引擎端点（内存链路即可验证查表逻辑）
@@ -127,7 +128,11 @@ fn p4a_dual_engine_node_remotely_reachable() {
         // 3. 从节点 A 远程 ask thread 引擎 actor → 方言 *2
         let r_thread = a.remote_ref("/user/rust_service");
         let pong = r_thread.send(Box::new(Ping(21))).await.unwrap();
-        assert_eq!(pong.downcast_ref::<Pong>().unwrap().0, 42, "thread 引擎方言 *2");
+        assert_eq!(
+            pong.downcast_ref::<Pong>().unwrap().0,
+            42,
+            "thread 引擎方言 *2"
+        );
 
         // 4. 从节点 A 远程 ask actix 引擎 actor → 方言 +1000
         let r_actix = a.remote_ref(actix_path.clone());

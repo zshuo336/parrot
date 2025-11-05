@@ -26,6 +26,10 @@ pub mod sys_event_tag {
     pub const ADMIN_CMD_V2: u8 = 0x03;
     pub const ADMIN_REPLY_V2: u8 = 0x04;
     pub const MEMBERSHIP_GOSSIP: u8 = 0x10;
+    pub const MEMBERSHIP_PING: u8 = 0x11;
+    pub const MEMBERSHIP_PING_REQ: u8 = 0x12;
+    pub const MEMBERSHIP_PONG: u8 = 0x13;
+    pub const MEMBERSHIP_PING_REQ_ACK: u8 = 0x14;
     pub const RECEPTIONIST_SYNC: u8 = 0x20;
 }
 
@@ -101,26 +105,28 @@ pub fn decode_sys_event(payload: &[u8]) -> Result<SysEvent, RemoteError> {
     };
     match tag {
         sys_event_tag::ADMIN_CMD => Ok(SysEvent::AdminCommand(
-            bincode::serde::decode_from_slice(body, bincode::config::standard())
-                .map_err(|e| RemoteError::Codec(format!("admin cmd decode: {e}")))?
-                .0,
+            parrot_api::message::serde_remote_deserialize(body)
+                .map_err(|e| RemoteError::Codec(format!("admin cmd decode: {e}")))?,
         )),
         sys_event_tag::ADMIN_REPLY => Ok(SysEvent::AdminReply(
-            bincode::serde::decode_from_slice(body, bincode::config::standard())
-                .map_err(|e| RemoteError::Codec(format!("admin reply decode: {e}")))?
-                .0,
+            parrot_api::message::serde_remote_deserialize(body)
+                .map_err(|e| RemoteError::Codec(format!("admin reply decode: {e}")))?,
         )),
         sys_event_tag::MEMBERSHIP_GOSSIP => Ok(SysEvent::MembershipGossip(body.to_vec().into())),
+        tag @ (sys_event_tag::MEMBERSHIP_PING
+        | sys_event_tag::MEMBERSHIP_PING_REQ
+        | sys_event_tag::MEMBERSHIP_PONG
+        | sys_event_tag::MEMBERSHIP_PING_REQ_ACK) => Ok(SysEvent::MembershipProbe(
+            crate::swim::ProbeEvent::decode(tag, body)?,
+        )),
         sys_event_tag::RECEPTIONIST_SYNC => Ok(SysEvent::ReceptionistSync(body.to_vec().into())),
         sys_event_tag::ADMIN_CMD_V2 => Ok(SysEvent::AdminCommandV2(
-            bincode::serde::decode_from_slice(body, bincode::config::standard())
-                .map_err(|e| RemoteError::Codec(format!("admin cmd v2 decode: {e}")))?
-                .0,
+            parrot_api::message::serde_remote_deserialize(body)
+                .map_err(|e| RemoteError::Codec(format!("admin cmd v2 decode: {e}")))?,
         )),
         sys_event_tag::ADMIN_REPLY_V2 => Ok(SysEvent::AdminReplyV2(
-            bincode::serde::decode_from_slice(body, bincode::config::standard())
-                .map_err(|e| RemoteError::Codec(format!("admin reply v2 decode: {e}")))?
-                .0,
+            parrot_api::message::serde_remote_deserialize(body)
+                .map_err(|e| RemoteError::Codec(format!("admin reply v2 decode: {e}")))?,
         )),
         other => Err(RemoteError::Codec(format!(
             "unknown SYSTEM_EVENT tag 0x{other:02X}"
@@ -137,6 +143,7 @@ pub enum SysEvent {
     AdminCommandV2(crate::admin_v2::AdminCommandV2),
     AdminReplyV2(crate::admin_v2::AdminReplyV2),
     MembershipGossip(bytes::Bytes),
+    MembershipProbe(crate::swim::ProbeEvent),
     ReceptionistSync(bytes::Bytes),
 }
 
@@ -154,34 +161,8 @@ pub fn find_factory(name: &str) -> Option<&'static PropsFactory> {
     parrot_api::message::inventory::iter::<PropsFactory>().find(|f| f.name == name)
 }
 
-/// admin 回执路由：req_id → oneshot（发起方挂起等待）。
-#[derive(Default)]
-pub struct AdminPending {
-    inner:
-        std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<AdminReply>>>,
-}
-
-impl AdminPending {
-    pub fn insert(&self, req_id: u64, tx: tokio::sync::oneshot::Sender<AdminReply>) {
-        self.inner.lock().unwrap().insert(req_id, tx);
-    }
-    pub fn complete(&self, r: AdminReply) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .remove(&r.req_id())
-            .is_some_and(|tx| tx.send(r).is_ok())
-    }
-    pub fn fail_all(&self, detail: &str) {
-        for (_, tx) in self.inner.lock().unwrap().drain() {
-            let _ = tx.send(AdminReply::Failed {
-                req_id: 0,
-                code: ErrCode::ConnectionLost as u16,
-                detail: detail.into(),
-            });
-        }
-    }
-}
+/// Bounded administrative callbacks with optional physical connection binding.
+pub type AdminPending = crate::admin_pending::Pending<AdminReply>;
 
 impl AdminReply {
     pub fn req_id(&self) -> u64 {
@@ -193,13 +174,37 @@ impl AdminReply {
     }
 }
 
+/// Build a typed management response; request IDs must agree with the envelope.
+pub fn reply_frame(req_id: u64, reply_to: &str, reply: &AdminReply) -> Frame {
+    Frame {
+        header: crate::frame::FrameHeader {
+            frame_len: 0,
+            version: crate::frame::PROTOCOL_VERSION,
+            frame_type: frame_type::SYSTEM_EVENT,
+            flags: 0,
+            correlation_id: req_id,
+            hop_count: 0,
+            hop_limit: 8,
+            seq: crate::frame::SEQ_NONE,
+        },
+        path: reply_to.into(),
+        type_key: String::new(),
+        payload: encode_admin_reply(reply),
+    }
+}
+
 /// 目标节点侧：处理入站 AdminCommand（ingress SYSTEM_EVENT 分支调起）。
 pub async fn handle_admin_command(
     cmd: AdminCommand,
     local: &Arc<dyn LocalLookup>,
     back: &crate::transport::FrameSender,
 ) {
-    match cmd {
+    use crate::ingress::unwind::{self, Cleanup};
+    let cleanup = Cleanup::default();
+    // Cancellation cannot send a terminal reply. If its cleanup fails, close
+    // this connection; a normally completed failure reply disarms this guard.
+    let mut close = cleanup.close_on_failure(back);
+    let (req_id, reply_to, reply) = match cmd {
         AdminCommand::SpawnLocal {
             req_id,
             props,
@@ -212,72 +217,75 @@ pub async fn handle_admin_command(
                     code: ErrCode::NotRemotable as u16,
                     detail: format!("props '{props}' not registered"),
                 },
-                Some(f) => match (f.spawn)(&path).await {
-                    Ok(_) => AdminReply::Spawned { req_id, path },
-                    Err(e) => AdminReply::Failed {
-                        req_id,
-                        code: ErrCode::ProtocolViolation as u16,
-                        detail: format!("spawn failed: {e}"),
-                    },
+                Some(factory) => match unwind::run(&cleanup, || (factory.spawn)(&path)).await {
+                    Ok(Ok(actor)) => {
+                        cleanup.dispose(actor);
+                        AdminReply::Spawned { req_id, path }
+                    }
+                    Ok(Err(error)) => admin_failure(&cleanup, req_id, "spawn", error),
+                    Err(()) => admin_panic(req_id, "spawn handler panicked"),
                 },
             };
-            let _ = back
-                .send(Frame {
-                    header: crate::frame::FrameHeader {
-                        frame_len: 0,
-                        version: crate::frame::PROTOCOL_VERSION,
-                        frame_type: frame_type::SYSTEM_EVENT,
-                        flags: 0,
-                        correlation_id: req_id,
-                        hop_count: 0,
-                        hop_limit: 8,
-                        seq: crate::frame::SEQ_NONE,
-                    },
-                    path: reply_to,
-                    type_key: String::new(),
-                    payload: encode_admin_reply(&reply),
-                })
-                .await;
+            (req_id, reply_to, reply)
         }
         AdminCommand::AdminStop {
             req_id,
             target_path,
             reply_to,
         } => {
-            let reply = match local.lookup(&target_path).await {
-                Some(r) => match r.stop().await {
-                    Ok(()) => AdminReply::Stopped { req_id },
-                    Err(e) => AdminReply::Failed {
-                        req_id,
-                        code: ErrCode::ProtocolViolation as u16,
-                        detail: format!("stop failed: {e}"),
-                    },
-                },
-                None => AdminReply::Failed {
+            let reply = match unwind::run(&cleanup, || local.lookup(&target_path)).await {
+                Ok(Some(actor)) => {
+                    let mut actor = cleanup.owned(actor);
+                    let reply = if cleanup.failed() {
+                        admin_panic(req_id, "admin lookup cleanup panicked")
+                    } else {
+                        match unwind::run(&cleanup, || actor.value().stop()).await {
+                            Ok(Ok(())) => AdminReply::Stopped { req_id },
+                            Ok(Err(error)) => admin_failure(&cleanup, req_id, "stop", error),
+                            Err(()) => admin_panic(req_id, "admin stop handler panicked"),
+                        }
+                    };
+                    actor.retire();
+                    reply
+                }
+                Ok(None) if !cleanup.failed() => AdminReply::Failed {
                     req_id,
                     code: ErrCode::ActorNotFound as u16,
                     detail: target_path,
                 },
+                _ => admin_panic(req_id, "admin lookup panicked"),
             };
-            let _ = back
-                .send(Frame {
-                    header: crate::frame::FrameHeader {
-                        frame_len: 0,
-                        version: crate::frame::PROTOCOL_VERSION,
-                        frame_type: frame_type::SYSTEM_EVENT,
-                        flags: 0,
-                        correlation_id: req_id,
-                        hop_count: 0,
-                        hop_limit: 8,
-                        seq: crate::frame::SEQ_NONE,
-                    },
-                    path: reply_to,
-                    type_key: String::new(),
-                    payload: encode_admin_reply(&reply),
-                })
-                .await;
+            (req_id, reply_to, reply)
         }
+    };
+    let reply = if cleanup.failed() && !matches!(reply, AdminReply::Failed { .. }) {
+        admin_panic(req_id, "administrative request cleanup panicked")
+    } else {
+        reply
+    };
+    close.disarm();
+    back.send_reply(reply_frame(req_id, &reply_to, &reply));
+}
+
+fn admin_panic(req_id: u64, detail: &str) -> AdminReply {
+    AdminReply::Failed {
+        req_id,
+        code: ErrCode::ProtocolViolation as u16,
+        detail: detail.into(),
     }
+}
+fn admin_failure(
+    cleanup: &crate::ingress::unwind::Cleanup,
+    req_id: u64,
+    operation: &str,
+    error: parrot_api::errors::ActorError,
+) -> AdminReply {
+    let mut error = cleanup.owned(error);
+    let detail = cleanup
+        .call(|| format!("{operation} failed: {}", error.value()))
+        .unwrap_or_else(|()| format!("{operation} error formatter panicked"));
+    error.retire();
+    admin_panic(req_id, &detail)
 }
 
 /// 发起方侧：SYSTEM_EVENT 回执帧 → AdminPending（cid 即 req_id）。
@@ -286,16 +294,20 @@ pub fn handle_admin_reply_frame(frame: &Frame) -> Result<Option<AdminReply>, Rem
         return Ok(None);
     }
     match decode_sys_event(&frame.payload)? {
-        SysEvent::AdminReply(r) => Ok(Some(r)),
+        SysEvent::AdminReply(r) if r.req_id() == frame.header.correlation_id => Ok(Some(r)),
+        SysEvent::AdminReply(_) => Err(RemoteError::Codec(
+            "admin reply correlation_id disagrees with req_id".into(),
+        )),
         _ => Ok(None),
     }
 }
 
-/// 便捷：非 admin 语义拒绝（K4 mTLS 前占位——权限检查钩子）。
-pub fn admin_allowed(_from_node: &str) -> bool {
-    // P2 前期：信任连接边界（mem/tcp 均为显式配置对端）。
-    // K4 后：证书 role=admin 校验，不匹配 → false → 回 REPLY_ERR(Forbidden)。
-    true
+/// Authorize using the transport-verified peer identity, never a claimed name alone.
+pub fn admin_allowed(
+    policy: &crate::security::ControlPolicy,
+    peer: &crate::transport::FrameSender,
+) -> bool {
+    policy.allows(peer)
 }
 
 /// 错误体解码重导出（admin 路径校验测试用）。
@@ -310,6 +322,53 @@ pub fn encode_err(code: ErrCode, detail: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_decode_rejects_trailing_bytes_for_all_four_tags() {
+        let mut payloads = vec![
+            encode_admin_cmd(&AdminCommand::AdminStop {
+                req_id: 1,
+                target_path: "/target".into(),
+                reply_to: String::new(),
+            }),
+            encode_admin_reply(&AdminReply::Stopped { req_id: 2 }),
+            crate::admin_v2::encode_admin_cmd_v2(&crate::admin_v2::AdminCommandV2::StopComponent {
+                req_id: 3,
+                path_prefix: "/target".into(),
+            }),
+            crate::admin_v2::encode_admin_reply_v2(&crate::admin_v2::AdminReplyV2::Stopped {
+                req_id: 4,
+            }),
+        ];
+        for payload in payloads.drain(..) {
+            assert!(decode_sys_event(&payload).is_ok());
+            let mut extra = payload.to_vec();
+            extra.push(0);
+            assert!(
+                decode_sys_event(&extra).is_err(),
+                "tag {} accepted trailing bytes",
+                extra[0]
+            );
+        }
+    }
+
+    #[test]
+    fn admin_decode_rejects_impossible_string_length_without_panicking() {
+        let mut payload = encode_admin_reply(&AdminReply::Spawned {
+            req_id: 1,
+            path: String::new(),
+        })
+        .to_vec();
+        assert_eq!(payload.pop(), Some(0));
+        payload
+            .extend(bincode::serde::encode_to_vec(u64::MAX, bincode::config::standard()).unwrap());
+        let result = std::panic::catch_unwind(|| decode_sys_event(&payload));
+        assert!(
+            result.is_ok(),
+            "untrusted admin length panicked before validating input"
+        );
+        assert!(result.unwrap().is_err());
+    }
 
     #[test]
     fn admin_cmd_roundtrip() {
@@ -374,7 +433,7 @@ mod tests {
     fn pending_complete_routing() {
         let p = AdminPending::default();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        p.insert(42, tx);
+        p.insert(42, tx).unwrap();
         assert!(p.complete(AdminReply::Stopped { req_id: 42 }));
         assert!(matches!(
             rx.blocking_recv(),

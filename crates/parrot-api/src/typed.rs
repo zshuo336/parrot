@@ -23,28 +23,35 @@
 //!
 //! ## 使用形态（thread / actix 引擎同款 API）
 //!
-//! ```ignore
-//! use parrot_api::message::Message;
-//! use parrot_api::typed::TypedReceive;
+//! ```rust
+//! use parrot_api::{Message, ParrotTypedActor};
+//! use parrot_api::typed::{ParrotMsgVariant, ParrotTypedDispatch, TypedReceive};
 //! use parrot_api::types::{ActorResult, BoxedFuture};
 //!
-//! struct Add(u64);
+//! pub struct Add(u64);
 //! impl Message for Add { type Result = u64; }
+//! pub struct Get;
+//! impl Message for Get { type Result = u64; }
 //!
 //! #[derive(ParrotTypedActor)]
 //! #[ParrotTypedActor(msgs(Add, Get))]
 //! struct Calc { n: u64 }
 //!
 //! impl TypedReceive<Add> for Calc {
-//!     fn receive_typed<'a>(&'a mut self, msg: Add)
-//!         -> BoxedFuture<'a, ActorResult<u64>> {
+//!     fn receive_typed<'a>(&'a mut self, msg: Add) -> BoxedFuture<'a, ActorResult<u64>> {
 //!         Box::pin(async move { self.n += msg.0; Ok(self.n) })
 //!     }
 //! }
+//! impl TypedReceive<Get> for Calc {
+//!     fn receive_typed<'a>(&'a mut self, _: Get) -> BoxedFuture<'a, ActorResult<u64>> {
+//!         Box::pin(async move { Ok(self.n) })
+//!     }
+//! }
 //!
-//! // system.spawn_typed(Calc { n: 0 }, "/calc") -> TypedActorRef<Calc, Add>
-//! // r.ask(Add(41)).await -> u64，零 Any 装箱零 downcast
-//! // r.ref_for::<Get>()  -> 同一 actor 的 Get 协议视图
+//! // The protocol compiles independently of any engine.
+//! fn check_protocol<A: ParrotTypedDispatch, M: ParrotMsgVariant<A>>() {}
+//! check_protocol::<Calc, Add>();
+//! check_protocol::<Calc, Get>();
 //! ```
 
 use crate::errors::ActorError;
@@ -61,7 +68,87 @@ use crate::types::{ActorResult, BoxedFuture};
 /// 进程内高速通道，不经类型擦除；`into_dyn` 桥接点才装箱。
 pub trait TypedReceive<M: Message>: Send + 'static {
     /// 处理一条类型化消息，返回 `M::Result` 类型的回复。
-    fn receive_typed<'a>(&'a mut self, msg: M) -> BoxedFuture<'a, ActorResult<M::Result>>;
+    fn receive_typed<'a>(&'a mut self, _msg: M) -> BoxedFuture<'a, ActorResult<M::Result>> {
+        Box::pin(async {
+            Err(ActorError::MessageHandlingError(
+                "this protocol requires a managed typed context".into(),
+            ))
+        })
+    }
+    /// Managed engines may provide generation-owned services. Existing receivers
+    /// keep their context-free behavior by default.
+    fn receive_typed_with_context<'a>(
+        &'a mut self,
+        msg: M,
+        _context: &'a crate::typed_context::TypedContext,
+    ) -> BoxedFuture<'a, ActorResult<M::Result>> {
+        self.receive_typed(msg)
+    }
+}
+
+/// Optional lifecycle implementation for actors using `#[derive(ParrotTypedActor)]`.
+///
+/// Add `lifecycle` to `#[ParrotTypedActor(msgs(Query), lifecycle)]` to forward
+/// the generated dispatcher's hooks to this trait. Without the flag, generated
+/// actors retain their existing no-op hooks and need not implement this trait.
+/// Each constructed generation initializes once before receiving messages.
+/// The normal stop hook runs after its children retire; failure/reconstruction
+/// does not run that hook. Engine deadlines, cancellation and error propagation
+/// are identical to hand-written [`ParrotTypedDispatch`] implementations.
+///
+/// Contextual defaults call the context-free hooks. Override contextual hooks
+/// to use the generation's child scope, identity and other managed services.
+/// Merely adding inherent methods named `init` or `before_stop` does not opt in.
+/// This trait does not change the single-protocol adapter's lifecycle behavior.
+///
+/// Opting in without implementing the lifecycle trait is a compile error:
+///
+/// ```compile_fail
+/// use parrot_api::{Message, ParrotTypedActor};
+/// pub struct Query;
+/// impl Message for Query { type Result = (); }
+/// #[derive(ParrotTypedActor)]
+/// #[ParrotTypedActor(msgs(Query), lifecycle)]
+/// struct Service;
+/// impl parrot_api::typed::TypedReceive<Query> for Service {}
+/// ```
+///
+/// Repeated lifecycle declarations are rejected, including across attributes:
+///
+/// ```compile_fail
+/// use parrot_api::{Message, ParrotTypedActor};
+/// pub struct Query;
+/// impl Message for Query { type Result = (); }
+/// #[derive(ParrotTypedActor)]
+/// #[ParrotTypedActor(msgs(Query), lifecycle)]
+/// #[ParrotTypedActor(lifecycle)]
+/// struct Service;
+/// impl parrot_api::typed::TypedReceive<Query> for Service {}
+/// impl parrot_api::typed::TypedLifecycle for Service {}
+/// ```
+pub trait TypedLifecycle: Send + 'static {
+    /// Initialize this instance before dispatch.
+    fn init(&mut self) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Release resources on a normal stop, after owned children have retired.
+    fn before_stop(&mut self) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Initialize with this generation's managed context.
+    fn init_with_context<'a>(
+        &'a mut self,
+        _context: &'a crate::typed_context::TypedContext,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        <Self as TypedLifecycle>::init(self)
+    }
+    /// Normal stop with this generation's managed context.
+    fn before_stop_with_context<'a>(
+        &'a mut self,
+        _context: &'a crate::typed_context::TypedContext,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        <Self as TypedLifecycle>::before_stop(self)
+    }
 }
 
 /// actor 的全协议分派面：枚举信封（`Msg`）+ 回复枚举（`Reply`）。
@@ -69,13 +156,23 @@ pub trait TypedReceive<M: Message>: Send + 'static {
 /// `#[derive(ParrotTypedActor)]` 按属性声明的消息集生成本 trait 的
 /// 实现（枚举定义 + match 分派到各 `TypedReceive<M>`）；引擎的
 /// `spawn_typed` 消费本 trait 建类型化通道——通道元素是 `Msg`，
-/// 回复是 `Reply`，全链路零 `Any`。
+/// 回复是 `Reply`，业务分派全链路零 `Any`；可选终止事件仅在注入边界转换。
 pub trait ParrotTypedDispatch: Send + 'static {
     /// 枚举信封：每个协议消息一个变体。
     type Msg: Send + 'static;
 
     /// 回复枚举：每个协议回复一个变体（`<M as Message>::Result`）。
     type Reply: Send + 'static;
+
+    /// Optional system-event protocol, independent of the reference's entry
+    /// protocol. Derive supplies this when ActorTerminated is in `msgs(...)`.
+    /// Hand-written dispatchers opt in by mapping the event to their own Msg.
+    /// Business dispatch remains fully typed; only this event boundary may cast.
+    /// The conversion runs at admission and must be short and nonblocking, like
+    /// other producer-side message conversions. It must not call actor methods.
+    fn termination_protocol() -> Option<TerminationProtocol<Self::Msg>> {
+        None
+    }
 
     /// Initialize before the first dispatch. Managed engines run this once.
     fn init(&mut self) -> BoxedFuture<'_, ActorResult<()>> {
@@ -88,8 +185,46 @@ pub trait ParrotTypedDispatch: Send + 'static {
         Box::pin(async { Ok(()) })
     }
 
+    /// Initialize with a generation-owned managed context.
+    fn init_with_context<'a>(
+        &'a mut self,
+        _context: &'a crate::typed_context::TypedContext,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        self.init()
+    }
+    /// Normal stop hook, after owned children have actually retired.
+    fn before_stop_with_context<'a>(
+        &'a mut self,
+        _context: &'a crate::typed_context::TypedContext,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        self.before_stop()
+    }
+    /// Managed concrete dispatch; the default preserves existing dispatchers.
+    fn dispatch_with_context<'a>(
+        &'a mut self,
+        msg: Self::Msg,
+        _context: &'a crate::typed_context::TypedContext,
+    ) -> BoxedFuture<'a, ActorResult<Self::Reply>> {
+        self.dispatch(msg)
+    }
+
     /// 分派一条枚举消息到 actor 的对应 `TypedReceive<M>` impl。
     fn dispatch<'a>(&'a mut self, msg: Self::Msg) -> BoxedFuture<'a, ActorResult<Self::Reply>>;
+}
+
+/// Converts a termination event into an actor's declared message protocol.
+pub type TerminationProtocol<M> = fn(crate::context::ActorTerminated) -> ActorResult<M>;
+
+/// Support for generated system-event injection. Type identity, including
+/// aliases, is checked before this is installed by a managed engine.
+#[doc(hidden)]
+pub fn cast_termination<M: Message>(event: crate::context::ActorTerminated) -> ActorResult<M> {
+    let event: crate::types::BoxedMessage = Box::new(event);
+    event.downcast::<M>().map(|event| *event).map_err(|_| {
+        crate::errors::ActorError::MessageHandlingError(
+            "typed termination protocol does not accept ActorTerminated".into(),
+        )
+    })
 }
 
 /// 单个消息类型 M 到 actor 枚举信封的变体绑定（inject/extract）。
@@ -113,9 +248,10 @@ pub trait TypedAskRef<M: Message>: Send + Sync {
     /// 静态 ask：消息直达类型化通道，等待 `M::Result` 回复。
     fn ask<'a>(&'a self, msg: M) -> BoxedFuture<'a, ActorResult<M::Result>>;
 
-    /// 静态 tell：fire-and-forget，入队失败静默丢弃（与动态轨
-    /// `ActorRefExt::tell` 的语义一致）。
-    fn tell<'a>(&'a self, msg: M) -> BoxedFuture<'a, ()>;
+    /// Static tell: await mailbox admission, not business processing.
+    /// Full/closed mailbox errors remain visible, matching `ActorRefExt::tell`.
+    #[must_use = "tell must be awaited and its admission result handled"]
+    fn tell<'a>(&'a self, msg: M) -> BoxedFuture<'a, ActorResult<()>>;
 }
 
 /// 变体不匹配兜底错误（derive 生成代码与手写实现共用；属于逻辑
@@ -257,8 +393,8 @@ mod tests {
         fn ask<'a>(&'a self, msg: Add) -> BoxedFuture<'a, ActorResult<u64>> {
             Box::pin(async move { Ok(msg.0 * 2) })
         }
-        fn tell<'a>(&'a self, _msg: Add) -> BoxedFuture<'a, ()> {
-            Box::pin(async {})
+        fn tell<'a>(&'a self, _msg: Add) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -266,6 +402,6 @@ mod tests {
     async fn typed_ask_ref_contract() {
         let r = FakeAskRef;
         assert_eq!(TypedAskRef::<Add>::ask(&r, Add(21)).await.unwrap(), 42);
-        TypedAskRef::<Add>::tell(&r, Add(1)).await;
+        TypedAskRef::<Add>::tell(&r, Add(1)).await.unwrap();
     }
 }

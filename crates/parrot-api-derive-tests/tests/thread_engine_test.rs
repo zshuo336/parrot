@@ -3,14 +3,12 @@
 //! 断言：
 //! 1. `#[ParrotActor(engine = "thread")]` 生成可用 impl（Context 经
 //!    `__parrot_engine::EngineContext<Self>` 绑定到 thread 形状的 mock）
-//! 2. thread 分支不生成 actix 同步快路径（`receive_message_with_engine`
-//!    返回 None 的默认行为）
-//! 3. 同一 actor 类型形状在两种引擎绑定下各自编译通过——宏代码零具体
-//!    引擎符号（由 `scripts/macro_lint.sh` 在 CI 守门）
+//! 2. thread actor 不需要用户提供 Actix 同步 handler。
+//! 3. 此测试 crate 不依赖 parrot 实现 crate；mock context 下编译并调用
+//!    生成代码。真实引擎执行由 parrot 的集成测试和 quickstart 覆盖。
 
 use parrot_api::actor::{Actor, ActorState};
 use parrot_api::errors::ActorError;
-use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
 
@@ -60,17 +58,6 @@ impl ThreadCounter {
         }
         Err(ActorError::MessageHandlingError("unknown".into()))
     }
-
-    // thread 引擎不消费同步快路径；但生成代码可能仍要求此形状存在
-    // （保持与 actix 形状对称的编写体验）。M1 生成物不再调用它。
-    pub fn handle_message_engine(
-        &mut self,
-        _msg: BoxedMessage,
-        _ctx: &mut __parrot_engine::EngineContext<Self>,
-        _engine_ctx: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        None
-    }
 }
 
 #[test]
@@ -93,19 +80,17 @@ async fn thread_engine_derive_dispatches_async() {
 }
 
 #[tokio::test]
-async fn thread_engine_has_no_sync_fast_path_impl() {
-    // M6: thread 分支不生成 `ActixEngineExt` impl——同步快路径是 actix
-    // 引擎侧扩展。类型层面验证：derive 不为 thread 分支生成该 impl
-    // （宏单测断言展开 token 流不含 `ActixEngineExt`）。此处运行时
-    // 验证 async 派发路径不受影响。
-    fn assert_no_ext<T: parrot_api::actor::Actor>() {}
-    assert_no_ext::<ThreadCounter>();
-
+async fn thread_engine_reports_unknown_message_without_losing_state() {
     let mut actor = ThreadCounter { count: 0 };
     let mut ctx = __parrot_engine::EngineContext::<ThreadCounter>::new();
-
-    let r = actor.receive_message(Box::new(Tick(1)), &mut ctx).await;
-    assert_eq!(*r.unwrap().downcast::<u64>().unwrap(), 1);
+    let first = actor.receive_message(Box::new(Tick(3)), &mut ctx).await;
+    assert_eq!(*first.unwrap().downcast::<u64>().unwrap(), 3);
+    let error = actor
+        .receive_message(Box::new("unsupported"), &mut ctx)
+        .await;
+    assert!(matches!(error, Err(ActorError::MessageHandlingError(_))));
+    let next = actor.receive_message(Box::new(Tick(4)), &mut ctx).await;
+    assert_eq!(*next.unwrap().downcast::<u64>().unwrap(), 7);
 }
 
 /// 历史 "tokio" 别名映射到 thread 引擎（兼容旧代码）。
@@ -131,8 +116,7 @@ fn tokio_alias_resolves_to_thread_kind() {
     assert_eq!(a.state(), ActorState::Running);
 }
 
-/// 未知引擎必须编译期报错（保留在 compile-fail 语义之外，用运行时形状验证：
-/// 此处仅验证已知引擎枚举行为，未知引擎的编译错误由宏单测覆盖）。
+/// thread 引擎接受显式异步选项；这里只验证该标志，不声称覆盖未知引擎。
 #[derive(ParrotActor, Debug)]
 #[ParrotActor(
     engine = "thread",

@@ -1,0 +1,4 @@
+# Tools used to build the jieba source distribution without isolated downloads.
+pip>=25
+setuptools
+wheel

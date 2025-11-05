@@ -28,9 +28,16 @@ fn main() {
         println!("{}", serde_json::to_string_pretty(&doc).unwrap());
         return;
     }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&wire_document()).unwrap()
+    );
+}
+
+fn wire_document() -> serde_json::Value {
     let mut items = Vec::new();
     for v in golden_vectors() {
-        items.push(serde_json::json!({
+        let mut item = serde_json::json!({
             "name": v.name,
             "frame_type": format!("0x{:02X}", v.frame.header.frame_type),
             "correlation_id": v.frame.header.correlation_id,
@@ -40,13 +47,32 @@ fn main() {
             "type_key": v.frame.type_key,
             "payload_hex": hex(&v.frame.payload),
             "bytes_hex": hex(v.bytes),
-        }));
+        });
+        // Preserve the original four frozen objects, whose zero fields are implicit.
+        if v.frame.header.flags != 0 {
+            item["flags"] = serde_json::json!(v.frame.header.flags);
+        }
+        if v.frame.header.seq != 0 {
+            item["sequence"] = serde_json::json!(v.frame.header.seq);
+        }
+        items.push(item);
     }
-    let doc = serde_json::json!({
+    serde_json::json!({
         "format": "parrot-wire-1.0",
         "frozen": true,
         "note": "只增不改：修改 = 协议 break = 走 version 协商（07 X2）",
         "vectors": items,
-    });
-    println!("{}", serde_json::to_string_pretty(&doc).unwrap());
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_export_matches_shared_frozen_objects() {
+        let shared: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../docs/vectors/wire1.json")).unwrap();
+        assert_eq!(wire_document(), shared);
+    }
 }

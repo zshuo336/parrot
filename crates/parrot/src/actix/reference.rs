@@ -4,7 +4,6 @@ use crate::actix::lifecycle::ActorControl;
 use crate::actix::message::ActixMessageWrapper;
 use actix::Addr;
 use actix::prelude::SendError;
-use anyhow::anyhow;
 use async_trait::async_trait;
 use parrot_api::actor::Actor as ParrotActor;
 use parrot_api::address::ActorRef;
@@ -18,6 +17,95 @@ use std::time::Duration;
 /// An internal message to stop the actor
 #[derive(Debug)]
 pub struct StopMessage;
+
+pub(crate) struct IdleRecipient<A: actix::Actor> {
+    pub(crate) addr: actix::WeakAddr<A>,
+}
+impl<A> crate::receive_timeout::IdleRecipient for IdleRecipient<A>
+where
+    A: actix::Actor + actix::Handler<ActixMessageWrapper>,
+    A::Context: actix::dev::ToEnvelope<A, ActixMessageWrapper>,
+{
+    fn deliver(
+        &self,
+        signal: crate::receive_timeout::IdleSignal,
+    ) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async move {
+            let addr = self.addr.upgrade().ok_or(ActorError::Stopped)?;
+            let wrapper = ActixMessageWrapper {
+                envelope: MessageEnvelope {
+                    trace_context: None,
+                    id: uuid::Uuid::new_v4(),
+                    payload: Box::new(signal),
+                    sender: None,
+                    options: MessageOptions::default(),
+                    message_type: "ReceiveTimeout",
+                },
+            };
+            // The clock waits for capacity without do_send. Claiming the token
+            // also wakes/cancels this wait; user handling errors do not disable
+            // future idle intervals. Execution stays on the owning arbiter.
+            let _ = addr.send(wrapper).await.map_err(|_| ActorError::Stopped)?;
+            Ok(())
+        })
+    }
+}
+
+pub(crate) struct ChildRecipient<A: actix::Actor> {
+    pub(crate) addr: actix::WeakAddr<A>,
+}
+impl<A> crate::children::ChildRecipient for ChildRecipient<A>
+where
+    A: actix::Actor + actix::Handler<ActixMessageWrapper>,
+    A::Context: actix::dev::ToEnvelope<A, ActixMessageWrapper>,
+{
+    fn deliver(&self, event: crate::children::ChildTerminated) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async move {
+            let addr = self.addr.upgrade().ok_or(ActorError::Stopped)?;
+            let wrapper = ActixMessageWrapper {
+                envelope: MessageEnvelope {
+                    trace_context: None,
+                    id: uuid::Uuid::new_v4(),
+                    payload: Box::new(event),
+                    sender: None,
+                    options: MessageOptions::default(),
+                    message_type: "ChildTerminated",
+                },
+            };
+            // Bounded actor mailbox; the worker also waits for its processing receipt.
+            let _ = addr.send(wrapper).await.map_err(|_| ActorError::Stopped)?;
+            Ok(())
+        })
+    }
+}
+
+pub(crate) struct StreamRecipient<A: actix::Actor> {
+    pub(crate) addr: actix::WeakAddr<A>,
+}
+impl<A> crate::streams::StreamRecipient for StreamRecipient<A>
+where
+    A: actix::Actor + actix::Handler<ActixMessageWrapper>,
+    A::Context: actix::dev::ToEnvelope<A, ActixMessageWrapper>,
+{
+    fn deliver(&self, event: crate::streams::StreamEvent) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async move {
+            let addr = self.addr.upgrade().ok_or(ActorError::Stopped)?;
+            let wrapper = ActixMessageWrapper {
+                envelope: MessageEnvelope {
+                    trace_context: None,
+                    id: uuid::Uuid::new_v4(),
+                    payload: Box::new(event),
+                    sender: None,
+                    options: MessageOptions::default(),
+                    message_type: "StreamEvent",
+                },
+            };
+            // Bounded actor mailbox; the worker also waits for its processing receipt.
+            let _ = addr.send(wrapper).await.map_err(|_| ActorError::Stopped)?;
+            Ok(())
+        })
+    }
+}
 
 // Implement actix::Message for StopMessage
 impl actix::Message for StopMessage {
@@ -50,7 +138,6 @@ where
     /// Path to the actor in the system
     path: String,
     control: Option<Arc<ActorControl>>,
-    default_timeout: Option<Duration>,
 }
 
 impl<A> ActixActorRef<A>
@@ -66,17 +153,16 @@ where
             addr: Arc::new(addr),
             path,
             control: None,
-            default_timeout: None,
         }
     }
 
-    pub(crate) fn with_control(
-        mut self,
-        control: Arc<ActorControl>,
-        ask_timeout: Duration,
-    ) -> Self {
+    pub(crate) fn with_control(mut self, control: Arc<ActorControl>) -> Self {
+        // Only the initial published reference installs the endpoint. Self
+        // references built during started() share the same generation handle.
+        let _ = control.death_watch.set_recipient(Arc::new(WatchRecipient {
+            addr: self.addr.downgrade(),
+        }));
         self.control = Some(control);
-        self.default_timeout = Some(ask_timeout);
         self
     }
 
@@ -101,6 +187,7 @@ where
         message_type: &'static str,
     ) -> ActixMessageWrapper {
         let envelope = MessageEnvelope {
+            trace_context: parrot_api::trace::TraceContext::current(),
             id: uuid::Uuid::new_v4(),
             payload: msg,
             sender,
@@ -118,6 +205,7 @@ where
         message_type: &'static str,
     ) -> ActixMessageWrapper {
         let envelope = MessageEnvelope {
+            trace_context: parrot_api::trace::TraceContext::current(),
             id: uuid::Uuid::new_v4(),
             payload: msg,
             sender,
@@ -181,7 +269,7 @@ where
 
     /// Fire-and-forget delivery: enqueue and return immediately.
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             if self
                 .control
                 .as_ref()
@@ -197,7 +285,21 @@ where
                     ActorError::MessageHandlingError("Actix mailbox is full".into())
                 }
             })
-        })
+        }))
+    }
+
+    fn deliver_with_options<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(parrot_api::trace::capture(async move {
+            options.validate_single_attempt()?;
+            options.validate_fifo()?;
+            // Native try_send has no admission wait. Its receipt never claims
+            // that handler execution finished within the caller's timeout.
+            self.deliver(msg).await
+        }))
     }
 
     /// Send a message to the actor with a timeout
@@ -218,8 +320,7 @@ where
         let wrapper = self.create_envelope(msg, None, MessageOptions::default(), "unknown");
         let addr = self.addr.clone();
 
-        let timeout = timeout.or(self.default_timeout);
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             let request = async {
                 let request = addr.send(wrapper);
                 let result = match timeout {
@@ -239,18 +340,32 @@ where
                     Ok(None) => Err(ActorError::MessageHandlingError(
                         "No response from actor".into(),
                     )),
-                    Err(e) => Err(ActorError::Other(anyhow!(
-                        "Failed to deliver message: {}",
-                        e
+                    Err(actix::MailboxError::Closed) => Err(ActorError::Stopped),
+                    Err(actix::MailboxError::Timeout) => Err(ActorError::TimeoutDetail(format!(
+                        "Native request to actor {} timed out",
+                        self.path
                     ))),
                 }
             };
             if let Some(control) = &self.control {
-                tokio::select! { biased; _ = control.channel.closed() => Err(ActorError::Stopped), result = request => result }
+                tokio::select! { biased; result = request => result, _ = control.channel.closed() => Err(ActorError::Stopped) }
             } else {
                 request.await
             }
-        })
+        }))
+    }
+
+    fn send_with_options<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(parrot_api::trace::capture(async move {
+            options.validate_single_attempt()?;
+            options.validate_fifo()?;
+            // Reuse the generation close fence as well as its deadline logic.
+            self.send_with_timeout(msg, options.timeout).await
+        }))
     }
 
     /// Stop the actor
@@ -297,11 +412,56 @@ where
             addr: self.addr.clone(),
             path: self.path.clone(),
             control: self.control.clone(),
-            default_timeout: self.default_timeout,
         })
     }
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn death_watch(&self) -> Option<parrot_api::death_watch::DeathWatch> {
+        self.control
+            .as_ref()
+            .map(|control| control.death_watch.clone())
+    }
+}
+
+// No strong Addr or ActorControl is retained by a subscription endpoint.
+struct WatchRecipient<A: actix::Actor> {
+    addr: actix::WeakAddr<A>,
+}
+impl<A> parrot_api::death_watch::TerminationRecipient for WatchRecipient<A>
+where
+    A: actix::Actor + actix::Handler<ActixMessageWrapper>,
+    A::Context: actix::dev::ToEnvelope<A, ActixMessageWrapper>,
+{
+    fn deliver(
+        &self,
+        event: parrot_api::context::ActorTerminated,
+    ) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async move {
+            let addr = self.addr.upgrade().ok_or(ActorError::Stopped)?;
+            let wrapper = ActixMessageWrapper {
+                envelope: MessageEnvelope {
+                    trace_context: None,
+                    id: uuid::Uuid::new_v4(),
+                    payload: Box::new(event),
+                    sender: None,
+                    options: MessageOptions::default(),
+                    message_type: "ActorTerminated",
+                },
+            };
+            // Actix Request waits for capacity. Its cancellation removes a
+            // still-waiting request; no unbounded do_send escape hatch is used.
+            addr.send(wrapper)
+                .await
+                .map_err(|_| ActorError::Stopped)?
+                .ok_or_else(|| {
+                    ActorError::MessageHandlingError(
+                        "termination notification had no response".into(),
+                    )
+                })??;
+            Ok(())
+        })
     }
 }

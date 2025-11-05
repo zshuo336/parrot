@@ -14,8 +14,8 @@
 //!    handler signatures.
 //!
 //! # What this file proves
-//! - The derive-generated `receive_message` forwards to the user's
-//!   `handle_message` unconditionally (no cfg(test) bifurcation).
+//! - The Actix synchronous derive path reports an unhandled message and
+//!   successfully processes a subsequent supported message.
 //! - A derive actor with `#[ParrotActor(async_handler = true)]` opts into
 //!   the async dispatch path and **runs end-to-end on the Actix engine**,
 //!   including real IO-style `.await` points inside the handler.
@@ -26,11 +26,8 @@ use parrot::actix as __parrot_engine;
 use parrot::actix::ActixActorSystem;
 use parrot_api::actor::{Actor, EmptyConfig, EngineContextHandle};
 use parrot_api::address::ActorRefExt;
-use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedMessage};
 use parrot_api_derive::{Message, ParrotActor};
-use std::any::Any;
-use std::ptr::NonNull;
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -150,17 +147,15 @@ impl AsyncCounter {
 }
 
 // ---------------------------------------------------------------------------
-// Part 1 — unit-level dispatch semantics of the derive impls
+// Part 1 — actual Actix synchronous dispatch semantics
 // ---------------------------------------------------------------------------
 
 #[test]
-fn derive_receive_message_forwards_to_handle_message() {
+fn derive_sync_handler_reports_unhandled_messages_and_keeps_serving() {
     // Actix actors must run inside an actix System (arbiter context).
     actix::System::new().block_on(async {
-        // This mirrors what the thread engine's primary path invokes.
-        // Constructing an ActixContext requires a live Addr, so the full
-        // engine path is covered by Part 2 (Actix e2e) below; here we verify
-        // the codegen contract through the trait object on the Actix engine.
+        // This exercises the synchronous Actix path, not receive_message
+        // or the thread engine. Async forwarding is tested separately below.
         let sys = ActixActorSystem::new().await.expect("actix system starts");
         let aref = sys
             .spawn_root_typed(Counter { value: 0, ops: 0 }, EmptyConfig)
@@ -177,6 +172,7 @@ fn derive_receive_message_forwards_to_handle_message() {
         // Get IS handled by the engine fast path.
         let r = aref.ask(Get).await.expect("get via fast path");
         assert_eq!(r, 0);
+        sys.shutdown().await.expect("shutdown synchronous actor");
     });
 }
 
@@ -201,6 +197,7 @@ fn derive_async_handler_opt_in_runs_on_actix() {
         assert_eq!(r, 7);
         let r = aref.ask(Describe).await.expect("async describe");
         assert_eq!(r, "async value=7 ops=2");
+        sys.shutdown().await.expect("shutdown async actor");
     });
 }
 
@@ -208,20 +205,16 @@ fn derive_async_handler_opt_in_runs_on_actix() {
 // Part 3 — ADR-2: the safe handle API (no user-side unsafe)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn engine_context_handle_safe_downcasts() {
+#[test]
+fn engine_context_handle_safe_downcasts() {
     let mut data = 42u32;
-    let raw = NonNull::from(&mut data);
-    let erased: NonNull<dyn Any> = raw;
-    // Engine-side minting (single unsafe boundary — mirrors what the
-    // Actix adapter does internally).
-    let mut handle = unsafe { EngineContextHandle::from_raw(erased) };
-
-    assert_eq!(handle.downcast_ref::<u32>(), Some(&42));
-    assert!(handle.downcast_ref::<String>().is_none());
-    if let Some(v) = handle.downcast_mut::<u32>() {
-        // The pointee is a shared local here; only read it.
-        assert_eq!(*v, 42);
+    {
+        let mut handle = EngineContextHandle::new(&mut data);
+        assert_eq!(handle.downcast_ref::<u32>(), Some(&42));
+        assert!(handle.downcast_ref::<String>().is_none());
+        assert!(handle.downcast_mut::<String>().is_none());
+        *handle.downcast_mut::<u32>().expect("original context type") = 43;
+        assert_eq!(handle.downcast_ref::<u32>(), Some(&43));
     }
-    assert!(handle.downcast_ref::<String>().is_none());
+    assert_eq!(data, 43);
 }

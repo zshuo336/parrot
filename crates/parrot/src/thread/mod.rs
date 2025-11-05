@@ -2,11 +2,15 @@
 
 pub mod actor;
 pub mod address;
+mod child_instance;
 pub mod common;
 pub mod config;
 pub mod context;
+mod death_watch;
 pub mod envelope;
 pub mod error;
+mod factory;
+mod instance;
 pub mod mailbox;
 pub mod message;
 pub mod message_pool;
@@ -14,6 +18,7 @@ pub mod processor;
 pub mod reply;
 pub mod scheduler;
 pub mod single_alloc;
+mod stop_deadline;
 pub mod supervisor_exec;
 pub mod system;
 pub mod typed;

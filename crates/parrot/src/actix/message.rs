@@ -1,9 +1,7 @@
 use actix::Message as ActixMessage;
 use parrot_api::errors::ActorError;
-use parrot_api::message::{Message, MessageEnvelope, MessageOptions};
+use parrot_api::message::{Message, MessageEnvelope};
 use parrot_api::types::{ActorResult, BoxedMessage};
-use std::any::Any;
-use uuid::Uuid;
 
 /// Wrapper for MessageEnvelope to implement actix::Message
 ///
@@ -59,11 +57,5 @@ impl MessageDowncast for BoxedMessage {
 
 /// Helper function to create a message envelope from a message
 pub fn create_envelope<M: Message>(msg: M) -> MessageEnvelope {
-    MessageEnvelope {
-        id: Uuid::new_v4(),
-        payload: Box::new(msg) as Box<dyn Any + Send>,
-        sender: None,
-        options: MessageOptions::default(),
-        message_type: std::any::type_name::<M>(),
-    }
+    MessageEnvelope::new(msg, None, None)
 }

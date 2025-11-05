@@ -1,11 +1,11 @@
 //! MG1-4（DEV_09 §5.2）：单 App 跨 parrot+erlang+ray+jvm 四引擎部署全链。
 //!
-//! **ignored 形态**（DoD §5.6：`cargo test -p parrot-app --test mg_multiengine
-//! -- --ignored`）——需本机工具链（erl / python3+ray / java+jar），CI 与
+//! **ignored 形态**（执行入口：`make test-app-polyglot`）——需本机工具链（erl / python3+ray / java+jar），CI 与
 //! G3 验收显式拉起。
 //!
 //! 验收语义（TECH_DESIGN_09 MG1-4 行）：
-//! deploy → 组件全 Running → 跨引擎 ask/tell 全链 → status 聚合视图。
+//! 当前验证 deploy → 四引擎业务 ASK → 真实组件状态 → teardown。
+//! TELL 扇出、drain、wiring 端到端语义仍须另外验收。
 //!
 //! 形态：`test_assemble` helper（G2/M5）+ ProcessGatewayFactory 真实子
 //! 进程网关（registry 模式——MG11 四方言同一路径）。
@@ -30,7 +30,7 @@ use parrot_app::manifest::{
 use parrot_app::planner::LocalTopology;
 use parrot_app::test_support::test_assemble_default_cfg;
 
-// ---------------- 测试组件（跨引擎 hub——MG3 tell 扇出源） ----------------
+// ---------------- 本地对照组件 ----------------
 
 pub struct HubActor;
 
@@ -49,10 +49,13 @@ impl Actor for HubActor {
     }
 }
 
-fn spawn_hub(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-    let path = path.to_string();
+fn spawn_hub(
+    ts: Arc<ThreadActorSystem>,
+    path: String,
+    _config: Option<toml::Table>,
+) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
     Box::pin(async move {
-        let r = thread_system()
+        let r = ts
             .spawn_at(HubActor, &path, None, ThreadActorConfig::default())
             .await
             .map_err(|e| parrot_api::errors::ActorError::InternalError(format!("spawn: {e}")))?;
@@ -61,64 +64,20 @@ fn spawn_hub(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
 }
 
 parrot_api::message::inventory::submit! {
-    parrot_remote::admin::PropsFactory {
+    parrot_app::host::ThreadPropsFactory {
         name: "app.mg.hub",
         spawn: spawn_hub,
     }
 }
 
-// u:Ping / u:Pong（方言键探针——+3 erl / +2 ray——run-lab 同款；
-// 键名必须与网关注册表一致：bin:u:Ping / bin:u:Pong）
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnitPing(pub u64);
-
-parrot_api::message::inventory::submit! {
-    parrot_api::message::CodecRegistration {
-        type_key: "bin:u:Ping",
-        type_id: std::any::TypeId::of::<UnitPing>(),
-        encode: |msg: &BoxedMessage| {
-            let m = msg.downcast_ref::<UnitPing>().ok_or("downcast fail")?;
-            Ok(m.0.to_le_bytes().to_vec())
-        },
-        decode: |b: &[u8]| {
-            Ok(Box::new(UnitPing(u64::from_le_bytes(b[0..8].try_into().unwrap()))) as BoxedMessage)
-        },
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnitPong(pub u64);
-
-parrot_api::message::inventory::submit! {
-    parrot_api::message::CodecRegistration {
-        type_key: "bin:u:Pong",
-        type_id: std::any::TypeId::of::<UnitPong>(),
-        encode: |msg: &BoxedMessage| {
-            let m = msg.downcast_ref::<UnitPong>().ok_or("downcast fail")?;
-            Ok(m.0.to_le_bytes().to_vec())
-        },
-        decode: |b: &[u8]| {
-            Ok(Box::new(UnitPong(u64::from_le_bytes(b[0..8].try_into().unwrap()))) as BoxedMessage)
-        },
-    }
-}
+// 真实 crawler 业务载荷与结果契约。
+#[path = "support/crawler_contract.rs"]
+mod crawler_contract;
 
 // ---------------- 公共设施（app_run_scenarios 同款） ----------------
 
-static TS: std::sync::OnceLock<Arc<ThreadActorSystem>> = std::sync::OnceLock::new();
-
 fn thread_system() -> Arc<ThreadActorSystem> {
-    TS.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .expect("dedicated engine runtime");
-        let handle = rt.handle().clone();
-        Box::leak(Box::new(rt));
-        ThreadActorSystem::shared_with_handle(Default::default(), handle)
-    })
-    .clone()
+    ThreadActorSystem::shared(Default::default())
 }
 
 fn repo_root() -> std::path::PathBuf {
@@ -167,16 +126,22 @@ async fn mg_multiengine_deploy_running_ask_status_full_chain() {
         EngineKind::Erlang,
         ArtifactRef::Beam {
             app: "frontier".into(),
-            uri: None,
+            uri: Some(format!(
+                "file://{}",
+                repo_root().join("apps/crawler-lab/erlang").display()
+            )),
         },
     );
     let mut index = comp(
         "index",
         EngineKind::Ray,
         ArtifactRef::PyModule {
-            module: "index".into(),
+            module: "index_builder".into(),
             runtime_env: None,
-            uri: None,
+            uri: Some(format!(
+                "file://{}",
+                repo_root().join("apps/crawler-lab/python").display()
+            )),
         },
     );
     let mut search = comp(
@@ -209,6 +174,7 @@ async fn mg_multiengine_deploy_running_ask_status_full_chain() {
         version: "1.0.0".into(),
         components: vec![frontier, index, search, hub],
         wiring: vec![],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
 
@@ -216,7 +182,7 @@ async fn mg_multiengine_deploy_running_ask_status_full_chain() {
     let spawner = ThreadPropsSpawner::new(ts.clone());
 
     // ── deploy：依赖序装配（三网关先注册，hub 本地 spawn）──
-    let a = test_assemble_default_cfg(
+    let mut a = test_assemble_default_cfg(
         &m,
         Box::new(LocalTopology),
         Box::new(gw2(&gw)),
@@ -244,25 +210,10 @@ async fn mg_multiengine_deploy_running_ask_status_full_chain() {
     }
 
     // ── 跨引擎 ask：方言键探针（erl +3 / ray +2 / jvm 搜索类回执）──
-    let f = a.first("frontier").expect("frontier ref");
-    let pong = f.send(Box::new(UnitPing(100))).await.expect("erl ask");
-    match pong.downcast::<UnitPong>() {
-        Ok(p) => assert_eq!(p.0, 103, "erl 方言键 +3"),
-        Err(other) => panic!("erl ask 回执类型不符: {other:?}"),
-    }
+    crawler_contract::frontier(&a.first("frontier").unwrap()).await;
+    crawler_contract::ray_index(&a.first("index").unwrap()).await;
+    crawler_contract::jvm_search(&a.first("search").unwrap()).await;
 
-    let i = a.first("index").expect("index ref");
-    let pong = i.send(Box::new(UnitPing(100))).await.expect("ray ask");
-    match pong.downcast::<UnitPong>() {
-        Ok(p) => assert_eq!(p.0, 102, "ray 方言键 +2"),
-        Err(other) => panic!("ray ask 回执类型不符: {other:?}"),
-    }
-
-    // jvm：CrawlerSearchMain 是业务网关（非 echo）——ask 探针不在其语义内；
-    // Running 断言（refs 非空 + teardown 不炸）即 MG1-4 对 jvm 侧的部署
-    // 全链要求；业务回执由 crawler-lab 回归承载（run_regression.sh）。
-
-    // ── parrot 本地 hub ask（同链对照——MG12 轨迹锚点）──
     let h = a.first("hub").expect("hub ref");
     let r = h
         .send(Box::new("mg".to_string()) as BoxedMessage)
@@ -276,9 +227,22 @@ async fn mg_multiengine_deploy_running_ask_status_full_chain() {
         assert!(!paths.is_empty(), "{c} paths 空");
     }
 
+    for name in ["frontier", "index", "search"] {
+        let node = gw.component_node(name).expect("owned gateway identity");
+        let status = remote
+            .component_status(&node, &format!("/user/{name}"))
+            .await
+            .unwrap();
+        assert_eq!(status.len(), 1, "{name} must report its deployed instance");
+        assert_eq!(status[0].version, m.version);
+        assert_eq!(status[0].state, "running");
+    }
+    assert!(h.is_alive().await);
+
     a.teardown().await.expect("teardown");
-    gw.procs().kill_all();
-    remote.shutdown().await.ok();
+    gw.procs().kill_all().await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ---------------- 分引擎门禁（回归定位用——单网关失败时快速归因） ----------------
@@ -287,17 +251,17 @@ async fn mg_multiengine_deploy_running_ask_status_full_chain() {
 #[ignore = "DoD §5.6 子项：单 erl 网关——快速归因用"]
 async fn mg_erlang_gateway_smoke() {
     let _g = GW_LOCK.lock().await;
-    single_engine_smoke(
-        comp(
-            "frontier",
-            EngineKind::Erlang,
-            ArtifactRef::Beam {
-                app: "frontier".into(),
-                uri: None,
-            },
-        ),
-        103,
-    )
+    single_engine_smoke(comp(
+        "frontier",
+        EngineKind::Erlang,
+        ArtifactRef::Beam {
+            app: "frontier".into(),
+            uri: Some(format!(
+                "file://{}",
+                repo_root().join("apps/crawler-lab/erlang").display()
+            )),
+        },
+    ))
     .await;
 }
 
@@ -305,22 +269,22 @@ async fn mg_erlang_gateway_smoke() {
 #[ignore = "DoD §5.6 子项：单 ray 网关——快速归因用"]
 async fn mg_ray_gateway_smoke() {
     let _g = GW_LOCK.lock().await;
-    single_engine_smoke(
-        comp(
-            "index",
-            EngineKind::Ray,
-            ArtifactRef::PyModule {
-                module: "index".into(),
-                runtime_env: None,
-                uri: None,
-            },
-        ),
-        102,
-    )
+    single_engine_smoke(comp(
+        "index",
+        EngineKind::Ray,
+        ArtifactRef::PyModule {
+            module: "index_builder".into(),
+            runtime_env: None,
+            uri: Some(format!(
+                "file://{}",
+                repo_root().join("apps/crawler-lab/python").display()
+            )),
+        },
+    ))
     .await;
 }
 
-async fn single_engine_smoke(c: ComponentSpec, expect_offset: u64) {
+async fn single_engine_smoke(c: ComponentSpec) {
     let ts = thread_system();
     let remote = make_remote(ts.clone(), alloc_port()).await;
     let m = AppManifest {
@@ -328,11 +292,12 @@ async fn single_engine_smoke(c: ComponentSpec, expect_offset: u64) {
         version: "1.0.0".into(),
         components: vec![c],
         wiring: vec![],
+        mirrors: Vec::new(),
         config_overlay: None,
     };
     let gw = ProcessGatewayFactory::new(repo_root(), remote.clone());
     let spawner = ThreadPropsSpawner::new(ts.clone());
-    let a = test_assemble_default_cfg(
+    let mut a = test_assemble_default_cfg(
         &m,
         Box::new(LocalTopology),
         Box::new(gw2(&gw)),
@@ -342,12 +307,15 @@ async fn single_engine_smoke(c: ComponentSpec, expect_offset: u64) {
     .expect("assemble");
     let name = a.started().first().unwrap().clone();
     let r = a.first(&name).expect("ref");
-    let pong = r.send(Box::new(UnitPing(100))).await.expect("ask");
-    let p = pong.downcast::<UnitPong>().expect("pong");
-    assert_eq!(p.0, expect_offset);
-    a.teardown().await.ok();
-    gw.procs().kill_all();
-    remote.shutdown().await.ok();
+    match name.as_str() {
+        "frontier" => crawler_contract::frontier(&r).await,
+        "index" => crawler_contract::ray_index(&r).await,
+        other => panic!("unexpected component {other}"),
+    }
+    a.teardown().await.unwrap();
+    gw.procs().kill_all().await.unwrap();
+    remote.shutdown().await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 // ---------------- 私有 helper ----------------
@@ -363,29 +331,7 @@ async fn make_remote(ts: Arc<ThreadActorSystem>, port: u16) -> Arc<RemoteActorSy
     r
 }
 
-/// gw 借用适配（Assembled 持 Box<dyn GatewayFactory>——同实例共享 procs）。
-fn gw2(gw: &ProcessGatewayFactory) -> GwRef {
-    GwRef {
-        inner: gw as *const ProcessGatewayFactory,
-    }
-}
-
-/// 裸指针借用包装（test 体内 gw 栈对象存活——Send 合规由测试串行锁保证）。
-struct GwRef {
-    inner: *const ProcessGatewayFactory,
-}
-unsafe impl Send for GwRef {}
-unsafe impl Sync for GwRef {}
-
-impl parrot_app::assemble::GatewayFactory for GwRef {
-    fn start_gateway(
-        &self,
-        comp: &ComponentSpec,
-        paths: &[String],
-    ) -> Result<Vec<BoxedActorRef>, parrot_app::assemble::DeployError> {
-        unsafe { (*self.inner).start_gateway(comp, paths) }
-    }
-    fn stop_gateway(&self, comp: &ComponentSpec) -> Result<(), parrot_app::assemble::DeployError> {
-        unsafe { (*self.inner).stop_gateway(comp) }
-    }
+/// A clone shares owned process state without raw-pointer lifetime assertions.
+fn gw2(gw: &ProcessGatewayFactory) -> ProcessGatewayFactory {
+    gw.clone()
 }

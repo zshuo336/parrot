@@ -5,7 +5,7 @@ import { readFileSync, statSync } from "node:fs";
 
 const BUDGET = 50 * 1024;
 try {
-  const buf = readFileSync("dist/lite.js");
+  const buf = readFileSync("dist/parrot-lite.bundle.js");
   const gz = gzipSync(buf);
   const size = gz.length;
   console.log(`bundle min+gz: ${(size / 1024).toFixed(1)}KB (budget ${BUDGET / 1024}KB)`);
@@ -15,6 +15,6 @@ try {
   }
   console.log("size gate PASS");
 } catch (e) {
-  console.error("dist/lite.js missing — run `npm run bundle` first:", e.message);
+  console.error("dist/parrot-lite.bundle.js missing — run `npm run bundle` first:", e.message);
   process.exit(2);
 }

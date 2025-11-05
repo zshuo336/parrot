@@ -1,9 +1,11 @@
-//! 职责：mTLS——TCP 路径 tokio-rustls 包裹 + node_id↔证书 CN 强绑定（DEV_02 §5 / 06 §2.4）。
+//! mTLS helpers: tokio-rustls streams and leaf-subject CN identity checks.
+//! Used by RemoteActorSystem TCP and QUIC when mutual TLS is configured.
 //!
-//! 证书体系（P2）：自签 CA + 节点证书（CN=node_id）；`parrot-remote-cli cert gen`
-//! 生成（开发环境 10 分钟可用）。P3 完整证书轮换——P2 只做双证书容忍（CA 链
-//! 同时信任新旧）。
+//! Callers supply a trusted CA bundle and node certificates (subject CN=node_id).
+//! Multiple CA roots can be trusted together; certificate issuance, rotation,
+//! revocation and automatic rotation are separate, unfinished capabilities.
 
+use rustls_pki_types::pem::{Error as PemError, PemObject};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -15,7 +17,12 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::RemoteError;
 
-/// TLS 材料配置（RemoteConfig.tls 注入）。
+/// Maximum encoded bytes per certificate chain, private key or CA bundle.
+pub const MAX_TLS_PEM_BYTES: usize = 1024 * 1024;
+/// Maximum certificates per chain or trust bundle, before root-store building.
+pub const MAX_TLS_CERTIFICATES: usize = 64;
+
+/// PEM material for the explicit TLS helper API.
 #[derive(Clone)]
 pub struct TlsConfig {
     pub cert_pem: Vec<u8>,
@@ -24,35 +31,111 @@ pub struct TlsConfig {
 }
 
 impl TlsConfig {
-    /// 文件路径加载。
+    /// Read regular files with bounded input. Symlinks to regular files are
+    /// accepted so deployment tools can rotate credentials by replacing links.
     pub fn from_paths(cert_path: &str, key_path: &str, ca_path: &str) -> Result<Self, RemoteError> {
         Ok(Self {
-            cert_pem: std::fs::read(cert_path)
-                .map_err(|e| RemoteError::Transport(format!("read {cert_path}: {e}")))?,
-            key_pem: std::fs::read(key_path)
-                .map_err(|e| RemoteError::Transport(format!("read {key_path}: {e}")))?,
-            ca_pem: std::fs::read(ca_path)
-                .map_err(|e| RemoteError::Transport(format!("read {ca_path}: {e}")))?,
+            cert_pem: read_material(cert_path)?,
+            key_pem: read_material(key_path)?,
+            ca_pem: read_material(ca_path)?,
         })
+    }
+
+    fn validate_size(&self) -> Result<(), RemoteError> {
+        for pem in [&self.cert_pem, &self.key_pem, &self.ca_pem] {
+            check_material_size(pem.len() as u64)?;
+        }
+        Ok(())
     }
 }
 
+fn check_material_size(bytes: u64) -> Result<(), RemoteError> {
+    if bytes > MAX_TLS_PEM_BYTES as u64 {
+        return Err(RemoteError::Transport(format!(
+            "TLS material limit: each PEM input must be at most {MAX_TLS_PEM_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn read_material(path: &str) -> Result<Vec<u8>, RemoteError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Inspect the opened descriptor, without blocking on a FIFO writer or
+        // introducing a stat/open race for symlink-based deployments.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| RemoteError::Transport(format!("open TLS material {path}: {e}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| RemoteError::Transport(format!("TLS material metadata {path}: {e}")))?;
+    if !metadata.is_file() {
+        return Err(RemoteError::Transport(
+            "TLS material must be a regular file".into(),
+        ));
+    }
+    check_material_size(metadata.len())?;
+    read_material_bytes(file)
+}
+
+fn read_material_bytes(reader: impl std::io::Read) -> Result<Vec<u8>, RemoteError> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_TLS_PEM_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| RemoteError::Transport(format!("read TLS material: {e}")))?;
+    // A file growing after metadata inspection cannot bypass the read budget.
+    check_material_size(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
 fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, RemoteError> {
-    let mut rd = std::io::BufReader::new(pem);
-    rustls_pemfile::certs(&mut rd)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| RemoteError::Transport(format!("cert parse: {e}")))
+    check_material_size(pem.len() as u64)?;
+    let mut certs = Vec::new();
+    for cert in CertificateDer::pem_slice_iter(pem) {
+        if certs.len() == MAX_TLS_CERTIFICATES {
+            return Err(RemoteError::Transport(format!(
+                "TLS material limit: at most {MAX_TLS_CERTIFICATES} certificates per PEM bundle"
+            )));
+        }
+        certs.push(cert.map_err(|e| RemoteError::Transport(format!("cert parse: {e}")))?);
+    }
+    if certs.is_empty() {
+        return Err(RemoteError::Transport(
+            "no certificates in PEM material".into(),
+        ));
+    }
+    Ok(certs)
 }
 
 fn load_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, RemoteError> {
-    let mut rd = std::io::BufReader::new(pem);
-    rustls_pemfile::private_key(&mut rd)
-        .map_err(|e| RemoteError::Transport(format!("key parse: {e}")))?
-        .ok_or_else(|| RemoteError::Transport("no private key in pem".into()))
+    check_material_size(pem.len() as u64)?;
+    // Preserve first-key selection across PKCS1, PKCS8 and SEC1. Invalid key
+    // material must not fall through to another key that happens to match.
+    PrivateKeyDer::from_pem_slice(pem).map_err(|error| match error {
+        PemError::NoItemsFound => RemoteError::Transport("no private key in pem".into()),
+        other => RemoteError::Transport(format!("key parse: {other}")),
+    })
+}
+
+// Honor an explicitly installed provider. Otherwise select the already-enabled
+// ring implementation locally; feature unification can enable multiple rustls
+// backends, so relying on its implicit global selection would panic.
+pub(crate) fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
 }
 
 /// server 侧 TLS acceptor（mTLS：要求客户端证书）。
-pub fn server_acceptor(cfg: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, RemoteError> {
+pub fn server_config(cfg: &TlsConfig) -> Result<ServerConfig, RemoteError> {
+    cfg.validate_size()?;
     let certs = load_certs(&cfg.cert_pem)?;
     let key = load_key(&cfg.key_pem)?;
     let mut ca = load_certs(&cfg.ca_pem)?;
@@ -63,18 +146,22 @@ pub fn server_acceptor(cfg: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, Rem
             .add(c)
             .map_err(|e| RemoteError::Transport(format!("ca add: {e}")))?;
     }
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+    let provider = crypto_provider();
+    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
         .build()
         .map_err(|e| RemoteError::Transport(format!("verifier: {e}")))?;
-    let sc = ServerConfig::builder()
+    let sc = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| RemoteError::Transport(format!("server TLS versions: {e}")))?
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .map_err(|e| RemoteError::Transport(format!("server cert: {e}")))?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(sc)))
+    Ok(sc)
 }
 
 /// client 侧 connector（验证 server 证书链；本端证书 mTLS 呈递）。
-pub fn client_connector(cfg: &TlsConfig) -> Result<TlsConnector, RemoteError> {
+pub fn client_config(cfg: &TlsConfig) -> Result<ClientConfig, RemoteError> {
+    cfg.validate_size()?;
     let certs = load_certs(&cfg.cert_pem)?;
     let key = load_key(&cfg.key_pem)?;
     let mut ca = load_certs(&cfg.ca_pem)?;
@@ -84,11 +171,32 @@ pub fn client_connector(cfg: &TlsConfig) -> Result<TlsConnector, RemoteError> {
             .add(c)
             .map_err(|e| RemoteError::Transport(format!("ca add: {e}")))?;
     }
-    let cc = ClientConfig::builder()
+    let cc = ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| RemoteError::Transport(format!("client TLS versions: {e}")))?
         .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)
         .map_err(|e| RemoteError::Transport(format!("client cert: {e}")))?;
-    Ok(TlsConnector::from(Arc::new(cc)))
+    Ok(cc)
+}
+
+/// Build a TCP acceptor that requires verified client certificates.
+pub fn server_acceptor(cfg: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, RemoteError> {
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config(
+        cfg,
+    )?)))
+}
+/// Build a TCP connector with CA verification and client authentication.
+pub fn client_connector(cfg: &TlsConfig) -> Result<TlsConnector, RemoteError> {
+    Ok(TlsConnector::from(Arc::new(client_config(cfg)?)))
+}
+/// Node IDs in mTLS mode must also be usable as the TLS server name/SAN.
+pub(crate) fn validate_local_identity(cfg: &TlsConfig, node: &str) -> Result<(), RemoteError> {
+    cfg.validate_size()?;
+    ServerName::try_from(node.to_string()).map_err(|e| {
+        RemoteError::Transport(format!("mTLS node ID must be a valid TLS server name: {e}"))
+    })?;
+    verify_node_identity(&load_certs(&cfg.cert_pem)?, node)
 }
 
 /// TCP 流 → TLS 流（connect 侧）。
@@ -135,9 +243,29 @@ pub fn verify_node_identity(
             "mTLS: peer presented no certificate".into(),
         ));
     };
-    // 提取 CN（OU 简化解析——x509-parser 不进白名单；CN 在 Subject DN 可打印串）
-    let cn = extract_cn(cert)
-        .ok_or_else(|| RemoteError::Transport("mTLS: certificate has no CN".into()))?;
+    // Parse the certificate structure, not OID-shaped bytes anywhere in DER:
+    // issuer, extensions and signatures cannot supply a leaf subject identity.
+    let (remaining, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
+        .map_err(|e| RemoteError::Transport(format!("mTLS: invalid certificate DER: {e}")))?;
+    if !remaining.is_empty() {
+        return Err(RemoteError::Transport(
+            "mTLS: trailing certificate DER".into(),
+        ));
+    }
+    let mut names = parsed.subject().iter_common_name();
+    let name = names
+        .next()
+        .ok_or_else(|| RemoteError::Transport("mTLS: leaf subject has no CN".into()))?;
+    if names.next().is_some() {
+        return Err(RemoteError::Transport(
+            "mTLS: ambiguous leaf subject CN".into(),
+        ));
+    }
+    let cn = name
+        .as_str()
+        .map_err(|_| RemoteError::Transport("mTLS: invalid leaf subject CN string".into()))?;
+    parrot_config::endpoint::validate_node_id(claimed_node_id)
+        .map_err(|e| RemoteError::Transport(format!("mTLS: invalid claimed identity: {e}")))?;
     if cn != claimed_node_id {
         return Err(RemoteError::Transport(format!(
             "mTLS: node_id mismatch (cert CN={cn:?}, handshake={claimed_node_id:?})"
@@ -146,44 +274,30 @@ pub fn verify_node_identity(
     Ok(())
 }
 
-/// 最小 CN 提取：Subject DN 中 CN 的值是 UTF8String/PrintableString——
-/// DER 里以可打印字节直存。策略：定位声称 node_id 的字节串并要求其
-/// 紧邻 OID 上下文（2.5.4.3 CN 的 DER `06 03 55 04 03` + 长度 + 串）。
-fn extract_cn(cert: &CertificateDer<'_>) -> Option<String> {
-    let der = cert.as_ref();
-    // CN OID DER 编码：06 03 55 04 03（1.2.840.113549.1.9.1 之外的常用位）
-    const CN_OID: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
-    let mut pos = 0;
-    while let Some(off) = find(der, CN_OID, pos) {
-        // OID 后：[A0/13/0C len] 值（0C=UTF8String, 13=PrintableString）
-        // 跳过可选 tag（context [4] 0xA4 等包装）——直接扫可打印串 tag
-        let scan_end = (off + CN_OID.len() + 4).min(der.len());
-        for i in (off + CN_OID.len())..scan_end {
-            let (tag, len) = (der[i], der[i + 1] as usize);
-            if tag == 0x0C || tag == 0x13 {
-                let start = i + 2;
-                let end = start + len;
-                if end <= der.len() {
-                    return Some(String::from_utf8_lossy(&der[start..end]).into_owned());
-                }
-                return None;
-            }
-        }
-        pos = off + 1;
-    }
-    None
-}
-
-fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
-    }
-    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn material_read_budget_also_bounds_growing_inputs() {
+        use std::io::Read;
+        struct Infinite {
+            consumed: usize,
+        }
+        impl Read for Infinite {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                out.fill(b'x');
+                self.consumed += out.len();
+                Ok(out.len())
+            }
+        }
+        let mut source = Infinite { consumed: 0 };
+        let error = read_material_bytes(&mut source).unwrap_err().to_string();
+        assert!(error.contains("TLS material limit"));
+        assert_eq!(source.consumed, MAX_TLS_PEM_BYTES + 1);
+        let exact = vec![b'x'; MAX_TLS_PEM_BYTES];
+        assert_eq!(read_material_bytes(exact.as_slice()).unwrap(), exact);
+    }
 
     // dev 材料：rcgen 自签 CA + 两节点证书（测试进程内生成）
     struct DevPki {
@@ -194,7 +308,7 @@ mod tests {
     }
 
     fn dev_pki() -> DevPki {
-        // 简化：直接自签两份（互为 CA 的 dev 形态——分离 CA 链在 cli cert gen）
+        // Self-signed fixtures here; tls_identity_contract also covers CA-issued leaves.
         let a = rcgen::generate_simple_self_signed(vec!["node-a".into()]).unwrap();
         let b = rcgen::generate_simple_self_signed(vec!["node-b".into()]).unwrap();
         DevPki {
@@ -219,8 +333,6 @@ mod tests {
         };
         let acceptor = server_acceptor(&cfg_b).unwrap();
         let (client_io, server_io) = tokio::io::duplex(8 * 1024);
-        let acc = acceptor.clone();
-        let server_task = tokio::spawn(async move { wrap_server(&acc, server_io).await });
         // client 用 B 自己的证书（dev 自签自证——链通过）
         let cfg_c = TlsConfig {
             cert_pem: pki.node_b.clone(),
@@ -228,8 +340,16 @@ mod tests {
             ca_pem: pki.node_b.clone(),
         };
         let connector = client_connector(&cfg_c).unwrap();
-        let _tls = wrap_client(&connector, client_io, "node-b").await.unwrap();
-        let _tls_server = server_task.await.unwrap().unwrap();
+        let (server, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                wrap_server(&acceptor, server_io),
+                wrap_client(&connector, client_io, "node-b")
+            )
+        })
+        .await
+        .expect("valid TLS handshake did not complete");
+        server.unwrap();
+        client.unwrap();
     }
 
     // tls_reject_bad_ca：client 不信任 server 证书 → 握手失败
@@ -245,18 +365,22 @@ mod tests {
         };
         let acceptor = server_acceptor(&cfg_b).unwrap();
         let (client_io, server_io) = tokio::io::duplex(8 * 1024);
-        let acc = acceptor.clone();
-        let _server_task = tokio::spawn(async move {
-            let _ = wrap_server(&acc, server_io).await;
-        });
         let bad_ca_cfg = TlsConfig {
             cert_pem: pki.node_a.clone(),
             key_pem: pki.node_a_key.clone(),
             ca_pem: pki.node_a.clone(), // 只信 node-a 链
         };
         let connector = client_connector(&bad_ca_cfg).unwrap();
-        let r = wrap_client(&connector, client_io, "node-b").await;
-        assert!(r.is_err(), "bad CA must fail handshake");
+        let (server, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                wrap_server(&acceptor, server_io),
+                wrap_client(&connector, client_io, "node-b")
+            )
+        })
+        .await
+        .expect("bad CA handshake did not retire");
+        assert!(client.is_err(), "bad CA must fail handshake");
+        assert!(server.is_err(), "server must observe failed handshake");
     }
 
     /// 生成 CN=指定值的自签证书（rcgen param 显式 Subject）。

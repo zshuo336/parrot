@@ -1,3 +1,6 @@
+mod runtime;
+mod shutdown;
+mod topology;
 use crate::actix::ActixActorSystem;
 use crate::thread::system::ThreadActorSystem;
 use anyhow;
@@ -11,8 +14,45 @@ use parrot_api::{
         ActorSystem, ActorSystemConfig, SystemError, SystemResources, SystemState, SystemStatus,
     },
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+// Commit first, release every displaced registration outside all locks, then
+// report cleanup errors. One destructor panic must not skip later retirements.
+fn retire_registrations<T>(values: impl IntoIterator<Item = T>) -> Result<(), SystemError> {
+    let mut failed = false;
+    for value in values {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
+        {
+            failed = true;
+            if let Err(secondary) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+            {
+                std::mem::forget(secondary);
+            }
+        }
+    }
+    if failed {
+        Err(SystemError::Other(anyhow::anyhow!(
+            "registration committed but displaced resource cleanup panicked"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_spawn<A: Send + 'static, C: Send + 'static>(
+    actor: crate::owned_payload::OwnedPayload<A>,
+    config: crate::owned_payload::OwnedPayload<C>,
+    error: SystemError,
+) -> parrot_api::types::BoxedFuture<'static, Result<Box<dyn ActorRef>, SystemError>> {
+    Box::pin(async move {
+        let (actor, config) = tokio::join!(actor.retire(), config.retire());
+        actor.and(config).map_err(SystemError::ActorError)?;
+        Err(error)
+    })
+}
 
 /// Supported ActorSystem implementation types
 #[derive(Clone)]
@@ -22,62 +62,81 @@ pub enum ActorSystemImpl {
     Actix(ActixActorSystem),
     /// Thread engine implementation (native shared-pool / dedicated-thread)
     Thread(Arc<ThreadActorSystem>),
+    /// Any production asynchronous runtime, without a new enum arm per backend.
+    Runtime(Arc<dyn parrot_api::engine::AsyncEngineRuntime>),
 }
 
 impl ActorSystemImpl {
-    /// Forward spawn_root_typed method; generic version returns an error
-    pub async fn spawn_root_typed<A: Actor + 'static>(
-        &self,
-        _actor: A,
-        _config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError> {
+    fn identity(&self) -> (u8, usize) {
         match self {
-            ActorSystemImpl::Actix(_) => {
-                Err(SystemError::ActorCreationError(
-                    "Generic actor creation not supported directly. Use spawn_root_typed_actix for Actix system.".to_string()
-                ))
-            },
-            ActorSystemImpl::Thread(sys) => {
-                // The engine-specific typed entry point requires the
-                // `Context = ThreadContext<A>` bound, which cannot be proven
-                // from the fully generic context; return a helpful error.
-                let _ = sys;
-                Err(SystemError::ActorCreationError(
-                    "Generic actor creation not supported directly. Use spawn_root_thread for the thread system.".to_string()
-                ))
-            },
-            // Add branches for other system types
+            Self::Actix(system) => (0, Arc::as_ptr(&system.registry) as usize),
+            Self::Thread(system) => (1, Arc::as_ptr(&system.registry) as usize),
+            Self::Runtime(system) => (2, Arc::as_ptr(system) as *const () as usize),
         }
     }
 
-    /// Actix-specific spawn method with necessary type constraints
-    pub async fn spawn_root_typed_actix<A>(
-        &self,
+    /// Spawn a type-erased actor on either built-in engine. Each engine adapts
+    /// the public `dyn ActorContext` contract to its concrete native context.
+    pub fn spawn_root_boxed<'a>(
+        &'a self,
+        actor: Box<dyn Actor<Config = Box<dyn std::any::Any + Send>, Context = dyn ActorContext>>,
+        config: Box<dyn std::any::Any + Send>,
+    ) -> parrot_api::types::BoxedFuture<'a, Result<Box<dyn ActorRef>, SystemError>> {
+        // Construct the native owner now, before returning any outer future.
+        match self {
+            Self::Thread(sys) => {
+                <ThreadActorSystem as ActorSystem>::spawn_root_boxed(&**sys, actor, config)
+            }
+            Self::Actix(sys) => Box::pin(sys.spawn_root_boxed(actor, config)),
+            Self::Runtime(sys) => sys.spawn(actor, config, Default::default()),
+        }
+    }
+
+    /// Forward spawn_root_typed method; generic version returns an error
+    pub fn spawn_root_typed<'a, A: Actor + 'static>(
+        &'a self,
         actor: A,
         config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError>
+    ) -> parrot_api::types::BoxedFuture<'a, Result<Box<dyn ActorRef>, SystemError>> {
+        let actor = crate::owned_payload::OwnedPayload::unbound(actor);
+        let config = crate::owned_payload::OwnedPayload::unbound(config);
+        let message = match self {
+            Self::Actix(_) => {
+                "Generic actor creation not supported directly. Use spawn_root_typed_actix for Actix system."
+            }
+            Self::Thread(_) => {
+                "Generic actor creation not supported directly. Use spawn_root_thread for the thread system."
+            }
+            Self::Runtime(_) => "Use the asynchronous runtime interface for engine-neutral actors",
+        };
+        reject_spawn(
+            actor,
+            config,
+            SystemError::ActorCreationError(message.into()),
+        )
+    }
+
+    /// Actix-specific spawn method with necessary type constraints
+    pub fn spawn_root_typed_actix<'a, A>(
+        &'a self,
+        actor: A,
+        config: A::Config,
+    ) -> parrot_api::types::BoxedFuture<'a, Result<Box<dyn ActorRef>, SystemError>>
     where
         A: Actor<Context = crate::actix::context::ActixContext<crate::actix::actor::ActixActor<A>>>
             + parrot_api::actor::ActixEngineExt<
                 Context = crate::actix::context::ActixContext<crate::actix::actor::ActixActor<A>>,
-            > + std::marker::Unpin
+            > + Unpin
             + 'static,
     {
-        // Move actor and config into a local tuple to avoid capturing external variables in the async block
-        let actor_data = (actor, config);
-        let self_clone = self.clone();
-
-        async move {
-            match self_clone {
-                ActorSystemImpl::Actix(sys) => {
-                    sys.spawn_root_typed(actor_data.0, actor_data.1).await
-                }
-                _ => Err(SystemError::ActorCreationError(
-                    "Not an Actix system".to_string(),
-                )),
-            }
+        match self {
+            Self::Actix(sys) => Box::pin(sys.spawn_root_typed(actor, config)),
+            _ => reject_spawn(
+                crate::owned_payload::OwnedPayload::unbound(actor),
+                crate::owned_payload::OwnedPayload::unbound(config),
+                SystemError::ActorCreationError("Not an Actix system".into()),
+            ),
         }
-        .await
     }
 
     /// Forward get_actor method
@@ -99,6 +158,7 @@ impl ActorSystemImpl {
                     use parrot_api::system::ActorSystem as _;
                     sys.get_actor(&path_copy).await
                 }
+                ActorSystemImpl::Runtime(sys) => sys.get_actor(&path_copy.path).await,
             }
         }
         .await
@@ -116,7 +176,10 @@ impl ActorSystemImpl {
                 ActorSystemImpl::Thread(sys) => {
                     use parrot_api::system::ActorSystem as _;
                     sys.broadcast(msg_copy).await
-                } // Add branches for other system types
+                }
+                ActorSystemImpl::Runtime(_) => Err(SystemError::Other(anyhow::anyhow!(
+                    "registered asynchronous runtime does not expose broadcast"
+                ))),
             }
         }
         .await
@@ -130,7 +193,7 @@ impl ActorSystemImpl {
                 .shutdown_internal()
                 .await
                 .map_err(|e| SystemError::Other(anyhow::anyhow!(e.to_string()))),
-            // Add branches for other system types
+            ActorSystemImpl::Runtime(sys) => sys.shutdown().await,
         }
     }
 }
@@ -149,65 +212,125 @@ pub trait RemoteGateway: Send + Sync + 'static {
 /// parrot 与 parrot-remote 共见，同 RemoteGateway 的倒置模式）。
 pub use parrot_api::receptionist::ReceptionistGateway;
 
+type PrefixHandlers = RwLock<Vec<(String, Arc<dyn ActorRef>)>>;
+
 /// ParrotActorSystem manages multiple ActorSystem implementations
 pub struct ParrotActorSystem {
+    started_at: Instant,
     // Main system configuration
-    #[allow(dead_code)] // 配置快照保留（远程网关读取）
     config: ActorSystemConfig,
     // Store registered ActorSystem implementations, using name as key
-    systems: RwLock<HashMap<String, ActorSystemImpl>>,
+    systems: Arc<RwLock<HashMap<String, ActorSystemImpl>>>,
     // Default system name
-    default_system: RwLock<Option<String>>,
+    default_system: Arc<RwLock<Option<String>>>,
     // Remote gateway (optional; DEV_01 §3.7 facade 三级路由的远程出口)
     remote: RwLock<Option<std::sync::Arc<dyn RemoteGateway>>>,
     // Receptionist gateway（K2——双引擎 context 三方法转发出口）
     receptionist: RwLock<Option<std::sync::Arc<dyn ReceptionistGateway>>>,
     // 前缀通配处理器（DEV_04 §7.1——ShardRouter 的 `/user/entity-*` 注册面；
-    // 本地 registry 特例：命中即拦截，位于本地默认系统查找之前）
-    prefix_handlers: RwLock<Vec<(String, std::sync::Arc<dyn ActorRef>)>>,
+    // 具体本地actor未命中之后，按最长前缀兜底）
+    prefix_handlers: Arc<PrefixHandlers>,
     // 镜像策略（F2 DEV_09 §3.6）：src_prefix 命中的目标引用被包成双写
     // MirrorRef——tell/ask 原路 + 镜像副本（fire-and-forget，失败不回传）
-    mirror_policies: RwLock<Vec<crate::mirror::MirrorPolicy>>,
+    mirrors: Arc<crate::mirror::MirrorRegistry>,
+    lifecycle: Arc<shutdown::Lifecycle>,
+    topology: Arc<topology::Node>,
+    runtime: Option<tokio::runtime::Handle>,
+    cleanup_slots: Arc<tokio::sync::Semaphore>,
+}
+
+// Workers resolve the current shadow generation for each copy. Weak registry
+// handles avoid retaining the facade/engines through old source references.
+struct LocalMirrorLookup {
+    systems: std::sync::Weak<RwLock<HashMap<String, ActorSystemImpl>>>,
+    default_system: std::sync::Weak<RwLock<Option<String>>>,
+    prefixes: std::sync::Weak<PrefixHandlers>,
+}
+impl crate::mirror::MirrorLookup for LocalMirrorLookup {
+    fn lookup<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> parrot_api::types::BoxedFuture<'a, Option<parrot_api::types::BoxedActorRef>> {
+        Box::pin(async move {
+            let default = self.default_system.upgrade()?.read().ok()?.clone();
+            let systems = {
+                let registry = self.systems.upgrade()?;
+                let guard = registry.read().ok()?;
+                let mut systems: Vec<_> = guard
+                    .iter()
+                    .map(|(name, system)| (name.clone(), system.clone()))
+                    .collect();
+                systems.sort_by_key(|(name, _)| (Some(name) != default.as_ref(), name.clone()));
+                systems
+            };
+            let actor_path = ActorPath::placeholder(path);
+            for (_, system) in systems {
+                if let Some(actor) = system.get_actor(&actor_path).await {
+                    return Some(actor);
+                }
+            }
+            let registry = self.prefixes.upgrade()?;
+            let handler = registry
+                .read()
+                .ok()?
+                .iter()
+                .find(|(prefix, _)| path.starts_with(prefix))
+                .map(|(_, actor)| actor.clone());
+            handler.map(|actor| actor.clone_boxed())
+        })
+    }
 }
 
 impl ParrotActorSystem {
     /// Create new ParrotActorSystem
     pub async fn new(config: ActorSystemConfig) -> Result<Self, SystemError> {
         Ok(Self {
+            started_at: Instant::now(),
             config,
-            systems: RwLock::new(HashMap::new()),
-            default_system: RwLock::new(None),
+            systems: Arc::new(RwLock::new(HashMap::new())),
+            default_system: Arc::new(RwLock::new(None)),
             remote: RwLock::new(None),
             receptionist: RwLock::new(None),
-            prefix_handlers: RwLock::new(Vec::new()),
-            mirror_policies: RwLock::new(Vec::new()),
+            prefix_handlers: Arc::new(RwLock::new(Vec::new())),
+            mirrors: Arc::new(crate::mirror::MirrorRegistry::default()),
+            lifecycle: Arc::default(),
+            topology: Arc::default(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            cleanup_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
     /// Register a receptionist gateway（K2 注入面——context 三方法出口）。
     ///
-    /// 注入时向已注册的 thread 引擎系统下发（后注册的 thread 系统在
-    /// register_thread_system 时继承）。
+    /// Publish to registered Thread and Actix systems. Systems registered later
+    /// inherit the current gateway before they become visible in this facade.
     pub async fn register_receptionist_gateway(
         &self,
         gw: std::sync::Arc<dyn ReceptionistGateway>,
     ) -> Result<(), SystemError> {
-        {
-            let mut g = self
+        // Serialize publication, propagation and late engine registration in
+        // systems -> facade gateway -> engine gateway lock order. Arc swaps do
+        // not call user code. Retain every displaced object until ALL locks end.
+        let retired = {
+            let systems = self
+                .systems
+                .read()
+                .map_err(|_| SystemError::Other(anyhow::anyhow!("systems lock poisoned")))?;
+            let mut current = self
                 .receptionist
                 .write()
-                .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
-            *g = Some(gw.clone());
-        }
-        // 下发到已注册的 thread 系统
-        if let Ok(systems) = self.systems.read() {
-            for sys in systems.values() {
-                if let ActorSystemImpl::Thread(ts) = sys {
-                    ts.set_receptionist_gateway(gw.clone());
-                }
+                .map_err(|_| SystemError::Other(anyhow::anyhow!("receptionist lock poisoned")))?;
+            let mut retired = vec![current.replace(gw.clone())];
+            for system in systems.values() {
+                retired.push(match system {
+                    ActorSystemImpl::Thread(thread) => thread.swap_receptionist_gateway(gw.clone()),
+                    ActorSystemImpl::Actix(actix) => actix.swap_receptionist_gateway(gw.clone()),
+                    ActorSystemImpl::Runtime(_) => None,
+                });
             }
-        }
-        Ok(())
+            retired
+        };
+        retire_registrations(retired)
     }
 
     /// 全局 receptionist 句柄（双引擎 context 转发用——Weak 防循环持有）。
@@ -217,18 +340,18 @@ impl ParrotActorSystem {
 
     /// Register a remote gateway（与 register_thread_system 同族命名/风格）。
     ///
-    /// 注入后 `get_actor` 的解析管线变为三级：本地 default → 本地遍历 →
-    /// 远程网关（parrot:// 前缀路径）。本地优先级不变（05 §3.2 ①）。
+    /// `parrot://` 显式远程路径优先交给网关，其结果不会回退到本地。
+    /// 其它路径仍依次查询默认引擎、其它引擎、最长前缀处理器。
     pub async fn register_remote_gateway(
         &self,
         gw: std::sync::Arc<dyn RemoteGateway>,
     ) -> Result<(), SystemError> {
-        let mut g = self
+        let old = self
             .remote
             .write()
-            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
-        *g = Some(gw);
-        Ok(())
+            .map_err(|_| SystemError::Other(anyhow::anyhow!("remote gateway lock poisoned")))?
+            .replace(gw);
+        retire_registrations([old])
     }
 
     /// 配置切面一站式入口：单进程纯本地引擎（thread）从折叠配置构建。
@@ -239,65 +362,94 @@ impl ParrotActorSystem {
     pub async fn from_config(
         r: &parrot_config::Resolved,
     ) -> Result<Arc<crate::thread::system::ThreadActorSystem>, SystemError> {
-        let sys = crate::thread::system::ThreadActorSystem::new(
+        Ok(crate::thread::system::ThreadActorSystem::shared(
             crate::thread::config::ThreadActorSystemConfig::from_resolved(r),
-        );
-        Ok(std::sync::Arc::new(sys))
+        ))
     }
 
     /// Register an Actix system
+    ///
+    /// Names are opaque keys, including the empty string. The first registered
+    /// engine becomes the default even when `set_as_default` is false.
     pub async fn register_actix_system(
         &self,
         name: String,
         system: ActixActorSystem,
         set_as_default: bool,
     ) -> Result<(), SystemError> {
+        let topology = topology::mutation();
+        let lifecycle = self.lifecycle.receipt.lock().unwrap();
+        if lifecycle.is_some() {
+            return Err(SystemError::ShuttingDown);
+        }
         let mut systems = self
             .systems
             .write()
             .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
 
-        // Store the system
-        systems.insert(name.clone(), ActorSystemImpl::Actix(system));
+        let retired_gateway = self
+            .receptionist_gateway()
+            .and_then(|gw| system.swap_receptionist_gateway(gw));
+        let old = systems.insert(name.clone(), ActorSystemImpl::Actix(system));
 
         // Set as default if needed
         if set_as_default || self.default_system.read().unwrap().is_none() {
-            *self.default_system.write().unwrap() = Some(name);
+            *self.default_system.write().unwrap() = Some(name.clone());
         }
 
-        Ok(())
+        self.topology.set(&name, None);
+        drop(systems);
+        drop(lifecycle);
+        drop(topology);
+        let gateway_cleanup = retire_registrations([retired_gateway]);
+        let system_cleanup = retire_registrations([old]);
+        gateway_cleanup.and(system_cleanup)
     }
 
     /// Register a thread engine system
+    ///
+    /// Names are opaque keys, including the empty string. The first registered
+    /// engine becomes the default even when `set_as_default` is false.
     pub async fn register_thread_system(
         &self,
         name: String,
         system: Arc<ThreadActorSystem>,
         set_as_default: bool,
     ) -> Result<(), SystemError> {
+        let topology = topology::mutation();
+        let lifecycle = self.lifecycle.receipt.lock().unwrap();
+        if lifecycle.is_some() {
+            return Err(SystemError::ShuttingDown);
+        }
         let mut systems = self
             .systems
             .write()
             .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire write lock")))?;
 
-        // K2：facade 已有 receptionist 网关 → 新 thread 系统继承（context 三方法可用）
-        if let Some(gw) = self.receptionist_gateway() {
-            system.set_receptionist_gateway(gw);
-        }
-
-        // Store the system
-        systems.insert(name.clone(), ActorSystemImpl::Thread(system));
-
-        // Set as default if needed
+        // No user destructor may run while this facade's registry is locked.
+        let retired_gateway = self
+            .receptionist_gateway()
+            .and_then(|gw| system.swap_receptionist_gateway(gw));
+        let old = systems.insert(name.clone(), ActorSystemImpl::Thread(system));
         if set_as_default || self.default_system.read().unwrap().is_none() {
-            *self.default_system.write().unwrap() = Some(name);
+            *self.default_system.write().unwrap() = Some(name.clone());
         }
-
-        Ok(())
+        self.topology.set(&name, None);
+        drop(systems);
+        drop(lifecycle);
+        drop(topology);
+        // Retire both even if one user destructor panics.
+        let gateway_cleanup = retire_registrations([retired_gateway]);
+        let system_cleanup = retire_registrations([old]);
+        gateway_cleanup.and(system_cleanup)
     }
 
     /// Set default system
     pub fn set_default_system(&self, name: &str) -> Result<(), SystemError> {
+        let lifecycle = self.lifecycle.receipt.lock().unwrap();
+        if lifecycle.is_some() {
+            return Err(SystemError::ShuttingDown);
+        }
         // Verify system exists
         let systems = self
             .systems
@@ -319,16 +471,10 @@ impl ParrotActorSystem {
     /// Get default system
     #[allow(dead_code)] // 公共 API 委托入口保留
     fn get_default_system_impl(&self) -> Result<ActorSystemImpl, SystemError> {
-        let guard = self
-            .default_system
-            .read()
-            .map_err(|_| SystemError::Other(anyhow::anyhow!("Failed to acquire read lock")))?;
-
-        let default_name = guard
-            .as_ref()
-            .ok_or_else(|| SystemError::Other(anyhow::anyhow!("No default system registered")))?;
-
-        self.get_system_impl(default_name)
+        // Release the default-name guard before taking systems: registration
+        // uses systems -> default and must never encounter the reverse order.
+        let default_name = self.get_default_system_name()?;
+        self.get_system_impl(&default_name)
     }
 
     /// Get system by name
@@ -359,33 +505,38 @@ impl ParrotActorSystem {
     }
 
     /// Create actor in default system
-    pub async fn internal_spawn_actor<A: Actor + 'static>(
-        &self,
+    pub fn internal_spawn_actor<'a, A: Actor + 'static>(
+        &'a self,
         actor: A,
         config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError> {
-        // First, retrieve the default system name and release the lock immediately
-        let default_name = self.get_default_system_name()?;
-
-        // Then clone the system to avoid holding the lock across an await
-        let system = self.get_system_impl(&default_name)?;
-
-        // Perform the actual spawn operation in a new async block
-        // No locks are held at this point, so the future can safely be sent across threads
-        system.spawn_root_typed(actor, config).await
+    ) -> parrot_api::types::BoxedFuture<'a, Result<Box<dyn ActorRef>, SystemError>> {
+        let actor = self.own(actor);
+        let config = self.own(config);
+        Box::pin(async move {
+            let system = match self.get_creation_system(None) {
+                Ok(system) => system,
+                Err(error) => return reject_spawn(actor, config, error).await,
+            };
+            system.spawn_root_typed(actor.take(), config.take()).await
+        })
     }
 
     /// Create actor in specified system
-    pub async fn spawn_actor_in_system<A: Actor + 'static>(
-        &self,
-        system_name: &str,
+    pub fn spawn_actor_in_system<'a, A: Actor + 'static>(
+        &'a self,
+        system_name: &'a str,
         actor: A,
         config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError> {
-        // Use get_system_impl to get a cloned system instance
-        let system = self.get_system_impl(system_name)?;
-
-        system.spawn_root_typed(actor, config).await
+    ) -> parrot_api::types::BoxedFuture<'a, Result<Box<dyn ActorRef>, SystemError>> {
+        let actor = self.own(actor);
+        let config = self.own(config);
+        Box::pin(async move {
+            let system = match self.get_creation_system(Some(system_name)) {
+                Ok(system) => system,
+                Err(error) => return reject_spawn(actor, config, error).await,
+            };
+            system.spawn_root_typed(actor.take(), config.take()).await
+        })
     }
 
     /// Query actor by path
@@ -393,33 +544,28 @@ impl ParrotActorSystem {
         // 远程分支（一级）：parrot:// 前缀且网关注册 → 远程 ref。
         // 置于本地解析之前——parrot:// 是显式远程意图（05 §3.2 解析管线：
         // 显式协议前缀优先于本地命中；本地系统注册的是 /user/... 本地路径）
-        if path.path.starts_with("parrot://")
-            && let Ok(g) = self.remote.read()
-            && let Some(gw) = g.as_ref()
-        {
-            return gw.lookup(&path.path);
+        if path.path.starts_with("parrot://") {
+            let gateway = self.remote.read().ok().and_then(|g| g.clone());
+            if let Some(gateway) = gateway {
+                return gateway.lookup(&path.path);
+            }
         }
 
         // Try to get the actor from the default system
-        let default_system = match self.get_default_system_name() {
-            Ok(name) => name,
-            Err(_) => "".to_string(), // Use an empty string to indicate no default system
-        };
-
-        if !default_system.is_empty() {
-            // Clone the default system instance
-            if let Ok(system) = self.get_system_impl(&default_system)
-                && let Some(actor) = system.get_actor(path).await
-            {
-                return Some(actor);
-            }
+        // An empty name is a valid registry key, not an absent default.
+        let default_system = self.get_default_system_name().ok();
+        if let Some(default_name) = default_system.as_ref()
+            && let Ok(system) = self.get_system_impl(default_name)
+            && let Some(actor) = system.get_actor(path).await
+        {
+            return Some(actor);
         }
 
         // If not found in the default system, try all registered systems
         if let Ok(system_names) = self.list_registered_systems() {
             for name in system_names {
                 // Skip the default system which has already been checked
-                if name == default_system {
+                if default_system.as_deref() == Some(name.as_str()) {
                     continue;
                 }
 
@@ -434,13 +580,13 @@ impl ParrotActorSystem {
         // 前缀通配兜底（DEV_04 §7.1）：显式 actor 未命中 → 最长前缀
         // handler（ShardRouter 惰性激活入口）。位于本地查找之后——
         // 显式 spawn 的 actor 优先于通配。
-        if let Ok(g) = self.prefix_handlers.read()
-            && let Some((_, handler)) = g.iter().find(|(p, _)| path.path.starts_with(p.as_str()))
-        {
-            return Some(handler.clone_boxed());
-        }
-
-        None
+        let handler = self.prefix_handlers.read().ok().and_then(|handlers| {
+            handlers
+                .iter()
+                .find(|(p, _)| path.path.starts_with(p.as_str()))
+                .map(|(_, handler)| handler.clone())
+        });
+        handler.map(|handler| handler.clone_boxed())
     }
 
     /// get_actor 镜像包装出口（F2）：命中策略的引用包 MirrorRef 双写。
@@ -449,10 +595,16 @@ impl ParrotActorSystem {
         path: &parrot_api::address::ActorPath,
     ) -> Option<Box<dyn ActorRef>> {
         let actor = self.internal_get_actor(path).await?;
-        if let Some(policy) = self.mirror_policy_for(&path.path) {
+        if let Some(handle) = self.mirrors.find(&path.path) {
+            let lookup = Arc::new(LocalMirrorLookup {
+                systems: Arc::downgrade(&self.systems),
+                default_system: Arc::downgrade(&self.default_system),
+                prefixes: Arc::downgrade(&self.prefix_handlers),
+            });
             return Some(Box::new(crate::mirror::MirrorRef::new(
                 std::sync::Arc::from(actor),
-                policy,
+                lookup,
+                handle,
             )));
         }
         Some(actor)
@@ -475,12 +627,19 @@ impl ParrotActorSystem {
         &self,
         msg: M,
     ) -> Result<(), SystemError> {
-        // Get all registered system names
-        let system_names = self.list_registered_systems()?;
-
-        for name in system_names {
-            // Clone each system instance
-            if let Ok(system) = self.get_system_impl(&name) {
+        // Capture one stable selection before invoking any user Clone or engine.
+        let systems: Vec<_> = self.systems.read().unwrap().values().cloned().collect();
+        if systems
+            .iter()
+            .any(|system| matches!(system, ActorSystemImpl::Runtime(_)))
+        {
+            return Err(SystemError::Other(anyhow::anyhow!(
+                "registered asynchronous runtime does not expose broadcast"
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for system in systems {
+            if seen.insert(system.identity()) {
                 system.broadcast(msg.clone()).await?;
             }
         }
@@ -490,141 +649,131 @@ impl ParrotActorSystem {
 
     /// Shutdown all systems
     pub async fn internal_shutdown(self) -> Result<(), SystemError> {
-        println!("ParrotActorSystem: Starting shutdown sequence");
-
-        let systems = match self.systems.into_inner() {
-            Ok(systems) => systems,
-            Err(_) => {
-                println!("ParrotActorSystem: Failed to unwrap systems");
-                return Err(SystemError::Other(anyhow::anyhow!(
-                    "Failed to unwrap systems"
-                )));
-            }
-        };
-
-        println!(
-            "ParrotActorSystem: Shutting down {} registered systems",
-            systems.len()
-        );
-
-        let mut errors = Vec::new();
-
-        for (name, system) in systems {
-            println!("ParrotActorSystem: Shutting down system '{}'", name);
-            if let Err(e) = system.shutdown().await {
-                let error_msg = format!("Failed to shut down system {}: {}", name, e);
-                println!("ParrotActorSystem: {}", error_msg);
-                errors.push(error_msg);
-            } else {
-                println!("ParrotActorSystem: System '{}' shutdown completed", name);
-            }
-        }
-
-        if errors.is_empty() {
-            println!("ParrotActorSystem: All systems shutdown successfully");
-            Ok(())
-        } else {
-            let error_msg = errors.join("; ");
-            println!(
-                "ParrotActorSystem: Shutdown completed with errors: {}",
-                error_msg
-            );
-            Err(SystemError::Other(anyhow::anyhow!(error_msg)))
-        }
+        self.shutdown_runtime().await
     }
 
     /// Spawn an actor specific to the Actix system
     ///
     /// This method is an Actix-specific version of spawn_root_typed,
     /// designed for actors compatible with the Actix backend
-    pub async fn spawn_root_actix<A>(
-        &self,
+    pub fn spawn_root_actix<'a, A>(
+        &'a self,
         actor: A,
         config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError>
+    ) -> parrot_api::types::BoxedFuture<'a, Result<Box<dyn ActorRef>, SystemError>>
     where
         A: Actor<Context = crate::actix::context::ActixContext<crate::actix::actor::ActixActor<A>>>
             + parrot_api::actor::ActixEngineExt<
                 Context = crate::actix::context::ActixContext<crate::actix::actor::ActixActor<A>>,
-            > + std::marker::Unpin
+            > + Unpin
             + 'static,
     {
-        // Get the default system name
-        let default_name = self.get_default_system_name()?;
-
-        // Get the system instance
-        let system = self.get_system_impl(&default_name)?;
-
-        // Check if the default system is an Actix system
-        match system {
-            ActorSystemImpl::Actix(_) => {
-                // Use the Actix-specific spawn method
-                system.spawn_root_typed_actix(actor, config).await
+        let actor = self.own(actor);
+        let config = self.own(config);
+        Box::pin(async move {
+            let system = match self.get_creation_system(None) {
+                Ok(system) => system,
+                Err(error) => return reject_spawn(actor, config, error).await,
+            };
+            match system {
+                ActorSystemImpl::Actix(_) => {
+                    system
+                        .spawn_root_typed_actix(actor.take(), config.take())
+                        .await
+                }
+                _ => {
+                    reject_spawn(
+                        actor,
+                        config,
+                        SystemError::ActorCreationError(
+                            "Default system is not an Actix system".into(),
+                        ),
+                    )
+                    .await
+                }
             }
-            _ => Err(SystemError::ActorCreationError(
-                "Default system is not an Actix system".to_string(),
-            )),
-        }
+        })
     }
 
     /// Spawn an actor specific to the thread engine system
     ///
     /// This method is a thread-engine-specific version of spawn_root_typed,
     /// designed for actors whose `Context` is `ThreadContext<A>`.
-    pub async fn spawn_root_thread<A>(
-        &self,
+    pub fn spawn_root_thread<'a, A>(
+        &'a self,
         actor: A,
         config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError>
+    ) -> parrot_api::types::BoxedFuture<'a, Result<Box<dyn ActorRef>, SystemError>>
     where
         A: Actor<Context = crate::thread::context::ThreadContext<A>> + Send + Sync + 'static,
     {
-        // Get the default system name
-        let default_name = self.get_default_system_name()?;
-
-        // Get the system instance
-        let system = self.get_system_impl(&default_name)?;
-
-        // Check if the default system is a thread engine system
-        match system {
-            ActorSystemImpl::Thread(sys) => {
-                let typed_ref = sys
-                    .spawn_root_typed_thread(actor, config)
+        let actor = self.own(actor);
+        let config = self.own(config);
+        Box::pin(async move {
+            let system = match self.get_creation_system(None) {
+                Ok(system) => system,
+                Err(error) => return reject_spawn(actor, config, error).await,
+            };
+            match system {
+                ActorSystemImpl::Thread(sys) => {
+                    let reference = sys
+                        .spawn_root_typed_thread(actor.take(), config.take())
+                        .await
+                        .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
+                    Ok(Box::new(reference) as Box<dyn ActorRef>)
+                }
+                _ => {
+                    reject_spawn(
+                        actor,
+                        config,
+                        SystemError::ActorCreationError(
+                            "Default system is not a thread engine system".to_string(),
+                        ),
+                    )
                     .await
-                    .map_err(|e| SystemError::ActorCreationError(e.to_string()))?;
-                Ok(Box::new(typed_ref) as Box<dyn ActorRef>)
+                }
             }
-            _ => Err(SystemError::ActorCreationError(
-                "Default system is not a thread engine system".to_string(),
-            )),
-        }
+        })
     }
 
     /// Spawn an actor specific to the thread engine system in a named system
-    pub async fn spawn_root_thread_in_system<A>(
-        &self,
-        system_name: &str,
+    pub fn spawn_root_thread_in_system<'a, A>(
+        &'a self,
+        system_name: &'a str,
         actor: A,
         config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError>
+    ) -> parrot_api::types::BoxedFuture<'a, Result<Box<dyn ActorRef>, SystemError>>
     where
         A: Actor<Context = crate::thread::context::ThreadContext<A>> + Send + Sync + 'static,
     {
-        let system = self.get_system_impl(system_name)?;
-
-        match system {
-            ActorSystemImpl::Thread(sys) => {
-                let typed_ref = sys
-                    .spawn_root_typed_thread(actor, config)
+        let actor = self.own(actor);
+        let config = self.own(config);
+        Box::pin(async move {
+            let system = match self.get_creation_system(Some(system_name)) {
+                Ok(system) => system,
+                Err(error) => return reject_spawn(actor, config, error).await,
+            };
+            match system {
+                ActorSystemImpl::Thread(sys) => {
+                    let reference = sys
+                        .spawn_root_typed_thread(actor.take(), config.take())
+                        .await
+                        .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
+                    Ok(Box::new(reference) as Box<dyn ActorRef>)
+                }
+                _ => {
+                    reject_spawn(
+                        actor,
+                        config,
+                        SystemError::ActorCreationError(format!(
+                            "System '{}' is not a thread engine system",
+                            system_name
+                        )),
+                    )
                     .await
-                    .map_err(|e| SystemError::ActorCreationError(e.to_string()))?;
-                Ok(Box::new(typed_ref) as Box<dyn ActorRef>)
+                }
             }
-            _ => Err(SystemError::ActorCreationError(format!(
-                "System '{}' is not a thread engine system",
-                system_name
-            ))),
-        }
+        })
     }
 
     /// 注册前缀通配处理器（DEV_04 §7.1——ShardRouter 的 facade 注册面）。
@@ -633,60 +782,93 @@ impl ParrotActorSystem {
     /// actor 时路由到 `handler`（最长前缀优先）。用于 cluster sharding
     /// 的实体惰性激活——`/user/entity-{key}` → ShardRouter → ring 放置。
     ///
-    /// 顺序（DEV_04 §7.1）：本地前缀 handler 在**远程分支之前**、显式
-    /// 本地查找之后——前缀是"本地 registry 特例"而非远程意图。
+    /// 显式parrot://远程意图优先，其次本地actor，最后最长前缀。
+    /// 同一prefix再次注册替换旧handler；已捕获的引用不被撤销。
     pub fn register_prefix_handler(
         &self,
         prefix: impl Into<String>,
         handler: std::sync::Arc<dyn ActorRef>,
     ) -> Result<(), SystemError> {
-        let mut g = self
-            .prefix_handlers
-            .write()
-            .map_err(|_| SystemError::Other(anyhow::anyhow!("prefix handler lock poisoned")))?;
+        // Into<String> and a rejected handler's Drop are user code too.
         let prefix = prefix.into();
         if !prefix.ends_with('-') && !prefix.ends_with('/') {
             return Err(SystemError::ActorCreationError(format!(
                 "prefix handler must end with '-' or '/' (got {prefix:?})——通配语义锚点"
             )));
         }
-        // 最长前缀优先：插到更短前缀之前（查找线性扫，命中即中）
-        let pos = g
-            .iter()
-            .position(|(p, _)| p.len() < prefix.len())
-            .unwrap_or(g.len());
-        g.insert(pos, (prefix, handler));
-        Ok(())
+        let old = {
+            let mut handlers = self
+                .prefix_handlers
+                .write()
+                .map_err(|_| SystemError::Other(anyhow::anyhow!("prefix handler lock poisoned")))?;
+            if let Some((_, existing)) = handlers.iter_mut().find(|(p, _)| p == &prefix) {
+                Some(std::mem::replace(existing, handler))
+            } else {
+                let pos = handlers
+                    .iter()
+                    .position(|(p, _)| p.len() < prefix.len())
+                    .unwrap_or(handlers.len());
+                handlers.insert(pos, (prefix, handler));
+                None
+            }
+        };
+        retire_registrations([old])
     }
 
-    /// 注册镜像策略（F2 DEV_09 §3.6）：`src_prefix` 命中的目标引用
-    /// 被 [`crate::mirror::MirrorRef`] 包装——原投递 + mirror_path 副本。
-    ///
-    /// 镜像副本 fire-and-forget：投递失败仅记日志（不回传错误——
-    /// 调试面不得影响业务路径）。
-    pub fn register_mirror_policy(&self, policy: crate::mirror::MirrorPolicy) {
-        let mut g = self.mirror_policies.write().unwrap();
-        // 同 src_prefix 幂等替换
-        g.retain(|p| p.src_prefix != policy.src_prefix);
-        g.push(policy);
+    /// Remove only this exact prefix. Captured references remain valid; future
+    /// lookups use the remaining longest prefix or explicit local actor.
+    pub fn unregister_prefix_handler(&self, prefix: &str) -> Result<bool, SystemError> {
+        let old = {
+            let mut handlers = self
+                .prefix_handlers
+                .write()
+                .map_err(|_| SystemError::Other(anyhow::anyhow!("prefix handler lock poisoned")))?;
+            handlers
+                .iter()
+                .position(|(p, _)| p == prefix)
+                .map(|index| handlers.remove(index))
+        };
+        let existed = old.is_some();
+        retire_registrations([old])?;
+        Ok(existed)
     }
 
-    /// 移除镜像策略。
-    pub fn remove_mirror_policy(&self, src_prefix: &str) {
-        self.mirror_policies
-            .write()
-            .unwrap()
-            .retain(|p| p.src_prefix != src_prefix);
+    /// Register an explicit message copying/size-accounting contract.
+    pub fn register_mirror_copier(
+        &self,
+        copier: crate::mirror::MirrorCopier,
+    ) -> Result<(), crate::mirror::MirrorError> {
+        self.mirrors.register_copier(copier)
     }
 
-    /// 命中策略查找（MirrorRef 包装用——path 前缀匹配首条）。
+    /// Register bounded best-effort shadow delivery for facade lookups.
+    /// At least one message copier must be registered first. The returned
+    /// handle exposes failures and permits explicit cancellation/join.
+    pub fn register_mirror_policy(
+        &self,
+        policy: crate::mirror::MirrorPolicy,
+    ) -> Result<crate::mirror::MirrorHandle, crate::mirror::MirrorError> {
+        self.register_mirror_policy_with_options(policy, crate::mirror::MirrorOptions::default())
+    }
+    pub fn register_mirror_policy_with_options(
+        &self,
+        policy: crate::mirror::MirrorPolicy,
+        options: crate::mirror::MirrorOptions,
+    ) -> Result<crate::mirror::MirrorHandle, crate::mirror::MirrorError> {
+        self.mirrors.register(policy, options)
+    }
+
+    /// Cancel this policy, including copies from previously obtained refs.
+    /// Await the returned handle's shutdown to join its worker.
+    pub fn remove_mirror_policy(&self, src_prefix: &str) -> Option<crate::mirror::MirrorHandle> {
+        self.mirrors.remove(src_prefix)
+    }
+
+    /// Longest matching source prefix; shadow target itself is excluded.
     pub fn mirror_policy_for(&self, path: &str) -> Option<crate::mirror::MirrorPolicy> {
-        self.mirror_policies
-            .read()
-            .unwrap()
-            .iter()
-            .find(|p| path.starts_with(p.src_prefix.as_str()))
-            .cloned()
+        self.mirrors
+            .find(path)
+            .map(|handle| handle.policy().clone())
     }
 
     /// Get a thread engine system by name
@@ -704,37 +886,42 @@ impl ParrotActorSystem {
 #[async_trait]
 impl ActorSystem for ParrotActorSystem {
     async fn start(config: ActorSystemConfig) -> Result<Self, SystemError> {
-        Ok(Self {
-            config,
-            systems: RwLock::new(HashMap::new()),
-            default_system: RwLock::new(None),
-            remote: RwLock::new(None),
-            receptionist: RwLock::new(None),
-            prefix_handlers: RwLock::new(Vec::new()),
-            mirror_policies: RwLock::new(Vec::new()),
-        })
+        Self::new(config).await
     }
 
-    async fn spawn_root_typed<A: Actor + 'static>(
-        &self,
+    fn spawn_root_typed<'life0, 'async_trait, A>(
+        &'life0 self,
         actor: A,
         config: A::Config,
-    ) -> Result<Box<dyn ActorRef>, SystemError> {
-        // Move actor and config into a local variable to avoid holding locks across await points
-        let actor_data = (actor, config);
-
-        // Use the generic implementation; for Actix-compatible actors, use spawn_root_actix
-        async move { self.internal_spawn_actor(actor_data.0, actor_data.1).await }.await
+    ) -> parrot_api::types::BoxedFuture<'async_trait, Result<Box<dyn ActorRef>, SystemError>>
+    where
+        A: Actor + 'static + 'async_trait,
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.internal_spawn_actor(actor, config)
     }
 
-    async fn spawn_root_boxed(
-        &self,
-        _actor: Box<dyn Actor<Config = Box<dyn std::any::Any + Send>, Context = dyn ActorContext>>,
-        _config: Box<dyn std::any::Any + Send>,
-    ) -> Result<Box<dyn ActorRef>, SystemError> {
-        Err(SystemError::ActorCreationError(
-            "Type-erased actor creation not implemented".to_string(),
-        ))
+    fn spawn_root_boxed<'life0, 'async_trait>(
+        &'life0 self,
+        actor: Box<dyn Actor<Config = Box<dyn std::any::Any + Send>, Context = dyn ActorContext>>,
+        config: Box<dyn std::any::Any + Send>,
+    ) -> parrot_api::types::BoxedFuture<'async_trait, Result<Box<dyn ActorRef>, SystemError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let actor = self.own(actor);
+        let config = self.own(config);
+        Box::pin(async move {
+            parrot_api::engine::AsyncEngineRuntime::spawn(
+                self,
+                actor.take(),
+                config.take(),
+                Default::default(),
+            )
+            .await
+        })
     }
 
     async fn get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
@@ -767,18 +954,69 @@ impl ActorSystem for ParrotActorSystem {
         async move { self.internal_broadcast(msg_copy).await }.await
     }
 
+    /// Snapshot unique registered engines, sampling each outside the facade
+    /// lock. Aliases and Actix clones share registry identity. This is not an
+    /// atomic cross-engine snapshot. Uptime belongs to the facade itself.
+    /// Empty registries are ready for registration (Running); otherwise state
+    /// preference is Running, Starting, ShuttingDown, then all Stopped.
     fn status(&self) -> SystemStatus {
-        // Return combined status
-        SystemStatus {
+        let systems: Vec<_> = self.systems.read().unwrap().values().cloned().collect();
+        let mut seen = HashSet::new();
+        let mut state_rank = 0;
+        let mut result = SystemStatus {
             state: SystemState::Running,
             active_actors: 0,
-            uptime: std::time::Duration::from_secs(0),
+            uptime: self.started_at.elapsed(),
             resources: SystemResources {
                 cpu_usage: 0.0,
                 memory_usage: 0,
                 thread_count: 0,
             },
+        };
+        for system in &systems {
+            let identity = system.identity();
+            if !seen.insert(identity) {
+                continue;
+            }
+            let status = match system {
+                ActorSystemImpl::Actix(s) => s.status(),
+                ActorSystemImpl::Thread(s) => s.status(),
+                ActorSystemImpl::Runtime(s) => s.status(),
+            };
+            let rank = match status.state {
+                SystemState::Stopped => 0,
+                SystemState::ShuttingDown => 1,
+                SystemState::Starting => 2,
+                SystemState::Running => 3,
+            };
+            state_rank = state_rank.max(rank);
+            result.active_actors = result.active_actors.saturating_add(status.active_actors);
+            result.resources.thread_count = result
+                .resources
+                .thread_count
+                .saturating_add(status.resources.thread_count);
+            result.resources.memory_usage = result
+                .resources
+                .memory_usage
+                .saturating_add(status.resources.memory_usage);
+            result.resources.cpu_usage += status.resources.cpu_usage;
         }
+        if !seen.is_empty() {
+            result.state = match state_rank {
+                3 => SystemState::Running,
+                2 => SystemState::Starting,
+                1 => SystemState::ShuttingDown,
+                _ => SystemState::Stopped,
+            };
+        }
+        if self.lifecycle.started() {
+            result.state = if self.lifecycle.finished() && state_rank == 0 {
+                SystemState::Stopped
+            } else {
+                SystemState::ShuttingDown
+            };
+        }
+        result
     }
 
     async fn shutdown(self) -> Result<(), SystemError> {
@@ -874,6 +1112,56 @@ mod tests {
 
         // get_thread_system rejects non-thread systems.
         assert!(parrot.get_thread_system("missing").is_err());
+
+        parrot.internal_shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_facade_forwards_boxed_spawn_to_default_thread_system() {
+        struct ErasedEcho;
+        impl Actor for ErasedEcho {
+            type Config = Box<dyn std::any::Any + Send>;
+            type Context = dyn ActorContext;
+
+            fn receive_message<'a>(
+                &'a mut self,
+                msg: BoxedMessage,
+                _ctx: &'a mut Self::Context,
+            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+                Box::pin(async move { Ok(msg) })
+            }
+
+            fn state(&self) -> ActorState {
+                ActorState::Running
+            }
+        }
+
+        let parrot = ParrotActorSystem::new(ActorSystemConfig::default())
+            .await
+            .unwrap();
+        parrot
+            .register_thread_system(
+                "boxed-default".into(),
+                crate::thread::system::ThreadActorSystem::shared(
+                    crate::thread::config::ThreadActorSystemConfig::default(),
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let actor_ref = <ParrotActorSystem as ActorSystem>::spawn_root_boxed(
+            &parrot,
+            Box::new(ErasedEcho),
+            Box::new("facade-config") as Box<dyn std::any::Any + Send>,
+        )
+        .await
+        .expect("facade should forward boxed spawn");
+        let response = actor_ref
+            .send(Box::new(9_u64) as BoxedMessage)
+            .await
+            .expect("facade-spawned actor should answer");
+        assert_eq!(response.downcast::<u64>().unwrap().as_ref(), &9);
 
         parrot.internal_shutdown().await.unwrap();
     }

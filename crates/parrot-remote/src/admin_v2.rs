@@ -102,7 +102,7 @@ pub struct ComponentDeploy {
     pub artifact: AdminArtifactRef,
     pub instances: AdminInstancePolicy,
     /// toml 片段（组件级 config——目标节点方言各自解释；bincode/serde
-    /// 原生支持 Option<Vec<u8>>——无须 bytes 适配层）。
+    /// 原生支持 `Option<Vec<u8>>`——无须 bytes 适配层）。
     #[serde(default)]
     pub config: Option<Vec<u8>>,
 }
@@ -131,6 +131,13 @@ pub enum AdminCommandV2 {
     ComponentStatus { req_id: u64, path_prefix: String },
     /// 采集运行时指标（观测五件套 P1——探针拉取全量快照）。
     MetricsReport { req_id: u64 },
+    /// Availability and counter-owner identity; appended wire discriminant 5.
+    MetricsReportV2 { req_id: u64 },
+    /// Negotiated mirror extension; appended wire discriminant 6.
+    MirrorControl {
+        req_id: u64,
+        command: crate::mirror_control::MirrorControl,
+    },
 }
 
 impl AdminCommandV2 {
@@ -140,7 +147,9 @@ impl AdminCommandV2 {
             | Self::DrainComponent { req_id, .. }
             | Self::StopComponent { req_id, .. }
             | Self::ComponentStatus { req_id, .. }
-            | Self::MetricsReport { req_id } => *req_id,
+            | Self::MetricsReport { req_id }
+            | Self::MetricsReportV2 { req_id }
+            | Self::MirrorControl { req_id, .. } => *req_id,
         }
     }
 
@@ -150,7 +159,9 @@ impl AdminCommandV2 {
             | Self::DrainComponent { req_id, .. }
             | Self::StopComponent { req_id, .. }
             | Self::ComponentStatus { req_id, .. }
-            | Self::MetricsReport { req_id } => *req_id = id,
+            | Self::MetricsReport { req_id }
+            | Self::MetricsReportV2 { req_id }
+            | Self::MirrorControl { req_id, .. } => *req_id = id,
         }
     }
 }
@@ -195,6 +206,16 @@ pub enum AdminReplyV2 {
     Metrics {
         req_id: u64,
         snapshot: MetricsSnapshot,
+    },
+    /// Measured metrics extension, appended wire discriminant 6.
+    MeasuredMetrics {
+        req_id: u64,
+        metrics: crate::metrics::MeasuredMetrics,
+    },
+    /// Negotiated mirror extension; appended wire discriminant 7.
+    MirrorControl {
+        req_id: u64,
+        result: crate::mirror_control::MirrorControlReply,
     },
 }
 
@@ -262,6 +283,8 @@ impl AdminReplyV2 {
             | Self::Stopped { req_id }
             | Self::Status { req_id, .. }
             | Self::Metrics { req_id, .. }
+            | Self::MeasuredMetrics { req_id, .. }
+            | Self::MirrorControl { req_id, .. }
             | Self::Failed { req_id, .. } => *req_id,
         }
     }
@@ -283,6 +306,7 @@ pub mod v2_err {
     pub const FACTORY_NOT_FOUND: u16 = 0x0A05;
     /// B2：实例 spawn 失败（路径冲突 / 调度器拒绝等）。
     pub const SPAWN_FAILED: u16 = 0x0A06;
+    pub const MIRROR_CONTROL: u16 = 0x0A07;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -354,12 +378,18 @@ pub trait ComponentExecutor: Send + Sync {
     async fn drain(&self, req_id: u64, prefix: &str, timeout_ms: u64) -> AdminReplyV2;
     async fn stop(&self, req_id: u64, prefix: &str) -> AdminReplyV2;
     async fn status(&self, req_id: u64, prefix: &str) -> AdminReplyV2;
-    /// 指标快照（观测五件套——默认实现给空快照，方言网关各自覆写）。
+    /// Legacy snapshot. An unimplemented producer must not invent zero values.
     async fn metrics(&self, req_id: u64) -> AdminReplyV2 {
-        AdminReplyV2::Metrics {
+        failed_v2(
             req_id,
-            snapshot: MetricsSnapshot::default(),
-        }
+            v2_err::DIALECT_MISMATCH,
+            "executor does not provide legacy metrics",
+        )
+    }
+    /// Runtime fields owned by this executor; remote transport metrics are
+    /// supplied independently by RemoteActorSystem. Unset bits are unavailable.
+    async fn measured_metrics(&self) -> crate::metrics::MeasuredMetrics {
+        crate::metrics::MeasuredMetrics::default()
     }
 }
 
@@ -370,10 +400,25 @@ pub async fn handle_admin_command_v2(
     back: &crate::transport::FrameSender,
     reply_to: &str,
 ) {
+    let cleanup = crate::ingress::unwind::Cleanup::default();
+    let mut close = cleanup.close_on_failure(back);
     let req_id = cmd.req_id();
-    let reply = match (executor, cmd) {
+    let reply = execute_admin_command_v2(cmd, executor, &cleanup).await;
+    close.disarm();
+    back.send_reply(reply_frame_v2(req_id, reply_to, &reply));
+}
+
+/// Produce a reply before the caller retires its owned executor and publishes it.
+pub(crate) async fn execute_admin_command_v2(
+    cmd: AdminCommandV2,
+    executor: Option<&dyn ComponentExecutor>,
+    cleanup: &crate::ingress::unwind::Cleanup,
+) -> AdminReplyV2 {
+    use crate::ingress::unwind;
+    let req_id = cmd.req_id();
+    let result = match (executor, cmd) {
         (Some(ex), AdminCommandV2::DeployComponent { req_id, component }) => {
-            ex.deploy(req_id, &component).await
+            unwind::run(cleanup, || ex.deploy(req_id, &component)).await
         }
         (
             Some(ex),
@@ -382,60 +427,74 @@ pub async fn handle_admin_command_v2(
                 path_prefix,
                 timeout_ms,
             },
-        ) => ex.drain(req_id, &path_prefix, timeout_ms).await,
+        ) => unwind::run(cleanup, || ex.drain(req_id, &path_prefix, timeout_ms)).await,
         (
             Some(ex),
             AdminCommandV2::StopComponent {
                 req_id,
                 path_prefix,
             },
-        ) => ex.stop(req_id, &path_prefix).await,
+        ) => unwind::run(cleanup, || ex.stop(req_id, &path_prefix)).await,
         (
             Some(ex),
             AdminCommandV2::ComponentStatus {
                 req_id,
                 path_prefix,
             },
-        ) => ex.status(req_id, &path_prefix).await,
-        (Some(ex), AdminCommandV2::MetricsReport { req_id }) => ex.metrics(req_id).await,
-        (None, _) => failed_v2(
+        ) => unwind::run(cleanup, || ex.status(req_id, &path_prefix)).await,
+        (Some(ex), AdminCommandV2::MetricsReport { req_id }) => {
+            unwind::run(cleanup, || ex.metrics(req_id)).await
+        }
+        (Some(ex), AdminCommandV2::MetricsReportV2 { req_id }) => {
+            unwind::run(cleanup, || ex.measured_metrics())
+                .await
+                .map(|metrics| AdminReplyV2::MeasuredMetrics { req_id, metrics })
+        }
+        (Some(_), AdminCommandV2::MirrorControl { .. }) => Ok(failed_v2(
+            req_id,
+            v2_err::DIALECT_MISMATCH,
+            "mirror commands require the owning remote system",
+        )),
+        (None, _) => Ok(failed_v2(
             req_id,
             v2_err::DIALECT_MISMATCH,
             "no ComponentExecutor installed on this node",
-        ),
+        )),
     };
-    let _ = back.send(reply_frame_v2(req_id, reply_to, &reply)).await;
+    let reply = result.unwrap_or_else(|()| {
+        failed_v2(
+            req_id,
+            ErrCode::ProtocolViolation as u16,
+            "component executor panicked",
+        )
+    });
+    finish_admin_reply_v2(req_id, reply, cleanup.failed())
 }
 
-/// v2 回执挂起表（req_id → oneshot；与 v1 AdminPending 同构但类型独立）。
-#[derive(Default)]
-pub struct AdminPendingV2 {
-    inner: std::sync::Mutex<
-        std::collections::HashMap<u64, tokio::sync::oneshot::Sender<AdminReplyV2>>,
-    >,
+pub(crate) fn finish_admin_reply_v2(
+    req_id: u64,
+    reply: AdminReplyV2,
+    cleanup_failed: bool,
+) -> AdminReplyV2 {
+    if reply.req_id() != req_id {
+        failed_v2(
+            req_id,
+            ErrCode::ProtocolViolation as u16,
+            "executor returned a different request id",
+        )
+    } else if cleanup_failed && !matches!(reply, AdminReplyV2::Failed { .. }) {
+        failed_v2(
+            req_id,
+            ErrCode::ProtocolViolation as u16,
+            "component executor cleanup panicked",
+        )
+    } else {
+        reply
+    }
 }
 
-impl AdminPendingV2 {
-    pub fn insert(&self, req_id: u64, tx: tokio::sync::oneshot::Sender<AdminReplyV2>) {
-        self.inner.lock().unwrap().insert(req_id, tx);
-    }
-    pub fn complete(&self, r: AdminReplyV2) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .remove(&r.req_id())
-            .is_some_and(|tx| tx.send(r).is_ok())
-    }
-    pub fn fail_all(&self, detail: &str) {
-        for (_, tx) in self.inner.lock().unwrap().drain() {
-            let _ = tx.send(AdminReplyV2::Failed {
-                req_id: 0,
-                code: ErrCode::ConnectionLost as u16,
-                detail: detail.into(),
-            });
-        }
-    }
-}
+/// Bounded administrative callbacks with optional physical connection binding.
+pub type AdminPendingV2 = crate::admin_pending::Pending<AdminReplyV2>;
 
 // ─────────────────────────────────────────────────────────────
 // golden vectors（B1 冻结件——只增不改；修改 = 协议 break）
@@ -781,7 +840,7 @@ mod tests {
     async fn pending_v2_complete_routing() {
         let p = AdminPendingV2::default();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        p.insert(7, tx);
+        p.insert(7, tx).unwrap();
         assert!(p.complete(AdminReplyV2::Stopped { req_id: 7 }));
         assert!(matches!(rx.await, Ok(AdminReplyV2::Stopped { req_id: 7 })));
         assert!(!p.complete(AdminReplyV2::Stopped { req_id: 7 }), "迟到回执");
@@ -791,7 +850,7 @@ mod tests {
     async fn pending_v2_fail_all() {
         let p = AdminPendingV2::default();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        p.insert(8, tx);
+        p.insert(8, tx).unwrap();
         p.fail_all("system shutdown");
         match rx.await {
             Ok(AdminReplyV2::Failed { code, detail, .. }) => {

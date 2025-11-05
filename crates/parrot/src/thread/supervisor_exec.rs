@@ -10,10 +10,7 @@ use crate::thread::{
     system::{StopOutcome, ThreadActorSystem, drain_mailbox},
 };
 use parrot_api::{supervisor::DeathReason, types::BoxedFuture};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
@@ -23,39 +20,26 @@ pub(crate) type Respawn = Arc<
             Arc<ThreadActorSystem>,
             Arc<SupervisionEntry>,
             Arc<dyn Mailbox>,
+            Arc<RestartControl>,
+            Option<Arc<crate::children::recovery::Recovery>>,
         ) -> BoxedFuture<'static, Result<(), SystemError>>
         + Send
         + Sync,
 >;
 
 pub(crate) struct SupervisionEntry {
+    pub stop_request: super::address::StopRequest,
+    pub watches: crate::thread::death_watch::ThreadWatches,
     pub strategy: SupervisorStrategy,
     pub restarts: Mutex<Vec<Instant>>,
     pub mailbox: Arc<Mutex<WeakMailboxRef>>,
     pub respawn: Respawn,
+    pub factory: Arc<dyn crate::thread::factory::FactoryDisposal>,
 }
 
 pub use crate::thread::system::ErasedSpawnBoxTyped;
 
-#[derive(Default)]
-pub(crate) struct RestartControl {
-    cancelled: AtomicBool,
-    notify: tokio::sync::Notify,
-}
-impl RestartControl {
-    pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.notify.notify_one();
-    }
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-    async fn cancelled(&self) {
-        if !self.is_cancelled() {
-            self.notify.notified().await;
-        }
-    }
-}
+pub(crate) use crate::constructor::ConstructionControl as RestartControl;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
@@ -71,6 +55,8 @@ pub(crate) fn decide(
     now: Instant,
 ) -> Decision {
     match strategy {
+        // Handler Resume is resolved while the instance is alive. This path
+        // only handles generations already committed to retirement.
         SupervisorStrategy::Stop | SupervisorStrategy::Resume => Decision::Stop,
         SupervisorStrategy::Escalate => Decision::Escalate("strategy=Escalate".into()),
         SupervisorStrategy::Restart {
@@ -92,17 +78,41 @@ pub(crate) fn decide(
 }
 
 impl ThreadActorSystem {
-    pub(crate) async fn on_child_panic(
+    pub(crate) async fn on_child_failure(
         self: &Arc<Self>,
         path: &str,
         expected: WeakMailboxRef,
-        panic_msg: String,
+        error: Arc<parrot_api::errors::ActorError>,
+        reason: DeathReason,
+    ) {
+        self.retire_generation(path, expected, error, reason, false)
+            .await;
+    }
+
+    pub(crate) async fn retire_generation(
+        self: &Arc<Self>,
+        path: &str,
+        expected: WeakMailboxRef,
+        error: Arc<parrot_api::errors::ActorError>,
+        reason: DeathReason,
+        healthy: bool,
     ) {
         let Some(mailbox) = expected.upgrade() else {
             return;
         };
         let mailbox: Arc<dyn Mailbox> = mailbox;
-        let (decision, supervision, control, completion) = {
+        let mut deadline = tokio::time::Instant::now() + self.config().shutdown_timeout;
+        let (
+            fallback_strategy,
+            supervision,
+            control,
+            completion,
+            retired_sender,
+            mode,
+            watches,
+            children,
+            lifetime,
+        ) = {
             let mut registry = self.registry.write().unwrap();
             let Some(entry) = registry.get_mut(path).and_then(|entry| entry.dynamic_mut()) else {
                 return;
@@ -110,86 +120,280 @@ impl ThreadActorSystem {
             if !Arc::ptr_eq(&entry.mailbox, &mailbox) || entry.stop_completion.is_some() {
                 return;
             }
-            let decision = match &entry.supervision {
-                Some(supervision) => decide(
-                    &supervision.strategy,
-                    &mut supervision.restarts.lock().unwrap(),
-                    Instant::now(),
-                ),
-                None => decide(
-                    entry
-                        .config
-                        .supervisor_strategy
-                        .as_ref()
-                        .unwrap_or(&self.config().default_supervisor_strategy),
-                    &mut Vec::new(),
-                    Instant::now(),
-                ),
-            };
-            let control = Arc::new(RestartControl::default());
+            if let Some(decision) = entry.lifetime.decision_deadline() {
+                deadline = deadline.min(decision);
+            }
+            if let Some(group) = entry.lifetime.recovery() {
+                deadline = group.deadline;
+            }
+            let fallback_strategy = entry
+                .config
+                .supervisor_strategy
+                .clone()
+                .unwrap_or_else(|| self.config().default_supervisor_strategy.clone());
+            let control = Arc::new(RestartControl::with_deadline(deadline));
             let (sender, receiver) = tokio::sync::watch::channel(None);
+            entry.watches.suspend();
             entry.restart_cancel = Some(control.clone());
             entry.stop_completion = Some(receiver);
+            let (retired_sender, retirement) = tokio::sync::watch::channel(None);
+            entry.retirement_completion = Some(retirement);
             mailbox.seal();
-            (decision, entry.supervision.clone(), control, sender)
+            entry.children.close();
+            (
+                fallback_strategy,
+                entry.supervision.clone(),
+                control,
+                sender,
+                retired_sender,
+                entry
+                    .config
+                    .scheduling_mode
+                    .clone()
+                    .unwrap_or_else(|| self.config().default_scheduling_mode.clone()),
+                entry.watches.clone(),
+                entry.children.clone(),
+                entry.lifetime.clone(),
+            )
         };
-        let deadline = tokio::time::Instant::now() + self.config().shutdown_timeout;
-        let retired = self
-            .retire_panicked_actor(path, mailbox.clone(), deadline)
-            .await;
-        let mut result = retired;
+        if !healthy && let Some(processor) = mailbox.get_processor() {
+            processor.cancel_processing();
+        }
+        let policy_future =
+            lifetime.failure_policy(error.clone(), self.typed_slots.clone(), deadline);
+        tokio::pin!(policy_future);
+        let (policy, decision_timed_out) = tokio::select! {
+            biased;
+            policy = &mut policy_future => (policy, false),
+            _ = tokio::time::sleep_until(deadline) => {
+                completion.send_replace(Some(StopOutcome::TimedOut(format!("failed actor {path} supervision decision exceeded deadline"))));
+                (policy_future.await, true)
+            }
+        };
+        let (mut policy, policy_error) = match policy {
+            Ok(policy) => (policy, None),
+            Err(error) => (None, Some(SystemError::Other(anyhow::Error::new(error)))),
+        };
+        if let Some(group) = policy.as_ref().and_then(|policy| policy.recovery.as_ref()) {
+            deadline = deadline.min(group.deadline);
+        }
+        if control.is_cancelled() || decision_timed_out {
+            policy = None;
+        }
+        let decision = match policy.as_ref().map(|policy| policy.decision) {
+            _ if control.is_cancelled() || decision_timed_out => Decision::Stop,
+            Some(
+                parrot_api::supervisor::SupervisionDecision::Stop
+                | parrot_api::supervisor::SupervisionDecision::Resume,
+            ) => Decision::Stop,
+            Some(parrot_api::supervisor::SupervisionDecision::Restart) => Decision::Restart,
+            Some(parrot_api::supervisor::SupervisionDecision::Escalate) => {
+                Decision::Escalate("child policy requested escalation".into())
+            }
+            None if policy_error.is_some() => Decision::Stop,
+            None => match &supervision {
+                Some(entry) => decide(
+                    &entry.strategy,
+                    &mut entry.restarts.lock().unwrap(),
+                    Instant::now(),
+                ),
+                None => decide(&fallback_strategy, &mut Vec::new(), Instant::now()),
+            },
+        };
+        let retirement = async {
+            let siblings = async {
+                match &policy {
+                    Some(policy) => policy.stop_siblings().await,
+                    None => Ok(()),
+                }
+            };
+            let (siblings_result, children_result, result) =
+                tokio::join!(siblings, children.join(), async {
+                    if healthy {
+                        super::system::stop_actor_resources(
+                            path,
+                            mailbox.clone(),
+                            mode,
+                            self.scheduler_group.clone(),
+                            self.cleanup_slots.clone(),
+                            deadline,
+                        )
+                        .await
+                    } else {
+                        self.retire_panicked_actor(path, mailbox.clone(), mode, deadline)
+                            .await
+                    }
+                });
+            let decisions = lifetime
+                .settle_live_decision()
+                .await
+                .map_err(|e| SystemError::Other(anyhow::Error::new(e)));
+            result
+                .and(children_result.map_err(|e| SystemError::Other(anyhow::Error::new(e))))
+                .and(siblings_result.map_err(|e| SystemError::Other(anyhow::Error::new(e))))
+                .and(decisions)
+        };
+        tokio::pin!(retirement);
+        let (mut result, timed_out) = tokio::select! {
+            biased;
+            result = &mut retirement => (result, false),
+            _ = tokio::time::sleep_until(deadline) => {
+                completion.send_replace(Some(StopOutcome::TimedOut(format!("failed actor {path} cleanup exceeded configured deadline"))));
+                (retirement.await, true)
+            }
+        };
+        let mut timed_out = timed_out || decision_timed_out;
+        if let Some(error) = policy_error {
+            result = Err(error);
+        }
+        if timed_out || tokio::time::Instant::now() >= deadline {
+            result = Err(SystemError::Timeout(format!(
+                "failed actor {path} cleanup exceeded configured deadline"
+            )));
+        }
         if result.is_ok()
             && decision == Decision::Restart
-            && let Some(entry) = supervision
+            && let Some(entry) = &supervision
         {
-            // Cancellation from explicit stop/shutdown prevents a factory result
-            // from publishing. spawn_at_internal rechecks under the registry lock.
+            let restart = (entry.respawn)(
+                self.clone(),
+                entry.clone(),
+                mailbox.clone(),
+                control.clone(),
+                policy.as_ref().and_then(|policy| policy.recovery.clone()),
+            );
+            tokio::pin!(restart);
             result = tokio::select! {
                 biased;
-                _ = control.cancelled() => Ok(()),
-                _ = tokio::time::sleep_until(deadline) => Err(SystemError::Timeout(format!("restart of {path} exceeded configured deadline"))),
-                result = (entry.respawn)(self.clone(), entry.clone(), mailbox.clone()) => result,
+                result = &mut restart => result,
+                _ = tokio::time::sleep_until(deadline) => {
+                    timed_out = true;
+                    control.cancel();
+                    completion.send_replace(Some(StopOutcome::TimedOut(format!("restart of {path} exceeded configured deadline"))));
+                    restart.await
+                }
             };
-            if result.is_ok() && !control.is_cancelled() {
-                completion.send_replace(Some(StopOutcome::Stopped));
+            if result.is_ok() {
+                if !timed_out {
+                    completion.send_replace(Some(StopOutcome::Stopped));
+                }
+                retired_sender.send_replace(Some(StopOutcome::Stopped));
                 return;
             }
         }
-        // An explicit stop can race the final publication check. A cancellation
-        // rejection is successful termination, not a failed stop operation.
-        if control.is_cancelled() && matches!(result, Err(SystemError::ActorCreationError(_))) {
+        if !timed_out && tokio::time::Instant::now() >= deadline {
+            timed_out = true;
+            completion.send_replace(Some(StopOutcome::TimedOut(format!(
+                "recovery of {path} exceeded configured deadline"
+            ))));
+        }
+        // Only cancellation is a successful stop; a panicking cancelled output
+        // or failed capture disposal must remain a reported cleanup failure.
+        if control.is_cancelled() && matches!(result, Err(SystemError::ShuttingDown)) {
             result = Ok(());
         }
-        if let Err(error) = &result {
-            tracing::error!(%path, %error, "supervision recovery failed");
+        if let Some(group) = lifetime.recovery() {
+            group.abort("Thread member could not recover");
         }
-        let notified = self
-            .notify_termination_until(path, DeathReason::Panic(panic_msg), deadline)
+        let disposal = async {
+            let policy = lifetime
+                .dispose_policy()
+                .await
+                .map_err(SystemError::policy_disposal);
+            let factory = match &supervision {
+                Some(entry) => entry.factory.dispose().await,
+                None => Ok(()),
+            };
+            factory.and(policy)
+        };
+        let (disposed, disposal_timed_out) =
+            super::stop_deadline::join_until(disposal, deadline, || {
+                control.cancel();
+                completion.send_replace(Some(StopOutcome::TimedOut(format!(
+                    "factory disposal for {path} exceeded configured deadline"
+                ))));
+            })
             .await;
+        timed_out |= disposal_timed_out;
+        if let Err(error) = disposed {
+            result = Err(error);
+        }
+        if let Err(error) = &result {
+            tracing::error!(%path, error = %crate::error_receipt::system_summary(error), "supervision recovery failed");
+        }
+        // Observers are outside the supervision hierarchy. Their delivery
+        // deadline must never consume or suppress a ready escalation decision.
         if let Decision::Escalate(message) = decision
             && !control.is_cancelled()
+            && tokio::time::Instant::now() < deadline
+            && !lifetime.escalate(error.clone())
         {
-            self.escalate_to_parents(path, &message).await;
+            tracing::debug!(%path, %message, "failed actor has no active managed parent for escalation");
         }
+        watches.close();
+        let reason = match &result {
+            Ok(()) => reason,
+            Err(SystemError::Panic(message)) => DeathReason::Panic(message.clone()),
+            // Expiry while waiting for disposal is not a forced kill. The
+            // originating failure still explains why the actor terminated.
+            Err(SystemError::Timeout(_)) => reason,
+            Err(error) => DeathReason::Failed(crate::error_receipt::system_summary(error)),
+        };
+        let event = parrot_api::context::ActorTerminated {
+            generation: watches.common.id(),
+            path: path.into(),
+            reason: reason.clone(),
+        };
+        let (_, notified) = tokio::join!(
+            watches
+                .common
+                .terminated(event, self.config().shutdown_timeout),
+            crate::thread::death_watch::notify_legacy(
+                &watches.legacy,
+                path,
+                reason,
+                self.config().shutdown_timeout
+            )
+        );
+
         {
             let mut registry = self.registry.write().unwrap();
-            if registry
-                .get(path)
-                .and_then(|entry| entry.dynamic())
-                .is_some_and(|entry| Arc::ptr_eq(&entry.mailbox, &mailbox))
+            if let Some(entry) = registry.get(path).and_then(|entry| entry.dynamic())
+                && Arc::ptr_eq(&entry.mailbox, &mailbox)
             {
+                // Publish the terminal logical owner's receipt before removing
+                // its registration. Successful restarts returned above and must
+                // not pin an obsolete generation into this shared OnceCell.
+                let _ = entry.stop_request.set(completion.subscribe());
                 registry.remove(path);
             }
         }
-        completion.send_replace(Some(StopOutcome::from_result(result.and(notified))));
+        let result = result.map_err(crate::error_receipt::SystemReceipt::new);
+        let notification = lifetime.finish(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| error.actor_receipt()),
+        );
+        let outcome = StopOutcome::from_result(
+            result
+                .map_err(crate::error_receipt::SystemReceipt::into_error)
+                .and(notified),
+        );
+        if !timed_out {
+            completion.send_replace(Some(outcome.clone()));
+        }
+        retired_sender.send_replace(Some(outcome));
+        notification.await;
     }
 
     /// Skip before_stop on the failed instance. Disposal stays owned and
     /// isolated; a timed-out retirement must never start a replacement.
-    async fn retire_panicked_actor(
+    pub(crate) async fn retire_panicked_actor(
         &self,
         path: &str,
         mailbox: Arc<dyn Mailbox>,
+        mode: crate::thread::config::SchedulingMode,
         deadline: tokio::time::Instant,
     ) -> Result<(), SystemError> {
         mailbox.seal();
@@ -197,7 +401,20 @@ impl ThreadActorSystem {
         if let Some(processor) = &processor {
             processor.cancel_processing();
         }
-        let drained = drain_mailbox(mailbox, Arc::new(tokio::sync::Semaphore::new(1)));
+        let slots = self.cleanup_slots.clone();
+        let drained = drain_mailbox(mailbox, slots.clone())
+            .await
+            .map_err(|error| SystemError::ShutdownError(error.to_string()))
+            .and_then(|result| {
+                result.map_err(|error| SystemError::ShutdownError(error.to_string()))
+            });
+        let retired = if let Some(processor) = processor {
+            self.scheduler_group
+                .retire_actor(path, &mode, processor, slots, deadline)
+                .await
+        } else {
+            Ok(())
+        };
         let _ = self.scheduler_group.shared_scheduler.deschedule(path).await;
         if let Some(sharded) = self
             .scheduler_group
@@ -208,88 +425,7 @@ impl ThreadActorSystem {
         {
             let _ = sharded.deschedule(path);
         }
-        match self
-            .scheduler_group
-            .dedicated_scheduler
-            .deschedule_until(path, deadline)
-            .await
-        {
-            Ok(()) | Err(SystemError::ActorNotFound(_)) => {}
-            Err(error) => return Err(error),
-        }
-        tokio::time::timeout_at(deadline, async {
-            drained
-                .await
-                .map_err(|error| SystemError::ShutdownError(error.to_string()))?
-                .map_err(|error| SystemError::ShutdownError(error.to_string()))?;
-            if let Some(processor) = processor {
-                processor
-                    .join_context_tasks()
-                    .await
-                    .map_err(|error| SystemError::ShutdownError(error.to_string()))?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|_| {
-            SystemError::Timeout(format!(
-                "failed actor {path} cleanup exceeded configured deadline"
-            ))
-        })?
-    }
-
-    /// Escalate a failure to the failed actor's parent chain.
-    ///
-    /// Each ancestor receives a `ChildFailure` control message; an ancestor
-    /// that itself dies during handling escalates further (walk stops at the
-    /// root or when an ancestor's strategy absorbs the failure).
-    async fn escalate_to_parents(&self, path: &str, msg: &str) {
-        // Determine the parent chain from the path convention
-        // ("/user/parent/child" → "/user/parent"). Path-based parenting is
-        // the thread engine's convention (contexts hold parent refs, but the
-        // supervision walk only needs the chain order).
-        let mut current = path.to_string();
-        #[allow(clippy::never_loop)] // break 均为终止条件（哨兵路径保护）
-        while let Some(pos) = current.rfind('/') {
-            // Don't strip past "/user"
-            if current == "/user" || current.ends_with("/user") {
-                break;
-            }
-            current.truncate(pos);
-            if current.is_empty() || current == "/" {
-                break;
-            }
-
-            // Deliver a ChildFailure control message to the ancestor.
-            let failure = crate::thread::envelope::ControlMessage::ChildFailure {
-                path: path.to_string(),
-                reason: msg.to_string(),
-            };
-            let mailbox = self.get_mailbox(&current);
-            if let Some(mailbox) = mailbox {
-                match tokio::time::timeout(
-                    self.config().shutdown_timeout,
-                    mailbox.push_with_priority(
-                        Box::new(failure),
-                        crate::thread::config::BackpressureStrategy::Block,
-                        true,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        tracing::error!(parent = %current, %error, "supervision escalation delivery failed")
-                    }
-                    Err(_) => {
-                        tracing::error!(parent = %current, "supervision escalation delivery exceeded configured deadline")
-                    }
-                }
-            }
-            // Only the immediate parent gets the control message; further
-            // escalation happens if THAT parent panics handling it.
-            break;
-        }
+        retired.and(drained)
     }
 }
 
@@ -356,9 +492,290 @@ mod tests {
     }
 
     #[test]
-    fn decision_resume_maps_to_stop_for_panics() {
+    fn retired_generation_resume_does_not_reconstruct_an_instance() {
         let mut restarts = vec![];
         let d = decide(&SupervisorStrategy::Resume, &mut restarts, Instant::now());
         assert_eq!(d, Decision::Stop);
+    }
+}
+
+#[cfg(test)]
+mod disposal_deadline_tests {
+    use super::*;
+    use crate::thread::{config::ThreadActorSystemConfig, context::ThreadContext};
+    use futures::FutureExt;
+    use parrot_api::{
+        actor::{Actor, ActorState, EmptyConfig},
+        address::ActorRef,
+        context::ActorTerminated,
+        death_watch::{DeathWatch, TerminationRecipient},
+        errors::ActorError,
+        system::{ActorSystem, SystemState},
+        types::{ActorResult, BoxedMessage},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+
+    struct Probe(Arc<AtomicUsize>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Actor for Probe {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+        fn receive_message<'a>(
+            &'a mut self,
+            message: BoxedMessage,
+            _: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move { Ok(message) })
+        }
+    }
+
+    struct Capture {
+        drops: Arc<AtomicUsize>,
+        panic: bool,
+    }
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic, "supervisor capture disposal probe");
+        }
+    }
+
+    type DisposalGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    struct HeldReceipt {
+        actual: Arc<dyn crate::thread::factory::FactoryDisposal>,
+        gate: Mutex<Option<DisposalGate>>,
+    }
+    impl crate::thread::factory::FactoryDisposal for HeldReceipt {
+        fn dispose(&self) -> BoxedFuture<'_, Result<(), SystemError>> {
+            let gate = self.gate.lock().unwrap().take();
+            Box::pin(async move {
+                // Run the real factory retirement, including its real capture
+                // panic handling. Only delivery of its actual result is gated.
+                let result = self.actual.dispose().await;
+                if let Some((ready, release)) = gate {
+                    let _ = ready.send(());
+                    let _ = release.await;
+                }
+                result
+            })
+        }
+    }
+    #[derive(Default)]
+    struct Events(Mutex<Vec<ActorTerminated>>);
+    impl TerminationRecipient for Events {
+        fn deliver(&self, event: ActorTerminated) -> BoxedFuture<'_, ActorResult<()>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(event);
+                Ok(())
+            })
+        }
+    }
+    #[derive(Clone, Copy)]
+    enum Timing {
+        Early,
+        BothReady,
+        TimerFirst,
+    }
+
+    async fn check_disposal(timing: Timing, capture_panics: bool) {
+        const PATH: &str = "/supervisor-disposal-probe";
+        const BUDGET: Duration = Duration::from_secs(30);
+        let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
+            shared_pool_size: 1,
+            shutdown_timeout: BUDGET,
+            ..Default::default()
+        });
+        let actor_drops = Arc::new(AtomicUsize::new(0));
+        let capture_drops = Arc::new(AtomicUsize::new(0));
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let capture = Capture {
+            drops: capture_drops.clone(),
+            panic: capture_panics,
+        };
+        let made = constructions.clone();
+        let actors = actor_drops.clone();
+        let actor = system
+            .spawn_supervised(
+                move || {
+                    let _ = &capture;
+                    made.fetch_add(1, Ordering::SeqCst);
+                    Probe(actors.clone())
+                },
+                PATH,
+                SupervisorStrategy::Stop,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *actor
+                .send(Box::new(42_u64))
+                .await
+                .unwrap()
+                .downcast::<u64>()
+                .unwrap(),
+            42
+        );
+
+        let watcher = DeathWatch::new(1);
+        let events = Arc::new(Events::default());
+        watcher.set_recipient(events.clone()).unwrap();
+        actor.death_watch().unwrap().watch(&watcher).unwrap();
+        let (ready, reached) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        let mut release = Some(release);
+        let (mailbox, replaced) = {
+            let mut registry = system.registry.write().unwrap();
+            let entry = registry.get_mut(PATH).unwrap().dynamic_mut().unwrap();
+            let old = entry.supervision.as_ref().unwrap().clone();
+            let mailbox = old.mailbox.lock().unwrap().clone();
+            let replacement = Arc::new(SupervisionEntry {
+                stop_request: old.stop_request.clone(),
+                watches: old.watches.clone(),
+                strategy: old.strategy.clone(),
+                restarts: Mutex::new(old.restarts.lock().unwrap().clone()),
+                mailbox: old.mailbox.clone(),
+                respawn: old.respawn.clone(),
+                factory: Arc::new(HeldReceipt {
+                    actual: old.factory.clone(),
+                    gate: Mutex::new(Some((ready, held))),
+                }),
+            });
+            (mailbox, entry.supervision.replace(replacement))
+        };
+        drop(replaced);
+        // This is the actual terminal owner with a live managed generation,
+        // not a copy of its select. Drive it explicitly to control repoll order.
+        let owner = system.retire_generation(
+            PATH,
+            mailbox,
+            Arc::new(ActorError::InternalError(
+                "terminal generation probe".into(),
+            )),
+            DeathReason::Failed("terminal generation probe".into()),
+            true,
+        );
+        tokio::pin!(owner);
+        let mut completed = false;
+        let mut paused = false;
+        let checked = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = owner.as_mut() => { completed = true; panic!("owner completed before disposal receipt release"); },
+                    reached = reached => reached.expect("real factory disposal must reach gate"),
+                }
+            }).await.expect("real retirement must reach the controlled receipt");
+            assert_eq!(actor_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(capture_drops.load(Ordering::SeqCst), 1);
+            let (public, actual) = {
+                let registry = system.registry.read().unwrap();
+                let entry = registry.get(PATH).unwrap().dynamic().unwrap();
+                (entry.stop_completion.clone().unwrap(), entry.retirement_completion.clone().unwrap())
+            };
+            assert!(public.borrow().is_none());
+            assert!(actual.borrow().is_none());
+            assert!(events.0.lock().unwrap().is_empty());
+            tokio::time::pause();
+            paused = true;
+            if !matches!(timing, Timing::Early) {
+                tokio::time::advance(BUDGET + Duration::from_secs(1)).await;
+            }
+            if matches!(timing, Timing::TimerFirst) {
+                assert!(futures::poll!(owner.as_mut()).is_pending());
+                assert!(matches!(*public.borrow(), Some(StopOutcome::TimedOut(_))));
+                assert!(actual.borrow().is_none(), "timeout cannot publish retirement early");
+                assert!(system.registry.read().unwrap().contains_key(PATH));
+                assert!(events.0.lock().unwrap().is_empty(), "timeout is not a termination event");
+            }
+            release.take().unwrap().send(()).unwrap();
+            owner.as_mut().await;
+            completed = true;
+            tokio::time::resume();
+            paused = false;
+            assert!(!system.registry.read().unwrap().contains_key(PATH));
+            let first = actor.stop().await;
+            let repeated = actor.stop().await;
+            let actual = crate::thread::system::await_stop(actual).await;
+            if matches!(timing, Timing::Early) {
+                if capture_panics {
+                    assert!(first.is_err(), "early real capture failure must remain public: {first:?}");
+                    assert!(first.as_ref().unwrap_err().to_string().contains("supervisor capture disposal probe"));
+                } else {
+                    assert!(first.is_ok(), "early cleanup: {first:?}");
+                }
+            } else {
+                assert!(
+                    matches!(&first, Err(ActorError::TimeoutDetail(_))),
+                    "late supervisor disposal must retain public timeout: {first:?}"
+                );
+            }
+            assert_eq!(first.map_err(|e| e.to_string()), repeated.map_err(|e| e.to_string()));
+            if capture_panics {
+                assert!(actual.is_err(), "actual capture failure must survive timeout: {actual:?}");
+                assert!(actual.unwrap_err().to_string().contains("supervisor capture disposal probe"), "actual capture failure must survive timeout");
+            } else {
+                assert!(actual.is_ok(), "actual successful cleanup must remain independent: {actual:?}");
+            }
+            let events = events.0.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].path, PATH);
+            assert!(matches!(&events[0].reason, DeathReason::Failed(message) if message.contains(if capture_panics { "supervisor capture disposal probe" } else { "terminal generation probe" })));
+            assert_eq!(watcher.subscriptions(), (0, 0));
+        }).catch_unwind().await;
+        if paused {
+            tokio::time::resume();
+        }
+        if let Some(release) = release {
+            let _ = release.send(());
+        }
+        if !completed {
+            tokio::time::timeout(Duration::from_secs(5), owner.as_mut())
+                .await
+                .expect("fixture owner must retire after assertion failure");
+        }
+        let shutdown = system.shutdown_internal().await;
+        assert!(
+            shutdown.is_ok(),
+            "fixture workers must retire: {shutdown:?}"
+        );
+        assert_eq!(system.status().state, SystemState::Stopped);
+        assert_eq!(actor_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(capture_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            constructions.load(Ordering::SeqCst),
+            1,
+            "terminal stop must not restart"
+        );
+        if let Err(payload) = checked {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn early_actual_factory_success_and_panic_keep_original_results() {
+        for panic in [false, true] {
+            check_disposal(Timing::Early, panic).await;
+        }
+    }
+    #[tokio::test]
+    async fn late_actual_factory_success_keeps_public_timeout() {
+        check_disposal(Timing::BothReady, false).await;
+    }
+    #[tokio::test]
+    async fn late_actual_factory_panic_keeps_public_timeout() {
+        check_disposal(Timing::BothReady, true).await;
+    }
+    #[tokio::test]
+    async fn pending_disposal_keeps_registration_and_real_retirement_owned() {
+        for panic in [false, true] {
+            check_disposal(Timing::TimerFirst, panic).await;
+        }
     }
 }

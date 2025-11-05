@@ -13,7 +13,9 @@ fn enc_u64(v: u64) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
 fn dec_u64(b: &[u8]) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(b.try_into().map_err(|_| "u64 len".to_string())?))
+    Ok(u64::from_le_bytes(
+        b.try_into().map_err(|_| "u64 len".to_string())?,
+    ))
 }
 
 /// 注册 POC 全套消息。
@@ -41,6 +43,9 @@ pub fn install_poc_messages() {
             None => Err("Add downcast".into()),
         },
         |b| {
+            if b.len() != 16 {
+                return Err("Add requires exactly 16 bytes".into());
+            }
             let a = u64::from_le_bytes(b[0..8].try_into().map_err(|_| "Add a")?);
             let c = u64::from_le_bytes(b[8..16].try_into().map_err(|_| "Add b")?);
             Ok(Box::new(Add(a, c)))

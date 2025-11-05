@@ -1,18 +1,23 @@
 {
   "name": "@parrot/lite",
   "version": "0.1.0",
-  "description": "Parrot Wire 1.0 lite client for edge (DEV_03 §2 / E1)",
+  "description": "Parrot Wire 1.0 lite client for edge (DEV_03 \u00a72 / E1)",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "bundle": "esbuild src/index.ts --bundle --minify --format=esm --outfile=dist/lite.js",
-    "gate:size": "node scripts/size-gate.mjs"
+    "bundle": "esbuild src/index.ts --bundle --minify --format=esm --outfile=dist/parrot-lite.bundle.js",
+    "gate:size": "node scripts/size-gate.mjs",
+    "test:crawler": "npm run build && node --test tests/integration/crawler_client.test.mjs",
+    "test:package": "npm run build && npm run bundle && node scripts/package-gate.mjs && npm run gate:size",
+    "test:jvm": "npm run build && node --test tests/integration/jvm_codec.test.mjs"
   },
   "devDependencies": {
-    "esbuild": "^0.24.0",
+    "esbuild": "^0.25.12",
+    "json-bigint": "1.0.0",
+    "lossless-json": "4.3.0",
     "typescript": "^5.5.0"
   },
   "engines": {

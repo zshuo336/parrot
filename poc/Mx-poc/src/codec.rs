@@ -18,7 +18,10 @@ struct CodecInner {
 }
 
 const fn empty_const() -> CodecInner {
-    CodecInner { by_key: None, by_type_id: None }
+    CodecInner {
+        by_key: None,
+        by_type_id: None,
+    }
 }
 
 static GLOBAL: Mutex<CodecInner> = Mutex::new(empty_const());
@@ -42,8 +45,10 @@ impl CodecRegistry {
         decode: DecodeFn,
     ) {
         let mut g = GLOBAL.lock().unwrap();
-        g.key_map().insert(type_type_key, CodecEntry { encode, decode });
-        g.type_map().insert(std::any::TypeId::of::<M>(), type_type_key);
+        g.key_map()
+            .insert(type_type_key, CodecEntry { encode, decode });
+        g.type_map()
+            .insert(std::any::TypeId::of::<M>(), type_type_key);
     }
 
     /// 测试隔离：清空。
@@ -59,28 +64,37 @@ impl CodecRegistry {
 
     /// 编码出口：TypeId → TYPE_KEY → encode。未注册 → NotRemotable 错误。
     pub fn encode_outgoing(msg: &BoxedMessage) -> Result<(String, Vec<u8>), String> {
-        let g = GLOBAL.lock().unwrap();
-        let km = g.by_key.as_ref().expect("codec not installed");
-        let tm = g.by_type_id.as_ref().expect("codec not installed");
-        let key = *tm
-            .get(&(*msg).type_id())
-            .ok_or_else(|| {
-                format!(
-                    "not remotable: {:?} (需 derive RemoteMessage 并在两端注册)",
-                    (*msg).type_id()
-                )
-            })?;
-        let entry = km.get(key).expect("key→entry invariant");
-        let payload = (entry.encode)(msg.as_ref()).map_err(|e| format!("encode: {e}"))?;
+        let (key, encode) = {
+            let g = GLOBAL.lock().unwrap();
+            let key = g
+                .by_type_id
+                .as_ref()
+                .and_then(|m| m.get(&msg.as_ref().type_id()))
+                .copied()
+                .ok_or_else(|| format!("not remotable: {:?}", msg.as_ref().type_id()))?;
+            let encode = g
+                .by_key
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .ok_or("codec entry missing")?
+                .encode;
+            (key, encode)
+        };
+        // User callbacks may reenter the registry or panic. Never execute one
+        // while holding the global lock.
+        let payload = encode(msg.as_ref()).map_err(|e| format!("encode: {e}"))?;
         Ok((key.to_string(), payload))
     }
 
     pub fn decode_incoming(type_key: &str, payload: &[u8]) -> Result<BoxedMessage, String> {
-        let g = GLOBAL.lock().unwrap();
-        let km = g.by_key.as_ref().expect("codec not installed");
-        let entry = km
-            .get(type_key)
-            .ok_or_else(|| format!("unknown TYPE_KEY {type_key:?} (两端类型不一致或未注册)"))?;
-        (entry.decode)(payload).map_err(|e| format!("decode: {e}"))
+        let decode = {
+            let g = GLOBAL.lock().unwrap();
+            g.by_key
+                .as_ref()
+                .and_then(|m| m.get(type_key))
+                .ok_or_else(|| format!("unknown TYPE_KEY {type_key:?}"))?
+                .decode
+        };
+        decode(payload).map_err(|e| format!("decode: {e}"))
     }
 }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "derive-decouple",
     "api-neutral",
+    "core-engines",
     "typed-static",
     "erased-alloc",
     "supervision",

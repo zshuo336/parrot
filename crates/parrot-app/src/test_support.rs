@@ -48,8 +48,18 @@ impl Assembled {
         self.ctx.component_paths(comp)
     }
 
+    /// Cooperatively drain while retaining ownership for teardown or retry.
+    pub async fn drain(&mut self) -> Result<(), DeployError> {
+        let d = LocalDeployer {
+            topology: &*self.deployer.topology,
+            gateway_factory: &*self.deployer.gateway_factory,
+            parrot_spawner: &*self.deployer.parrot_spawner,
+        };
+        self.ctx.drain(&d).await
+    }
+
     /// 逆序停用（装配的镜像回卷——原 deployer 三元组）。
-    pub async fn teardown(mut self) -> Result<(), DeployError> {
+    pub async fn teardown(&mut self) -> Result<(), DeployError> {
         let d = LocalDeployer {
             topology: &*self.deployer.topology,
             gateway_factory: &*self.deployer.gateway_factory,

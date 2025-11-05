@@ -1,17 +1,19 @@
-//! E7 · ParrotMqttBridge（DEV_03 §8 / 07 §4.5 裁定落地）。
+//! MQTT topic mapping and an owned ingress bridge to Parrot actors.
 //!
-//! 结构：
-//! ```text
-//! ParrotMqttBridge（parrot 节点，topology_role=Border）：
-//!   MQTT 侧：rumqttc AsyncClient（对接存量 EMQX/Mosquitto）
-//!   parrot 侧：FrameLink（Transport 接入）
-//!   映射：topic ↔ Receptionist key（"edge/rpa" ↔ "$parrot/edge/rpa"）；
-//!         MQTT payload = 完整 Parrot 帧（透传）
-//!   QoS：QoS0 ↔ TELL；QoS1 ↔ durable tell（E2 复用——桥即 CloudProxy 的
-//!        MQTT 前端）
-//! ```
-//! keep-alive：MQTT 层与 Wire 心跳并存不冲突；桥重连退避取两者 max
-//! （实现注意事项 §10.5）。
+//! [`MqttBridge`] connects to an existing broker; it is not an MQTT broker.
+//! One configured topic binds one producer/session to one receiver path. QoS0
+//! forwards ordinary Wire TELL frames without replay. QoS1 requires a stable
+//! durable envelope, persists idempotent acceptance, and awaits transactional
+//! business completion before publishing a Wire receipt and sending MQTT PUBACK.
+//! Broker ACLs provide publisher identity isolation; MQTT packet IDs do not.
+//! The small mapping helpers below do not themselves provide any delivery guarantee.
+
+/// MQTT option and packet types from the exact client used by this bridge.
+/// Local consumers should use this re-export instead of mixing client sources.
+pub use rumqttc as client;
+
+mod bridge;
+pub use bridge::{BridgeConfig, BridgeError, BridgeHandle, BridgeStatus, MqttBridge};
 
 use std::time::Duration;
 
@@ -34,9 +36,9 @@ pub fn topic_to_key(topic: &str) -> Option<&str> {
 /// QoS 策略映射。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QosMode {
-    /// QoS0 ↔ TELL：at-most-once，不落 WAL。
+    /// QoS0 maps to TELL; the bridge does not replay it.
     Tell,
-    /// QoS1 ↔ durable tell：at-least-once + 端侧去重（E2 WAL 复用）。
+    /// Intended durable mode; only the owned bridge implements storage/receipts.
     DurableTell,
 }
 

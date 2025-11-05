@@ -19,9 +19,10 @@ use crate::thread::processor::ProcessorInterface;
 /// This mailbox allows multiple senders to send messages to a single consumer,
 /// which is typically an actor. It provides FIFO ordering guarantees.
 ///
-/// M5: the internal channel carries [`MailboxItem`] values — ask envelopes
-/// flow **by value** (no envelope boxing); `pop` re-boxes for compat and
-/// `pop_item` is the single-block consumer path.
+/// By default, the internal [`MailboxItem`] channel carries ask envelopes by
+/// value; `pop` re-boxes them for compatibility. With `parrot_envelope_legacy`,
+/// `push_ask` instead uses the boxed compatibility representation. Both paths
+/// preserve the payload and original reply channel.
 pub struct MpscMailbox {
     /// The sending half of the channel
     sender: Sender<MailboxItem>,
@@ -45,7 +46,7 @@ pub struct MpscMailbox {
     schedule_state: crate::thread::mailbox::ScheduleState,
     /// M2: high-priority lane (drained before the normal flume queue).
     ///
-    /// Mutex<VecDeque> keeps the hot path (push/pop under contention) simple
+    /// `Mutex<VecDeque>` keeps the hot path (push/pop under contention) simple
     /// and correct; priority messages are rare (system/death/control), so the
     /// lock is effectively uncontended in practice.
     high_lane: std::sync::Mutex<std::collections::VecDeque<(u64, MailboxItem)>>,
@@ -162,7 +163,11 @@ impl MpscMailbox {
                 let full = self.normal_len() + high.len() >= self.capacity;
                 if full {
                     match strategy {
-                        BackpressureStrategy::DropNewest => return Ok(()),
+                        BackpressureStrategy::DropNewest => {
+                            return Err(MailboxError::Dropped {
+                                capacity: self.capacity,
+                            });
+                        }
                         BackpressureStrategy::Error => {
                             return Err(MailboxError::Full {
                                 capacity: self.capacity,
@@ -269,7 +274,13 @@ impl Mailbox for MpscMailbox {
         item: MailboxItem,
         strategy: BackpressureStrategy,
     ) -> Result<(), MailboxError> {
-        self.enqueue(item, strategy, false).await
+        let high = match &item {
+            MailboxItem::Ask(envelope) => envelope.options.priority.value() >= 70,
+            MailboxItem::Plain(message) => message
+                .downcast_ref::<crate::thread::envelope::AskEnvelope>()
+                .is_some_and(|envelope| envelope.options.priority.value() >= 70),
+        };
+        self.enqueue(item, strategy, high).await
     }
 
     /// Both priority lanes share one capacity and one close boundary.
@@ -282,6 +293,10 @@ impl Mailbox for MpscMailbox {
         self.enqueue(MailboxItem::Plain(msg), strategy, high_priority)
             .await?;
         Ok(high_priority)
+    }
+
+    fn supports_high_priority(&self) -> bool {
+        true
     }
 
     fn has_high_priority_messages(&self) -> bool {
@@ -504,8 +519,8 @@ mod tests {
             .push(message2, BackpressureStrategy::DropNewest)
             .await;
 
-        // Should succeed but the message is dropped
-        assert!(result.is_ok());
+        // Discarding the message must report a rejected admission
+        assert!(matches!(result, Err(MailboxError::Dropped { capacity: 1 })));
 
         // Pop should only return the first message
         let received1 = mailbox.pop().await;
@@ -667,43 +682,52 @@ mod tests {
     // ============ M5 单块信封路径 ============
 
     #[tokio::test]
-    async fn test_push_ask_envelope_by_value_roundtrip() {
+    async fn test_push_ask_roundtrip_preserves_feature_representation_and_reply() {
         use crate::thread::envelope::AskEnvelope;
 
         let path = create_test_actor_path("m5-actor");
         let mailbox = MpscMailbox::new(10, path);
 
-        // inline ask：载荷零独立分配，信封按值入队
         let (envelope, reply_rx) = AskEnvelope::new_inline(42u64);
         mailbox
             .push_ask(envelope, BackpressureStrategy::Block)
             .await
             .unwrap();
 
-        // pop_item：按值取出（零装箱）
+        // The feature intentionally changes the mailbox representation, not
+        // the payload or the original reply channel. Check both contracts.
         let item = mailbox.pop_item().await.expect("item queued");
-        match item {
-            MailboxItem::Ask(env) => {
-                let (payload, reply) = env.into_parts_layered();
-                let boxed = payload.into_boxed();
-                assert_eq!(*boxed.downcast::<u64>().unwrap(), 42);
-                let _ = reply.send(Ok(Box::new("done") as BoxedMessage));
-            }
-            other => panic!("expected Ask item, got {:?}", other.into_boxed_message()),
-        }
-
-        let reply = reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            matches!(&item, MailboxItem::Plain(_)),
+            cfg!(feature = "parrot_envelope_legacy"),
+            "only legacy asks use the boxed compatibility representation"
+        );
+        let envelope = match item {
+            MailboxItem::Ask(envelope) => envelope,
+            MailboxItem::Plain(boxed) => *boxed
+                .downcast::<AskEnvelope>()
+                .expect("legacy item contains the original ask envelope"),
+        };
+        let (payload, reply) = envelope.into_parts_layered();
+        assert_eq!(*payload.into_boxed().downcast::<u64>().unwrap(), 42);
+        reply.send(Ok(Box::new("done") as BoxedMessage)).unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(*reply.downcast::<&str>().unwrap(), "done");
+        assert!(mailbox.pop_item().await.is_none());
     }
 
     #[tokio::test]
-    async fn test_pop_compat_reboxes_ask_envelope() {
+    async fn test_pop_compat_preserves_ask_payload_and_reply() {
         use crate::thread::envelope::AskEnvelope;
 
         let path = create_test_actor_path("m5-compat");
         let mailbox = MpscMailbox::new(10, path);
 
-        let (envelope, _rx) = AskEnvelope::new_typed("big".to_string());
+        let (envelope, reply_rx) = AskEnvelope::new_typed("big".to_string());
         mailbox
             .push_ask(envelope, BackpressureStrategy::Block)
             .await
@@ -714,8 +738,16 @@ mod tests {
         let env = boxed
             .downcast::<AskEnvelope>()
             .expect("compat pop must re-box ask envelopes");
-        let (payload, _reply) = env.into_parts_layered();
+        let (payload, reply) = env.into_parts_layered();
         let boxed = payload.into_boxed();
         assert_eq!(*boxed.downcast::<String>().unwrap(), "big");
+        reply.send(Ok(Box::new(3usize) as BoxedMessage)).unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*reply.downcast::<usize>().unwrap(), 3);
+        assert!(mailbox.pop().await.is_none());
     }
 }

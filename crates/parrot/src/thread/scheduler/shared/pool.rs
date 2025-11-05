@@ -15,13 +15,21 @@ use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::ThreadScheduler;
 use crate::thread::scheduler::queue::SchedulingQueue;
 
+#[cfg(test)]
+#[path = "shutdown_contracts.rs"]
+mod shutdown_contracts;
+
+#[path = "shutdown.rs"]
+mod shutdown;
+use shutdown::{Failures, Receipt};
+
 /// Configuration for the shared thread pool
 #[derive(Debug, Clone)]
 pub struct SharedThreadPoolConfig {
-    /// Number of worker threads
+    /// Configured core worker tasks on the caller-owned Tokio runtime
     pub pool_size: usize,
 
-    /// Maximum capacity of the scheduling queue for metrics
+    /// Maximum resident ready entries shared by both priority lanes
     pub max_queue_capacity: usize,
 
     /// Maximum number of messages to process in one batch
@@ -41,8 +49,8 @@ pub struct SharedThreadPoolConfig {
     /// Burst workers are spawned when the scheduling queue stays backlogged
     /// while all core workers are busy (e.g. every core worker is stuck in a
     /// minute-level CPU task) and exit after `burst_idle_timeout` of
-    /// continuous idleness. The global thread count is bounded by
-    /// `pool_size + burst_workers_max`, preventing thread explosions.
+    /// continuous idleness. The worker-task count is bounded by
+    /// `pool_size + burst_workers_max`, bounding elastic task growth.
     pub burst_workers_max: usize,
 
     /// Elastic-scaling: how long the queue must stay backlogged (with no
@@ -62,7 +70,7 @@ impl Default for SharedThreadPoolConfig {
             idle_sleep_duration: Duration::from_millis(10),
             yield_after_each_message: false,
             enable_detailed_logging: false,
-            // Elastic defaults: up to `num_cpus` extra threads, requiring
+            // Elastic defaults: up to `num_cpus` extra worker tasks, requiring
             // the queue to stay backlogged ≥100ms before scaling out, and
             // reaping burst workers after 5s of idleness.
             burst_workers_max: num_cpus::get(),
@@ -106,7 +114,7 @@ impl SchedulerStatus {
 /// Metrics about the scheduler state
 #[derive(Debug, Clone)]
 pub struct SchedulerMetrics {
-    /// Number of worker threads in the pool
+    /// Configured core worker tasks, not an owned OS-thread count
     pub pool_size: usize,
 
     /// Number of currently-alive elastic burst workers
@@ -114,6 +122,12 @@ pub struct SchedulerMetrics {
 
     /// Current length of the scheduling queue
     pub queue_length: usize,
+
+    /// Configured resident ready-queue capacity.
+    pub queue_capacity: usize,
+
+    /// Registered actors waiting for ready-queue space (one marker per actor).
+    pub deferred_ready: usize,
 
     /// Whether the scheduler is shutting down
     pub is_shutting_down: bool,
@@ -159,6 +173,8 @@ pub struct ElasticController {
     runtime: Handle,
 
     workers: std::sync::Weak<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    retirement: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    failures: Arc<Failures>,
 }
 
 impl ElasticController {
@@ -228,6 +244,12 @@ impl ElasticController {
         let Some(workers) = self.workers.upgrade() else {
             return;
         };
+        // A slow payload destructor must not allow unlimited finished handles
+        // to accumulate behind its observer. Pause expansion until it retires.
+        let mut retirement = self.retirement.lock().unwrap();
+        if retirement.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
         self.burst_alive.fetch_add(1, O::Relaxed);
 
         let queue = queue as Arc<SchedulingQueue>;
@@ -252,7 +274,30 @@ impl ElasticController {
         // with core workers. Idle retirement must not cancel suspended actors.
         let handle = worker.spawn_burst(idle_timeout, burst_alive);
         let mut workers = workers.lock().unwrap();
-        workers.retain(|handle| !handle.is_finished());
+        // A tracked observer consumes completed joins outside every pool lock.
+        // It cannot be aborted by the grace deadline: it owns retirement receipts.
+        {
+            let mut finished = Vec::new();
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    finished.push(workers.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if let Some(previous) = retirement.take() {
+                finished.push(previous);
+            }
+            if !finished.is_empty() {
+                let failures = self.failures.clone();
+                *retirement = Some(self.runtime.spawn(async move {
+                    for handle in finished {
+                        failures.join(handle.await, false);
+                    }
+                }));
+            }
+        }
         workers.push(handle);
     }
 }
@@ -276,7 +321,7 @@ impl fmt::Debug for SharedThreadPool {
 
 /// Scheduler implementation for managing a shared thread pool
 ///
-/// SharedThreadPool maintains a group of worker threads that pull ready
+/// SharedThreadPool maintains a group of Tokio worker tasks that pull ready
 /// mailboxes from a central [`SchedulingQueue`]. Each mailbox carries its
 /// type-erased processor (`Arc<dyn ProcessorInterface>`); workers execute it
 /// without knowing the concrete actor type.
@@ -311,7 +356,12 @@ pub struct SharedThreadPool {
     status: Arc<AtomicUsize>,
 
     /// Scheduled actor paths (registered by path, executed via queue)
-    scheduled_paths: std::sync::Mutex<std::collections::HashSet<String>>,
+    scheduled_paths: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<dyn Mailbox>>>>,
+
+    shutdown_receipt: std::sync::Mutex<Option<Receipt>>,
+    failures: Arc<Failures>,
+    retirement: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    patrol: std::sync::Mutex<Option<JoinHandle<()>>>,
 
     // ----- Elastic burst-worker state -----
     /// Currently alive burst workers (bounded by burst_workers_max)
@@ -351,7 +401,11 @@ impl SharedThreadPool {
             config,
             worker_manager,
             status,
-            scheduled_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
+            scheduled_paths: Default::default(),
+            shutdown_receipt: Default::default(),
+            failures: Default::default(),
+            retirement: Default::default(),
+            patrol: Default::default(),
             burst_workers_alive: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             backlog_since_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pool_started: std::time::Instant::now(),
@@ -380,12 +434,13 @@ impl SharedThreadPool {
         let controller = self.elastic_controller();
         let shutting_down = self.is_shutting_down.clone();
         let tick = self.config.burst_backlog_threshold / 2;
-        self.runtime_handle.spawn(async move {
+        let handle = self.runtime_handle.spawn(async move {
             while !shutting_down.load(Ordering::Relaxed) {
                 tokio::time::sleep(tick).await;
                 controller.probe();
             }
         });
+        *self.patrol.lock().unwrap() = Some(handle);
     }
 
     /// Start worker tasks
@@ -448,11 +503,15 @@ impl SharedThreadPool {
 
         {
             let mut paths = self.scheduled_paths.lock().unwrap();
-            if !paths.insert(path.to_string()) {
+            if paths.contains_key(path) {
                 return Err(SystemError::RegistrationError(format!(
                     "actor {path} is already scheduled"
                 )));
             }
+            if !self.scheduling_queue.register(&mailbox) {
+                return Err(SystemError::ShuttingDown);
+            }
+            paths.insert(path.to_string(), mailbox.clone());
         }
 
         // Install the wake hook: whenever a push succeeds after this actor is
@@ -479,14 +538,15 @@ impl SharedThreadPool {
                     } else {
                         crate::thread::scheduler::queue::Lane::Normal
                     };
-                    queue.push_with_lane(strong, lane);
+                    queue.enqueue_registered(strong, lane);
                     elastic.probe();
                 }
             }));
         }
 
         if mailbox.schedule_state().try_enqueue() {
-            self.scheduling_queue.push(mailbox.clone());
+            self.scheduling_queue
+                .enqueue_registered(mailbox, crate::thread::scheduler::queue::Lane::Normal);
         }
 
         Ok(())
@@ -498,53 +558,94 @@ impl SharedThreadPool {
             let mut paths = self.scheduled_paths.lock().unwrap();
             paths.remove(path)
         };
-        if !removed {
-            return Err(SystemError::ActorNotFound(path.to_string()));
-        }
-        // Mailbox re-queueing is guarded by has_more_messages checks; the
-        // mailbox may still be drained one last time but no new batches run.
+        let mailbox = removed.ok_or_else(|| SystemError::ActorNotFound(path.to_string()))?;
+        self.scheduling_queue.unregister(&mailbox);
+        // Keep the hook: queue registration checks make stale wakes harmless.
+        // Clearing it here could overwrite a concurrently installed hook when
+        // the same mailbox is registered again.
         Ok(())
     }
 
     /// Check if an actor is scheduled
     pub fn is_scheduled(&self, path: &str) -> bool {
-        self.scheduled_paths.lock().unwrap().contains(path)
+        self.scheduled_paths.lock().unwrap().contains_key(path)
     }
 
-    /// Shutdown the thread pool
-    ///
-    /// # Arguments
-    /// * `timeout_ms` - Timeout in milliseconds to wait for graceful shutdown
+    /// Close admission and join every owned task. Concurrent/repeated calls share
+    /// one result; cancelling a waiter does not cancel cleanup. The first caller's
+    /// `timeout_ms` sets the grace period, after which pending workers are aborted
+    /// and joined. The caller-owned Tokio runtime must remain alive through cleanup.
     pub async fn shutdown(&self, timeout_ms: u64) -> Result<(), SystemError> {
-        self.status
-            .store(SchedulerStatus::ShuttingDown as usize, Ordering::SeqCst);
-        {
-            let _gate = self.burst_spawn_gate.lock().unwrap();
-            self.is_shutting_down.store(true, Ordering::SeqCst);
-        }
-
-        // Wake all idle workers so they observe the shutdown flag.
-        for _ in 0..self.pool_size {
-            self.scheduling_queue.notify_handle().notify_one();
-        }
-
-        // Give workers a bounded chance to exit.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut receipt = self.ensure_shutdown(timeout_ms);
         loop {
-            // Take one handle out of the lock scope before awaiting so the
-            // MutexGuard is not held across the await point.
-            let next = { self.workers.lock().unwrap().pop() };
-            let Some(mut handle) = next else { break };
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if tokio::time::timeout(remaining, &mut handle).await.is_err() {
-                // Dropping a JoinHandle detaches it. Abort explicitly so all
-                // suspended actor futures are reclaimed instead.
-                handle.abort();
+            if let Some(result) = receipt.borrow_and_update().clone() {
+                return result.map_err(SystemError::ShutdownError);
             }
+            receipt.changed().await.map_err(|_| {
+                SystemError::ShutdownError(
+                    "shared cleanup runtime stopped before completion".into(),
+                )
+            })?;
         }
+    }
+
+    fn ensure_shutdown(&self, timeout_ms: u64) -> Receipt {
+        let mut receipt = self.shutdown_receipt.lock().unwrap();
+        if let Some(receipt) = &*receipt {
+            return receipt.clone();
+        }
+        let _gate = self.burst_spawn_gate.lock().unwrap();
+        self.is_shutting_down.store(true, Ordering::Release);
         self.status
-            .store(SchedulerStatus::Shutdown as usize, Ordering::SeqCst);
-        Ok(())
+            .store(SchedulerStatus::ShuttingDown as usize, Ordering::Release);
+        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        let retirement = self.retirement.lock().unwrap().take();
+        let patrol = self.patrol.lock().unwrap().take();
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        *receipt = Some(receiver.clone());
+        let queue = self.scheduling_queue.clone();
+        let registrations = self.scheduled_paths.clone();
+        let failures = self.failures.clone();
+        let status = self.status.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        drop(_gate);
+        drop(receipt);
+        self.runtime_handle.spawn(async move {
+            // Close the queue BEFORE taking the path index: a concurrent schedule
+            // holding that index must either finish registration or see closed.
+            for mailbox in queue.close_and_take() {
+                failures.isolate("mailbox schedule release", || {
+                    mailbox.schedule_state().force_release()
+                });
+                failures.isolate("queued mailbox destructor", || drop(mailbox));
+            }
+            let registrations = std::mem::take(&mut *registrations.lock().unwrap());
+            for mailbox in registrations.into_values() {
+                failures.isolate("registered mailbox destructor", || drop(mailbox));
+            }
+            if let Some(patrol) = patrol {
+                let already_finished = patrol.is_finished();
+                patrol.abort();
+                failures.join(patrol.await, !already_finished);
+            }
+            for mut worker in workers.into_iter().rev() {
+                let result = tokio::time::timeout_at(deadline, &mut worker).await;
+                match result {
+                    Ok(result) => failures.join(result, false),
+                    Err(_) => {
+                        let already_finished = worker.is_finished();
+                        worker.abort();
+                        failures.join(worker.await, !already_finished);
+                    }
+                }
+            }
+            if let Some(retirement) = retirement {
+                failures.join(retirement.await, false);
+            }
+            status.store(SchedulerStatus::Shutdown as usize, Ordering::Release);
+            sender.send_replace(Some(failures.result()));
+        });
+        receiver
     }
 
     /// Get the pool size
@@ -562,7 +663,7 @@ impl SharedThreadPool {
     // controller spawns *temporary* burst workers to drain the backlog and
     // reaps them after `burst_idle_timeout` of continuous idleness.
     //
-    // Global thread bound: pool_size + burst_workers_max — no explosion.
+    // Worker-task bound: pool_size + burst_workers_max. The caller owns OS threads.
     //
     // Controller algorithm (probe() runs on every queue push under load):
     //   1. If a core worker is idle OR no burst budget remains → reset.
@@ -587,6 +688,8 @@ impl SharedThreadPool {
             config: self.config.clone(),
             runtime: self.runtime_handle.clone(),
             workers: Arc::downgrade(&self.workers),
+            retirement: self.retirement.clone(),
+            failures: self.failures.clone(),
         })
     }
 
@@ -601,6 +704,8 @@ impl SharedThreadPool {
             pool_size: self.pool_size,
             burst_workers_alive: self.burst_workers_alive.load(Ordering::Relaxed),
             queue_length: self.scheduling_queue.len(),
+            queue_capacity: self.scheduling_queue.capacity(),
+            deferred_ready: self.scheduling_queue.deferred_len(),
             is_shutting_down: self.is_shutting_down.load(Ordering::Relaxed),
             status: self.status(),
             active_processors: self.worker_manager.tracked_worker_count(),
@@ -610,16 +715,17 @@ impl SharedThreadPool {
 
 impl Drop for SharedThreadPool {
     fn drop(&mut self) {
-        self.is_shutting_down.store(true, Ordering::Release);
-        for handle in self.workers.lock().unwrap().drain(..) {
-            handle.abort();
-        }
+        // The operation owns cleanup independently of this pool and its waiters.
+        // Explicit shutdown is required to observe errors before runtime teardown.
+        self.ensure_shutdown(0);
     }
 }
 
 impl ThreadScheduler for SharedThreadPool {
     fn metrics_thread_count(&self) -> usize {
-        self.pool_size
+        // These workers are tasks on a caller-owned Tokio runtime, not OS
+        // threads owned by this pool. Configured slots remain in metrics().
+        0
     }
 
     fn schedule(
@@ -719,6 +825,38 @@ mod tests {
             }),
             tokio::runtime::Handle::current(),
         )
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_aborted_worker_before_reporting_completion() {
+        struct Retired(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let pool = make_pool(1);
+        assert_eq!(pool.metrics_thread_count(), 0);
+        assert_eq!(pool.metrics().pool_size, 1);
+        let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = retired.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let pending = tokio::spawn(async move {
+            let _owned = Retired(signal);
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+        // shutdown pops from the end. Put the suspended task first so it is
+        // aborted last; a current-thread executor cannot retire it until polled.
+        pool.workers.lock().unwrap().insert(0, pending);
+        pool.shutdown(0).await.unwrap();
+        let disposed_at_completion = retired.load(Ordering::Acquire);
+        tokio::task::yield_now().await;
+        assert!(
+            disposed_at_completion,
+            "abort alone is not worker retirement"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -943,5 +1081,95 @@ mod tests {
         );
         let repr = format!("{:?}", pool);
         assert!(repr.contains("SharedThreadPool"));
+    }
+    #[tokio::test]
+    async fn scheduler_owns_deferred_actors_and_drop_breaks_ready_queue_cycles() {
+        // No await before Drop: on this current-thread runtime the worker
+        // cannot dequeue either registration, making saturation deterministic.
+        let pool = SharedThreadPool::new(
+            Some(SharedThreadPoolConfig {
+                pool_size: 1,
+                max_queue_capacity: 1,
+                burst_workers_max: 0,
+                ..Default::default()
+            }),
+            Handle::current(),
+        );
+        let resident = build_mailbox("owned/resident");
+        let deferred = build_mailbox("owned/deferred");
+        let weak_resident = Arc::downgrade(&resident);
+        let weak_deferred = Arc::downgrade(&deferred);
+        pool.schedule_now("owned/resident", resident, None).unwrap();
+        pool.schedule_now("owned/deferred", deferred, None).unwrap();
+        assert_eq!(pool.metrics().queue_length, 1);
+        assert_eq!(pool.metrics().deferred_ready, 1);
+        assert!(
+            weak_deferred.upgrade().is_some(),
+            "accepted actor lost its only owner while waiting for queue space"
+        );
+        let terminal = pool.status.clone();
+        drop(pool);
+        // Drop starts owned asynchronous retirement. Keep the runtime alive and
+        // observe its actual completion before checking strong-reference cycles.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while SchedulerStatus::from_usize(terminal.load(Ordering::Acquire))
+                != SchedulerStatus::Shutdown
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            weak_resident.upgrade().is_none(),
+            "mailbox -> hook -> queue retained a resident actor"
+        );
+        assert!(
+            weak_deferred.upgrade().is_none(),
+            "deferred actor leaked after scheduler Drop"
+        );
+    }
+    #[tokio::test]
+    async fn descheduled_ready_mailbox_can_be_registered_again_without_losing_work() {
+        let pool = SharedThreadPool::new(
+            Some(SharedThreadPoolConfig {
+                pool_size: 1,
+                max_queue_capacity: 1,
+                burst_workers_max: 0,
+                ..Default::default()
+            }),
+            Handle::current(),
+        );
+        let first = build_mailbox("reuse/first");
+        let waiting = build_mailbox("reuse/waiting");
+        pool.schedule_now("reuse/first", first, None).unwrap();
+        pool.schedule_now("reuse/waiting", waiting.clone(), None)
+            .unwrap();
+        waiting
+            .push(
+                Box::new(7_u64),
+                crate::thread::config::BackpressureStrategy::Block,
+            )
+            .await
+            .unwrap();
+        pool.deschedule("reuse/waiting").await.unwrap();
+        assert_eq!(pool.metrics().deferred_ready, 0);
+        waiting
+            .push(
+                Box::new(8_u64),
+                crate::thread::config::BackpressureStrategy::Block,
+            )
+            .await
+            .unwrap();
+        pool.schedule_now("reuse/waiting", waiting.clone(), None)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !waiting.is_empty().await {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("re-registration lost the earlier ready ownership");
+        pool.shutdown(2000).await.unwrap();
     }
 }

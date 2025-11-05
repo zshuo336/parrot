@@ -1,17 +1,5 @@
-//! interop-ray：Rust ↔ Python(ray) 网关一致性验证（DEV_03 §5 / E4 集成门禁）。
-//!
-//! 流程：
-//! 1. spawn `python3 -m parrot_protocol.ray_gw <port>`
-//! 2. 解析 stdout 的 `RAY_GW_PORT=<n>`
-//! 3. Rust RemoteActorSystem（TCP）connect → 握手（TLV，ray 侧 pb-only caps）
-//! 4. ask Ping(100) → Pong(102)（ray 方言 +2）语义验证
-//! 5. ask Add(3,4) → AddR(1007)（ray 方言 +1000）
-//!
-//! 注意：ray 网关是 pb 栈 caps（bit1），Rust 客户端握手协商须兼容（1.0 固定
-//! bin 优先 + pb 回退——caps 声明是声明，载荷语义经 type_key 路由透传）。
+//! Owned local ray interoperability probe; see interop/README.md for prerequisites and deadlines.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use parrot_api::address::ActorRef;
@@ -80,8 +68,12 @@ parrot_api::message::inventory::submit! {
             b.put_u64_le(m.1);
             Ok(b.freeze().to_vec())
         },
-        decode: |b: &[u8]| {
-            Ok(Box::new(UAddR(u64::from_le_bytes(b[8..16].try_into().map_err(|_| "len")?))) as BoxedMessage)
+        decode: |b: &[u8]| match b.as_chunks::<8>() {
+            ([left, right], []) => Ok(Box::new(UAdd(
+                u64::from_le_bytes(*left),
+                u64::from_le_bytes(*right),
+            )) as BoxedMessage),
+            _ => Err("len!=16".into()),
         },
     }
 }
@@ -112,68 +104,133 @@ impl LocalLookup for NoopLookup {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    let port_arg = std::env::args().nth(1).unwrap_or_else(|| "0".into());
-    let mut child = Command::new("python3")
-        .arg("-m")
-        .arg("parrot_protocol.ray_gw")
-        .arg(&port_arg)
-        .env("PYTHONPATH", "interop/python")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn ray gw");
+#[path = "interop_probe/options.rs"]
+mod options;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "interop_probe/owner.rs"]
+mod owner;
 
-    let port = {
-        let stdout = child.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).expect("read ray stdout");
-            if n == 0 {
-                eprintln!("interop-ray: ray gateway exited before printing port");
-                std::process::exit(2);
-            }
-            if let Some(p) = line.strip_prefix("RAY_GW_PORT=") {
-                break p.trim().parse::<u16>().expect("parse port");
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => {
+            println!("interop-ray PASS");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("interop-ray: {error}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn run() -> Result<(), String> {
+    Err("verified gateway process ownership requires Linux or macOS".into())
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn run() -> Result<(), String> {
+    let options = options::Options::parse(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(15),
+    )?;
+    let mut signals = options::Signals::new()?;
+    let root = owner::source_root()?;
+    let mut gateway = owner::Gateway::spawn(
+        owner::GatewaySpec {
+            command: vec![
+                "python3".into(),
+                root.join("tools/parrot-obs/ray_gateway.py")
+                    .into_os_string(),
+                options.port.to_string().into(),
+            ],
+            node: "ray-gw-1",
+            marker: "RAY_GW_PORT=",
+            port: options.port,
+            inline_ray: true,
+            startup_output_limit: 262144,
+        },
+        options.startup,
+    )?;
+    let started = tokio::select! {
+        result = gateway.ready() => result,
+        _ = signals.cancelled() => Err("interrupted during gateway startup".into()),
+    };
+    let result = match started {
+        Ok(port) => {
+            println!("ray gateway port: {port}");
+            match RemoteActorSystem::new(
+                RemoteConfig::tcp("interop-ray-rust", None),
+                Arc::new(NoopLookup),
+            ) {
+                Ok(client) => {
+                    let business = tokio::select! {
+                        result = tokio::time::timeout(options.business, probe(&client, port)) => result.unwrap_or_else(|_| Err("business deadline exceeded".into())),
+                        _ = signals.cancelled() => Err("interrupted during business verification".into()),
+                        result = gateway.ended() => Err(format!("gateway ended during business verification: {result:?}")),
+                    };
+                    let shutdown =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), client.shutdown())
+                            .await;
+                    match shutdown {
+                        Ok(Ok(())) => business,
+                        other => Err(format!(
+                            "business: {business:?}; remote shutdown: {other:?}"
+                        )),
+                    }
+                }
+                Err(error) => Err(error.to_string()),
             }
         }
+        Err(error) => Err(error),
     };
-    println!("ray gateway port: {port}");
-
-    let mut cfg = RemoteConfig::tcp("interop-ray-rust", None);
-    cfg.extra_caps = parrot_remote::handshake::caps::PB; // ray 网关 pb-only（07 §8.1）
-    let client = RemoteActorSystem::new(cfg, Arc::new(NoopLookup)).unwrap();
-    client.start().await.unwrap();
+    let retired = gateway.retire().await;
+    match (result, retired) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (result, Err(error)) => Err(format!("probe: {result:?}; gateway retirement: {error}")),
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn probe(client: &Arc<RemoteActorSystem>, port: u16) -> Result<(), String> {
+    client.start().await.map_err(|e| e.to_string())?;
     client
         .connect(&parrot_remote::NodeAddr::tcp(
             "ray-gw-1",
-            format!("127.0.0.1:{port}").parse().unwrap(),
+            ([127, 0, 0, 1], port).into(),
         ))
         .await
-        .expect("connect+handshake with pb-only peer");
-
+        .map_err(|e| e.to_string())?;
     let ping = client
         .remote_ref("parrot://ray-gw-1/ray/user/echo")
-        .unwrap();
-
-    // 语义：Ping(100) → Pong(102)（ray 方言 +2）
-    let r = ping.send(Box::new(UPing(100))).await.unwrap();
-    let got = r.downcast_ref::<UPong>().unwrap().0;
-    assert_eq!(got, 102, "ray dialect: Ping(100) -> Pong(102)");
-
-    // 语义：Add(3,4) → AddR(1007)（ray 方言 +1000）
+        .map_err(|e| e.to_string())?;
+    let reply = ping
+        .send(Box::new(UPing(100)))
+        .await
+        .map_err(|e| e.to_string())?;
+    let got = reply
+        .downcast_ref::<UPong>()
+        .ok_or("unexpected Ping response type")?
+        .0;
+    if got != 102 {
+        return Err(format!("Ping(100): expected 102, got {got}"));
+    }
     let add = client
         .remote_ref("parrot://ray-gw-1/ray/user/calc")
-        .unwrap();
-    let r = add.send(Box::new(UAdd(3, 4))).await.unwrap();
-    let got = r.downcast_ref::<UAddR>().unwrap().0;
-    assert_eq!(got, 1007, "ray dialect: Add(3,4) -> AddR(1007)");
-
-    let _ = child.kill();
-    let _ = child.wait();
-    client.shutdown().await.ok();
-    println!("interop-ray PASS");
+        .map_err(|e| e.to_string())?;
+    let reply = add
+        .send(Box::new(UAdd(3, 4)))
+        .await
+        .map_err(|e| e.to_string())?;
+    let got = reply
+        .downcast_ref::<UAddR>()
+        .ok_or("unexpected Add response type")?
+        .0;
+    if got != 1007 {
+        return Err(format!("Add(3,4): expected 1007, got {got}"));
+    }
+    Ok(())
 }
+
+#[cfg(test)]
+#[path = "interop_probe/codec_contracts.rs"]
+mod codec_contracts;

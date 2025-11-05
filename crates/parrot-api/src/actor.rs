@@ -83,10 +83,18 @@ pub struct EmptyConfig;
 ///
 /// Implement this trait to define custom configuration parameters for your actor.
 /// The configuration is passed to the actor during creation through the `ActorFactory`.
-pub trait ActorConfig: Send + Sync + 'static {}
+///
+/// Configurations are moved into an actor factory and are never shared by the
+/// runtime. They therefore only need to be `Send`; requiring `Sync` made the
+/// public type-erased spawn API impossible to implement for its own
+/// `Box<dyn Any + Send>` contract.
+pub trait ActorConfig: Send + 'static {}
 
 /// Implement ActorConfig for the EmptyConfig type
 impl ActorConfig for EmptyConfig {}
+
+/// Type-erased configuration accepted by `ActorSystem::spawn_root_boxed`.
+impl ActorConfig for Box<dyn std::any::Any + Send> {}
 
 /// Factory trait for creating actor instances.
 ///
@@ -230,12 +238,56 @@ pub trait Actor: Send + 'static {
     /// * `ctx` - Mutable reference to actor context
     ///
     /// # Returns
-    /// `ActorResult<BoxedMessage>` containing the response message or error
+    /// `ActorResult<BoxedMessage>` containing the response message or error.
+    /// Managed dynamic engines supervise a returned `Err` just like a handler
+    /// panic. Use a successful reply containing a domain `Result` for expected
+    /// rejection, or configure Resume when retaining mutated state is intended.
+    /// Resume discards the failed dispatch; it does not replay or roll it back.
     fn receive_message<'a>(
         &'a mut self,
         msg: BoxedMessage,
         ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>>;
+
+    /// Opt in a message to ordered coalescing by engines that support batches.
+    /// The Thread engine additionally requires `message_batch_size > 1` in its
+    /// actor config. Other engines may continue using single-message dispatch.
+    /// Return false for barriers (inspection, drain, lifecycle transitions).
+    /// This predicate must be quick and must not change actor state.
+    fn can_batch_message(&self, _message: &BoxedMessage) -> bool {
+        false
+    }
+
+    /// Process a contiguous group of opted-in messages in mailbox dequeue order.
+    /// Return exactly one result per input, in the same order. The engine owns
+    /// the original reply channels and publishes results after this completes.
+    /// The Thread engine treats a completed batch as one supervision event,
+    /// using its first error; all available individual replies are retained.
+    /// An invalid result count is a terminal dispatch contract violation.
+    /// A batch is not an atomic transaction: failures/cancellation may leave
+    /// effects. All engine control messages are excluded from this hook.
+    /// The default preserves serial handling; overrides may share I/O while
+    /// retaining their application's required ordering and commit guarantees.
+    fn receive_batch<'a>(
+        &'a mut self,
+        messages: Vec<BoxedMessage>,
+        ctx: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, Vec<ActorResult<BoxedMessage>>> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(messages.len());
+            let mut messages = messages.into_iter();
+            while let Some(message) = messages.next() {
+                let outcome = self.receive_message(message, ctx).await;
+                let fatal = matches!(outcome, Err(ActorError::Panic(_)));
+                results.push(outcome);
+                if fatal {
+                    results.extend(messages.map(|_| Err(ActorError::Stopped)));
+                    break;
+                }
+            }
+            results
+        })
+    }
 
     /// Whether this actor wants its messages dispatched through the async
     /// [`receive_message`](Self::receive_message) path.
@@ -321,7 +373,11 @@ pub trait Actor: Send + 'static {
         Box::pin(async move { Err(err) })
     }
 
-    /// Perform cleanup before actor stops.
+    /// Perform cleanup during a graceful actor stop.
+    ///
+    /// The managed Thread/Actix engines do not call this hook on an instance
+    /// terminated by a non-resumable initialization/handler failure. Its owned
+    /// resources still retire; Drop must not depend on this hook having run.
     ///
     /// Override to:
     /// - Clean up resources

@@ -12,20 +12,31 @@ license = "MIT"
 parrot = { path = "../parrot" }
 parrot-api = { path = "../parrot-api", features = ["remote"] }
 parrot-remote = { path = "../parrot-remote" }
-parrot-app = { path = "../parrot-app" }
+parrot-app = { path = "../parrot-app", features = ["host"] }
+parrot-config = { path = "../parrot-config" }
 parrot-wasm = { path = "../parrot-wasm", optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
 futures = "0.3"
+tracing = "0.1"
 sha2 = "0.10"
 hex = "0.4"
+bytes = "1"
+url = "2"
+toml = "0.8"
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [features]
 # C 阶段（DEV_09 §3.3）：WasmActor 接线——wasmtime 重编译成本高（R1），
-# 默认关；开启后 executor_v2 支持 AdminArtifactRef::Wasm 部署。
+# 默认关；开启共享 WasmActor、应用 manifest 和 Node Admin V2 Wasm 部署。
 default = []
-wasm = ["dep:parrot-wasm", "parrot-wasm/runtime"]
+wasm = ["dep:parrot-wasm", "parrot-wasm/runtime", "parrot-app/wasm"]
+# Native loader support only; execution additionally requires explicit NativeTrust.
+dylib = ["parrot-app/dylib"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lib]
 name = "parrot_node"
@@ -40,6 +51,7 @@ name = "parrot-probe"
 path = "src/bin/parrot-probe.rs"
 
 [dev-dependencies]
+tempfile = "3"
+rcgen = "0.14.10"
 hex = "0.4"
 sha2 = "0.10"
-bytes = "1"

@@ -6,10 +6,12 @@
 //! ③ placement 无候选 → `Unplaceable` 带原因串；
 //! ④ Sharded(n)/Pool(n) 生成 n 个路径（`/user/{name}-{i}`）。
 
+use crate::limits::{add, check, AdmissionError, ApplicationLimits};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::manifest::{
-    validate, AppManifest, ComponentSpec, InstancePolicy, ManifestError, PlacementConstraint,
+    validate_with_limits, AppManifest, ComponentSpec, InstancePolicy, ManifestError,
+    PlacementConstraint,
 };
 
 /// 拓扑视图（测试替身友好——真实实现查 SWIM/Directory）。
@@ -26,7 +28,7 @@ pub struct CandidateNode {
     pub node_id: String,
     pub role: String,
     pub labels: Vec<String>,
-    /// 负载水位 [0,1]（选节点时低者优先）。
+    /// 负载水位 `[0,1]`（选节点时低者优先）。
     pub load: f32,
 }
 
@@ -50,7 +52,7 @@ impl TopologyView for LocalTopology {
 }
 
 /// 规划产物。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Plan {
     /// 依赖序装配序列（Kahn 确定性）。
     pub order: Vec<PlannedComponent>,
@@ -59,7 +61,7 @@ pub struct Plan {
 }
 
 /// 单组件规划结果。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PlannedComponent {
     pub spec: ComponentSpec,
     /// Sharded/Pool 的实例路径分配（None = Singleton 单路径）。
@@ -71,6 +73,8 @@ pub struct PlannedComponent {
 /// 规划错误。
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PlanError {
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
     #[error("manifest invalid: {0:?}")]
     Manifest(Vec<ManifestError>),
     #[error("component {comp:?} unplaceable: {reason}")]
@@ -79,8 +83,24 @@ pub enum PlanError {
 
 /// 规划入口（A2 规约签名）。
 pub fn plan(m: &AppManifest, topology: &dyn TopologyView) -> Result<Plan, PlanError> {
-    // 校验前置（A1 规约 ①：全项通过才可进 Planner）
-    validate(m).map_err(PlanError::Manifest)?;
+    plan_with_limits(m, topology, &ApplicationLimits::default())
+}
+
+pub fn plan_with_limits(
+    m: &AppManifest,
+    topology: &dyn TopologyView,
+    limits: &ApplicationLimits,
+) -> Result<Plan, PlanError> {
+    validate_with_limits(m, limits).map_err(PlanError::Manifest)?;
+    let mut expanded = 0;
+    for component in &m.components {
+        add(
+            "expanded bytes",
+            &mut expanded,
+            limits.path_bytes(component)?,
+            limits.max_expanded_bytes,
+        )?;
+    }
 
     let mut out = Plan::default();
 
@@ -112,8 +132,13 @@ pub fn plan(m: &AppManifest, topology: &dyn TopologyView) -> Result<Plan, PlanEr
     while let Some(&name) = ready.iter().next() {
         ready.remove(&name);
         let c = by_name[name];
-        out.order
-            .push(plan_component(c, topology, &mut out.warnings)?);
+        out.order.push(plan_component(
+            c,
+            topology,
+            &mut out.warnings,
+            limits,
+            &mut expanded,
+        )?);
         emitted += 1;
         for &dep in dependents.get(name).into_iter().flatten() {
             let e = indegree.get_mut(dep).expect("indegree entry exists");
@@ -130,6 +155,7 @@ pub fn plan(m: &AppManifest, topology: &dyn TopologyView) -> Result<Plan, PlanEr
         m.components.len(),
         "Kahn emitted all (no cycle — validate pre-checked)"
     );
+    limits.check_plan(&out)?;
     Ok(out)
 }
 
@@ -138,8 +164,41 @@ fn plan_component(
     c: &ComponentSpec,
     topology: &dyn TopologyView,
     warnings: &mut Vec<String>,
+    limits: &ApplicationLimits,
+    expanded: &mut u64,
 ) -> Result<PlannedComponent, PlanError> {
     let mut cands = topology.candidates(&c.placement);
+    check(
+        "topology candidates",
+        cands.len() as u64,
+        limits.max_candidates,
+    )?;
+    let mut bytes = 0;
+    for node in &cands {
+        add(
+            "candidate bytes",
+            &mut bytes,
+            std::mem::size_of::<CandidateNode>() as u64,
+            limits.max_candidate_bytes,
+        )?;
+        for text in std::iter::once(&node.node_id)
+            .chain(std::iter::once(&node.role))
+            .chain(node.labels.iter())
+        {
+            add(
+                "candidate bytes",
+                &mut bytes,
+                text.len() as u64 + std::mem::size_of::<String>() as u64,
+                limits.max_candidate_bytes,
+            )?;
+        }
+        if !node.load.is_finite() || !(0.0..=1.0).contains(&node.load) {
+            return Err(PlanError::Unplaceable {
+                comp: c.name.clone(),
+                reason: "candidate load must be finite and in 0..=1".into(),
+            });
+        }
+    }
     if cands.is_empty() {
         return Err(PlanError::Unplaceable {
             comp: c.name.clone(),
@@ -150,19 +209,34 @@ fn plan_component(
         });
     }
     // 低负载优先（placement 规约：SWIM 元数据过滤后选水位最低）
-    cands.sort_by(|a, b| {
-        a.load
-            .partial_cmp(&b.load)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
+    cands.sort_by(|a, b| a.load.total_cmp(&b.load));
     let n = c.instances.instance_count();
+    // Admit all selected node clones before allocating paths or assignments.
+    if c.placement.anti_affinity && n > 1 {
+        for (i, node) in cands.iter().enumerate().take(n) {
+            let copies = n / cands.len() + usize::from(i < n % cands.len());
+            let charge = (node.node_id.len() as u64 + std::mem::size_of::<String>() as u64)
+                .checked_mul(copies as u64)
+                .ok_or(AdmissionError::Overflow("expanded bytes"))?;
+            add(
+                "expanded bytes",
+                expanded,
+                charge,
+                limits.max_expanded_bytes,
+            )?;
+        }
+    } else {
+        add(
+            "expanded bytes",
+            expanded,
+            cands[0].node_id.len() as u64 + std::mem::size_of::<String>() as u64,
+            limits.max_expanded_bytes,
+        )?;
+    }
     let shard_plan = match c.instances {
-        InstancePolicy::Sharded(k) | InstancePolicy::Pool(k) => Some(
-            (0..k)
-                .map(|i| format!("/user/{}-{}", c.name, i))
-                .collect::<Vec<_>>(),
-        ),
+        InstancePolicy::Sharded(_) | InstancePolicy::Pool(_) => {
+            Some(c.instance_paths_with_limits(limits)?)
+        }
         _ => None,
     };
 
@@ -220,6 +294,7 @@ mod tests {
             version: "1.0.0".into(),
             components: comps,
             wiring: vec![],
+            mirrors: Vec::new(),
             config_overlay: None,
         }
     }
@@ -472,20 +547,47 @@ mod tests {
     }
 
     #[test]
-    fn plan_wiring_survives_plan() {
+    fn valid_wiring_preserves_dependency_order() {
         let m = AppManifest {
             name: "w".into(),
             version: "1.0.0".into(),
             components: vec![comp("a", &[]), comp("b", &["a"])],
             wiring: vec![WireSpec {
                 from: "a:/user/out".into(),
-                to: "b:/user/in".into(),
+                to: "b:/user/b/in".into(),
                 qos: "lan".into(),
             }],
+            mirrors: Vec::new(),
             config_overlay: None,
         };
         let p = plan(&m, &LocalTopology).unwrap();
-        assert_eq!(p.order.len(), 2);
+        assert_eq!(
+            p.order
+                .iter()
+                .map(|c| c.spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn invalid_wiring_is_rejected_before_topology_queries() {
+        struct Untouched;
+        impl TopologyView for Untouched {
+            fn candidates(&self, _: &PlacementConstraint) -> Vec<CandidateNode> {
+                panic!("invalid manifest reached topology");
+            }
+            fn self_is(&self, _: Option<&str>) -> bool {
+                panic!("invalid manifest reached topology");
+            }
+        }
+        let mut m = manifest(vec![comp("a", &[]), comp("b", &["a"])]);
+        m.wiring.push(WireSpec {
+            from: "a:/user/out".into(),
+            to: "b:/user/other".into(),
+            qos: "lan".into(),
+        });
+        assert!(matches!(plan(&m, &Untouched), Err(PlanError::Manifest(_))));
     }
 
     #[test]
@@ -506,6 +608,22 @@ mod tests {
         let p = plan(&manifest(comps), &LocalTopology).unwrap();
         assert_eq!(p.order.len(), 100);
         assert_eq!(p.order[99].spec.name, "c099");
+    }
+
+    #[test]
+    fn excessive_instance_request_is_rejected_before_topology_or_expansion() {
+        struct Untouched;
+        impl TopologyView for Untouched {
+            fn candidates(&self, _: &PlacementConstraint) -> Vec<CandidateNode> {
+                panic!("unbounded instance request reached topology before admission");
+            }
+            fn self_is(&self, _: Option<&str>) -> bool {
+                panic!("unbounded instance request reached topology before admission");
+            }
+        }
+        let mut m = manifest(vec![comp("huge", &[])]);
+        m.components[0].instances = InstancePolicy::Pool(u32::MAX as usize);
+        assert!(plan(&m, &Untouched).is_err());
     }
 
     #[test]

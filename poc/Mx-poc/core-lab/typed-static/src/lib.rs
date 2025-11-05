@@ -1,175 +1,75 @@
-//! POC 5：静态类型编程模式（动态/静态双轨 ActorRef）。
+//! Owned actor workers with a genuinely typed mailbox and optional dynamic edges.
 //!
-//! 核心思想：
-//!   - 动态轨（现状）：Box<dyn Any + Send>，2 装箱 + 2 downcast
-//!   - 静态轨（新增）：TypedActorRef<M>，send/ask/tell 消息类型编译期固定，
-//!     零 Any 装箱、零 downcast，直达引擎 mailbox（mpsc<M> 类型化通道）
-//!   - 两条轨同一引擎并存，可互转（typed ↔ dyn 桥接点显式装箱一次）
-//!   - #[typed_actor] 宏消除模板代码
+//! Static messages/replies stay generic: no Any conversion or message boxing is
+//! required by this path. Queues and reply channels can still allocate. The
+//! `typed_actor!` macro dispatches several typed protocols to one actor state.
+mod bridge;
+mod engine;
+mod mailbox;
+mod protocol;
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
+pub use bridge::{BoxedMessage, BoxedResult, DynActorRef, TypedToDyn};
+pub use engine::SimpleEngine;
+pub use mailbox::TypedActorRef;
+pub use protocol::{ProtocolMessage, ProtocolRef};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::time::{Duration, Instant};
 
-pub type BoxedMessage = Box<dyn Any + Send>;
-pub type BoxedResult = Result<BoxedMessage, String>;
-
-// ============ 静态轨接口（用户需求中的 ActorRefExt） ============
-
-/// 静态 ask：M → R 编译期固定。
+pub struct SendError<M> {
+    pub reason: String,
+    pub message: M,
+}
+impl<M> std::fmt::Debug for SendError<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendError")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
 pub trait TypedAskRef<M: Send + 'static>: Send + Sync {
     type Reply: Send + 'static;
-    fn ask(&self, msg: M) -> Result<Self::Reply, String>;
-    fn tell(&self, msg: M);
+    fn ask(&self, msg: M) -> Result<Self::Reply, String> {
+        self.ask_with_timeout(msg, Duration::from_secs(5))
+    }
+    fn ask_with_timeout(&self, msg: M, timeout: Duration) -> Result<Self::Reply, String>;
+    /// Admission only; on failure the original message is returned.
+    fn tell(&self, msg: M) -> Result<(), SendError<M>>;
 }
-
-/// 静态 receive（Actor trait 的静态参数版）。
 pub trait TypedReceive<M>: Send + 'static {
     type Reply: Send + 'static;
     fn receive_typed(&mut self, msg: M) -> Result<Self::Reply, String>;
 }
-
-/// 静态 ref：包裹类型化通道，零 Any。
-pub struct TypedActorRef<M, R> {
-    tx: std::sync::mpsc::Sender<(M, Option<std::sync::mpsc::Sender<Result<R, String>>>)>,
-    path: String,
-    _marker: PhantomData<fn(M) -> R>,
-}
-
-impl<M: Send + 'static, R: Send + 'static> TypedAskRef<M> for TypedActorRef<M, R> {
-    type Reply = R;
-    fn ask(&self, msg: M) -> Result<R, String> {
-        let (rtx, rrx) = std::sync::mpsc::channel();
-        self.tx.send((msg, Some(rtx))).map_err(|e| e.to_string())?;
-        rrx.recv().map_err(|e| e.to_string())?
+fn deadline(timeout: Duration) -> Result<Instant, String> {
+    if timeout.is_zero() {
+        return Err("timeout must be positive".into());
     }
-    fn tell(&self, msg: M) {
-        let _ = self.tx.send((msg, None));
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "timeout is too large".into())
+}
+fn safe_drop<T>(value: T) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
+        if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            std::mem::forget(secondary);
+        }
     }
 }
-
-impl<M, R> TypedActorRef<M, R> {
-    pub fn path(&self) -> &str { &self.path }
-}
-
-// ============ 动态轨（现状不变） ============
-
-pub trait DynActorRef: Send + Sync {
-    fn send_dyn(&self, msg: BoxedMessage) -> BoxedResult;
-    fn path(&self) -> String;
-}
-
-// ============ 引擎：双轨 spawn ============
-
-/// 最小引擎：线程 + mpsc。两种 spawn 各走各的通道类型。
-pub struct SimpleEngine {
-    actors: Mutex<HashMap<String, ()>>, // 路径占用表
-}
-
-impl SimpleEngine {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self { actors: Mutex::new(HashMap::new()) })
-    }
-
-    /// 静态 spawn：TypedReceive actor，全程零 Any。
-    pub fn spawn_typed<A, M>(
-        &self,
-        mut actor: A,
-        path: &str,
-    ) -> Result<TypedActorRef<M, A::Reply>, String>
-    where
-        A: TypedReceive<M> + Send + 'static,
-        M: Send + 'static,
-    {
-        let (tx, rx) = std::sync::mpsc::channel::<(M, Option<std::sync::mpsc::Sender<Result<A::Reply, String>>>)>();
-        std::thread::spawn(move || {
-            for (msg, rtx) in rx {
-                let reply = actor.receive_typed(msg);
-                if let Some(rtx) = rtx {
-                    let _ = rtx.send(reply);
-                }
-            }
-        });
-        self.actors.lock().unwrap().insert(path.to_string(), ());
-        Ok(TypedActorRef { tx, path: path.to_string(), _marker: PhantomData })
-    }
-
-    /// 动态 spawn（现状路径，Box<dyn Any>）。
-    pub fn spawn_dyn(
-        &self,
-        mut actor: Box<dyn FnMut(BoxedMessage) -> BoxedResult + Send>,
-        path: &str,
-    ) -> Result<Arc<dyn DynActorRef>, String> {
-        let (tx, rx) = std::sync::mpsc::channel::<(BoxedMessage, Option<std::sync::mpsc::Sender<BoxedResult>>)>();
-        std::thread::spawn(move || {
-            for (msg, rtx) in rx {
-                let r = actor(msg);
-                if let Some(rtx) = rtx {
-                    let _ = rtx.send(r);
-                }
-            }
-        });
-        self.actors.lock().unwrap().insert(path.to_string(), ());
-        Ok(Arc::new(DynRef { tx, path: path.to_string() }))
+struct Owned<T>(Option<T>);
+impl<T> Drop for Owned<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            safe_drop(value);
+        }
     }
 }
-
-struct DynRef {
-    tx: std::sync::mpsc::Sender<(BoxedMessage, Option<std::sync::mpsc::Sender<BoxedResult>>)>,
-    path: String,
-}
-
-impl DynActorRef for DynRef {
-    fn send_dyn(&self, msg: BoxedMessage) -> BoxedResult {
-        let (rtx, rrx) = std::sync::mpsc::channel();
-        self.tx.send((msg, Some(rtx))).map_err(|e| e.to_string())?;
-        rrx.recv().map_err(|e| e.to_string())?
-    }
-    fn path(&self) -> String { self.path.clone() }
-}
-
-// ============ 双轨桥接（显式、一次性装箱） ============
-
-/// 把静态 ref 桥接到动态接口：调用方提供 M 的编解码（显式装箱点）。
-pub struct TypedToDyn<M, R> {
-    tx: std::sync::mpsc::Sender<(M, Option<std::sync::mpsc::Sender<Result<R, String>>>)>,
-    path: String,
-    encode: fn(BoxedMessage) -> Result<M, String>,
-    decode: fn(R) -> BoxedMessage,
-}
-
-impl<M: Send + 'static, R: Send + 'static> DynActorRef for TypedToDyn<M, R> {
-    fn send_dyn(&self, msg: BoxedMessage) -> BoxedResult {
-        let m = (self.encode)(msg)?;
-        let (rtx, rrx) = std::sync::mpsc::channel();
-        self.tx.send((m, Some(rtx))).map_err(|e| e.to_string())?;
-        let r = rrx.recv().map_err(|e| e.to_string())?;
-        r.map(|x| (self.decode)(x))
-    }
-    fn path(&self) -> String { self.path.clone() }
-}
-
-impl<M: Send + 'static, R: Send + 'static> TypedActorRef<M, R> {
-    /// 桥接到动态轨（装箱发生在 encode/decode 边界，各一次）。
-    pub fn into_dyn(
-        self,
-        encode: fn(BoxedMessage) -> Result<M, String>,
-        decode: fn(R) -> BoxedMessage,
-    ) -> Arc<dyn DynActorRef> {
-        Arc::new(TypedToDyn { tx: self.tx, path: self.path, encode, decode })
-    }
-}
-
-// ============ 便捷 spawn（宏展开后的形态，POC 用类型推断函数达到同等便利） ============
-
-impl SimpleEngine {
-    /// 一行完成 TypedReceive actor 的静态 spawn。
-    pub fn actor<A, M>(&self, actor: A, path: &str) -> Result<TypedActorRef<M, A::Reply>, String>
-    where
-        A: TypedReceive<M> + Send + 'static,
-        M: Send + 'static,
-    {
-        self.spawn_typed(actor, path)
-    }
+fn panic_error(payload: Box<dyn std::any::Any + Send>) -> String {
+    let text = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "opaque panic".into()
+    };
+    safe_drop(payload);
+    format!("actor or adapter panicked: {text}")
 }

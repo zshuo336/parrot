@@ -21,11 +21,24 @@ async fn spawn_wasm(
     path: &str,
     fuel: u64,
 ) -> parrot_api::types::BoxedActorRef {
-    let rt = WasmRuntime::new(WasmConfig {
-        fuel_per_message: fuel,
-        ..Default::default()
-    })
-    .unwrap();
+    spawn_wasm_with_config(
+        ts,
+        path,
+        WasmConfig {
+            fuel_per_message: fuel,
+            epoch_deadline: 1_000_000,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn spawn_wasm_with_config(
+    ts: &Arc<ThreadActorSystem>,
+    path: &str,
+    config: WasmConfig,
+) -> parrot_api::types::BoxedActorRef {
+    let rt = WasmRuntime::new(config).unwrap();
     let ctx = HostCtx {
         self_path: path.to_string(),
         ..Default::default()
@@ -37,7 +50,12 @@ async fn spawn_wasm(
             actor,
             path,
             None,
-            parrot::thread::config::ThreadActorConfig::default(),
+            parrot::thread::config::ThreadActorConfig {
+                // WasmComponent resets its guest after traps. These tests
+                // explicitly keep the host wrapper alive to verify recovery.
+                supervisor_strategy: Some(parrot::thread::SupervisorStrategy::Resume),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -63,6 +81,31 @@ async fn wasm_actor_echo_roundtrip() {
     let reply = ask(&r, "echo", b"hello wasm actor").await.unwrap();
     assert_eq!(reply.0, b"hello wasm actor");
     ts.stop_actor("/user/wasm-echo").await.unwrap();
+}
+
+#[tokio::test]
+async fn wasm_actor_epoch_interrupts_after_the_runtime_owner_is_dropped() {
+    let ts = ThreadActorSystem::shared(Default::default());
+    // spawn_wasm_with_config drops its runtime before returning the actor.
+    // Finite fuel remains a fallback if epoch ownership is accidentally lost.
+    let r = spawn_wasm_with_config(
+        &ts,
+        "/user/wasm-epoch",
+        WasmConfig {
+            fuel_per_message: 1_000_000_000,
+            epoch_deadline: 10,
+            ..Default::default()
+        },
+    )
+    .await;
+    let error = ask(&r, "spin", &[]).await.unwrap_err();
+    assert!(
+        error.to_string().contains("epoch deadline exceeded"),
+        "{error}"
+    );
+    assert_eq!(ask(&r, "echo", b"recovered").await.unwrap().0, b"recovered");
+    ts.stop_actor("/user/wasm-epoch").await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 #[tokio::test]
@@ -108,4 +151,55 @@ async fn wasm_actor_self_path_visible() {
     let out = ask(&r, "self", &[]).await.unwrap();
     assert_eq!(out.0, b"/user/wasm-self");
     ts.stop_actor("/user/wasm-self").await.unwrap();
+}
+
+#[tokio::test]
+async fn wasm_actor_memory_budget_survives_guest_recovery() {
+    let ts = ThreadActorSystem::shared(Default::default());
+    let path = "/user/wasm-limited";
+    let actor = spawn_wasm_with_config(
+        &ts,
+        path,
+        WasmConfig {
+            memory_limit_mb: 2,
+            fuel_per_message: 100_000,
+            epoch_deadline: 1_000_000,
+        },
+    )
+    .await;
+    for round in 0..2 {
+        let grown = ask(&actor, "grow", &33u32.to_le_bytes()).await.unwrap();
+        assert_eq!(
+            u64::from_le_bytes(grown.0.try_into().unwrap()),
+            u32::MAX as u64
+        );
+        let pages = ask(&actor, "memory-pages", &[]).await.unwrap();
+        assert!(u64::from_le_bytes(pages.0.try_into().unwrap()) <= 32);
+        assert_eq!(ask(&actor, "echo", b"alive").await.unwrap().0, b"alive");
+        if round == 0 {
+            assert!(ask(&actor, "spin", &[])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("OverQuota"));
+        }
+    }
+    ts.stop_actor(path).await.unwrap();
+    ts.shutdown_internal().await.unwrap();
+}
+
+#[tokio::test]
+async fn wasm_actor_restores_start_state_after_trap() {
+    let ts = ThreadActorSystem::shared(Default::default());
+    let path = "/user/wasm-start-recovery";
+    let actor = spawn_wasm(&ts, path, 100_000).await;
+    assert_eq!(ask(&actor, "started", &[]).await.unwrap().0, [1]);
+    assert!(ask(&actor, "spin", &[])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("OverQuota"));
+    assert_eq!(ask(&actor, "started", &[]).await.unwrap().0, [1]);
+    ts.stop_actor(path).await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }

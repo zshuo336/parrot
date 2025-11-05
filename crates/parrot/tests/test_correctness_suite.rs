@@ -142,6 +142,158 @@ async fn ask_typed(
 // C1+C2+C3：恰好一次 + 每发送者 FIFO + 计算完整性（一次跑全）
 // ---------------------------------------------------------------------------
 
+async fn queued_fifo_phase(ts: &Arc<ThreadActorSystem>) {
+    const SENDERS: u64 = 8;
+    const PER_SENDER: u64 = 128;
+    enum QueuedMessage {
+        Hold,
+        Value { sender: u64, sequence: u64 },
+        Snapshot(tokio::sync::oneshot::Sender<Vec<(u64, u64)>>),
+    }
+    struct Gate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    struct QueuedRecorder {
+        gate: Arc<Gate>,
+        values: Vec<(u64, u64)>,
+    }
+    impl Actor for QueuedRecorder {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn receive_message<'a>(
+            &'a mut self,
+            message: BoxedMessage,
+            _context: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                match *message
+                    .downcast::<QueuedMessage>()
+                    .expect("unexpected queued FIFO message")
+                {
+                    QueuedMessage::Hold => {
+                        self.gate.entered.notify_one();
+                        self.gate.release.notified().await;
+                        Ok(Box::new(99u64) as BoxedMessage)
+                    }
+                    QueuedMessage::Value { sender, sequence } => {
+                        self.values.push((sender, sequence));
+                        Ok(Box::new(()) as BoxedMessage)
+                    }
+                    QueuedMessage::Snapshot(reply) => {
+                        reply
+                            .send(self.values.clone())
+                            .expect("queued FIFO observer must be alive");
+                        Ok(Box::new(()) as BoxedMessage)
+                    }
+                }
+            })
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+    struct ReleaseOnDrop(Arc<Gate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+        }
+    }
+
+    let gate = Arc::new(Gate {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let release = ReleaseOnDrop(gate.clone());
+    let actor = ts
+        .spawn_at::<QueuedRecorder>(
+            QueuedRecorder {
+                gate: gate.clone(),
+                values: Vec::new(),
+            },
+            "/c1/queued",
+            None,
+            ThreadActorConfig {
+                // 全部业务和最后的快照都在释放门之前入队。此处只测排序，
+                // 背压容量和策略由独立C6契约验证。
+                mailbox_capacity: Some((SENDERS * PER_SENDER + 1) as usize),
+                backpressure_strategy: Some(BackpressureStrategy::Error),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn queued FIFO actor");
+    let held_actor = actor.clone();
+    let held = tokio::spawn(async move {
+        held_actor
+            .send_with_timeout(Box::new(QueuedMessage::Hold), None)
+            .await
+    });
+    gate.entered.notified().await;
+    let start = Arc::new(tokio::sync::Barrier::new(SENDERS as usize + 1));
+    let mut producers = Vec::new();
+    for sender in 0..SENDERS {
+        let actor = actor.clone();
+        let start = start.clone();
+        producers.push(tokio::spawn(async move {
+            start.wait().await;
+            for sequence in 0..PER_SENDER {
+                actor
+                    .deliver(Box::new(QueuedMessage::Value { sender, sequence }))
+                    .await
+                    .expect("queued FIFO admission must succeed");
+                if sequence % 7 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }));
+    }
+    start.wait().await;
+    for producer in producers {
+        producer.await.expect("queued FIFO producer panicked");
+    }
+    let (snapshot, result) = tokio::sync::oneshot::channel();
+    actor
+        .deliver(Box::new(QueuedMessage::Snapshot(snapshot)))
+        .await
+        .expect("queued FIFO snapshot must be admitted last");
+    drop(release);
+    let reply = held
+        .await
+        .expect("queued FIFO held caller panicked")
+        .expect("queued FIFO held request failed");
+    assert_eq!(
+        *reply.downcast::<u64>().unwrap(),
+        99,
+        "queued FIFO held reply must be preserved"
+    );
+    let values = result
+        .await
+        .expect("queued FIFO snapshot must be delivered");
+    assert_eq!(
+        values.len(),
+        (SENDERS * PER_SENDER) as usize,
+        "queued FIFO snapshot must follow every admitted message"
+    );
+    for sender in 0..SENDERS {
+        let sequence: Vec<u64> = values
+            .iter()
+            .filter(|(id, _)| *id == sender)
+            .map(|(_, sequence)| *sequence)
+            .collect();
+        assert_eq!(
+            sequence,
+            (0..PER_SENDER).collect::<Vec<_>>(),
+            "queued FIFO must preserve each sender's admitted sequence exactly"
+        );
+    }
+    ts.stop_actor("/c1/queued")
+        .await
+        .expect("queued FIFO actor retirement");
+}
+
 #[test]
 fn c1_c2_c3_exactly_once_fifo_integrity() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -242,7 +394,12 @@ fn c1_c2_c3_exactly_once_fifo_integrity() {
             "[C1/C2/C3] {} events: exactly-once ✓ per-sender FIFO ✓ burn integrity ✓",
             SENDERS * PER
         );
-        let _ = ts.shutdown_internal().await;
+        tokio::time::timeout(Duration::from_secs(15), queued_fifo_phase(&ts))
+            .await
+            .expect("queued FIFO exceeded its independent liveness watchdog");
+        ts.shutdown_internal()
+            .await
+            .expect("C1 system shutdown must succeed");
     });
 }
 
@@ -370,198 +527,193 @@ fn c5_mode_equivalence() {
 
 #[test]
 fn c6_backpressure_semantics() {
+    enum ContractMessage {
+        Hold,
+        Value(u64),
+        Snapshot,
+    }
+    struct Gate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: AtomicU64,
+    }
+    struct ControlledRecorder {
+        gate: Arc<Gate>,
+        values: Vec<u64>,
+    }
+    impl Actor for ControlledRecorder {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive_message<'a>(
+            &'a mut self,
+            message: BoxedMessage,
+            _c: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                match *message
+                    .downcast::<ContractMessage>()
+                    .expect("unexpected C6 message")
+                {
+                    ContractMessage::Hold => {
+                        self.gate.entered.notify_one();
+                        self.gate.release.notified().await;
+                        self.gate.finished.store(1, Ordering::SeqCst);
+                        Ok(Box::new(99u64) as BoxedMessage)
+                    }
+                    ContractMessage::Value(value) => {
+                        self.values.push(value);
+                        Ok(Box::new(value) as BoxedMessage)
+                    }
+                    ContractMessage::Snapshot => Ok(Box::new(self.values.clone()) as BoxedMessage),
+                }
+            })
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+    struct ReleaseOnDrop(Arc<Gate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+        }
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async move {
-        let (_p, ts) = setup("corr6").await;
+        tokio::time::timeout(Duration::from_secs(15), async move {
+            let (_p, ts) = setup("corr6").await;
+            for (strategy, path, count, expected) in [
+                (
+                    BackpressureStrategy::Error,
+                    "/c6/err",
+                    20u64,
+                    vec![0u64, 1, 2, 3],
+                ),
+                (
+                    BackpressureStrategy::DropOldest,
+                    "/c6/dropold",
+                    8u64,
+                    vec![4u64, 5, 6, 7],
+                ),
+            ] {
+                let rejects = matches!(strategy, BackpressureStrategy::Error);
+                let gate = Arc::new(Gate {
+                    entered: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                    finished: AtomicU64::new(0),
+                });
+                let release = ReleaseOnDrop(gate.clone());
+                let actor = ts
+                    .spawn_at::<ControlledRecorder>(
+                        ControlledRecorder {
+                            gate: gate.clone(),
+                            values: Vec::new(),
+                        },
+                        path,
+                        None,
+                        ThreadActorConfig {
+                            mailbox_capacity: Some(4),
+                            backpressure_strategy: Some(strategy),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let held_actor = actor.clone();
+                let held = tokio::spawn(async move {
+                    held_actor
+                        .send_with_timeout(Box::new(ContractMessage::Hold), None)
+                        .await
+                });
+                gate.entered.notified().await;
+                assert_eq!(gate.finished.load(Ordering::SeqCst), 0);
 
-        // --- Error 策略：容量 4，堵住后恰好拒收超额数 ---
-        let ops_e = Arc::new(AtomicU64::new(0));
-        struct Blocky {
-            ops: Arc<AtomicU64>,
-        }
-        impl Actor for Blocky {
-            type Config = EmptyConfig;
-            type Context = ThreadContext<Self>;
-            fn init<'a>(
-                &'a mut self,
-                _c: &'a mut Self::Context,
-            ) -> BoxedFuture<'a, ActorResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn receive_message<'a>(
-                &'a mut self,
-                m: BoxedMessage,
-                _c: &'a mut Self::Context,
-            ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-                let ops = self.ops.clone();
-                Box::pin(async move {
-                    if let Some(t) = m.downcast_ref::<Tagged>() {
-                        ops.fetch_add(1, Ordering::Relaxed);
-                        let v = burn_cpu(t.iters, t.salt);
-                        ops.fetch_add(1, Ordering::Relaxed);
-                        Ok(Box::new(v) as BoxedMessage)
+                // 门直到所有投递结束才释放，调用者的调度延迟不会改变满队列前提。
+                for value in 0..count {
+                    let result = actor.deliver(Box::new(ContractMessage::Value(value))).await;
+                    if rejects && value >= 4 {
+                        match result {
+                            Err(ActorError::InternalError(error)) => assert!(
+                                error.ends_with("Full { capacity: 4 }"),
+                                "C6 every rejection must report Full with capacity 4: {error}"
+                            ),
+                            other => panic!(
+                                "C6 excess Error delivery {value} must fail as Full: {other:?}"
+                            ),
+                        }
                     } else {
-                        Ok(m)
-                    }
-                })
-            }
-            fn state(&self) -> ActorState {
-                ActorState::Running
-            }
-        }
-        let cfg_err = ThreadActorConfig {
-            mailbox_capacity: Some(4),
-            backpressure_strategy: Some(BackpressureStrategy::Error),
-            ..Default::default()
-        };
-        let a_err = ts
-            .spawn_at::<Blocky>(Blocky { ops: ops_e.clone() }, "/c6/err", None, cfg_err)
-            .await
-            .unwrap();
-
-        // 堵门：后台长任务（fire-and-forget ask，占住 handler）
-        {
-            let ab = a_err.clone();
-            tokio::spawn(async move {
-                let _ = ab
-                    .ask(Box::new(Tagged {
-                        sender: 0,
-                        seq: 0,
-                        iters: calibrated_iters(1.2),
-                        salt: 1,
-                    }) as BoxedMessage)
-                    .await;
-            });
-        }
-        let started = wait_until(
-            || ops_e.load(Ordering::Relaxed) >= 1,
-            Duration::from_secs(10),
-            Duration::from_millis(5),
-        )
-        .await;
-        assert!(started);
-
-        // 灌 20：in-flight = handler 内 1 条；容量 4 ⇒ 前 4 条 OK，后 16 条 Full
-        let mut ok = 0;
-        let mut full = 0;
-        let mut full_cap = None;
-        for i in 0..20u64 {
-            match a_err.deliver(Box::new(EchoMsg { v: i })).await {
-                Ok(_) => ok += 1,
-                Err(ActorError::InternalError(e)) => {
-                    full += 1;
-                    if full_cap.is_none() && e.contains("Full") {
-                        full_cap = Some(e);
+                        result.expect("C6 accepted delivery must succeed");
                     }
                 }
-                Err(e) => panic!("unexpected error kind: {:?}", e),
+                assert_eq!(gate.finished.load(Ordering::SeqCst), 0);
+                drop(release);
+                let reply = held
+                    .await
+                    .expect("C6 held caller panicked")
+                    .expect("C6 held ask failed");
+                assert_eq!(
+                    *reply.downcast::<u64>().unwrap(),
+                    99,
+                    "C6 held reply must be preserved"
+                );
+                assert_eq!(gate.finished.load(Ordering::SeqCst), 1);
+
+                // 查询使用Block策略，绝不能由查询自己挤掉尚未处理的业务。
+                // 同一个普通FIFO队列的回复是排空屏障，比“处理至少四条”更严格。
+                let snapshot = actor
+                    .ask_with_strategy_and_timeout(
+                        Box::new(ContractMessage::Snapshot),
+                        BackpressureStrategy::Block,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("C6 FIFO snapshot must reply");
+                assert_eq!(
+                    *snapshot.downcast::<Vec<u64>>().unwrap(),
+                    expected,
+                    "C6 processed values must exactly match the admission policy"
+                );
+
+                let recovered = actor
+                    .send_with_timeout(
+                        Box::new(ContractMessage::Value(100)),
+                        Some(Duration::from_secs(5)),
+                    )
+                    .await
+                    .expect("C6 actor must accept new work after draining");
+                assert_eq!(*recovered.downcast::<u64>().unwrap(), 100);
+                let snapshot = actor
+                    .ask_with_strategy_and_timeout(
+                        Box::new(ContractMessage::Snapshot),
+                        BackpressureStrategy::Block,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("C6 recovery snapshot must reply");
+                let mut recovered_expected = expected;
+                recovered_expected.push(100);
+                assert_eq!(
+                    *snapshot.downcast::<Vec<u64>>().unwrap(),
+                    recovered_expected
+                );
             }
-        }
-        assert_eq!(
-            ok, 4,
-            "capacity-4 mailbox must accept exactly 4 while blocked (got {})",
-            ok
-        );
-        assert_eq!(full, 16, "exactly the excess must be rejected");
-        assert!(full_cap.is_some(), "rejections must be MailboxError::Full");
-        println!("[C6] Error strategy: exact accept=4 reject=16 (cap=4) with Full error ✓");
-
-        // --- DropOldest：容量 4，灌 8 条（值 0..8），应保留最新 4 条（4..8）---
-        let gate_started2 = Arc::new(AtomicU64::new(0));
-        let cfg_do = ThreadActorConfig {
-            mailbox_capacity: Some(4),
-            backpressure_strategy: Some(BackpressureStrategy::DropOldest),
-            ..Default::default()
-        };
-        let journal2 = Journal::new();
-        let a_do = ts
-            .spawn_at::<Recorder>(
-                Recorder {
-                    journal: journal2.clone(),
-                    started: gate_started2.clone(),
-                },
-                "/c6/dropold",
-                None,
-                cfg_do,
-            )
-            .await
-            .unwrap();
-        let gate = {
-            let ab = a_do.clone();
-            tokio::spawn(async move {
-                let _ = ab
-                    .ask(Box::new(Tagged {
-                        sender: 7,
-                        seq: 0,
-                        iters: calibrated_iters(1.0),
-                        salt: 1,
-                    }) as BoxedMessage)
-                    .await;
-            })
-        };
-        let gate_in_handler = wait_until(
-            || gate_started2.load(Ordering::Relaxed) >= 1,
-            Duration::from_secs(30),
-            Duration::from_millis(10),
-        )
-        .await;
-        assert!(
-            gate_in_handler,
-            "gate Tagged(7,0) must enter handler before flooding (started flag)"
-        );
-        for i in 0..8u64 {
-            let _ = a_do.deliver(Box::new(EchoMsg { v: i })).await;
-        }
-        // 等堵门任务完成并排空邮箱后才可断言
-        let _ = gate.await;
-        let drained = wait_until(
-            || {
-                let ev = journal2.events.lock().unwrap();
-                ev.iter().filter(|(s, _)| *s == u64::MAX).count() >= 4
-            },
-            Duration::from_secs(30),
-            Duration::from_millis(50),
-        )
-        .await;
-        assert!(
-            drained,
-            "retained messages must be processed after gate completes; got {:?}",
-            journal2
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(s, _)| *s == u64::MAX)
-                .collect::<Vec<_>>()
-        );
-        // EchoMsg 事件记为 (u64::MAX, v)
-        let kept: Vec<u64> = journal2
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(s, _)| *s == u64::MAX)
-            .map(|(_, v)| *v)
-            .collect();
-        assert_eq!(
-            kept.len(),
-            4,
-            "DropOldest must retain exactly cap=4 (got {:?})",
-            kept
-        );
-        assert_eq!(
-            kept,
-            vec![4, 5, 6, 7],
-            "DropOldest must retain the NEWEST 4 (got {:?})",
-            kept
-        );
-        println!("[C6] DropOldest: 8 into cap-4 keeps newest [4,5,6,7] ✓");
-
-        let _ = ts.shutdown_internal().await;
+            ts.shutdown_internal()
+                .await
+                .expect("C6 system shutdown failed");
+        })
+        .await
+        .expect("C6 backpressure contract exceeded its independent liveness watchdog");
     });
 }
 
@@ -571,51 +723,130 @@ fn c6_backpressure_semantics() {
 
 #[test]
 fn c7_stop_semantics() {
+    struct LifecycleState {
+        values: Mutex<Vec<u64>>,
+        hooks: AtomicU64,
+        disposed: AtomicU64,
+    }
+    struct LifecycleRecorder(Arc<LifecycleState>);
+    impl Drop for LifecycleRecorder {
+        fn drop(&mut self) {
+            self.0.disposed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Actor for LifecycleRecorder {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn receive_message<'a>(
+            &'a mut self,
+            message: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                let echo = message
+                    .downcast::<EchoMsg>()
+                    .expect("unexpected C7 message");
+                self.0.values.lock().unwrap().push(echo.v);
+                Ok(Box::new(echo.v) as BoxedMessage)
+            })
+        }
+
+        fn before_stop<'a>(
+            &'a mut self,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move {
+                self.0.hooks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async move {
-        let (_p, ts) = setup("corr7").await;
-        let journal = Journal::new();
-        let a = ts
-            .spawn_at::<Recorder>(
-                Recorder {
-                    journal: journal.clone(),
-                    started: Arc::new(AtomicU64::new(0)),
-                },
-                "/c7/a",
-                None,
-                ThreadActorConfig::default(),
-            )
-            .await
-            .unwrap();
-
-        // 先正常处理 10 条
-        for i in 0..10u64 {
-            let rep = a
-                .ask(Box::new(EchoMsg { v: i }) as BoxedMessage)
+        tokio::time::timeout(Duration::from_secs(15), async move {
+            let (_p, ts) = setup("corr7").await;
+            let state = Arc::new(LifecycleState {
+                values: Mutex::new(Vec::new()),
+                hooks: AtomicU64::new(0),
+                disposed: AtomicU64::new(0),
+            });
+            let actor = ts
+                .spawn_at::<LifecycleRecorder>(
+                    LifecycleRecorder(state.clone()),
+                    "/c7/a",
+                    None,
+                    ThreadActorConfig::default(),
+                )
                 .await
                 .unwrap();
-            assert_eq!(*rep.downcast::<u64>().unwrap(), i);
-        }
-        let before = journal.events.lock().unwrap().len();
+            let retained_mailbox = ts
+                .get_mailbox("/c7/a")
+                .expect("C7 actor must be registered");
+            for value in 0..10u64 {
+                let reply = actor
+                    .ask(Box::new(EchoMsg { v: value }) as BoxedMessage)
+                    .await
+                    .unwrap();
+                assert_eq!(*reply.downcast::<u64>().unwrap(), value);
+            }
+            assert_eq!(
+                *state.values.lock().unwrap(),
+                (0..10u64).collect::<Vec<_>>()
+            );
 
-        // 停止
-        ts.stop_actor("/c7/a").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            ts.stop_actor("/c7/a").await.expect("C7 stop must succeed");
+            // 成功stop本身就是退休屏障，不再以额外睡眠掩盖过早返回。
+            assert_eq!(
+                state.hooks.load(Ordering::SeqCst),
+                1,
+                "C7 stop must join its hook"
+            );
+            assert_eq!(
+                state.disposed.load(Ordering::SeqCst),
+                1,
+                "C7 stop must dispose actor storage"
+            );
+            assert_eq!(ts.actor_count(), 0);
+            assert!(!actor.is_alive().await);
 
-        // 停止后 ask 必须失败
-        let r = a.ask(Box::new(EchoMsg { v: 99 }) as BoxedMessage).await;
-        assert!(r.is_err(), "ask after stop must fail, got {:?}", r);
+            let ask = actor.ask(Box::new(EchoMsg { v: 99 }) as BoxedMessage).await;
+            assert!(
+                matches!(ask, Err(ActorError::Stopped)),
+                "C7 post-stop ASK must report Stopped, got {ask:?}"
+            );
+            let tell = actor.deliver(Box::new(EchoMsg { v: 100 })).await;
+            assert!(
+                matches!(tell, Err(ActorError::Stopped)),
+                "C7 post-stop TELL must report Stopped, got {tell:?}"
+            );
+            assert_eq!(
+                *state.values.lock().unwrap(),
+                (0..10u64).collect::<Vec<_>>()
+            );
 
-        // 再等待一段时间，事件数不得增长（无幽灵处理）
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let after = journal.events.lock().unwrap().len();
-        assert_eq!(after, before, "no ghost processing after stop");
-        println!("[C7] stop semantics: post-stop ask fails, no ghost processing ✓");
-        let _ = ts.shutdown_internal().await;
+            // 保留mailbox及引用不能保留已停止actor的用户存储；系统shutdown也
+            // 不能再次调用hook或析构。此处检查退休事实，不把有限采样当永久保证。
+            ts.shutdown_internal()
+                .await
+                .expect("C7 system shutdown must succeed");
+            drop(retained_mailbox);
+            drop(actor);
+            assert_eq!(state.hooks.load(Ordering::SeqCst), 1);
+            assert_eq!(state.disposed.load(Ordering::SeqCst), 1);
+            println!("[C7] stop joins hook and disposal; post-stop ASK/TELL report Stopped");
+        })
+        .await
+        .expect("C7 retirement contract exceeded its independent liveness watchdog");
     });
 }
 
@@ -625,84 +856,136 @@ fn c7_stop_semantics() {
 
 #[test]
 fn c8_timeout_semantics() {
+    struct Hold;
+    struct Gate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: AtomicU64,
+    }
+    struct ControlledEcho(Arc<Gate>);
+    impl Actor for ControlledEcho {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn init<'a>(&'a mut self, _c: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive_message<'a>(
+            &'a mut self,
+            message: BoxedMessage,
+            _c: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                if message.is::<Hold>() {
+                    self.0.entered.notify_one();
+                    self.0.release.notified().await;
+                    self.0.finished.store(1, Ordering::SeqCst);
+                    Ok(Box::new(99u64) as BoxedMessage)
+                } else if let Some(echo) = message.downcast_ref::<EchoMsg>() {
+                    Ok(Box::new(echo.v) as BoxedMessage)
+                } else {
+                    Err(ActorError::MessageHandlingError(
+                        "unexpected C8 message".into(),
+                    ))
+                }
+            })
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+    // 即使断言失败或外层watchdog取消测试，也释放正在等待的handler。
+    struct ReleaseOnDrop(Arc<Gate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+        }
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async move {
-        let (_p, ts) = setup("corr8").await;
-        let journal = Journal::new();
-        let a_started = Arc::new(AtomicU64::new(0));
-        let a = ts
-            .spawn_at::<Recorder>(
-                Recorder {
-                    journal,
-                    started: a_started.clone(),
-                },
-                "/c8/a",
-                None,
-                ThreadActorConfig::default(),
-            )
-            .await
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let (_p, ts) = setup("corr8").await;
+            let gate = Arc::new(Gate {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                finished: AtomicU64::new(0),
+            });
+            let release = ReleaseOnDrop(gate.clone());
+            let a = ts
+                .spawn_at::<ControlledEcho>(
+                    ControlledEcho(gate.clone()),
+                    "/c8/a",
+                    None,
+                    ThreadActorConfig::default(),
+                )
+                .await
+                .unwrap();
 
-        // 空闲：50ms 超时的 echo 必须成功
-        let t0 = Instant::now();
-        let r = a
-            .send_with_timeout(Box::new(EchoMsg { v: 7 }), Some(Duration::from_millis(50)))
-            .await;
-        assert!(r.is_ok(), "idle ask with 50ms timeout must succeed");
-        assert!(
-            t0.elapsed() < Duration::from_millis(50),
-            "must not have hit the timeout"
-        );
-
-        // 阻塞：前置 ~1.2s 校准任务 + 5ms 超时探测 ⇒ 必须超时且及时返回
-        // 确定性门控：等 heavy 真正进入 handler（Recorder.started 置位），
-        // 消除 sleep(300ms) 在插桩/慢机下的时序抖动。
-        let heavy_started = Arc::new(AtomicU64::new(0));
-        let ab = a.clone();
-        tokio::spawn(async move {
-            let _ = ab
-                .ask(Box::new(Tagged {
-                    sender: 0,
-                    seq: 0,
-                    iters: calibrated_iters(1.5),
-                    salt: 1,
-                }) as BoxedMessage)
+            // 成功路径验证实际回复。五秒只用于卡死保护，不是50ms性能承诺；
+            // 已经完成的回复不会因为调用者随后被OS暂停而变为超时错误。
+            let r = a
+                .send_with_timeout(Box::new(EchoMsg { v: 7 }), Some(Duration::from_secs(5)))
                 .await;
-        });
-        let started = wait_until(
-            || a_started.load(Ordering::Relaxed) >= 1,
-            Duration::from_secs(30),
-            Duration::from_millis(2),
-        )
-        .await;
-        assert!(started, "heavy must enter handler before probing");
-        let _ = heavy_started;
-        let t1 = Instant::now();
-        let r2 = a
-            .send_with_timeout(Box::new(EchoMsg { v: 8 }), Some(Duration::from_millis(5)))
-            .await;
-        assert!(
-            matches!(
-                &r2,
-                Err(ActorError::TimeoutDetail(_)) | Err(ActorError::Timeout)
-            ),
-            "blocked ask must time out, got {:?}",
-            r2
-        );
-        let el = t1.elapsed();
-        assert!(
-            el < Duration::from_millis(500),
-            "timeout must return promptly, took {:?}",
-            el
-        );
-        println!(
-            "[C8] timeout semantics: idle succeeds fast, blocked times out promptly ({:.0}ms) ✓",
-            el.as_secs_f64() * 1000.0
-        );
-        let _ = ts.shutdown_internal().await;
+            assert_eq!(
+                *r.expect("idle ask must reply").downcast::<u64>().unwrap(),
+                7
+            );
+
+            // 持有真正的handler门直到观察到5ms超时；调用者被暂停也不会使
+            // 前置任务自行完成。notify_one保留许可，不依赖两个线程的启动顺序。
+            let ab = a.clone();
+            let held =
+                tokio::spawn(async move { ab.send_with_timeout(Box::new(Hold), None).await });
+            gate.entered.notified().await;
+            assert_eq!(gate.finished.load(Ordering::SeqCst), 0);
+            let deadline = Duration::from_millis(5);
+            let t1 = Instant::now();
+            let r2 = a
+                .send_with_timeout(Box::new(EchoMsg { v: 8 }), Some(deadline))
+                .await;
+            assert!(
+                matches!(
+                    &r2,
+                    Err(ActorError::TimeoutDetail(_)) | Err(ActorError::Timeout)
+                ),
+                "blocked ask must time out, got {:?}",
+                r2
+            );
+            assert!(
+                t1.elapsed() >= deadline,
+                "ask timed out before its deadline"
+            );
+            assert_eq!(gate.finished.load(Ordering::SeqCst), 0);
+
+            drop(release);
+            let reply = held
+                .await
+                .expect("held caller panicked")
+                .expect("held ask failed");
+            assert_eq!(*reply.downcast::<u64>().unwrap(), 99);
+            assert_eq!(gate.finished.load(Ordering::SeqCst), 1);
+            // Timeout不承诺撤回已经入队的业务；检查后续请求能独立得到自己的回复，
+            // 不对超时请求是否已处理引入额外的取消语义。
+            let resumed = a
+                .send_with_timeout(Box::new(EchoMsg { v: 9 }), Some(Duration::from_secs(5)))
+                .await
+                .expect("actor must remain usable after caller timeout");
+            assert_eq!(*resumed.downcast::<u64>().unwrap(), 9);
+            ts.shutdown_internal()
+                .await
+                .expect("C8 system shutdown failed");
+            println!(
+                "[C8] timeout semantics: reply identity, held deadline and recovery verified ✓"
+            );
+        })
+        .await
+        .expect("C8 deadline contract exceeded its independent liveness watchdog");
     });
 }
