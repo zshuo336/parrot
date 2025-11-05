@@ -2,6 +2,7 @@
 # applications, fixtures, POCs and benchmarks. Generated target trees stay ignored.
 tasks/
 docs/
+!/docs/
 target/
 temp_code/
 gitcmd.sh
