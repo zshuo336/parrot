@@ -21,6 +21,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "thread_configuration/export.rs"]
+mod export_contracts;
+
 #[derive(Debug, Default)]
 struct Counts {
     disposed: AtomicUsize,
@@ -424,6 +427,8 @@ async fn actor_config_can_export_thread_engine_configuration() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let path = reference.path();
     assert_eq!(system.get_mailbox(&path).unwrap().capacity(), 7);
+    let reply = bounded(reference.send(Box::new(73_u64))).await.unwrap();
+    assert_eq!(*reply.downcast::<u64>().unwrap(), 73);
     bounded(reference.stop()).await.unwrap();
     bounded(system.shutdown_internal()).await.unwrap();
 }

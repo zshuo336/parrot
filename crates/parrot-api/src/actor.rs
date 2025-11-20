@@ -90,10 +90,12 @@ pub struct EmptyConfig;
 /// `Box<dyn Any + Send>` contract.
 pub trait ActorConfig: Send + 'static {
     /// Optionally expose an engine-specific configuration without coupling the
-    /// public API crate to a concrete engine. A built-in engine may downcast
-    /// the returned value to its own configuration type; returning `None`
-    /// keeps the engine's normal defaults. Existing implementations inherit
-    /// this default and remain source-compatible.
+    /// public API crate to a concrete engine. The native Thread root instance
+    /// entry downcasts the returned value to `ThreadActorConfig` and rejects
+    /// other types. Returning `None` keeps that entry's normal defaults.
+    /// Explicit engine configuration entries and other engines do not call
+    /// this hook. It does not inject business settings into [`Actor::init`].
+    /// Existing implementations inherit this default.
     fn engine_config(&self) -> Option<Box<dyn Any + Send>> {
         None
     }
