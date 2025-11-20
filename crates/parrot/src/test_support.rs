@@ -43,7 +43,10 @@ pub(crate) fn isolated_with_timeout(full_name: &str, timeout: Duration, body: im
         "{full_name}: {status:?}"
     );
     assert_eq!(
-        output.lines().filter(|line| *line == marker).count(),
+        output
+            .lines()
+            .filter(|line| line.trim_end().ends_with(&marker))
+            .count(),
         1,
         "{full_name}: child did not execute its body exactly once"
     );

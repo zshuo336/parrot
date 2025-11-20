@@ -356,11 +356,12 @@ fn isolated(name: &str, action: impl FnOnce()) {
         println!("escalation input completed: {full}");
         return;
     }
+    let log = tempfile::NamedTempFile::new().unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([&full, "--exact", "--nocapture", "--test-threads=1"])
         .env("PARROT_ESCALATION_INPUT_CHILD", &full)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(log.as_file().try_clone().unwrap())
+        .stderr(log.as_file().try_clone().unwrap())
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -374,18 +375,15 @@ fn isolated(name: &str, action: impl FnOnce()) {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let output = child.wait_with_output().unwrap();
+    let status = child.wait().unwrap();
+    let output = std::fs::read_to_string(log.path()).unwrap();
     assert!(
-        !timed_out && output.status.success(),
-        "queued input child failed: timeout={timed_out}, status={:?}\n{}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        !timed_out && status.success(),
+        "queued input child failed: timeout={timed_out}, status={:?}\n{}",
+        status,
+        output
     );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains(&format!("escalation input completed: {full}"))
-    );
+    assert!(output.contains(&format!("escalation input completed: {full}")));
 }
 
 async fn retirement_unpolled(failure: bool, recursive: bool) {
