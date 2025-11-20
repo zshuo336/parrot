@@ -45,6 +45,7 @@ jobs:
           mkdir "$RUNNER_TEMP/project-inputs-unpacked"
           tar -xzf "$RUNNER_TEMP/project-inputs.tar.gz" -C "$RUNNER_TEMP/project-inputs-unpacked"
           python3 scripts/project_inputs.py verify --root "$RUNNER_TEMP/project-inputs-unpacked/source" --manifest "$RUNNER_TEMP/project-inputs-unpacked/manifest.json" --exact
+          python3 scripts/project_inputs.py build-target --root "$RUNNER_TEMP/project-inputs-unpacked/source" --manifest "$RUNNER_TEMP/project-inputs-unpacked/manifest.json" --output "$RUNNER_TEMP/project-validation-targets"
           python3 -B "$RUNNER_TEMP/project-inputs/source/scripts/check_implementation_contracts.py" --root "$RUNNER_TEMP/project-inputs/source" --catalog "$RUNNER_TEMP/project-inputs/source/scripts/implementation_contracts.json"
 
   timeout-wrapper-contracts:

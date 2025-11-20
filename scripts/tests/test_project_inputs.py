@@ -1,5 +1,6 @@
 """Real Git and compiler fixtures for validation source export and verification."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import runpy
@@ -279,6 +280,100 @@ class ProjectInputs(unittest.TestCase):
         result = self.verify('--exact')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('input identity mismatch: Cargo.toml', result.stderr)
+
+    def build_target(self, output=None, root=None):
+        return self.run_script('build-target', '--root', root or self.bundle / 'source',
+                               '--manifest', self.bundle / 'manifest.json',
+                               '--output', output or self.base / 'builds')
+
+    def test_build_target_is_manifest_bound_fresh_and_refuses_existing_artifacts(self):
+        manifest = self.exported()
+        result = self.build_target()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        digest = hashlib.sha256((self.bundle / 'manifest.json').read_bytes()).hexdigest()
+        target = (self.base / 'builds' / digest).resolve()
+        self.assertEqual(receipt, {'status': 'ok', 'files': len(manifest['files']),
+                                  'action': 'build-target', 'target_dir': str(target),
+                                  'manifest_sha256': digest, 'fresh': True})
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertNotEqual(self.build_target().returncode, 0)
+        marker = target / 'existing-artifact'
+        marker.write_text('keep original artifact')
+        self.assertNotEqual(self.build_target().returncode, 0)
+        self.assertEqual(marker.read_text(), 'keep original artifact')
+
+    def test_build_target_rejects_modified_inputs_and_in_source_output(self):
+        self.exported()
+        result = self.build_target(output=self.bundle / 'source/builds')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('outside the verified source tree', result.stderr)
+        self.assertFalse((self.bundle / 'source/builds').exists())
+        (self.bundle / 'source/Cargo.toml').write_text('changed source')
+        result = self.build_target()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('input identity mismatch', result.stderr)
+        self.assertFalse((self.base / 'builds').exists())
+
+    def test_build_target_refuses_symlinked_existing_target(self):
+        self.exported()
+        digest = hashlib.sha256((self.bundle / 'manifest.json').read_bytes()).hexdigest()
+        builds = self.base / 'builds'
+        builds.mkdir()
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (builds / digest).symlink_to(outside, target_is_directory=True)
+        self.assertNotEqual(self.build_target().returncode, 0)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_same_count_archived_cargo_source_uses_fresh_build_despite_old_mtimes(self):
+        compiler = shutil.which('cargo')
+        self.assertIsNotNone(compiler, 'cargo is required for the actual stale-build contract')
+        self.write('Cargo.toml', '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n[workspace]\n')
+        self.write('src/main.rs', 'fn main() { println!("111"); }\n')
+        lock = subprocess.run([compiler, 'generate-lockfile', '--offline'], cwd=self.root,
+                              env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(lock.returncode, 0, lock.stderr)
+        first = self.exported()
+        original_bundle = self.bundle
+        source = original_bundle / 'source'
+        shared = self.base / 'shared-target'
+
+        def execute(target):
+            result = subprocess.run([compiler, 'run', '--offline', '--locked', '--quiet',
+                                     '--manifest-path', str(source / 'Cargo.toml'),
+                                     '--target-dir', str(target)], env=self.env,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout
+
+        self.assertEqual(execute(shared), '111\n')
+        old_target = self.build_target()
+        self.assertEqual(old_target.returncode, 0, old_target.stderr)
+        self.write('src/main.rs', 'fn main() { println!("222"); }\n')
+        self.bundle = self.base / 'bundle-two'
+        second = self.exported()
+        self.assertEqual(set(first['files']), set(second['files']))
+        self.assertNotEqual(first['files']['src/main.rs'], second['files']['src/main.rs'])
+        self.assertEqual(self.archive().returncode, 0)
+        with tarfile.open(self.base / 'inputs.tar.gz') as packed:
+            for member in packed:
+                path = original_bundle / member.name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(packed.extractfile(member).read())
+                path.chmod(member.mode)
+                os.utime(path, (member.mtime, member.mtime))
+        self.bundle = original_bundle
+        self.assertEqual(self.verify('--exact').returncode, 0)
+        self.assertEqual((source / 'src/main.rs').stat().st_mtime_ns, 0)
+        # Newer Cargo versions may detect this themselves. The isolated target
+        # must return the new program regardless of the shared cache's decision.
+        self.assertIn(execute(shared), {'111\n', '222\n'})
+        result = self.build_target()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = Path(json.loads(result.stdout)['target_dir'])
+        self.assertNotEqual(target, Path(json.loads(old_target.stdout)['target_dir']))
+        self.assertEqual(execute(target), '222\n')
 
     def test_executable_tampering_is_detected(self):
         self.exported()

@@ -250,6 +250,22 @@ def archive(bundle, output, includes):
     return manifest
 
 
+def build_target(root, manifest_path, output):
+    root, manifest_path = Path(root).resolve(), Path(manifest_path).resolve()
+    expected = identity(manifest_path)
+    manifest = load_manifest(manifest_path)
+    verify(root, manifest, exact=True)
+    if identity(manifest_path) != expected:
+        raise InputError('manifest changed while preparing build target')
+    target = Path(output).resolve() / expected['sha256']
+    if target == root or root in target.parents:
+        raise InputError('build target must be outside the verified source tree')
+    # Normalized archive mtimes can make Cargo reuse older, different source.
+    # Refuse even an existing empty target: this operation never certifies a cache.
+    target.mkdir(parents=True, exist_ok=False)
+    return manifest, target, expected['sha256']
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest='action', required=True)
@@ -267,12 +283,22 @@ def main():
     pack.add_argument('--output', type=Path, required=True)
     pack.add_argument('--include', action='append', default=[],
                       help='explicit bundle-relative helper file; may be repeated')
+    build = actions.add_parser('build-target', help='create a fresh manifest-bound Cargo target outside verified source')
+    build.add_argument('--root', type=Path, required=True)
+    build.add_argument('--manifest', type=Path, required=True)
+    build.add_argument('--output', type=Path, required=True, help='parent for a new digest-named target; reuse is refused')
     args = parser.parse_args()
     try:
         if args.action == 'export':
             manifest = export(args.root, args.output)
         elif args.action == 'archive':
             manifest = archive(args.bundle, args.output, args.include)
+        elif args.action == 'build-target':
+            manifest, target, digest = build_target(args.root, args.manifest, args.output)
+            print(json.dumps({'status': 'ok', 'files': len(manifest['files']),
+                              'action': args.action, 'target_dir': str(target),
+                              'manifest_sha256': digest, 'fresh': True}))
+            return 0
         else:
             manifest = load_manifest(args.manifest)
             verify(args.root, manifest, selection=args.selection, exact=args.exact)
