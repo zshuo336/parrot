@@ -36,6 +36,7 @@ pub(super) struct RequestCommand {
 }
 pub(super) enum StoredCommand {
     ReadBarrier,
+    Ownership(super::ownership::Request),
     Plain(DirCmd),
     Request(RequestCommand),
 }
@@ -73,6 +74,9 @@ pub(super) fn encode_request(
     Ok(bytes)
 }
 pub(super) fn decode(bytes: &[u8]) -> Result<StoredCommand, DirectoryApplyError> {
+    if bytes.starts_with(super::ownership::MAGIC) {
+        return super::ownership::decode(bytes).map(StoredCommand::Ownership);
+    }
     if bytes == READ_BARRIER {
         return Ok(StoredCommand::ReadBarrier);
     }

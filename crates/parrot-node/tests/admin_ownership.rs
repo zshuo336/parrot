@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -23,6 +23,8 @@ use tokio::sync::Notify;
 
 #[derive(Default)]
 struct Probe {
+    factory_context: Mutex<Option<parrot_api::trace::TraceContext>>,
+    stop_contexts: Mutex<Vec<(&'static str, Option<parrot_api::trace::TraceContext>)>>,
     init_started: Notify,
     init_release: Notify,
     initialized: AtomicUsize,
@@ -40,6 +42,12 @@ struct Probe {
     block_stop: bool,
     fail_stop: bool,
     reject_stop: Arc<AtomicBool>,
+    block_drop: bool,
+    fail_drop: bool,
+    drop_entered: AtomicBool,
+    drop_exited: AtomicBool,
+    drop_expired: AtomicBool,
+    drop_release: (Mutex<bool>, Condvar),
 }
 
 #[derive(Debug)]
@@ -48,6 +56,9 @@ struct RetryStopRef {
     reject: Arc<AtomicBool>,
 }
 impl ActorRef for RetryStopRef {
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.actor.retirement_status()
+    }
     fn send<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         self.actor.send(message)
     }
@@ -96,6 +107,16 @@ struct Observed {
     probe: Arc<Probe>,
     total: u64,
 }
+struct StopGuard(Arc<Probe>);
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        self.0
+            .stop_contexts
+            .lock()
+            .unwrap()
+            .push(("drop", parrot_api::trace::TraceContext::current()));
+    }
+}
 impl Actor for Observed {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
@@ -126,7 +147,19 @@ impl Actor for Observed {
         })
     }
     fn before_stop<'a>(&'a mut self, _: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        self.probe
+            .stop_contexts
+            .lock()
+            .unwrap()
+            .push(("construct", parrot_api::trace::TraceContext::current()));
+        let guard = StopGuard(self.probe.clone());
         Box::pin(async move {
+            let _guard = guard;
+            self.probe
+                .stop_contexts
+                .lock()
+                .unwrap()
+                .push(("poll", parrot_api::trace::TraceContext::current()));
             self.probe.stop_started.notify_one();
             if self.probe.block_stop {
                 self.probe.stop_release.notified().await;
@@ -145,6 +178,23 @@ impl Actor for Observed {
 }
 impl Drop for Observed {
     fn drop(&mut self) {
+        if self.probe.block_drop {
+            self.probe.drop_entered.store(true, Ordering::SeqCst);
+            let (released, changed) = &self.probe.drop_release;
+            let (guard, timeout) = changed
+                .wait_timeout_while(released.lock().unwrap(), Duration::from_secs(15), |ready| {
+                    !*ready
+                })
+                .unwrap();
+            drop(guard);
+            self.probe
+                .drop_expired
+                .store(timeout.timed_out(), Ordering::SeqCst);
+            self.probe.drop_exited.store(true, Ordering::SeqCst);
+            if self.probe.fail_drop {
+                panic!("late Node actor destructor failure");
+            }
+        }
         self.probe.dropped.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -156,6 +206,7 @@ fn spawn(
     Box::pin(async move {
         let key = config.as_ref().unwrap()["probe"].as_str().unwrap();
         let probe = probes().lock().unwrap().get(key).unwrap().clone();
+        *probe.factory_context.lock().unwrap() = parrot_api::trace::TraceContext::current();
         if path.ends_with("-1") {
             if probe.block_factory {
                 probe.second_started.notify_one();
@@ -168,6 +219,7 @@ fn spawn(
             }
         }
         let reject = probe.reject_stop.clone();
+        let direct = probe.block_drop;
         engine
             .spawn_at(
                 Observed { probe, total: 0 },
@@ -177,6 +229,9 @@ fn spawn(
             )
             .await
             .map(|actor| {
+                if direct {
+                    return Box::new(actor) as BoxedActorRef;
+                }
                 Box::new(RetryStopRef {
                     actor: Box::new(actor),
                     reject,
@@ -237,11 +292,19 @@ struct Setup {
 }
 impl Setup {
     fn new(probe: Probe, count: usize) -> Self {
+        Self::with_timeout(probe, count, None)
+    }
+    fn with_timeout(probe: Probe, count: usize, timeout: Option<Duration>) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let name = format!("admin-owned-{}", NEXT.fetch_add(1, Ordering::SeqCst));
         let probe = Arc::new(probe);
         probes().lock().unwrap().insert(name.clone(), probe.clone());
-        let engine = ThreadActorSystem::shared(Default::default());
+        let engine = ThreadActorSystem::shared(parrot::thread::config::ThreadActorSystemConfig {
+            shutdown_timeout: timeout.unwrap_or_else(|| {
+                parrot::thread::config::ThreadActorSystemConfig::default().shutdown_timeout
+            }),
+            ..Default::default()
+        });
         let executor = NodeComponentExecutor::new(engine.clone());
         Self {
             engine,
@@ -288,13 +351,656 @@ impl Setup {
 }
 impl Drop for Setup {
     fn drop(&mut self) {
+        self.release_drop();
         probes().lock().unwrap().remove(&self.command.name);
+    }
+}
+impl Setup {
+    fn release_drop(&self) {
+        *self.probe.drop_release.0.lock().unwrap() = true;
+        self.probe.drop_release.1.notify_all();
     }
 }
 async fn wait(signal: &Notify) {
     tokio::time::timeout(Duration::from_secs(5), signal.notified())
         .await
         .unwrap();
+}
+
+async fn late_retirement_contract(rollback: bool, fail_drop: bool) {
+    let setup = Setup::with_timeout(
+        Probe {
+            block_drop: true,
+            fail_drop,
+            fail_factory: rollback,
+            ..Default::default()
+        },
+        if rollback { 2 } else { 1 },
+        Some(Duration::from_millis(100)),
+    );
+    if !rollback {
+        setup.deploy().await;
+    }
+    let executor = setup.executor.clone();
+    let command = setup.command.clone();
+    let prefix = setup.path.clone();
+    let job = tokio::spawn(async move {
+        if rollback {
+            executor.deploy(2, &command).await
+        } else {
+            executor.stop(2, &prefix).await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !setup.probe.drop_entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let path = if rollback {
+        format!("{}-0", setup.path)
+    } else {
+        setup.path.clone()
+    };
+    let original = setup.engine.get_actor_ref(&path).unwrap();
+    let first = job.await.unwrap();
+    assert!(matches!(first, R::Failed { .. }), "{first:?}");
+    let pending = setup.executor.stop(3, &setup.path).await;
+    assert!(
+        matches!(pending, R::Failed { .. }),
+        "pending retirement cannot be confirmed: {pending:?}"
+    );
+    assert!(setup.engine.get_actor_ref(&path).is_some());
+    setup.release_drop();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(
+            original.retirement_status(),
+            parrot_api::address::RetirementStatus::Retired(_)
+        ) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(setup.probe.drop_exited.load(Ordering::SeqCst));
+    assert!(!setup.probe.drop_expired.load(Ordering::SeqCst));
+    let replacement = setup
+        .engine
+        .spawn_at(
+            Observed {
+                probe: Arc::new(Probe::default()),
+                total: 0,
+            },
+            &path,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let retry = setup.executor.stop(4, &setup.path).await;
+    let status = setup.executor.status(5, &setup.path).await;
+    let reply = replacement.send(Box::new(41u64)).await.unwrap();
+    assert_eq!(*reply.downcast::<u64>().unwrap(), 41);
+    replacement.stop().await.unwrap();
+    assert!(matches!(
+        original.stop().await,
+        Err(ActorError::TimeoutDetail(_))
+    ));
+    setup.shutdown().await;
+    if fail_drop {
+        assert!(matches!(retry, R::Failed { .. }), "{retry:?}");
+        assert!(
+            format!("{retry:?}").contains("late Node actor destructor failure"),
+            "{retry:?}"
+        );
+        assert!(
+            matches!(status, R::Status { states, .. } if states.len() == 1 && states[0].state == "cleanup_failed")
+        );
+    } else {
+        assert!(
+            matches!(retry, R::Stopped { .. }),
+            "actual successful retirement must clear the historical timeout: {retry:?}"
+        );
+        assert!(
+            matches!(status, R::Failed { code, .. } if code == parrot_remote::admin_v2::v2_err::COMPONENT_NOT_FOUND),
+            "removed records must return component-not-found: {status:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_retirement_success_clears_deployed_node_record_without_stopping_replacement() {
+    late_retirement_contract(false, false).await;
+}
+#[tokio::test]
+async fn late_retirement_failure_survives_deployed_node_stop_timeout() {
+    late_retirement_contract(false, true).await;
+}
+#[tokio::test]
+async fn late_retirement_success_clears_failed_node_pool_without_stopping_replacement() {
+    late_retirement_contract(true, false).await;
+}
+#[tokio::test]
+async fn late_retirement_failure_survives_failed_node_pool_stop_timeout() {
+    late_retirement_contract(true, true).await;
+}
+
+fn lifecycle_record<'a>(
+    snapshot: &'a parrot_api::trace::RecordingSnapshot,
+    kind: parrot_api::trace::SpanKind,
+    path: &str,
+    parent: &parrot_api::trace::SpanRecord,
+) -> &'a parrot_api::trace::SpanRecord {
+    let hooks: Vec<_> = snapshot
+        .records
+        .iter()
+        .filter(|record| record.kind == kind && record.target == path)
+        .collect();
+    assert_eq!(hooks.len(), 1, "one actual {kind:?} hook");
+    let hook = hooks[0];
+    assert_eq!(hook.trace_id, parent.trace_id);
+    assert_eq!(hook.parent_span_id, Some(parent.span_id));
+    assert_ne!(hook.span_id, parent.span_id);
+    assert_eq!(hook.status, parrot_api::trace::SpanStatus::Ok);
+    hook
+}
+
+#[tokio::test]
+async fn deploy_factory_inherits_management_operation_and_next_stop_is_isolated() {
+    use parrot_api::trace::{SpanKind, SpanStatus, TraceRecorder};
+    let setup = Setup::new(Probe::default(), 1);
+    let recorder = TraceRecorder::new(8).unwrap();
+    let root = recorder.root();
+    assert!(matches!(
+        root.scope(setup.executor.deploy(1, &setup.command)).await,
+        R::Deployed { .. }
+    ));
+    setup.ready(&setup.path).await;
+    let context = setup.probe.factory_context.lock().unwrap().clone();
+    let reply = setup.executor.stop(2, &setup.path).await;
+    setup.shutdown().await;
+    assert!(matches!(reply, R::Stopped { .. }));
+    let context = context.expect("contextual factory lost deployment context");
+    let snapshot = recorder.snapshot();
+    assert_eq!(snapshot.counts.in_flight, 0);
+    assert_eq!(snapshot.records.len(), 2);
+    let record = snapshot
+        .records
+        .iter()
+        .find(|record| record.kind == SpanKind::ManagedTask)
+        .unwrap();
+    assert_eq!(record.kind, SpanKind::ManagedTask);
+    assert_eq!(record.target, "node/deploy");
+    assert_eq!(record.status, SpanStatus::Ok);
+    assert_eq!(record.parent_span_id, Some(root.span_id()));
+    assert_eq!(context.span_id(), record.span_id);
+    assert_eq!(context.trace_id(), root.trace_id());
+    lifecycle_record(&snapshot, SpanKind::ActorInit, &setup.path, record);
+    let stops = setup.probe.stop_contexts.lock().unwrap();
+    assert_eq!(
+        stops.iter().map(|event| event.0).collect::<Vec<_>>(),
+        ["construct", "poll", "drop"]
+    );
+    assert!(
+        stops.iter().all(|event| event.1.is_none()),
+        "untraced stop reused deployment identity: {stops:?}"
+    );
+}
+
+#[tokio::test]
+async fn tcp_management_roots_are_explicit_local_and_reach_real_factory() {
+    use parrot_api::trace::{SpanKind, SpanStatus, TraceRecorder};
+    use parrot_remote::{
+        IncomingTracePolicy, LocalLookup, NodeAddr, RemoteActorSystem, RemoteConfig,
+    };
+    struct Empty;
+    #[async_trait::async_trait]
+    impl LocalLookup for Empty {
+        async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
+            None
+        }
+    }
+    use IncomingTracePolicy::{PropagateOnly, StartRoots};
+    for (policy, traced, stop) in [
+        (PropagateOnly, false, false),
+        (StartRoots, false, false),
+        (PropagateOnly, true, false),
+        (StartRoots, true, false),
+        (PropagateOnly, false, true),
+        (StartRoots, false, true),
+        (PropagateOnly, true, true),
+        (StartRoots, true, true),
+    ] {
+        let setup = Setup::new(Probe::default(), 1);
+        let target = RemoteActorSystem::new(
+            RemoteConfig::tcp("managed-receiver", Some("127.0.0.1:0".parse().unwrap()))
+                .with_insecure_development(),
+            Arc::new(Empty),
+        )
+        .unwrap();
+        target.set_component_executor(Some(Arc::new(setup.executor.clone())));
+        let source = RemoteActorSystem::new(
+            RemoteConfig::tcp("managed-caller", None).with_insecure_development(),
+            Arc::new(Empty),
+        )
+        .unwrap();
+        let recorder = TraceRecorder::new(16).unwrap();
+        let _attachment = target.attach_trace_recorder_with_policy(recorder.clone(), policy);
+        target.start().await.unwrap();
+        source.start().await.unwrap();
+        source
+            .connect(&NodeAddr::tcp(
+                "managed-receiver",
+                target.local_addr().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let caller = TraceRecorder::new(8).unwrap().root();
+        let context = traced.then(|| caller.clone());
+        let deployed = parrot_api::trace::scope(
+            context.clone(),
+            source.deploy_component("managed-receiver", setup.command.clone()),
+        )
+        .await;
+        setup.ready(&setup.path).await;
+        let factory = setup.probe.factory_context.lock().unwrap().clone();
+        let status = parrot_api::trace::scope(
+            context.clone(),
+            source.component_status("managed-receiver", &setup.path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].state, "running");
+        let metrics =
+            parrot_api::trace::scope(context.clone(), source.metrics_report("managed-receiver"))
+                .await
+                .unwrap();
+        assert_eq!(metrics.components, 1);
+        assert_eq!(metrics.component_states, status);
+        let measured =
+            parrot_api::trace::scope(context.clone(), source.measured_metrics("managed-receiver"))
+                .await
+                .unwrap();
+        assert_eq!(measured.snapshot.component_states, status);
+        let drained = parrot_api::trace::scope(context, async {
+            if stop {
+                source
+                    .stop_component("managed-receiver", &setup.path)
+                    .await
+                    .map(|()| (1, 0))
+            } else {
+                source
+                    .drain_component("managed-receiver", &setup.path, Duration::from_secs(5))
+                    .await
+            }
+        })
+        .await;
+        source.shutdown().await.unwrap();
+        target.shutdown().await.unwrap();
+        setup.shutdown().await;
+        assert_eq!(deployed.unwrap(), vec![setup.path.clone()]);
+        assert_eq!(drained.unwrap(), (1, 0));
+        assert_eq!(setup.probe.stopped.load(Ordering::SeqCst), 1);
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.counts.in_flight, 0);
+        if !traced && policy == IncomingTracePolicy::PropagateOnly {
+            assert!(factory.is_none());
+            assert_eq!(snapshot.counts.started, 0);
+            assert!(setup
+                .probe
+                .stop_contexts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event.1.is_none()));
+        } else {
+            let records: Vec<_> = snapshot
+                .records
+                .iter()
+                .filter(|record| record.kind == SpanKind::ManagedTask)
+                .collect();
+            assert_eq!(records.len(), 2);
+            let queries: Vec<_> = snapshot
+                .records
+                .iter()
+                .filter(|record| record.kind == SpanKind::Application)
+                .collect();
+            assert_eq!(queries.len(), 3);
+            for target in ["node/status", "node/metrics", "node/measured_metrics"] {
+                assert_eq!(
+                    queries
+                        .iter()
+                        .filter(|record| record.target == target)
+                        .count(),
+                    1
+                );
+            }
+            let trace_ids: std::collections::BTreeSet<_> = snapshot
+                .records
+                .iter()
+                .map(|record| record.trace_id)
+                .collect();
+            assert_eq!(
+                trace_ids.len(),
+                if traced { 1 } else { 5 },
+                "preserve the incoming parent; only untraced requests start roots"
+            );
+            for record in queries {
+                assert_eq!(record.status, SpanStatus::Ok);
+                assert!(record.parent_span_id.is_some());
+                if traced {
+                    assert_eq!(record.trace_id, caller.trace_id());
+                    assert_eq!(record.parent_span_id, Some(caller.span_id()));
+                } else {
+                    assert_ne!(record.trace_id, caller.trace_id());
+                }
+            }
+            let deploy = records
+                .iter()
+                .find(|record| record.target == "node/deploy")
+                .unwrap();
+            let drain = records
+                .iter()
+                .find(|record| record.target == if stop { "node/stop" } else { "node/drain" })
+                .unwrap();
+            assert_eq!(snapshot.records.len(), if stop { 7 } else { 8 });
+            lifecycle_record(&snapshot, SpanKind::ActorInit, &setup.path, deploy);
+            let stop_hook =
+                lifecycle_record(&snapshot, SpanKind::ActorBeforeStop, &setup.path, drain);
+            let handlers: Vec<_> = snapshot
+                .records
+                .iter()
+                .filter(|record| record.kind == SpanKind::DynamicHandler)
+                .collect();
+            assert_eq!(handlers.len(), usize::from(!stop));
+            for handler in handlers {
+                assert_eq!(handler.target, setup.path);
+                assert_eq!(handler.trace_id, drain.trace_id);
+                assert_eq!(handler.parent_span_id, Some(drain.span_id));
+                assert_eq!(handler.status, SpanStatus::Ok);
+            }
+            let factory = factory.unwrap();
+            assert_eq!(factory.span_id(), deploy.span_id);
+            assert_eq!(factory.trace_id(), deploy.trace_id);
+            assert_eq!(deploy.trace_id == drain.trace_id, traced);
+            let stops = setup.probe.stop_contexts.lock().unwrap();
+            assert_eq!(
+                stops.iter().map(|event| event.0).collect::<Vec<_>>(),
+                ["construct", "poll", "drop"]
+            );
+            for (_, context) in stops.iter() {
+                let context = context
+                    .as_ref()
+                    .expect("Node drain lost identity before real hook");
+                assert_eq!(context.trace_id(), drain.trace_id);
+                assert_eq!(context.span_id(), stop_hook.span_id);
+                assert_eq!(context.parent_span_id(), Some(drain.span_id));
+            }
+            for record in records {
+                if traced {
+                    assert_eq!(record.trace_id, caller.trace_id());
+                    assert_eq!(record.parent_span_id, Some(caller.span_id()));
+                } else {
+                    assert_ne!(record.trace_id, caller.trace_id());
+                }
+                assert!(record.parent_span_id.is_some());
+                assert_eq!(record.status, SpanStatus::Ok);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn management_parent_crosses_real_process_boundary() {
+    use parrot_api::trace::{SpanKind, SpanStatus, TraceContext, TraceRecorder};
+    use parrot_remote::{LocalLookup, NodeAddr, RemoteActorSystem, RemoteConfig};
+    use std::{
+        fs,
+        path::PathBuf,
+        process::{Child, Command, Stdio},
+    };
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Ready {
+        addr: String,
+        path: String,
+        command: ComponentDeploy,
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Expected {
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+    }
+    struct Empty;
+    #[async_trait::async_trait]
+    impl LocalLookup for Empty {
+        async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
+            None
+        }
+    }
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    if let Some(directory) = std::env::var_os("PARROT_ADMIN_TRACE_CHILD") {
+        let directory = PathBuf::from(directory);
+        let setup = Setup::new(Probe::default(), 1);
+        let remote = RemoteActorSystem::new(
+            RemoteConfig::tcp("process-receiver", Some("127.0.0.1:0".parse().unwrap()))
+                .with_insecure_development(),
+            Arc::new(Empty),
+        )
+        .unwrap();
+        remote.set_component_executor(Some(Arc::new(setup.executor.clone())));
+        let recorder = TraceRecorder::new(16).unwrap();
+        remote.set_trace_recorder(Some(recorder.clone()));
+        remote.start().await.unwrap();
+        let ready = Ready {
+            addr: remote.local_addr().unwrap().to_string(),
+            path: setup.path.clone(),
+            command: setup.command.clone(),
+        };
+        fs::write(
+            directory.join("ready.tmp"),
+            toml::to_string(&ready).unwrap(),
+        )
+        .unwrap();
+        fs::rename(directory.join("ready.tmp"), directory.join("ready.toml")).unwrap();
+        // Expected IDs are published only after all management RPCs have returned.
+        let text = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match fs::read_to_string(directory.join("expected.toml")) {
+                    Ok(text) => break text,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("expected identity read failed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let expected: Expected = toml::from_str(&text).unwrap();
+        remote.shutdown().await.unwrap();
+        setup.shutdown().await;
+        assert_eq!(setup.probe.initialized.load(Ordering::SeqCst), 1);
+        assert_eq!(setup.probe.stopped.load(Ordering::SeqCst), 1);
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.counts.in_flight, 0);
+        assert_eq!(snapshot.records.len(), 8, "records: {:?}", snapshot.records);
+        for (target, kind) in [
+            ("node/deploy", SpanKind::ManagedTask),
+            ("node/status", SpanKind::Application),
+            ("node/metrics", SpanKind::Application),
+            ("node/measured_metrics", SpanKind::Application),
+            ("node/drain", SpanKind::ManagedTask),
+        ] {
+            let records: Vec<_> = snapshot
+                .records
+                .iter()
+                .filter(|record| record.target == target)
+                .collect();
+            assert_eq!(records.len(), 1);
+            let record = records[0];
+            assert_eq!(record.kind, kind);
+            assert_eq!(record.status, SpanStatus::Ok);
+            assert_eq!(record.trace_id, expected.trace_id);
+            assert_eq!(record.parent_span_id, Some(expected.span_id));
+        }
+        let deploy = snapshot
+            .records
+            .iter()
+            .find(|record| record.target == "node/deploy")
+            .unwrap();
+        let factory = setup.probe.factory_context.lock().unwrap().clone().unwrap();
+        assert_eq!(factory.span_id(), deploy.span_id);
+        assert_eq!(factory.trace_id(), deploy.trace_id);
+        let drain = snapshot
+            .records
+            .iter()
+            .find(|record| record.target == "node/drain")
+            .unwrap();
+        lifecycle_record(&snapshot, SpanKind::ActorInit, &setup.path, deploy);
+        let stop_hook = lifecycle_record(&snapshot, SpanKind::ActorBeforeStop, &setup.path, drain);
+        // Drain's actual health-check handler is a child of the Node operation.
+        let handlers: Vec<_> = snapshot
+            .records
+            .iter()
+            .filter(|record| record.kind == SpanKind::DynamicHandler)
+            .collect();
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].target, setup.path);
+        assert_eq!(handlers[0].trace_id, drain.trace_id);
+        assert_eq!(handlers[0].parent_span_id, Some(drain.span_id));
+        assert_eq!(handlers[0].status, SpanStatus::Ok);
+        let stops = setup.probe.stop_contexts.lock().unwrap();
+        assert_eq!(
+            stops.iter().map(|event| event.0).collect::<Vec<_>>(),
+            ["construct", "poll", "drop"]
+        );
+        for (_, context) in stops.iter() {
+            let context = context.as_ref().unwrap();
+            assert_eq!(context.trace_id(), drain.trace_id);
+            assert_eq!(context.span_id(), stop_hook.span_id);
+            assert_eq!(context.parent_span_id(), Some(drain.span_id));
+        }
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let log_path = directory.path().join("child.log");
+    let log = fs::File::create(&log_path).unwrap();
+    let mut child = OwnedChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "management_parent_crosses_real_process_boundary",
+                "--nocapture",
+            ])
+            .env("PARROT_ADMIN_TRACE_CHILD", directory.path())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let ready: Ready = loop {
+        match fs::read_to_string(directory.path().join("ready.toml")) {
+            Ok(text) => break toml::from_str(&text).unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("receiver readiness read failed: {error}"),
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "receiver exited before readiness: {}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "receiver readiness watchdog expired: {}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let remote = RemoteActorSystem::new(
+        RemoteConfig::tcp("process-caller", None).with_insecure_development(),
+        Arc::new(Empty),
+    )
+    .unwrap();
+    remote.start().await.unwrap();
+    remote
+        .connect(&NodeAddr::tcp(
+            "process-receiver",
+            ready.addr.parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+    let root = TraceContext::root();
+    let paths = root
+        .scope(remote.deploy_component("process-receiver", ready.command))
+        .await
+        .unwrap();
+    assert_eq!(paths.as_slice(), std::slice::from_ref(&ready.path));
+    let states = root
+        .scope(remote.component_status("process-receiver", &ready.path))
+        .await
+        .unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].state, "running");
+    let metrics = root
+        .scope(remote.metrics_report("process-receiver"))
+        .await
+        .unwrap();
+    assert_eq!(metrics.components, 1);
+    assert_eq!(metrics.component_states, states);
+    let measured = root
+        .scope(remote.measured_metrics("process-receiver"))
+        .await
+        .unwrap();
+    assert_eq!(measured.snapshot.component_states, states);
+    assert_eq!(
+        root.scope(remote.drain_component("process-receiver", &ready.path, Duration::from_secs(5)))
+            .await
+            .unwrap(),
+        (1, 0)
+    );
+    remote.shutdown().await.unwrap();
+    let expected = Expected {
+        trace_id: root.trace_id(),
+        span_id: root.span_id(),
+    };
+    fs::write(
+        directory.path().join("expected.tmp"),
+        toml::to_string(&expected).unwrap(),
+    )
+    .unwrap();
+    fs::rename(
+        directory.path().join("expected.tmp"),
+        directory.path().join("expected.toml"),
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "receiver assertions failed: {status}\n{}",
+                fs::read_to_string(&log_path).unwrap()
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "receiver retirement watchdog expired: {}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -593,6 +1299,90 @@ async fn drain_budget_includes_the_current_handler_even_when_queue_is_empty() {
 }
 
 #[tokio::test]
+async fn tcp_drain_duration_boundaries_wait_for_the_current_handler() {
+    use parrot_remote::{LocalLookup, NodeAddr, RemoteActorSystem, RemoteConfig};
+    struct Empty;
+    #[async_trait::async_trait]
+    impl LocalLookup for Empty {
+        async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
+            None
+        }
+    }
+    let mut outcomes = Vec::new();
+    for duration in [
+        Duration::ZERO,
+        Duration::from_secs(5),
+        Duration::from_millis(u64::MAX),
+        Duration::new(18_446_744_073_709_551, 616_000_000),
+        Duration::MAX,
+    ] {
+        let setup = Setup::new(Probe::default(), 1);
+        setup.deploy().await;
+        let target = RemoteActorSystem::new(
+            RemoteConfig::tcp("drain-target", Some("127.0.0.1:0".parse().unwrap()))
+                .with_insecure_development(),
+            Arc::new(Empty),
+        )
+        .unwrap();
+        target.set_component_executor(Some(Arc::new(setup.executor.clone())));
+        let source = RemoteActorSystem::new(
+            RemoteConfig::tcp("drain-source", None).with_insecure_development(),
+            Arc::new(Empty),
+        )
+        .unwrap();
+        target.start().await.unwrap();
+        source.start().await.unwrap();
+        source
+            .connect(&NodeAddr::tcp("drain-target", target.local_addr().unwrap()))
+            .await
+            .unwrap();
+        let actor = setup.engine.get_actor_ref(&setup.path).unwrap();
+        let handler = tokio::spawn(async move { actor.send(Box::new(Block)).await });
+        wait(&setup.probe.handler_started).await;
+        let caller = source.clone();
+        let path = setup.path.clone();
+        let drain = tokio::spawn(async move {
+            caller
+                .drain_component("drain-target", &path, duration)
+                .await
+        });
+        let mailbox = setup.engine.get_mailbox(&setup.path).unwrap();
+        // The drain health check queues behind Block. An expired budget instead
+        // returns early; release the actor in both cases before asserting.
+        let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+            while !drain.is_finished() && mailbox.is_empty().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        setup.probe.handler_release.notify_one();
+        handler.await.unwrap().unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let retained = setup.engine.get_actor_ref(&setup.path).is_some();
+        source.shutdown().await.unwrap();
+        target.shutdown().await.unwrap();
+        setup.shutdown().await;
+        assert!(
+            admitted.is_ok(),
+            "drain never reached the actor: {duration:?}"
+        );
+        outcomes.push((duration, reply, retained));
+    }
+    for (duration, reply, retained) in outcomes {
+        let expected = if duration.is_zero() { (0, 1) } else { (1, 0) };
+        assert_eq!(reply.unwrap(), expected, "drain result for {duration:?}");
+        assert_eq!(
+            retained,
+            duration.is_zero(),
+            "actor retained for {duration:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn old_deployment_cannot_report_or_stop_a_replacement_at_the_same_path() {
     let setup = Setup::new(Probe::default(), 1);
     setup.deploy().await;
@@ -690,6 +1480,81 @@ async fn malformed_direct_requests_are_rejected_before_spawning() {
         assert_eq!(setup.engine.actor_count(), 0);
     }
     setup.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_semver_identifiers_are_rejected_before_actor_creation() {
+    for version in [
+        "1.0.0-alpha..1",
+        "1.0.0-.alpha",
+        "1.0.0-alpha.",
+        "1.0.0-01",
+        "1.0.0-alpha.00+build.01",
+        "1.0.0+.",
+        "1.0.0+.build",
+        "1.0.0+build.",
+        "1.0.0+build..1",
+    ] {
+        let mut setup = Setup::new(Probe::default(), 1);
+        setup.command.version = version.into();
+        let reply = setup.executor.deploy(1, &setup.command).await;
+        let actors = setup.engine.actor_count();
+        let initialized = setup.probe.initialized.load(Ordering::SeqCst);
+        // Retire any unexpected successful deployment before reporting a failure.
+        setup.executor.stop(2, &setup.path).await;
+        setup.shutdown().await;
+        assert!(matches!(reply, R::Failed { code, detail, .. }
+            if code == parrot_remote::admin_v2::v2_err::SPAWN_FAILED
+                && detail == "invalid component semantic version"));
+        assert_eq!(actors, 0, "invalid version created an actor: {version}");
+        assert_eq!(
+            initialized, 0,
+            "invalid version initialized an actor: {version}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn valid_semver_identifiers_keep_exact_versions_and_node_byte_limit() {
+    let boundary = format!("1.0.0+{}", "x".repeat(250));
+    assert_eq!(boundary.len(), 256);
+    for version in [
+        "1.0.0-alpha.0+build.01",
+        "1.0.0-01a",
+        "1.0.0--+00",
+        &boundary,
+    ] {
+        let mut setup = Setup::new(Probe::default(), 1);
+        setup.command.version = version.into();
+        let paths = setup.deploy().await;
+        let actor = setup.engine.get_actor_ref(&paths[0]).unwrap();
+        assert_eq!(
+            *actor
+                .send(Box::new(7u64))
+                .await
+                .unwrap()
+                .downcast::<u64>()
+                .unwrap(),
+            7
+        );
+        assert!(matches!(setup.executor.status(2, &setup.path).await,
+            R::Status { states, .. } if states.len() == 1 && states[0].version == version));
+        assert!(matches!(
+            setup.executor.stop(3, &setup.path).await,
+            R::Stopped { .. }
+        ));
+        setup.shutdown().await;
+    }
+    let mut setup = Setup::new(Probe::default(), 1);
+    setup.command.version = format!("{boundary}x");
+    let reply = setup.executor.deploy(1, &setup.command).await;
+    let actors = setup.engine.actor_count();
+    setup.executor.stop(2, &setup.path).await;
+    setup.shutdown().await;
+    assert!(matches!(reply, R::Failed { code, detail, .. }
+        if code == parrot_remote::admin_v2::v2_err::SPAWN_FAILED
+            && detail == "invalid component semantic version"));
+    assert_eq!(actors, 0);
 }
 
 #[tokio::test]

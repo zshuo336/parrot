@@ -251,6 +251,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 fn kind(value: SpanKind) -> &'static str {
     match value {
+        SpanKind::ActorInit => "actor_init",
+        SpanKind::ActorBeforeStop => "actor_before_stop",
+        SpanKind::ActorInitLocalStreams => "actor_init_local_streams",
         SpanKind::TypedHandler => "typed_handler",
         SpanKind::DynamicHandler => "dynamic_handler",
         SpanKind::BusinessBatch => "business_batch",
@@ -261,6 +264,10 @@ fn kind(value: SpanKind) -> &'static str {
         SpanKind::StreamFinished => "stream_finished",
         SpanKind::StreamError => "stream_error",
         SpanKind::Application => "application",
+        SpanKind::WasmGuest => "wasm_guest",
+        SpanKind::NativeGuest => "native_guest",
+        SpanKind::WasmLifecycle => "wasm_lifecycle",
+        SpanKind::NativeLifecycle => "native_lifecycle",
     }
 }
 fn status(value: SpanStatus) -> &'static str {

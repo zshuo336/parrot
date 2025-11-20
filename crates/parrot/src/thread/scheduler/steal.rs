@@ -22,9 +22,11 @@ pub struct StealDeque<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> StealDeque<T> {
+    /// Construct a FIFO with exactly `cap` slots. Panics for zero capacity.
     pub fn new(cap: usize) -> Self {
+        assert!(cap > 0, "steal queue capacity must be positive");
         Self {
-            slots: ArrayQueue::new(cap.max(4)),
+            slots: ArrayQueue::new(cap),
             closed: AtomicU64::new(0),
         }
     }
@@ -55,6 +57,9 @@ impl<T: Send + 'static> StealDeque<T> {
         self.slots.is_empty()
     }
 
+    /// Reject subsequent pushes without discarding accepted work. A push
+    /// already overlapping this call may still succeed; this is not a drain
+    /// barrier. Consumers may continue to pop or steal until empty.
     pub fn close(&self) {
         self.closed.store(1, Ordering::Release);
     }
@@ -71,7 +76,11 @@ pub struct StealRing {
 pub type MailboxRef = Arc<dyn crate::thread::mailbox::Mailbox + Send + Sync>;
 
 impl StealRing {
+    /// Construct nonempty worker queues, each with exactly `cap` slots.
+    /// Panics for zero workers or zero capacity before allocating any queue.
     pub fn new(workers: usize, cap: usize) -> Self {
+        assert!(workers > 0, "steal ring worker count must be positive");
+        assert!(cap > 0, "steal queue capacity must be positive");
         Self {
             deques: (0..workers)
                 .map(|_| Arc::new(StealDeque::new(cap)))
@@ -79,13 +88,15 @@ impl StealRing {
         }
     }
 
+    /// Select a worker modulo the number of queues.
     pub fn local(&self, i: usize) -> &Arc<StealDeque<MailboxRef>> {
         &self.deques[i % self.deques.len()]
     }
 
-    /// 尝试从 other 的本地队列偷一个（跳过 self）。
+    /// Scan every other queue, excluding the same modulo worker as `local`.
     pub fn steal_from_others(&self, self_idx: usize) -> Option<MailboxRef> {
         let n = self.deques.len();
+        let self_idx = self_idx % n;
         // 随机起点：读一个便宜时钟做伪随机
         let start = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -52,8 +52,8 @@ fn sup(m: AppManifest) -> AppSupervisor {
     .unwrap()
 }
 
-/// 场景 1：升级中 kill -9 目标 Executor → RolloutTracker 自动回滚 →
-/// App 恢复 Running（旧版本继续服务）。
+/// 状态机模型：注入节点丢失并确认回滚动作，随后注入宿主恢复回执。
+/// 本测试没有启动Executor、发送SIGKILL或证明旧版本真实恢复。
 #[test]
 fn rollout_node_loss_requests_rollback() {
     let mut t = RolloutTracker::new("frontier");
@@ -61,13 +61,14 @@ fn rollout_node_loss_requests_rollback() {
     t.advance(RolloutEvent::PlanReady).unwrap();
     t.advance(RolloutEvent::Drained { aborted: 0 }).unwrap();
     assert!(t.in_phase(RolloutPhase::Deploying));
-    // kill -9：节点消失
+    // 模拟宿主提供节点丢失事件。
     let a = t
         .advance(RolloutEvent::NodeLost("erl-gw-1".into()))
         .unwrap();
     assert!(matches!(a, RolloutAction::Rollback { .. }));
-    // 回滚完成 → Done；旧版本恢复（App 回到 Running 由 supervisor 下轮确认）
-    t.advance(RolloutEvent::Drained { aborted: 0 }).unwrap();
+    // 宿主恢复回执推进Done；observed同样由本模型手动注入。
+    t.advance(RolloutEvent::RollbackComplete { aborted: 0 })
+        .unwrap();
     assert!(t.in_phase(RolloutPhase::Done));
     // supervisor 视角：旧版本 observed running → converged
     let s = sup(manifest(vec![spec("frontier")]));
@@ -114,7 +115,7 @@ fn stale_supervisor_waits_after_another_owner_commits() {
         .all(|action| matches!(action, ReconcileAction::Wait { .. })));
 }
 
-/// 场景 3：网关双杀（akka+ray 同时）→ 降级清单正确 → 恢复自动 reconcile。
+/// Inject link loss and fresh status receipts for two assigned gateways.
 #[test]
 fn link_snapshot_loss_degrades_then_status_recovers() {
     let mut h = HealthWatch::new(vec!["akka-gw-1".into(), "ray-gw-1".into()]).unwrap();
@@ -128,7 +129,7 @@ fn link_snapshot_loss_degrades_then_status_recovers() {
     let poll = h.begin_poll("ray-gw-1", "parse").unwrap();
     h.apply_poll(poll, vec![rep("/user/parse", "running")])
         .unwrap();
-    // 双杀
+    // Inject an empty link snapshot.
     let d = h.apply_links(vec![]).unwrap();
     assert_eq!(d.left.len(), 2, "双网关同时离线");
     let o = h.observed();
@@ -148,11 +149,11 @@ fn link_snapshot_loss_degrades_then_status_recovers() {
     let o2 = h.observed();
     assert!(
         o2.any_running("search") && o2.any_running("parse"),
-        "恢复后自动 reconcile 数据面就绪"
+        "fresh status receipts must restore both observed components"
     );
 }
 
-/// 场景 4：drain 半程消息风暴——超时兜底触发，DRAIN_ABORTED 计数=预期。
+/// Count the executor's reported aborts; this model does not execute a drain.
 #[test]
 fn rollout_accounts_executor_reported_aborts() {
     let mut t = RolloutTracker::new("index");

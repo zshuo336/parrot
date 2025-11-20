@@ -38,6 +38,10 @@ impl Drop for TcpTransport {
 }
 
 impl TcpTransport {
+    pub(crate) fn with_admission(mut self, admission: super::ConnectionAdmission) -> Self {
+        self.tasks.admission = admission;
+        self
+    }
     pub(crate) fn with_metrics(mut self, metrics: Arc<crate::metrics::TransportMetrics>) -> Self {
         self.tasks.metrics = metrics;
         self
@@ -59,7 +63,7 @@ impl TcpTransport {
         knobs: Option<crate::transport::RuntimeKnobs>,
     ) -> Self {
         Self {
-            tasks: ConnectionTasks::default(),
+            tasks: ConnectionTasks::with_knobs(knobs),
             capture: None,
             security: Default::default(),
             tls: None,
@@ -98,6 +102,7 @@ impl TcpTransport {
     async fn establish(
         &self,
         stream: TcpStream,
+        connection: tokio::sync::OwnedSemaphorePermit,
         side: ConnSide,
         expected: Option<&str>,
     ) -> Result<ConnectionHandle, RemoteError> {
@@ -107,6 +112,7 @@ impl TcpTransport {
             .peer_addr()
             .map_err(|e| RemoteError::Transport(e.to_string()))?;
         self.security.check_address(address)?;
+        let stream = super::AdmittedIo::new(stream, connection);
         let (io, trust): (Box<dyn TcpIo>, crate::security::PeerTrust) = match (&self.tls, side) {
             (Some((_, connector)), ConnSide::Connect) => {
                 let name = rustls::pki_types::ServerName::try_from(expected.unwrap().to_owned())
@@ -173,6 +179,12 @@ impl TcpTransport {
     }
 }
 
+impl super::OwnedTransport for TcpTransport {
+    fn close_admission(&self) {
+        self.tasks.close_admission();
+    }
+}
+
 #[async_trait::async_trait]
 impl Transport for TcpTransport {
     async fn connect(&self, addr: &NodeAddr) -> Result<ConnectionHandle, RemoteError> {
@@ -184,11 +196,13 @@ impl Transport for TcpTransport {
         }
         self.tasks
             .run(crate::security::handshake_deadline(async {
+                let (connection, _handshake) = self.tasks.admit()?;
                 let stream = TcpStream::connect(addr.addr).await.map_err(|e| {
                     RemoteError::Transport(format!("tcp connect {}: {e}", addr.addr))
                 })?;
                 self.establish(
                     stream,
+                    connection,
                     ConnSide::Connect,
                     addr.identity_is_explicit.then_some(addr.node_id.as_str()),
                 )
@@ -227,15 +241,24 @@ impl Transport for TcpTransport {
                     .accept()
                     .await
                     .map_err(|e| RemoteError::Transport(format!("tcp accept: {e}")))?;
-                crate::security::handshake_deadline(self.establish(stream, ConnSide::Accept, None))
-                    .await
+                let (connection, _handshake) = self.tasks.admit()?;
+                crate::security::handshake_deadline(self.establish(
+                    stream,
+                    connection,
+                    ConnSide::Accept,
+                    None,
+                ))
+                .await
             })
             .await
     }
 
     fn close(&self) {
+        self.tasks.close_admission();
+        let listener = self.listener.lock().unwrap().take();
+        let cleanup = crate::ingress::unwind::Cleanup::default();
         self.tasks.close();
-        self.listener.lock().unwrap().take();
+        cleanup.dispose(listener);
     }
 
     async fn shutdown(&self) {
@@ -261,6 +284,70 @@ mod tests {
     use super::*;
     use crate::frame::{frame_type, Frame};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn stalled_inbound_handshake_is_bounded_and_failed_peer_releases_capacity() {
+        use tokio::io::AsyncReadExt;
+        let (inbound, _receiver) = tokio::sync::mpsc::channel(8);
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let server = Arc::new(TcpTransport::new(
+            HandshakeBody {
+                node_id: "inbound-admission-server".into(),
+                ..Default::default()
+            },
+            inbound,
+            Arc::new(|_| {}),
+            shutdown,
+            Some(super::super::RuntimeKnobs {
+                connection_capacity: 2,
+                handshake_capacity: 1,
+                ..Default::default()
+            }),
+        ));
+        server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let address = server.local_addr().unwrap();
+        let stalled = TcpStream::connect(address).await.unwrap();
+        let owner = server.clone();
+        let attempt = tokio::spawn(async move { owner.accept().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match server.tasks.admit() {
+                    Err(error) => {
+                        assert!(error.to_string().contains("handshake capacity"), "{error}");
+                        break;
+                    }
+                    Ok(permits) => drop(permits),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first accept never started its handshake");
+        let mut rejected = TcpStream::connect(address).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), server.accept())
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("handshake capacity"), "{error}");
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), rejected.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(stalled);
+        assert!(attempt.await.unwrap().is_err());
+        // Both the failed handshake and the rejected attempt must return their
+        // connection permits, rather than permanently reducing node capacity.
+        let first = server.tasks.admit().unwrap();
+        drop(first.1);
+        let second = server.tasks.admit().unwrap();
+        drop((first.0, second));
+        server.shutdown().await;
+    }
 
     // 两个 TcpTransport 经真实 TCP 握手并交换一帧（CI 用 127.0.0.1 随机端口）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -16,6 +16,17 @@ sys.path.insert(0, str(ROOT / "apps/test_support"))
 from owned_process import OwnedProcess, _exit_observer, _darwin_only_zombie_leader, process_exited
 
 
+def loopback_bind_available():
+    try:
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+        return True
+    except OSError as error:
+        if error.errno in (errno.EPERM, errno.EACCES):
+            return False
+        raise
+
+
 class OwnedProcessTests(unittest.TestCase):
     def start(self, source, *args):
         child = OwnedProcess([sys.executable, "-c", source, *map(str, args)],
@@ -139,6 +150,8 @@ class OwnedProcessTests(unittest.TestCase):
         self.assertFalse(child.retired)
         self.assertEqual(_exit_observer()(child.pid), 23)
 
+    @unittest.skipUnless(loopback_bind_available(),
+                         'loopback listeners are unavailable in this environment')
     def test_native_crash_leaves_descendant_unassisted_until_explicit_close(self):
         # A live descendant must keep serving after the driver crashes. A
         # watchdog that kills it on driver exit would falsify recovery tests.

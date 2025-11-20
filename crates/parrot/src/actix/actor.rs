@@ -1,7 +1,7 @@
 use crate::actix::{
     context::ActixContext,
     lifecycle::{ActorControl, panic_message},
-    message::ActixMessageWrapper,
+    message::{ActixMessageWrapper, ActixReply},
     reference::{ActixActorRef, StopMessage},
 };
 use actix::fut::{ActorFutureExt, WrapFuture};
@@ -19,7 +19,59 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+mod cancellation_contracts;
+
 pub(crate) type ActorOutcome = Arc<Mutex<Option<ActorResult<()>>>>;
+
+// Publish disposal failures even if Actix cancels the enclosing stage. The
+// generation monitor consumes this receipt after the complete context retires.
+struct StageCleanup {
+    control: Arc<ActorControl>,
+    first: Option<crate::error_receipt::ActorReceipt>,
+    cancelled: bool,
+    recording: Option<parrot_api::trace::SpanGuard>,
+}
+impl StageCleanup {
+    fn new(control: Arc<ActorControl>) -> Self {
+        Self {
+            control,
+            first: None,
+            cancelled: false,
+            recording: None,
+        }
+    }
+    fn borrow(&mut self) -> crate::typed_supervision::DispatchCleanup<'_> {
+        crate::typed_supervision::DispatchCleanup::new(&mut self.first, &mut self.cancelled)
+    }
+    fn finish_recording<T>(&mut self, result: &ActorResult<T>) {
+        if let Some(recording) = self.recording.take() {
+            recording.finish(if self.first.is_some() {
+                parrot_api::trace::SpanStatus::Panicked
+            } else {
+                parrot_api::trace::SpanStatus::from_result(result)
+            });
+        }
+    }
+}
+impl Drop for StageCleanup {
+    fn drop(&mut self) {
+        if let Some(recording) = self.recording.take() {
+            recording.finish(if self.first.is_some() || std::thread::panicking() {
+                parrot_api::trace::SpanStatus::Panicked
+            } else {
+                parrot_api::trace::SpanStatus::Cancelled
+            });
+        }
+        if let Some(error) = self.first.take() {
+            self.control
+                .cleanup_failure
+                .lock()
+                .unwrap()
+                .get_or_insert(error);
+        }
+    }
+}
 
 /// Actor adapter with serial dispatch and owned, cancellable lifecycle futures.
 pub struct ActixActor<A>
@@ -197,9 +249,10 @@ where
             .map(|service| service.runtime.clone())
             .unwrap_or_else(tokio::runtime::Handle::current);
         self.control.children.bind_escalator(Arc::new(move |error| {
+            let error = crate::error_receipt::ActorReceipt::new(error);
             if let Some(control) = weak_control.upgrade()
                 && !control.is_stopping()
-                && control.dynamic_escalation.begin(error.clone())
+                && control.dynamic_escalation.begin(error.error().clone())
             {
                 let deadline = tokio::time::Instant::now() + control.timeout;
                 let decision = control.lifetime.start_escalation(
@@ -225,7 +278,8 @@ where
                         return;
                     }
                     control.record_failure_context();
-                    *control.escalated.lock().unwrap() = Some(error);
+                    let removed = control.escalated.lock().unwrap().replace(error);
+                    drop(removed);
                     control
                         .supervision_failed
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -242,6 +296,7 @@ where
         let mut inner = self.inner.take().expect("actor not yet initialized");
         let control = self.control.clone();
         let initialize = async move {
+            let mut cleanup = StageCleanup::new(control.clone());
             let result = std::panic::AssertUnwindSafe(initialize_after_admission(
                 &control,
                 async {
@@ -253,11 +308,33 @@ where
                     }
                     Ok(())
                 },
-                async { inner.init(&mut actor_ctx).await },
+                async {
+                    let target = parrot_api::context::ActorContext::path(&actor_ctx)
+                        .path()
+                        .to_owned();
+                    let outcome = crate::typed_supervision::recorded_lifecycle_stage(
+                        parrot_api::trace::SpanKind::ActorInit,
+                        &target,
+                        || inner.init(&mut actor_ctx),
+                        cleanup
+                            .borrow()
+                            .with_deadline(control.initialization_deadline()),
+                    )
+                    .await;
+                    if !matches!(&outcome.result, Ok(Ok(()))) {
+                        parrot_api::trace::in_scope(outcome.context, || {
+                            control.record_failure_context()
+                        });
+                    }
+                    outcome
+                        .result
+                        .unwrap_or_else(|message| Err(ActorError::Panic(message)))
+                },
             ))
             .catch_unwind()
             .await
             .unwrap_or_else(|payload| Err(ActorError::Panic(panic_message(payload))));
+            drop(cleanup);
             if result.is_err() {
                 control.record_failure_context();
             }
@@ -269,6 +346,7 @@ where
                 .map(|(inner, actor_ctx, result), actor, ctx| {
                     actor.inner = Some(inner);
                     actor.ctx = Some(actor_ctx);
+                    actor.control.finish_initialization();
                     match result {
                         Ok(true) => {
                             actor.initialized = true;
@@ -306,7 +384,7 @@ where
         self.control
             .begin_cleanup(tokio::time::Instant::now() + self.control.timeout);
         if self.control.escalated.lock().unwrap().is_some()
-            || self.control.dynamic_escalation.pending().is_some()
+            || self.control.dynamic_escalation.is_pending()
             || self.control.lifetime.decision_deadline().is_some()
         {
             // The monitor retains the originating failure separately. An actual
@@ -347,7 +425,9 @@ where
         };
         self.hook_started = true;
         let control = self.control.clone();
+        let stop_context = control.take_stop_context();
         let stop = async move {
+            let mut cleanup = StageCleanup::new(control.clone());
             let result = std::panic::AssertUnwindSafe(async {
                 if control.expired_now() {
                     return Err(control.enforce_deadline());
@@ -358,22 +438,34 @@ where
                     result = async {
                         let children_result = control.children.join().await;
                         let tasks_result = control.tasks.join().await.and(children_result);
-                        inner.before_stop(&mut actor_ctx).await.map_err(crate::error_receipt::protect_actor).and(tasks_result)
+                        let target = parrot_api::context::ActorContext::path(&actor_ctx).path().to_owned();
+                        crate::typed_supervision::recorded_lifecycle_stage(
+                            parrot_api::trace::SpanKind::ActorBeforeStop,
+                            &target,
+                            || inner.before_stop(&mut actor_ctx), cleanup.borrow(),
+                        ).await.result.unwrap_or_else(|message| Err(ActorError::Panic(message)))
+                            .map_err(crate::error_receipt::protect_actor).and(tasks_result)
                     } => result,
                 }
             })
             .catch_unwind()
             .await
             .unwrap_or_else(|payload| Err(ActorError::Panic(panic_message(payload))));
+            drop(cleanup);
             let result = result.map_err(|error| {
                 let error = crate::error_receipt::ActorReceipt::from_error(error);
-                *control.stop_failure.lock().unwrap() = Some(error.clone());
+                control
+                    .cleanup_failure
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(error.clone());
                 error.into_error()
             });
             (inner, actor_ctx, result)
         };
         ctx.wait(
-            stop.into_actor(self)
+            parrot_api::trace::scope(stop_context, stop)
+                .into_actor(self)
                 .map(|(inner, actor_ctx, result), actor, ctx| {
                     actor.inner = Some(inner);
                     actor.ctx = Some(actor_ctx);
@@ -405,12 +497,16 @@ where
             .as_ref()
             .map(|service| service.runtime.clone())
             .unwrap_or_else(tokio::runtime::Handle::current);
-        let trace_context = message.envelope.trace_context.map(|parent| parent.child());
-        let mut payload = message.envelope.payload;
+        let trace_context = message
+            .envelope
+            .trace_context
+            .as_ref()
+            .map(|parent| parent.child());
+        let payload = &message.envelope.payload;
         if payload.is::<StopMessage>() || self.stop_requested() {
             let deadline = tokio::time::Instant::now() + self.control.timeout;
             if payload.is::<StopMessage>() {
-                self.control.request_stop(deadline);
+                parrot_api::trace::in_scope(trace_context, || self.control.request_stop(deadline));
             } else {
                 self.control.begin_cleanup(deadline);
             }
@@ -435,8 +531,13 @@ where
                 .into_actor(self),
             );
         };
-        let activity = if payload.is::<crate::receive_timeout::IdleSignal>() {
-            let signal = *payload
+        let mut message = message;
+        let activity = if message
+            .envelope
+            .payload
+            .is::<crate::receive_timeout::IdleSignal>()
+        {
+            let signal = *std::mem::replace(&mut message.envelope.payload, Box::new(()))
                 .downcast::<crate::receive_timeout::IdleSignal>()
                 .unwrap();
             let Some(activity) = actor_ctx.idle.claim(signal) else {
@@ -444,13 +545,17 @@ where
                     futures::future::ready(Some(Ok(Box::new(()) as BoxedMessage))).into_actor(self),
                 );
             };
-            payload = Box::new(parrot_api::context::LifecycleEvent::ReceiveTimeout);
+            message.envelope.payload =
+                Box::new(parrot_api::context::LifecycleEvent::ReceiveTimeout);
             activity
         } else {
             actor_ctx.idle.enter()
         };
-        if !payload.is::<crate::streams::StreamEvent>()
-            && !payload.is::<crate::children::ChildTerminated>()
+        if !message.envelope.payload.is::<crate::streams::StreamEvent>()
+            && !message
+                .envelope
+                .payload
+                .is::<crate::children::ChildTerminated>()
             && !inner.use_async_handler()
         {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -459,11 +564,30 @@ where
                         parrot_api::trace::SpanKind::DynamicHandler,
                         &self.path,
                     );
+                    let started = tokio::time::Instant::now();
                     let result = inner.receive_message_with_engine(
-                        payload,
+                        message.into_payload(),
                         actor_ctx,
                         EngineContextHandle::new(ctx),
                     );
+                    let result = if !self.control.message_timeout.is_zero()
+                        && started.elapsed() >= self.control.message_timeout
+                    {
+                        if let Err(error) =
+                            crate::owned_payload::PublicationInput::new(result).retire()
+                        {
+                            self.control
+                                .cleanup_failure
+                                .lock()
+                                .unwrap()
+                                .get_or_insert_with(|| {
+                                    crate::error_receipt::ActorReceipt::from_error(error)
+                                });
+                        }
+                        Some(Err(ActorError::Timeout))
+                    } else {
+                        result
+                    };
                     recording.finish(result.as_ref().map_or(
                         parrot_api::trace::SpanStatus::Error,
                         parrot_api::trace::SpanStatus::from_result,
@@ -478,13 +602,14 @@ where
             };
             let control = self.control.clone();
             let unmanaged = !self.managed;
+            let supervised = control.supervise_message(result, unmanaged, &decision_runtime);
             return Box::pin(
                 parrot_api::trace::scope(trace_context, async move {
                     let _activity = activity;
                     tokio::select! {
                         biased;
                         _ = control.cancellation() => (Err(ActorError::Stopped), None),
-                        result = control.dynamic_escalation.guard(control.supervise_message(result, unmanaged, &decision_runtime)) => result,
+                        result = control.dynamic_escalation.guard(supervised) => result,
                     }
                 })
                 .into_actor(self)
@@ -514,38 +639,69 @@ where
         let dispatch = async move {
             let _activity = activity;
             let work = async {
-                let recording = parrot_api::trace::SpanGuard::current(
+                let mut cleanup = StageCleanup::new(control.clone());
+                cleanup.recording = Some(parrot_api::trace::SpanGuard::current(
                     parrot_api::trace::SpanKind::DynamicHandler,
                     parrot_api::context::ActorContext::path(&actor_ctx).path(),
-                );
+                ));
                 let result = std::panic::AssertUnwindSafe(async {
-                    if payload.is::<crate::children::ChildTerminated>() {
-                        inner
-                            .handle_child_terminated(
-                                payload
-                                    .downcast::<crate::children::ChildTerminated>()
-                                    .unwrap()
-                                    .0,
-                                &mut actor_ctx,
-                            )
-                            .await?;
+                    if message
+                        .envelope
+                        .payload
+                        .is::<crate::children::ChildTerminated>()
+                    {
+                        crate::typed_supervision::lifecycle_stage(
+                            || {
+                                inner.handle_child_terminated(
+                                    message
+                                        .into_payload()
+                                        .downcast::<crate::children::ChildTerminated>()
+                                        .unwrap()
+                                        .into_actor(),
+                                    &mut actor_ctx,
+                                )
+                            },
+                            cleanup.borrow(),
+                        )
+                        .await
+                        .unwrap_or_else(|message| Err(ActorError::Panic(message)))?;
                         Ok(Box::new(()) as BoxedMessage)
-                    } else if payload.is::<crate::streams::StreamEvent>() {
+                    } else if message.envelope.payload.is::<crate::streams::StreamEvent>() {
                         crate::streams::dispatch(
-                            *payload.downcast::<crate::streams::StreamEvent>().unwrap(),
+                            *message
+                                .into_payload()
+                                .downcast::<crate::streams::StreamEvent>()
+                                .unwrap(),
                             &mut inner,
                             &mut actor_ctx,
+                            control.message_timeout,
+                            cleanup.borrow(),
                         )
                         .await
                     } else {
-                        inner.receive_message(payload, &mut actor_ctx).await
+                        crate::typed_supervision::guarded_stage(
+                            || inner.receive_message(message.into_payload(), &mut actor_ctx),
+                            cleanup.borrow().with_timeout(control.message_timeout),
+                        )
+                        .await
+                        .unwrap_or_else(|message| Err(ActorError::Panic(message)))
                     }
                 })
                 .catch_unwind()
                 .await;
                 let result =
                     result.unwrap_or_else(|payload| Err(ActorError::Panic(panic_message(payload))));
-                recording.finish_result(&result);
+                let disposal_failure = cleanup.first.clone();
+                cleanup.finish_recording(&result);
+                drop(cleanup);
+                if let Some(disposal) = disposal_failure {
+                    let error = Arc::new(result.err().unwrap_or_else(|| disposal.into_error()));
+                    control.record_failure_context();
+                    return (
+                        Err(crate::supervision_policy::reply_error(error.clone())),
+                        Some(error),
+                    );
+                }
                 control
                     .supervise_message(result, unmanaged, &decision_runtime)
                     .await
@@ -587,17 +743,22 @@ where
         + Unpin
         + 'static,
 {
-    type Result = AtomicResponse<Self, Option<ActorResult<BoxedMessage>>>;
+    type Result = AtomicResponse<Self, ActixReply>;
     fn handle(&mut self, message: ActixMessageWrapper, ctx: &mut Context<Self>) -> Self::Result {
         // Validate ownership and initialization at admission. Deferring these
         // errors until the pause future is polled could turn a rejected direct
         // pre-start call into a user message after started() creates the context.
         if self.inner.is_none() || self.ctx.is_none() {
-            return AtomicResponse::new(self.handle_ready(message, ctx));
+            return AtomicResponse::new(Box::pin(
+                self.handle_ready(message, ctx)
+                    .map(|result, _, _| ActixReply::new(result)),
+            ));
         }
         let control = self.control.clone();
         if message.envelope.payload.is::<StopMessage>() {
-            control.request_stop(tokio::time::Instant::now() + control.timeout);
+            parrot_api::trace::in_scope(message.envelope.trace_context.clone(), || {
+                control.request_stop(tokio::time::Instant::now() + control.timeout);
+            });
         }
         let ready = async move {
             tokio::select! {
@@ -606,18 +767,22 @@ where
                 _ = control.dynamic_escalation.ready() => true,
             }
         };
-        AtomicResponse::new(Box::pin(ready.into_actor(self).then(
-            move |ready, actor, ctx| {
-                if ready {
-                    actor.handle_ready(message, ctx)
-                } else {
-                    ctx.stop();
-                    Box::pin(
-                        futures::future::ready(Some(Err(ActorError::Stopped))).into_actor(actor),
-                    )
-                }
-            },
-        )))
+        AtomicResponse::new(Box::pin(
+            ready
+                .into_actor(self)
+                .then(move |ready, actor, ctx| {
+                    if ready {
+                        actor.handle_ready(message, ctx)
+                    } else {
+                        ctx.stop();
+                        Box::pin(
+                            futures::future::ready(Some(Err(ActorError::Stopped)))
+                                .into_actor(actor),
+                        )
+                    }
+                })
+                .map(|result, _, _| ActixReply::new(result)),
+        ))
     }
 }
 impl<A> Handler<StopMessage> for ActixActor<A>
@@ -629,8 +794,10 @@ where
 {
     type Result = ();
     fn handle(&mut self, _: StopMessage, ctx: &mut Self::Context) {
-        self.control
-            .request_stop(tokio::time::Instant::now() + self.control.timeout);
+        parrot_api::trace::in_scope(None, || {
+            self.control
+                .request_stop(tokio::time::Instant::now() + self.control.timeout)
+        });
         ctx.stop();
     }
 }

@@ -3,6 +3,7 @@ use parrot::thread::{context::ThreadContext, system::ThreadActorSystem};
 use parrot_api::{
     actor::{Actor, ActorState, EmptyConfig},
     address::ActorRef,
+    errors::ActorError,
     types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage},
 };
 use parrot_app::host::ThreadPropsFactory;
@@ -25,6 +26,7 @@ struct State {
     mode: String,
     armed: std::sync::atomic::AtomicBool,
     callback_fail: std::sync::atomic::AtomicBool,
+    callback_drops: AtomicUsize,
     stopped: AtomicUsize,
     roots_dropped: AtomicUsize,
     clones_dropped: AtomicUsize,
@@ -78,6 +80,7 @@ impl Drop for Ref {
         if self.cloned
             && self.state.armed.load(Ordering::SeqCst)
             && !matches!(self.state.mode.as_str(), "health" | "status_panic")
+            && !self.state.mode.starts_with("callback:")
         {
             if self.state.mode == "payload" {
                 std::panic::panic_any(ThrowingPayload);
@@ -86,6 +89,82 @@ impl Drop for Ref {
         }
     }
 }
+struct CallbackFuture<'a, T> {
+    inner: BoxedFuture<'a, T>,
+    state: Arc<State>,
+    poll_panics: bool,
+    drop_panics: bool,
+    pending: bool,
+}
+impl<T> Future for CallbackFuture<'_, T> {
+    type Output = T;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<T> {
+        if self.pending {
+            self.state.entered.notify_one();
+            return std::task::Poll::Pending;
+        }
+        assert!(!self.poll_panics, "injected callback poll panic");
+        self.inner.as_mut().poll(cx)
+    }
+}
+impl<T> Drop for CallbackFuture<'_, T> {
+    fn drop(&mut self) {
+        self.state.callback_drops.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.drop_panics,
+            "injected callback future destructor panic"
+        );
+    }
+}
+#[derive(Debug)]
+struct CallbackError {
+    display_panics: bool,
+    drop_panics: bool,
+}
+impl std::fmt::Display for CallbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        assert!(
+            !self.display_panics,
+            "injected callback error formatting panic"
+        );
+        f.write_str("callback business failure")
+    }
+}
+impl std::error::Error for CallbackError {}
+impl Drop for CallbackError {
+    fn drop(&mut self) {
+        assert!(
+            !self.drop_panics,
+            "injected callback error destructor panic"
+        );
+    }
+}
+struct CallbackReply;
+impl Drop for CallbackReply {
+    fn drop(&mut self) {
+        panic!("injected health reply destructor panic");
+    }
+}
+struct PanicSubscriber;
+impl tracing::Subscriber for PanicSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+            && metadata.target().starts_with("parrot_node::executor_v2")
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {
+        panic!("injected management subscriber panic");
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
 impl ActorRef for Ref {
     fn send<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         if self.state.mode == "health"
@@ -93,6 +172,33 @@ impl ActorRef for Ref {
             && self.state.callback_fail.load(Ordering::SeqCst)
         {
             panic!("injected health-check construction panic");
+        }
+        let mode = self.state.mode.as_str();
+        if self.state.callback_fail.load(Ordering::SeqCst)
+            && self.index == 1
+            && mode.starts_with("callback:health_")
+        {
+            let inner = Box::pin(async move {
+                self.actor.send(message).await?;
+                if mode == "callback:health_error_both" {
+                    Err(ActorError::Other(
+                        CallbackError {
+                            display_panics: true,
+                            drop_panics: true,
+                        }
+                        .into(),
+                    ))
+                } else {
+                    Ok(Box::new(CallbackReply) as BoxedMessage)
+                }
+            });
+            return Box::pin(CallbackFuture {
+                inner,
+                state: self.state.clone(),
+                poll_panics: mode == "callback:health_poll_drop",
+                drop_panics: mode == "callback:health_poll_drop",
+                pending: false,
+            });
         }
         self.actor.send(message)
     }
@@ -107,6 +213,42 @@ impl ActorRef for Ref {
         self.actor.deliver(message)
     }
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
+        let mode = self.state.mode.as_str();
+        if self.state.callback_fail.load(Ordering::SeqCst)
+            && self.index == 1
+            && (mode.starts_with("callback:stop_") || mode.starts_with("callback:rollback_"))
+        {
+            let inner = Box::pin(async move {
+                if mode.starts_with("callback:stop_error_")
+                    || mode.starts_with("callback:rollback_error_")
+                {
+                    Err(ActorError::Other(
+                        CallbackError {
+                            display_panics: mode.ends_with("display") || mode.ends_with("both"),
+                            drop_panics: mode.ends_with("drop") || mode.ends_with("both"),
+                        }
+                        .into(),
+                    ))
+                } else {
+                    self.actor.stop().await
+                }
+            });
+            return Box::pin(CallbackFuture {
+                inner,
+                state: self.state.clone(),
+                poll_panics: matches!(
+                    mode,
+                    "callback:stop_poll_drop" | "callback:rollback_poll_drop"
+                ),
+                drop_panics: matches!(
+                    mode,
+                    "callback:stop_poll_drop"
+                        | "callback:stop_ready_drop"
+                        | "callback:rollback_poll_drop"
+                ),
+                pending: false,
+            });
+        }
         Box::pin(async move {
             if self.state.reject_stop.load(Ordering::SeqCst) && self.index == 0 {
                 return Err(parrot_api::errors::ActorError::InternalError(
@@ -120,6 +262,19 @@ impl ActorRef for Ref {
         self.actor.path()
     }
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+        let mode = self.state.mode.as_str();
+        if self.state.callback_fail.load(Ordering::SeqCst)
+            && self.index == 0
+            && (mode.starts_with("callback:status_") || mode == "callback:metrics_poll_drop")
+        {
+            return Box::pin(CallbackFuture {
+                inner: self.actor.is_alive(),
+                state: self.state.clone(),
+                poll_panics: mode.ends_with("poll_drop") || mode.ends_with("poll_logger"),
+                drop_panics: !mode.ends_with("logger"),
+                pending: mode == "callback:status_cancel_drop",
+            });
+        }
         Box::pin(async move {
             if matches!(self.state.mode.as_str(), "status" | "cancel_status") {
                 self.state.entered.notify_one();
@@ -170,8 +325,21 @@ fn spawn(
 parrot_api::message::inventory::submit! { ThreadPropsFactory { name: "test.node-disposal", spawn } }
 fn legacy_spawn(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
     let path = path.to_string();
-    Box::pin(async move {
-        if path.ends_with("-2") {
+    let state = state().get().unwrap().clone();
+    let third = path.ends_with("-2");
+    let wrap = third && state.mode.starts_with("callback:factory_");
+    let observed = state.clone();
+    let inner = Box::pin(async move {
+        if third && state.mode.starts_with("callback:factory_error_") {
+            return Err(ActorError::Other(
+                CallbackError {
+                    display_panics: state.mode.ends_with("display") || state.mode.ends_with("both"),
+                    drop_panics: state.mode.ends_with("drop") || state.mode.ends_with("both"),
+                }
+                .into(),
+            ));
+        }
+        if third && state.mode != "callback:factory_ready_drop" {
             return Err(parrot_api::errors::ActorError::InternalError(
                 "legacy third factory failed".into(),
             ));
@@ -181,7 +349,21 @@ fn legacy_spawn(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> 
         let view = actor.clone_boxed();
         drop(actor);
         Ok(view)
-    })
+    });
+    if wrap {
+        Box::pin(CallbackFuture {
+            inner,
+            poll_panics: observed.mode == "callback:factory_poll_drop",
+            drop_panics: matches!(
+                observed.mode.as_str(),
+                "callback:factory_poll_drop" | "callback:factory_ready_drop"
+            ),
+            pending: false,
+            state: observed,
+        })
+    } else {
+        inner
+    }
 }
 parrot_api::message::inventory::submit! { parrot_remote::admin::PropsFactory { name: "test.node-legacy-disposal", spawn: legacy_spawn } }
 async fn exercise(mode: &str) {
@@ -189,6 +371,7 @@ async fn exercise(mode: &str) {
         mode: mode.into(),
         armed: false.into(),
         callback_fail: true.into(),
+        callback_drops: 0.into(),
         stopped: 0.into(),
         roots_dropped: 0.into(),
         clones_dropped: 0.into(),
@@ -198,7 +381,10 @@ async fn exercise(mode: &str) {
     });
     state().set(probe.clone()).unwrap();
     let engine = ThreadActorSystem::shared(Default::default());
-    if mode == "legacy" {
+    if mode == "legacy"
+        || mode.starts_with("callback:rollback_")
+        || mode.starts_with("callback:factory_")
+    {
         let facade = Arc::new(
             parrot::system::ParrotActorSystem::new(Default::default())
                 .await
@@ -223,6 +409,65 @@ async fn exercise(mode: &str) {
             config: None,
         };
         let reply = executor.deploy(1, &command).await;
+        if mode.starts_with("callback:factory_") {
+            if mode == "callback:factory_error_drop" {
+                assert!(
+                    matches!(reply, R::Failed { ref detail, .. } if detail.contains("callback business failure")),
+                    "cleanup replaced the formatted factory cause: {reply:?}"
+                );
+            }
+            assert!(
+                matches!(reply, R::Failed { ref detail, .. } if detail.contains("Props factory test.node-legacy-disposal panicked")),
+                "{reply:?}"
+            );
+            assert_eq!(
+                engine.actor_count(),
+                0,
+                "factory failure orphaned an admitted instance"
+            );
+            let count = if mode == "callback:factory_ready_drop" {
+                3
+            } else {
+                2
+            };
+            assert_eq!(probe.stopped.load(Ordering::SeqCst), count);
+            assert_eq!(probe.clones_dropped.load(Ordering::SeqCst), count);
+            assert_eq!(probe.callback_drops.load(Ordering::SeqCst), 1);
+            assert!(
+                matches!(executor.status(2, "/user/legacy").await, R::Failed { code, .. } if code == v2_err::COMPONENT_NOT_FOUND)
+            );
+            engine.shutdown_internal().await.unwrap();
+            return;
+        }
+        if mode.starts_with("callback:rollback_") {
+            let stop_failure = if mode == "callback:rollback_poll_drop" {
+                "Panic: injected callback poll panic"
+            } else {
+                "actor stop panicked"
+            };
+            assert!(
+                matches!(reply, R::Failed { ref detail, .. } if detail.contains("legacy third factory failed") && detail.contains(stop_failure)),
+                "{reply:?}"
+            );
+            assert_eq!(engine.actor_count(), 1);
+            assert_eq!(probe.stopped.load(Ordering::SeqCst), 1);
+            let status = executor.status(2, "/user/legacy").await;
+            assert!(
+                matches!(status, R::Status { ref states, .. } if states.len() == 1 && states[0].path.ends_with("-1") && states[0].state == "cleanup_failed"),
+                "{status:?}"
+            );
+            probe.callback_fail.store(false, Ordering::SeqCst);
+            assert!(matches!(
+                executor.stop(3, "/user/legacy").await,
+                R::Stopped { .. }
+            ));
+            assert_eq!(engine.actor_count(), 0);
+            assert_eq!(probe.stopped.load(Ordering::SeqCst), 2);
+            assert_eq!(probe.clones_dropped.load(Ordering::SeqCst), 2);
+            assert_eq!(probe.callback_drops.load(Ordering::SeqCst), 1);
+            engine.shutdown_internal().await.unwrap();
+            return;
+        }
         assert!(
             matches!(reply,R::Failed{ref detail,..} if detail.contains("legacy third factory failed") && detail.contains("reference panicked")),
             "{reply:?}"
@@ -260,14 +505,125 @@ async fn exercise(mode: &str) {
     .await
     .unwrap();
     probe.armed.store(true, Ordering::SeqCst);
-    if mode == "owner" {
+    let owner_mode = matches!(mode, "owner" | "owner_logger");
+    if owner_mode {
         engine.shutdown_internal().await.unwrap();
+        let _subscriber =
+            (mode == "owner_logger").then(|| tracing::subscriber::set_default(PanicSubscriber));
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(executor))).is_ok(),
             "executor Drop unwound"
         );
     } else {
         match mode {
+            mode if mode.starts_with("callback:status_")
+                || mode == "callback:metrics_poll_drop" =>
+            {
+                let _subscriber = mode
+                    .ends_with("logger")
+                    .then(|| tracing::subscriber::set_default(PanicSubscriber));
+                if mode == "callback:status_cancel_drop" {
+                    let mut status = Box::pin(executor.status(2, "/user/disposal"));
+                    assert!(futures::poll!(&mut status).is_pending());
+                    probe.entered.notified().await;
+                    probe.callback_fail.store(false, Ordering::SeqCst);
+                    assert!(matches!(
+                        executor.stop(3, "/user/disposal").await,
+                        R::Stopped { .. }
+                    ));
+                    assert!(
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(status)))
+                            .is_ok(),
+                        "cancelled callback future unwound"
+                    );
+                } else {
+                    let states = if mode == "callback:metrics_poll_drop" {
+                        match executor.metrics(2).await {
+                            R::Metrics { snapshot, .. } => snapshot.component_states,
+                            other => panic!("{other:?}"),
+                        }
+                    } else {
+                        match executor.status(2, "/user/disposal").await {
+                            R::Status { states, .. } => states,
+                            other => panic!("{other:?}"),
+                        }
+                    };
+                    assert_eq!(states.len(), 2);
+                    assert_eq!(states[0].state, "unavailable");
+                    assert_eq!(states[1].state, "running");
+                    probe.callback_fail.store(false, Ordering::SeqCst);
+                    assert!(matches!(
+                        executor.stop(3, "/user/disposal").await,
+                        R::Stopped { .. }
+                    ));
+                }
+                assert_eq!(probe.callback_drops.load(Ordering::SeqCst), 1);
+            }
+            mode if mode.starts_with("callback:stop_") || mode.starts_with("callback:health_") => {
+                if mode.starts_with("callback:stop_") {
+                    let reply = executor.stop(2, "/user/disposal").await;
+                    if mode == "callback:stop_error_drop" {
+                        assert!(
+                            matches!(reply, R::Failed { ref detail, .. } if detail.contains("callback business failure")),
+                            "cleanup replaced the formatted stop cause: {reply:?}"
+                        );
+                    }
+                    let stop_failure = match mode {
+                        "callback:stop_poll_drop" => "Panic: injected callback poll panic",
+                        "callback:stop_ready_drop" => {
+                            "Panic: injected callback future destructor panic"
+                        }
+                        _ => "actor stop panicked",
+                    };
+                    assert!(
+                        matches!(reply, R::Failed { ref detail, .. } if detail.contains(stop_failure)),
+                        "{reply:?}"
+                    );
+                    assert_eq!(
+                        probe.stopped.load(Ordering::SeqCst),
+                        if mode == "callback:stop_ready_drop" {
+                            2
+                        } else {
+                            1
+                        },
+                        "a failed callback skipped a healthy member"
+                    );
+                    let status = executor.status(3, "/user/disposal").await;
+                    assert!(
+                        matches!(status, R::Status { ref states, .. } if states.len() == 1 && states[0].path.ends_with("-1") && states[0].state == "cleanup_failed"),
+                        "{status:?}"
+                    );
+                    probe.callback_fail.store(false, Ordering::SeqCst);
+                    assert!(matches!(
+                        executor.stop(4, "/user/disposal").await,
+                        R::Stopped { .. }
+                    ));
+                } else {
+                    let reply = executor.drain(2, "/user/disposal", 3000).await;
+                    assert!(
+                        matches!(
+                            reply,
+                            R::Drained {
+                                drained: 1,
+                                aborted: 1,
+                                ..
+                            }
+                        ),
+                        "{reply:?}"
+                    );
+                    assert_eq!(probe.stopped.load(Ordering::SeqCst), 1);
+                    probe.callback_fail.store(false, Ordering::SeqCst);
+                    assert!(matches!(
+                        executor.drain(4, "/user/disposal", 3000).await,
+                        R::Drained {
+                            drained: 1,
+                            aborted: 0,
+                            ..
+                        }
+                    ));
+                }
+                assert_eq!(probe.callback_drops.load(Ordering::SeqCst), 1);
+            }
             "status" | "cancel_status" => {
                 let mut status = Box::pin(executor.status(2, "/user/disposal"));
                 std::future::poll_fn(|cx| {
@@ -390,11 +746,11 @@ async fn exercise(mode: &str) {
     assert_eq!(engine.actor_count(), 0);
     assert_eq!(
         probe.stopped.load(Ordering::SeqCst),
-        if mode == "owner" { 2 } else { 4 }
+        if owner_mode { 2 } else { 4 }
     );
     assert_eq!(
         probe.clones_dropped.load(Ordering::SeqCst),
-        if mode == "owner" { 2 } else { 4 }
+        if owner_mode { 2 } else { 4 }
     );
 }
 // Baselines with two panicking destructors can abort, so isolate every case.
@@ -494,4 +850,37 @@ fn node_reference_panic_payload_disposal_is_bounded() {
         "node_reference_panic_payload_disposal_is_bounded",
         "payload",
     );
+}
+
+macro_rules! callback_case {
+    ($name:ident, $mode:literal) => {
+        #[test]
+        fn $name() {
+            child(stringify!($name), concat!("callback:", $mode));
+        }
+    };
+}
+callback_case!(node_callback_status_ready_drop, "status_ready_drop");
+callback_case!(node_callback_status_poll_drop, "status_poll_drop");
+callback_case!(node_callback_status_cancel_drop, "status_cancel_drop");
+callback_case!(node_callback_status_poll_logger, "status_poll_logger");
+callback_case!(node_callback_metrics_poll_drop, "metrics_poll_drop");
+callback_case!(node_callback_stop_ready_drop, "stop_ready_drop");
+callback_case!(node_callback_stop_poll_drop, "stop_poll_drop");
+callback_case!(node_callback_stop_error_display, "stop_error_display");
+callback_case!(node_callback_stop_error_drop, "stop_error_drop");
+callback_case!(node_callback_stop_error_both, "stop_error_both");
+callback_case!(node_callback_health_poll_drop, "health_poll_drop");
+callback_case!(node_callback_health_error_both, "health_error_both");
+callback_case!(node_callback_health_reply_drop, "health_reply_drop");
+callback_case!(node_callback_rollback_poll_drop, "rollback_poll_drop");
+callback_case!(node_callback_rollback_error_both, "rollback_error_both");
+callback_case!(node_callback_factory_poll_drop, "factory_poll_drop");
+callback_case!(node_callback_factory_ready_drop, "factory_ready_drop");
+callback_case!(node_callback_factory_error_display, "factory_error_display");
+callback_case!(node_callback_factory_error_drop, "factory_error_drop");
+callback_case!(node_callback_factory_error_both, "factory_error_both");
+#[test]
+fn node_callback_owner_logger() {
+    child("node_callback_owner_logger", "owner_logger");
 }

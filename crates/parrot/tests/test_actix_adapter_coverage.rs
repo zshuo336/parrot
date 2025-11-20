@@ -348,7 +348,7 @@ fn dispatch_before_started_reports_diagnostic() {
         // Drive the AtomicResponse through MessageResponse::handle with a
         // oneshot sender; the ready future resolves on ctx.wait inside
         // raw_ctx.run.
-        let (tx, rx) = tokio::sync::oneshot::channel::<Option<ActorResult<BoxedMessage>>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<parrot::actix::message::ActixReply>();
         actix::dev::MessageResponse::<ActixActor<Inner>, ActixMessageWrapper>::handle(
             resp,
             &mut raw_ctx,
@@ -359,6 +359,7 @@ fn dispatch_before_started_reports_diagnostic() {
             .await
             .expect("diagnostic must resolve")
             .expect("reply channel must remain live")
+            .into_inner()
             .expect("Some error reply")
             .expect_err("diagnostic error");
         assert!(err.to_string().contains("context not initialized"), "{err}");
@@ -699,7 +700,14 @@ fn actix_ref_closed_try_send_and_envelope_delivery() {
             "Add",
         );
         assert_eq!(wrapper.envelope.message_type, "Add");
-        let value = r2.get_addr().send(wrapper).await.unwrap().unwrap().unwrap();
+        let value = r2
+            .get_addr()
+            .send(wrapper)
+            .await
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .unwrap();
         assert_eq!(*value.downcast::<u64>().unwrap(), 3);
         assert_eq!(r2.ask(Add(0)).await.unwrap(), 3);
         r2.stop().await.unwrap();

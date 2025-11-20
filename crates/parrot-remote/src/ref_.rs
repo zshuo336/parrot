@@ -1,7 +1,8 @@
 //! 职责：RemoteActorRef——ActorRef trait 的远程实现（位置透明核心，05 §5）。
 //!
 //! ask = cid + oneshot 挂起 + REPLY 回程；deliver = TELL 帧 at-most-once；
-//! stop = STOP 帧火忘 + 本地 5s 兜底（P1 简化，DEV_01 §8.9）。
+//! stop waits for STOP writer-queue admission, without a completion receipt or
+//! built-in deadline. is_alive reports an available route, not actor existence.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -62,9 +63,8 @@ pub struct RemoteInner {
     /// 星型拓扑默认路由（07 §6）：目标节点不在直连表时经 hub 中转。
     /// None = 无 uplink（纯直连模式——miss 即 fail）。
     pub uplink: Option<FrameSender>,
-    /// 端到端 TELL 序号分配（per 目标节点单调递增，从 1 起；跨路径切换
-    /// 连续——接收端据此重排。外层 Mutex 简单正确：临界区仅查表+自增，
-    /// 无 await；高并发 TELL 热点可换 sharded，当前压测未见瓶颈）。
+    /// Local per-destination TELL sequence, starting at one and skipping zero.
+    /// This is not a persisted source/session identity across process restarts.
     pub(crate) seq_counters: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
 }
 
@@ -79,8 +79,7 @@ impl RemoteInner {
         frame
     }
 
-    /// 取目标节点下一序号（首帧 =1；u32 回绕在 2^32 帧后——接收端
-    /// expected 同步回绕，语义仍单调）。
+    /// Advance the local sequence modulo u32, skipping the unordered zero sentinel.
     pub fn next_seq(&self, node: String) -> u32 {
         let mut g = self.seq_counters.lock().unwrap();
         let c = g.entry(node).or_insert(0u32);
@@ -301,12 +300,11 @@ impl RemoteActorRef {
             }
             let cid = self.inner.callbacks.next_cid();
             span.record("cid", cid);
-            let (tx, rx) = tokio::sync::oneshot::channel::<ReplyPayload>();
-            self.inner
+            let (rx, _pending) = self
+                .inner
                 .callbacks
-                .insert_on(cid, self.node_id.clone(), tx, &sender)
+                .register_on(cid, self.node_id.clone(), &sender)
                 .map_err(|e| e.to_actor_error())?;
-            let _pending = self.inner.callbacks.guard(cid);
             let sending = Phase::new(span.clone(), "completion.queue_admission");
             let mut frame = self
                 .inner
@@ -421,12 +419,10 @@ impl ActorRef for RemoteActorRef {
                         ))
                     })?;
                 let cid = self.inner.callbacks.next_cid();
-                let (tx, rx) = tokio::sync::oneshot::channel::<ReplyPayload>();
-                self.inner
+                let (rx, _pending) = self.inner
                     .callbacks
-                    .insert_on(cid, self.node_id.clone(), tx, &sender)
+                    .register_on(cid, self.node_id.clone(), &sender)
                     .map_err(|e| e.to_actor_error())?;
-                let _pending = self.inner.callbacks.guard(cid);
                 let reply_to = format!("parrot://{}/_remote/reply", self.inner.self_node);
                 let mut frame = self.inner.outgoing(Frame::ask(
                     cid,

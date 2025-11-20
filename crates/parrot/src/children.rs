@@ -1,11 +1,19 @@
 //! Bounded generation-owned children, independent of public metadata and watches.
+#[cfg(test)]
+mod decision_cancellation;
+#[cfg(test)]
+mod escalation_inputs;
+#[cfg(test)]
+mod notification_contracts;
 pub(crate) mod recovery;
+#[cfg(test)]
+mod registry_contracts;
 use crate::error_receipt::ActorReceipt;
 use futures::FutureExt;
 use parrot_api::{
     context::ReadOnlyChildrenVec,
     errors::ActorError,
-    supervisor::{DecisionFn, DefaultStrategy, SupervisionDecision, SupervisorStrategyType},
+    supervisor::{DefaultStrategy, SupervisionDecision, SupervisorStrategyType},
     types::{ActorResult, BoxedActorRef, BoxedFuture},
 };
 use std::{
@@ -22,17 +30,68 @@ use uuid::Uuid;
 const MAX_CHILDREN: usize = 1024;
 pub(crate) type Escalate = Arc<dyn Fn(Arc<ActorError>) + Send + Sync>;
 pub(crate) type StopChild = Arc<dyn Fn() -> BoxedFuture<'static, ActorResult<()>> + Send + Sync>;
-pub(crate) struct ChildTerminated(pub BoxedActorRef);
+struct ChildInput<T>(Option<T>);
+impl<T> ChildInput<T> {
+    fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+    fn value(&self) -> &T {
+        self.0.as_ref().expect("live child input")
+    }
+    fn take(&mut self) -> T {
+        self.0.take().expect("live child input")
+    }
+}
+impl<T> Drop for ChildInput<T> {
+    fn drop(&mut self) {
+        if let Err(error) = crate::owned_payload::PublicationInput::new(self.0.take()).retire() {
+            tracing::error!(
+                error = %crate::error_receipt::actor_summary(&error),
+                "child ownership input disposal failed"
+            );
+        }
+    }
+}
+struct RegisteredReference {
+    actor: ChildInput<BoxedActorRef>,
+    // A snapshot can be the last owner after replacement or notification.
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+pub(crate) struct ChildTerminated(Arc<RegisteredReference>);
+impl ChildTerminated {
+    pub(crate) fn into_actor(self) -> BoxedActorRef {
+        match Arc::try_unwrap(self.0) {
+            Ok(mut reference) => reference.actor.take(),
+            Err(reference) => reference.actor.value().clone_boxed(),
+        }
+    }
+}
 pub(crate) trait ChildRecipient: Send + Sync {
     fn deliver(&self, event: ChildTerminated) -> BoxedFuture<'_, ActorResult<()>>;
 }
 type RecoverChild = Arc<dyn Fn(Arc<recovery::Recovery>) + Send + Sync>;
 struct Child {
     lifetime: Arc<ChildLifetime>,
-    actor: BoxedActorRef,
+    actor: Arc<RegisteredReference>,
     stop: StopChild,
     // Keep capacity reserved through termination notification, too.
-    permit: OwnedSemaphorePermit,
+    permit: Arc<OwnedSemaphorePermit>,
+}
+struct RetiredChild {
+    _lifetime: Arc<ChildLifetime>,
+    event: ChildTerminated,
+    _stop: StopChild,
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+impl From<Child> for RetiredChild {
+    fn from(child: Child) -> Self {
+        Self {
+            _lifetime: child.lifetime,
+            event: ChildTerminated(child.actor),
+            _stop: child.stop,
+            _permit: child.permit,
+        }
+    }
 }
 pub(crate) struct ChildScope {
     closed: AtomicBool,
@@ -101,14 +160,19 @@ impl ChildScope {
         );
     }
     pub(crate) fn view(&self) -> ReadOnlyChildrenVec {
-        let snapshot = self
+        let snapshot: Vec<_> = self
             .children
             .lock()
             .unwrap()
             .values()
-            .map(|child| child.actor.clone_boxed())
+            .map(|child| child.actor.clone())
             .collect();
-        ReadOnlyChildrenVec::new(Arc::new(RwLock::new(snapshot)))
+        let mut protected: Vec<_> = snapshot
+            .iter()
+            .map(|reference| ChildInput::new(reference.actor.value().clone_boxed()))
+            .collect();
+        let references = protected.iter_mut().map(ChildInput::take).collect();
+        ReadOnlyChildrenVec::new(Arc::new(RwLock::new(references)))
     }
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
@@ -121,7 +185,7 @@ impl ChildScope {
                 // abort serializes with the last publication acknowledgement.
                 // A committed epoch belongs to the live generation and ignores
                 // this abort; an uncommitted one cannot activate after close.
-                group.abort("parent stop cancelled cohort recovery");
+                group.cancel("parent stop cancelled cohort recovery");
             }
         }
         self.changed.notify_waiters();
@@ -131,7 +195,7 @@ impl ChildScope {
     pub(crate) fn spawn(
         self: &Arc<Self>,
         spawn: impl FnOnce(Arc<ChildLifetime>) -> ActorResult<(BoxedActorRef, StopChild)>,
-    ) -> ActorResult<BoxedActorRef> {
+    ) -> ActorResult<()> {
         let permit = self.slots.clone().try_acquire_owned().map_err(|_| ActorError::InternalError("child capacity exhausted (1024 live children or pending termination notifications)".into()))?;
         let mut children = self.children.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
@@ -152,16 +216,33 @@ impl ChildScope {
                 std::panic::resume_unwind(panic);
             }
         };
+        // All stop aliases share one protected capture owner, including clones
+        // held by join/group operations after the notification has finished.
+        let stop = ChildInput::new(stop);
+        let notification = lifetime.clone();
+        let stop: StopChild = Arc::new(move || {
+            let stop = stop.value()();
+            let notification = notification.clone();
+            Box::pin(async move {
+                let result = stop.await;
+                result.and(notification.wait_for_notification().await)
+            })
+        });
+        let permit = Arc::new(permit);
+        let actor = Arc::new(RegisteredReference {
+            actor: ChildInput::new(actor),
+            _permit: permit.clone(),
+        });
         children.insert(
             lifetime.id,
             Child {
                 lifetime,
-                actor: actor.clone_boxed(),
+                actor,
                 stop,
                 permit,
             },
         );
-        Ok(actor)
+        Ok(())
     }
     pub(crate) async fn join(&self) -> ActorResult<()> {
         self.close();
@@ -185,8 +266,7 @@ impl ChildScope {
             .clone()
             .map_or(Ok(()), |error| Err(error.into_error()))
     }
-    async fn notify(&self, child: Child) {
-        let _permit = child.permit;
+    async fn notify(&self, child: RetiredChild) {
         let closed = self.changed.notified();
         tokio::pin!(closed);
         closed.as_mut().enable();
@@ -197,7 +277,7 @@ impl ChildScope {
             tokio::select! {
                 biased;
                 _ = closed => {},
-                result = tokio::time::timeout(self.timeout, recipient.deliver(ChildTerminated(child.actor))) => {
+                result = tokio::time::timeout(self.timeout, recipient.deliver(child.event)) => {
                     if !matches!(result, Ok(Ok(()))) { tracing::warn!("child termination notification could not be delivered before deadline"); }
                 }
             }
@@ -218,6 +298,8 @@ struct LiveDecision {
         futures::future::Shared<BoxedFuture<'static, Result<Option<PolicyChoice>, ActorReceipt>>>,
     deadline: tokio::time::Instant,
 }
+pub(crate) type RetirementReceipt = watch::Receiver<Option<Result<(), ActorReceipt>>>;
+
 /// Completed explicitly by the lifecycle owner after actual disposal. ActorRef
 /// retention, user stop deadlines, and obsolete generation Drop are not receipts.
 pub(crate) struct ChildLifetime {
@@ -227,10 +309,12 @@ pub(crate) struct ChildLifetime {
     recover: OnceLock<RecoverChild>,
     parent: Weak<ChildScope>,
     done: watch::Sender<Option<Result<(), ActorReceipt>>>,
+    notification: watch::Sender<Option<()>>,
     // A child remains a parent-owned member until its creation bridge has
     // returned and released its captures, even if the live actor stops first.
     publication: watch::Sender<Option<Result<(), ActorReceipt>>>,
     policy: crate::supervision_policy::PolicyStore,
+    decisions: crate::supervision_policy::DecisionTracker,
     admission: OnceLock<Arc<crate::thread::mailbox::admission::ManagedAdmission>>,
     restarts: Mutex<Vec<tokio::time::Instant>>,
     // Message and child-escalation decisions may overlap while a parent stage is paused.
@@ -256,10 +340,12 @@ impl ChildLifetime {
             recover: OnceLock::new(),
             parent,
             policy: crate::supervision_policy::PolicyStore::new(strategy, slots),
+            decisions: Default::default(),
             admission: OnceLock::new(),
             restarts: Mutex::new(Vec::new()),
             live_decision: [Mutex::new(None), Mutex::new(None)],
             done: watch::channel(None).0,
+            notification: watch::channel(None).0,
             publication: watch::channel(Some(Ok(()))).0,
         })
     }
@@ -283,7 +369,7 @@ impl ChildLifetime {
         self.stopping.store(true, Ordering::Release);
         let assigned = self.recovery.lock().unwrap().clone();
         if let Some(group) = assigned {
-            group.abort("explicit member stop cancelled cohort recovery");
+            group.cancel("explicit member stop cancelled cohort recovery");
             return group.is_committed();
         }
         false
@@ -293,20 +379,22 @@ impl ChildLifetime {
     }
     async fn evaluate_decision(
         &self,
-        error: Arc<ActorError>,
+        error: ActorReceipt,
         slots: Arc<Semaphore>,
     ) -> ActorResult<Option<PolicyChoice>> {
         let parent = self.parent.upgrade();
-        let strategy = self.policy.get().or_else(|| {
-            parent
-                .as_ref()
-                .map(|parent| parent.policy.get().unwrap_or_default())
-        });
+        let strategy = self.decisions.snapshot(slots.clone(), || {
+            self.policy.get().or_else(|| {
+                parent
+                    .as_ref()
+                    .map(|parent| parent.policy.get().unwrap_or_default())
+            })
+        })?;
         let Some(strategy) = strategy else {
             return Ok(None);
         };
-        let all = matches!(strategy, SupervisorStrategyType::OneForAll(_));
-        let budget = match &strategy {
+        let all = matches!(strategy.strategy(), SupervisorStrategyType::OneForAll(_));
+        let budget = match strategy.strategy() {
             SupervisorStrategyType::OneForOne(strategy) => {
                 Some((strategy.max_restarts, strategy.within))
             }
@@ -315,37 +403,31 @@ impl ChildLifetime {
             }
             SupervisorStrategyType::Default(_) => None,
         };
-        let permit = slots
-            .acquire_owned()
-            .await
-            .map_err(|_| ActorError::Stopped)?;
+        let permit = match slots.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                // A closed cleanup semaphore cannot admit another worker. Do
+                // the bounded synchronous fallback instead of submitting an
+                // unowned blocking job for every rejected decision.
+                strategy.reject()?;
+                return Err(ActorError::Stopped);
+            }
+        };
         let context = parrot_api::trace::TraceContext::current();
         let decision = tokio::task::spawn_blocking(move || {
             parrot_api::trace::in_scope(context, || {
                 let _permit = permit;
                 // No registry/topology/strategy lock is held while invoking user code.
-                match strategy {
-                    SupervisorStrategyType::Default(DefaultStrategy::StopOnFailure) => {
-                        SupervisionDecision::Stop
-                    }
-                    SupervisorStrategyType::Default(DefaultStrategy::RestartOnFailure) => {
-                        SupervisionDecision::Restart
-                    }
-                    SupervisorStrategyType::Default(DefaultStrategy::ResumeOnFailure) => {
-                        SupervisionDecision::Resume
-                    }
-                    SupervisorStrategyType::Default(DefaultStrategy::EscalateFailure) => {
-                        SupervisionDecision::Escalate
-                    }
-                    SupervisorStrategyType::OneForOne(strategy) => strategy.decider.decide(&error),
-                    SupervisorStrategyType::OneForAll(strategy) => strategy.decider.decide(&error),
-                }
+                crate::supervision_policy::decide(strategy, &error)
             })
         })
         .await
         .map_err(|error| {
-            ActorError::InternalError(format!("supervision decider failed: {error}"))
-        })?;
+            ActorError::InternalError(format!(
+                "supervision decider failed: {}",
+                crate::owned_payload::join_error(error)
+            ))
+        })??;
         Ok(Some(PolicyChoice {
             decision,
             all,
@@ -366,50 +448,50 @@ impl ChildLifetime {
     }
     /// Retain callback ownership across cancellation of a message future. Only
     /// a Resume consumes the receipt here; retirement consumes every other result.
-    pub(crate) async fn resume_message(
-        self: &Arc<Self>,
-        error: Arc<ActorError>,
+    pub(crate) fn resume_message<'a>(
+        self: &'a Arc<Self>,
+        error: impl Into<ActorReceipt>,
         deadline: tokio::time::Instant,
         fallback_resume: bool,
-        runtime: &tokio::runtime::Handle,
-    ) -> bool {
+        runtime: &'a tokio::runtime::Handle,
+    ) -> impl std::future::Future<Output = bool> + Send + 'a {
         self.resume_decision(
             &self.live_decision[0],
-            error,
+            error.into(),
             deadline,
             fallback_resume,
             runtime,
         )
-        .await
     }
     /// A paused parent message keeps its own receipt. A child failure must not
     /// reuse or consume that decision, even when both callbacks are pending.
-    pub(crate) async fn resume_escalation(
-        self: &Arc<Self>,
-        error: Arc<ActorError>,
+    pub(crate) fn resume_escalation<'a>(
+        self: &'a Arc<Self>,
+        error: impl Into<ActorReceipt>,
         deadline: tokio::time::Instant,
-        runtime: &tokio::runtime::Handle,
-    ) -> bool {
-        self.start_escalation(error, deadline, false, runtime).await
+        runtime: &'a tokio::runtime::Handle,
+    ) -> impl std::future::Future<Output = bool> + Send + 'a {
+        let error = error.into();
+        async move { self.start_escalation(error, deadline, false, runtime).await }
     }
     /// Publish the real callback receipt before returning from the child's
     /// escalation hook. Parent retirement joins that child, so policy disposal
     /// cannot overtake a merely queued decision owner.
     pub(crate) fn start_escalation(
         self: &Arc<Self>,
-        error: Arc<ActorError>,
+        error: impl Into<ActorReceipt>,
         deadline: tokio::time::Instant,
         fallback_resume: bool,
         runtime: &tokio::runtime::Handle,
     ) -> BoxedFuture<'static, bool> {
-        let receipt = self.start_decision(&self.live_decision[1], error, deadline, runtime);
+        let receipt = self.start_decision(&self.live_decision[1], error.into(), deadline, runtime);
         let owner = self.clone();
         Box::pin(async move { owner.await_decision(receipt, fallback_resume).await })
     }
     async fn resume_decision(
         self: &Arc<Self>,
         slot: &Mutex<Option<LiveDecision>>,
-        error: Arc<ActorError>,
+        error: ActorReceipt,
         deadline: tokio::time::Instant,
         fallback_resume: bool,
         runtime: &tokio::runtime::Handle,
@@ -420,7 +502,7 @@ impl ChildLifetime {
     fn start_decision(
         self: &Arc<Self>,
         slot: &Mutex<Option<LiveDecision>>,
-        error: Arc<ActorError>,
+        error: ActorReceipt,
         deadline: tokio::time::Instant,
         runtime: &tokio::runtime::Handle,
     ) -> LiveDecision {
@@ -478,9 +560,17 @@ impl ChildLifetime {
     }
     /// The lifecycle owner must retain this future through timeout: a blocked
     /// user decider still owns resources and must not be detached at retirement.
-    pub(crate) async fn failure_policy(
+    pub(crate) fn failure_policy(
         &self,
-        error: Arc<ActorError>,
+        error: impl Into<ActorReceipt>,
+        slots: Arc<Semaphore>,
+        deadline: tokio::time::Instant,
+    ) -> impl std::future::Future<Output = ActorResult<Option<FailurePolicy>>> + Send + '_ {
+        self.failure_policy_owned(error.into(), slots, deadline)
+    }
+    async fn failure_policy_owned(
+        &self,
+        error: ActorReceipt,
         slots: Arc<Semaphore>,
         deadline: tokio::time::Instant,
     ) -> ActorResult<Option<FailurePolicy>> {
@@ -676,12 +766,13 @@ impl ChildLifetime {
             failure_context,
         }))
     }
-    pub(crate) fn escalate(&self, error: Arc<ActorError>) -> bool {
+    pub(crate) fn escalate(&self, error: impl Into<ActorReceipt>) -> bool {
+        let error = error.into();
         if let Some(parent) = self.parent.upgrade()
             && !parent.closed.load(Ordering::Acquire)
             && let Some(escalate) = parent.escalator.get()
         {
-            escalate(error);
+            escalate(error.error().clone());
             true
         } else {
             false
@@ -741,12 +832,13 @@ impl ChildLifetime {
         // callbacks keep their leases, but no new callback can start.
         let admission = self.admission.get().map(|policy| policy.close());
         let decision = self.settle_live_decision().await;
+        let snapshots = self.decisions.close().await;
         let policy = self.policy.dispose().await;
         let admission = match admission {
             Some(admission) => admission.await.map_err(ActorError::Panic),
             None => Ok(()),
         };
-        admission.and(policy).and(decision)
+        admission.and(policy).and(decision).and(snapshots)
     }
     /// Called by the publication owner before config/mailbox/scheduler clones.
     /// All generations reuse the same logical actor's policy; only the final
@@ -777,13 +869,43 @@ impl ChildLifetime {
             receiver.changed().await.map_err(|_| ActorError::Stopped)?;
         }
     }
-    pub(crate) fn publish_reference(&self, actor: BoxedActorRef) {
-        if let Some(parent) = self.parent.upgrade() {
-            let mut children = parent.children.lock().unwrap();
-            if let Some(child) = children.get_mut(&self.id) {
-                child.actor = actor;
+    async fn wait_for_notification(&self) -> ActorResult<()> {
+        let mut receiver = self.notification.subscribe();
+        loop {
+            if receiver.borrow_and_update().is_some() {
+                return Ok(());
             }
+            receiver.changed().await.map_err(|_| ActorError::Stopped)?;
         }
+    }
+    pub(crate) fn retirement_receipt(&self) -> RetirementReceipt {
+        self.done.subscribe()
+    }
+    pub(crate) fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        match self.done.borrow().clone() {
+            Some(result) => parrot_api::address::RetirementStatus::Retired(
+                result.map_err(ActorReceipt::into_error),
+            ),
+            None => parrot_api::address::RetirementStatus::Pending,
+        }
+    }
+    pub(crate) fn publish_reference(&self, actor: BoxedActorRef) {
+        let mut actor = ChildInput::new(actor);
+        let displaced = if let Some(parent) = self.parent.upgrade() {
+            let mut children = parent.children.lock().unwrap();
+            children.get_mut(&self.id).map(|child| {
+                std::mem::replace(
+                    &mut child.actor,
+                    Arc::new(RegisteredReference {
+                        actor: ChildInput::new(actor.take()),
+                        _permit: child.permit.clone(),
+                    }),
+                )
+            })
+        } else {
+            None
+        };
+        drop(displaced);
     }
     pub(crate) fn hold_publication(&self) {
         self.publication.send_replace(None);
@@ -833,15 +955,19 @@ impl ChildLifetime {
             }
             child
         });
+        // Protect removed inputs before creating the lazy notification future.
+        let child = child.map(RetiredChild::from);
         if let Some(recovery) = self.recovery() {
             recovery.abort("member terminated during cohort recovery");
             recovery.retired_after_abort(self.id);
         }
         self.done.send_replace(Some(result));
+        let notification = self.notification.clone();
         Box::pin(async move {
             if let (Some(parent), Some(child)) = (parent, child) {
                 parent.notify(child).await;
             }
+            notification.send_replace(Some(()));
         })
     }
 }
@@ -943,7 +1069,6 @@ mod live_owner_tests {
             }
         }
     }
-
     #[tokio::test]
     async fn independent_retirement_before_scope_close_is_not_replayed() {
         let (scope, child) = scope_with_child();

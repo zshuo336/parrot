@@ -264,7 +264,10 @@ async fn rejected_roots_retire_call_owned_captures_without_executing_constructor
                     let error = poll_under(polling, work).await.unwrap_err();
                     match (erased, rejection, error) {
                         (false, "duplicate", Failure::Native(SpawnError::ActorPathAlreadyExists(path))) => assert_eq!(path, "/rejected"),
-                        (false, "invalid", Failure::Native(SpawnError::InvalidConfig(message))) => assert_eq!(message, "message_batch_size must be in 1..=256"),
+                        (false, "invalid", Failure::Native(SpawnError::InvalidConfig(message))) => {
+                            assert!(message.contains("actor.message_batch_size"), "{message}");
+                            assert!(message.contains("1..=256"), "{message}");
+                        },
                         (false, "shutdown", Failure::Native(SpawnError::SystemShutdown)) => {},
                         (true, "invalid", Failure::Runtime(parrot_api::system::SystemError::ActorCreationError(message))) => assert_eq!(message, "factory restart window must be positive"),
                         (true, "duplicate", Failure::Runtime(parrot_api::system::SystemError::ActorCreationError(message))) => assert_eq!(message, SpawnError::ActorPathAlreadyExists("/rejected".into()).to_string()),

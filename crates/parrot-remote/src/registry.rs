@@ -4,11 +4,16 @@
 //! cid 计数器随系统生命周期单调（重连不重置——RC7 断言防新旧连接撞车）。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::error::RemoteError;
 use crate::transport::{FrameSender, LATE_REPLY_DROPPED};
+
+#[cfg(test)]
+mod notification_contracts;
+#[cfg(test)]
+pub(crate) mod pending_contracts;
 
 /// REPLY 载荷语义（成功带 type_key；失败带结构化错误）。
 #[derive(Debug, Clone)]
@@ -19,6 +24,7 @@ pub enum ReplyPayload {
 
 pub struct CallbackRegistry {
     next_cid: AtomicU64,
+    closed: AtomicBool,
     /// Logical destination and actual connection are distinct for hub routes.
     slots: Mutex<HashMap<u64, CallbackSlot>>,
     capacity: usize,
@@ -28,6 +34,39 @@ struct CallbackSlot {
     tx: tokio::sync::oneshot::Sender<ReplyPayload>,
     node: String,
     connection: Option<FrameSender>,
+    identity: Arc<()>,
+}
+
+impl CallbackSlot {
+    fn notify(self, payload: Option<ReplyPayload>) {
+        let Self {
+            tx,
+            node,
+            connection,
+            identity,
+        } = self;
+        let cleanup = crate::ingress::unwind::Cleanup::default();
+        let _ = cleanup.call(|| match payload {
+            Some(payload) => {
+                let _ = tx.send(payload);
+            }
+            None => drop(tx),
+        });
+        cleanup.dispose((node, connection, identity));
+    }
+}
+
+impl Drop for CallbackRegistry {
+    fn drop(&mut self) {
+        let slots = std::mem::take(
+            self.slots
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for slot in slots.into_values() {
+            slot.notify(None);
+        }
+    }
 }
 
 /// Network replies rejected because they do not belong to the recorded connection.
@@ -37,11 +76,24 @@ pub static WRONG_REPLY_SOURCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct PendingCallback<'a> {
     registry: &'a CallbackRegistry,
     cid: u64,
+    identity: Arc<()>,
 }
 
 impl Drop for PendingCallback<'_> {
     fn drop(&mut self) {
-        self.registry.remove(self.cid);
+        let mut slots = self.registry.slots.lock().unwrap();
+        let removed = if slots
+            .get(&self.cid)
+            .is_some_and(|slot| Arc::ptr_eq(&slot.identity, &self.identity))
+        {
+            slots.remove(&self.cid)
+        } else {
+            None
+        };
+        drop(slots);
+        if let Some(slot) = removed {
+            slot.notify(None);
+        }
     }
 }
 
@@ -55,6 +107,7 @@ impl CallbackRegistry {
     pub fn new(capacity: usize) -> Self {
         Self {
             next_cid: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
             slots: Mutex::new(HashMap::new()),
             capacity,
         }
@@ -72,7 +125,7 @@ impl CallbackRegistry {
         node: impl Into<String>,
         tx: tokio::sync::oneshot::Sender<ReplyPayload>,
     ) -> Result<(), RemoteError> {
-        self.insert_slot(cid, node.into(), tx, None)
+        self.insert_slot(cid, node, tx, None).map(|_| ())
     }
 
     pub fn insert_on(
@@ -82,17 +135,26 @@ impl CallbackRegistry {
         tx: tokio::sync::oneshot::Sender<ReplyPayload>,
         connection: &FrameSender,
     ) -> Result<(), RemoteError> {
-        self.insert_slot(cid, node.into(), tx, Some(connection.clone()))
+        self.insert_slot(cid, node, tx, Some(connection.clone()))
+            .map(|_| ())
     }
 
     fn insert_slot(
         &self,
         cid: u64,
-        node: String,
+        node: impl Into<String>,
         tx: tokio::sync::oneshot::Sender<ReplyPayload>,
         connection: Option<FrameSender>,
-    ) -> Result<(), RemoteError> {
+    ) -> Result<Arc<()>, RemoteError> {
+        let cleanup = crate::ingress::unwind::Cleanup::default();
+        let mut tx = cleanup.owned(tx);
+        let node = node.into();
         let mut slots = self.slots.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(RemoteError::Transport(
+                "callback registry is shut down".into(),
+            ));
+        }
         if slots.contains_key(&cid) {
             return Err(RemoteError::Transport("duplicate correlation id".into()));
         }
@@ -104,32 +166,60 @@ impl CallbackRegistry {
         if connection.as_ref().is_some_and(FrameSender::is_closed) {
             return Err(RemoteError::Transport("connection already closed".into()));
         }
+        let identity = Arc::new(());
         slots.insert(
             cid,
             CallbackSlot {
-                tx,
+                tx: tx.take(),
                 node,
                 connection,
+                identity: identity.clone(),
             },
         );
-        Ok(())
+        Ok(identity)
     }
 
-    pub(crate) fn guard(&self, cid: u64) -> PendingCallback<'_> {
-        PendingCallback {
-            registry: self,
-            cid,
-        }
+    /// Capture ownership during insertion: a completed slot may already be
+    /// replaced before this method returns or the caller next polls its future.
+    pub(crate) fn register_on(
+        &self,
+        cid: u64,
+        node: impl Into<String>,
+        connection: &FrameSender,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<ReplyPayload>,
+            PendingCallback<'_>,
+        ),
+        RemoteError,
+    > {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let identity = self.insert_slot(cid, node, tx, Some(connection.clone()))?;
+        Ok((
+            rx,
+            PendingCallback {
+                registry: self,
+                cid,
+                identity,
+            },
+        ))
     }
 
     pub fn remove(&self, cid: u64) -> bool {
-        self.slots.lock().unwrap().remove(&cid).is_some()
+        let removed = self.slots.lock().unwrap().remove(&cid);
+        if let Some(slot) = removed {
+            slot.notify(None);
+            true
+        } else {
+            false
+        }
     }
 
     /// Trusted local completion. Network ingress must use complete_from.
     pub fn complete(&self, cid: u64, payload: ReplyPayload) -> bool {
-        if let Some(slot) = self.slots.lock().unwrap().remove(&cid) {
-            let _ = slot.tx.send(payload);
+        let removed = self.slots.lock().unwrap().remove(&cid);
+        if let Some(slot) = removed {
+            slot.notify(Some(payload));
             true
         } else {
             LATE_REPLY_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -153,7 +243,8 @@ impl CallbackRegistry {
             return false;
         }
         let slot = slots.remove(&cid).expect("slot checked under lock");
-        let _ = slot.tx.send(payload);
+        drop(slots);
+        slot.notify(Some(payload));
         true
     }
 
@@ -163,51 +254,52 @@ impl CallbackRegistry {
         code: crate::error::ErrCode,
         detail: &str,
     ) -> usize {
-        let mut slots = self.slots.lock().unwrap();
-        let before = slots.len();
-        let ids: Vec<_> = slots
-            .iter()
-            .filter(|(_, slot)| {
+        self.fail_selected(
+            |slot| {
                 slot.connection
                     .as_ref()
                     .is_some_and(|owner| owner.same_connection(connection))
-            })
-            .map(|(cid, _)| *cid)
-            .collect();
-        for cid in ids {
-            let slot = slots.remove(&cid).expect("slot checked under lock");
-            let _ = slot.tx.send(ReplyPayload::Err(code, detail.to_owned()));
-        }
-        before - slots.len()
+            },
+            code,
+            detail,
+        )
     }
 
-    /// 断连清空：所有挂起 ask 得 ConnectionLost（POC 实证路径——系统级关闭用）。
+    /// Permanently reject new callbacks without notifying existing receivers.
+    pub(crate) fn close_admission(&self) {
+        let _slots = self.slots.lock().unwrap();
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Fail the current cohort; ordinary disconnect cleanup permits new requests.
     pub fn fail_all(&self, code: crate::error::ErrCode, detail: &str) -> usize {
-        let mut n = 0;
-        let mut g = self.slots.lock().unwrap();
-        for (_, slot) in g.drain() {
-            let _ = slot.tx.send(ReplyPayload::Err(code, detail.to_string()));
-            n += 1;
-        }
-        n
+        self.fail_selected(|_| true, code, detail)
     }
 
     /// Explicit node-wide administrative failure. Not a connection-close hook.
     pub fn fail_node(&self, node: &str, code: crate::error::ErrCode, detail: &str) -> usize {
-        let mut n = 0;
-        let mut g = self.slots.lock().unwrap();
-        let cids: Vec<u64> = g
-            .iter()
-            .filter(|(_, slot)| slot.node == node)
-            .map(|(cid, _)| *cid)
+        self.fail_selected(|slot| slot.node == node, code, detail)
+    }
+
+    fn fail_selected(
+        &self,
+        matches: impl Fn(&CallbackSlot) -> bool,
+        code: crate::error::ErrCode,
+        detail: &str,
+    ) -> usize {
+        // Commit the whole selected cohort before any receiver can reenter.
+        let selected: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap()
+            .extract_if(|_, slot| matches(slot))
+            .map(|(_, slot)| slot)
             .collect();
-        for cid in cids {
-            if let Some(slot) = g.remove(&cid) {
-                let _ = slot.tx.send(ReplyPayload::Err(code, detail.to_string()));
-                n += 1;
-            }
+        let count = selected.len();
+        for slot in selected {
+            slot.notify(Some(ReplyPayload::Err(code, detail.to_owned())));
         }
-        n
+        count
     }
 
     pub fn len(&self) -> usize {

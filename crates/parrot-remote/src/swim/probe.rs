@@ -129,6 +129,19 @@ struct Slot {
     indirect: bool,
     tx: oneshot::Sender<ProbeOutcome>,
 }
+impl Slot {
+    fn notify(self, outcome: Option<ProbeOutcome>) {
+        let Self { source, tx, .. } = self;
+        let cleanup = crate::ingress::unwind::Cleanup::default();
+        let _ = cleanup.call(|| match outcome {
+            Some(outcome) => {
+                let _ = tx.send(outcome);
+            }
+            None => drop(tx),
+        });
+        cleanup.dispose(source);
+    }
+}
 struct Inner {
     next: u64,
     closed: bool,
@@ -157,7 +170,10 @@ struct RequestGuard {
 }
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.state.inner.lock().unwrap().pending.remove(&self.id);
+        let removed = self.state.inner.lock().unwrap().pending.remove(&self.id);
+        if let Some(slot) = removed {
+            slot.notify(None);
+        }
     }
 }
 impl ProbeState {
@@ -205,16 +221,45 @@ impl ProbeState {
             .pending
             .remove(&reply.request_id)
             .expect("validated slot");
-        let _ = slot.tx.send(reply.outcome);
+        drop(inner);
+        slot.notify(Some(reply.outcome));
         true
     }
+    pub(crate) fn close_admission(&self) {
+        self.inner.lock().unwrap().closed = true;
+    }
+    pub(crate) fn helper(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return None;
+        }
+        self.helpers.clone().try_acquire_owned().ok()
+    }
     pub(crate) fn close(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.closed = true;
-        inner.pending.clear();
-        self.helpers.close();
+        let pending = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.closed = true;
+            std::mem::take(&mut inner.pending)
+        };
+        let _ = crate::ingress::unwind::Cleanup::default().call(|| self.helpers.close());
+        for slot in pending.into_values() {
+            slot.notify(None);
+        }
     }
     pub(crate) async fn exchange(
+        self: Arc<Self>,
+        source: FrameSender,
+        target: String,
+        indirect: bool,
+        budget: Duration,
+        shutdown: watch::Receiver<bool>,
+    ) -> ProbeOutcome {
+        crate::transport::notify_safely(
+            self.exchange_inner(source, target, indirect, budget, shutdown),
+        )
+        .await
+    }
+    async fn exchange_inner(
         self: Arc<Self>,
         source: FrameSender,
         target: String,
@@ -258,6 +303,9 @@ impl ProbeState {
         }
     }
 }
+
+#[cfg(test)]
+mod notification_contracts;
 
 #[cfg(test)]
 mod tests {

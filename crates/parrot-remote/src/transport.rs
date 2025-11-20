@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod lifecycle;
-pub(crate) use lifecycle::ConnectionTasks;
+#[cfg(test)]
+mod notification_contracts;
+pub(crate) use lifecycle::notify_safely;
+pub(crate) use lifecycle::{AdmittedIo, ConnectionAdmission, ConnectionTasks};
 pub mod memory;
 pub mod quic;
 pub mod tcp;
@@ -36,7 +39,7 @@ pub struct FrameSender {
     pub(crate) tx: mpsc::Sender<Frame>,
     /// 归属对端 node_id（hub 转发 fail_target 定位用——run_connection 注入；
     /// 构造后不变）。
-    peer_node: Arc<std::sync::OnceLock<String>>,
+    peer_node: Arc<PeerState>,
     cancelled: tokio_util::sync::CancellationToken,
     authentication: crate::security::PeerAuthentication,
     peer_capabilities: u32,
@@ -45,11 +48,33 @@ pub struct FrameSender {
     max_frame_len: u32,
 }
 
+#[derive(Default)]
+struct PeerState {
+    node: std::sync::OnceLock<String>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Retain a physical identity without retaining IO, cancellation or notifying senders.
+pub(crate) struct ConnectionIdentity(Arc<PeerState>);
+impl ConnectionIdentity {
+    pub(crate) fn key(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
 impl FrameSender {
+    #[cfg(test)]
+    pub(crate) fn segmented_test_sender(tx: mpsc::Sender<Frame>, max_frame_len: u32) -> Self {
+        let mut sender = Self::new(tx, "segmented-test-peer");
+        sender.negotiated_capabilities = crate::handshake::caps::RECEPTIONIST_SEGMENTS;
+        sender.max_frame_len = max_frame_len;
+        sender
+    }
+
     /// 构造（peer_node 已知——转发失效定位用）。
     pub fn new(tx: mpsc::Sender<Frame>, peer_node: impl Into<String>) -> Self {
-        let cell = Arc::new(std::sync::OnceLock::new());
-        let _ = cell.set(peer_node.into());
+        let cell = Arc::new(PeerState::default());
+        let _ = cell.node.set(peer_node.into());
         Self {
             tx,
             peer_node: cell,
@@ -65,7 +90,7 @@ impl FrameSender {
     pub fn anon(tx: mpsc::Sender<Frame>) -> Self {
         Self {
             tx,
-            peer_node: Arc::new(std::sync::OnceLock::new()),
+            peer_node: Arc::new(PeerState::default()),
             cancelled: tokio_util::sync::CancellationToken::new(),
             authentication: crate::security::PeerAuthentication::Unauthenticated,
             peer_capabilities: 0,
@@ -85,13 +110,17 @@ impl FrameSender {
         Arc::as_ptr(&self.peer_node) as usize
     }
 
+    pub(crate) fn retain_identity(&self) -> ConnectionIdentity {
+        ConnectionIdentity(self.peer_node.clone())
+    }
+
     /// Authentication established by the owning transport, never by HELLO fields.
     pub fn authentication(&self) -> crate::security::PeerAuthentication {
         self.authentication
     }
 
     pub fn node_id(&self) -> &str {
-        self.peer_node.get().map(String::as_str).unwrap_or("?")
+        self.peer_node.node.get().map(String::as_str).unwrap_or("?")
     }
 
     /// Capabilities advertised by this exact connection's peer during HELLO.
@@ -99,6 +128,14 @@ impl FrameSender {
     /// capability is not authentication or proof of downstream business behavior.
     pub fn peer_capabilities(&self) -> u32 {
         self.peer_capabilities
+    }
+
+    pub(crate) fn max_frame_len(&self) -> u32 {
+        self.max_frame_len
+    }
+
+    pub(crate) fn supports_receptionist_segments(&self) -> bool {
+        self.negotiated_capabilities & crate::handshake::caps::RECEPTIONIST_SEGMENTS != 0
     }
 
     pub(crate) fn supports_mirror_shadow(&self) -> bool {
@@ -112,10 +149,33 @@ impl FrameSender {
         self.negotiated_capabilities & crate::handshake::caps::TRACE_CONTEXT != 0
     }
 
+    /// Both ends of this physical link advertised the bounded BATCH envelope.
+    /// Manual senders have no negotiated extensions. This says nothing about
+    /// another relay hop or atomic execution of the members.
+    pub fn supports_batch_frames(&self) -> bool {
+        self.negotiated_capabilities & crate::handshake::caps::BATCH_FRAMES != 0
+    }
+
+    /// Admin parents are separately negotiated so business-only peers keep
+    /// receiving their original SYSTEM_EVENT payload and flags.
+    pub fn supports_admin_trace_context(&self) -> bool {
+        let required =
+            crate::handshake::caps::TRACE_CONTEXT | crate::handshake::caps::ADMIN_TRACE_CONTEXT;
+        self.negotiated_capabilities & required == required
+    }
+
+    pub(crate) fn supports_trace_for(&self, frame: &Frame) -> bool {
+        if frame.header.frame_type == frame_type::SYSTEM_EVENT {
+            self.supports_admin_trace_context()
+        } else {
+            self.supports_trace_context()
+        }
+    }
+
     /// Encode only on a mutually capable link. An older hop gets the original
     /// business frame and no invented causal relationship beyond that boundary.
     pub(crate) fn trace_request(&self, frame: Frame) -> Result<Frame, RemoteError> {
-        if self.supports_trace_context() {
+        if self.supports_trace_for(&frame) {
             if let Some(context) = parrot_api::trace::TraceContext::current() {
                 return Ok(frame.with_trace_parent(context.as_parent())?);
             }
@@ -123,9 +183,10 @@ impl FrameSender {
         Ok(frame)
     }
 
-    fn check_trace_context(&self, frame: &Frame) -> Result<(), RemoteError> {
-        if (frame.header.flags & crate::frame::flags::TRACE_CONTEXT != 0
-            && !self.supports_trace_context())
+    fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+        if (frame.header.flags & crate::frame::flags::BATCH != 0 && !self.supports_batch_frames())
+            || (frame.header.flags & crate::frame::flags::TRACE_CONTEXT != 0
+                && !self.supports_trace_for(frame))
             || (frame.header.flags & crate::frame::flags::MIRROR_SHADOW != 0
                 && !self.supports_mirror_shadow())
         {
@@ -138,13 +199,16 @@ impl FrameSender {
     }
 
     pub async fn send(&self, f: Frame) -> Result<(), RemoteError> {
-        self.check_trace_context(&f)?;
+        self.check_negotiated_features(&f)?;
         f.validate_size(self.max_frame_len)?;
-        tokio::select! {
-            biased;
-            _ = self.closed() => Err(RemoteError::Transport("writer closed".into())),
-            result = self.tx.send(f) => result.map_err(|_| RemoteError::Transport("writer dropped".into())),
-        }
+        lifecycle::notify_safely(async {
+            tokio::select! {
+                biased;
+                _ = self.closed_inner() => Err(RemoteError::Transport("writer closed".into())),
+                result = self.tx.send(f) => result.map_err(|_| RemoteError::Transport("writer dropped".into())),
+            }
+        })
+        .await
     }
     /// Check size before reserving capacity. Callers may change fixed-width
     /// sequence/correlation fields after admission, but must not grow the body.
@@ -152,25 +216,46 @@ impl FrameSender {
         &self,
         frame: &Frame,
     ) -> Result<mpsc::Permit<'_, Frame>, RemoteError> {
-        self.check_trace_context(frame)?;
+        self.check_negotiated_features(frame)?;
         frame.validate_size(self.max_frame_len)?;
-        tokio::select! {
-            biased;
-            _ = self.closed() => Err(RemoteError::Transport("writer closed".into())),
-            result = self.tx.reserve() => result.map_err(|_| RemoteError::Transport("writer dropped".into())),
-        }
+        lifecycle::notify_safely(async {
+            tokio::select! {
+                biased;
+                _ = self.closed_inner() => Err(RemoteError::Transport("writer closed".into())),
+                result = self.tx.reserve() => result.map_err(|_| RemoteError::Transport("writer dropped".into())),
+            }
+        })
+        .await
     }
 
     pub fn is_closed(&self) -> bool {
-        self.cancelled.is_cancelled() || self.tx.is_closed()
+        self.peer_node
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.cancelled.is_cancelled()
+            || self.tx.is_closed()
+    }
+
+    pub(crate) fn close_admission(&self) {
+        self.peer_node
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Close only this connection, including any writer currently blocked on IO.
     pub fn close(&self) {
-        self.cancelled.cancel();
+        self.close_admission();
+        let _ = crate::ingress::unwind::Cleanup::default().call(|| self.cancelled.cancel());
     }
 
     pub async fn closed(&self) {
+        lifecycle::notify_safely(self.closed_inner()).await;
+    }
+
+    async fn closed_inner(&self) {
+        if self.is_closed() {
+            return;
+        }
         tokio::select! {
             _ = self.cancelled.cancelled() => {},
             _ = self.tx.closed() => {},
@@ -191,7 +276,7 @@ impl FrameSender {
 
     /// 同步转发（TELL 中转——队列满返回 Err，调用方记死信）。
     pub fn send_frame_sync(&self, f: Frame) -> Result<(), RemoteError> {
-        self.check_trace_context(&f)?;
+        self.check_negotiated_features(&f)?;
         f.validate_size(self.max_frame_len)?;
         if self.is_closed() {
             return Err(RemoteError::Transport("writer closed".into()));
@@ -208,7 +293,7 @@ impl FrameSender {
     }
 }
 
-/// 传输载体抽象。P1：tcp/mem；P2：quic（07 §8.1 scheme() 统一命名）。
+/// Built-in transports are memory, TCP and QUIC; no WebSocket carrier is supplied.
 /// A transport owns its connection drivers. Built-in transports synchronously
 /// close admission and request cancellation on Drop without awaiting task exit.
 /// Keep the runtime alive for cleanup, or use shutdown() as a completion barrier.
@@ -227,6 +312,11 @@ pub trait Transport: Send + Sync + 'static {
     fn local_addr(&self) -> Option<SocketAddr> {
         None
     }
+}
+
+/// Built-in system ownership can fence admission before any close notification.
+pub(crate) trait OwnedTransport: Transport {
+    fn close_admission(&self);
 }
 
 /// 一条已建立的连接（握手完成后产出）。
@@ -373,16 +463,20 @@ pub struct ConnParams {
     pub inbound: mpsc::Sender<(Frame, FrameSender, String)>,
     pub on_disconnect: OnDisconnect,
     pub shutdown: tokio::sync::watch::Receiver<bool>,
-    /// 运行时旋钮（配置切面——None=编译期默认常量，零迁移成本）。
+    /// Runtime settings; None selects the current bounded defaults.
     pub knobs: Option<RuntimeKnobs>,
 }
 
 /// 连接层运行时旋钮（原写死常量参数化——配置切面 `[remote.transport]`）。
 ///
 /// 心跳/出站队列沿用原默认值（2s / 5 次 / 1024 帧）；入站 ASK
-/// 新增系统级并发与编码长度预算，超限明确拒绝，见 SEMANTIC_CHANGES。
+/// 系统级连接/握手、入站并发与编码长度预算超限时明确拒绝，见 SEMANTIC_CHANGES。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeKnobs {
+    /// Physical connections, including handshakes, retained by this system.
+    pub connection_capacity: usize,
+    /// Concurrent connection attempts after accept or before outbound allocation.
+    pub handshake_capacity: usize,
     /// Enable proactive heartbeat and loss detection; incoming heartbeats are
     /// acknowledged even when disabled. RemoteConfig may also disable this.
     pub heartbeat_enabled: bool,
@@ -413,6 +507,8 @@ pub struct RuntimeKnobs {
 impl Default for RuntimeKnobs {
     fn default() -> Self {
         Self {
+            connection_capacity: parrot_config::Defaults::connection_capacity(),
+            handshake_capacity: parrot_config::Defaults::handshake_capacity(),
             heartbeat_enabled: true,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             heartbeat_max_loss: HEARTBEAT_MAX_LOSS,
@@ -492,9 +588,9 @@ where
         .filter(|budget| !budget.is_zero())
         .filter(|budget| tokio::time::Instant::now().checked_add(*budget).is_some())
         .ok_or_else(|| RemoteError::Transport("invalid heartbeat deadline".into()))?;
-    if knobs.outbound_queue == 0 {
+    if knobs.outbound_queue == 0 || knobs.outbound_queue > tokio::sync::Semaphore::MAX_PERMITS {
         return Err(RemoteError::Transport(
-            "outbound queue capacity must be positive".into(),
+            "outbound queue capacity exceeds channel bounds".into(),
         ));
     }
     let metrics = owner.map(|o| o.metrics.clone()).unwrap_or_default();
@@ -710,7 +806,7 @@ where
                         return;
                     }
                     let violation = if frame.validate_payload_flags().is_err()
-                        || back_sender.check_trace_context(&frame).is_err()
+                        || back_sender.check_negotiated_features(&frame).is_err()
                     {
                         Some("unsupported payload flags")
                     } else {
@@ -867,8 +963,9 @@ where
             _ = drive => {},
         };
         cancelled.cancel();
-        dis(&disconnected_sender);
-        let _ = closed_tx.send(());
+        let cleanup = crate::ingress::unwind::Cleanup::default();
+        let _ = cleanup.call(|| dis(&disconnected_sender));
+        let _ = cleanup.call(|| closed_tx.send(()));
     };
     if let Some(owner) = owner {
         owner.spawn(driver)?;

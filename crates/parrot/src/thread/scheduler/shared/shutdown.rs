@@ -1,11 +1,70 @@
 //! Bounded, stable shutdown diagnostics. No arbitrary panic payload is formatted,
 //! and payload destruction cannot interrupt another owned resource's retirement.
 use std::any::Any;
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Mutex;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use tokio::task::JoinError;
 
 pub(super) type Receipt = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
+
+// Keep the original close operation alive past the worker grace deadline. Both
+// its polling and its final disposal may invoke a custom mailbox's user code.
+pub(super) struct MailboxClose {
+    operation: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    mailbox: Option<Arc<dyn crate::thread::mailbox::Mailbox>>,
+    failures: Arc<Failures>,
+    phase: &'static str,
+}
+impl MailboxClose {
+    pub(super) fn new(
+        mailbox: Arc<dyn crate::thread::mailbox::Mailbox>,
+        failures: Arc<Failures>,
+        phase: &'static str,
+    ) -> Self {
+        let closing = mailbox.clone();
+        Self {
+            operation: Some(Box::pin(async move { closing.close().await })),
+            mailbox: Some(mailbox),
+            failures,
+            phase,
+        }
+    }
+    fn dispose(&mut self) {
+        let operation = self.operation.take();
+        self.failures
+            .isolate("mailbox close future destructor", || drop(operation));
+        let mailbox = self.mailbox.take();
+        self.failures
+            .isolate("mailbox destructor", || drop(mailbox));
+    }
+}
+impl Future for MailboxClose {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            this.operation.as_mut().unwrap().as_mut().poll(cx)
+        }));
+        match result {
+            Ok(Poll::Pending) => Poll::Pending,
+            result => {
+                if let Err(payload) = result {
+                    this.failures.record_panic(this.phase, payload);
+                }
+                this.dispose();
+                Poll::Ready(())
+            }
+        }
+    }
+}
+impl Drop for MailboxClose {
+    fn drop(&mut self) {
+        self.dispose();
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Failures(Mutex<Summary>);
@@ -72,6 +131,10 @@ impl Failures {
         }
     }
 
+    pub(super) fn record_panic(&self, phase: &str, payload: Box<dyn Any + Send>) {
+        self.record(format!("{phase} panicked: {}", panic_message(payload)));
+    }
+
     pub(super) fn result(&self) -> Result<(), String> {
         let summary = self.0.lock().unwrap();
         if summary.count == 0 {
@@ -82,6 +145,63 @@ impl Failures {
                 summary.count,
                 summary.messages.join("; ")
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CloseProbe {
+        ready: bool,
+        panic_poll: bool,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Future for CloseProbe {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            assert!(!self.panic_poll, "custom close poll failure");
+            if self.ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for CloseProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("custom close future destructor failure");
+        }
+    }
+    #[test]
+    fn close_future_poll_completion_and_cancellation_disposal_are_isolated() {
+        for (ready, panic_poll) in [(false, false), (true, false), (false, true)] {
+            let failures = Arc::new(Failures::default());
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut close = Box::pin(MailboxClose {
+                operation: Some(Box::pin(CloseProbe {
+                    ready,
+                    panic_poll,
+                    drops: drops.clone(),
+                })),
+                mailbox: None,
+                failures: failures.clone(),
+                phase: "custom close",
+            });
+            let waker = futures::task::noop_waker();
+            let polled = close.as_mut().poll(&mut Context::from_waker(&waker));
+            assert_eq!(polled.is_ready(), ready || panic_poll);
+            drop(close);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let message = failures.result().unwrap_err();
+            assert!(
+                message.contains("custom close future destructor failure"),
+                "{message}"
+            );
+            assert_eq!(message.contains("custom close poll failure"), panic_poll);
         }
     }
 }

@@ -414,6 +414,22 @@ async fn real_jvm_components_preserve_config_version_instances_and_stop_isolatio
     };
     let first = jvm_component("alpha", 2);
     let second = jvm_component("beta", 1);
+    let mut oversized = first.clone();
+    let mut value = toml::Value::Integer(1);
+    for _ in 0..64 {
+        value = toml::Value::Array(vec![value]);
+    }
+    oversized.config = Some(toml::Table::from_iter([("value".into(), value)]));
+    assert!(matches!(gateway.start_gateway(&oversized,
+        &["/user/alpha-0".into(), "/user/alpha-1".into()], "2.3.4").await,
+        Err(DeployError::Config(error)) if error.contains("config depth budget exceeded")));
+    assert!(matches!(gateway.start_gateway(&first,
+        &["/user/alpha-1".into(), "/user/alpha-0".into()], "2.3.4").await,
+        Err(DeployError::Config(error)) if error.contains("instance paths")));
+    assert_eq!(gateway.procs().child_count(), 0);
+    assert_eq!(gateway.procs().budget().in_use(), 0);
+    assert!(gateway.component_node("alpha").is_none());
+    assert!(lookup.lookup("/user/alpha-0").await.is_none());
     let a = gateway
         .start_gateway(
             &first,

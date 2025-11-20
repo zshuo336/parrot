@@ -1,17 +1,21 @@
-//! D2 · Cluster Singleton（DEV_04 §3 / 06 P4.2）。
+//! Local singleton lease bookkeeping for a host-provided authority protocol.
 //!
-//! 租约制：候选节点向多数派（Alive 集合严格多数 >n/2）周期续约
-//! （lease 10s / renew 3s）；持有者 Dead → 租约到期 → 候选序号最高者接管
-//! （接管等待 = lease 全额过期，防双主）。
+//! This module performs no network voting, persistence or resource fencing.
+//! SWIM reachability and a caller-supplied boolean alone cannot prove exclusive
+//! ownership: two independent candidates can both receive `true`. Production
+//! hosts need an authenticated authority protocol, durable epochs and fencing
+//! at the resource before using this state to control singleton work.
 //!
-//! 用途：云 proxy 分配器、全局定时器、ACL 管理者。
-//!
-//! 注：P4 实现为"单节点本地租约状态机 + 多数派确认回调"形态——网络
-//! 确认经 SWIM Alive 视图（非多数派侧续约失败自动降级，无需额外心跳）。
+//! Hosts drive `tick` with fresh confirmations and inspect state after every
+//! observation. A lost local lease emits one `SteppedDown` on the next tick,
+//! including losses discovered by `observe`. Retirement prevents this instance
+//! from reacquiring the same epoch. Reconstructing this object resets its floor;
+//! it is not a substitute for persistent fencing across processes or restarts.
 
 use std::time::{Duration, Instant};
 
-/// 租约参数（06 P4.2：lease 10s / renew 3s / 接管 ≤13s 门禁）。
+/// Host lease duration and suggested tick cadence. These are not a measured
+/// cluster takeover bound. Zero or unrepresentable leases do not grant authority.
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseParams {
     pub lease: Duration,
@@ -27,11 +31,30 @@ impl Default for LeaseParams {
     }
 }
 
-/// 候选者身份：node_id + 序号（节点单调递增——重启 +1）。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Host-provided identity and epoch priority. Ordering compares sequence first,
+/// then node name. Node-local restart counters do not establish a global epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub node: String,
     pub seq: u64,
+}
+
+impl Candidate {
+    fn valid(&self) -> bool {
+        self.seq != 0 && !self.node.is_empty() && !self.node.chars().any(char::is_control)
+    }
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.seq, &self.node).cmp(&(other.seq, &other.node))
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// 租约状态机（本节点视角）。
@@ -39,22 +62,25 @@ pub struct Candidate {
 pub enum SingletonState {
     /// 无主（初始/租约失效后）。
     Vacant,
-    /// 本节点持有有效租约。
+    /// Last processed local ownership; also check the deadline at current time.
     Leader,
     /// 他节点持有（已知 Leader）。
     Follower,
 }
 
-/// 单例租约协调（确定性状态机——时间由调用方注入便于测试）。
+/// Deterministic local state. `state()` is the last processed state; callers
+/// must drive ticks and check `current_holder(now)` before relying on a lease.
 pub struct SingletonLease {
     params: LeaseParams,
     me: Candidate,
     /// 当前已知持有者 + 租约到期时刻。
     holder: Option<(Candidate, Instant)>,
-    /// 最后已知持有者序号（过期不清除——低序号候选不得竞选，
-    /// 防与"仍在续约的真持有者"竞争形成双主）。
+    /// Highest admitted epoch, including local acquisition. Retirement does
+    /// not make a delayed observation or local confirmation a new epoch.
     floor_seq: u64,
     state: SingletonState,
+    pending_loss: bool,
+    last_now: Option<Instant>,
 }
 
 impl SingletonLease {
@@ -65,6 +91,8 @@ impl SingletonLease {
             holder: None,
             floor_seq: 0,
             state: SingletonState::Vacant,
+            pending_loss: false,
+            last_now: None,
         }
     }
 
@@ -85,70 +113,101 @@ impl SingletonLease {
         self.state
     }
 
-    /// 续约/竞选推进（renew 周期调用）。
-    ///
-    /// `alive_confirmed`：SWIM 视角本候选可达多数派的确认（严格 >n/2——
-    /// 现签名是回调形态：调用方传入 `quorum_ok`）。
+    fn deadline(&self, now: Instant) -> Option<Instant> {
+        now.checked_add(self.params.lease).filter(|end| *end > now)
+    }
+
+    fn expire(&mut self, now: Instant) {
+        if self.holder.as_ref().is_some_and(|(_, end)| now >= *end) {
+            let (holder, _) = self.holder.take().expect("expired holder");
+            self.floor_seq = self.floor_seq.max(holder.seq);
+            self.pending_loss |= self.state == SingletonState::Leader;
+            self.state = SingletonState::Vacant;
+        }
+    }
+
+    fn advance(&mut self, now: Instant) -> bool {
+        if self.last_now.is_some_and(|last| now < last) {
+            return false;
+        }
+        self.last_now = Some(now);
+        self.expire(now);
+        true
+    }
+
+    /// Advance with a fresh host authority confirmation. Reachability alone
+    /// is insufficient. Expiry is reported before any further acquisition;
+    /// losing authority permanently retires this instance's local epoch.
     pub fn tick(&mut self, now: Instant, quorum_ok: bool) -> Option<SingletonTransition> {
-        // 1. 租约过期检测（floor 保留——过期后低序号候选仍不可竞选）
-        if let Some((c, expiry)) = &self.holder {
-            if now >= *expiry {
-                self.floor_seq = self.floor_seq.max(c.seq);
-                self.holder = None;
-                self.state = SingletonState::Vacant;
-            }
+        if !self.advance(now) {
+            return None;
+        }
+        if std::mem::take(&mut self.pending_loss) {
+            return Some(SingletonTransition::SteppedDown(self.me.clone()));
         }
 
         match self.state {
             SingletonState::Leader => {
                 if quorum_ok {
-                    // 续约：租约延长
-                    if let Some((_, expiry)) = self.holder.as_mut() {
-                        *expiry = now + self.params.lease;
+                    if let Some(deadline) = self.deadline(now) {
+                        if let Some((_, expiry)) = self.holder.as_mut() {
+                            *expiry = (*expiry).max(deadline);
+                            return None;
+                        }
                     }
-                    None
-                } else {
-                    // 多数派失联——自动降级（防双主的核心）
-                    self.holder = None;
-                    self.state = SingletonState::Vacant;
-                    Some(SingletonTransition::SteppedDown(self.me.clone()))
                 }
+                self.holder = None;
+                self.state = SingletonState::Vacant;
+                Some(SingletonTransition::SteppedDown(self.me.clone()))
             }
             SingletonState::Vacant | SingletonState::Follower => {
-                // 竞选：租约有效期内绝不夺权（等过期）；过期后需
-                // me.seq > floor（最后持有者序号）——重启低序号节点
-                // 不得与"可能仍在续约的真持有者"竞争。
-                let can_take = self.holder.is_none() && self.me.seq > self.floor_seq;
+                let can_take =
+                    self.holder.is_none() && self.me.valid() && self.me.seq > self.floor_seq;
                 if quorum_ok && can_take {
-                    self.holder = Some((self.me.clone(), now + self.params.lease));
-                    self.state = SingletonState::Leader;
-                    Some(SingletonTransition::Acquired(self.me.clone()))
-                } else {
-                    None
+                    if let Some(deadline) = self.deadline(now) {
+                        self.floor_seq = self.me.seq;
+                        self.holder = Some((self.me.clone(), deadline));
+                        self.state = SingletonState::Leader;
+                        return Some(SingletonTransition::Acquired(self.me.clone()));
+                    }
                 }
+                None
             }
         }
     }
 
-    /// 观察（SWIM gossip 广播途径）。
+    /// Apply a fresh authenticated lease confirmation supplied by the host.
+    /// Raw gossip/replayed identities are not confirmations. A matching live
+    /// remote holder may renew, but an expired epoch cannot be resurrected.
+    /// Self-observation never grants authority. Inspect state after this call;
+    /// a local loss is also retained for the next tick's notification.
     pub fn observe(&mut self, now: Instant, holder: &Candidate) {
-        let expiry = now + self.params.lease;
-        match &self.holder {
-            Some((cur, _)) if cur.seq >= holder.seq => {} // 旧观察，忽略
-            _ => {
-                self.floor_seq = self.floor_seq.max(holder.seq);
-                self.holder = Some((holder.clone(), expiry));
-                self.state = if *holder == self.me {
-                    SingletonState::Leader
-                } else {
-                    SingletonState::Follower
-                };
+        if !self.advance(now) {
+            return;
+        }
+        if !holder.valid() || *holder == self.me {
+            return;
+        }
+        let Some(deadline) = self.deadline(now) else {
+            return;
+        };
+        if let Some((current, expiry)) = self.holder.as_mut() {
+            if current == holder {
+                *expiry = (*expiry).max(deadline);
+                return;
             }
         }
+        if holder.seq <= self.floor_seq {
+            return;
+        }
+        self.pending_loss |= self.state == SingletonState::Leader;
+        self.floor_seq = holder.seq;
+        self.holder = Some((holder.clone(), deadline));
+        self.state = SingletonState::Follower;
     }
 
-    /// 接管等待预算（防双主：候选须等 lease 全额过期才可竞选——
-    /// 06 P4.2 门禁 ≤13s = lease 10s + 确认 3s）。
+    /// Configured observation lifetime. Renewals, host scheduling and authority
+    /// protocol availability can delay takeover beyond this duration.
     pub fn takeover_wait(&self) -> Duration {
         self.params.lease
     }
@@ -157,9 +216,9 @@ impl SingletonLease {
 /// 状态迁移事件。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SingletonTransition {
-    /// 竞选成功（本节点成为 singleton）。
+    /// Local acquisition after the supplied host confirmation.
     Acquired(Candidate),
-    /// 多数派失联降级。
+    /// Local authority lost through expiry, preemption or failed confirmation.
     SteppedDown(Candidate),
 }
 
@@ -174,7 +233,7 @@ mod tests {
         }
     }
 
-    // 竞选 + 续约：多数派 OK → Acquired → 周期续约保持 Leader
+    // Inject host confirmations; this does not obtain real network votes.
     #[test]
     fn acquire_and_renew() {
         let mut l = SingletonLease::new(cand("a", 1), LeaseParams::default());
@@ -190,7 +249,7 @@ mod tests {
         assert!(l.current_holder(t0 + Duration::from_secs(12)).is_some());
     }
 
-    // 多数派失联 → 降级（防双主核心）
+    // A denied host confirmation withdraws local ownership.
     #[test]
     fn step_down_on_quorum_loss() {
         let mut l = SingletonLease::new(cand("a", 1), LeaseParams::default());
@@ -203,23 +262,22 @@ mod tests {
         assert_eq!(l.state(), SingletonState::Vacant);
     }
 
-    // 接管时序：kill 持有者 → 候选等 lease 过期 → 高序号者接管（≤13s）
+    // Check the exact injected expiry boundary without a process/network failure.
     #[test]
-    fn takeover_within_budget() {
+    fn takeover_at_injected_expiry() {
         let mut l = SingletonLease::new(cand("b", 5), LeaseParams::default());
         let t0 = Instant::now();
         // 观察：a(seq=3) 是持有者（t0 起租 10s）
         l.observe(t0, &cand("a", 3));
         assert_eq!(l.state(), SingletonState::Follower);
-        // a 死亡——b 视角租约到 t0+10s；期间 tick 不竞选（租约仍有效）
+        // No further model observations of a are supplied.
         assert_eq!(l.tick(t0 + Duration::from_secs(9), true), None);
         assert_eq!(l.state(), SingletonState::Follower);
-        // 过期后（t0+10s）b 可接管——门禁：kill 后 ≤13s
-        let t_take = t0 + Duration::from_secs(10);
-        let wait = t_take.duration_since(t0);
-        assert!(
-            wait <= Duration::from_secs(13),
-            "takeover wait {wait:?} > 13s gate"
+        let t_take = t0 + l.takeover_wait();
+        assert_eq!(
+            l.tick(t_take - Duration::from_nanos(1), true),
+            None,
+            "the current holder must not be replaced just before expiry"
         );
         assert_eq!(
             l.tick(t_take, true),
@@ -237,7 +295,8 @@ mod tests {
         assert_eq!(l.tick(t0 + Duration::from_secs(11), true), None);
         // 过期即 Vacant（等待更高序号持有者/重启后新序号）
         assert_eq!(l.state(), SingletonState::Vacant);
-        // 新一届：a 重启 seq 提升至 10 > floor=9 → 可竞选
+        // A separate object with a higher supplied epoch can acquire. This
+        // does not test persistence of the first object's epoch floor.
         let mut l2 = SingletonLease::new(cand("a", 10), LeaseParams::default());
         assert_eq!(
             l2.tick(t0 + Duration::from_secs(11), true),
@@ -245,9 +304,9 @@ mod tests {
         );
     }
 
-    // 分区唯一性：非多数派侧（quorum_ok=false）永不成主
+    // Repeated denied confirmations cannot grant local authority.
     #[test]
-    fn minority_never_leads() {
+    fn unconfirmed_candidate_never_acquires() {
         let mut l = SingletonLease::new(cand("a", 1), LeaseParams::default());
         let t0 = Instant::now();
         for t in 0..20 {
@@ -256,7 +315,7 @@ mod tests {
         assert_eq!(
             l.state(),
             SingletonState::Vacant,
-            "minority side must not lead"
+            "an unconfirmed local candidate must not acquire"
         );
     }
 }

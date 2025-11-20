@@ -72,6 +72,8 @@ allowed_external_types = [
 parrot-native-progress = []
 # Remote receptionist owners defer callbacks until their application locks release.
 parrot-deferred-mpsc = []
+# Core cleanup requires failed blocking dispatch to release task ownership.
+parrot-blocking-ownership = []
 default = []
 fs = []
 full = [

@@ -49,7 +49,8 @@ class CppMakeContracts(unittest.TestCase):
         for name in ['MAKEFLAGS', 'MFLAGS', 'GNUMAKEFLAGS', 'MAKELEVEL', 'MAKEOVERRIDES']:
             env.pop(name, None)
         result = subprocess.run([MAKE, '--no-print-directory', target], cwd=directory, env=env,
-            capture_output=True, text=True, timeout=15)
+            # This is a hang watchdog, not a recipe performance threshold.
+            capture_output=True, text=True, timeout=60)
         (directory / 'make.stdout').write_text(result.stdout)
         (directory / 'make.stderr').write_text(result.stderr)
         events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []

@@ -47,11 +47,13 @@ pub struct HostCtx {
     pub self_path: String,
     /// config overlay 合成视图（ctx.config-get 数据源）。
     pub config_overlay: toml_table::Table,
-    /// 日志级别下限（低于此级别的组件 log 吞掉）。
+    /// Most verbose guest log level admitted: 0=error, 1=warn, 2=info,
+    /// 3=debug, 4=trace. Default 0 admits error only. Host tracing filters
+    /// still apply after this component-specific filter.
     pub log_level: u8,
 }
 
-/// Explicit causal parent for one guest message. IDs use W3C byte order;
+/// Explicit causal parent for one guest invocation. IDs use W3C byte order;
 /// neither identifier may be all zero. This is metadata, not a recorded span,
 /// authentication state or sampling decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,10 +144,23 @@ pub mod runtime {
     use super::{ComponentError, HostCtx, TraceParent, WasmConfig, WasmMetrics};
     use std::path::Path;
 
+    mod asynchronous;
     mod cache;
     mod epoch;
     mod limits;
+    mod messaging;
+    mod recording;
+    mod services;
+    pub use asynchronous::PreparedComponent;
     pub use cache::CompilationLimits;
+    pub use messaging::{GuestMessaging, MessagingError, MessagingRequest, MAX_MESSAGE_BYTES};
+    pub use recording::{
+        GuestScope, GuestSpan, GuestSpanStatus, GuestTrace, MAX_GUEST_SPANS,
+        MAX_GUEST_SPAN_TARGET_BYTES,
+    };
+    pub use services::{
+        GuestServices, GuestSubscription, ServiceError, ServiceEvent, ServiceFuture,
+    };
 
     #[derive(Debug, thiserror::Error)]
     #[error("host panic: {0}")]
@@ -160,6 +175,13 @@ pub mod runtime {
             } else {
                 "non-string host panic".to_string()
             };
+            // Panic payload destructors are user code. A second hostile
+            // payload cannot safely be dropped recursively during recovery.
+            if let Err(secondary) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+            {
+                std::mem::forget(secondary);
+            }
             Err(HostPanic(message).into())
         })
     }
@@ -168,7 +190,11 @@ pub mod runtime {
         if let Some(HostPanic(message)) = error.downcast_ref::<HostPanic>() {
             ComponentError::Panic(message.clone())
         } else {
-            ComponentError::AbiVersion(format!("{phase}: {error}"))
+            match error.downcast_ref::<wasmtime::Trap>() {
+                Some(wasmtime::Trap::OutOfFuel) => ComponentError::OutOfFuel,
+                Some(wasmtime::Trap::Interrupt) => ComponentError::EpochDeadline,
+                _ => ComponentError::AbiVersion(format!("{phase}: {error}")),
+            }
         }
     }
 
@@ -186,6 +212,35 @@ pub mod runtime {
         host: HostCtx,
         limits: limits::GuestLimits,
         trace_parent: Option<TraceParent>,
+        recording: Option<recording::Invocation>,
+        next_span_handle: u64,
+        messaging: Option<std::sync::Arc<dyn GuestMessaging>>,
+        services: Option<std::sync::Arc<dyn GuestServices>>,
+        subscriptions: std::collections::BTreeMap<u64, services::Subscription>,
+        next_subscription_handle: u64,
+        host_calls: usize,
+        cleanup: asynchronous::CleanupFailures,
+    }
+
+    impl StoreState {
+        fn charge_host_call(&mut self) -> bool {
+            if self.host_calls >= 64 {
+                return false;
+            }
+            self.host_calls += 1;
+            true
+        }
+    }
+
+    impl Drop for StoreState {
+        fn drop(&mut self) {
+            self.subscriptions.clear();
+            // Unpublished initialization and final Store disposal own these
+            // host capabilities too, including their last Arc destructor.
+            let _ = self.cleanup.dispose(self.recording.take());
+            let _ = self.cleanup.dispose(self.messaging.take());
+            let _ = self.cleanup.dispose(self.services.take());
+        }
     }
 
     fn memory_limit_bytes(cfg: &WasmConfig) -> Result<usize, ComponentError> {
@@ -210,6 +265,14 @@ pub mod runtime {
                 host,
                 limits: limits::GuestLimits::new(memory_limit_bytes(cfg)?),
                 trace_parent: None,
+                recording: None,
+                next_span_handle: 1,
+                messaging: None,
+                services: None,
+                subscriptions: Default::default(),
+                next_subscription_handle: 1,
+                host_calls: 0,
+                cleanup: Default::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -380,6 +443,19 @@ pub mod runtime {
             self.instantiate_bytes_started(bytes, ctx, std::time::Instant::now())
         }
 
+        /// Compile on a blocking worker, then instantiate with asynchronous
+        /// host imports using [`PreparedComponent::instantiate_async`].
+        pub fn prepare_bytes(&self, bytes: &[u8]) -> Result<PreparedComponent, ComponentError> {
+            let t0 = std::time::Instant::now();
+            Ok(PreparedComponent {
+                engine: self.engine.clone(),
+                component: std::sync::Arc::new(self.compile_cached(bytes)?),
+                cfg: self.cfg.clone(),
+                epoch_driver: self.epoch_driver.clone(),
+                started_at: t0,
+            })
+        }
+
         fn instantiate_bytes_started(
             &self,
             bytes: &[u8],
@@ -395,6 +471,7 @@ pub mod runtime {
                 store,
                 bindings,
                 poisoned: false,
+                asynchronous: false,
                 started: false,
                 _epoch_driver: self.epoch_driver.clone(),
                 engine: self.engine.clone(),
@@ -461,7 +538,16 @@ pub mod runtime {
             store: &mut wasmtime::Store<StoreState>,
             comp: &wasmtime::component::Component,
         ) -> wasmtime::Result<Self> {
-            let mut linker = wasmtime::component::Linker::new(store.engine());
+            let linker = Self::linker(store.engine(), false)?;
+            let instance = linker.instantiate(&mut *store, comp)?;
+            Self::bindings(store, instance)
+        }
+
+        fn linker(
+            engine: &wasmtime::Engine,
+            asynchronous: bool,
+        ) -> wasmtime::Result<wasmtime::component::Linker<StoreState>> {
+            let mut linker = wasmtime::component::Linker::new(engine);
             // ctx 能力（host functions——最小权限四件套；返回 Result 形态）
             let mut ctx = linker.instance("parrot:component/ctx@0.1.0")?;
             ctx.func_wrap(
@@ -474,7 +560,7 @@ pub mod runtime {
                 "log",
                 |caller: wasmtime::StoreContextMut<'_, StoreState>, (level, msg): (u8, String)| {
                     let data = &caller.data().host;
-                    if level <= data.log_level.max(2) {
+                    if level <= data.log_level {
                         match level {
                             0 => tracing::error!(target: "parrot_wasm", "{}", msg),
                             1 => tracing::warn!(target: "parrot_wasm", "{}", msg),
@@ -513,7 +599,18 @@ pub mod runtime {
                 },
             )?;
 
-            let instance = linker.instantiate(&mut *store, comp)?;
+            recording::link(&mut linker)?;
+            if asynchronous {
+                messaging::link(&mut linker)?;
+                services::link(&mut linker)?;
+            }
+            Ok(linker)
+        }
+
+        fn bindings(
+            store: &mut wasmtime::Store<StoreState>,
+            instance: wasmtime::component::Instance,
+        ) -> wasmtime::Result<Self> {
             let handler_idx = instance
                 .get_export_index(&mut *store, None, "parrot:component/handler@0.1.0")
                 .ok_or_else(|| wasmtime::Error::msg("missing export parrot:component/handler"))?;
@@ -562,6 +659,7 @@ pub mod runtime {
         /// 以全新 Store + 实例重建（宿主零污染；组件状态丢弃是
         /// 沙箱语义：失活组件的监督决策由宿主决定）。
         poisoned: bool,
+        asynchronous: bool,
         /// A rebuilt instance must re-run a previously successful on_start.
         started: bool,
         // Ownership, not a direct caller: keeps ticking through runtime drop
@@ -586,14 +684,41 @@ pub mod runtime {
 
         /// Invoke a guest with an explicit parent. Legacy guests keep their
         /// existing exports and simply do not import this metadata. The Store
-        /// owns a copy only for the message call; lifecycle/rebuild is untraced.
+        /// owns a copy only for this call. Plain lifecycle/rebuild is untraced;
+        /// explicit lifecycle methods accept their own invocation context.
         pub fn handle_with_trace(
             &mut self,
             type_key: &str,
             payload: &[u8],
             parent: Option<&TraceParent>,
         ) -> Result<Vec<u8>, ComponentError> {
-            self.enter_message_scope(parent)?;
+            self.handle_invocation(type_key, payload, parent, None)
+        }
+
+        /// Invoke with an explicit host recording capability. Neither ambient
+        /// tracing nor plain lifecycle calls implicitly acquire this capability.
+        pub fn handle_with_recording(
+            &mut self,
+            type_key: &str,
+            payload: &[u8],
+            recording: Box<dyn GuestTrace>,
+        ) -> Result<Vec<u8>, ComponentError> {
+            let recording = recording::Invocation::new(recording);
+            let parent = recording
+                .parent()
+                .map_err(|e| init_error("recording parent", e))?;
+            self.handle_invocation(type_key, payload, Some(&parent), Some(recording))
+        }
+
+        fn handle_invocation(
+            &mut self,
+            type_key: &str,
+            payload: &[u8],
+            parent: Option<&TraceParent>,
+            recording: Option<recording::Invocation>,
+        ) -> Result<Vec<u8>, ComponentError> {
+            self.enter_message_scope(parent, recording.as_ref())?;
+            self.store.data_mut().recording = recording;
             let r = guest_boundary(|| {
                 self.bindings.handle_fn.call(
                     &mut self.store,
@@ -603,7 +728,8 @@ pub mod runtime {
                     },),
                 )
             });
-            self.exit_message_scope(&r);
+            let unfinished = matches!(&r, Ok((Err(_),))).then_some(GuestSpanStatus::Error);
+            let r = self.exit_message_scope(r, unfinished);
             match r {
                 Ok((Ok(out),)) => {
                     self.metrics.messages = self.metrics.messages.saturating_add(1);
@@ -629,7 +755,32 @@ pub mod runtime {
             payload: &[u8],
             parent: Option<&TraceParent>,
         ) -> Result<(), ComponentError> {
-            self.enter_message_scope(parent)?;
+            self.tell_invocation(type_key, payload, parent, None)
+        }
+
+        /// One-way message with the same bounded recording lifetime as ASK.
+        pub fn tell_with_recording(
+            &mut self,
+            type_key: &str,
+            payload: &[u8],
+            recording: Box<dyn GuestTrace>,
+        ) -> Result<(), ComponentError> {
+            let recording = recording::Invocation::new(recording);
+            let parent = recording
+                .parent()
+                .map_err(|e| init_error("recording parent", e))?;
+            self.tell_invocation(type_key, payload, Some(&parent), Some(recording))
+        }
+
+        fn tell_invocation(
+            &mut self,
+            type_key: &str,
+            payload: &[u8],
+            parent: Option<&TraceParent>,
+            recording: Option<recording::Invocation>,
+        ) -> Result<(), ComponentError> {
+            self.enter_message_scope(parent, recording.as_ref())?;
+            self.store.data_mut().recording = recording;
             let r = guest_boundary(|| {
                 self.bindings.tell_fn.call(
                     &mut self.store,
@@ -639,7 +790,7 @@ pub mod runtime {
                     },),
                 )
             });
-            self.exit_message_scope(&r);
+            let r = self.exit_message_scope(r, None);
             match r {
                 Ok(()) => {
                     self.metrics.messages = self.metrics.messages.saturating_add(1);
@@ -651,13 +802,42 @@ pub mod runtime {
 
         /// Startup runs with the same finite message budget as business calls.
         pub fn on_start(&mut self) -> Result<(), ComponentError> {
-            self.prepare_scope(false)?;
+            self.on_start_with_trace(None)
+        }
+
+        /// Explicit startup identity, cleared before the next invocation.
+        pub fn on_start_with_trace(
+            &mut self,
+            parent: Option<&TraceParent>,
+        ) -> Result<(), ComponentError> {
+            self.start_invocation(parent, None)
+        }
+
+        /// Explicit startup recording with its own bounded invocation budget.
+        pub fn on_start_with_recording(
+            &mut self,
+            recording: Box<dyn GuestTrace>,
+        ) -> Result<(), ComponentError> {
+            let recording = recording::Invocation::new(recording);
+            let parent = recording
+                .parent()
+                .map_err(|e| init_error("recording parent", e))?;
+            self.start_invocation(Some(&parent), Some(recording))
+        }
+
+        fn start_invocation(
+            &mut self,
+            parent: Option<&TraceParent>,
+            recording: Option<recording::Invocation>,
+        ) -> Result<(), ComponentError> {
+            self.enter_scope(parent, false, None)?;
+            self.store.data_mut().recording = recording;
             self.call_start()
         }
 
         fn call_start(&mut self) -> Result<(), ComponentError> {
             let result = guest_boundary(|| self.bindings.on_start_fn.call(&mut self.store, ()));
-            self.exit_message_scope(&result);
+            let result = self.exit_message_scope(result, None);
             match result {
                 Ok(()) => {
                     self.started = true;
@@ -669,9 +849,39 @@ pub mod runtime {
 
         /// A cooperative drain hook; it receives its own finite call budget.
         pub fn on_drain(&mut self) -> Result<(), ComponentError> {
-            self.enter_message_scope(None)?;
+            self.on_drain_with_trace(None)
+        }
+
+        /// Explicit drain identity; a required poisoned-store restart still
+        /// runs without inheriting this invocation's parent or capability.
+        pub fn on_drain_with_trace(
+            &mut self,
+            parent: Option<&TraceParent>,
+        ) -> Result<(), ComponentError> {
+            self.drain_invocation(parent, None)
+        }
+
+        /// Explicit drain recording, retired on success, trap or host panic.
+        pub fn on_drain_with_recording(
+            &mut self,
+            recording: Box<dyn GuestTrace>,
+        ) -> Result<(), ComponentError> {
+            let recording = recording::Invocation::new(recording);
+            let parent = recording
+                .parent()
+                .map_err(|e| init_error("recording parent", e))?;
+            self.drain_invocation(Some(&parent), Some(recording))
+        }
+
+        fn drain_invocation(
+            &mut self,
+            parent: Option<&TraceParent>,
+            recording: Option<recording::Invocation>,
+        ) -> Result<(), ComponentError> {
+            self.enter_message_scope(parent, recording.as_ref())?;
+            self.store.data_mut().recording = recording;
             let result = guest_boundary(|| self.bindings.on_drain_fn.call(&mut self.store, ()));
-            self.exit_message_scope(&result);
+            let result = self.exit_message_scope(result, None);
             match result {
                 Ok(()) => Ok(()),
                 Err(error) => Err(self.classify_trap_err(&error)),
@@ -688,39 +898,106 @@ pub mod runtime {
         fn enter_message_scope(
             &mut self,
             parent: Option<&TraceParent>,
+            recovery: Option<&recording::Invocation>,
         ) -> Result<(), ComponentError> {
+            self.enter_scope(parent, true, recovery)
+        }
+
+        fn enter_scope(
+            &mut self,
+            parent: Option<&TraceParent>,
+            restore_start: bool,
+            recovery: Option<&recording::Invocation>,
+        ) -> Result<(), ComponentError> {
+            if self.asynchronous {
+                return Err(ComponentError::InvalidConfig(
+                    "messaging-enabled components require asynchronous invocation".into(),
+                ));
+            }
             if parent.is_some_and(|parent| !parent.is_valid()) {
                 return Err(ComponentError::InvalidTraceParent);
             }
-            self.prepare_scope(true)?;
+            self.prepare_scope(restore_start, recovery)?;
             self.store.data_mut().trace_parent = parent.copied();
             Ok(())
         }
 
-        fn prepare_scope(&mut self, restore_start: bool) -> Result<(), ComponentError> {
+        fn prepare_scope(
+            &mut self,
+            restore_start: bool,
+            recovery: Option<&recording::Invocation>,
+        ) -> Result<(), ComponentError> {
+            self.store
+                .data()
+                .cleanup
+                .result()
+                .map_err(|error| self.classify_trap_err(&error))?;
+            self.retire_recording(GuestSpanStatus::Cancelled)
+                .map_err(|e| self.classify_trap_err(&e))?;
             self.store.data_mut().trace_parent = None;
             if self.poisoned {
                 // Retire poisoned guest allocations before allocating the next
                 // instance, so rebuild cannot temporarily double the guest cap.
                 // Host context remains available on failure; poisoned remains
                 // true until all required exports have been validated.
-                let store = create_store(&self.engine, &self.cfg, self.store.data().host.clone())?;
+                let mut store =
+                    create_store(&self.engine, &self.cfg, self.store.data().host.clone())?;
+                store.data_mut().next_span_handle = self.store.data().next_span_handle;
                 self.store = store;
                 let bindings = guest_boundary(|| {
                     ParrotComponent::instantiate(&mut self.store, self.component.as_ref())
                 })
                 .map_err(|e| init_error("re-instantiate after trap", e))?;
                 self.bindings = bindings;
-                self.poisoned = false;
                 if restore_start && self.started {
                     self.reset_budget()?;
-                    self.call_start()?;
+                    self.begin_recovery_recording(recovery)?;
+                    let scope = self
+                        .store
+                        .data()
+                        .recording
+                        .as_ref()
+                        .map(recording::Invocation::execution_scope)
+                        .transpose()
+                        .map(Option::flatten);
+                    let result = match scope {
+                        Ok(scope) => {
+                            let failures = self.store.data().cleanup.clone();
+                            recording::scoped_owned(scope, failures, || {
+                                self.bindings.on_start_fn.call(&mut self.store, ())
+                            })
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let result = self.exit_message_scope(result, None);
+                    result.map_err(|error| self.classify_trap_err(&error))?;
                 }
+                self.poisoned = false;
             }
             self.reset_budget()
         }
 
+        fn begin_recovery_recording(
+            &mut self,
+            source: Option<&recording::Invocation>,
+        ) -> Result<(), ComponentError> {
+            let Some(source) = source else { return Ok(()) };
+            let target = format!("wasm/recovery-start:{}", self.store.data().host.self_path);
+            if let Some(recording) = source
+                .recovery(&target)
+                .map_err(|error| self.classify_trap_err(&error))?
+            {
+                let parent = recording
+                    .parent()
+                    .map_err(|error| self.classify_trap_err(&error))?;
+                self.store.data_mut().trace_parent = Some(parent);
+                self.store.data_mut().recording = Some(recording);
+            }
+            Ok(())
+        }
+
         fn reset_budget(&mut self) -> Result<(), ComponentError> {
+            self.store.data_mut().host_calls = 0;
             self.store
                 .set_fuel(self.cfg.fuel_per_message)
                 .map_err(|e| ComponentError::AbiVersion(format!("message fuel: {e}")))?;
@@ -729,7 +1006,52 @@ pub mod runtime {
             Ok(())
         }
 
-        fn exit_message_scope<T>(&mut self, _r: &Result<T, wasmtime::Error>) {
+        fn retire_recording(&mut self, status: GuestSpanStatus) -> wasmtime::Result<()> {
+            self.finish_recording(status, status)
+        }
+
+        fn finish_recording(
+            &mut self,
+            unfinished: GuestSpanStatus,
+            completed: GuestSpanStatus,
+        ) -> wasmtime::Result<()> {
+            let result = self
+                .store
+                .data_mut()
+                .recording
+                .take()
+                .map_or(Ok(()), |invocation| {
+                    invocation.retire(unfinished, completed)
+                });
+            self.store.data().cleanup.record(&result);
+            result
+        }
+
+        fn exit_message_scope<T>(
+            &mut self,
+            mut r: wasmtime::Result<T>,
+            unfinished: Option<GuestSpanStatus>,
+        ) -> wasmtime::Result<T> {
+            if r.is_err() {
+                self.store.data_mut().subscriptions.clear();
+            }
+            if let Err(error) = self.store.data().cleanup.result() {
+                self.store.data_mut().subscriptions.clear();
+                // Keep any returned host-owned value outside the unwind boundary.
+                let _ = self.store.data().cleanup.dispose(r);
+                r = Err(error);
+            }
+            let status = unfinished
+                .filter(|_| r.is_ok())
+                .unwrap_or_else(|| recording::outcome(&r));
+            let completed = if r.is_ok() {
+                unfinished.unwrap_or(GuestSpanStatus::Ok)
+            } else {
+                recording::outcome(&r)
+            };
+            if let Err(error) = self.finish_recording(status, completed) {
+                r = Err(error);
+            }
             self.store.data_mut().trace_parent = None;
             if let Ok(f) = self.store.get_fuel() {
                 self.metrics.fuel_consumed = self
@@ -737,6 +1059,7 @@ pub mod runtime {
                     .fuel_consumed
                     .saturating_add(self.cfg.fuel_per_message.saturating_sub(f));
             }
+            r
         }
 
         fn classify_trap(&mut self, msg: String) -> ComponentError {
@@ -746,6 +1069,9 @@ pub mod runtime {
 
         fn classify_trap_err(&mut self, t: &wasmtime::Error) -> ComponentError {
             use wasmtime::Trap;
+            self.store.data_mut().subscriptions.clear();
+            let cleanup = self.store.data().cleanup.result();
+            let t = cleanup.as_ref().err().unwrap_or(t);
             if let Some(HostPanic(message)) = t.downcast_ref::<HostPanic>() {
                 self.metrics.trap_count = self.metrics.trap_count.saturating_add(1);
                 self.poisoned = true;
@@ -765,7 +1091,7 @@ pub mod runtime {
                 _ => {
                     self.metrics.trap_count = self.metrics.trap_count.saturating_add(1);
                     self.poisoned = true;
-                    ComponentError::Trap(t.to_string())
+                    ComponentError::Trap(format!("{t:#}"))
                 }
             }
         }
@@ -780,13 +1106,76 @@ pub mod runtime {
     /// 注：parrot-wasm 不依赖 parrot-api（分层铁律——09 §2.2）；
     /// 适配在 parrot-node 侧完成，此处仅暴露句柄语义。
     impl WasmComponent {
+        /// A physical host cleanup failure permanently prevents this component
+        /// from executing again. This receipt survives cancellation; recreate
+        /// the admitted actor under its owner's supervision rather than retrying
+        /// an inner Store after resources failed to retire.
+        pub fn cleanup_error(&self) -> Option<ComponentError> {
+            self.store.data().cleanup.result().err().map(|error| {
+                if let Some(HostPanic(message)) = error.downcast_ref::<HostPanic>() {
+                    ComponentError::Panic(message.clone())
+                } else {
+                    ComponentError::Trap(format!("{error:#}"))
+                }
+            })
+        }
+
         pub fn is_alive(&self) -> bool {
-            true // store 存活即活（drop 后句柄失效由 owner 管）
+            self.cleanup_error().is_none()
         }
     }
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn hostile_panic_payload_destructor_is_contained() {
+            const CHILD: &str = "PARROT_WASM_HOSTILE_PANIC_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "runtime::tests::hostile_panic_payload_destructor_is_contained",
+                    ])
+                    .env(CHILD, "1")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        assert!(status.success(), "panic boundary child failed: {status}");
+                        return;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("panic boundary child did not terminate");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            struct Secondary;
+            impl Drop for Secondary {
+                fn drop(&mut self) {
+                    panic!("secondary payload must not be dropped");
+                }
+            }
+            struct Payload;
+            impl Drop for Payload {
+                fn drop(&mut self) {
+                    std::panic::panic_any(Secondary);
+                }
+            }
+            let error = guest_boundary::<()>(|| std::panic::panic_any(Payload)).unwrap_err();
+            assert_eq!(
+                init_error("test", error),
+                ComponentError::Panic("non-string host panic".into())
+            );
+            assert_eq!(guest_boundary(|| Ok(42)).unwrap(), 42);
+        }
 
         #[test]
         fn cache_rejects_oversized_input_before_compilation() {
@@ -905,7 +1294,7 @@ pub mod runtime {
             // Observe the real owned ticker AFTER arming the actual store.
             // We deliberately avoid racing a hot spin loop against fuel.
             component.cfg.epoch_deadline = 2;
-            component.enter_message_scope(None).unwrap();
+            component.enter_message_scope(None, None).unwrap();
             let target = ticks.load(Ordering::Acquire) + 2;
             let timeout = Instant::now() + Duration::from_secs(5);
             while ticks.load(Ordering::Acquire) < target {
@@ -975,6 +1364,34 @@ pub mod runtime {
                 Some(&wasmtime::Trap::Interrupt)
             );
             assert!(store.get_fuel().unwrap() > 0);
+            assert_eq!(
+                init_error("instantiate", error.context("guest initializer")),
+                ComponentError::EpochDeadline
+            );
+        }
+
+        #[test]
+        fn instantiation_fuel_exhaustion_is_not_an_abi_mismatch() {
+            let runtime = WasmRuntime::new_with_manual_epoch(WasmConfig::default()).unwrap();
+            let error = match runtime.instantiate_bytes(
+                br"(component
+                    (core module $guest
+                        (func $start (loop br 0))
+                        (start $start))
+                    (core instance (instantiate $guest)))",
+                HostCtx::default(),
+            ) {
+                Ok(_) => panic!("unbounded guest initializer must exhaust its finite fuel"),
+                Err(error) => error,
+            };
+            assert_eq!(error, ComponentError::OutOfFuel);
+            let error = match runtime.instantiate_bytes(b"(component)", HostCtx::default()) {
+                Ok(_) => panic!("missing handler interface must remain invalid"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, ComponentError::AbiVersion(message) if message.contains("missing export"))
+            );
         }
 
         #[test]
@@ -1075,6 +1492,24 @@ pub mod runtime {
             .unwrap();
         }
 
+        #[derive(Debug)]
+        struct RebuildRecording(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl GuestTrace for RebuildRecording {
+            fn parent(&self) -> TraceParent {
+                TraceParent {
+                    trace_id: [1; 16],
+                    span_id: [2; 8],
+                }
+            }
+            fn start(&self, _: &str) -> Option<Box<dyn GuestSpan>> {
+                None
+            }
+            fn start_recovery(&self, _: &str) -> Option<Box<dyn GuestSpan>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("failed rebuild must not start a lifecycle owner");
+            }
+        }
+
         #[test]
         fn failed_rebuild_returns_error_and_preserves_host_context() {
             // This test injects an export-contract failure on rebuild. A real
@@ -1093,18 +1528,62 @@ pub mod runtime {
                     },
                 )
                 .unwrap();
+            component.on_start().unwrap();
             component.component = std::sync::Arc::new(
                 wasmtime::component::Component::new(runtime.engine(), "(component)").unwrap(),
             );
             component.poisoned = true;
+            let factories = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             for _ in 0..2 {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    component.handle("echo", b"retry")
+                    component.handle_with_recording(
+                        "echo",
+                        b"retry",
+                        Box::new(RebuildRecording(factories.clone())),
+                    )
                 }))
                 .expect("rebuild failure must be returned, not panic");
                 assert!(result.is_err());
                 assert_eq!(component.host_ctx().self_path, "/retained");
+                assert!(component.poisoned);
             }
+            assert_eq!(factories.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn failed_async_rebuild_does_not_create_recovery_or_reuse_invalid_bindings() {
+            let runtime = WasmRuntime::new_with_manual_epoch(WasmConfig::default()).unwrap();
+            let mut component = runtime
+                .prepare_bytes(include_bytes!("../tests/fixtures/fixture-component.wasm"))
+                .unwrap()
+                .instantiate_async(
+                    HostCtx {
+                        self_path: "/retained".into(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            component.on_start_async(None).await.unwrap();
+            component.component = std::sync::Arc::new(
+                wasmtime::component::Component::new(runtime.engine(), "(component)").unwrap(),
+            );
+            component.poisoned = true;
+            let factories = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for _ in 0..2 {
+                let result = component
+                    .handle_async(
+                        "echo",
+                        b"retry",
+                        Some(Box::new(RebuildRecording(factories.clone()))),
+                    )
+                    .await;
+                assert!(matches!(result, Err(ComponentError::AbiVersion(_))));
+                assert!(component.poisoned);
+                assert_eq!(component.host_ctx().self_path, "/retained");
+            }
+            assert_eq!(factories.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
 
         #[test]
@@ -1127,7 +1606,7 @@ pub mod runtime {
                 }
                 assert_eq!(component.handle("echo", b"before").unwrap(), b"before");
 
-                component.enter_message_scope(None).unwrap();
+                component.enter_message_scope(None, None).unwrap();
                 for _ in 0..deadline - 1 {
                     runtime.tick_epoch();
                 }

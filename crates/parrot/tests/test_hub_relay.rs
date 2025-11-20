@@ -8,6 +8,8 @@
 // Transport semantics use explicitly trusted development TCP peers;
 // authenticated/denied paths are covered by control_authentication.
 mod common;
+#[path = "support/network.rs"]
+mod network_support;
 
 use common::*;
 use parrot::system::ParrotActorSystem;
@@ -241,6 +243,9 @@ async fn star_topology_with_capture(
 
 #[tokio::test]
 async fn rh1_relayed_ask_round_trip() {
+    if network_support::skip_tcp("hub relay ask") {
+        return;
+    }
     let (ra, _rb, _hub, _) = star_topology().await;
     let r = ra.remote_ref("parrot://node-b/user/echo").unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(5), r.send(Box::new(HPing(42))))
@@ -256,6 +261,9 @@ async fn rh1_relayed_ask_round_trip() {
 
 #[tokio::test]
 async fn rh2_relayed_tell_delivered() {
+    if network_support::skip_tcp("hub relay tell") {
+        return;
+    }
     let (ra, _rb, _hub, counter) = star_topology().await;
     let r = ra.remote_ref("parrot://node-b/user/note").unwrap();
     for i in 0..10u64 {
@@ -273,6 +281,9 @@ async fn rh2_relayed_tell_delivered() {
 
 #[tokio::test]
 async fn rh3_no_route_err() {
+    if network_support::skip_tcp("hub relay no-route") {
+        return;
+    }
     let (ra, _rb, _hub, _) = star_topology().await;
     let r = ra.remote_ref("parrot://node-z/user/echo").unwrap();
     let err = tokio::time::timeout(Duration::from_secs(5), r.send(Box::new(HPing(1))))
@@ -294,6 +305,9 @@ async fn rh3_no_route_err() {
 
 #[tokio::test]
 async fn rh4_new_ask_fails_after_destination_disconnect() {
+    if network_support::skip_tcp("hub relay disconnect") {
+        return;
+    }
     let (ra, rb, hub, _) = star_topology().await;
     // 拆掉 hub↔B 链路（B 主动断）
     rb.shutdown().await.unwrap();
@@ -316,6 +330,9 @@ async fn rh4_new_ask_fails_after_destination_disconnect() {
 
 #[tokio::test]
 async fn rh5_hop_count_incremented() {
+    if network_support::skip_tcp("hub relay hop accounting") {
+        return;
+    }
     use parrot_remote::capture::{CaptureDirection, CaptureLimits, FrameCapture};
     let (capture, mut receiver) = FrameCapture::channel(CaptureLimits::default()).unwrap();
     let recording = std::thread::spawn(move || {
@@ -371,6 +388,9 @@ async fn rh5_hop_count_incremented() {
 
 #[tokio::test]
 async fn rh6_direct_link_learned_from_hint() {
+    if network_support::skip_tcp("hub relay direct-link learning") {
+        return;
+    }
     // hub
     let hub = RemoteActorSystem::new(
         RCfg::tcp("hub", Some("127.0.0.1:0".parse().unwrap()))
@@ -510,6 +530,9 @@ impl Actor for OrderActor {
 
 #[tokio::test]
 async fn rh7_tell_order_with_drained_relay_before_switch() {
+    if network_support::skip_tcp("hub relay switch ordering") {
+        return;
+    }
     // 拓扑复用 RH6 形态：hub + b（direct_addr）+ a
     let hub = RemoteActorSystem::new(
         RCfg::tcp("hub", Some("127.0.0.1:0".parse().unwrap()))
@@ -658,6 +681,9 @@ async fn rh7_tell_order_with_drained_relay_before_switch() {
 
 #[tokio::test]
 async fn rh8_direct_fifo_with_bounded_inflight_window() {
+    if network_support::skip_tcp("hub relay direct FIFO") {
+        return;
+    }
     // 两节点直连（无 hub）
     let facade_b = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
@@ -743,6 +769,9 @@ async fn rh8_direct_fifo_with_bounded_inflight_window() {
 
 #[tokio::test]
 async fn rh9_shutdown_no_hang() {
+    if network_support::skip_tcp("hub relay shutdown") {
+        return;
+    }
     let facade_b = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
             .await

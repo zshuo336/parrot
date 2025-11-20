@@ -10,7 +10,9 @@ Requirements: POSIX host, Python 3.9+, Rust compiler, Erlang/OTP 27+ (`erl`,
 `erlc`, `escript`). Compilation uses a private temporary directory and `-Werror`;
 no existing `out/*.beam` files are loaded. Compiler, oracle and runtime failures
 fail the command. SIGINT/SIGTERM stop the active tool process group and remove
-its temporary build directory. This does not promise cleanup after SIGKILL of
+its temporary build directory. Each tool exit also retires remaining members of
+that owned group, including children left by a successful or failed leader.
+This does not promise cleanup after SIGKILL of
 the Python launcher. BEAM actors and workers are owned by their scenario process.
 
 The twenty scenarios retain the original full message/actor counts, including

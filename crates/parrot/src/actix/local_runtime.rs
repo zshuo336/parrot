@@ -3,7 +3,9 @@ use super::{ActixActorSystem, local_typed::LocalSource};
 use crate::owned_payload::OwnedPayload;
 use parrot_api::{
     address::ActorRef,
-    engine::{AsyncLocalRuntime, FactoryOptions, LocalRuntimeActor, LocalRuntimeFactory},
+    engine::{
+        AsyncLocalRuntime, FactoryOptions, LocalRuntimeActor, LocalRuntimeFactory, SpawnOptions,
+    },
     local_typed::{LocalBoxedFuture, LocalMsgVariant, LocalTypedActorRef, LocalTypedDispatch},
     supervisor::{DefaultSupervisorStrategyFactory, SupervisorStrategyType},
     system::SystemError,
@@ -131,6 +133,9 @@ impl ActorRef for LocalRef {
     fn death_watch(&self) -> Option<parrot_api::death_watch::DeathWatch> {
         self.0.clone().into_dyn().death_watch()
     }
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.0.clone().into_dyn().retirement_status()
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -174,6 +179,7 @@ impl AsyncLocalRuntime for ActixActorSystem {
                     LocalSource {
                         path: &path,
                         parent: None,
+                        cohort: None,
                         repeatable: true,
                         erase: |reference| Box::new(LocalRef(reference)),
                     },
@@ -186,6 +192,46 @@ impl AsyncLocalRuntime for ActixActorSystem {
 }
 
 impl ActixActorSystem {
+    pub(super) fn spawn_local_factory_in_cohort<'a>(
+        &'a self,
+        factory: LocalRuntimeFactory,
+        options: SpawnOptions,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
+        let factory = OwnedPayload::new(factory, &self.runtime, &self.cleanup_slots);
+        Box::pin(parrot_api::trace::capture(async move {
+            if let Err(error) = options.validate() {
+                factory.retire().await.map_err(SystemError::ActorError)?;
+                return Err(error);
+            }
+            let constructor = factory.take();
+            let factory = OwnedPayload::new(
+                move || LocalBehavior(constructor()),
+                &self.runtime,
+                &self.cleanup_slots,
+            );
+            let policy = OwnedPayload::new(None, &self.runtime, &self.cleanup_slots);
+            let path = options
+                .path
+                .unwrap_or_else(|| format!("actix://local/{}", uuid::Uuid::new_v4().simple()));
+            let reference = Arc::new(self.clone())
+                .spawn_local_source(
+                    factory,
+                    policy,
+                    LocalSource {
+                        path: &path,
+                        parent: None,
+                        cohort: Some(cohort),
+                        repeatable: true,
+                        erase: |reference| Box::new(LocalRef(reference)),
+                    },
+                )
+                .await
+                .map_err(SystemError::ActorError)?;
+            Ok(Box::new(LocalRef(reference)) as BoxedActorRef)
+        }))
+    }
+
     pub(crate) async fn spawn_neutral_local_child(
         self: &Arc<Self>,
         factory: OwnedPayload<LocalRuntimeFactory>,
@@ -206,6 +252,7 @@ impl ActixActorSystem {
                 LocalSource {
                     path,
                     parent: Some(parent),
+                    cohort: None,
                     repeatable: true,
                     erase: |reference| Box::new(LocalRef(reference)),
                 },

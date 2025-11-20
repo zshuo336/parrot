@@ -24,6 +24,13 @@ from parrot_protocol.wire import FrameDecoder, build_frame, with_reply_to_prefix
 
 class PeerRetirement(unittest.TestCase):
     evidence = None
+    fixture = FIXTURE
+    unexpected_request = 'unexpected request type'
+    invalid_request_payload = b''
+    messages = [
+        ('bin:u:Ping', struct.pack('<Q', 100), struct.pack('<Q', 102)),
+        ('bin:u:Add', struct.pack('<QQ', 3, 4), struct.pack('<Q', 1007)),
+    ]
 
     def wait_for(self, predicate, process, log):
         deadline = time.monotonic() + 5
@@ -40,10 +47,11 @@ class PeerRetirement(unittest.TestCase):
             log = root / 'gateway.log'
             env = dict(os.environ, PROBE_MODE='success', PROBE_MARKER='READY=',
                        PROBE_PID_FILE=str(record), PROBE_REQUESTS=str(requests),
+                       PROBE_CHILD_FILE=str(root / 'child.json'),
                        PROBE_PEER_CLOSED=str(closed), PARROT_NODE_ID='ray-gw-1',
                        PROBE_WIRE_ROOT=str(ROOT / 'interop/python'))
             with log.open('xb') as output, OwnedProcess(
-                    [sys.executable, '-u', '-c', FIXTURE], env=env,
+                    [sys.executable, '-u', '-c', self.fixture], env=env,
                     stdout=output, stderr=output) as process:
                 self.wait_for(record.exists, process, log)
                 state = json.loads(record.read_text())
@@ -53,15 +61,12 @@ class PeerRetirement(unittest.TestCase):
                     # The fixture tests lifecycle, not handshake admission.
                     # The production CLI contracts separately exercise handshake.
                     if ending == 'malformed':
-                        peer.sendall(build_frame(FT_ASK, 1, 'actor', 'bin:unknown', with_reply_to_prefix('', b'')))
+                        peer.sendall(build_frame(FT_ASK, 1, 'actor', 'bin:unknown', with_reply_to_prefix('', self.invalid_request_payload)))
                         self.assertNotEqual(process.wait(timeout=5), 0)
-                        self.assertIn('unexpected request type', log.read_text())
+                        self.assertIn(self.unexpected_request, log.read_text())
                         self.assertFalse(closed.exists(), 'protocol failure must not become a clean disconnect')
                     else:
-                        for cid, key, payload, expected in [
-                            (1, 'bin:u:Ping', struct.pack('<Q', 100), 102),
-                            (2, 'bin:u:Add', struct.pack('<QQ', 3, 4), 1007),
-                        ]:
+                        for cid, (key, payload, expected) in enumerate(self.messages, 1):
                             peer.sendall(build_frame(FT_ASK, cid, 'actor', key, with_reply_to_prefix('', payload)))
                             frame = None
                             while frame is None:
@@ -71,18 +76,17 @@ class PeerRetirement(unittest.TestCase):
                                 frame = decoder.next_frame()
                             self.assertEqual(frame.ft, FT_REPLY)
                             self.assertEqual(frame.cid, cid)
-                            self.assertEqual(frame.payload, struct.pack('<Q', expected))
+                            self.assertEqual(frame.payload, expected)
                         if ending == 'reset':
                             peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
                             peer.close()
                         else:
                             peer.shutdown(socket.SHUT_WR)
                             self.assertEqual(peer.recv(1), b'', 'fixture must close its peer on EOF')
-                        if ending == 'reset':
-                            self.wait_for(closed.exists, process, log)
-                            receipt = json.loads(closed.read_text())
-                            self.assertEqual(receipt['reason'], ending)
-                            self.assertEqual(receipt['requests'], 2)
+                        self.wait_for(closed.exists, process, log)
+                        receipt = json.loads(closed.read_text())
+                        self.assertEqual(receipt['reason'], ending)
+                        self.assertEqual(receipt['requests'], len(self.messages))
                         self.assertIsNone(process.poll(), 'peer disconnect must not retire the gateway owner')
                         self.assertFalse(process_exited(state['child']))
                 # OwnedProcess performs the group cleanup even for the malformed

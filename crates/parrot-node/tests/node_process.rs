@@ -830,22 +830,13 @@ async fn directory_disk_failure_stops_the_actual_process_and_releases_its_owner(
         Some("mem://disk-failure")
     );
     // A missing second voter keeps elections changing persistent state. Inject
-    // the failure only after readiness, without deleting an active state file.
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match std::fs::create_dir(data.join("raft.next")) {
-                Ok(()) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    tokio::task::yield_now().await
-                }
-                Err(e) => panic!("{e}"),
-            }
-        }
-    })
-    .await
-    .unwrap();
+    // the failure only after readiness, retaining the actual published bytes.
+    // Blocking raft.next would affect checkpoints, not ordinary appends.
+    std::fs::rename(data.join("raft.state"), data.join("raft.backup")).unwrap();
+    std::fs::create_dir(data.join("raft.state")).unwrap();
     assert!(!finish(&mut child).await.success());
-    std::fs::remove_dir(data.join("raft.next")).unwrap();
+    std::fs::remove_dir(data.join("raft.state")).unwrap();
+    std::fs::rename(data.join("raft.backup"), data.join("raft.state")).unwrap();
     let owner = parrot_remote::roles::directory::DurableDirectory::open(
         &data,
         "failure-group",

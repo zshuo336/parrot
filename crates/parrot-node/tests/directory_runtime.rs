@@ -107,9 +107,18 @@ async fn standard_node_owns_directory_actors_failure_supervision_and_storage_rel
         .unwrap();
     assert!(view.is_leader && !view.closed);
     assert_eq!(view.applied_index, 1);
+    assert_eq!(h.compact().await.unwrap(), 1);
+    assert_eq!(
+        h.proposal_status(&receipt).await.unwrap(),
+        DurableDirectoryStatus::Applied
+    );
+    assert!(std::fs::read(path.join("raft.state"))
+        .unwrap()
+        .starts_with(b"PRAFT03\0"));
     // A real sync publication failure must fence the Directory, notify the
     // process supervisor, and still shut down actors and release the disk lock.
-    std::fs::create_dir(path.join("raft.next")).unwrap();
+    std::fs::rename(path.join("raft.state"), path.join("raft.backup")).unwrap();
+    std::fs::create_dir(path.join("raft.state")).unwrap();
     assert!(h
         .propose(&DirCmd::Remove {
             node: "worker".into()
@@ -130,7 +139,8 @@ async fn standard_node_owns_directory_actors_failure_supervision_and_storage_rel
     );
     client.shutdown().await.unwrap();
     drop(node);
-    std::fs::remove_dir(path.join("raft.next")).unwrap();
+    std::fs::remove_dir(path.join("raft.state")).unwrap();
+    std::fs::rename(path.join("raft.backup"), path.join("raft.state")).unwrap();
     let reopened = DurableDirectory::open(
         &path,
         "standard",

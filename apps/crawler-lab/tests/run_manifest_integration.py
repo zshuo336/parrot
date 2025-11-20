@@ -32,18 +32,23 @@ def verify_ray_allocator(output):
     from ray._private.node import Node
     from parrot_protocol.ray_startup import guarded_allocator
     real_socket = socket.socket
+    # Ray 2.51 reads the node address before allocating a port.  Keep the
+    # fixture compatible with that API while avoiding a real Ray node startup.
+    class FakeNode:
+        _node_ip_address = '127.0.0.1'
+
     class Initial:
         def bind(self, address): pass
         def getsockname(self): return '', 65534
         def close(self): pass
     with patch('ray._private.node.socket.socket', return_value=Initial()), patch('ray._private.node.random.randint', return_value=65534):
-        before = Node._get_unused_port(object(), {65534, 65535})
+        before = Node._get_unused_port(FakeNode(), {65534, 65535})
     calls = []
     def create(*args):
         calls.append(1)
         return Initial() if len(calls) == 1 else real_socket(*args)
     with patch('ray._private.node.socket.socket', side_effect=create), patch('ray._private.node.random.randint', return_value=65534):
-        after = guarded_allocator(Node._get_unused_port)(object(), {65534, 65535})
+        after = guarded_allocator(Node._get_unused_port)(FakeNode(), {65534, 65535})
     require(after not in {65534, 65535}, 'allocator returned an already allocated internal port')
     (output / 'ray-port-proof.json').write_text(json.dumps(dict(ray_version=ray.__version__, original=before, guarded=after, excluded=[65534,65535]), indent=2) + '\n')
 

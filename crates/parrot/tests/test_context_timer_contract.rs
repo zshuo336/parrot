@@ -432,13 +432,15 @@ impl Actor for ActixTimers {
     }
 }
 enum Backend {
-    Actix(ActixActorSystem),
+    Actix(Box<ActixActorSystem>),
     Thread(Arc<ThreadActorSystem>),
 }
 impl Backend {
     async fn new(actix: bool) -> Self {
         if actix {
-            Self::Actix(ActixActorSystem::with_arbiter_count(1).await.unwrap())
+            Self::Actix(Box::new(
+                ActixActorSystem::with_arbiter_count(1).await.unwrap(),
+            ))
         } else {
             Self::Thread(ThreadActorSystem::shared(Default::default()))
         }
@@ -816,7 +818,7 @@ async fn thread_zero_interval_rejected() {
 impl Backend {
     async fn configured(actix: bool, limit: usize, timeout: Duration) -> Self {
         if actix {
-            Self::Actix(
+            Self::Actix(Box::new(
                 ActixActorSystem::with_settings(parrot::actix::ActixSystemSettings {
                     arbiter_count: 1,
                     max_context_tasks: limit,
@@ -825,7 +827,7 @@ impl Backend {
                 })
                 .await
                 .unwrap(),
-            )
+            ))
         } else {
             Self::Thread(ThreadActorSystem::shared(
                 parrot::thread::config::ThreadActorSystemConfig {

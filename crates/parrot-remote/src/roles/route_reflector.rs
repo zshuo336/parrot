@@ -68,8 +68,15 @@ impl RouteReflector {
             .collect()
     }
 
-    /// RR 本地路由通告（RR 自己也是 border——向 clients 广播）。
+    /// Broadcast a strict local improvement using the same preference as reflected routes.
     pub fn advertise_local(&mut self, entry: RouteEntry) -> Vec<(String, Vec<RouteEntry>)> {
+        if self
+            .table
+            .get(&entry.prefix)
+            .is_some_and(|current| !entry.preferred_to(current))
+        {
+            return Vec::new();
+        }
         self.table.insert(entry.prefix.clone(), entry.clone());
         self.clients
             .iter()

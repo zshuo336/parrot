@@ -317,9 +317,14 @@ async fn scenario(
         if engine == 2 { assert!(events.iter().all(|event| event.2 == events[0].2), "Local lifecycle and messages stay on their owner"); }
         let observed: Vec<_> = lifecycle.iter().map(|event| event.1.clone()).collect();
         println!("PARROT_TYPED_CHILD_CREATION_RETIRED engine={engine} repeatable={repeatable} explicit={explicit} traced={traced} poll_traced={poll_traced}");
-        (observed, vec![origin; 4])
+        let initialization = lifecycle[1].1.clone();
+        lifecycle_identity::assert_child(initialization.as_ref(), origin.as_ref());
+        (observed, vec![origin, initialization.clone(), initialization.clone(), initialization])
     }).await.expect("typed child creation independent liveness bound")
 }
+
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;
 async fn matrix(engine: usize, repeatable: bool, explicit: bool) {
     let mut observed = Vec::new();
     let mut expected = Vec::new();

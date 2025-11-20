@@ -22,6 +22,36 @@ fn record_startup<T>(
     })
 }
 
+pub(super) fn configuration(
+    tracing: &parrot_config::tracing::TracingResolved,
+    service_name: &str,
+) -> Result<Option<TraceExportConfig>, Error> {
+    if !tracing.enabled {
+        return Ok(None);
+    }
+    let endpoint = tracing
+        .otlp_endpoint
+        .as_deref()
+        .ok_or("tracing requires an OTLP endpoint")?;
+    let mut config = TraceExportConfig::new(endpoint, service_name);
+    config.allow_insecure_http = tracing.allow_insecure_http;
+    config.capacity = tracing.capacity;
+    config.interval = Duration::from_millis(tracing.interval_ms);
+    config.request_timeout = Duration::from_millis(tracing.request_timeout_ms);
+    config.max_attempts = tracing.max_attempts;
+    config.validate()?;
+    if let Some(socket) = &tracing.socket {
+        #[cfg(unix)]
+        super::trace_query::validate_path(socket)?;
+        #[cfg(not(unix))]
+        {
+            let _ = socket;
+            return Err("tracing.socket requires Unix".into());
+        }
+    }
+    Ok(Some(config))
+}
+
 pub(super) struct Session {
     exporter: TraceExporter,
     attachment: TraceRecorderAttachment,

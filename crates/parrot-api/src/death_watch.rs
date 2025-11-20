@@ -10,11 +10,11 @@ use crate::{
     errors::ActorError,
     types::{ActorResult, BoxedFuture},
 };
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::{stream::FuturesUnordered, StreamExt};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock, Weak,
     },
     time::Duration,
@@ -213,7 +213,9 @@ impl DeathWatch {
     /// recipients share a deadline; cancellation and failed recipients cannot
     /// strand other recipients or retain subscriptions after this future drops.
     pub async fn terminated(&self, event: ActorTerminated, timeout: Duration) {
-        let _ = self.terminated_checked(event, timeout).await;
+        drop(crate::owned_input::Input::new(
+            self.terminated_checked(event, timeout).await,
+        ));
     }
 
     /// Same owned delivery as `terminated`, also returning the first delivery
@@ -233,32 +235,121 @@ impl DeathWatch {
         let mut deliveries: FuturesUnordered<_> = guards.into_iter().map(|guard| {
             let event = event.clone();
             async move {
-                let mut cancelled = guard.0.cancel.subscribe();
-                let Some(watcher) = guard.0.watcher.upgrade() else { return Ok(()); };
-                let Some(endpoint) = watcher.endpoint.get().cloned() else { return Ok(()); };
-                drop(watcher);
-                let Some(deadline) = deadline else { return Err(ActorError::Timeout); };
-                let delivery = std::panic::AssertUnwindSafe(async { endpoint.deliver(event).await }).catch_unwind();
-                tokio::select! {
-                    biased;
-                    _ = cancelled.wait_for(|cancelled| *cancelled) => Ok(()),
-                    result = tokio::time::timeout_at(deadline, delivery) => match result {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(_)) => Err(ActorError::Panic("termination recipient panicked".into())),
-                        Err(_) => Err(ActorError::Timeout),
-                    }
+                let failure = DeliveryFailure {
+                    target: &self.0,
+                    recorded: AtomicBool::new(false),
+                };
+                let result = async {
+                    let mut cancelled = guard.0.cancel.subscribe();
+                    let Some(watcher) = guard.0.watcher.upgrade() else { return Ok(()); };
+                    let Some(endpoint) = watcher.endpoint.get().cloned() else { return Ok(()); };
+                    let mut endpoint = RecipientInput::new(endpoint, &failure, "recipient");
+                    drop(watcher);
+                    let Some(deadline) = deadline else { return Err(ActorError::Timeout); };
+                    let future = crate::owned_input::call(|| endpoint.input.value().deliver(event))?;
+                    let mut future = RecipientInput::new(future, &failure, "delivery future");
+                    let delivery = std::future::poll_fn(|cx| {
+                        match crate::owned_input::call(|| future.input.value_mut().as_mut().poll(cx)) {
+                            Ok(poll) => poll,
+                            Err(error) => std::task::Poll::Ready(Err(error)),
+                        }
+                    });
+                    let result = tokio::select! {
+                        biased;
+                        // Release the watch read guard before any user input or
+                        // subscription cleanup can try to update this channel.
+                        _ = async { let _ = cancelled.wait_for(|cancelled| *cancelled).await; } => Ok(()),
+                        result = tokio::time::timeout_at(deadline, delivery) => {
+                            result.unwrap_or(Err(ActorError::Timeout))
+                        }
+                    };
+                    let result = future.finish(result);
+                    drop(future);
+                    endpoint.finish(result)
+                }.await;
+                if result.is_err() {
+                    failure.record();
                 }
+                result
             }
         }).collect();
-        let mut failure = None;
+        let mut failure = crate::owned_input::Input::new(None);
         while let Some(result) = deliveries.next().await {
             if let Err(error) = result {
-                self.0.failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(target = %self.id(), %error, "death-watch notification failed");
-                failure.get_or_insert(error);
+                tracing::warn!(target = %self.id(), category = error_category(&error),
+                    "death-watch notification failed");
+                if failure.value().is_none() {
+                    *failure.value_mut() = Some(error);
+                } else {
+                    drop(crate::owned_input::Input::new(error));
+                }
             }
         }
-        failure.map_or(Ok(()), Err)
+        failure.take().map_or(Ok(()), Err)
+    }
+}
+
+struct DeliveryFailure<'a> {
+    target: &'a Inner,
+    recorded: AtomicBool,
+}
+impl DeliveryFailure<'_> {
+    fn record(&self) {
+        if !self.recorded.swap(true, Ordering::Relaxed) {
+            self.target.failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+// Keep borrowed endpoint futures pinned outside polling unwind scopes. Both
+// endpoint and future retirement also remain protected on cancellation.
+struct RecipientInput<'a, T> {
+    input: crate::owned_input::Input<T>,
+    failure: &'a DeliveryFailure<'a>,
+    stage: &'static str,
+}
+impl<'a, T> RecipientInput<'a, T> {
+    fn new(value: T, failure: &'a DeliveryFailure<'a>, stage: &'static str) -> Self {
+        Self {
+            input: crate::owned_input::Input::new(value),
+            failure,
+            stage,
+        }
+    }
+    fn retire(&mut self) -> ActorResult<()> {
+        let result = self.input.retire();
+        if let Err(error) = &result {
+            self.failure.record();
+            tracing::warn!(target = %self.failure.target.id(), stage = self.stage,
+                category = error_category(error), "death-watch input disposal failed");
+        }
+        result
+    }
+    fn finish(&mut self, result: ActorResult<()>) -> ActorResult<()> {
+        match (result, self.retire()) {
+            (Err(error), _) => Err(error),
+            (Ok(()), cleanup) => cleanup,
+        }
+    }
+}
+impl<T> Drop for RecipientInput<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.retire();
+    }
+}
+
+fn error_category(error: &ActorError) -> &'static str {
+    match error {
+        ActorError::InitializationError(_) => "initialization",
+        ActorError::MessageHandlingError(_) => "message_handling",
+        ActorError::Stopped => "stopped",
+        ActorError::Timeout | ActorError::TimeoutDetail(_) => "timeout",
+        ActorError::ActorNotFound(_) => "actor_not_found",
+        ActorError::InternalError(_) => "internal",
+        ActorError::ProcessMessageError(_) => "process_message",
+        ActorError::ReplyChannelError(_) => "reply_channel",
+        ActorError::Panic(_) => "panic",
+        ActorError::Other(_) => "other",
     }
 }
 

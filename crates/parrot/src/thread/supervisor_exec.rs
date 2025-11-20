@@ -78,22 +78,32 @@ pub(crate) fn decide(
 }
 
 impl ThreadActorSystem {
-    pub(crate) async fn on_child_failure(
-        self: &Arc<Self>,
-        path: &str,
+    pub(crate) fn on_child_failure<'a>(
+        self: &'a Arc<Self>,
+        path: &'a str,
         expected: WeakMailboxRef,
-        error: Arc<parrot_api::errors::ActorError>,
+        error: impl Into<crate::error_receipt::ActorReceipt>,
         reason: DeathReason,
-    ) {
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
         self.retire_generation(path, expected, error, reason, false)
-            .await;
     }
 
-    pub(crate) async fn retire_generation(
+    pub(crate) fn retire_generation<'a>(
+        self: &'a Arc<Self>,
+        path: &'a str,
+        expected: WeakMailboxRef,
+        error: impl Into<crate::error_receipt::ActorReceipt>,
+        reason: DeathReason,
+        healthy: bool,
+    ) -> impl std::future::Future<Output = ()> + Send + 'a {
+        self.retire_generation_owned(path, expected, error.into(), reason, healthy)
+    }
+
+    async fn retire_generation_owned(
         self: &Arc<Self>,
         path: &str,
         expected: WeakMailboxRef,
-        error: Arc<parrot_api::errors::ActorError>,
+        error: crate::error_receipt::ActorReceipt,
         reason: DeathReason,
         healthy: bool,
     ) {
@@ -255,18 +265,24 @@ impl ThreadActorSystem {
             && decision == Decision::Restart
             && let Some(entry) = &supervision
         {
+            let group = policy.as_ref().and_then(|policy| policy.recovery.clone());
+            let restart_deadline = if group.is_some() {
+                deadline
+            } else {
+                self.reconstruction_deadline(deadline)
+            };
             let restart = (entry.respawn)(
                 self.clone(),
                 entry.clone(),
                 mailbox.clone(),
-                control.clone(),
-                policy.as_ref().and_then(|policy| policy.recovery.clone()),
+                control.bounded(restart_deadline),
+                group,
             );
             tokio::pin!(restart);
             result = tokio::select! {
                 biased;
                 result = &mut restart => result,
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = tokio::time::sleep_until(restart_deadline) => {
                     timed_out = true;
                     control.cancel();
                     completion.send_replace(Some(StopOutcome::TimedOut(format!("restart of {path} exceeded configured deadline"))));
@@ -289,7 +305,11 @@ impl ThreadActorSystem {
         }
         // Only cancellation is a successful stop; a panicking cancelled output
         // or failed capture disposal must remain a reported cleanup failure.
-        if control.is_cancelled() && matches!(result, Err(SystemError::ShuttingDown)) {
+        let cancelled = control.is_cancelled()
+            || lifetime
+                .recovery()
+                .is_some_and(|group| group.was_cancelled());
+        if cancelled && matches!(result, Err(SystemError::ShuttingDown)) {
             result = Ok(());
         }
         if let Some(group) = lifetime.recovery() {
@@ -546,6 +566,135 @@ mod disposal_deadline_tests {
             self.drops.fetch_add(1, Ordering::SeqCst);
             assert!(!self.panic, "supervisor capture disposal probe");
         }
+    }
+
+    async fn group_cancel_before_member_stop(capture_panics: bool) {
+        use parrot_api::supervisor::{
+            BasicDecisionFn, OneForAllStrategy, SupervisionDecision, SupervisorStrategyType,
+        };
+
+        let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
+            shared_pool_size: 1,
+            shared_burst_workers_max: 0,
+            ..Default::default()
+        });
+        let cohort = system
+            .root_cohort(SupervisorStrategyType::OneForAll(OneForAllStrategy {
+                max_restarts: 1,
+                within: Duration::from_secs(30),
+                decider: BasicDecisionFn::new(|_| SupervisionDecision::Restart),
+            }))
+            .await
+            .unwrap();
+        let actor_drops = Arc::new(AtomicUsize::new(0));
+        let capture_drops = Arc::new(AtomicUsize::new(0));
+        let capture = Capture {
+            drops: capture_drops.clone(),
+            panic: capture_panics,
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        let (entered, ready) = oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        let drops = actor_drops.clone();
+        let actor = system
+            .spawn_supervised_in_cohort(
+                move || {
+                    let _capture = &capture;
+                    if count.fetch_add(1, Ordering::SeqCst) == 1 {
+                        entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                        blocked
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(8))
+                            .unwrap();
+                    }
+                    Probe(drops.clone())
+                },
+                "/group-cancel-before-stop",
+                Default::default(),
+                &cohort,
+            )
+            .await
+            .unwrap();
+        let lifetime = system
+            .registry
+            .read()
+            .unwrap()
+            .get("/group-cancel-before-stop")
+            .unwrap()
+            .dynamic()
+            .unwrap()
+            .lifetime
+            .clone();
+        let owned = system.clone();
+        let address = actor.mailbox_cell().lock().unwrap().clone();
+        let work = system.retirement_runtime().spawn(async move {
+            owned
+                .on_child_failure(
+                    "/group-cancel-before-stop",
+                    address,
+                    Arc::new(ActorError::InternalError("controlled recovery".into())),
+                    DeathReason::Failed("controlled recovery".into()),
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(8), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let control = system
+            .registry
+            .read()
+            .unwrap()
+            .get("/group-cancel-before-stop")
+            .unwrap()
+            .dynamic()
+            .unwrap()
+            .restart_cancel
+            .clone()
+            .unwrap();
+        // Cancel the epoch without polling any member stop. This fixes the
+        // ordering that otherwise races the independent retirement driver.
+        cohort.scope.close();
+        assert!(lifetime.recovery().unwrap().was_cancelled());
+        assert!(!control.is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), work)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = lifetime.wait().await;
+        if capture_panics {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("supervisor capture disposal probe")
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "group cancellation became a retirement failure: {result:?}"
+            );
+        }
+        assert_eq!(actor_drops.load(Ordering::SeqCst), 2);
+        assert_eq!(capture_drops.load(Ordering::SeqCst), 1);
+        assert!(!control.is_cancelled());
+        let stopped = cohort.stop().await;
+        assert_eq!(stopped.is_err(), capture_panics);
+        system.shutdown_internal().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_cancellation_before_member_stop_is_successful_retirement() {
+        group_cancel_before_member_stop(false).await;
+    }
+
+    #[tokio::test]
+    async fn group_cancellation_before_member_stop_preserves_capture_panic() {
+        group_cancel_before_member_stop(true).await;
     }
 
     type DisposalGate = (oneshot::Sender<()>, oneshot::Receiver<()>);

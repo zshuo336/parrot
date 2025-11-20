@@ -25,6 +25,18 @@ use std::{
         Arc, Mutex,
     },
 };
+
+mod budget;
+mod lifecycle;
+mod messaging;
+mod policy;
+mod recording;
+mod service_policy;
+mod services;
+pub use messaging::{NativeMessageGrant, NativeMessageOperation};
+pub use policy::NativeMessagingPolicy;
+pub use service_policy::NativeServicePolicy;
+pub use services::{NativeServiceGrant, NativeServiceOperation};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 /// Maximum live native workers per spawner and all its clones.
@@ -100,22 +112,25 @@ enum Command {
     Message {
         key: String,
         payload: Vec<u8>,
-        parent: Option<AbiTraceParentV1>,
+        context: Option<TraceContext>,
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
     },
-    Drain(oneshot::Sender<NativeResult>),
+    Drain {
+        context: Option<TraceContext>,
+        reply: oneshot::Sender<NativeResult>,
+    },
     Stop,
 }
 #[derive(Clone)]
 struct Control {
     commands: mpsc::Sender<Command>,
     finished: watch::Receiver<Option<NativeResult>>,
-    stop_requested: Arc<AtomicBool>,
+    stop_requested: Arc<lifecycle::StopRequest>,
     worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 impl Control {
     fn request_stop(&self) {
-        self.stop_requested.store(true, Ordering::Release);
+        self.stop_requested.request();
         // A full queue already wakes the worker; it checks the flag before
         // executing another command. Never block a destructor on queue space.
         let _ = self.commands.try_send(Command::Stop);
@@ -148,9 +163,10 @@ impl Control {
         }
     }
     async fn drain(&self) -> NativeResult {
+        let context = TraceContext::current();
         let (reply, result) = oneshot::channel();
         self.commands
-            .send(Command::Drain(reply))
+            .send(Command::Drain { context, reply })
             .await
             .map_err(|_| "native worker closed".to_string())?;
         result
@@ -158,16 +174,13 @@ impl Control {
             .map_err(|_| "native drain lost its acknowledgement".to_string())?
     }
     async fn message(&self, key: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-        let parent = TraceContext::current().map(|context| AbiTraceParentV1 {
-            trace_id: context.trace_id(),
-            span_id: context.span_id(),
-        });
+        let context = TraceContext::current();
         let (reply, result) = oneshot::channel();
         self.commands
             .send(Command::Message {
                 key,
                 payload,
-                parent,
+                context,
                 reply,
             })
             .await
@@ -177,8 +190,19 @@ impl Control {
             .map_err(|_| "native message lost its acknowledgement".to_string())?
     }
 }
+struct NativeInitialization {
+    path: String,
+    artifact: NativeArtifact,
+    config: String,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    messaging: messaging::Binding,
+    service_grants: Vec<NativeServiceGrant>,
+}
+type Startup = oneshot::Receiver<Result<(), DeployError>>;
 struct DylibActor {
-    control: Control,
+    control: Option<Control>,
+    initialization: Option<NativeInitialization>,
+    startup: Option<oneshot::Sender<Result<(), DeployError>>>,
     admission: Arc<Admission>,
     cleanup_reported: bool,
 }
@@ -187,9 +211,11 @@ impl Drop for DylibActor {
         // Failed actors deliberately skip before_stop. Managed Thread disposal
         // runs on an isolated cleanup worker; retain that owner until native
         // drain/destroy/unload and the native OS thread have really completed.
-        if let Err(error) = self.control.join_blocking() {
-            if !self.cleanup_reported {
-                panic!("native worker retirement failed: {error}");
+        if let Some(control) = &self.control {
+            if let Err(error) = control.join_blocking() {
+                if !self.cleanup_reported {
+                    panic!("native worker retirement failed: {error}");
+                }
             }
         }
     }
@@ -200,6 +226,30 @@ fn native_error(error: String) -> ActorError {
 impl Actor for DylibActor {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
+    fn init<'a>(&'a mut self, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            let result = async {
+                let mut initialization = self.initialization.take().ok_or_else(|| {
+                    DeployError::Engine("native initialization already consumed".into())
+                })?;
+                // The engine reserves the actual actor path before invoking init.
+                let services =
+                    services::Binding::new(ctx, std::mem::take(&mut initialization.service_grants));
+                let (control, started) = start_worker(initialization, services)?;
+                // Retain the worker before suspension so failed or cancelled init
+                // still joins native cleanup through this actor's owned disposal.
+                self.control = Some(control);
+                started
+                    .await
+                    .map_err(|_| DeployError::Engine("native constructor worker exited".into()))?
+            }
+            .await;
+            if let Some(startup) = self.startup.take() {
+                let _ = startup.send(result.clone());
+            }
+            result.map_err(|error| ActorError::InitializationError(error.to_string()))
+        })
+    }
     fn receive_message<'a>(
         &'a mut self,
         msg: BoxedMessage,
@@ -211,7 +261,12 @@ impl Actor for DylibActor {
                     hook_phase::START => {} // ABI construct already completed.
                     hook_phase::DRAIN | hook_phase::STOP => {
                         self.admission.0.store(true, Ordering::Release);
-                        self.control.drain().await.map_err(native_error)?;
+                        self.control
+                            .as_ref()
+                            .expect("initialized native worker")
+                            .drain()
+                            .await
+                            .map_err(native_error)?;
                     }
                     _ => return Err(native_error("invalid hook phase".into())),
                 }
@@ -226,6 +281,8 @@ impl Actor for DylibActor {
             };
             let reply = self
                 .control
+                .as_ref()
+                .expect("initialized native worker")
                 .message(key, payload)
                 .await
                 .map_err(native_error)?;
@@ -235,7 +292,10 @@ impl Actor for DylibActor {
     fn before_stop<'a>(&'a mut self, _: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         self.admission.0.store(true, Ordering::Release);
         Box::pin(async move {
-            let result = self.control.stop().await;
+            let result = match &self.control {
+                Some(control) => control.stop().await,
+                None => Ok(()),
+            };
             self.cleanup_reported = result.is_err();
             result.map_err(native_error)
         })
@@ -264,16 +324,38 @@ pub(super) fn digest_hex(digest: &str) -> Result<String, DeployError> {
 pub(super) struct DylibHost {
     trusted: BTreeSet<String>,
     workers: Arc<Semaphore>,
+    messaging: Vec<NativeMessageGrant>,
+    services: Vec<NativeServiceGrant>,
 }
 impl Default for DylibHost {
     fn default() -> Self {
         Self {
             trusted: BTreeSet::new(),
             workers: Arc::new(Semaphore::new(MAX_WORKERS)),
+            messaging: Vec::new(),
+            services: Vec::new(),
         }
     }
 }
 impl DylibHost {
+    pub(super) fn with_services(
+        &self,
+        mut grants: Vec<NativeServiceGrant>,
+    ) -> Result<Self, DeployError> {
+        services::validate(&mut grants)?;
+        let mut host = self.clone();
+        host.services = grants;
+        Ok(host)
+    }
+    pub(super) fn with_messaging(
+        &self,
+        mut grants: Vec<NativeMessageGrant>,
+    ) -> Result<Self, DeployError> {
+        messaging::validate(&mut grants)?;
+        let mut host = self.clone();
+        host.messaging = grants;
+        Ok(host)
+    }
     pub(super) fn authorize(&self, digest: &str) -> Result<Self, DeployError> {
         let mut host = self.clone();
         host.trusted.insert(digest_hex(digest)?);
@@ -330,16 +412,22 @@ impl DylibHost {
             })?;
         // Preserve all business TOML values under config, without reserving or
         // overwriting any of their keys. Self identity has a separate envelope.
+        #[derive(serde::Serialize)]
+        struct ConstructorConfig<'a> {
+            self_path: &'a str,
+            config: &'a toml::Table,
+        }
+        let empty = toml::Table::new();
         let mut configs = Vec::new();
         for path in &cleanup.paths {
-            let envelope = toml::Table::from_iter([
-                ("self_path".into(), toml::Value::String(path.clone())),
-                (
-                    "config".into(),
-                    toml::Value::Table(config.cloned().unwrap_or_default()),
-                ),
-            ]);
-            let cfg = toml::to_string(&envelope).map_err(|e| DeployError::Config(e.to_string()))?;
+            let envelope = ConstructorConfig {
+                self_path: path,
+                config: config.unwrap_or(&empty),
+            };
+            let cfg =
+                crate::encoding::canonical(&envelope, MAX_CONFIG_BYTES as u64).map_err(|e| {
+                    DeployError::Config(format!("native constructor configuration: {e}"))
+                })?;
             if cfg.len() > MAX_CONFIG_BYTES {
                 return Err(DeployError::Config(
                     "native constructor configuration exceeds byte limit".into(),
@@ -351,10 +439,11 @@ impl DylibHost {
             return Err(DeployError::Engine("dylib caller cancelled".into()));
         }
         let digest = digest.to_owned();
+        let preparation_digest = digest.clone();
         let artifact = engine
             .runtime_handle()
             .spawn_blocking(move || {
-                NativeArtifact::prepare(&path, &digest, NativeArtifactLimits::default())
+                NativeArtifact::prepare(&path, &preparation_digest, NativeArtifactLimits::default())
                     .map_err(load_error)
             })
             .await
@@ -366,10 +455,29 @@ impl DylibHost {
                     return Err(DeployError::Engine("dylib caller cancelled".into()));
                 }
                 let permit = permits.split(1).expect("reserved native worker");
-                let control = start_worker(artifact.clone(), cfg, permit).await?;
                 let admission = Arc::new(Admission::default());
+                let (startup, started) = oneshot::channel();
                 let actor = DylibActor {
-                    control: control.clone(),
+                    control: None,
+                    initialization: Some(NativeInitialization {
+                        path: path.clone(),
+                        artifact: artifact.clone(),
+                        config: cfg,
+                        permit,
+                        messaging: messaging::Binding::new(engine, path, &digest, &self.messaging),
+                        service_grants: self
+                            .services
+                            .iter()
+                            .filter(|grant| {
+                                grant.source_path == *path
+                                    && grant.artifact_digest.eq_ignore_ascii_case(
+                                        digest.strip_prefix("sha256:").unwrap_or(&digest),
+                                    )
+                            })
+                            .cloned()
+                            .collect(),
+                    }),
+                    startup: Some(startup),
                     admission: admission.clone(),
                     cleanup_reported: false,
                 };
@@ -377,19 +485,25 @@ impl DylibHost {
                     message_admission: Some(admission),
                     ..Default::default()
                 };
-                match engine.spawn_at(actor, path, None, actor_config).await {
-                    Ok(actor) => Ok(Box::new(actor) as BoxedActorRef),
-                    Err(error) => {
-                        let cleanup = control.stop().await;
-                        Err(DeployError::Engine(format!(
-                            "spawn {path}: {error}; native cleanup: {cleanup:?}"
-                        )))
-                    }
-                }
+                engine
+                    .spawn_at(actor, path, None, actor_config)
+                    .await
+                    .map(|actor| (Box::new(actor) as BoxedActorRef, started))
+                    .map_err(|error| DeployError::Engine(format!("spawn {path}: {error}")))
             }
             .await;
             match result {
-                Ok(actor) => owned.push(actor),
+                Ok((actor, started)) => {
+                    owned.push(actor);
+                    let result = started.await.unwrap_or_else(|_| {
+                        Err(DeployError::Engine(
+                            "native initializer retired before startup acknowledgement".into(),
+                        ))
+                    });
+                    if let Err(error) = result {
+                        return Err(cleanup.rollback(owned, error).await);
+                    }
+                }
                 Err(error) => return Err(cleanup.rollback(owned, error).await),
             }
         }
@@ -397,85 +511,191 @@ impl DylibHost {
     }
 }
 
-async fn start_worker(
-    artifact: NativeArtifact,
-    config: String,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) -> Result<Control, DeployError> {
+fn start_worker(
+    initialization: NativeInitialization,
+    services: services::Binding,
+) -> Result<(Control, Startup), DeployError> {
+    let NativeInitialization {
+        path,
+        artifact,
+        config,
+        permit,
+        messaging,
+        service_grants: _,
+    } = initialization;
     let (commands, mut receiver) = mpsc::channel(1);
     let (completed, finished) = watch::channel(None);
     let (ready, started) = oneshot::channel();
-    let stop_requested = Arc::new(AtomicBool::new(false));
+    let initialization_context = TraceContext::current();
+    let stop_requested = Arc::new(lifecycle::StopRequest::default());
     let worker_stop = stop_requested.clone();
     let worker = std::thread::Builder::new()
         .name("parrot-native-actor".into())
         .spawn(move || {
-            let worker_permit = permit;
-            // SAFETY: only the unsafe exact-digest authorization can reach here.
-            // The worker exclusively owns the handle, instance, and call buffers.
-            let handle = match unsafe { artifact.load() } {
-                Ok(handle) => handle,
-                Err(error) => {
-                    let _ = ready.send(Err(load_error(error)));
-                    return;
-                }
-            };
-            let component = match DylibLoader.construct(&handle, &config) {
-                Ok(component) => component,
-                Err(error) => {
-                    let _ = DylibLoader.unload_blocking(handle);
-                    let _ = ready.send(Err(load_error(error)));
-                    return;
-                }
-            };
-            if ready.send(Ok(())).is_ok() {
-                while let Some(command) = receiver.blocking_recv() {
-                    if worker_stop.load(Ordering::Acquire) {
-                        break;
+            let mut services = services::State::new(services);
+            // Never reuse guest span handles across construction, messages,
+            // drain or destruction, including failed startup cleanup.
+            let mut next_span_handle = 1;
+            let result = (|| {
+                // SAFETY: only the unsafe exact-digest authorization can reach here.
+                // The worker exclusively owns the handle, instance, and call buffers.
+                let handle = match lifecycle::run(
+                    initialization_context.clone(),
+                    "load",
+                    &path,
+                    || unsafe { artifact.load() },
+                    lifecycle::load_status,
+                ) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        let _ = ready.send(Err(load_error(error)));
+                        return Ok(());
                     }
-                    match command {
-                        Command::Message {
-                            key,
-                            payload,
-                            parent,
-                            reply,
-                        } => {
-                            let mut buffer = vec![0; MAX_MESSAGE_BYTES];
-                            let mut out = AbiReplyBuf::new(&mut buffer);
-                            let result = unsafe {
-                                DylibLoader.handle_msg_with_trace(
-                                    &handle,
-                                    component,
-                                    AbiMsg::new(&key, &payload),
-                                    &mut out,
-                                    parent.as_ref(),
-                                )
-                            }
-                            .map_err(|(code, detail)| format!("native code {code}: {detail}"))
-                            .and_then(|()| {
-                                if out.written as usize > buffer.len() {
-                                    return Err("native reply length exceeds host buffer".into());
+                };
+                let component = match lifecycle::run(
+                    initialization_context.clone(),
+                    "construct",
+                    &path,
+                    || lifecycle::construct(&handle, &config, &mut next_span_handle),
+                    lifecycle::load_status,
+                ) {
+                    Ok(component) => component,
+                    Err(error) => {
+                        let cleanup = lifecycle::run(
+                            initialization_context.clone(),
+                            "retire",
+                            &path,
+                            || lifecycle::unload(handle, &mut next_span_handle),
+                            lifecycle::unload_status,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                        let _ = ready.send(Err(load_error(error)));
+                        return cleanup;
+                    }
+                };
+                let published = ready.send(Ok(())).is_ok();
+                let mut drain_result = None;
+                if published {
+                    while let Some(command) = receiver.blocking_recv() {
+                        if worker_stop.requested() {
+                            break;
+                        }
+                        match command {
+                            Command::Message {
+                                key,
+                                payload,
+                                context,
+                                reply,
+                            } => {
+                                let mut buffer = vec![0; MAX_MESSAGE_BYTES];
+                                let mut out = AbiReplyBuf::new(&mut buffer);
+                                let parent = context.as_ref().map(|context| AbiTraceParentV1 {
+                                    trace_id: context.trace_id(),
+                                    span_id: context.span_id(),
+                                });
+                                let budget = budget::Budget::default();
+                                let mut messages =
+                                    messaging.session_with_budget(context.clone(), budget.clone());
+                                let message_host = messages.host();
+                                let mut discovery = services.session(budget.clone());
+                                let service_host = discovery.host();
+                                let mut session =
+                                    recording::Session::new(context, &mut next_span_handle);
+                                let host = session.host();
+                                let mut result = unsafe {
+                                    DylibLoader.handle_msg_with_services(
+                                        &handle,
+                                        component,
+                                        AbiMsg::new(&key, &payload),
+                                        &mut out,
+                                        parent.as_ref(),
+                                        Some(&host),
+                                        Some(&message_host),
+                                        Some(&service_host),
+                                    )
+                                };
+                                messages.complete(&mut result);
+                                if result.is_ok() && out.written as usize > buffer.len() {
+                                    result = Err((
+                                        parrot_abi::ABI_ERR_OVERFLOW,
+                                        "native reply length exceeds host buffer".into(),
+                                    ));
                                 }
-                                buffer.truncate(out.written as usize);
-                                Ok(buffer)
-                            });
-                            let _ = reply.send(result);
+                                session.complete(&mut result);
+                                let result = result
+                                    .map_err(|(code, detail)| {
+                                        format!("native code {code}: {detail}")
+                                    })
+                                    .map(|()| {
+                                        buffer.truncate(out.written as usize);
+                                        buffer
+                                    });
+                                let _ = reply.send(result);
+                            }
+                            Command::Drain { context, reply } => {
+                                let result = drain_result
+                                    .get_or_insert_with(|| {
+                                        lifecycle::run(
+                                            context,
+                                            "drain",
+                                            &path,
+                                            || unsafe {
+                                                lifecycle::drain(
+                                                    &handle,
+                                                    component,
+                                                    &mut next_span_handle,
+                                                )
+                                            },
+                                            lifecycle::drain_status,
+                                        )
+                                        .map_err(
+                                            |(code, detail)| {
+                                                format!("native code {code}: {detail}")
+                                            },
+                                        )
+                                    })
+                                    .clone();
+                                let _ = reply.send(result);
+                            }
+                            Command::Stop => break,
                         }
-                        Command::Drain(reply) => {
-                            let result = unsafe { DylibLoader.drain_instance(&handle, component) }
-                                .map_err(|(code, detail)| format!("native code {code}: {detail}"));
-                            let _ = reply.send(result);
-                        }
-                        Command::Stop => break,
                     }
                 }
-            }
-            let result = DylibLoader
-                .unload_blocking(handle)
+                let retirement_context = if worker_stop.requested() {
+                    worker_stop.take_context()
+                } else if !published {
+                    initialization_context.clone()
+                } else {
+                    None
+                };
+                lifecycle::run(
+                    retirement_context,
+                    "retire",
+                    &path,
+                    || {
+                        if drain_result.is_none() {
+                            let _ = lifecycle::run(
+                                TraceContext::current(),
+                                "drain",
+                                &path,
+                                || unsafe {
+                                    lifecycle::drain(&handle, component, &mut next_span_handle)
+                                },
+                                lifecycle::drain_status,
+                            );
+                        }
+                        lifecycle::unload(handle, &mut next_span_handle)
+                    },
+                    lifecycle::unload_status,
+                )
                 .map(|_| ())
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string())
+            })();
+            let result = result.and(services.retire());
+            drop(services);
             drop(artifact);
-            drop(worker_permit);
+            drop(permit);
             // Receipt follows drain, destroy, dlclose and release of this worker's
             // staging reference and capacity. Siblings may still own the snapshot.
             completed.send_replace(Some(result));
@@ -487,28 +707,5 @@ async fn start_worker(
         stop_requested,
         worker: Arc::new(Mutex::new(Some(worker))),
     };
-    match started.await {
-        Ok(Ok(())) => Ok(control),
-        result => {
-            // Construction failed before publication. Reap its owned OS thread
-            // before returning the construction error; no actor Drop owns it yet.
-            let worker = control
-                .worker
-                .lock()
-                .unwrap()
-                .take()
-                .expect("unpublished worker");
-            tokio::task::spawn_blocking(move || worker.join())
-                .await
-                .map_err(|error| DeployError::Engine(format!("native constructor join: {error}")))?
-                .map_err(|_| DeployError::Engine("native constructor worker panicked".into()))?;
-            match result {
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(DeployError::Engine(
-                    "native constructor worker exited".into(),
-                )),
-                Ok(Ok(())) => unreachable!(),
-            }
-        }
-    }
+    Ok((control, started))
 }

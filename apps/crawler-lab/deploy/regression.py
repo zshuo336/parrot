@@ -12,6 +12,46 @@ from launcher import Launcher, ROOT, RunFailure, arguments
 GOLDEN = ROOT / 'apps/crawler-lab/golden/pre_migration_output.txt'
 
 
+def strict_json(text):
+    def fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate JSON field: ' + key)
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError('non-JSON numeric constant: ' + value)
+
+    try:
+        return json.loads(text, object_pairs_hook=fields, parse_constant=constant)
+    except ValueError as error:
+        raise RunFailure('invalid regression JSON: ' + str(error)) from error
+
+
+def built_application(output):
+    candidates = []
+    source = ROOT / 'apps/crawler-lab/src/main.rs'
+    for line in output.splitlines():
+        # Cargo diagnostics and build-script output may share the guardian log.
+        if not line.startswith('{'):
+            continue
+        event = strict_json(line)
+        if not isinstance(event, dict) or event.get('reason') != 'compiler-artifact':
+            continue
+        target = event.get('target', {})
+        if (target.get('name') == 'crawler-lab' and target.get('kind') == ['bin']
+                and target.get('src_path') == str(source)
+                and event.get('profile', {}).get('test') is False):
+            executable = event.get('executable')
+            if isinstance(executable, str) and Path(executable).is_absolute():
+                candidates.append(Path(executable))
+    if len(candidates) != 1 or not candidates[0].is_file() or not os.access(candidates[0], os.X_OK):
+        raise RunFailure('Cargo did not identify exactly one runnable crawler-lab application')
+    return candidates[0]
+
+
 def observations(text):
     patterns = {
         'crawl': r'\[lab\] 爬取完成：fetched=(\d+)（去重后）pushed_total=(\d+) 耗时 .+',
@@ -34,7 +74,7 @@ def observations(text):
             if match:
                 # Preserve JSON token types and reject malformed JSON. The
                 # historical key order is not a semantic part of the contract.
-                value = json.loads(match[1]) if key in ('index', 'health') else match.groups()
+                value = strict_json(match[1]) if key in ('index', 'health') else match.groups()
                 if key == 'ray':
                     if match[3] is not None and match[3] != match[1]:
                         raise RunFailure('inconsistent historical local term count')
@@ -42,8 +82,8 @@ def observations(text):
                 put(key, value)
         match = re.fullmatch(r'\[lab\] search (\[.+\]) → (\[.*\])', line)
         if match:
-            query = json.dumps(json.loads(match[1]), ensure_ascii=False)
-            put('search ' + query, json.loads(match[2]))
+            query = json.dumps(strict_json(match[1]), ensure_ascii=False)
+            put('search ' + query, strict_json(match[2]))
     if set(values) != set(patterns) | {
         'search ["parrot"]', 'search ["actor", "cluster"]',
         'search ["crawler", "index", "search"]', 'search ["raft", "swim"]',
@@ -65,9 +105,10 @@ class Regression(Launcher):
     def execute(self):
         build_components = self.spawn('build-components', ['make', 'build-crawler-components'])
         self.completed(build_components)
-        build = self.spawn('build-rust', [os.environ.get('CARGO', 'cargo'), 'build', '--locked', '-p', 'crawler-lab'])
+        build = self.spawn('build-rust', [os.environ.get('CARGO', 'cargo'), 'build', '--locked',
+                                        '-p', 'crawler-lab', '--bin', 'crawler-lab', '--message-format=json'])
         self.completed(build)
-        os.environ['PARROT_LAB_BIN'] = str(ROOT / 'target/debug/crawler-lab')
+        os.environ['PARROT_LAB_BIN'] = str(built_application(build.text()))
         super().execute()
         app = next(child for child in self.children if child.name == 'app')
         compare(GOLDEN.read_text(), app.text())

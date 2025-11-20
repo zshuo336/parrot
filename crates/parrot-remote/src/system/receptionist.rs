@@ -1,5 +1,7 @@
-//! Direct-peer discovery uses the system's owned lifetime and verified link identity.
-use super::RemoteActorSystem;
+//! Source-bound discovery uses the system's owned lifetime and verified link identity.
+pub(super) mod routes;
+pub(super) mod segments;
+use super::{MembershipOwner, RemoteActorSystem};
 use crate::{
     acl::AclDecision,
     frame::{frame_type, Frame, FrameHeader, PROTOCOL_VERSION, SEQ_NONE},
@@ -52,22 +54,33 @@ impl RemoteActorSystem {
             .gossip_interval
             .max(Duration::from_millis(1));
         self.spawn_background(async move {
+            let mut outgoing = segments::Outgoing::default();
+            let mut send_cursor = 0usize;
             let mut ticker = tokio::time::interval(period);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                // Do not retain the system while waiting on its public membership lock.
-                let members = membership.lock().await;
-                let Some(system) = weak.upgrade() else { break };
+                let mut retired_assemblies = segments::RetiredAssemblies::default();
+                let Some(owner) = MembershipOwner::acquire(&weak, &membership).await else { break };
+                let system = &owner.system;
+                let members = &owner.members;
+                let gate = system.link_gate.lock().unwrap();
+                if system.is_closing() { break; }
+                let senders = current_senders(system);
+                retired_assemblies.extend(system.receptionist_assemblies.lock().unwrap().prune(std::time::Instant::now()));
                 let available: HashSet<_> = members
                     .members
                     .values()
                     .filter(|member| member.status != MemberStatus::Dead)
                     .map(|member| member.node_id.clone())
                     .collect();
-                let (snapshot, notifications) = {
+                let (snapshot, routed, notifications) = {
+                    let mut routes = system.receptionist_routes.lock().unwrap();
                     let mut table = system.receptionist.lock().unwrap();
                     let mut notifications = Notifications::default();
+                    for event in routes.prune(&senders.iter().map(FrameSender::dispatch_key).collect(), &available, &mut table) {
+                        notifications.extend(table.broadcast_deferred(&event));
+                    }
                     for event in table.remove_unavailable(&system.config.node_id, &available) {
                         notifications.extend(table.broadcast_deferred(&event));
                     }
@@ -75,24 +88,24 @@ impl RemoteActorSystem {
                         from: system.config.node_id.clone(),
                         entries: table.snapshot(&system.config.node_id),
                     };
-                    (snapshot, notifications)
+                    let routed = routes.snapshot(snapshot.clone(), "");
+                    (snapshot, routed, notifications)
                 };
-                drop(members);
+                drop(gate);
+                let system = owner.release();
+                drop(retired_assemblies);
                 if let Err(error) = notifications.dispatch() {
-                    tracing::warn!(%error, "receptionist retirement notification failed");
+                    super::diagnostic(|| tracing::warn!(%error, "receptionist retirement notification failed"));
                 }
                 let payload = encode_sync(&snapshot);
                 let mut legacy_payload = None;
-                let mut seen = HashSet::new();
-                let senders: Vec<_> = system
-                    .links
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .rev()
-                    .filter(|(node, sender, _)| !sender.is_closed() && seen.insert(node.clone()))
-                    .map(|(_, sender, _)| sender.clone())
-                    .collect();
+                let mut senders = senders;
+                if !senders.is_empty() {
+                    let count = senders.len();
+                    senders.rotate_left(send_cursor % count);
+                    send_cursor = send_cursor.wrapping_add(1);
+                }
+                outgoing.prune(&senders.iter().map(FrameSender::dispatch_key).collect());
                 for sender in senders {
                     if system
                         .config
@@ -103,7 +116,19 @@ impl RemoteActorSystem {
                     {
                         // A bounded full queue drops this attempt. The next periodic
                         // complete snapshot repairs lost registration AND withdrawal.
-                        let payload =
+                        let routed_payload;
+                        let payload = if sender.peer_capabilities() & caps::RECEPTIONIST_ROUTES != 0 {
+                            let mut projected = routed.clone();
+                            projected.views.retain(|view| !view.path.iter().any(|node| node == sender.node_id()));
+                            if sender.peer_capabilities() & caps::RECEPTIONIST_NATIVE_PATHS == 0 {
+                                for view in &mut projected.views {
+                                    view.entries.retain(|entry| crate::mirror::remote_shadow(&entry.remote_path).is_some());
+                                }
+                                projected.views.retain(|view| !view.entries.is_empty());
+                            }
+                            routed_payload = routes::encode(&projected);
+                            &routed_payload
+                        } else {
                             if sender.peer_capabilities() & caps::RECEPTIONIST_NATIVE_PATHS != 0 {
                                 &payload
                             } else {
@@ -121,8 +146,11 @@ impl RemoteActorSystem {
                                             .collect(),
                                     })
                                 })
-                            };
-                        let _ = sender.send_frame_sync(frame(payload.clone()));
+                            }
+                        };
+                        if let Err(error) = outgoing.send(&sender, payload) {
+                            super::diagnostic(|| tracing::debug!(node = sender.node_id(), %error, "receptionist synchronization deferred"));
+                        }
                     }
                 }
             }
@@ -130,35 +158,160 @@ impl RemoteActorSystem {
     }
 }
 
+fn current_senders(system: &RemoteActorSystem) -> Vec<FrameSender> {
+    let mut seen = HashSet::new();
+    system
+        .links
+        .read()
+        .unwrap()
+        .iter()
+        .rev()
+        .filter(|link| !link.sender.is_closed() && seen.insert(link.node_id().to_owned()))
+        .map(|link| link.sender.clone())
+        .collect()
+}
+
 pub(super) async fn receive(weak: Weak<RemoteActorSystem>, body: &[u8], back: &FrameSender) {
     let Ok(sync) = decode_sync(body) else {
         back.close();
         return;
     };
+    if sync.from != back.node_id() {
+        back.close();
+        return;
+    }
+    receive_views(
+        weak,
+        vec![routes::Advertisement {
+            path: vec![sync.from],
+            entries: sync.entries,
+        }],
+        back,
+        false,
+    )
+    .await;
+}
+
+pub(super) async fn receive_routes(weak: Weak<RemoteActorSystem>, body: &[u8], back: &FrameSender) {
+    let decoded: Result<routes::Sync, _> = parrot_api::message::serde_remote_deserialize(body);
+    let Ok(sync) = decoded else {
+        back.close();
+        return;
+    };
+    if sync.from != back.node_id()
+        || back.peer_capabilities() & caps::RECEPTIONIST_ROUTES == 0
+        || sync.views.len() > routes::MAX_VIEWS
+    {
+        back.close();
+        return;
+    }
+    receive_views(weak, sync.views, back, true).await;
+}
+
+fn project_views(
+    system: &RemoteActorSystem,
+    views: Vec<routes::Advertisement>,
+    back: &FrameSender,
+    routed: bool,
+) -> Result<Vec<routes::Advertisement>, ()> {
+    let mut owners = HashSet::new();
+    let mut keys = HashSet::new();
+    let mut result = Vec::new();
+    for view in views {
+        if view.path.is_empty()
+            || view.path.len() > routes::MAX_HOPS
+            || view.path.last().is_none_or(|node| node != back.node_id())
+            || view.path.iter().any(|node| {
+                node == &system.config.node_id
+                    || parrot_config::endpoint::validate_node_id(node).is_err()
+            })
+            || view.path.iter().collect::<HashSet<_>>().len() != view.path.len()
+        {
+            return Err(());
+        }
+        let owner = view.path[0].clone();
+        owners.insert(owner.clone());
+        if owners.len() > routes::MAX_ORIGINS {
+            return Err(());
+        }
+        if !routed && owner != back.node_id() {
+            return Err(());
+        }
+        let mut grouped: std::collections::BTreeMap<_, Vec<_>> = std::collections::BTreeMap::new();
+        let mut unique = HashSet::new();
+        for entry in view.entries {
+            if entry.node != owner
+                || crate::receptionist::validate_event(&entry.key, &entry.remote_path).is_err()
+                || crate::actor_path::split(&entry.remote_path).is_none_or(|(node, local)| {
+                    node != owner
+                        || (local.starts_with("actix://")
+                            && back.peer_capabilities() & caps::RECEPTIONIST_NATIVE_PATHS == 0)
+                })
+            {
+                return Err(());
+            }
+            let allowed = system
+                .config
+                .receptionist_acl
+                .check(&owner, entry.key.as_str())
+                == AclDecision::Allow;
+            if owner == back.node_id() && !allowed {
+                return Err(());
+            }
+            if !allowed
+                || (owner != back.node_id()
+                    && system
+                        .config
+                        .receptionist_relay_acl
+                        .check(back.node_id(), entry.key.as_str())
+                        != AclDecision::Allow)
+            {
+                continue;
+            }
+            if unique.insert(entry.clone()) {
+                grouped
+                    .entry(entry.key.as_str().to_owned())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+        for (key, entries) in grouped {
+            if !keys.insert((owner.clone(), key)) {
+                return Err(());
+            }
+            result.push(routes::Advertisement {
+                path: view.path.clone(),
+                entries,
+            });
+            if result.len() > routes::MAX_VIEWS {
+                return Err(());
+            }
+        }
+    }
+    Ok(result)
+}
+
+async fn receive_views(
+    weak: Weak<RemoteActorSystem>,
+    views: Vec<routes::Advertisement>,
+    back: &FrameSender,
+    routed: bool,
+) {
     let membership = {
         let Some(system) = weak.upgrade() else { return };
         system.membership.clone()
     };
-    let members = membership.lock().await;
-    let Some(system) = weak.upgrade() else { return };
-    if sync.from != back.node_id()
-        || sync.from == system.config.node_id
-        || !system.config.security.control_policy().allows_cluster(back)
+    let Some(owner) = MembershipOwner::acquire(&weak, &membership).await else {
+        return;
+    };
+    let system = &owner.system;
+    let members = &owner.members;
+    let projected = project_views(system, views, back, routed);
+    if !system.config.security.control_policy().allows_cluster(back)
         || back.peer_capabilities() & caps::RECEPTIONIST_SYNC == 0
-        || sync.entries.iter().any(|entry| {
-            entry.node != sync.from
-                || crate::actor_path::split(&entry.remote_path).is_none_or(|(node, local)| {
-                    node != sync.from
-                        || (local.starts_with("actix://")
-                            && back.peer_capabilities() & caps::RECEPTIONIST_NATIVE_PATHS == 0)
-                })
-                || system
-                    .config
-                    .receptionist_acl
-                    .check(&sync.from, entry.key.as_str())
-                    != AclDecision::Allow
-        })
+        || projected.is_err()
     {
+        let _system = owner.release();
         back.close();
         return;
     }
@@ -166,29 +319,113 @@ pub(super) async fn receive(weak: Weak<RemoteActorSystem>, body: &[u8], back: &F
     // queued frames from dead or superseded connections cannot revive old services.
     if members
         .members
-        .get(&sync.from)
+        .get(back.node_id())
         .is_none_or(|member| member.status == MemberStatus::Dead)
     {
         return;
     }
     let _gate = system.link_gate.lock().unwrap();
-    if *system.shutdown_tx.borrow()
+    if system.is_closing()
         || system
-            .direct_sender_of(&sync.from)
+            .direct_sender_of(back.node_id())
             .is_none_or(|current| !current.same_connection(back))
     {
         return;
     }
+    let available: HashSet<_> = members
+        .members
+        .values()
+        .filter(|member| member.status != MemberStatus::Dead)
+        .map(|member| member.node_id.clone())
+        .collect();
+    let mut views = projected.unwrap();
+    views.retain(|view| view.path.iter().all(|node| available.contains(node)));
+    let senders = current_senders(system);
+    let current = senders.iter().map(FrameSender::dispatch_key).collect();
+    system.reconcile_membership_routes(members);
+    let mut routes = system.receptionist_routes.lock().unwrap();
     let mut table = system.receptionist.lock().unwrap();
+    system.receptionist_assemblies.lock().unwrap().discard(back);
+    let mut events = routes.prune(&current, &available, &mut table);
+    let replacement = routes.replace(back, views, &mut table);
+    let admission_error = replacement.as_ref().err().map(ToString::to_string);
+    events.extend(replacement.unwrap_or_default());
     let mut notifications = Notifications::default();
-    for event in table.merge_sync(&sync) {
+    for event in events {
         notifications.extend(table.broadcast_deferred(&event));
     }
     drop(table);
+    drop(routes);
     drop(_gate);
-    drop(members);
+    let _system = owner.release();
+    if let Some(error) = admission_error {
+        super::diagnostic(
+            || tracing::debug!(node = back.node_id(), %error, "receptionist snapshot admission deferred"),
+        );
+    }
     if let Err(error) = notifications.dispatch() {
-        tracing::warn!(%error, "receptionist snapshot notification failed");
+        super::diagnostic(|| tracing::warn!(%error, "receptionist snapshot notification failed"));
+    }
+}
+
+pub(super) async fn receive_segment(
+    weak: Weak<RemoteActorSystem>,
+    body: &[u8],
+    back: &FrameSender,
+    routed: bool,
+) {
+    // Keep retired sender ownership outside every table, membership and link guard.
+    let mut retired_assemblies = segments::RetiredAssemblies::default();
+    let membership = {
+        let Some(system) = weak.upgrade() else { return };
+        system.membership.clone()
+    };
+    let Some(owner) = MembershipOwner::acquire(&weak, &membership).await else {
+        return;
+    };
+    let system = &owner.system;
+    let members = &owner.members;
+    if back.node_id() == system.config.node_id
+        || !back.supports_receptionist_segments()
+        || back.peer_capabilities() & caps::RECEPTIONIST_SYNC == 0
+        || !system.config.security.control_policy().allows_cluster(back)
+        || (routed && back.peer_capabilities() & caps::RECEPTIONIST_ROUTES == 0)
+    {
+        let _system = owner.release();
+        back.close();
+        return;
+    }
+    let gate = system.link_gate.lock().unwrap();
+    if system.is_closing()
+        || members
+            .members
+            .get(back.node_id())
+            .is_none_or(|member| member.status == MemberStatus::Dead)
+        || system
+            .direct_sender_of(back.node_id())
+            .is_none_or(|current| !current.same_connection(back))
+    {
+        return;
+    }
+    let result = system
+        .receptionist_assemblies
+        .lock()
+        .unwrap()
+        .push_deferred(
+            back,
+            body,
+            std::time::Instant::now(),
+            routed,
+            &mut retired_assemblies,
+        );
+    drop(gate);
+    drop(owner);
+    drop(retired_assemblies);
+    match result {
+        Ok(Some(body)) if routed => receive_routes(weak, &body, back).await,
+        Ok(Some(body)) => receive(weak, &body, back).await,
+        Ok(None) => {}
+        Err(_) => back.close(),
     }
 }
 
@@ -303,6 +540,10 @@ mod wake_boundary_network_contracts {
 
     #[tokio::test]
     async fn real_tcp_snapshot_wakes_after_all_outer_locks_and_survives_callback_panic() {
+        snapshot_wakes().await;
+    }
+
+    async fn snapshot_wakes() {
         let a = node("wake-net-a");
         let b = node("wake-net-b");
         a.start().await.unwrap();
@@ -325,6 +566,9 @@ mod wake_boundary_network_contracts {
         })
         .await
         .unwrap();
+        let original = a
+            .direct_sender_of(&b.config.node_id)
+            .expect("snapshot diagnostics must preserve the original TCP connection");
         observed(&throwing, 1).await;
         observed(&healthy, 1).await;
         for probe in [&throwing, &healthy] {
@@ -354,12 +598,23 @@ mod wake_boundary_network_contracts {
         for probe in [&throwing, &healthy] {
             unlocked(probe);
         }
+        let preserved = !original.is_closed()
+            && a.direct_sender_of(&b.config.node_id)
+                .is_some_and(|current| current.same_connection(&original));
         b.shutdown().await.unwrap();
         a.shutdown().await.unwrap();
+        assert!(
+            preserved,
+            "snapshot diagnostics closed or replaced its connection"
+        );
     }
 
     #[tokio::test]
     async fn periodic_retirement_releases_membership_and_table_before_every_wake() {
+        periodic_retirement().await;
+    }
+
+    async fn periodic_retirement() {
         let system = node("wake-retirement");
         system.receptionist.lock().unwrap().register(
             "departed",
@@ -442,4 +697,42 @@ mod wake_boundary_network_contracts {
         ));
         system.shutdown().await.unwrap();
     }
+
+    macro_rules! diagnostic_contract {
+        ($name:ident, $throwing_payload:expr, $exercise:ident) => {
+            #[tokio::test]
+            async fn $name() {
+                super::super::diagnostic_contracts::isolated(
+                    concat!(module_path!(), "::", stringify!($name))
+                        .strip_prefix("parrot_remote::")
+                        .unwrap(),
+                    &["parrot_remote::system::receptionist"],
+                    $throwing_payload,
+                    1,
+                    $exercise(),
+                )
+                .await;
+            }
+        };
+    }
+    diagnostic_contract!(
+        snapshot_diagnostic_panic_preserves_sync,
+        false,
+        snapshot_wakes
+    );
+    diagnostic_contract!(
+        snapshot_diagnostic_payload_panic_preserves_sync,
+        true,
+        snapshot_wakes
+    );
+    diagnostic_contract!(
+        retirement_diagnostic_panic_preserves_sync,
+        false,
+        periodic_retirement
+    );
+    diagnostic_contract!(
+        retirement_diagnostic_payload_panic_preserves_sync,
+        true,
+        periodic_retirement
+    );
 }

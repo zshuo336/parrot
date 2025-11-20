@@ -21,7 +21,7 @@ fn direct_wasm_echo_latency_report() {
     let mut c = rt.instantiate(&fixture_path(), HostCtx::default()).unwrap();
     // 预热（JIT/类型检查缓存）
     for _ in 0..100 {
-        let _ = c.handle("echo", b"warmup").unwrap();
+        assert_eq!(c.handle("echo", b"warmup").unwrap(), b"warmup");
     }
     // 采样 1000 次取 p50/p99
     let mut samples = Vec::with_capacity(1000);

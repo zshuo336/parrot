@@ -351,7 +351,8 @@ fn write_failure_fences_queued_rpc_and_commit_until_reopen() {
     let t = Temp::new();
     let mut n = open(&t, Arc::new(ManualClock::new()));
     n.step("a".into(), vote("a", 1)).unwrap(); // Leave a previously queued RPC.
-    std::fs::write(t.0.join("raft.next"), b"interrupted").unwrap();
+    std::fs::rename(t.0.join("raft.state"), t.0.join("raft.backup")).unwrap();
+    std::fs::create_dir(t.0.join("raft.state")).unwrap();
     assert!(n.step("a".into(), append(history(), 3)).is_err());
     assert!(n.is_closed());
     assert_eq!(n.current_term(), 1);
@@ -367,6 +368,8 @@ fn write_failure_fences_queued_rpc_and_commit_until_reopen() {
         Err(RaftStorageError::Closed)
     ));
     drop(n);
+    std::fs::remove_dir(t.0.join("raft.state")).unwrap();
+    std::fs::rename(t.0.join("raft.backup"), t.0.join("raft.state")).unwrap();
     let n = open(&t, Arc::new(ManualClock::new()));
     assert_eq!(n.current_term(), 1);
     assert_eq!(n.voted_for(), Some("a"));
@@ -803,10 +806,17 @@ fn capacity_admission_reserves_space_for_later_term_vote_and_commit_metadata() {
         n.outbox().unwrap();
     }
     let before = std::fs::read(t.0.join("raft.state")).unwrap();
+    let logical_size = bincode::serde::encode_to_vec(
+        (1u8, "margin", "s", &peers, 1u64, Some("s"), n.log(), 0u64),
+        bincode::config::standard(),
+    )
+    .unwrap()
+    .len()
+        + 40;
     let candidate = LogEntry {
         index: 16,
         term: 1,
-        cmd: vec![8; 16 * 1024 * 1024 - before.len() - 64],
+        cmd: vec![8; 16 * 1024 * 1024 - logical_size - 64],
     };
     let projected: Vec<_> = n.log().iter().chain(std::iter::once(&candidate)).collect();
     // Independently encode the actual v1 snapshot: this fits today's short
@@ -927,10 +937,35 @@ fn cumulative_append_capacity_preserves_state_and_allows_shorter_replacement() {
         .unwrap();
         assert_eq!(n.log().len(), 1);
         assert_eq!(n.committed().unwrap()[0].cmd, vec![9]);
+        // Keep using the same owner: reopening would rebuild its cached sizes
+        // and hide stale capacity retained from the removed suffix.
+        let followup: Vec<_> = (2..=3)
+            .map(|index| LogEntry {
+                index,
+                term: 3,
+                cmd: vec![index as u8; 1024 * 1024],
+            })
+            .collect();
+        n.step(
+            "a".into(),
+            RaftRpc::AppendEntries {
+                term: 3,
+                leader: "a".into(),
+                prev_log_index: 1,
+                prev_log_term: 3,
+                entries: followup.clone(),
+                leader_commit: 3,
+            },
+        )
+        .expect("removed suffix must release capacity before reopening");
+        assert_eq!(n.committed().unwrap(), followup);
         drop(n);
-        let recovered = open(&t, Arc::new(ManualClock::new()));
+        let mut recovered = open(&t, Arc::new(ManualClock::new()));
         assert_eq!(recovered.current_term(), 3);
-        assert_eq!(recovered.commit_index(), 1);
-        assert_eq!(recovered.log().len(), 1);
+        assert_eq!(recovered.commit_index(), 3);
+        assert_eq!(recovered.log().len(), 3);
+        let replay = recovered.committed().unwrap();
+        assert_eq!(replay[0].cmd, vec![9]);
+        assert_eq!(replay[1..], followup);
     }
 }

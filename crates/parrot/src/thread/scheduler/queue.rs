@@ -5,10 +5,14 @@ use tokio::sync::Notify;
 
 use crate::thread::mailbox::Mailbox;
 
+#[cfg(test)]
+#[path = "queue/work_stealing_contracts.rs"]
+mod work_stealing_contracts;
+
 type ReadyMailbox = Arc<dyn Mailbox>;
 
-/// High-priority ready work is selected before normal work. Admission order
-/// within a lane is preserved, including registered actors waiting for space.
+/// High-priority ready work is selected before normal work. Central selection
+/// preserves admission order within a lane, including deferred registrations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lane {
     High,
@@ -19,6 +23,7 @@ pub enum Lane {
 struct Admission {
     lane: Lane,
     ticket: u128,
+    worker: Option<usize>,
 }
 struct Entry {
     mailbox: ReadyMailbox,
@@ -34,6 +39,12 @@ struct Registration {
 struct State {
     normal: VecDeque<Entry>,
     high: VecDeque<Entry>,
+    local: Vec<VecDeque<Entry>>,
+    local_capacity: usize,
+    local_runs: Vec<u8>,
+    resident: usize,
+    local_pops: u64,
+    steals: u64,
     registered: HashMap<usize, Registration>,
     deferred_count: usize,
     next_ticket: u128,
@@ -41,20 +52,79 @@ struct State {
 }
 impl State {
     fn len(&self) -> usize {
-        self.normal.len() + self.high.len()
+        self.resident
     }
-    fn admission(&mut self, lane: Lane) -> Admission {
+    fn admission(&mut self, lane: Lane, worker: Option<usize>) -> Admission {
         let admission = Admission {
             lane,
             ticket: self.next_ticket,
+            worker: worker.filter(|&worker| worker < self.local.len()),
         };
         self.next_ticket += 1;
         admission
     }
     fn append(&mut self, entry: Entry) {
+        self.resident += 1;
         match entry.admission.lane {
             Lane::High => self.high.push_back(entry),
-            Lane::Normal => self.normal.push_back(entry),
+            Lane::Normal => match entry.admission.worker {
+                Some(worker) if self.local[worker].len() < self.local_capacity => {
+                    self.local[worker].push_back(entry)
+                }
+                _ => self.normal.push_back(entry),
+            },
+        }
+    }
+    fn oldest_resident(&self, worker: Option<usize>) -> Option<(Source, Admission)> {
+        if let Some(entry) = self.high.front() {
+            return Some((Source::High, entry.admission));
+        }
+        if let Some(id) = worker
+            && let Some(entry) = self.local.get(id).and_then(|queue| queue.front())
+            && self.local_runs[id] < 4
+        {
+            let local = (Source::Local(id), entry.admission);
+            return Some(
+                self.normal
+                    .front()
+                    .map(|entry| (Source::Global, entry.admission))
+                    .filter(|(_, admission)| *admission < local.1)
+                    .unwrap_or(local),
+            );
+        }
+        self.normal
+            .front()
+            .map(|entry| (Source::Global, entry.admission))
+            .into_iter()
+            .chain(self.local.iter().enumerate().filter_map(|(id, queue)| {
+                queue
+                    .front()
+                    .map(|entry| (Source::Local(id), entry.admission))
+            }))
+            .min_by_key(|(_, admission)| *admission)
+    }
+    fn take_resident(&mut self, source: Source, worker: Option<usize>) -> Entry {
+        self.resident -= 1;
+        if let Some(worker) = worker.filter(|&worker| worker < self.local_runs.len()) {
+            self.local_runs[worker] = if matches!(source, Source::Local(owner) if owner == worker) {
+                self.local_runs[worker].saturating_add(1)
+            } else {
+                0
+            };
+        }
+        match source {
+            Source::High => self.high.pop_front().unwrap(),
+            Source::Global => self.normal.pop_front().unwrap(),
+            Source::Local(owner) => {
+                if let Some(worker) = worker {
+                    if worker == owner {
+                        self.local_pops = self.local_pops.saturating_add(1);
+                    } else {
+                        self.steals = self.steals.saturating_add(1);
+                    }
+                }
+                self.local[owner].pop_front().unwrap()
+            }
         }
     }
     fn oldest_deferred(&self) -> Option<(usize, Admission)> {
@@ -89,6 +159,12 @@ impl State {
         }
     }
 }
+#[derive(Clone, Copy)]
+enum Source {
+    High,
+    Global,
+    Local(usize),
+}
 fn identity(mailbox: &ReadyMailbox) -> usize {
     Arc::as_ptr(mailbox) as *const () as usize
 }
@@ -119,6 +195,10 @@ impl fmt::Debug for SchedulingQueue {
         f.debug_struct("SchedulingQueue")
             .field("max_capacity", &self.max_capacity)
             .field("normal_len", &state.normal.len())
+            .field(
+                "local_len",
+                &state.local.iter().map(VecDeque::len).sum::<usize>(),
+            )
             .field("high_len", &state.high.len())
             .field("deferred", &state.deferred_count)
             .finish()
@@ -129,12 +209,26 @@ impl SchedulingQueue {
     /// Panics for zero, like bounded channel constructors. File configuration
     /// rejects zero during validation before constructing a scheduler.
     pub fn new(max_capacity: usize) -> Self {
+        Self::with_workers(max_capacity, 0)
+    }
+    pub(crate) fn with_workers(max_capacity: usize, workers: usize) -> Self {
         assert!(
             max_capacity > 0,
             "scheduling queue capacity must be positive"
         );
         Self {
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                local: (0..workers).map(|_| VecDeque::new()).collect(),
+                local_runs: vec![0; workers],
+                // Bound retained local backing storage by capacity + workers,
+                // rather than allowing every local queue to retain the full cap.
+                local_capacity: if workers == 0 {
+                    0
+                } else {
+                    max_capacity.div_ceil(workers)
+                },
+                ..State::default()
+            }),
             notify: Arc::new(Notify::new()),
             max_capacity,
         }
@@ -151,7 +245,7 @@ impl SchedulingQueue {
         if state.closed || state.len() >= self.max_capacity {
             return Err(mailbox);
         }
-        let admission = state.admission(lane);
+        let admission = state.admission(lane, None);
         state.append(Entry { mailbox, admission });
         drop(state);
         self.notify.notify_one();
@@ -174,6 +268,14 @@ impl SchedulingQueue {
     /// Called only by a holder of the mailbox's scheduling ownership. Full
     /// queues retain that ownership in one fixed readiness marker per actor.
     pub(crate) fn enqueue_registered(&self, mailbox: ReadyMailbox, lane: Lane) -> bool {
+        self.enqueue_on_worker(mailbox, lane, None)
+    }
+    pub(crate) fn enqueue_on_worker(
+        &self,
+        mailbox: ReadyMailbox,
+        lane: Lane,
+        worker: Option<usize>,
+    ) -> bool {
         let schedule = mailbox.schedule_state();
         let mut state = self.state.lock().unwrap();
         let id = identity(&mailbox);
@@ -187,7 +289,7 @@ impl SchedulingQueue {
             deferred.lane = deferred.lane.min(lane);
         } else {
             state.refill(self.max_capacity);
-            let admission = state.admission(lane);
+            let admission = state.admission(lane, worker);
             if state.len() < self.max_capacity {
                 state.append(Entry {
                     mailbox: mailbox.clone(),
@@ -214,8 +316,13 @@ impl SchedulingQueue {
             state.deferred_count -= 1;
         }
         let mut removed = Vec::new();
-        let State { normal, high, .. } = &mut *state;
-        for lane in [normal, high] {
+        let State {
+            normal,
+            high,
+            local,
+            ..
+        } = &mut *state;
+        for lane in [normal, high].into_iter().chain(local.iter_mut()) {
             let mut retained = VecDeque::new();
             for entry in lane.drain(..) {
                 if identity(&entry.mailbox) == id {
@@ -226,6 +333,7 @@ impl SchedulingQueue {
             }
             *lane = retained;
         }
+        state.resident -= removed.len();
         if was_deferred || !removed.is_empty() {
             // No worker owns this ready admission. It may be registered again.
             // A running mailbox keeps ownership until its worker releases it.
@@ -245,8 +353,15 @@ impl SchedulingQueue {
         state.deferred_count = 0;
         let normal = std::mem::take(&mut state.normal);
         let high = std::mem::take(&mut state.high);
+        let local = std::mem::take(&mut state.local);
+        state.resident = 0;
         drop(state);
-        let mut mailboxes: Vec<_> = normal.into_iter().chain(high).map(|e| e.mailbox).collect();
+        let mut mailboxes: Vec<_> = normal
+            .into_iter()
+            .chain(high)
+            .chain(local.into_iter().flatten())
+            .map(|e| e.mailbox)
+            .collect();
         for registration in registrations.into_values() {
             if registration.deferred.is_some()
                 && let Some(mailbox) = registration.mailbox.upgrade()
@@ -266,13 +381,16 @@ impl SchedulingQueue {
     /// Pop the oldest high-priority admission, otherwise the oldest normal one.
     /// Deferred high work may precede a full normal lane without exceeding capacity.
     pub fn try_pop(&self) -> Option<ReadyMailbox> {
+        self.pop_for(None)
+    }
+    pub(crate) fn try_pop_for_worker(&self, worker: usize) -> Option<ReadyMailbox> {
+        self.pop_for(Some(worker))
+    }
+    fn pop_for(&self, worker: Option<usize>) -> Option<ReadyMailbox> {
         let mut state = self.state.lock().unwrap();
         loop {
-            let front = state
-                .high
-                .front()
-                .or_else(|| state.normal.front())
-                .map(|entry| entry.admission);
+            let resident = state.oldest_resident(worker);
+            let front = resident.map(|(_, admission)| admission);
             let deferred = state.oldest_deferred();
             let entry = if let Some((id, _)) =
                 deferred.filter(|(_, admission)| front.is_none_or(|front| *admission < front))
@@ -282,10 +400,7 @@ impl SchedulingQueue {
                 };
                 entry
             } else {
-                state
-                    .high
-                    .pop_front()
-                    .or_else(|| state.normal.pop_front())?
+                state.take_resident(resident?.0, worker)
             };
             state.refill(self.max_capacity);
             return Some(entry.mailbox);
@@ -311,7 +426,23 @@ impl SchedulingQueue {
         self.state.lock().unwrap().high.len()
     }
     pub fn normal_len(&self) -> usize {
-        self.state.lock().unwrap().normal.len()
+        let state = self.state.lock().unwrap();
+        state.resident - state.high.len()
+    }
+    pub(crate) fn local_len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .local
+            .iter()
+            .map(VecDeque::len)
+            .sum()
+    }
+    pub(crate) fn local_pops(&self) -> u64 {
+        self.state.lock().unwrap().local_pops
+    }
+    pub(crate) fn steals(&self) -> u64 {
+        self.state.lock().unwrap().steals
     }
     pub fn deferred_len(&self) -> usize {
         self.state.lock().unwrap().deferred_count

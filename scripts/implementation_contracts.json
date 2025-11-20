@@ -1,0 +1,513 @@
+{
+  "schema": "parrot-implementation-contracts-v1",
+  "documents": {
+    "DEV_00": {"path": "docs/DEV_00_总体测试与验收计划.md", "sha256": "007d8b4f9c0014cc49b2ac5d0298ff817b8e389fb40066d2fc4656466b07bd3c", "supplemental": ["TOPOLOGY", "FAULTS", "REGRESSION", "PROCESS", "METRICS"]},
+    "DEV_01": {"path": "docs/DEV_01_P1_远程实现开发文档.md", "sha256": "253fddb856c6cb0a1871c00c5271ae2d21481e8186b76bc24ed4b0403803aecb", "supplemental": ["EXIT"]},
+    "DEV_02": {"path": "docs/DEV_02_P2_集群核心开发文档.md", "sha256": "8350837351d004a1185a7b5bea8ceeff2321b1d89c608fec21ae0d74b5b4c392", "supplemental": ["EXIT"]},
+    "DEV_03": {"path": "docs/DEV_03_P3_边缘与桥开发文档.md", "sha256": "34afe834ef3672ff388312aa5e3ad4dcb723946fda14af739959d94c66123473", "supplemental": ["EXIT"]},
+    "DEV_04": {"path": "docs/DEV_04_P4_集群深化开发文档.md", "sha256": "60d83ed8dc6bf455ee18bbe5759d7f53abd924da40e212596324d9d8528a0011", "supplemental": ["EXIT"]},
+    "DEV_05": {"path": "docs/DEV_05_P5_联邦控制面开发文档.md", "sha256": "c997d39ade4e602adade278e6b6ba19b3727372ab10b6a94d6a24a3f907ce6f8", "supplemental": ["EXIT"]},
+    "DEV_06": {"path": "docs/DEV_06_P6_规模化开发文档.md", "sha256": "ef3c7dbb7e9cbe47bee5862b33a7feec26a751bea96184823229022ea53d978c", "supplemental": ["EXIT"]},
+    "DEV_09": {"path": "docs/DEV_09_应用体系与多引擎统一编排开发文档.md", "sha256": "4f038b7e3ea510ddf740f7e6fd94c2b3373acd5966294c08ca5ae45ba0aaa2ce", "supplemental": ["MG", "CHAOS", "COVERAGE", "PERFORMANCE", "EXIT"]}
+  },
+  "contracts": {
+    "DEV_00/L0": {
+      "anchor": "| L0 编译期 |", "owners": ["K25", "K26", "K27"],
+      "implementation": [".github/workflows/ci.yml", "Makefile"], "tests": ["scripts/tests/test_make_contracts.py"],
+      "acceptance": ["每提交/PR在Linux和macOS完成编译、warning/Clippy、semver、依赖白名单及unsafe审查；原矩阵预算≤5min。"],
+      "remaining": ["严格Clippy的专项历史结果不证明全部L0检查、CI触发范围与5min预算达标；按当前版本执行并核对发布兼容策略。"]
+    },
+    "DEV_00/L1": {
+      "anchor": "| L1 单元回环 |", "owners": ["K21", "K26", "K27"],
+      "implementation": ["Makefile", ".github/workflows/ci.yml"], "tests": ["crates/parrot/tests/test_remote_semantics.rs"],
+      "acceptance": ["每提交执行单元、golden、codec、状态机和mem回环；原矩阵预算≤10min。"],
+      "remaining": ["归档当前源码、feature、实际非零测试及全部失败；8478项Debug通过不代替Release、其他平台或时长验收。"]
+    },
+    "DEV_00/L2": {
+      "anchor": "| L2 集成 |", "owners": ["K19", "K21", "K26", "K27"],
+      "implementation": ["Makefile", "interop/README.md"], "tests": ["crates/parrot-app/tests/mg_multiengine.rs", "crates/parrot-remote/tests/tls_identity_contract.rs"],
+      "acceptance": ["每PR真实双/三节点TCP、QUIC、TLS集成≤20min；协议变化时六语言共享向量矩阵≤15min。"],
+      "remaining": ["逐语言、双平台和外部依赖的当前执行矩阵；缺工具失败，不能以ignored或零测试过滤替代真实互通。"]
+    },
+    "DEV_00/L3": {
+      "anchor": "| L3 混沌 |", "owners": ["K23", "K27"],
+      "implementation": ["Makefile", ".github/workflows/ci.yml"], "tests": ["crates/parrot-app/tests/chaos_scenarios.rs", "crates/parrot-remote/tests/swim_network.rs"],
+      "acceptance": ["每夜02:00及手动执行真实kill、分区、丢包、慢盘、时钟跳变和双杀；≤60min，失败阻塞release。"],
+      "remaining": ["建立覆盖全部六注入的真实运行器与调度；本地状态转移和单次SIGKILL证据不能核销整层。"]
+    },
+    "DEV_00/L4": {
+      "anchor": "| L4 基准 |", "owners": ["K22", "K23", "K27"],
+      "implementation": ["crates/parrot-remote/src/bin/remote_bench.rs", "tools/federation-lab/src/twin.rs"], "tests": ["tools/federation-lab/tests/twin_contract.rs"],
+      "acceptance": ["独占裸机release全量基准2h/缩减版≤30min；性能回退>5%阻塞发布；50集群专机规模验收≤6h并归档G5。"],
+      "remaining": ["当前源码性能、真实规模、环境噪声与可比较基线；本地百万地址分批遍历不证明百万驻留或网络性能。"]
+    },
+    "DEV_00/TOPOLOGY": {
+      "anchor": "### 2.1 拓扑仿真", "owners": ["K17", "K23", "K26"],
+      "implementation": ["tools/federation-lab/src/composegen.rs", "deploy/parrot-mesh/README.md"], "tests": ["tools/federation-lab/tests/compose_config.rs", "scripts/tests/test_mesh_generator.py"],
+      "acceptance": ["single、pair-tcp/quic/ws、trio及K0认证、hub-relay、双集群、三模式和federation-50逐个build/run；折叠部署身份、端口、发现及安全真实接线。"],
+      "remaining": ["composegen目前为规划输出；须实现运行装配、故障剧本和40k逻辑节点部署，不能用生成器结构测试替代。"]
+    },
+    "DEV_00/FAULTS": {
+      "anchor": "### 2.2 故障注入器", "owners": ["K23", "K27"],
+      "implementation": ["tools/federation-lab/src/twin_app.rs", "Makefile"], "tests": ["crates/parrot-app/tests/chaos_scenarios.rs"],
+      "acceptance": ["声明式可重放六种注入：SIGKILL、对称/非对称分区、丢包、慢盘、时钟跳变、Raft双杀；输出JUnit、指标和实际终态。"],
+      "remaining": ["现有静态孪生与局部故障夹具不是统一网络注入器；须记录注入是否生效、负控、恢复和后代回收。"]
+    },
+    "DEV_00/REGRESSION": {
+      "anchor": "## 3. 回归保障体系", "owners": ["K12", "K19", "K21", "K25", "K27"],
+      "implementation": ["docs/vectors/wire1.json", "Makefile"], "tests": ["crates/parrot/tests/test_remote_semantics.rs", "interop/cpp-lite/test_vectors.cpp"],
+      "acceptance": ["冻结向量、错误码、C ABI及性能基线；RC1–RC8环境从双节点到带gossip三节点再到中继加严，X1–X8双引擎永久回归；里程碑重跑此前所有阶段。"],
+      "remaining": ["核对每种环境真实执行与断言，补ABI兼容和里程碑CI；冻结件存在和同名测试不证明回归覆盖完整。"]
+    },
+    "DEV_00/PROCESS": {
+      "anchor": "### 4.1 通用流程", "owners": ["K21", "K26", "K27", "K28"],
+      "implementation": ["Makefile", "scripts/check_dev09_coverage.py"], "tests": ["scripts/tests/test_dev09_coverage.py", "scripts/tests/test_project_inputs.py"],
+      "acceptance": ["自验、CI、逐数值DoD评审、里程碑回归和签收；命令、原始结果、输入、工具链、平台及阈值来源绑定同一版本。"],
+      "remaining": ["完整当前源码认证、覆盖率实测与签收未完成；已配置CI不代表已执行GitHub CI，源收集不证明依赖闭包。"]
+    },
+    "DEV_00/METRICS": {
+      "anchor": "## 5. 指标与观测", "owners": ["K20", "K22", "K23"],
+      "implementation": ["crates/parrot-remote/src/metrics.rs", "crates/parrot-remote/src/bin/remote_bench.rs"], "tests": ["crates/parrot-remote/src/system/metrics_contract_tests.rs"],
+      "acceptance": ["实际采集ask/tell/relay/RESOLVE延迟、SWIM/路由/选主收敛、gossip带宽、cid/迟到回复、压力RSS及缓存命中率；无指标不验收。"],
+      "remaining": ["逐场景证明指标来自真实事件与正确分母；本地计数器回归不能代替持续压力与网络测量。"]
+    },
+    "DEV_01/T1": {
+      "anchor": "### 3.1 frame.rs", "owners": ["K01", "K12", "K19", "K21"],
+      "implementation": ["crates/parrot-remote/src/frame.rs", "crates/parrot-remote/src/handshake.rs"], "tests": ["crates/parrot-remote/tests/frame_boundaries.rs", "docs/vectors/wire1.json"],
+      "acceptance": ["各帧逐字节golden、全截断不消费、长度/版本/UTF-8/reserved/hop拒绝；TLV未知跳过、重复/必填拒绝和完整协商。"],
+      "remaining": ["基础有历史修复；继续核对协议扩展、全部错误映射、跨语言与混合版本，不把帧层预算扩展为节点总预算。"]
+    },
+    "DEV_01/T2": {
+      "anchor": "### 3.3 transport.rs", "owners": ["K11", "K12", "K13"],
+      "implementation": ["crates/parrot-remote/src/transport/tcp.rs", "crates/parrot-remote/src/transport/memory.rs"], "tests": ["crates/parrot-remote/tests/transport_progress.rs"],
+      "acceptance": ["真实TCP握手及慢读逐字节完整传输、mem/TCP帧等价、NODELAY、并发关闭与驱动回收；写阻塞时的进度边界明确。"],
+      "remaining": ["当前控制/数据共驱动，独立读写/心跳进度和全系统drain仍待验收；mem身份准入不能替代网络额度。"]
+    },
+    "DEV_01/T3": {
+      "anchor": "### 3.4 codec.rs", "owners": ["K01", "K13", "K19", "K25"],
+      "implementation": ["crates/parrot-remote/src/codec_registry.rs", "crates/parrot-api-derive/src/remote.rs"], "tests": ["crates/parrot-remote/tests/derived_codec_contract.rs", "crates/parrot-api/tests/remote_decode_limits.rs"],
+      "acceptance": ["真实derive/inventory模块唯一键、显式版本键、bin/pb规范字节、损坏/尾随/重复/坏属性拒绝及schema演化兼容。"],
+      "remaining": ["标准serde解码预算已有专项；任意用户Deserialize、跨语言schema演化及总资源预算继续核对。"]
+    },
+    "DEV_01/T4": {
+      "anchor": "### 3.5 envelope.rs", "owners": ["K02", "K12", "K13"],
+      "implementation": ["crates/parrot-remote/src/ref_.rs", "crates/parrot-remote/src/registry.rs"], "tests": ["crates/parrot/tests/test_remote_semantics.rs", "crates/parrot-remote/tests/admin_connection_contract.rs"],
+      "acceptance": ["受限回调表、唯一cid、超时/取消/断连/shutdown精确回收、迟到与跨连接回复拒绝；ask/deliver/tell/stop有明确终态。"],
+      "remaining": ["会话/发送者重启与中继切换的端到端身份、顺序和退休继续归K12，不能从cid局部唯一推导恰好一次业务。"]
+    },
+    "DEV_01/T5": {
+      "anchor": "T5 入站路由", "owners": ["K12", "K13"],
+      "implementation": ["crates/parrot-remote/src/ingress.rs", "crates/parrot-remote/src/system/dispatch.rs"], "tests": ["crates/parrot-remote/tests/batch_contracts.rs", "crates/parrot/tests/test_remote_semantics.rs"],
+      "acceptance": ["ASK/TELL/REPLY/STOP及未知帧分派正确；codec失败可读，远端不错误重设调用预算，业务反压保留。"],
+      "remaining": ["全部入站来源/actor权限、总并发预算及关闭在途边界；局部解码成功不证明合法业务主体授权。"]
+    },
+    "DEV_01/T6": {
+      "anchor": "T6 系统组装", "owners": ["K11", "K12", "K13", "K26"],
+      "implementation": ["crates/parrot-remote/src/system.rs", "crates/parrot/src/system.rs"], "tests": ["crates/parrot-remote/tests/remote_lifecycle_regressions.rs", "crates/parrot/tests/test_remote_semantics.rs"],
+      "acceptance": ["系统/node/facade生命周期和远程查找正确；无本地default引擎也能解析远程路径，独立节点的注册/关闭所有权不混淆。"],
+      "remaining": ["全部静态/动态入口的宿主关闭、跨代在途和平台整合认证，不能仅凭系统组装文件存在关闭。"]
+    },
+    "DEV_01/T7": {
+      "anchor": "## 5. 语义复跑", "owners": ["K12", "K21"],
+      "implementation": ["crates/parrot-remote/src/ref_.rs", "crates/parrot-remote/src/ingress.rs"], "tests": ["crates/parrot/tests/test_remote_semantics.rs"],
+      "acceptance": ["RC1:128并发ask每次恰有一回复且cid无重复；RC2:同源100 TELL保序；RC3:双actor交叉ask无串扰。", "RC4:1ms本地超时、远端500ms仍完成且迟到计数+1；RC5:停止后Stopped；RC6:未注册类型本地失败零帧。", "RC7:真实断连失败后重连成功且cid不重置；RC8:慢消费下Block实际贯通；全部mem与TCP双跑，再扩到DEV_02/K6及中继。"],
+      "remaining": ["逐环境核对原断言和真实主体；恰有一回复不证明业务副作用exactly-once，零过滤/状态机替身不能抵扣RC。"]
+    },
+    "DEV_01/T8": {
+      "anchor": "## 6. 基准", "owners": ["K22", "K27"],
+      "implementation": ["crates/parrot-remote/src/bin/remote_bench.rs"], "tests": ["crates/parrot-remote/src/bin/remote_bench.rs"],
+      "acceptance": ["双进程TCP seq/concurrent c8/c64/tell/pingpong，预热3s采样≥30s，p50/p99/max和吞吐；ask p50<150µs、tell<60µs及真实非零失败码。"],
+      "remaining": ["当前源码裸机release、场景完整性、tell测量阶段和本地税基线；工具自身测试不等于性能达标。"]
+    },
+    "DEV_01/EXIT": {
+      "anchor": "## 7. DoD", "owners": ["K19", "K21", "K22", "K25", "K26", "K27"],
+      "implementation": ["Makefile", "crates/parrot-remote/src/bin/dump_vectors.rs"], "tests": ["scripts/tests/test_dev09_coverage.py", "crates/parrot/tests/test_remote_semantics.rs"],
+      "acceptance": ["Release workspace、mem/TCP RC1–8、性能、共享冻结向量、逐字段frame trace、remote行≥85%/分支≥75%、零warning/unsafe审查及设计/ADR签收。"],
+      "remaining": ["需各项同版本执行和真正覆盖率；DEV_09的100/95是独立更严范围，不覆盖或取代remote的85/75。"]
+    },
+    "DEV_02/K0": {
+      "anchor": "## 0. K0 ·", "owners": ["K02", "K13", "K17", "K19"],
+      "implementation": ["crates/parrot-remote/src/admin.rs", "crates/parrot-node/src/executor_v2.rs"], "tests": ["crates/parrot-node/tests/admin_ownership.rs", "crates/parrot-remote/tests/tls_identity_contract.rs"],
+      "acceptance": ["指定节点按名创建真实actor并ask；未知工厂零副作用；停止回执后真实邮箱关闭；并发同路径唯一成功；TCP/QUIC mTLS认证正反例。"],
+      "remaining": ["当前节点白名单与原角色证书权限不同；完整角色授权、执行代次和分布式编排继续验收。"]
+    },
+    "DEV_02/K1": {
+      "anchor": "## 2. K1 ·", "owners": ["K13", "K16", "K23"],
+      "implementation": ["crates/parrot-remote/src/swim.rs", "crates/parrot-remote/src/system/probes.rs"], "tests": ["crates/parrot-remote/tests/swim_network.rs", "crates/parrot-remote/tests/membership_probes.rs"],
+      "acceptance": ["直接/间接关联探测、Alive/Suspect/Dead/TTL及自我反驳、幂等乱序合并和refute风暴上界；实际kill9目标收敛≤3.5s，分区愈合30s另验。"],
+      "remaining": ["已有受控真实SIGKILL不构成通用3.5s SLO；随机化、启动epoch、来源授权和WAN分区继续核对。"]
+    },
+    "DEV_02/K2": {
+      "anchor": "## 3. K2 ·", "owners": ["K13", "K18", "K19", "K23"],
+      "implementation": ["crates/parrot-remote/src/receptionist.rs", "crates/parrot-api/src/context.rs"], "tests": ["crates/parrot/tests/test_network_receptionist.rs", "crates/parrot-remote/tests/receptionist_network.rs"],
+      "acceptance": ["Thread/Actix context注册/注销/订阅→认证网络发现→真实ASK；真实死亡精确撤销；所有权/预算/慢订阅和重订阅；与membership同车多事件≤50KB/s。"],
+      "remaining": ["独立快照循环未完成同车带宽目标；任意稀疏传播、guest及重启/静默分区恢复须分别验收，不用双表合并替代。"]
+    },
+    "DEV_02/K3": {
+      "anchor": "## 4. K3 ·", "owners": ["K12", "K13", "K22", "K26"],
+      "implementation": ["crates/parrot-remote/src/transport/quic.rs"], "tests": ["crates/parrot-remote/tests/transport_progress.rs", "crates/parrot-remote/tests/tls_identity_contract.rs"],
+      "acceptance": ["QUIC握手/TCP语义等价、每ASK独立uni流避免HOL、真实端点IP迁移持续业务。"],
+      "remaining": ["源码当前每连接单bi流共载控制/数据，open_uni为空预留；uni并发和IP迁移门禁尚不能核销。"]
+    },
+    "DEV_02/K4": {
+      "anchor": "## 5. K4 ·", "owners": ["K13", "K19", "K26"],
+      "implementation": ["crates/parrot-remote/src/tls.rs", "crates/parrot-remote/src/security.rs"], "tests": ["crates/parrot-remote/tests/tls_identity_contract.rs", "crates/parrot-remote/tests/tls_material_bounds.rs"],
+      "acceptance": ["TCP/QUIC双向证书链及node_id绑定、错误CA/冒名拒绝、证书生成工具；双证书过渡及轮换/撤销与跨语言认证。"],
+      "remaining": ["CA信任不等于逐角色权限；自动轮换、撤销、转发端到端身份和各语言证书接入分别验收。"]
+    },
+    "DEV_02/K5": {
+      "anchor": "## 6. K5 ·", "owners": ["K19", "K22", "K26", "K27"],
+      "implementation": ["interop/jvm/src/main/scala/parrot/protocol/jvm/ParrotTransportExtension.scala", "crates/parrot-remote/src/codec.rs"], "tests": ["interop/jvm/src/test/scala/parrot/protocol/jvm/SharedWireVectorsSpec.scala", "crates/parrot/tests/test_lite_interop.rs"],
+      "acceptance": ["真实protobuf与JVM共享逐字节/半包向量、Rust双向echo/cpu RTT<300µs、actor死亡is_alive与Unregistered、双语言CI。"],
+      "remaining": ["真实网关部署已有专项不代表完整原akka接入语义、死亡通知、QUIC或当前RTT门禁；独立语言测试与互通均须执行。"]
+    },
+    "DEV_02/K6": {
+      "anchor": "## 7. K6 ·", "owners": ["K12", "K19", "K21", "K23"],
+      "implementation": ["crates/parrot-remote/src/system.rs"], "tests": ["crates/parrot/tests/test_remote_semantics.rs", "crates/parrot-remote/tests/swim_runtime.rs"],
+      "acceptance": ["RC1–8在开启gossip的三节点mem集群复跑且原断言不变；随机kill一节点后多数成员继续业务；QUIC+TLS经JVM网关全链路。"],
+      "remaining": ["两节点mem/TCP语义不能替代三节点带噪与多语言QUIC认证链路；须保留实际故障及非零执行数。"]
+    },
+    "DEV_02/EXIT": {
+      "anchor": "## 8. DoD", "owners": ["K19", "K21", "K22", "K23", "K26", "K27"],
+      "implementation": ["Makefile", ".github/workflows/ci.yml"], "tests": ["crates/parrot/tests/test_actix_receptionist.rs", "crates/parrot-remote/tests/swim_network.rs"],
+      "acceptance": ["Rust/JVM全绿、真实kill9收敛、RTT<300µs、共享向量CI、两个引擎Receptionist接线和P2/ADR签收。"],
+      "remaining": ["功能、性能、真实故障与CI签收分别取证；本地ActorContext接线不抵扣跨节点门禁。"]
+    },
+    "DEV_03/E1": {
+      "anchor": "## 2. E1 ·", "owners": ["K12", "K13", "K19", "K26"],
+      "implementation": ["interop/typescript-lite/src/lite.ts", "interop/typescript-lite/src/wire.ts"], "tests": ["interop/typescript-lite/tests/connection_contracts.test.mjs", "interop/typescript-lite/scripts/package-gate.mjs"],
+      "acceptance": ["受限协议真实TCP/WS/WSS及严格协商、超时/重拨代次/handler所有权、打包通信与gzip<50,000字节（原DoD <50KB）；原WebTransport/QUIC、客户端证书、durable与迁移目标单独实现。"],
+      "remaining": ["当前API明确拒绝quic及自定义TLS；Node验证不等于真实浏览器，原传输/持久性能力仍需实现与认证。"]
+    },
+    "DEV_03/E2": {
+      "anchor": "## 3. E2 ·", "owners": ["K14", "K19", "K22", "K23"],
+      "implementation": ["crates/parrot-remote/src/durable.rs", "crates/parrot-remote/src/durable/outbox.rs"], "tests": ["crates/parrot-remote/tests/durable_outbox.rs", "crates/parrot/tests/test_durable_tell.rs"],
+      "acceptance": ["真实端侧断网5min持续生产100条，重连自动全达且接收端持久去重零重复效果；proxy写中kill恢复；ACK额外p99<1ms。"],
+      "remaining": ["WAL/Outbox/CloudProxy/TransactionalInbox各有局部合同；5分钟仅保留测试不证明断网恢复，任意外部效果需实际事务适配，ACK组提交和性能另验。"]
+    },
+    "DEV_03/E3": {
+      "anchor": "## 4. E3 ·", "owners": ["K12", "K13", "K14", "K19"],
+      "implementation": ["crates/parrot-remote/src/transport.rs", "crates/parrot-remote/src/durable/outbox.rs"], "tests": ["crates/parrot/tests/test_remote_semantics.rs", "crates/parrot/tests/test_durable_tell.rs"],
+      "acceptance": ["端侧慢5s、云端2000 tell，经实际传输窗口→proxy出站→1024邮箱→云业务全链；Error明确反压，Block恢复后全达。"],
+      "remaining": ["单队列容量或mem慢消费不证明QUIC/边缘/proxy整条反压；须观测各层有界性、错误、取消和恢复。"]
+    },
+    "DEV_03/E4": {
+      "anchor": "## 5. E4 ·", "owners": ["K19", "K22", "K26"],
+      "implementation": ["interop/python/parrot_protocol/ray_gw.py"], "tests": ["interop/python/tests/test_ray_adapter.py", "bench/ray-bench/tests/test_ownership.py"],
+      "acceptance": ["真实Ray dispatcher双向消息与错误/剩余期限，1000并行pb任务结果正确；对比纯Ray总耗时损耗<15%。"],
+      "remaining": ["mock Ray/本地Python不能抵扣真实集群、后代退休或开销门禁；采样需相同负载/集群并验证结果。"]
+    },
+    "DEV_03/E5": {
+      "anchor": "## 6. E5 ·", "owners": ["K13", "K18", "K19"],
+      "implementation": ["crates/parrot-remote/src/acl.rs", "crates/parrot-remote/src/system/receptionist.rs"], "tests": ["crates/parrot-remote/tests/acl_security_contract.rs", "crates/parrot-remote/tests/receptionist_network.rs"],
+      "acceptance": ["默认拒绝、完整key前缀语法/最长边界，register/deregister/subscribe真实执行点使用可信身份；越权返回正确远程错误且零业务效果。"],
+      "remaining": ["网络网关已有节点身份接线，不能重复列为完全未实现；逐业务调用者、guest、proxy权限及端到端来源仍须逐入口核对。"]
+    },
+    "DEV_03/E6": {
+      "anchor": "## 7. E6 ·", "owners": ["K19", "K22", "K26", "K27"],
+      "implementation": ["interop/erlang/parrot_gw.erl"], "tests": ["interop/erlang/test_wire.erl", "interop/erlang/test_admin_v2.erl"],
+      "acceptance": ["正式OTP连接生命周期、TLS、共享golden、注册发现桥、Rust双向ASK及与JVM相同口径RTT门禁。"],
+      "remaining": ["当前因果/管理/宿主证据不代表全部TLS、服务桥或性能；源码路径改名不算完成原能力。"]
+    },
+    "DEV_03/E7": {
+      "anchor": "## 8. E7 ·", "owners": ["K14", "K19", "K23", "K24"],
+      "implementation": ["crates/parrot-remote/src/mqtt.rs"], "tests": ["crates/parrot-remote/tests/mqtt_mosquitto.rs", "scripts/check_mqtt_bridge.sh"],
+      "acceptance": ["真实broker的QoS0 TELL、QoS1 durable断连重放、双向topic/key注册发现；存量EMQX互通，两个心跳/重连职责明确。"],
+      "remaining": ["Mosquitto专项与内存桥不等价于EMQX/完整持久业务效果；须核对重启、重复、容量和真实桥生命周期。"]
+    },
+    "DEV_03/EXIT": {
+      "anchor": "## 9. DoD", "owners": ["K19", "K21", "K22", "K23", "K26", "K27"],
+      "implementation": ["Makefile", ".github/workflows/ci.yml"], "tests": ["interop/typescript-lite/scripts/size-gate.mjs", "interop/python/tests/test_ray_adapter.py"],
+      "acceptance": ["Rust/TS/Python/Erlang真实CI、五分钟durable、Ray<15%、完整反压、MQTT QoS、lite体积及接入矩阵签收。"],
+      "remaining": ["语言单测和bundle通过只核销对应子项；原性能、故障和持续业务门禁保留。"]
+    },
+    "DEV_04/D1": {
+      "anchor": "## 2. D1 ·", "owners": ["K11", "K12", "K14", "K16", "K23"],
+      "implementation": ["crates/parrot-remote/src/sharding.rs", "crates/parrot-node/src/sharding.rs"], "tests": ["crates/parrot-remote/tests/sharding_contracts.rs", "crates/parrot-node/tests/shard_router.rs"],
+      "acceptance": ["真实3节点kill1≤5s重建；分区/并发接管/重启无重叠执行权威，消息效果与旧主退休可核对；节点及实际线程两级亲和。"],
+      "remaining": ["Node已有真实路由/共识授权/子actor/正常退休与状态接续；崩溃持有代次不自动夺取，放置稳定测试不证明线程亲和或故障接管。"]
+    },
+    "DEV_04/D2": {
+      "anchor": "## 3. D2 ·", "owners": ["K13", "K14", "K15", "K16", "K23"],
+      "implementation": ["crates/parrot-remote/src/singleton.rs", "crates/parrot-remote/src/roles/directory/ownership.rs"], "tests": ["crates/parrot-remote/tests/singleton_lease_contracts.rs", "crates/parrot-remote/tests/ownership_authority.rs"],
+      "acceptance": ["固定配置真实互斥多数授予/共识、持久任期、10s租约/3s续租与执行端围栏；实际kill后≤13s接管，覆盖分区/竞选/迟到/重启。"],
+      "remaining": ["singleton模块是宿主确认的本地状态机；布尔quorum和SWIM Alive均不能替代授予/执行围栏，须接通Node/facade/Orchestrator。"]
+    },
+    "DEV_04/D3": {
+      "anchor": "## 4. D3 ·", "owners": ["K12", "K13", "K22"],
+      "implementation": ["crates/parrot-remote/src/frame.rs", "crates/parrot-remote/src/ref_.rs"], "tests": ["crates/parrot-remote/tests/batch_contracts.rs", "crates/parrot/tests/test_message_batch.rs"],
+      "acceptance": ["兼容现有batch布局与真实入站；实现出站worker按5ms或64帧触发，在1000msg/s负载核对顺序/反压/取消/退休；带宽收益>60%。"],
+      "remaining": ["生产ref仍逐条发送，自动聚合未实现；10k条16B离线字节比较不证明窗口、吞吐或长期资源有界。"]
+    },
+    "DEV_04/D4": {
+      "anchor": "## 5. D4 ·", "owners": ["K18", "K19", "K22", "K25", "K26"],
+      "implementation": ["interop/cpp-lite/parrot_lite.h", "interop/cpp-lite/parrot_lite.cpp"], "tests": ["interop/cpp-lite/test_vectors.cpp", "crates/parrot/tests/test_cpp_interop.rs"],
+      "acceptance": ["C++协议子集、共享向量、Rust双向ASK及原JVM同口径门禁；真实C ABI dlopen调用、pl_free所有权、符号冻结兼容。"],
+      "remaining": ["C++ lite与parrot-abi原生插件是不同API，后者不能替代pl_* C接口验收；符号/所有权与实际平台矩阵须独立认证。"]
+    },
+    "DEV_04/EXIT": {
+      "anchor": "## 6. DoD", "owners": ["K16", "K19", "K21", "K22", "K23", "K25", "K26"],
+      "implementation": ["Makefile", "interop/cpp-lite/parrot_lite.h"], "tests": ["crates/parrot/tests/test_sharding_integration.rs", "crates/parrot-remote/tests/singleton_lease_contracts.rs"],
+      "acceptance": ["workspace/C++全绿，真实sharding≤5s、singleton≤13s、batch>60%，C ABI semver冻结及P4签收。"],
+      "remaining": ["本地同名测试不是网络故障数值门禁，当前不关闭D1/D2/D3或P4。"]
+    },
+    "DEV_05/F1": {
+      "anchor": "F1 拓扑配置/降级链", "owners": ["K12", "K16", "K17", "K23"],
+      "implementation": ["crates/parrot-remote/src/system.rs", "crates/parrot-config/src/lib.rs"], "tests": ["crates/parrot-remote/tests/config_wiring.rs", "crates/parrot/tests/test_hub_relay.rs"],
+      "acceptance": ["hub/mesh/hybrid配置实际生效；直连失败→回源一次→hub降级，QoS阈值、多hub与Directory变化驱动真实换路。"],
+      "remaining": ["模式/fallback已有历史接线，不重复从零建设；当前完整三模式故障矩阵、身份/FIFO/退休和动态拓扑接入须补验。"]
+    },
+    "DEV_05/F2": {
+      "anchor": "### 2.3 RouteGossip", "owners": ["K12", "K13", "K16", "K23"],
+      "implementation": ["crates/parrot-remote/src/topology.rs", "crates/parrot-remote/src/system.rs"], "tests": ["crates/parrot-remote/tests/route_convergence.rs"],
+      "acceptance": ["真实RouteGossip增量/版本/最长前缀与membership同车；relay hop递增/协商上限拒绝，直接路径不误增；路由撤销恢复。"],
+      "remaining": ["核对生产驱动、来源认证和真实同车流量；路由表合并单测不能证明自动广播、故障换路或收敛SLO。"]
+    },
+    "DEV_05/F3": {
+      "anchor": "## 3. F3 ·", "owners": ["K12", "K13", "K16", "K19"],
+      "implementation": ["crates/parrot-remote/src/roles/hub.rs"], "tests": ["crates/parrot/tests/test_hub_relay.rs", "crates/parrot-remote/tests/route_convergence.rs"],
+      "acceptance": ["真实hub接收/转发/回程cid恢复，表驱动最长前缀；三模式×ask/tell×断hub降级，映射容量65536及迟到/断连/取消清理。"],
+      "remaining": ["静态前缀与POC互通不能替代生产RouteGossip；多跳原始身份、FIFO和完整drain须与K12整合。"]
+    },
+    "DEV_05/F4": {
+      "anchor": "## 4. F4 ·", "owners": ["K09", "K15", "K21", "K23"],
+      "implementation": ["crates/parrot-remote/src/raft/mod.rs", "crates/parrot-remote/src/raft/storage.rs"], "tests": ["crates/parrot-remote/tests/durable_raft_snapshot.rs", "crates/parrot-remote/tests/raft_log_contract.rs"],
+      "acceptance": ["真实3节点kill leader≤3s选新主、1000并发提交及恢复追平、对称分区30s少数零提交/多数继续、愈合一致和确定性；持久输出前fsync。"],
+      "remaining": ["已有日志/ReadIndex/显式快照有限验收；自动快照、请求历史生命周期、joint consensus与运维迁移仍开放；内存模型不抵扣真实故障。"]
+    },
+    "DEV_05/F5": {
+      "anchor": "## 5. F5 ·", "owners": ["K15", "K16", "K17", "K23"],
+      "implementation": ["crates/parrot-remote/src/roles/directory.rs", "crates/parrot-remote/src/roles/directory/network.rs"], "tests": ["crates/parrot-node/tests/directory_cluster_process.rs", "crates/parrot-remote/tests/network_directory.rs"],
+      "acceptance": ["DirectoryStore/Api角色分工、Raft权威注册/离开/border声明/key聚合，RESOLVE与INVALIDATE接入真实节点发现和路由；恢复及线性读。"],
+      "remaining": ["标准Node认证Directory与客户端已有实现；路由解析自动整合、全部角色分工与双集群运行仍须验收。"]
+    },
+    "DEV_05/F6": {
+      "anchor": "F6 RouteReflector ──", "owners": ["K13", "K16", "K23"],
+      "implementation": ["crates/parrot-remote/src/roles/route_reflector.rs"], "tests": ["crates/parrot-remote/tests/route_convergence.rs"],
+      "acceptance": ["Directory权威与RouteGossip之间真实RouteReflector会话、增量/撤销/版本、跨集群传播和恢复。"],
+      "remaining": ["本模块入口与生产会话接线须逐条追踪；表操作测试不证明常驻RR、网络认证或规模收敛。"]
+    },
+    "DEV_05/F7": {
+      "anchor": "## 6. F7 ·", "owners": ["K12", "K13", "K16", "K22", "K23"],
+      "implementation": ["crates/parrot-remote/src/cache.rs", "crates/parrot-remote/src/resolve.rs"], "tests": ["crates/parrot-remote/tests/resolve_control_plane.rs", "crates/parrot-remote/tests/resolve_pending_contract.rs"],
+      "acceptance": ["Fresh/Stale/Invalid缓存、60s TTL，RESOLVE miss/stale及INVALIDATE推送→重新解析；命中零网络，直连失败回源/降级；Directory全灭仍在300s窗口服务。"],
+      "remaining": ["真实border代理、Directory下发/订阅、端到端自动路由及300s持续业务单独验收；注入时钟只证明本地时序。"]
+    },
+    "DEV_05/F8": {
+      "anchor": "## 7. F8 ·", "owners": ["K13", "K16", "K19"],
+      "implementation": ["crates/parrot-remote/src/acl.rs", "crates/parrot-remote/src/ingress.rs"], "tests": ["crates/parrot-remote/tests/acl_security_contract.rs"],
+      "acceptance": ["Directory策略带前缀允许realm/cluster，真实border/hub入口用认证来源在转发前拒绝跨域；默认拒绝，拒绝零业务效果。"],
+      "remaining": ["RouteAcl已接入业务中继入口并覆盖ASK/TELL/STOP；控制面策略下发、TLS证书realm绑定、可信来源贯穿和真实多节点转发拒绝验收仍须实现。"]
+    },
+    "DEV_05/F9": {
+      "anchor": "## 8. F9 ·", "owners": ["K17", "K19", "K23", "K24"],
+      "implementation": ["crates/parrot-remote/src/livekit.rs"], "tests": ["crates/parrot-remote/tests/livekit_callback_reentry.rs"],
+      "acceptance": ["真实livekit-server房间/participant/track/policy监督与发现、跨集群订阅信令3跳actor而媒体0跳，用抓包验证；AI旁路≤10fps。"],
+      "remaining": ["回调/模型测试不能代替SDK接线、真实媒体、容器服务与抓包；组件异常、关闭、权限和跨集群均需实证。"]
+    },
+    "DEV_05/EXIT": {
+      "anchor": "## 9. DoD", "owners": ["K13", "K16", "K17", "K19", "K21", "K23", "K26"],
+      "implementation": ["Makefile", "tools/federation-lab/src/composegen.rs"], "tests": ["crates/parrot-remote/tests/network_directory.rs", "crates/parrot/tests/test_hub_relay.rs"],
+      "acceptance": ["workspace与真实Raft故障、双集群Directory互访、三模式故障矩阵、认证跨域拒绝、300s stale业务、真实LiveKit三场景及ADR-21签收。"],
+      "remaining": ["不能用两个局部Cargo目标替代P5全量；原故障、时长、媒体和安全门禁保留。"]
+    },
+    "DEV_06/S1": {
+      "anchor": "## 2. S1 ·", "owners": ["K13", "K16", "K22", "K23"],
+      "implementation": ["crates/parrot-remote/src/swim.rs", "crates/parrot-remote/src/system.rs"], "tests": ["crates/parrot-remote/tests/swim_runtime.rs"],
+      "acceptance": ["成员≤200全量/>200自动digest，显式auto/full/digest配置；错表push/pull≤3轮修复，稳态≤10KB/s，收敛与full相比±10%，滚动混跑兼容。"],
+      "remaining": ["核对实际周期驱动/协商/混跑而非单函数；规模带宽、故障收敛与预算需真实运行。"]
+    },
+    "DEV_06/S2": {
+      "anchor": "## 3. S2 ·", "owners": ["K13", "K16", "K22", "K23"],
+      "implementation": ["crates/parrot-remote/src/topology.rs", "crates/parrot-remote/src/cache.rs"], "tests": ["crates/parrot-remote/tests/supernet_semantics.rs"],
+      "acceptance": ["500节点集群对外仅集群supernet，路由条目≤集群数+常数；Directory同样聚合，缓存LRU≤1024，工作集稳态命中率>99.9%，ACL不扩权。"],
+      "remaining": ["真实border/RR/Directory/cache接线与测量分母；本地聚合正确不等于对外明细不泄漏或命中率达标。"]
+    },
+    "DEV_06/S3": {
+      "anchor": "## 4. S3 ·", "owners": ["K15", "K16", "K23"],
+      "implementation": ["crates/parrot-remote/src/roles/directory.rs"], "tests": ["crates/parrot-remote/tests/directory_shard_contract.rs"],
+      "acceptance": ["逻辑前缀一致性分片、每组3副本，border透明定位；50集群分布，单片百万条目约≤200MB，加组迁移零丢失。"],
+      "remaining": ["现有本地应用视图/非原子跨片提交不证明持久网络协调、读屏障或布局迁移；百万驻留与RSS必须实测。"]
+    },
+    "DEV_06/S4": {
+      "anchor": "## 5. S4 ·", "owners": ["K17", "K23", "K26"],
+      "implementation": ["tools/federation-lab/src/composegen.rs", "tools/federation-lab/src/twin.rs"], "tests": ["tools/federation-lab/tests/twin_contract.rs", "tools/federation-lab/tests/compose_cli.rs"],
+      "acceptance": ["真实50集群折叠部署的收敛/路由/故障，跨集群收敛≤10s、额外≤1跳/目录miss≤10ms；百万地址正确率100%且≤10min，带宽/驻留/RSS/缓存逐行测量。"],
+      "remaining": ["规划生成器不启动多supervisor；Twin每批≤512为本地分片遍历，不能抵扣百万驻留或网络规模；10集群缩减与50集群完整验收分开。"]
+    },
+    "DEV_06/EXIT": {
+      "anchor": "## 6. DoD", "owners": ["K19", "K21", "K23", "K25", "K26", "K27"],
+      "implementation": ["docs/vectors/wire1.json", "docs/SCALE_REPORT.md"], "tests": ["crates/parrot-remote/src/bin/dump_vectors.rs", "tools/federation-lab/tests/twin_contract.rs"],
+      "acceptance": ["workspace与真实三剧本全过；§5.2规模参数逐行达标并归档；相对P1冻结向量wire零变更，P6/G5签收。"],
+      "remaining": ["向量格式等价只证明冻结字段，不证明全部状态机未变；新规模能力须在兼容协商与真实部署中验收。"]
+    },
+    "DEV_09/A1": {
+      "anchor": "\n| A1 |", "owners": ["K10", "K13", "K17", "K25"],
+      "implementation": ["crates/parrot-app/src/manifest.rs", "crates/parrot-app/src/limits.rs"], "tests": ["crates/parrot-app/tests/application_admission.rs", "crates/parrot-app/tests/manifest_diagnostic_admission.rs"],
+      "acceptance": ["Manifest全类型、25+有效断言、确定性校验/环路径、双TOML形态、engine-artifact匹配、语义版本、输入/规范输出/诊断预算及overlay身份。"],
+      "remaining": ["已有多批限定验收；所有公开入口、并发累计预算与完整文档承诺仍待核销，不把保留文本预算扩大为RSS保证。"]
+    },
+    "DEV_09/A2": {
+      "anchor": "\n| A2 |", "owners": ["K13", "K16", "K17"],
+      "implementation": ["crates/parrot-app/src/planner.rs"], "tests": ["crates/parrot-app/tests/planner_placement_contract.rs"],
+      "acceptance": ["15+判据，确定性DAG、真实role/realm/label候选、反亲和容量、实例路径、负载稳定排名与无候选可读错误。"],
+      "remaining": ["本机元数据与消费端复核已补；操作方声明不是认证发现，真实集群拓扑及跨节点逐实例部署未因此完成。"]
+    },
+    "DEV_09/A3": {
+      "anchor": "\n| A3 |", "owners": ["K11", "K13", "K17", "K18"],
+      "implementation": ["crates/parrot-app/src/assemble.rs", "crates/parrot-app/src/cleanup.rs"], "tests": ["crates/parrot-app/tests/application_wiring.rs", "crates/parrot-app/tests/gateway_stop_disposal.rs"],
+      "acceptance": ["20+判据，依赖序装配/逆序回滚、overlay优先级、每实例hook阶段/身份/期限/回执、失败保留重试、取消/poll/Drop隔离和实际资源退休。"],
+      "remaining": ["合作式hook ACK不证明全入口封锁/业务零在途；自动context wiring、全部执行器和网络drain仍需整合。"]
+    },
+    "DEV_09/A4": {
+      "anchor": "\n| A4 |", "owners": ["K17", "K18", "K19", "K24"],
+      "implementation": ["crates/parrot-app/src/cli.rs", "crates/parrot-app/src/host.rs"], "tests": ["crates/parrot-app/tests/app_run_scenarios.rs", "crates/parrot-app/tests/run_gateway_ownership.py"],
+      "acceptance": ["真实本地Parrot/JVM/Ray/Erlang四引擎与生产Wire路径同构、组件配置版本及外部业务路由、信号/失败后所有子进程退休；MG12轨迹等价。"],
+      "remaining": ["当前本地外语网关为独立TCP进程；依赖真实构建、后代生命周期及本地/集群轨迹基线，不能以就绪文件代替业务/退休。"]
+    },
+    "DEV_09/B1": {
+      "anchor": "\n| B1 |", "owners": ["K12", "K13", "K17", "K19", "K25"],
+      "implementation": ["crates/parrot-remote/src/admin_v2.rs", "crates/parrot-remote/src/admin.rs"], "tests": ["crates/parrot-remote/tests/codec_compatibility.rs", "crates/parrot-remote/tests/admin_connection_contract.rs"],
+      "acceptance": ["四命令/回复的0x03/0x04逐字节兼容、四方言同向量、能力预判、超时/取消/去重/Unsupported及可信连接/req_id绑定；有界可失败artifact转换。"],
+      "remaining": ["局部pending/转换已修复；全方言MG11、混合版本与管理执行的实际终态仍须当前版本独立验证。"]
+    },
+    "DEV_09/B2": {
+      "anchor": "\n| B2 |", "owners": ["K13", "K17", "K18"],
+      "implementation": ["crates/parrot-node/src/executor_v2.rs", "crates/parrot-node/src/host_options.rs"], "tests": ["crates/parrot-node/tests/admin_ownership.rs", "crates/parrot-node/tests/wasm_policy.rs", "crates/parrot-node/tests/native_policy.rs"],
+      "acceptance": ["15+判据，artifact同字节摘要/缓存/限额、Props/Wasm/Dylib真实部署/状态/停止，ARTIFACTS/WASM/DYLIB能力与操作者信任一致。"],
+      "remaining": ["已有真实Node进程专项；完整drain、升级、取消/重启恢复、并发loader负载和跨平台认证仍开放。"]
+    },
+    "DEV_09/B3": {
+      "anchor": "\n| B3 |", "owners": ["K17", "K19", "K26"],
+      "implementation": ["interop/python/parrot_protocol/ray_gw.py", "interop/python/parrot_protocol/ray_job.py"], "tests": ["interop/python/tests/test_admin_v2.py", "interop/python/tests/test_gateway_artifact_ownership.py"],
+      "acceptance": ["真实Ray job/runtime_env制品部署、命名dispatcher、Drain/Stop/Status与四方言MG11；mock与真Ray双跑。"],
+      "remaining": ["当前作业/租约/worker所有权专项不能替代三种升级策略、故障恢复或全部后代边界；保留真实Ray依赖失败。"]
+    },
+    "DEV_09/B4": {
+      "anchor": "\n| B4 |", "owners": ["K17", "K19", "K26"],
+      "implementation": ["interop/erlang/parrot_gw.erl", "interop/erlang/parrot_beam_host.erl"], "tests": ["interop/erlang/test_admin_v2.erl", "interop/erlang/test_beam_hosts.erl"],
+      "acceptance": ["实际BEAM制品加载/监督生命周期、热加载新旧模块行为切换、Drain/Stop/Status与MG11；失败/取消/同名替代不串代。"],
+      "remaining": ["独立guest隔离与管理合同已有入口；需核对原热升级目标与当前API差异及真实升级/故障链路。"]
+    },
+    "DEV_09/B5": {
+      "anchor": "\n| B5 |", "owners": ["K17", "K19", "K26"],
+      "implementation": ["interop/jvm/src/main/scala/parrot/protocol/jvm/AdminV2Executor.scala"], "tests": ["interop/jvm/src/test/scala/parrot/protocol/jvm/BridgeAdminV2Spec.scala", "interop/jvm/src/test/scala/parrot/protocol/jvm/OwnerRetentionSpec.scala"],
+      "acceptance": ["实际child-first类加载、同名两版本隔离、真实actor部署/Drain/Stop/Status、MG11和失败所有权；软卸载边界明示。"],
+      "remaining": ["原设计明确不保证classloader强卸载；升级与计划重启需真实执行，不能仅以反射构造成功或引用计数推断退休。"]
+    },
+    "DEV_09/C1": {
+      "anchor": "\n| C1 |", "owners": ["K11", "K13", "K18"],
+      "implementation": ["crates/parrot-wasm/src/lib.rs", "crates/parrot-wasm/src/runtime/asynchronous.rs"], "tests": ["crates/parrot-wasm/tests/async_cleanup.rs", "crates/parrot-wasm/tests/recovery_recording.rs"],
+      "acceptance": ["30+判据，真实component/fuel/epoch/初始化/消息/恢复、句柄及Store资源、panic/trap/取消、消息/服务显式授权、原身份实际退休。"],
+      "remaining": ["Store线性内存不是编译器/GC/宿主/RSS总预算；OverQuota监督与完整关闭、运行时资源峰值仍需实现/实测。"]
+    },
+    "DEV_09/C2": {
+      "anchor": "\n| C2 |", "owners": ["K18", "K19", "K25", "K26"],
+      "implementation": ["crates/parrot-wasm/wit/parrot-actor.wit"], "tests": ["crates/parrot-wasm/tests/wasm_trace_context.rs", "crates/parrot-wasm/tests/service_discovery.rs"],
+      "acceptance": ["parrot:actor@0.1.0 world语义版本冻结、四语言编解码向量、真实guest绑定及兼容升级；可选网络/服务world单独协商授权。"],
+      "remaining": ["已有WIT文件/二进制fixture不证明四语言消费同一向量；原三形态生命周期与RSS须与MG矩阵整合。"]
+    },
+    "DEV_09/D1": {
+      "anchor": "\n| D1 |", "owners": ["K13", "K18", "K25", "K26"],
+      "implementation": ["crates/parrot-abi/src/lib.rs", "crates/parrot-abi/src/loader.rs"], "tests": ["crates/parrot-abi/tests/abi_length_boundaries.rs", "crates/parrot-abi/tests/native_artifact_limits.rs"],
+      "acceptance": ["repr(C) ABI v1、摘要与显式unsafe信任、真实ffi字节/缓冲所有权、非regular/超额输入拒绝、可选消息/服务权限与保持ABI兼容。"],
+      "remaining": ["静态符号扫描不是任意native沙箱；FFI可信约定、依赖/映射/堆预算及平台ABI认证继续开放。"]
+    },
+    "DEV_09/D2": {
+      "anchor": "\n| D2 |", "owners": ["K11", "K18", "K26", "K27"],
+      "implementation": ["crates/parrot-abi/src/loader.rs"], "tests": ["crates/parrot-abi/tests/native_cleanup.rs", "crates/parrot-abi/tests/native_library_lifetime.rs"],
+      "acceptance": ["Quarantine→全部drain→全部destroy→dlclose，实际代码存活期与取消所有权、期限只停止等待；禁止清单CI扫描跨ELF/Mach-O失败默认拒绝，35+有效判据。"],
+      "remaining": ["受信任插件内部abort/永久阻塞不可恢复；并发dlopen/dlclose、请求/停止/卸载交错、RSS及后代回收须固定负载实测。"]
+    },
+    "DEV_09/E1": {
+      "anchor": "\n| E1 |", "owners": ["K15", "K16", "K17"],
+      "implementation": ["crates/parrot-app/src/orchestrator/supervisor.rs", "crates/parrot-app/src/orchestrator/file_state.rs"], "tests": ["crates/parrot-app/tests/mirror_orchestration.rs"],
+      "acceptance": ["调和diff/幂等、desired原子持久化与generation、真实动作执行、Node常驻/deploy CLI、共识自举Singleton、多Orchestrator唯一权威及故障恢复。"],
+      "remaining": ["FileStateStore是本地单owner非Raft；reconcile_once返回动作未自动执行，BD-3常驻/选主仍未完成。"]
+    },
+    "DEV_09/E2": {
+      "anchor": "\n| E2 |", "owners": ["K12", "K14", "K17", "K21"],
+      "implementation": ["crates/parrot-app/src/orchestrator/rollout.rs"], "tests": ["crates/parrot-app/tests/rollout_completion_receipts.rs", "crates/parrot-app/tests/chaos_scenarios.rs"],
+      "acceptance": ["全转移弧及回滚入口、重复/迟到事件与溢出；真实HotSwap/Rolling/Recreate、观察窗/恢复完成独立回执、升级代次、WAL零丢。"],
+      "remaining": ["ROL01只修本地回执状态机；MultiRollout非跨组件事务，三策略执行器、回执来源/代次和真实恢复仍属宿主/K17。"]
+    },
+    "DEV_09/E3": {
+      "anchor": "\n| E3 |", "owners": ["K16", "K17", "K20"],
+      "implementation": ["crates/parrot-app/src/orchestrator/health.rs"], "tests": ["crates/parrot-app/tests/health_assignment_admission.rs"],
+      "acceptance": ["真实链接差分/SWIM失联及ComponentStatus轮询接入observed→调和；旧票据不覆盖迁移/重启，赋值预算与拒绝原子性。"],
+      "remaining": ["HLT01已修借用准入；begin/fetch/apply仍由宿主驱动，同节点重部署须显式失效，自动网络循环/重启闭环未完成。"]
+    },
+    "DEV_09/F1": {
+      "anchor": "\n| F1 |", "owners": ["K17", "K19", "K20"],
+      "implementation": ["crates/parrot-api/src/trace.rs", "crates/parrot-app/src/cli/trace_session.rs"], "tests": ["crates/parrot-app/tests/app_trace_cli.rs", "crates/parrot-app/tests/wire_trace_context.rs"],
+      "acceptance": ["实际因果parent/cid贯穿引擎/Wire/durable/语言/guest；trace查询/follow、真实终态及丢失回执、OTLP收据，未知父/重复/环路单独诊断。"],
+      "remaining": ["当前本地森林和显式采样/导出不证明完整actor寿命或无父自发入口；JVM/Erlang异步、BATCH/durable及回复寿命仍有限制。"]
+    },
+    "DEV_09/F2": {
+      "anchor": "\n| F2 |", "owners": ["K13", "K17", "K20"],
+      "implementation": ["crates/parrot-app/src/orchestrator/mirror.rs", "crates/parrot-remote/src/mirror_control.rs"], "tests": ["crates/parrot-app/tests/application_mirror.rs", "crates/parrot-app/tests/mirror_orchestration.rs"],
+      "acceptance": ["主请求零语义干扰、受限shadow、实际facade/Wire/manifest/CLI/远端协商、版本/退休回执、持久策略与健康放置投影。"],
+      "remaining": ["独立Unix MirrorSupervisor不代替内嵌集群选主、全部宿主动作、统一调试和全局退休屏障。"]
+    },
+    "DEV_09/F3": {
+      "anchor": "\n| F3 |", "owners": ["K12", "K17", "K20", "K21"],
+      "implementation": ["crates/parrot-app/src/debug/replay.rs", "crates/parrot-api/src/trace/recording.rs"], "tests": ["crates/parrot-app/tests/replay_cli.rs", "crates/parrot-api/tests/trace_recording.rs"],
+      "acceptance": ["受限JSONL实际帧/终态记录、顺序/方向/完整性、URI明确映射、真实新actor经codec回放及清理后结果；确定性hash需要独立基线。"],
+      "remaining": ["当前单方向本地回放不证明跨节点调度/外部效果通用确定性；持久历史及损失/截断恢复需继续覆盖。"]
+    },
+    "DEV_09/F4": {
+      "anchor": "\n| F4 |", "owners": ["K17", "K21", "K23", "K27"],
+      "implementation": ["tools/federation-lab/src/twin_app.rs"], "tests": ["crates/parrot-app/tests/chaos_scenarios.rs", "tools/federation-lab/src/twin_app.rs"],
+      "acceptance": ["Manifest输入孪生≤100组件、实际六混沌场景、三种升级策略全分支≤10min、CI接入。"],
+      "remaining": ["当前twin_app只做静态图/映射/策略标签及Pending入口，不启动进程或升级；passed不代表原六场景已执行。"]
+    },
+    "DEV_09/G1": {
+      "anchor": "\n| G1 |", "owners": ["K17", "K20", "K24"],
+      "implementation": ["apps/crawler-lab/src/application.rs"], "tests": ["apps/crawler-lab/tests/run_manifest_integration.py", "apps/crawler-lab/run_regression.sh"],
+      "acceptance": ["M1真实crawler迁移到Manifest，编排≤50行、CLI overlay保持；N页完整golden与迁移前cid轨迹hash一致，基线必须先保留。"],
+      "remaining": ["业务golden和当前manifest测试不自动满足≤50行/迁移前cid轨迹等价；不得事后用新实现生成所谓旧基线。"]
+    },
+    "DEV_09/G2": {
+      "anchor": "\n| G2 |", "owners": ["K17", "K19", "K21", "K24", "K25"],
+      "implementation": ["tools/federation-lab/src/twin_app.rs", "crates/parrot-node/builtin_app.toml", "crates/parrot-node/src/runtime.rs"], "tests": ["crates/parrot-node/tests/builtin_manifest.rs", "crates/parrot-app/tests/mg_multiengine.rs", "crates/parrot/tests/test_hub_relay.rs"],
+      "acceptance": ["M2孪生Manifest输入；M3 echo/counter/kv/slow真实启动走统一装配且PARROT_ACTORS过滤不变；M4三网关fixture收敛到admin-v2/MG11；M5公共装配helper迁移且原业务断言不变。"],
+      "remaining": ["builtin TOML解析/过滤测试不能证明Node启动已走cmd_run；逐M追踪真实调用与断言，静态孪生不抵扣混沌。"]
+    },
+    "DEV_09/G3": {
+      "anchor": "\n| G3 |", "owners": ["K21", "K22", "K23", "K25", "K26", "K27", "K28"],
+      "implementation": ["Makefile", "scripts/check_dev09_coverage.py"], "tests": ["scripts/tests/test_dev09_coverage.py", "crates/parrot-app/tests/mg_multiengine.rs"],
+      "acceptance": ["§5.6全部命令有效且真实执行：build/Clippy、test-full/polyglot/stress、覆盖率、ignored MG、twin-app、crawler等价、Wasm/ABI性能；M1–M5和D1–D4逐项签收。"],
+      "remaining": ["命令存在和局部整仓通过不等于整张表达标；覆盖率/性能/全语言/长稳及所有前置工作包仍开放。"]
+    },
+    "DEV_09/MG": {
+      "anchor": "### 5.2 场景 + 集成归属", "owners": ["K11", "K14", "K17", "K18", "K19", "K20", "K23"],
+      "implementation": ["crates/parrot-app/src/assemble.rs", "crates/parrot-app/src/orchestrator/rollout.rs"], "tests": ["crates/parrot-app/tests/mg_multiengine.rs", "crates/parrot-app/tests/run_gateway_ownership.py"],
+      "acceptance": ["MG1–4真实跨引擎部署；MG5–8真实三策略升级及WAL零丢；MG9–10引擎kill/重启调和；MG11四方言golden；MG12本地/集群轨迹同构；三形态9套生命周期含RSS无泄漏。"],
+      "remaining": ["统一追踪场景真实执行主体、外部依赖、原始输出与负控；mock动作/状态表和内部child_count不能替代业务或后代终态。"]
+    },
+    "DEV_09/CHAOS": {
+      "anchor": "### 5.3 混沌", "owners": ["K17", "K18", "K23", "K27"],
+      "implementation": ["tools/federation-lab/src/twin_app.rs", ".github/workflows/ci.yml"], "tests": ["crates/parrot-app/tests/chaos_scenarios.rs"],
+      "acceptance": ["升级中SIGKILL、Raft分区、网关双杀、drain风暴、dylib重载、Wasm fuel风暴六场景实际执行并纳入每夜CI。"],
+      "remaining": ["同名状态机/标签枚举不是真实故障；需真实制品/进程/网络/资源及恢复判据，失败保留。"]
+    },
+    "DEV_09/COVERAGE": {
+      "anchor": "### 5.4 覆盖率铁律", "owners": ["K21", "K26", "K27"],
+      "implementation": ["scripts/check_dev09_coverage.py", "scripts/dev09_coverage_scope.json"], "tests": ["scripts/tests/test_dev09_coverage.py"],
+      "acceptance": ["parrot-app/abi/wasm逐crate行100%/分支≥95%，非零分母、全生产文件、原始profiles/工具链/源码/真实测试成功绑定；豁免≤10且需求方签批。"],
+      "remaining": ["目前没有达标当前报告或批准自动豁免；检查器单测、零分支分母和历史未绑定报告均不能当覆盖率。"]
+    },
+    "DEV_09/PERFORMANCE": {
+      "anchor": "### 5.5 性能门禁", "owners": ["K17", "K18", "K20", "K22", "K23"],
+      "implementation": ["crates/parrot-app/src/orchestrator/rollout.rs", "tools/federation-lab/src/twin_app.rs"], "tests": ["crates/parrot-app/tests/mg_multiengine.rs", "crates/parrot-app/tests/replay_cli.rs"],
+      "acceptance": ["独占裸机Dylib增量<1µs、Wasm<10µs、deploy回执P99<1s、真实HotSwap<10s、≤100组件全分支孪生<10min及record-replay确定性hash。"],
+      "remaining": ["需真实实现/相同负载基线/有效采样；回执状态机、静态图或成功编译不证明任一性能门禁。"]
+    },
+    "DEV_09/EXIT": {
+      "anchor": "### 5.6 DoD 验收命令表", "owners": ["K21", "K22", "K23", "K25", "K26", "K27", "K28"],
+      "implementation": ["Makefile", ".github/workflows/ci.yml"], "tests": ["scripts/tests/test_make_contracts.py", "scripts/tests/test_dev09_coverage.py"],
+      "acceptance": ["G3命令表、M1–M5各自断言、覆盖率报告签收及TECH_DESIGN_09 D1–D4全部核销；真实依赖缺失必须失败。"],
+      "remaining": ["本目录账只保证编号/绑定/责任齐全，不关闭G3、K10或综合验收；docs/documents/公开API承诺仍须另行逐项审阅。"]
+    }
+  }
+}

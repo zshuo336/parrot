@@ -34,7 +34,9 @@ failures cancel and join siblings; probe failures propagate, samples are bounded
 and the ticker is joined before samples are read. The runtime owner cancels any
 unfinished CPU/gate work on exceptional cleanup. The launcher propagates compiler,
 oracle and JVM failures without output-filter pipelines; SIGINT/SIGTERM kill and
-reap its active tool process group. Abrupt SIGKILL of the launcher is not covered.
+reap its active tool process group. Each tool exit also retires remaining members
+of that owned group, including children left by a successful or failed leader.
+Abrupt SIGKILL of the launcher is not covered.
 
 Measurement details:
 

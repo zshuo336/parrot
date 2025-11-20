@@ -56,17 +56,72 @@ pub struct ComponentSpec {
     pub hooks: ComponentHooks,
 }
 
+pub(crate) enum HookPathError {
+    Outside,
+    Invalid,
+    Empty,
+}
+
+struct HookDiagnostic<'a> {
+    error: HookPathError,
+    hook: &'a str,
+    component: &'a str,
+}
+impl std::fmt::Display for HookDiagnostic<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hook = self.hook;
+        let component = self.component;
+        match self.error {
+            HookPathError::Outside => {
+                write!(formatter, "hook {hook:?} is outside component {component}")
+            }
+            HookPathError::Invalid => write!(
+                formatter,
+                "invalid hook path {hook:?} for component {component}"
+            ),
+            HookPathError::Empty => write!(
+                formatter,
+                "empty hook path/segment for component {component}"
+            ),
+        }
+    }
+}
+
 impl ComponentSpec {
     /// Resolve a component-relative hook for one concrete instance. Absolute
     /// paths use the logical `/user/{component}` root, expanded for every pool
     /// or shard instance; `.` addresses the instance root itself.
     pub fn hook_path(&self, hook: &str, instance: &str) -> Result<String, String> {
-        let root = format!("/user/{}", self.name);
-        let suffix = if hook == "." || hook == root {
+        let suffix = self.hook_suffix(hook).map_err(|error| {
+            HookDiagnostic {
+                error,
+                hook,
+                component: &self.name,
+            }
+            .to_string()
+        })?;
+        Ok(if suffix.is_empty() {
+            instance.into()
+        } else {
+            format!("{instance}/{suffix}")
+        })
+    }
+
+    // Borrow the canonical suffix so admission can count cache keys without
+    // allocating roots, expanded paths, or potentially large error strings.
+    pub(crate) fn hook_suffix<'a>(&self, hook: &'a str) -> Result<&'a str, HookPathError> {
+        let suffix = if hook == "." {
             ""
         } else if hook.starts_with('/') {
-            hook.strip_prefix(&format!("{root}/"))
-                .ok_or_else(|| format!("hook {hook:?} is outside component {}", self.name))?
+            let rest = hook
+                .strip_prefix("/user/")
+                .and_then(|path| path.strip_prefix(self.name.as_str()))
+                .ok_or(HookPathError::Outside)?;
+            if rest.is_empty() {
+                ""
+            } else {
+                rest.strip_prefix('/').ok_or(HookPathError::Outside)?
+            }
         } else {
             hook
         };
@@ -75,22 +130,12 @@ impl ComponentSpec {
                 .split('/')
                 .any(|segment| !valid_path_segment(segment))
         {
-            return Err(format!(
-                "invalid hook path {hook:?} for component {}",
-                self.name
-            ));
+            return Err(HookPathError::Invalid);
         }
         if hook.is_empty() || hook.ends_with('/') {
-            return Err(format!(
-                "empty hook path/segment for component {}",
-                self.name
-            ));
+            return Err(HookPathError::Empty);
         }
-        Ok(if suffix.is_empty() {
-            instance.into()
-        } else {
-            format!("{instance}/{suffix}")
-        })
+        Ok(suffix)
     }
 
     /// A lossless TOML payload shared by local gateways and the reconciler.
@@ -98,18 +143,44 @@ impl ComponentSpec {
         &self,
         version: &str,
     ) -> Result<parrot_remote::admin_v2::ComponentDeploy, String> {
+        self.deployment_with_limits(version, &ApplicationLimits::default())
+    }
+
+    /// Build a wire payload using the caller's host policy before cloning or encoding.
+    pub fn deployment_with_limits(
+        &self,
+        version: &str,
+        limits: &ApplicationLimits,
+    ) -> Result<parrot_remote::admin_v2::ComponentDeploy, String> {
         use parrot_remote::admin_v2::{AdminInstancePolicy, ComponentDeploy};
+        limits.check_component(self).map_err(|e| e.to_string())?;
+        limits
+            .check_metadata(&(self, version))
+            .map_err(|e| e.to_string())?;
+        if !valid_path_segment(&self.name) {
+            return Err("invalid deployment component name".into());
+        }
+        if !self.engine.accepts(&self.artifact) {
+            return Err("deployment artifact is incompatible with component engine".into());
+        }
         let count = self.instances.instance_count();
         if count == 0 || count > u32::MAX as usize {
             return Err("instance count must fit 1..=u32::MAX".into());
         }
         if !is_valid_semver(version) {
-            return Err(format!("invalid deployment version: {version}"));
+            return Err("invalid deployment version: expected semver".into());
         }
-        Ok(ComponentDeploy {
+        let mut remaining = limits.max_metadata_bytes;
+        let artifact = self.artifact.encode_admin(limits, &mut remaining)?;
+        let config = self
+            .config
+            .as_ref()
+            .map(|config| crate::encoding::table(config, &mut remaining).map(String::into_bytes))
+            .transpose()?;
+        let payload = ComponentDeploy {
             name: self.name.clone(),
             version: version.into(),
-            artifact: self.artifact.clone().into(),
+            artifact,
             instances: match self.instances {
                 InstancePolicy::Singleton | InstancePolicy::Ephemeral => {
                     AdminInstancePolicy::Singleton
@@ -117,13 +188,10 @@ impl ComponentSpec {
                 InstancePolicy::Pool(count) => AdminInstancePolicy::Pool { count },
                 InstancePolicy::Sharded(count) => AdminInstancePolicy::Sharded { count },
             },
-            config: self
-                .config
-                .as_ref()
-                .map(|config| toml::to_string(config).map(String::into_bytes))
-                .transpose()
-                .map_err(|e| e.to_string())?,
-        })
+            config,
+        };
+        limits.check_metadata(&payload).map_err(|e| e.to_string())?;
+        Ok(payload)
     }
 }
 
@@ -227,9 +295,80 @@ impl ArtifactRef {
         }
     }
 
-    /// → admin-v2 镜像形态（E1 deploy 载荷生成用——BD-1 From 委托）。
-    pub fn into_admin(self) -> parrot_remote::admin_v2::AdminArtifactRef {
-        self.into()
+    /// Convert to the admin-v2 representation, reporting invalid runtime_env.
+    pub fn into_admin(self) -> Result<parrot_remote::admin_v2::AdminArtifactRef, String> {
+        self.try_into()
+    }
+
+    /// Borrowed conversion with an explicit host policy; None and an empty table
+    /// remain distinct. Runtime environments must be TOML tables.
+    pub fn to_admin_with_limits(
+        &self,
+        limits: &ApplicationLimits,
+    ) -> Result<parrot_remote::admin_v2::AdminArtifactRef, String> {
+        limits.check_artifact(self).map_err(|e| e.to_string())?;
+        let mut remaining = limits.max_metadata_bytes;
+        let result = self.encode_admin(limits, &mut remaining)?;
+        limits.check_metadata(&result).map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    fn encode_admin(
+        &self,
+        limits: &ApplicationLimits,
+        remaining: &mut u64,
+    ) -> Result<parrot_remote::admin_v2::AdminArtifactRef, String> {
+        use parrot_remote::admin_v2::AdminArtifactRef;
+        Ok(match self {
+            Self::Props { factory } => AdminArtifactRef::Props {
+                factory: factory.clone(),
+            },
+            Self::Wasm { digest, uri } => AdminArtifactRef::Wasm {
+                digest: digest.clone(),
+                uri: uri.clone(),
+            },
+            Self::Dylib { digest, uri, abi } => AdminArtifactRef::Dylib {
+                digest: digest.clone(),
+                uri: uri.clone(),
+                abi: *abi,
+            },
+            Self::Jvm {
+                main_class,
+                coords,
+                uri,
+            } => AdminArtifactRef::Jvm {
+                main_class: main_class.clone(),
+                coords: coords.clone(),
+                uri: uri.clone(),
+            },
+            Self::PyModule {
+                module,
+                runtime_env,
+                uri,
+            } => {
+                let runtime_env = runtime_env
+                    .as_ref()
+                    .map(|value| {
+                        let table = value.as_table().ok_or("runtime_env must be a TOML table")?;
+                        let text = crate::encoding::runtime_env(
+                            table,
+                            remaining,
+                            limits.max_source_bytes,
+                        )?;
+                        Ok::<_, String>(text)
+                    })
+                    .transpose()?;
+                AdminArtifactRef::PyModule {
+                    module: module.clone(),
+                    runtime_env,
+                    uri: uri.clone(),
+                }
+            }
+            Self::Beam { app, uri } => AdminArtifactRef::Beam {
+                app: app.clone(),
+                uri: uri.clone(),
+            },
+        })
     }
 }
 
@@ -335,14 +474,34 @@ pub struct WireSpec {
 /// Parse a component-qualified absolute actor/connection path without aliases,
 /// URI authorities, percent decoding or path normalization.
 pub fn wire_endpoint(value: &str) -> Result<(&str, &str), String> {
+    parse_wire_endpoint(value).map_err(|error| error.to_string())
+}
+
+enum WireEndpointError<'a> {
+    MissingSeparator(&'a str),
+    Invalid(&'a str),
+}
+impl std::fmt::Display for WireEndpointError<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSeparator(value) => write!(
+                formatter,
+                "wire endpoint requires component:/path: {value:?}"
+            ),
+            Self::Invalid(value) => write!(formatter, "invalid wire endpoint {value:?}"),
+        }
+    }
+}
+
+fn parse_wire_endpoint(value: &str) -> Result<(&str, &str), WireEndpointError<'_>> {
     let (component, path) = value
         .split_once(':')
-        .ok_or_else(|| format!("wire endpoint requires component:/path: {value:?}"))?;
+        .ok_or(WireEndpointError::MissingSeparator(value))?;
     if !valid_path_segment(component)
         || !path.starts_with("/user/")
         || !path[1..].split('/').all(valid_path_segment)
     {
-        return Err(format!("invalid wire endpoint {value:?}"));
+        return Err(WireEndpointError::Invalid(value));
     }
     Ok((component, path))
 }
@@ -445,31 +604,31 @@ pub(crate) fn valid_path_segment(value: &str) -> bool {
             .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
-/// 手写 semver 校验（`MAJOR.MINOR.PATCH[-prerelease][+build]`，省 semver 依赖）。
+/// Validate SemVer 2.0.0 syntax without allocating or imposing integer bounds.
+/// This checks grammar only; it does not compare version precedence.
 pub fn is_valid_semver(v: &str) -> bool {
+    fn identifiers(value: &str, prerelease: bool) -> bool {
+        value.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                // Only purely numeric prerelease identifiers forbid leading zeroes.
+                && !(prerelease
+                    && part.len() > 1
+                    && part.starts_with('0')
+                    && part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+    }
     // 剥 build metadata
     let core = match v.split_once('+') {
-        Some((c, build))
-            if !build.is_empty()
-                && build
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-') =>
-        {
-            c
-        }
+        Some((c, build)) if identifiers(build, false) => c,
         Some(_) => return false,
         None => v,
     };
     // 剥 prerelease
     let nums = match core.split_once('-') {
-        Some((c, pre))
-            if !pre.is_empty()
-                && pre
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.') =>
-        {
-            c
-        }
+        Some((c, pre)) if identifiers(pre, true) => c,
         Some(_) => return false,
         None => core,
     };
@@ -489,6 +648,55 @@ pub fn is_valid_semver(v: &str) -> bool {
 /// 全量校验（A1 规约：返回逐项错误）。
 pub fn validate(m: &AppManifest) -> Result<(), Vec<ManifestError>> {
     validate_with_limits(m, &ApplicationLimits::default())
+}
+
+// Write only admitted diagnostic chunks. Debug escaping can amplify input text;
+// formatting a complete String before charging it would defeat early rejection.
+fn diagnostic_text(
+    message: impl std::fmt::Display,
+    total: &mut u64,
+    limit: u64,
+) -> Result<String, AdmissionError> {
+    use std::fmt::Write;
+    crate::limits::add(
+        "diagnostic bytes",
+        total,
+        std::mem::size_of::<ManifestError>() as u64,
+        limit,
+    )?;
+    struct Writer<'a> {
+        text: String,
+        total: &'a mut u64,
+        limit: u64,
+        failure: Option<AdmissionError>,
+    }
+    impl Write for Writer<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            if let Err(error) = crate::limits::add(
+                "diagnostic bytes",
+                self.total,
+                text.len() as u64,
+                self.limit,
+            ) {
+                self.failure = Some(error);
+                return Err(std::fmt::Error);
+            }
+            self.text.push_str(text);
+            Ok(())
+        }
+    }
+    let mut writer = Writer {
+        text: String::new(),
+        total,
+        limit,
+        failure: None,
+    };
+    let result = write!(&mut writer, "{message}");
+    if let Some(error) = writer.failure {
+        return Err(error);
+    }
+    result.map_err(|_| AdmissionError::Serialization("diagnostic formatting failed".into()))?;
+    Ok(writer.text)
 }
 
 pub fn validate_with_limits(
@@ -517,6 +725,17 @@ pub fn validate_with_limits(
                 return Err(errs);
             }
             errs.push($error);
+        }};
+    }
+    macro_rules! report_text {
+        ($variant:path, $message:expr) => {{
+            match diagnostic_text($message, &mut diagnostic_bytes, limits.max_diagnostic_bytes) {
+                Ok(message) => errs.push($variant(message)),
+                Err(error) => {
+                    errs.push(ManifestError::Admission(error));
+                    return Err(errs);
+                }
+            }
         }};
     }
 
@@ -572,11 +791,18 @@ pub fn validate_with_limits(
             .into_iter()
             .flatten()
         {
-            if let Err(error) = c.hook_path(path, &format!("/user/{}", c.name)) {
-                report!(error.len(), ManifestError::BadHook(error));
+            if let Err(error) = c.hook_suffix(path) {
+                report_text!(
+                    ManifestError::BadHook,
+                    HookDiagnostic {
+                        error,
+                        hook: path,
+                        component: &c.name
+                    }
+                );
             }
         }
-        if !seen.insert(&c.name) {
+        if !seen.insert(c.name.as_str()) {
             report!(
                 c.name.len(),
                 ManifestError::DuplicateComponent(c.name.clone())
@@ -587,7 +813,7 @@ pub fn validate_with_limits(
     // ④ 依赖缺失
     for c in &m.components {
         for d in &c.deps {
-            if !seen.contains(d) {
+            if !seen.contains(d.as_str()) {
                 report!(
                     c.name.len() + d.len(),
                     ManifestError::UnknownDependency {
@@ -606,7 +832,7 @@ pub fn validate_with_limits(
                 .iter()
                 .map(|s| s.len() + std::mem::size_of::<String>())
                 .sum::<usize>(),
-            ManifestError::CycleDetected(cycle)
+            ManifestError::CycleDetected(cycle.into_iter().map(str::to_owned).collect())
         );
     }
 
@@ -639,12 +865,12 @@ pub fn validate_with_limits(
     // Reject malformed endpoints and ambiguous source aliases before planning.
     let mut sources = std::collections::HashSet::new();
     for w in &m.wiring {
-        let endpoints =
-            wire_endpoint(&w.from).and_then(|from| wire_endpoint(&w.to).map(|to| (from, to)));
+        let endpoints = parse_wire_endpoint(&w.from)
+            .and_then(|from| parse_wire_endpoint(&w.to).map(|to| (from, to)));
         match endpoints {
-            Err(error) => report!(error.len(), ManifestError::BadWiring(error)),
+            Err(error) => report_text!(ManifestError::BadWiring, error),
             Ok(((source, _), (target, path))) => {
-                if !seen.contains(&source.to_string()) || !seen.contains(&target.to_string()) {
+                if !seen.contains(source) || !seen.contains(target) {
                     report!(
                         w.from.len() + w.to.len(),
                         ManifestError::WiringUnreachable {
@@ -689,7 +915,7 @@ pub fn validate_with_limits(
 
 /// Iterative three-color DFS: deterministic cycle replay without call-stack
 /// depth proportional to a manifest's dependency chain.
-fn find_cycle(m: &AppManifest) -> Option<Vec<String>> {
+fn find_cycle(m: &AppManifest) -> Option<Vec<&str>> {
     let deps: BTreeMap<&str, &[String]> = m
         .components
         .iter()
@@ -717,8 +943,8 @@ fn find_cycle(m: &AppManifest) -> Option<Vec<String>> {
                     return Some(
                         stack[start..]
                             .iter()
-                            .map(|(node, _)| node.to_string())
-                            .chain(std::iter::once(target.to_string()))
+                            .map(|(node, _)| *node)
+                            .chain(std::iter::once(target))
                             .collect(),
                     );
                 }
@@ -757,7 +983,21 @@ impl AppManifest {
 
     /// 序列化为 TOML 文本（roundtrip 字节稳定的规范序：结构体字段序固定）。
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
-        toml::to_string(self)
+        self.to_toml_with_limits(&ApplicationLimits::default())
+    }
+
+    /// Admit the model before serialization and bound generated source bytes.
+    /// Uses the same canonical bytes as TOML serialization of admitted models;
+    /// semantic graph validation remains a separate operation.
+    pub fn to_toml_with_limits(
+        &self,
+        limits: &ApplicationLimits,
+    ) -> Result<String, toml::ser::Error> {
+        use serde::ser::Error;
+        limits
+            .check_manifest(self)
+            .map_err(toml::ser::Error::custom)?;
+        crate::encoding::canonical(self, limits.max_source_bytes)
     }
 
     /// Parse with default source/model admission. Semantic graph validation is
@@ -778,8 +1018,9 @@ impl AppManifest {
             .map_err(toml::de::Error::custom)?;
         Ok(manifest)
     }
-    /// Read at most source limit + 1 bytes, including when the file grows while
-    /// being read. Metadata size is not trusted as a substitute for a read bound.
+    /// Load a regular file, allowing symlinks to regular files. Unix opens do
+    /// not wait for a FIFO writer or acquire a controlling terminal. Read at
+    /// most source limit + 1 bytes, including if the file grows while reading.
     pub fn from_file(path: &Path) -> Result<Self, AppLoadError> {
         Self::from_file_with_limits(path, &ApplicationLimits::default())
     }
@@ -788,9 +1029,23 @@ impl AppManifest {
         limits: &ApplicationLimits,
     ) -> Result<Self, AppLoadError> {
         use std::io::Read;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "manifest source must be a regular file",
+            )
+            .into());
+        }
         let mut bytes = Vec::new();
-        std::fs::File::open(path)?
-            .take(limits.max_source_bytes.saturating_add(1))
+        file.take(limits.max_source_bytes.saturating_add(1))
             .read_to_end(&mut bytes)?;
         crate::limits::check("source bytes", bytes.len() as u64, limits.max_source_bytes)?;
         let text = String::from_utf8(bytes)
@@ -827,41 +1082,38 @@ pub fn component_config_flat(c: &ComponentSpec) -> BTreeMap<String, String> {
 // BD-1：AdminArtifactRef ↔ ArtifactRef 转换（serde 同形互锁）
 // ─────────────────────────────────────────────────────────────
 
-impl From<ArtifactRef> for parrot_remote::admin_v2::AdminArtifactRef {
-    fn from(a: ArtifactRef) -> Self {
-        use parrot_remote::admin_v2::AdminArtifactRef;
-        match a {
-            ArtifactRef::Props { factory } => AdminArtifactRef::Props { factory },
-            ArtifactRef::Wasm { digest, uri } => AdminArtifactRef::Wasm { digest, uri },
-            ArtifactRef::Dylib { digest, uri, abi } => AdminArtifactRef::Dylib { digest, uri, abi },
-            ArtifactRef::Jvm {
-                main_class,
-                coords,
-                uri,
-            } => AdminArtifactRef::Jvm {
-                main_class,
-                coords,
-                uri,
-            },
-            ArtifactRef::PyModule {
-                module,
-                runtime_env,
-                uri,
-            } => AdminArtifactRef::PyModule {
-                module,
-                // toml::Value → TOML 文本（wire 同形策略见 admin_v2.rs 文档）
-                runtime_env: runtime_env.and_then(|v| toml::to_string(&v).ok()),
-                uri,
-            },
-            ArtifactRef::Beam { app, uri } => AdminArtifactRef::Beam { app, uri },
+impl TryFrom<ArtifactRef> for parrot_remote::admin_v2::AdminArtifactRef {
+    type Error = String;
+    fn try_from(a: ArtifactRef) -> Result<Self, Self::Error> {
+        let result = a.to_admin_with_limits(&ApplicationLimits::default());
+        if let ArtifactRef::PyModule {
+            runtime_env: Some(value),
+            ..
+        } = a
+        {
+            crate::encoding::drop_value(value);
         }
+        result
     }
 }
 
-impl From<parrot_remote::admin_v2::AdminArtifactRef> for ArtifactRef {
-    fn from(a: parrot_remote::admin_v2::AdminArtifactRef) -> Self {
+impl TryFrom<parrot_remote::admin_v2::AdminArtifactRef> for ArtifactRef {
+    type Error = String;
+    fn try_from(a: parrot_remote::admin_v2::AdminArtifactRef) -> Result<Self, Self::Error> {
+        Self::from_admin_with_limits(a, &ApplicationLimits::default())
+    }
+}
+
+impl ArtifactRef {
+    /// Bound the wire model and runtime_env text before parsing. The TOML parser
+    /// retains its own nesting protection; decoded values also consume host limits.
+    pub fn from_admin_with_limits(
+        a: parrot_remote::admin_v2::AdminArtifactRef,
+        limits: &ApplicationLimits,
+    ) -> Result<Self, String> {
         use parrot_remote::admin_v2::AdminArtifactRef;
-        match a {
+        limits.check_metadata(&a).map_err(|e| e.to_string())?;
+        let result = match a {
             AdminArtifactRef::Props { factory } => ArtifactRef::Props { factory },
             AdminArtifactRef::Wasm { digest, uri } => ArtifactRef::Wasm { digest, uri },
             AdminArtifactRef::Dylib { digest, uri, abi } => ArtifactRef::Dylib { digest, uri, abi },
@@ -878,14 +1130,44 @@ impl From<parrot_remote::admin_v2::AdminArtifactRef> for ArtifactRef {
                 module,
                 runtime_env,
                 uri,
-            } => ArtifactRef::PyModule {
-                module,
-                // TOML 文本 → toml::Value（解析失败容忍 None——方言侧兜底）
-                runtime_env: runtime_env.and_then(|s| toml::from_str(&s).ok()),
-                uri,
-            },
+            } => {
+                let runtime_env = runtime_env
+                    .map(|text| {
+                        crate::limits::check(
+                            "source bytes",
+                            text.len() as u64,
+                            limits.max_source_bytes,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        toml::from_str::<toml::Table>(&text)
+                            .map(toml::Value::Table)
+                            .map_err(|e| {
+                                format!(
+                                    "invalid runtime_env TOML: {}",
+                                    e.message().chars().take(160).collect::<String>()
+                                )
+                            })
+                    })
+                    .transpose()?;
+                ArtifactRef::PyModule {
+                    module,
+                    runtime_env,
+                    uri,
+                }
+            }
             AdminArtifactRef::Beam { app, uri } => ArtifactRef::Beam { app, uri },
+        };
+        if let Err(error) = limits.check_artifact(&result) {
+            if let ArtifactRef::PyModule {
+                runtime_env: Some(value),
+                ..
+            } = result
+            {
+                crate::encoding::drop_value(value);
+            }
+            return Err(error.to_string());
         }
+        Ok(result)
     }
 }
 
@@ -1490,8 +1772,8 @@ Props = { factory = "f" }
             },
         ];
         for a in arts {
-            let wire: AdminArtifactRef = a.clone().into();
-            let back: ArtifactRef = wire.into();
+            let wire: AdminArtifactRef = a.clone().try_into().unwrap();
+            let back: ArtifactRef = wire.try_into().unwrap();
             assert_eq!(back, a);
         }
     }
@@ -1524,8 +1806,8 @@ Props = { factory = "f" }
             )),
             uri: None,
         };
-        let wire: AdminArtifactRef = orig.clone().into();
-        let back: ArtifactRef = wire.into();
+        let wire: AdminArtifactRef = orig.clone().try_into().unwrap();
+        let back: ArtifactRef = wire.try_into().unwrap();
         assert_eq!(back, orig, "toml 文本互转保真");
     }
 }

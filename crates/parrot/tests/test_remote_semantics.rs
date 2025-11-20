@@ -20,6 +20,9 @@ use parrot_remote::{LocalLookup, RemoteActorSystem, RemoteConfig as RCfg};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "support/network.rs"]
+mod network_support;
+
 // ===========================================================================
 // 远程消息（bincode 注册——inventory 经测试文件内 submit）
 // ===========================================================================
@@ -598,6 +601,9 @@ async fn rc8_remote_overload_closes_only_its_connection() {
 /// RC1/tcp：并发 ask 恰好一次（真实网络栈）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc1_exactly_once_tcp() {
+    if network_support::skip_tcp("remote TCP exactly-once") {
+        return;
+    }
     let (ra, _rb, _) = two_nodes_tcp().await;
     let echo = ra.remote_ref("parrot://node-b/user/echo").unwrap();
     let mut tasks = Vec::new();
@@ -620,6 +626,9 @@ async fn rc1_exactly_once_tcp() {
 /// RC6/tcp：NotRemotable 不出网。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc6_not_remotable_tcp() {
+    if network_support::skip_tcp("remote TCP non-remotable") {
+        return;
+    }
     let (ra, _rb, _) = two_nodes_tcp().await;
     let echo = ra.remote_ref("parrot://node-b/user/echo").unwrap();
     #[derive(Debug)]
@@ -631,6 +640,9 @@ async fn rc6_not_remotable_tcp() {
 /// RC5/tcp：stop 后 send 死信族错误。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc5_dead_letter_tcp() {
+    if network_support::skip_tcp("remote TCP dead-letter") {
+        return;
+    }
     let (ra, _rb, facade_b) = two_nodes_tcp().await;
     let ts = ThreadActorSystem::shared(ThreadActorSystemConfig::default());
     spawn_thread_actor(&facade_b, &ts, EchoActor, "/user/victim").await;
@@ -673,6 +685,9 @@ async fn rc5_dead_letter_tcp() {
 /// RC7：断连 → ask 得 ConnectionLost；重连后 ask 成功且 cid 单调。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rc7_disconnect_reconnect_tcp() {
+    if network_support::skip_tcp("remote TCP reconnect") {
+        return;
+    }
     let (ra, rb, facade_b) = two_nodes_tcp().await;
     let echo = ra.remote_ref("parrot://node-b/user/echo").unwrap();
     let p0 = echo

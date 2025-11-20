@@ -4,6 +4,7 @@ use std::fmt;
 use std::fmt::Debug;
 use tokio::sync::oneshot;
 
+use super::reply::ReplyReceiver;
 use parrot_api::errors::ActorError;
 use parrot_api::types::ActorResult;
 
@@ -130,9 +131,9 @@ pub struct AskEnvelope {
     pub options: MessageOptions,
     /// Channel to send the reply back to the requester.
     ///
-    /// `Option` 使 `take_reply` 可以零成本取走 sender（M5 单块消费路径），
-    /// 其余时间 Some。
-    reply: Option<oneshot::Sender<ActorResult<BoxedMessage>>>,
+    /// The private guard isolates receiver wake callbacks during disposal while
+    /// keeping the public payload movable and `take_reply` allocation-free.
+    reply: super::reply::ReplySender,
 }
 
 impl fmt::Debug for AskEnvelope {
@@ -149,43 +150,37 @@ impl AskEnvelope {
     ///
     /// Zero payload allocations: the value lives inline in the envelope,
     /// and the envelope flows by value into the mailbox.
-    pub fn new_inline<P: InlineMsg>(
-        msg: P,
-    ) -> (Self, oneshot::Receiver<ActorResult<BoxedMessage>>) {
+    pub fn new_inline<P: InlineMsg>(msg: P) -> (Self, ReplyReceiver) {
         let (tx, rx) = oneshot::channel();
         (
             Self {
                 payload: AskPayload::Inline(msg.into_inline()),
                 options: MessageOptions::default(),
                 trace_context: parrot_api::trace::TraceContext::current(),
-                reply: Some(tx),
+                reply: super::reply::ReplySender::new(Some(tx)),
             },
-            rx,
+            ReplyReceiver::new(rx),
         )
     }
 
     /// Create an ask envelope from an **unboxed** message of any size
     /// (zero-redundancy constructor: the only allocation is the payload
     /// box itself; the envelope is not boxed).
-    pub fn new_typed<M: Send + 'static>(
-        msg: M,
-    ) -> (Self, oneshot::Receiver<ActorResult<BoxedMessage>>) {
+    pub fn new_typed<M: Send + 'static>(msg: M) -> (Self, ReplyReceiver) {
         let (tx, rx) = oneshot::channel();
         (
             Self {
                 payload: AskPayload::Boxed(Box::new(msg)),
                 options: MessageOptions::default(),
                 trace_context: parrot_api::trace::TraceContext::current(),
-                reply: Some(tx),
+                reply: super::reply::ReplySender::new(Some(tx)),
             },
-            rx,
+            ReplyReceiver::new(rx),
         )
     }
 
     /// Create an ask envelope from an already-boxed message.
-    pub fn with_boxed(
-        payload: BoxedMessage,
-    ) -> (Self, oneshot::Receiver<ActorResult<BoxedMessage>>) {
+    pub fn with_boxed(payload: BoxedMessage) -> (Self, ReplyReceiver) {
         Self::with_boxed_options(payload, MessageOptions::default())
     }
 
@@ -193,60 +188,81 @@ impl AskEnvelope {
     pub fn with_boxed_options(
         payload: BoxedMessage,
         options: MessageOptions,
-    ) -> (Self, oneshot::Receiver<ActorResult<BoxedMessage>>) {
+    ) -> (Self, ReplyReceiver) {
         let (tx, rx) = oneshot::channel();
         (
             Self {
                 payload: AskPayload::Boxed(payload),
                 options,
                 trace_context: parrot_api::trace::TraceContext::current(),
-                reply: Some(tx),
+                reply: super::reply::ReplySender::new(Some(tx)),
             },
-            rx,
+            ReplyReceiver::new(rx),
         )
     }
 
     /// Compatibility constructor accepting an already-boxed payload.
-    pub fn new(payload: BoxedMessage) -> (Self, oneshot::Receiver<ActorResult<BoxedMessage>>) {
+    pub fn new(payload: BoxedMessage) -> (Self, ReplyReceiver) {
         Self::with_boxed(payload)
     }
 
-    /// send success reply
-    pub async fn reply_success(self, response: BoxedMessage) {
-        if let Some(reply) = self.reply {
-            let _ = reply.send(Ok(response));
-        }
+    /// Send a success reply when polled. Unpublished values are also protected
+    /// if the returned future is dropped without being polled.
+    pub fn reply_success(self, response: BoxedMessage) -> impl Future<Output = ()> + Send {
+        self.reply_async(Ok(response))
     }
 
-    /// send error reply
-    pub async fn reply_error(self, error: ActorError) {
-        if let Some(reply) = self.reply {
-            let _ = reply.send(Err(error));
-        }
+    /// Send an error reply when polled, preserving the original business error.
+    pub fn reply_error(self, error: ActorError) -> impl Future<Output = ()> + Send {
+        self.reply_async(Err(error))
     }
 
     /// Synchronous reply for timeout/shutdown paths where a dropped receiver
     /// is expected and not an error.
-    pub fn reply_sync(self, result: ActorResult<BoxedMessage>) {
-        if let Some(reply) = self.reply {
-            let _ = reply.send(result);
+    pub fn reply_sync(mut self, result: ActorResult<BoxedMessage>) {
+        let payload = super::reply::ReplyValue::new(self.payload);
+        let reply = super::reply::PendingReply::new(self.reply.take(), result);
+        Self::finish_reply(payload, reply);
+    }
+
+    fn reply_async(mut self, result: ActorResult<BoxedMessage>) -> impl Future<Output = ()> + Send {
+        let payload = super::reply::ReplyValue::new(self.payload);
+        let reply = super::reply::PendingReply::new(self.reply.take(), result);
+        async move { Self::finish_reply(payload, reply) }
+    }
+
+    fn finish_reply(
+        payload: super::reply::ReplyValue<AskPayload>,
+        reply: super::reply::PendingReply,
+    ) {
+        let (_, reply_cleanup) = reply.send();
+        let input_cleanup = payload.retire();
+        // These void compatibility helpers have no generation retirement owner.
+        // Finish both independent disposals before reporting either failure.
+        for error in [reply_cleanup, input_cleanup]
+            .into_iter()
+            .filter_map(Result::err)
+        {
+            super::reply::report_cleanup(&error);
         }
     }
 
     /// Deconstruct into (payload, reply sender) — used by the actor-side
     /// handler which consumes both parts.
-    pub fn into_parts(self) -> (BoxedMessage, oneshot::Sender<ActorResult<BoxedMessage>>) {
+    pub fn into_parts(mut self) -> (BoxedMessage, oneshot::Sender<ActorResult<BoxedMessage>>) {
         (
             self.payload.into_boxed(),
-            self.reply.expect("reply sender already taken"),
+            self.reply.take().expect("reply sender already taken"),
         )
     }
 
     /// M5: deconstruct keeping the layered payload (no inline re-box yet).
-    pub fn into_parts_layered(self) -> (AskPayload, oneshot::Sender<ActorResult<BoxedMessage>>) {
+    pub fn into_parts_layered(
+        mut self,
+    ) -> (AskPayload, oneshot::Sender<ActorResult<BoxedMessage>>) {
         (
             self.payload,
-            self.reply.expect("reply sender already taken"),
+            self.reply.take().expect("reply sender already taken"),
         )
     }
 
@@ -450,5 +466,47 @@ mod tests {
         assert!(matches!(env.payload, AskPayload::Boxed(_)));
         let boxed = env.into_parts().0;
         assert_eq!(*boxed.downcast::<String>().unwrap(), "hello");
+    }
+
+    #[test]
+    fn public_payload_remains_movable_and_sender_can_be_taken_once() {
+        let (mut envelope, mut receiver) = AskEnvelope::new_typed(String::from("request"));
+        let sender = envelope.take_reply().expect("first take owns sender");
+        assert!(envelope.take_reply().is_none());
+        let payload = envelope.payload.into_boxed();
+        assert_eq!(*payload.downcast::<String>().unwrap(), "request");
+        sender.send(Ok(Box::new(42u64))).unwrap();
+        assert_eq!(
+            *receiver
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .downcast::<u64>()
+                .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn deconstructed_senders_retain_delivery_ownership() {
+        let (envelope, mut receiver) = AskEnvelope::new_typed(String::from("boxed"));
+        let (payload, sender) = envelope.into_parts();
+        assert_eq!(*payload.downcast::<String>().unwrap(), "boxed");
+        sender.send(Err(ActorError::Timeout)).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Err(ActorError::Timeout))));
+
+        let (envelope, mut receiver) = AskEnvelope::new_inline(7u64);
+        let (payload, sender) = envelope.into_parts_layered();
+        assert!(matches!(payload, AskPayload::Inline(InlinePayload::U64(7))));
+        sender.send(Ok(Box::new(8u64))).unwrap();
+        assert_eq!(
+            *receiver
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .downcast::<u64>()
+                .unwrap(),
+            8
+        );
     }
 }

@@ -15,7 +15,7 @@ from parrot_protocol.ray_gw import main
 directory = tempfile.mkdtemp(prefix='pg-ray-', dir='/tmp')
 print('PARROT_RAY_DIRECTORY=' + directory, flush=True)
 try:
-    main(sys.argv, ray_kwargs={
+    main(sys.argv, owned_workers=True, ray_kwargs={
         'address': 'local', 'num_cpus': 2, 'include_dashboard': False,
         'log_to_driver': False, '_temp_dir': directory,
     })

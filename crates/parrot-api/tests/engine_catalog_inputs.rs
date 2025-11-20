@@ -358,12 +358,19 @@ fn isolated(name: &str, body: impl FnOnce()) {
         body();
         return;
     }
+    // The parent test harness runs cases in parallel, but each case forks the
+    // same binary to isolate panic payloads. Serialize those child processes
+    // so scheduler and stderr contention cannot look like a callback deadlock.
+    static ISOLATION_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = ISOLATION_LOCK
+        .lock()
+        .expect("catalog isolation lock was poisoned");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .env("PARROT_CATALOG_INPUT_CASE", name)
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(

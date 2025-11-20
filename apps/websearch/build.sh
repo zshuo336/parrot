@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  build.sh —— websearch 全组件构建（五运行时制品）
+#  build.sh —— websearch 全组件构建（四运行时制品）
 #
 #  Rust   target/{release,debug}/websearch     漫爬+编排+Web 服务
 #  JVM    jvm/target/websearch-jvm-1.0.0.jar   检索组件（jieba-analysis）
 #  Erlang erlang/frontier.erl                  源码即制品（网关热加载）
 #  Ray    python/tokenizer.py                  源码即制品（jieba 分词）
-#  TS     web/                                 静态页（Rust 直接内嵌服务）
+#  Web 页面由 Rust 直接生成，不包含独立 TS 运行时。
 # ============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"

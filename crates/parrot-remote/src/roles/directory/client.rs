@@ -100,8 +100,9 @@ pub struct DirectoryClient {
     group: String,
 }
 impl DirectoryClient {
-    /// Quorum-confirmed read, including absence. Each call appends a fresh
-    /// barrier; local QueryLocal and request status retain their local semantics.
+    /// Quorum-confirmed read, including absence. Each call obtains a fresh
+    /// ReadIndex quorum; a log barrier is needed only to initialize a term
+    /// without a current-term commit. QueryLocal and request status remain local.
     pub async fn query_linearizable(
         &self,
         peer: &NodeAddr,
@@ -255,7 +256,7 @@ impl DirectoryClient {
         )
         .await
     }
-    async fn call_wire<T: serde::de::DeserializeOwned>(
+    pub(super) async fn call_wire<T: serde::de::DeserializeOwned>(
         &self,
         peer: &NodeAddr,
         payload: Vec<u8>,
@@ -292,12 +293,10 @@ impl DirectoryClient {
             }
             check_deadline(deadline)?;
             let cid = self.remote.callbacks.next_cid();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.remote
+            let (rx, _pending) = self.remote
                 .callbacks
-                .insert_on(cid, peer.node_id.clone(), tx, &sender)
+                .register_on(cid, peer.node_id.clone(), &sender)
                 .map_err(|e| NetworkDirectoryError::Operation(e.to_string()))?;
-            let _pending = self.remote.callbacks.guard(cid);
             let frame = Frame::ask(
                 cid,
                 &format!("parrot://{}{path}", peer.node_id),
@@ -325,7 +324,8 @@ impl DirectoryClient {
                         parrot_api::message::RemoteDecodeLimits {
                             max_payload_bytes: 2 * 1024 * 1024,
                             max_values: 4300,
-                            max_depth: 8,
+                            // Ownership replies include an outcome, record and holder.
+                            max_depth: 12,
                         },
                     )
                     .map_err(NetworkDirectoryError::Invalid)

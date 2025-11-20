@@ -1,0 +1,13 @@
+[package]
+name = "parrot-abi-messagingcomp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "parrot_abi_messagingcomp"
+crate-type = ["cdylib"]
+
+[dependencies]
+parrot-abi = { path = "../../../", default-features = false }
+toml = "0.8"

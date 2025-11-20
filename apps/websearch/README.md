@@ -1,4 +1,6 @@
-# websearch —— 真实搜索引擎（五运行时全分工）
+# websearch：四种运行时协作的网页搜索应用
+
+> 与当前实现对齐：2026-11-06。以实际函数、协议处理器和启动脚本为依据；本文不记录未经本次执行确认的测试通过结论。
 
 与 `apps/crawler-lab`（合成页回归基线）同族架构，面向**真实互联网**：
 
@@ -8,9 +10,11 @@
 | Rust/Parrot | `crawler` | reqwest 真实 HTTPS 漫爬 + HTML 抽链/抽文 + 编排 + 百度式 Web 页 |
 | Ray/Python | `tokenizer` | **jieba 中文分词**（开源）+ 词频统计 |
 | Akka/JVM | `search` | **jieba-analysis 查询切词** + 倒排 + BM25 + 段文件落盘（重启回放） |
-| TS Lite | 浏览器 | 零依赖访问 `http://localhost:8080` |
 
-四节点可分布任意机器（组网/部署跨网络——见「跨网络部署」节；本 README 快速
+浏览器访问 Rust 生成的 HTML 和页面 JavaScript，不直接使用 TS Lite 或 Parrot Wire。
+Websearch 使用上述四种运行时，不是 Parrot 全部能力的演示或认证。
+
+四个角色可放在具有兼容运行时、制品和网络条件的不同机器（见「跨网络部署」节；本 README 快速
 上手只演示单机 direct 形态）。
 
 ## 📚 文档
@@ -21,32 +25,39 @@
 | [docs/PARROT_USAGE.md](docs/PARROT_USAGE.md) | parrot 能力全景——用了什么/为什么用/引擎内部原理（组网·握手·codec·RPC·部署·心跳·寻址） |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 运维手册——编译/部署/parrot 部署机制沙盘推演/监控/故障排查 |
 
-本 README 只保留快速上手；技术细节见上述三文档。
+本 README 同时说明启动、持久化与恢复契约；三份技术文档按相同实现展开。
+循序渐进的完整教程与本地网页语料见 [documents](../../documents/README.md)。
 
 ## 快速上手
 
 ```bash
-# 构建（rust + jvm fat jar + erl beam + 依赖自检）
+# 先准备通用网关，再构建业务；Python/Ray/jieba 等前提见运维手册
+make build-jvm build-erl
 apps/websearch/build.sh
 
 # 一键全链（默认构建后起三网关 + 漫爬 + Web 服务）——direct
 # 不给种子自动启用内置 47 条多样化种子集；默认目标 100 站 × 每站深度 10
-apps/websearch/run.sh --port 8080
+apps/websearch/run.sh --insecure-development --pages 100 --port 0
 
 # 也可以指定种子与目标
-apps/websearch/run.sh https://www.runoob.com --sites 100 --maxdepth 10
+apps/websearch/run.sh --insecure-development https://example.org/ --pages 100 --sites 100 --maxdepth 10
 
 # 仅检索（独立运行——回放已落盘索引）
-apps/websearch/run.sh --serve-only --port 8080 --data /absolute/path/to/saved/index
+apps/websearch/run.sh --insecure-development --serve-only --port 0 --data /absolute/path/to/saved/index
 ```
+
+公网 seed 不保证当前可访问。希望范围可控且无需公网网页时，使用
+[本地入门实验](../../documents/01-getting-started.md)。`--insecure-development`
+明确选择未认证开发连接，不提供 TLS 或生产权限隔离。
+原始 HTTP listener 绑定 `0.0.0.0`；READY 中的 loopback 地址不表示只监听本机。
 
 ## 本地清单宿主
 
 在仓库根目录构建业务和通用网关后，可由应用自身按清单装配：
 
 ```bash
-CARGO_BUILD_JOBS=2 apps/websearch/build.sh
 make build-jvm build-erl
+CARGO_BUILD_JOBS=2 apps/websearch/build.sh
 ./target/release/websearch --insecure-development \
   --manifest apps/websearch/websearch.app.toml \
   --data /absolute/websearch-data --pages 100 https://example.org/
@@ -90,7 +101,7 @@ Ctrl-C或TERM先请求应用结束当前抓取批次并确认落盘，最长等�
 | 模式 | 入口 | 形态 | 适用 |
 |---|---|---|---|
 | ① 单机调试 | `run.sh` | 本机三网关进程 + direct 拨号 | 开发调试 |
-| ② 单机 registry | `deploy/run-registry.sh` | 网关反拨注册（生产组网形态） | 组网演练 |
+| ② 单机 registry | `deploy/run-registry.sh` | 网关反拨注册 | 开发组网演练 |
 | ③ 多节点模拟 | `deploy/compose.sh up` | docker 4 容器真实跨网（项目独立 bridge） | 单机模拟多物理机 |
 | ④ 真实多机 | `deploy/distribute.sh` + `deploy/start-remote.sh` | ssh 分发 + 物理机网关 | 显式开发演练；生产验收未完成 |
 
@@ -113,9 +124,9 @@ registry启动只接受所需身份的已握手、当前未关闭直连。静态
 ./target/release/websearch --insecure-development --bind 0.0.0.0:19870 --wait 60 --port 8080 --node-root /opt/parrot/websearch
 
 # 各网关节点（制品先经 apps/websearch/deploy/distribute.sh 分发）
-apps/websearch/deploy/start-remote.sh erl  <应用IP>:19870   # Erlang 机器
-apps/websearch/deploy/start-remote.sh ray  <应用IP>:19870   # Python 机器
-apps/websearch/deploy/start-remote.sh jvm  <应用IP>:19870 --data /var/lib/websearch
+/opt/parrot/websearch/start-remote.sh erl APP_IP:19870 --root /opt/parrot/websearch
+/opt/parrot/websearch/start-remote.sh ray APP_IP:19870 --root /opt/parrot/websearch
+/opt/parrot/websearch/start-remote.sh jvm APP_IP:19870 --root /opt/parrot/websearch --data /var/lib/websearch
 ```
 
 ### 形态 2：direct 显式跨机地址
@@ -132,16 +143,16 @@ apps/websearch/deploy/start-remote.sh jvm  <应用IP>:19870 --data /var/lib/webs
 ### 形态 3：docker 多容器跨网模拟（apps/websearch/deploy 自包含）
 
 ```bash
-apps/websearch/deploy/compose.sh up        # 4 容器真实 TCP 跨"机"（bridge 网）
+apps/websearch/deploy/compose.sh up --insecure-development --pages 100 https://example.org/
 apps/websearch/deploy/compose.sh logs      # 跟踪应用日志
 apps/websearch/deploy/compose.sh stats     # /stats 快照
 apps/websearch/deploy/compose.sh down      # 销毁（down -v 连数据卷）
 ```
 
 app 的 compose 在 `apps/websearch/deploy/docker-compose.yml` **完备自包含**；
-镜像引用框架通用运行时（`deploy/images/gw-{erl,jvm,ray,app}.Dockerfile`——
-单一真源不复制）；app 制品（beam/jar/py/二进制）volume 挂载进容器，
-重建 app 不重建镜像。基镜像默认来自官方源；仅显式设置 `WS_REGISTRY_PREFIX` 才使用所选代理，空值也使用官方源。Web 端口发布到宿主 `127.0.0.1:8188`，容器内默认 `8080`；`up --port N` 会同时更新容器监听和发布目标。
+镜像引用框架通用运行时（`deploy/images/gw-{erl,jvm,ray,app}.Dockerfile`）；
+beam/py/jar 业务制品挂载，Rust 应用二进制在构建时 COPY 入 app 镜像，
+修改二进制后必须重建 app 镜像。基镜像默认来自官方源；仅显式设置 `WS_REGISTRY_PREFIX` 才使用所选代理，空值也使用官方源。Web 端口发布到宿主 `127.0.0.1:8188`，容器内默认 `8080`；`up --port N` 会同时更新容器监听和发布目标。
 
 ### 远程制品的完整性与版本目录
 
@@ -155,11 +166,12 @@ app 的 compose 在 `apps/websearch/deploy/docker-compose.yml` **完备自包含
 
 应用制品路径现在通过合法file URI编码，空格、中文、#、?和%不会被误当作URI结构。JVM按URI解码后加载，显式非法／非本地file URI和不存在jar返回ArtifactFetch，不再静默回退父classpath；未给URI的父classpath模式保留。Maven坐标自动下载仍未实现。
 
-当前示例中的非回环TCP组网须由调用者明确选择`--insecure-development`，仅用于显式开发演练；本批没有完成生产传输认证和真实跨机器发布验收。
+当前示例中的非回环TCP组网须由调用者明确选择`--insecure-development`，仅用于显式开发演练；这些命令不构成生产认证或真实跨机器发布通过的证据。
 
 
-分词三语言同族：Python `jieba`（原版）/ JVM `jieba-analysis`（huaban 移植）/ Rust 侧经
-Ray 通道复用 Python 分词（词条布局 `len|term|docid|tf` 四方言同构）。
+索引分词由 Python `jieba` 执行，查询分词由 JVM `jieba-analysis` 执行。Rust 校验 Ray
+返回的 `(term, docid, tf)`，再编码完整 `IndexDocuments`；没有独立 Rust/TS 分词阶段，
+也不是把 Ray 的 `Terms` 原样发送给 JVM。
 
 ## 站点目标制爬取（用户裁定 3）
 
@@ -173,14 +185,16 @@ Ray 通道复用 Python 分词（词条布局 `len|term|docid|tf` 四方言同�
   `--keep` 续爬（保留旧索引与去重表——增量模式）
 - **周期段落盘**（60s 一次）：爬取中途崩溃/中断后 `--serve-only` 可回放已爬部分——
   段为全量快照式（回放幂等，docid 覆盖）
-- **deploy 幂等**：网关进程长存（重启应用不重启网关）——同名组件已在位时自动
-  drain + 重部署（serve-only/应用重启不再 name 冲突 panic）
+- **组件恢复**：在目录锁保护下停止持久意图中记录的确切旧实例，写入本次新意图，
+  再部署带新运行标识的组件；不是匹配“重名”错误后 Drain 重试。
 
 参数在创建数据目录和启动网关连接前完整校验。缺值、未知/重复参数、越界数字、非HTTP(S)或带凭据种子返回退出码2；`--help`显示完整用法。`--node-root`须为目标网关上的绝对目录，网关地址使用具体IP和非零端口（IPv6写为`[::1]:PORT`）。`--wait`范围为1–86400秒。
 
 Web监听socket在数据修改和组件部署前实际绑定，并保留到服务运行；请求端口占用时最多向后尝试20个端口，超出65535不回绕。全部不可用时退出码3，数据目录不变。`--port 0`由操作系统分配端口，以日志`Web listening on ...`为准。
 
-预算停止不是可靠续爬事务：现有dedupe.tsv记录的是发现过的URL，未完成/失败URL的持久队列和可靠重试仍待实现，`--keep`不能保证补回所有未抓取内容。
+预算耗尽后，已发现但未完成的任务仍由 `crawl.journal` 保存；下次 `--keep`
+可重放，失败任务在下一次调用重试，而不是本次无限重试。发现范围之外的内容、
+尚未抽取到的链接和已完成 URL 的定时重抓不因此得到保证。恢复规则见“待爬任务的持久恢复”。
 
 ## 确定性主机集成测试
 
@@ -194,7 +208,7 @@ bash apps/websearch/jvm/test.sh
 
 覆盖 direct / registry、真实404及robots拒绝、`--keep`增量、JVM进程彻底重启后的磁盘回放、冷启动清理、相同种子重爬、实际末页内容、零/极大分页参数、空库、端口占用和网关迟到。网关回放必须保持业务结果及分数一致；只检查“docs>0”或日志无panic不算通过。JVM契约测试另验证独立BM25公式、重复词频更新及多快照回放。
 
-**此入口只验收主机进程，不包含容器矩阵。** 旧脚本的compose分支使用固定容器名、共享数据及公网抓取，已停止由本入口调用；独立容器入口为 `scripts/verify_websearch_images.py`，验证范围和准备步骤见 [镜像说明](../../deploy/images/README.md)。`--fast`保留为主机范围兼容别名；`--no-build`仅用于显式验证现有debug制品，结果会记录跳过构建。完整边界和排错见 [tests/README.md](tests/README.md)。
+**此入口只验收主机进程，不包含容器矩阵。** 旧脚本的compose分支使用固定容器名、共享数据及公网抓取，已停止由本入口调用；独立容器入口为 `scripts/verify_websearch_images.py`，验证范围和准备步骤见 [镜像说明](../../deploy/images/README.md)。`--fast`保留为主机范围兼容别名；默认构建从Cargo回执选择本次可执行文件，支持自定义target。`--no-build`显式使用现有debug制品，可附`--binary /absolute/websearch`指定路径，结果记录跳过构建及实际程序哈希。完整边界和排错见 [tests/README.md](tests/README.md)。
 
 ## 站点与分词表浏览（用户裁定 1/2）
 
@@ -216,7 +230,8 @@ bash apps/websearch/jvm/test.sh
 
 - 页面编码：GBK/GB2312/GB18030 使用内存解码器转 UTF-8，不依赖 iconv 子进程
 - 索引分词：ray 侧 jieba（停用词表 + 单字过滤）
-- 查询分词：jvm 侧 jieba-analysis SEARCH 模式（同停用词表）
+- 查询分词：jvm 侧 jieba-analysis SEARCH 模式及自己的过滤表；它与 Python 的
+  停用词集合并不完全相同，两种 jieba 实现也不保证对所有文本切词相同
 
 ## 数据目录
 
@@ -240,7 +255,7 @@ JVM --index-data（未绑定时WS_DATA）/
 
 页面响应在读取过程中执行 1 MiB 上限，按 HTTP 传输解码及 gzip 解压后的字节计数。Content-Length 已声明超限时，在读取正文前拒绝；未知长度及压缩响应逐块校验，超限即返回错误并停止读取，不再将截断页面当作成功页面送入索引。恰好 1 MiB 的完整响应允许。此上限位于字符集转换之前，UTF-8 转码后的字符串、HTTP 内部缓冲与并发请求仍各有内存开销，不代表进程 RSS 限制。
 
-`cargo test --locked -p websearch` 使用本地 HTTP 服务器验证声明超限、未知长度不停流、完整超大页、精确上限及 gzip 解压预算，另检查大 GBK 内容和 GB18030 四字节字符。无需公网、网关或搜索数据目录。这些回归不等同运行 `tests/run_all.sh` 的完整爬取/恢复场景。
+`cargo test --locked -p websearch --bin websearch fetch_tests` 使用本地 HTTP 服务器验证声明超限、未知长度不停流、完整超大页、精确上限及 gzip 解压预算，另检查大 GBK 内容和 GB18030 四字节字符。此过滤入口无需公网业务网站、真实网关或已有搜索数据。这些回归不等同运行整个包的进程测试或 `tests/run_all.sh` 的完整爬取/恢复场景。
 
 robots 策略、目标地址安全和跳转边界见下节。抓取/索引恢复、网关全链路和入口调度仍需独立验收；本地 HTTP 回归不代表这些流程已经完成。
 
@@ -253,7 +268,7 @@ robots 策略、目标地址安全和跳转边界见下节。抓取/索引恢复
 
 成功规则缓存至多24小时。除401/403/429外的4xx按文件不可用处理，允许抓取并缓存1小时；认证拒绝、限流、5xx、网络错误、超时或非法跳转暂时拒绝，30秒后下一次请求可重取。缓存最多256个origin，规则向量和字符串容量预算8 MiB，最多16个并发下载；同origin共用一个下载，取消调用会释放锁和名额。全局缓存锁不跨网络等待。没有可回收空间或下载名额时本次拒绝，不创建无界后台任务；当前调用将失败计入尝试预算，失败任务保留在持久日志，下次`--keep`重试；同一次调用不无限重试。
 
-robots 文件允许最多5次跳转，包括跨origin跳转，所得规则只归最初origin。页面关闭reqwest自动跳转，在每一跳发送前检查目标robots，跳转循环、超过5次、非HTTP(S)或含凭据的目标均失败。robots下载全链期限5秒；一次页面抓取的12秒总期限包含规则等待、跳转和正文读取。生产模式拒绝 loopback、RFC1918、link-local、共享/保留地址和 IPv4-mapped 私网地址；每个 redirect 都重新校验，DNS resolver 会检查一次解析返回的全部地址，环境 HTTP(S) 代理被禁用。测试如需访问本地 HTTP server 必须显式使用 test-only network policy。
+robots 文件允许最多5次跳转，包括跨origin跳转，所得规则只归最初origin，但显式 crawl-origin 仍限制允许目标。页面关闭reqwest自动跳转，在每一跳发送前检查目标robots，跳转循环、超过5次、非HTTP(S)或含凭据的目标均失败。robots下载全链期限5秒；一次页面抓取的12秒总期限包含规则等待、跳转和正文读取。默认公网策略拒绝 loopback、RFC1918、link-local、共享/保留地址和 IPv4-mapped 私网地址；每个 redirect 都重新校验，DNS resolver 检查一次解析返回的全部地址，环境 HTTP(S) 代理被禁用。CLI 本地实验使用显式 IP `--crawl-origin` 授权精确目标；内部单元测试另有 test-only network policy。
 
 索引URL与相对链接基址使用实际获取的最终URL。相对路径交给URL解析器，保留尾斜杠、查询原始编码及顺序；去掉fragment和显式的utm_/fbclid/gclid跟踪键。`/dir/page`与`/dir/page/`解析`child`的结果不同，不能合并为同一资源。现有入口的200ms调度间隔还不等于每一跳HTTP请求的严格间隔。
 
@@ -264,7 +279,7 @@ JVM独占数据目录，停止actor或进程退出后释放文件锁。Flush即�
 
 每个快照最多256 MiB、100万文档、100万词项、1600万posting，每个字符串最多16 MiB；旧目录最多10万个完整快照，迁移期间允许再发布一个新头；后台回收完成后保留一个完整快照。每个epoch最多保留10万个祖先摘要，达到上限后继续增长会明确失败，显式新爬取仍可Clear开启新epoch。这不是无限历史或无限规模索引；磁盘容量应持续检查。CRC32用于检测损坏，不是来源认证。写入/发布/同步失败后，actor返回错误并拒绝后续业务请求，须修复存储并重新部署恢复；同步失败可能发生在改名之后，失败回执不代表操作一定没有生效。
 
-冷启动在网关连接、部署和Clear确认前不删除索引或去重记录；只读serve-only也不重置去重记录。任务日志只在索引Checkpoint确认后记录完成，两次写入之间中断采用至少一次完整文档重放；这不是跨存储的原子事务。测试覆盖真实JVM进程SIGKILL后的恢复，不代表已验证断电、存储控制器缓存或所有文件系统的持久性。不要在实例运行时删除、改名或替换数据目录。
+冷启动在网关连接、部署和Clear确认前不删除索引或去重记录；serve-only 不重置去重记录，但仍获取目录锁并可能更新组件身份/意图，不能称整个运行完全无写入。任务日志只在索引Checkpoint确认后记录完成，两次写入之间中断采用至少一次完整文档重放；这不是跨存储原子事务。仓库提供真实JVM进程SIGKILL恢复测试，其通过结果也不能证明断电、存储控制器缓存或所有文件系统持久性。不要在实例运行时删除、改名或替换数据目录。
 
 ### Frontier 层级顺序与升级
 
@@ -317,8 +332,8 @@ JVM快照版本5携带16字节epoch、当前编号及有序祖先编号/SHA256�
 旧完成记录）转为待重放；迁移记录先同步落盘，不把旧编号当作内容证明。
 
 日志上限256MiB、单记录2MiB、单代任务100000；预算耗尽明确失败，不丢弃
-任务。日志支持下文的原子压缩，索引支持下文的后台回收。当前验证覆盖macOS本地文件系统与
-Linux容器中的真实进程中断与同epoch备份分叉拒绝；未认证掉电、NFS或跨机器锁。不同应用的组件地址互相隔离；目录锁和运行地址不替代分布式租约/fencing。
+任务。日志支持下文的原子压缩，索引支持下文的后台回收。主机与容器分别有真实进程中断和
+同epoch备份分叉拒绝的验证入口，实际结果以对应环境本次执行证据为准；不据此认证掉电、NFS或跨机器锁。不同应用的组件地址互相隔离；目录锁和运行地址不替代分布式租约/fencing。
 恢复日志与索引必须成套备份。升级须一起部署当前Rust应用和JVM业务jar，
 旧JVM可能不支持PrepareIndex或CrawlStateV2/CheckpointV2，旧快照读取器不能读取版本5。降级必须恢复升级前成套离线备份。
 服务保留旧CrawlState/Checkpoint的24字节回执接口；当前应用只使用带历史证明的V2接口。
@@ -352,7 +367,7 @@ serve-only只恢复检索，不触发旧历史准备。服务端准备未完成�
 历史固定名称组件不属于新身份；升级前由其管理者明确停止或重启专用网关，应用
 不会自动抢占`/user/search`等旧名称。`--index-data`显式选择并记住JVM上的索引数据
 目录；原始Rust的`--data`只选择本地日志/身份目录，不自动改变远端索引路径。
-两个独立身份争用同一索引时，后者被文件锁拒绝且不停止前者。运行地址隔离已经验证，跨机器克隆身份、分区和晚到Deploy
+两个独立身份争用同一索引时，后者被文件锁拒绝且不主动停止前者。运行地址隔离有独立回归入口，跨机器克隆身份、分区和晚到Deploy
 的租约/fencing、自动回收仍未完成。
 
 ### 共享网关上的独立索引

@@ -10,6 +10,7 @@ struct State {
     sends: AtomicUsize,
     stop_result: AtomicUsize,
     send_result: AtomicUsize,
+    error_disposals: Arc<AtomicUsize>,
     release: tokio::sync::Semaphore,
 }
 impl State {
@@ -20,12 +21,32 @@ impl State {
             sends: AtomicUsize::new(0),
             stop_result: AtomicUsize::new(0),
             send_result: AtomicUsize::new(0),
+            error_disposals: Arc::default(),
             release: tokio::sync::Semaphore::new(0),
         })
     }
 }
 #[derive(Debug, Clone)]
 struct RetiringRef(Arc<State>);
+
+#[derive(Debug)]
+struct HookError {
+    mode: usize,
+    disposed: Arc<AtomicUsize>,
+}
+impl std::fmt::Display for HookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        assert_ne!(self.mode, 5, "hook error formatting panic");
+        f.write_str("returned hook failure")
+    }
+}
+impl std::error::Error for HookError {}
+impl Drop for HookError {
+    fn drop(&mut self) {
+        self.disposed.fetch_add(1, Ordering::SeqCst);
+        assert_ne!(self.mode, 6, "hook error disposal panic");
+    }
+}
 impl ActorRef for RetiringRef {
     fn send<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
@@ -43,6 +64,13 @@ impl ActorRef for RetiringRef {
                     "hook actually failed".into(),
                 )),
                 3 => Ok(Box::new(ParrotAppHook(99)) as BoxedMessage),
+                mode @ (5 | 6) => Err(ActorError::Other(
+                    HookError {
+                        mode,
+                        disposed: self.0.error_disposals.clone(),
+                    }
+                    .into(),
+                )),
                 _ => panic!("hook callback panic"),
             }
         })
@@ -152,7 +180,7 @@ async fn cleanup_failure_is_not_a_successful_drain_and_can_be_retried() {
 }
 #[tokio::test]
 async fn stop_callback_panic_is_not_a_successful_drain() {
-    rejected_retirement(2, "hook panic").await;
+    rejected_retirement(2, "owned stop callback panic").await;
 }
 #[tokio::test]
 async fn missing_path_is_not_proof_of_owned_retirement() {
@@ -221,6 +249,15 @@ async fn rejected_hook(mode: usize, message: &str) {
     assert_eq!(state.stops.load(Ordering::SeqCst), 0);
     assert!(context.completed_hooks.is_empty());
     assert!(context.completed_terminations.is_empty());
+    if matches!(mode, 5 | 6) {
+        assert_eq!(state.error_disposals.load(Ordering::SeqCst), 1);
+        if mode == 6 {
+            assert!(
+                error.to_string().contains("returned hook failure"),
+                "{error}"
+            );
+        }
+    }
     state.release.add_permits(1);
     context.teardown(&deployer).await.unwrap();
 }
@@ -239,6 +276,14 @@ async fn invalid_ack_is_preserved_even_when_instance_then_closes() {
 #[tokio::test]
 async fn hook_panic_is_preserved_even_when_instance_then_closes() {
     rejected_hook(4, "hook panic").await;
+}
+#[tokio::test]
+async fn hook_error_formatting_panic_is_reported_without_acknowledging_or_losing_ownership() {
+    rejected_hook(5, "actor error formatting panicked").await;
+}
+#[tokio::test]
+async fn hook_error_disposal_panic_preserves_original_failure_and_retry_ownership() {
+    rejected_hook(6, "actor error disposal panicked").await;
 }
 #[tokio::test]
 async fn unreachable_gateway_is_not_joined_as_a_local_retirement() {

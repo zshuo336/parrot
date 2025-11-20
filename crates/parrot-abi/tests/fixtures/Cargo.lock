@@ -46,6 +46,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "parrot-abi-messagingcomp"
+version = "0.1.0"
+dependencies = [
+ "parrot-abi",
+ "toml",
+]
+
+[[package]]
+name = "parrot-abi-recordingcomp"
+version = "0.1.0"
+dependencies = [
+ "parrot-abi",
+ "toml",
+]
+
+[[package]]
 name = "parrot-abi-testcomp"
 version = "0.1.0"
 dependencies = [

@@ -273,20 +273,7 @@ pub trait Actor: Send + 'static {
         messages: Vec<BoxedMessage>,
         ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, Vec<ActorResult<BoxedMessage>>> {
-        Box::pin(async move {
-            let mut results = Vec::with_capacity(messages.len());
-            let mut messages = messages.into_iter();
-            while let Some(message) = messages.next() {
-                let outcome = self.receive_message(message, ctx).await;
-                let fatal = matches!(outcome, Err(ActorError::Panic(_)));
-                results.push(outcome);
-                if fatal {
-                    results.extend(messages.map(|_| Err(ActorError::Stopped)));
-                    break;
-                }
-            }
-            results
-        })
+        crate::batch_dispatch::serial(self, messages, ctx)
     }
 
     /// Whether this actor wants its messages dispatched through the async
@@ -295,17 +282,19 @@ pub trait Actor: Send + 'static {
     /// # Overview
     /// Engines consult this flag to select the dispatch path:
     ///
-    /// - `false` (default): the Actix engine probes
-    ///   `receive_message_with_engine` first (sync fast path). A `None`
-    ///   return drops the message (legacy behavior).
+    /// - `false` (default): the Actix engine calls
+    ///   [`ActixEngineExt::receive_message_with_engine`] (sync fast path).
+    ///   A `None` return reports an unhandled-message error; it does not retry
+    ///   the consumed message through `receive_message`.
     /// - `true`: the Actix engine skips the sync probe entirely and routes
     ///   every message through `receive_message`. The handler may `.await`
     ///   freely (real IO); the actor stays logically serial — subsequent
     ///   messages queue behind the in-flight one — while the arbiter thread
     ///   is released to poll other actors during the await.
     ///
-    /// The thread engine always uses `receive_message`, so setting this to
-    /// `true` makes actor behavior identical across both engines.
+    /// The thread engine always uses `receive_message`. Setting this to `true`
+    /// selects the same business handler on both engines; scheduling and
+    /// lifecycle guarantees still depend on the engine.
     fn use_async_handler(&self) -> bool {
         false
     }
@@ -431,8 +420,9 @@ pub trait Actor: Send + 'static {
 /// 注意：**故意不加 blanket impl**——stable Rust 无 specialization，
 /// blanket 会与 derive 生成的逐类型 impl 冲突（E0119）。
 pub trait ActixEngineExt: Actor {
-    /// 同步快路径：`Some(..)` 完全处理消息；`None` = 未处理
-    /// （引擎回退到 async `receive_message`）。
+    /// 同步快路径：`Some(..)` 返回处理结果；`None` 返回明确的未处理消息错误。
+    /// 消息已按值交给本方法，不会回退到异步入口。需要异步分派的 actor 应在调用前
+    /// 通过 [`Actor::use_async_handler`] 选择该路径。
     fn receive_message_with_engine<'a>(
         &'a mut self,
         msg: BoxedMessage,

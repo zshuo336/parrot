@@ -26,11 +26,11 @@ def run(command, directory):
         previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
         try:
             if process is not None:
-                if process.poll() is None:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                # An exited tool can still leave descendants in its owned group.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait(timeout=10)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous)

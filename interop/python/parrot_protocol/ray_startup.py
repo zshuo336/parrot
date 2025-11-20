@@ -11,6 +11,10 @@ Wrap these private compatibility seams only during this gateway's ray.init;
 never retry a partially started cluster. No Ray installation is modified.
 The gateway owns initialization in its process; unrelated concurrent ray.init
 calls in that same process are not supported.
+
+The private owned-node entrypoint also selects a Linux worker bootstrap which
+binds every worker (including prestarted idle workers) to raylet's lifetime.
+Embedding callers keep their existing bootstrap unless explicitly requested.
 """
 from contextlib import contextmanager
 from pathlib import Path
@@ -86,7 +90,7 @@ def guarded_allocator(original):
     return allocate
 
 
-def guarded_raylet_start(original):
+def guarded_raylet_start(original, *, owned_workers=False):
     def start(node, *args, **kwargs):
         params = node._ray_params
         # Cached agent ports are selected but not yet listening. The kernel's
@@ -98,17 +102,28 @@ def guarded_raylet_start(original):
                 selected = node._get_unused_port(params.reserved_ports)
                 setattr(params, name, selected)
                 params.update_pre_selected_port()
-        return original(node, *args, **kwargs)
+        if not owned_workers or sys.platform != 'linux':
+            return original(node, *args, **kwargs)
+        import ray
+        original_setup = params.setup_worker_path
+        expected = Path(ray.__file__).parent / '_private/workers/setup_worker.py'
+        if Path(original_setup).resolve() != expected.resolve():
+            raise RuntimeError('owned Ray workers require the standard runtime environment bootstrap')
+        params.setup_worker_path = str(Path(__file__).with_name('ray_owned_worker.py'))
+        try:
+            return original(node, *args, **kwargs)
+        finally:
+            params.setup_worker_path = original_setup
     return start
 
 
 @contextmanager
-def guarded_ports(node_type):
+def guarded_ports(node_type, *, owned_workers=False):
     with _INITIALIZATION:
         original = node_type._get_unused_port
         original_start = node_type.start_raylet
         allocator = guarded_allocator(original)
-        node_type.start_raylet = guarded_raylet_start(original_start)
+        node_type.start_raylet = guarded_raylet_start(original_start, owned_workers=owned_workers)
         node_type._get_unused_port = allocator
         try:
             yield
@@ -117,7 +132,7 @@ def guarded_ports(node_type):
             node_type.start_raylet = original_start
 
 
-def initialize(ray_module, kwargs):
+def initialize(ray_module, kwargs, *, owned_workers=False):
     from ray._private.node import Node
     from ray._private import ray_constants
     from .ray_artifacts import collect_orphaned_snapshots
@@ -133,7 +148,7 @@ def initialize(ray_module, kwargs):
     previous = signal.getsignal(signal.SIGTERM) if threading.current_thread() is threading.main_thread() else None
     owns_signal = previous == signal.SIG_IGN or callable(previous)
     try:
-        with guarded_ports(Node):
+        with guarded_ports(Node, owned_workers=owned_workers):
             # Ray snapshots this option at import, then consumes it when
             # creating the driver's CoreWorker. Its native logger otherwise
             # resets SIGTERM to SIG_DFL during shutdown, overriding even a

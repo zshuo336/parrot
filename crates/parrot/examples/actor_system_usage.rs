@@ -1,4 +1,3 @@
-use actix::{AsyncContext, Context as ActixBaseContext};
 use anyhow::Result;
 use parrot::{
     actix::{ActixActor, ActixActorSystem, ActixContext},
@@ -7,30 +6,54 @@ use parrot::{
 use parrot_api::{
     actor::{Actor, ActorState, EmptyConfig},
     address::ActorRefExt,
+    context::{ActorContext, ActorSpawnerExt},
     message::Message,
     system::{ActorSystem, ActorSystemConfig},
     types::{ActorResult, BoxedFuture, BoxedMessage},
 };
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 // Simple actor implementation using Actix context (not default)
 struct SimpleActor {
     state: ActorState,
     name: String,
+    parent: Option<String>,
+    retired: Arc<AtomicUsize>,
 }
 
 impl SimpleActor {
-    fn new(name: String) -> Self {
+    fn new(name: String, retired: Arc<AtomicUsize>) -> Self {
         Self {
             state: ActorState::Starting,
             name,
+            parent: None,
+            retired,
         }
+    }
+}
+
+impl Drop for SimpleActor {
+    fn drop(&mut self) {
+        self.retired.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 impl Actor for SimpleActor {
     type Config = EmptyConfig;
     type Context = ActixContext<ActixActor<Self>>;
+
+    fn init<'a>(&'a mut self, ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            assert_eq!(
+                ctx.parent().map(|parent| parent.path().to_owned()),
+                self.parent
+            );
+            Ok(())
+        })
+    }
 
     fn receive_message<'a>(
         &'a mut self,
@@ -53,14 +76,22 @@ impl Actor for SimpleActor {
 struct ActixCompatibleActor {
     state: ActorState,
     name: String,
+    retired: Arc<AtomicUsize>,
 }
 
 impl ActixCompatibleActor {
-    fn new(name: String) -> Self {
+    fn new(name: String, retired: Arc<AtomicUsize>) -> Self {
         Self {
             state: ActorState::Starting,
             name,
+            retired,
         }
+    }
+}
+
+impl Drop for ActixCompatibleActor {
+    fn drop(&mut self) {
+        self.retired.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -111,15 +142,23 @@ struct ActixContextSpawner {
     state: ActorState,
     name: String,
     child_count: usize,
+    retired: Arc<AtomicUsize>,
 }
 
 impl ActixContextSpawner {
-    fn new(name: String) -> Self {
+    fn new(name: String, retired: Arc<AtomicUsize>) -> Self {
         Self {
             state: ActorState::Starting,
             name,
             child_count: 0,
+            retired,
         }
+    }
+}
+
+impl Drop for ActixContextSpawner {
+    fn drop(&mut self) {
+        self.retired.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -127,15 +166,53 @@ impl Actor for ActixContextSpawner {
     type Config = EmptyConfig;
     type Context = ActixContext<ActixActor<Self>>;
 
+    fn use_async_handler(&self) -> bool {
+        true
+    }
+
     fn receive_message<'a>(
         &'a mut self,
-        _msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
+        msg: BoxedMessage,
+        ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        println!("ActixContextSpawner '{}' received message", self.name);
         Box::pin(async move {
-            // Cannot spawn here
-            Ok(Box::new("Cannot spawn in async handler".to_string()) as BoxedMessage)
+            let (another, requested) =
+                if let Some(request) = msg.downcast_ref::<SpawnChildMessage>() {
+                    (false, &request.0)
+                } else if let Some(request) = msg.downcast_ref::<ActixAnotherChildMessage>() {
+                    (true, &request.0)
+                } else if let Some(request) = msg.downcast_ref::<TestMessage>() {
+                    assert_eq!(ctx.children().unwrap().len(), self.child_count);
+                    return Ok(
+                        Box::new(format!("ActixContextSpawner received: {}", request.0))
+                            as BoxedMessage,
+                    );
+                } else {
+                    return Err(parrot_api::errors::ActorError::MessageHandlingError(
+                        "unknown spawner message".into(),
+                    ));
+                };
+            let index = self.child_count + 1;
+            let name = if another {
+                format!("{}_another_child_{index}", self.name)
+            } else {
+                format!("{}_child_{index}", self.name)
+            };
+            let mut child = SimpleActor::new(name.clone(), self.retired.clone());
+            child.parent = Some(ctx.path().path().to_owned());
+            let child = ctx.spawner().spawn_typed(child, EmptyConfig).await?;
+            assert_eq!(
+                child.ask(TestMessage(requested.clone())).await?,
+                format!("SimpleActor {name} received: {requested}")
+            );
+            self.child_count = index;
+            assert_eq!(ctx.children().unwrap().len(), index);
+            let response = if another {
+                format!("Created another managed child '{name}'")
+            } else {
+                format!("Spawned managed child '{name}'")
+            };
+            Ok(Box::new(response) as BoxedMessage)
         })
     }
 
@@ -200,119 +277,48 @@ async fn run_example() -> Result<()> {
         .register_actix_system("actix".to_string(), actix_system, true)
         .await?;
 
-    // Create SimpleActor using spawn_root_actix method
-    let simple_actor = SimpleActor::new("simple".to_string());
-    match system.spawn_root_actix(simple_actor, EmptyConfig).await {
-        Ok(actor_ref) => {
-            println!("Successfully created simple actor: {}", actor_ref.path());
+    let retired = Arc::new(AtomicUsize::new(0));
+    let result = async {
+        let simple = system
+            .spawn_root_actix(SimpleActor::new("simple".into(), retired.clone()), EmptyConfig)
+            .await?;
+        assert_eq!(
+            simple.ask(TestMessage("Hello Simple with ask".into())).await?,
+            "SimpleActor simple received: Hello Simple with ask"
+        );
+        // send waits for a business reply; deliver is the admission-only operation.
+        let reply = simple.send(Box::new(TestMessage("Hello Simple with send".into()))).await?;
+        assert_eq!(TestMessage::extract_result(reply)?, "SimpleActor simple received: Hello Simple with send");
 
-            // Use ask to get response
-            println!("Sending message with ask...");
-            match actor_ref
-                .ask(TestMessage("Hello Simple with ask".to_string()))
-                .await
-            {
-                Ok(response) => println!("Received response from simple actor: {}", response),
-                Err(e) => println!("Failed to get response from simple actor: {}", e),
-            }
+        let compatible = system
+            .spawn_root_actix(ActixCompatibleActor::new("actix-compatible".into(), retired.clone()), EmptyConfig)
+            .await?;
+        assert_eq!(compatible.ask(TestMessage("Hello Actix with ask".into())).await?, "Response from actix-compatible: Hello Actix with ask");
+        let reply = compatible.send(Box::new(TestMessage("Hello Actix with send".into()))).await?;
+        assert_eq!(TestMessage::extract_result(reply)?, "Response from actix-compatible: Hello Actix with send");
 
-            // Use send to send message (no response wait)
-            println!("Sending message with send...");
-            let msg = Box::new(TestMessage("Hello Simple with send".to_string())) as BoxedMessage;
-            match actor_ref.send(msg).await {
-                Ok(_) => println!("Message sent successfully to simple actor"),
-                Err(e) => println!("Failed to send message to simple actor: {}", e),
-            }
-        }
-        Err(e) => println!("Failed to create simple actor: {}", e),
-    }
-
-    // Create Actix-compatible actor using the specific spawn_root_actix method
-    let actix_actor = ActixCompatibleActor::new("actix-compatible".to_string());
-    match system.spawn_root_actix(actix_actor, EmptyConfig).await {
-        Ok(actor_ref) => {
-            println!(
-                "Successfully created Actix-compatible actor: {}",
-                actor_ref.path()
-            );
-
-            // Use ask to get response
-            println!("Sending message with ask to Actix actor...");
-            match actor_ref
-                .ask(TestMessage("Hello Actix with ask".to_string()))
-                .await
-            {
-                Ok(response) => println!("Received response from Actix actor: {}", response),
-                Err(e) => println!("Failed to get response from Actix actor: {}", e),
-            }
-
-            // Use send to send message
-            println!("Sending message with send to Actix actor...");
-            let msg = Box::new(TestMessage("Hello Actix with send".to_string())) as BoxedMessage;
-            match actor_ref.send(msg).await {
-                Ok(_) => println!("Message sent successfully to Actix actor"),
-                Err(e) => println!("Failed to send message to Actix actor: {}", e),
-            }
-        }
-        Err(e) => println!("Failed to create Actix-compatible actor: {}", e),
-    }
-
-    // Create ActixContextSpawner capable of spawning child actors
-    println!("\n=== Testing ActixContextSpawner (spawning child actors) ===");
-    let spawner_actor = ActixContextSpawner::new("main-spawner".to_string());
-    match system.spawn_root_actix(spawner_actor, EmptyConfig).await {
-        Ok(actor_ref) => {
-            println!("Successfully created spawner actor: {}", actor_ref.path());
-
-            // Send SpawnChildMessage to trigger child actor creation
-            println!("Requesting to spawn a child actor...");
-            match actor_ref
-                .ask(SpawnChildMessage("test-child".to_string()))
-                .await
-            {
-                Ok(response) => println!("Spawn response: {}", response),
-                Err(e) => println!("Failed to spawn child: {}", e),
-            }
-
-            // Send ActixAnotherChildMessage to trigger another type of child actor creation
-            println!("Requesting to create another child actor type...");
-            match actor_ref
-                .ask(ActixAnotherChildMessage("another-test-child".to_string()))
-                .await
-            {
-                Ok(response) => println!("Another child spawn response: {}", response),
-                Err(e) => println!("Failed to spawn another child: {}", e),
-            }
-
-            // Send a second SpawnChildMessage to trigger another child actor creation
-            println!("Requesting to spawn another child actor...");
-            match actor_ref
-                .ask(SpawnChildMessage("another-child".to_string()))
-                .await
-            {
-                Ok(response) => println!("Spawn response: {}", response),
-                Err(e) => println!("Failed to spawn child: {}", e),
-            }
-
-            // Send regular message for testing
-            match actor_ref
-                .ask(TestMessage("Test message to spawner".to_string()))
-                .await
-            {
-                Ok(response) => println!("Regular message response: {}", response),
-                Err(e) => println!("Failed to get response: {}", e),
-            }
-        }
-        Err(e) => println!("Failed to create spawner actor: {}", e),
-    }
-
-    // Wait for a moment to observe the output
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Shutdown the system
+        let spawner = system
+            .spawn_root_actix(ActixContextSpawner::new("main-spawner".into(), retired.clone()), EmptyConfig)
+            .await?;
+        assert_eq!(spawner.ask(SpawnChildMessage("test-child".into())).await?, "Spawned managed child 'main-spawner_child_1'");
+        assert_eq!(spawner.ask(ActixAnotherChildMessage("another-test-child".into())).await?, "Created another managed child 'main-spawner_another_child_2'");
+        assert_eq!(spawner.ask(SpawnChildMessage("another-child".into())).await?, "Spawned managed child 'main-spawner_child_3'");
+        assert_eq!(spawner.ask(TestMessage("Test message to spawner".into())).await?, "ActixContextSpawner received: Test message to spawner");
+        assert_eq!(system.status().active_actors, 6);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        spawner.stop().await?;
+        assert!(!spawner.is_alive().await);
+        assert_eq!(retired.load(Ordering::SeqCst), 4);
+        assert_eq!(system.status().active_actors, 2);
+        simple.stop().await?;
+        compatible.stop().await?;
+        assert_eq!(retired.load(Ordering::SeqCst), 6);
+        assert_eq!(system.status().active_actors, 0);
+        println!("facade replies verified; parent and three managed children retired; six actors disposed");
+        Ok(())
+    }.await;
     system.shutdown().await?;
-
-    Ok(())
+    result
 }
 
 // M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
@@ -373,103 +379,4 @@ impl parrot_api::actor::ActixEngineExt for ActixCompatibleActor {
     }
 }
 
-// M6: actix 同步快路径移至引擎侧扩展 trait（ActixEngineExt）。
-impl parrot_api::actor::ActixEngineExt for ActixContextSpawner {
-    fn receive_message_with_engine<'a>(
-        &'a mut self,
-        msg: BoxedMessage,
-        _ctx: &'a mut Self::Context,
-        engine_ctx: parrot_api::actor::EngineContextHandle,
-    ) -> Option<ActorResult<BoxedMessage>> {
-        println!(
-            "ActixContextSpawner '{}' received message via engine",
-            self.name
-        );
-
-        // Check if received SpawnChildMessage
-        if let Some(spawn_msg) = msg.downcast_ref::<SpawnChildMessage>() {
-            println!("Received request to spawn child actor: {}", spawn_msg.0);
-
-            // Try to convert engine_ctx to actix::Context<ActixActor<Self>>
-            let actix_ctx: Option<&ActixBaseContext<ActixActor<ActixContextSpawner>>> =
-                engine_ctx.downcast_ref::<actix::Context<ActixActor<Self>>>();
-
-            if let Some(actix_context) = actix_ctx {
-                // Create child actor
-                self.child_count += 1;
-                let child_name = format!("{}_child_{}", self.name, self.child_count);
-                let child_actor = SimpleActor::new(child_name.clone());
-
-                // Get current actor address - verify context conversion success
-                let addr = actix_context.address();
-                println!("Current actor address from context: {:?}", addr);
-
-                // Create and start child actor
-                let child_actor_base = ActixActor::new(child_actor);
-                let child_addr = actix::Actor::start(child_actor_base);
-
-                // Generate actor path
-                let path = format!("actix://{:?}", child_addr.clone());
-                println!("Successfully spawned child actor at path: {}", path);
-
-                Some(Ok(Box::new(format!(
-                    "Spawned child '{}' after validating engine_ctx",
-                    child_name
-                )) as BoxedMessage))
-            } else {
-                println!("Failed to downcast engine_ctx to actix::Context");
-                Some(Err(parrot_api::errors::ActorError::MessageHandlingError(
-                    "Failed to downcast engine_ctx to actix::Context".to_string(),
-                )))
-            }
-        } else if let Some(another_child_msg) = msg.downcast_ref::<ActixAnotherChildMessage>() {
-            println!(
-                "Received request to create another type of child: {}",
-                another_child_msg.0
-            );
-
-            // Try again to convert to actix::Context
-            let actix_ctx = engine_ctx.downcast_ref::<actix::Context<ActixActor<Self>>>();
-
-            if let Some(actix_context) = actix_ctx {
-                // Get current actor address - verify context is usable
-                let addr = actix_context.address();
-                println!("Current actor address from context: {:?}", addr);
-
-                // Create child actor
-                self.child_count += 1;
-                let child_name = format!("{}_another_child_{}", self.name, self.child_count);
-                let child_actor = SimpleActor::new(child_name.clone());
-
-                // Use ActixActor wrapper and start directly
-                let child_actor_base = ActixActor::new(child_actor);
-                let child_addr = actix::Actor::start(child_actor_base);
-
-                // Generate actor path
-                let path = format!("actix://{:?}", child_addr.clone());
-                println!("Successfully spawned another child actor at path: {}", path);
-
-                Some(Ok(Box::new(format!(
-                    "Created another child '{}' using engine_ctx",
-                    child_name
-                )) as BoxedMessage))
-            } else {
-                println!("Failed to downcast engine_ctx to actix::Context");
-                Some(Err(parrot_api::errors::ActorError::MessageHandlingError(
-                    "Failed to downcast engine_ctx to actix::Context".to_string(),
-                )))
-            }
-        } else if let Some(test_msg) = msg.downcast_ref::<TestMessage>() {
-            // Normal message processing
-            println!("Processing TestMessage: {}", test_msg.0);
-            Some(Ok(
-                Box::new(format!("ActixContextSpawner received: {}", test_msg.0)) as BoxedMessage,
-            ))
-        } else {
-            // Unknown message
-            Some(Err(parrot_api::errors::ActorError::MessageHandlingError(
-                "Unknown message type".to_string(),
-            )))
-        }
-    }
-}
+impl parrot_api::actor::ActixEngineExt for ActixContextSpawner {}

@@ -76,7 +76,14 @@ fn file(dir: &Path) -> String {
 fn event(text: &str, marker: &str) -> String {
     let lines: Vec<_> = text.lines().filter(|line| line.contains(marker)).collect();
     assert_eq!(lines.len(), 1, "missing or duplicated event: {text}");
-    lines[0].to_owned()
+    // libtest prints `test <name> ... ` without a newline before a test's
+    // first uncaptured record. Strip that harness prefix so assertions parse
+    // the logging payload itself rather than test-runner output.
+    lines[0]
+        .strip_prefix("test ")
+        .and_then(|line| line.split_once("... ").map(|(_, record)| record))
+        .unwrap_or(lines[0])
+        .to_owned()
 }
 fn json_event(text: &str, marker: &str) -> serde_json::Value {
     serde_json::from_str(&event(text, marker)).expect("requested JSON event")
@@ -452,6 +459,10 @@ fn concurrent_records_remain_complete_json() {
                     .lines()
                     .filter(|line| line.contains("CONCURRENT_RECORD"))
                 {
+                    let line = line
+                        .strip_prefix("test ")
+                        .and_then(|line| line.split_once("... ").map(|(_, record)| record))
+                        .unwrap_or(line);
                     let value: serde_json::Value =
                         serde_json::from_str(line).expect("complete JSON record");
                     let worker = value["worker"].as_u64().unwrap();

@@ -1,0 +1,6 @@
+package parrot:component@0.1.0;
+
+world messaging-parrot-actor {
+    include recording-parrot-actor;
+    import parrot:messaging/messages@0.1.0;
+}

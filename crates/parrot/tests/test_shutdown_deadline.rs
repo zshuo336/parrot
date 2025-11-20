@@ -70,6 +70,11 @@ async fn shutdown_cancels(mode: SchedulingMode, wait_in_stop: bool) {
     let entered = Arc::new(Notify::new());
     let cancelled = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
+    // This test measures shutdown, not the lazy creation of every shard runtime
+    // inside the actor's separate 40 ms creation deadline.
+    if matches!(&mode, SchedulingMode::Sharded { .. }) {
+        system.scheduler_group().try_sharded().unwrap();
+    }
     let actor = system
         .spawn_at(
             WaitingActor {

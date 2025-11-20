@@ -70,6 +70,23 @@ fn standard_node_rejects_role_service_mismatch_and_invalid_overrides() {
 }
 
 #[test]
+fn malformed_peer_environment_reports_its_actual_source() {
+    let f = File::new(CONFIG);
+    for (variable, value) in [
+        ("PARROT_DIRECTORY_PEERS", "mem://bad/name"),
+        ("PARROT_DIRECTORY_PEERS", "tcp://other@localhost:9000"),
+        ("PARROT_SEEDS", "mem://bad/name"),
+        ("PARROT_SEEDS", "tcp://other@localhost:9000"),
+    ] {
+        let error = f.settings(&[(variable, value)]).unwrap_err();
+        assert!(
+            matches!(&error, parrot_config::ConfigError::Invalid { key, .. } if key == &format!("{variable}[0]")),
+            "incorrect source for {variable}: {error}"
+        );
+    }
+}
+
+#[test]
 fn persistent_members_do_not_inherit_ordinary_node_identity_or_listener_defaults() {
     let without_identity = File::new(&CONFIG.replace("node_id='node-a'\n", ""));
     assert!(without_identity.settings(&[]).is_err());

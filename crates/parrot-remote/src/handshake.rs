@@ -63,6 +63,14 @@ pub mod caps {
     pub const RECEPTIONIST_SYNC: u32 = 1 << 17;
     /// Lossless native Actix service paths inside receptionist snapshots.
     pub const RECEPTIONIST_NATIVE_PATHS: u32 = 1 << 18;
+    /// Bounded, atomic receptionist snapshot segmentation on small-frame links.
+    pub const RECEPTIONIST_SEGMENTS: u32 = 1 << 19;
+    /// Causal parent prefix on Admin V2 requests; also requires TRACE_CONTEXT.
+    pub const ADMIN_TRACE_CONTEXT: u32 = 1 << 20;
+    /// Source-bound, path-vector service discovery; relay grants remain separate.
+    pub const RECEPTIONIST_ROUTES: u32 = 1 << 21;
+    /// Existing bounded ASK/TELL/REPLY BATCH envelope, negotiated on each link.
+    pub const BATCH_FRAMES: u32 = 1 << 22;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -1,7 +1,9 @@
 //! Negotiated, generation-owned remote mirror sessions. Opening a session never
 //! installs a policy. An old apply cannot resurrect a retired session, even when
 //! its owner name has been reused. Retirement receipts await workers and encoders.
-use crate::mirror::{WireMirrorGroup, WireMirrorOptions, WireMirrorPolicy, WireMirrorRegistry};
+use crate::mirror::{
+    RetireMirrors, WireMirrorGroup, WireMirrorOptions, WireMirrorPolicy, WireMirrorRegistry,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -254,13 +256,21 @@ impl MirrorControlStore {
             Ok(())
         }
     }
+    pub(crate) fn close_admission(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.open = false;
+        for session in state.sessions.values_mut() {
+            session.closing = true;
+        }
+    }
     pub(crate) fn close(&self) {
+        let mut retiring = RetireMirrors::default();
         let mut state = self.state.lock().unwrap();
         state.open = false;
         for session in state.sessions.values_mut() {
             session.closing = true;
             for group in session.group.iter().chain(&session.retiring) {
-                group.cancel();
+                group.retire_into(&mut retiring);
             }
         }
     }
@@ -269,7 +279,16 @@ impl MirrorControlStore {
         registry: &WireMirrorRegistry,
         command: MirrorControl,
     ) -> Result<MirrorControlReply, String> {
+        crate::transport::notify_safely(self.execute_inner(registry, command)).await
+    }
+    async fn execute_inner(
+        &self,
+        registry: &WireMirrorRegistry,
+        command: MirrorControl,
+    ) -> Result<MirrorControlReply, String> {
         command.validate()?;
+        let mut retiring = RetireMirrors::default();
+        let mut finished_groups = Vec::new();
         let (id, groups) = {
             let mut state = self.state.lock().unwrap();
             if !state.open {
@@ -376,13 +395,19 @@ impl MirrorControlStore {
                     if value.revision.checked_add(1) != Some(revision) {
                         return Err("mirror revision must advance exactly once".into());
                     }
-                    value.retiring.retain(|group| !group.is_finished());
+                    for group in std::mem::take(&mut value.retiring) {
+                        if group.is_finished() {
+                            finished_groups.push(group);
+                        } else {
+                            value.retiring.push(group);
+                        }
+                    }
                     let expanded = policies
                         .iter()
                         .map(MirrorPolicySpec::expand)
                         .collect::<Result<Vec<_>, _>>()?;
                     let group = registry
-                        .replace_group(value.group.as_deref(), expanded)
+                        .replace_group_deferred(value.group.as_deref(), expanded, &mut retiring)
                         .map_err(|e| e.to_string())?;
                     if let Some(old) = value.group.replace(Arc::new(group)) {
                         value.retiring.push(old);
@@ -400,12 +425,14 @@ impl MirrorControlStore {
                     let groups: Vec<_> =
                         value.group.iter().chain(&value.retiring).cloned().collect();
                     for group in &groups {
-                        group.cancel();
+                        group.retire_into(&mut retiring);
                     }
                     (session, groups)
                 }
             }
         };
+        retiring.notify();
+        drop(finished_groups);
         // A cancelled requester leaves Closing ownership in the store. A retry
         // joins the same groups. No mutex is held while awaiting user cleanup.
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -425,6 +452,9 @@ impl Drop for MirrorControlStore {
         self.close();
     }
 }
+
+#[cfg(test)]
+mod notification_contracts;
 
 #[cfg(test)]
 mod tests {

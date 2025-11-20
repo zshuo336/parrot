@@ -223,7 +223,8 @@ fn storage_failure_fences_queries_rpc_and_proposals_until_recovery() {
     d.step("a".into(), append(vec![entry(1, put("one"))], 1))
         .unwrap();
     d.outbox().unwrap();
-    std::fs::write(t.0.join("raft.next"), b"cannot publish").unwrap();
+    std::fs::rename(t.0.join("raft.state"), t.0.join("raft.backup")).unwrap();
+    std::fs::create_dir(t.0.join("raft.state")).unwrap();
     assert!(d
         .step(
             "a".into(),
@@ -238,6 +239,8 @@ fn storage_failure_fences_queries_rpc_and_proposals_until_recovery() {
     assert!(d.propose(&put("three")).is_err());
     assert_eq!(d.applied_index(), 1);
     drop(d);
+    std::fs::remove_dir(t.0.join("raft.state")).unwrap();
+    std::fs::rename(t.0.join("raft.backup"), t.0.join("raft.state")).unwrap();
     let d = open(&t, Arc::new(ManualClock::new()));
     assert_eq!(d.applied_index(), 1);
     assert!(d.query_local(&query("two")).unwrap().is_none());

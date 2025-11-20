@@ -113,13 +113,21 @@ def main():
     parser.add_argument('--binary', type=Path, default=REPO / 'target/debug/websearch')
     parser.add_argument('--report', type=Path)
     args = parser.parse_args()
+    args.binary = args.binary.resolve()
+    if not args.binary.is_file():
+        parser.error(
+            f"websearch binary not found: {args.binary}; "
+            "build it first with 'cargo build --locked -p websearch'"
+        )
+    if not os.access(args.binary, os.X_OK):
+        parser.error(f"websearch binary is not executable: {args.binary}")
     root = Path(tempfile.mkdtemp(prefix='ws-manifest-', dir='/tmp'))
     report = dict(directory=str(root), passed=[], resources={}, business={}, binary_sha256=hashlib.sha256(args.binary.read_bytes()).hexdigest())
     print('WEBSEARCH_MANIFEST_ARTIFACTS=' + str(root), flush=True)
     try:
         verify_port_probe(root)
         with ExitStack() as stack:
-            suite = Suite(root, args.binary.resolve(), stack)
+            suite = Suite(root, args.binary, stack)
             def passed(name, host=None, **finish):
                 if host:
                     report['resources'][name] = host.finish(**finish)

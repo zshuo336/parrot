@@ -223,6 +223,12 @@ macro_rules! policy_parent {
                 ctx: &'a mut Self::Context,
             ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
                 Box::pin(async move {
+                    if msg.is::<SupervisorStrategyType>() {
+                        ctx.set_supervisor_strategy(
+                            *msg.downcast::<SupervisorStrategyType>().unwrap(),
+                        );
+                        return Ok(Box::new(()) as BoxedMessage);
+                    }
                     let count = *msg.downcast::<u32>().unwrap();
                     let mut children = Vec::<BoxedActorRef>::new();
                     for _ in 0..count {
@@ -249,12 +255,12 @@ policy_parent!(
 );
 enum Engine {
     Thread(Arc<parrot::thread::ThreadActorSystem>),
-    Actix(parrot::actix::ActixActorSystem),
+    Actix(Box<parrot::actix::ActixActorSystem>),
 }
 impl Engine {
     async fn new(actix: bool, timeout: Duration) -> Self {
         if actix {
-            Self::Actix(
+            Self::Actix(Box::new(
                 parrot::actix::ActixActorSystem::with_settings(
                     parrot::actix::ActixSystemSettings {
                         arbiter_count: 1,
@@ -264,7 +270,7 @@ impl Engine {
                 )
                 .await
                 .unwrap(),
-            )
+            ))
         } else {
             Self::Thread(parrot::thread::ThreadActorSystem::shared(
                 parrot::thread::config::ThreadActorSystemConfig {
@@ -1142,3 +1148,276 @@ async fn system_shutdown_retains_actix_blocked_child_decider_and_parent() {
     assert!(registered);
     assert_eq!(sys.status().active_actors, 0);
 }
+
+#[derive(Clone, Copy)]
+enum DecisionFailure {
+    Callback,
+    RecursiveCallback,
+    Capture,
+    CallbackAndCapture,
+    RecursiveCallbackAndCapture,
+}
+struct DecisionPayload(Arc<AtomicUsize>);
+impl Drop for DecisionPayload {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        panic!("decision panic payload destructor");
+    }
+}
+struct DecisionCapture {
+    failure: DecisionFailure,
+    drops: Arc<AtomicUsize>,
+    payload_drops: Arc<AtomicUsize>,
+}
+impl DecisionCapture {
+    fn touch(&self) {}
+}
+impl Drop for DecisionCapture {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        match self.failure {
+            DecisionFailure::Capture | DecisionFailure::CallbackAndCapture => {
+                panic!("owned decision capture panic");
+            }
+            DecisionFailure::RecursiveCallbackAndCapture => {
+                std::panic::panic_any(DecisionPayload(self.payload_drops.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn decision_snapshot_contract(actix: bool, all: bool, failure: DecisionFailure) {
+    use parrot_api::{address::RetirementStatus, supervisor::DefaultStrategy};
+    let sys = Engine::new(actix, Duration::from_secs(3)).await;
+    let gate = Arc::new(Gate::default());
+    let _release = ReleaseGate(gate.clone());
+    let capture_drops = Arc::new(AtomicUsize::new(0));
+    let payload_drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let capture = DecisionCapture {
+        failure,
+        drops: capture_drops.clone(),
+        payload_drops: payload_drops.clone(),
+    };
+    let callback_gate = gate.clone();
+    let callback_calls = calls.clone();
+    let callback_payload = payload_drops.clone();
+    let parent = sys
+        .parent(policy(
+            BasicDecisionFn::new(move |_| {
+                capture.touch();
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                callback_gate.block();
+                match failure {
+                    DecisionFailure::Callback | DecisionFailure::CallbackAndCapture => {
+                        panic!("owned decision callback panic");
+                    }
+                    DecisionFailure::RecursiveCallback
+                    | DecisionFailure::RecursiveCallbackAndCapture => {
+                        std::panic::panic_any(DecisionPayload(callback_payload.clone()));
+                    }
+                    DecisionFailure::Capture => SupervisionDecision::Resume,
+                }
+            }),
+            all,
+        ))
+        .await;
+    let children = children(&*parent, 2).await;
+    let failing = children[0].clone_boxed();
+    let failed_request = tokio::spawn(async move { failing.send(Box::new(Crash)).await });
+    gate.entered().await;
+    parent
+        .send(Box::new(SupervisorStrategyType::Default(
+            DefaultStrategy::StopOnFailure,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(capture_drops.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        children[0].retirement_status(),
+        RetirementStatus::Pending
+    ));
+    gate.release();
+    assert!(failed_request.await.unwrap().is_err());
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match children[0].retirement_status() {
+                RetirementStatus::Retired(result) => break result,
+                RetirementStatus::Pending => tokio::task::yield_now().await,
+                RetirementStatus::Unsupported => panic!("managed child must retain its receipt"),
+            }
+        }
+    })
+    .await
+    .expect("decision and snapshot disposal must actually retire");
+    let message = result
+        .expect_err("decision or disposal failure cannot become Resume success")
+        .to_string();
+    assert!(message.contains("supervision"), "{message}");
+    assert!(
+        !message.contains("owner exited"),
+        "lost the actual diagnostic: {message}"
+    );
+    match failure {
+        DecisionFailure::Callback => assert!(
+            message.contains("owned decision callback panic"),
+            "{message}"
+        ),
+        DecisionFailure::Capture => assert!(
+            message.contains("owned decision capture panic"),
+            "{message}"
+        ),
+        DecisionFailure::CallbackAndCapture => {
+            assert!(
+                message.contains("owned decision callback panic"),
+                "{message}"
+            );
+            assert!(
+                message.contains("owned decision capture panic"),
+                "{message}"
+            );
+        }
+        DecisionFailure::RecursiveCallback | DecisionFailure::RecursiveCallbackAndCapture => {
+            assert!(message.contains("non-string panic payload"), "{message}");
+            assert!(
+                message.contains("panic payload destructor panicked"),
+                "{message}"
+            );
+        }
+    }
+    assert_eq!(capture_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        payload_drops.load(Ordering::SeqCst),
+        match failure {
+            DecisionFailure::RecursiveCallback => 1,
+            DecisionFailure::RecursiveCallbackAndCapture => 2,
+            _ => 0,
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    sys.absent(&children[0].path()).await;
+    children[1].send(Box::new(())).await.unwrap();
+    parent.send(Box::new(0_u32)).await.unwrap();
+    sys.shutdown().await;
+}
+
+fn isolated_decision(name: &str, actix: bool, all: bool, failure: DecisionFailure) {
+    use std::{
+        io::Read,
+        process::{Command, Stdio},
+        time::Instant,
+    };
+    if std::env::var("PARROT_DECISION_CHILD").as_deref() == Ok(name) {
+        actix::System::new().block_on(decision_snapshot_contract(actix, all, failure));
+        println!("decision ownership complete: {name}");
+        return;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("PARROT_DECISION_CHILD", name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fn drain(mut stream: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    }
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let timed_out = loop {
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let status = child.wait().unwrap();
+    let stdout = String::from_utf8(stdout.join().unwrap()).unwrap();
+    let stderr = String::from_utf8(stderr.join().unwrap()).unwrap();
+    assert!(
+        !timed_out && status.success(),
+        "decision child failed: timed_out={timed_out}, status={status:?}\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains(&format!("decision ownership complete: {name}")));
+}
+
+macro_rules! decision_contracts {
+    ($module:ident, $actix:literal, $all:literal) => {
+        mod $module {
+            use super::*;
+            #[test]
+            fn callback_diagnostic_survives_policy_replacement() {
+                isolated_decision(
+                    concat!(
+                        stringify!($module),
+                        "::callback_diagnostic_survives_policy_replacement"
+                    ),
+                    $actix,
+                    $all,
+                    DecisionFailure::Callback,
+                );
+            }
+            #[test]
+            fn recursive_callback_payload_keeps_the_real_diagnostic() {
+                isolated_decision(
+                    concat!(
+                        stringify!($module),
+                        "::recursive_callback_payload_keeps_the_real_diagnostic"
+                    ),
+                    $actix,
+                    $all,
+                    DecisionFailure::RecursiveCallback,
+                );
+            }
+            #[test]
+            fn successful_callback_cannot_hide_snapshot_disposal_failure() {
+                isolated_decision(
+                    concat!(
+                        stringify!($module),
+                        "::successful_callback_cannot_hide_snapshot_disposal_failure"
+                    ),
+                    $actix,
+                    $all,
+                    DecisionFailure::Capture,
+                );
+            }
+            #[test]
+            fn callback_and_last_capture_panics_are_independent_failures() {
+                isolated_decision(
+                    concat!(
+                        stringify!($module),
+                        "::callback_and_last_capture_panics_are_independent_failures"
+                    ),
+                    $actix,
+                    $all,
+                    DecisionFailure::CallbackAndCapture,
+                );
+            }
+            #[test]
+            fn recursive_callback_and_capture_payloads_both_retire() {
+                isolated_decision(
+                    concat!(
+                        stringify!($module),
+                        "::recursive_callback_and_capture_payloads_both_retire"
+                    ),
+                    $actix,
+                    $all,
+                    DecisionFailure::RecursiveCallbackAndCapture,
+                );
+            }
+        }
+    };
+}
+decision_contracts!(thread_one_decision, false, false);
+decision_contracts!(thread_all_decision, false, true);
+decision_contracts!(actix_one_decision, true, false);
+decision_contracts!(actix_all_decision, true, true);

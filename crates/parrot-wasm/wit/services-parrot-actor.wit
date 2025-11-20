@@ -1,0 +1,6 @@
+package parrot:component@0.1.0;
+
+world services-parrot-actor {
+    include messaging-parrot-actor;
+    import parrot:services/discovery@0.1.0;
+}

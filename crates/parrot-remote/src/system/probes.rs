@@ -24,7 +24,7 @@ pub(super) async fn observe(weak: Weak<RemoteActorSystem>, target: String) -> Pr
         let Some(system) = weak.upgrade() else {
             return ProbeOutcome::Unavailable;
         };
-        if *system.shutdown_tx.borrow() || !system.config.membership_gossip_enabled() {
+        if system.is_closing() || !system.config.membership_gossip_enabled() {
             return ProbeOutcome::Unavailable;
         }
         let direct = system
@@ -37,13 +37,13 @@ pub(super) async fn observe(weak: Weak<RemoteActorSystem>, target: String) -> Pr
             .unwrap()
             .iter()
             .rev()
-            .filter(|(id, sender, _)| {
-                id != &target
-                    && id != &system.config.node_id
-                    && eligible(&system, sender)
-                    && seen.insert(id.clone())
+            .filter(|link| {
+                link.node_id() != target
+                    && link.node_id() != system.config.node_id
+                    && eligible(&system, &link.sender)
+                    && seen.insert(link.node_id().to_owned())
             })
-            .map(|(id, sender, _)| (id.clone(), sender.clone()))
+            .map(|link| (link.node_id().to_owned(), link.sender.clone()))
             .collect::<Vec<_>>();
         helpers.sort_by(|a, b| a.0.cmp(&b.0));
         if !helpers.is_empty() {
@@ -158,8 +158,8 @@ pub(super) fn handle(weak: Weak<RemoteActorSystem>, event: ProbeEvent, back: &Fr
             let target = system
                 .direct_sender_of(&request.target)
                 .filter(|sender| eligible(&system, sender) && !sender.same_connection(back));
-            let permit = system.probes.helpers.clone().try_acquire_owned();
-            let (Some(target), Ok(permit)) = (target, permit) else {
+            let permit = system.probes.helper();
+            let (Some(target), Some(permit)) = (target, permit) else {
                 reply(back, request, ProbeOutcome::Unavailable, true);
                 return;
             };

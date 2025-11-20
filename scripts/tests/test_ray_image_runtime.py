@@ -1,6 +1,7 @@
 """Run with the image's CPython 3.11 environment, before gateway acceptance."""
 import importlib.metadata
 import logging
+import platform
 from pathlib import Path
 import re
 import subprocess
@@ -13,6 +14,18 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class RayImageRuntimeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # This module validates the Linux CPython used by gw-ray.Dockerfile.
+        # Running it during the repository-wide host test discovery on macOS
+        # or another Python minor version produces misleading dependency
+        # failures before the image contract is even exercised.
+        if platform.system() != "Linux" or sys.version_info[:2] != (3, 11):
+            raise unittest.SkipTest(
+                "Ray image runtime tests require Linux CPython 3.11; "
+                "run scripts/verify_ray_image.py or the Linux image CI job"
+            )
+
     def test_installed_dependencies_match_both_locks(self):
         for filename in ["requirements-ray-build.lock", "requirements-ray.lock"]:
             lock = (ROOT / "deploy/images" / filename).read_text()

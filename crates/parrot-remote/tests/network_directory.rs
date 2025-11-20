@@ -127,6 +127,15 @@ async fn applied(nodes: &[Option<NetworkDirectory>], index: u64) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_mtls_tcp_replicas_commit_catch_up_elect_and_recover_exact_history() {
+    three_replica_contract(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_mtls_tcp_replicas_install_snapshot_elect_and_recover_exact_history() {
+    three_replica_contract(true).await;
+}
+
+async fn three_replica_contract(compacted: bool) {
     let names = ["dir-a.test", "dir-b.test", "dir-c.test"];
     let certs = credentials(&names);
     let dirs: Vec<_> = (0..3).map(|_| Scratch::new()).collect();
@@ -199,8 +208,26 @@ async fn three_mtls_tcp_replicas_commit_catch_up_elect_and_recover_exact_history
         handle.propose(&cmd).await.unwrap();
         applied(&nodes, i + 2).await;
     }
+    if compacted {
+        assert_eq!(handle.compact().await.unwrap(), 7);
+        assert_eq!(
+            handle.proposal_status(&receipt).await.unwrap(),
+            DurableDirectoryStatus::Applied
+        );
+        assert!(std::fs::read(dirs[first].0.join("raft.state"))
+            .unwrap()
+            .starts_with(b"PRAFT03\0"));
+    }
     nodes[lagging] = Some(start(lagging).await.unwrap());
     applied(&nodes, 7).await;
+    if compacted {
+        assert!(
+            std::fs::read(dirs[lagging].0.join("raft.state"))
+                .unwrap()
+                .starts_with(b"PRAFT03\0"),
+            "lagging voter must receive a persisted snapshot through authenticated TCP"
+        );
+    }
     for n in nodes.iter().flatten() {
         for i in 0..6 {
             let actual = n
@@ -502,6 +529,20 @@ async fn malformed_raft_metadata_is_rejected_without_closing_the_mtls_owner() {
     let before = std::fs::read(dir.0.join("raft.state")).unwrap();
     for rpc in [
         vote(names[1], 0),
+        RaftRpc::ReadIndex {
+            term: 0,
+            leader: names[1].into(),
+            context: 1,
+        },
+        RaftRpc::ReadIndex {
+            term: 50,
+            leader: names[1].into(),
+            context: 0,
+        },
+        RaftRpc::ReadIndexResp {
+            term: 50,
+            context: 0,
+        },
         RaftRpc::AppendEntries {
             term: 0,
             leader: names[1].into(),
@@ -621,6 +662,35 @@ async fn mtls_membership_group_identity_destination_and_strict_decode_are_enforc
     for (payload, target, hop) in [
         (wire("other", vote(names[1], 500)), path.clone(), 0),
         (wire("secure", vote(names[2], 500)), path.clone(), 0),
+        (
+            wire(
+                "secure",
+                RaftRpc::ReadIndex {
+                    term: 500,
+                    leader: names[2].into(),
+                    context: 1,
+                },
+            ),
+            path.clone(),
+            0,
+        ),
+        (
+            wire(
+                "secure",
+                RaftRpc::InstallSnapshot {
+                    term: 500,
+                    leader: names[2].into(),
+                    index: 7,
+                    snapshot_term: 1,
+                    digest: [0; 32],
+                    offset: 0,
+                    total: 0,
+                    data: vec![],
+                },
+            ),
+            path.clone(),
+            0,
+        ),
         (
             wire("secure", vote(names[1], 500)),
             format!("parrot://other.test{RAFT_PATH}"),
@@ -1672,7 +1742,8 @@ async fn linear_read_wire_requires_fresh_quorum_without_mutating_business_revisi
         bincode::config::standard(),
     )
     .unwrap();
-    for index in [2, 3] {
+    let before = std::fs::read(dir.0.join("raft.state")).unwrap();
+    for _ in 0..2 {
         let result = raw_key(
             &source,
             names[0],
@@ -1686,8 +1757,8 @@ async fn linear_read_wire_requires_fresh_quorum_without_mutating_business_revisi
             panic!("{result:?}")
         };
         assert_eq!(key, "parrot:directory:read-result#v1");
-        // Independent structural decoder: exact entry, fresh log barrier, applied
-        // index and term. No production read type needed by the old-binary negative.
+        // Decode independently: a fresh quorum read can reuse the committed
+        // index, but must preserve the business revision and persisted bytes.
         type View = (
             Option<parrot_remote::roles::directory::DirEntry>,
             u64,
@@ -1698,10 +1769,11 @@ async fn linear_read_wire_requires_fresh_quorum_without_mutating_business_revisi
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(used, bytes.len());
         let (entry, barrier, applied, term) = result.unwrap();
-        assert_eq!(barrier, index);
-        assert_eq!(applied, index);
+        assert_eq!(barrier, 1);
+        assert_eq!(applied, 1);
         assert!(term > 0);
         assert_eq!(entry.unwrap().version, 1);
+        assert_eq!(std::fs::read(dir.0.join("raft.state")).unwrap(), before);
     }
     source.shutdown().await.unwrap();
     host.close().await.unwrap();
@@ -1755,7 +1827,7 @@ async fn minority_linear_reads_timeout_and_bounded_cancelled_waiters_release_adm
         .await
         .unwrap();
     assert_eq!(present.entry.unwrap().version, 1);
-    assert!(present.barrier_index >= 2);
+    assert!(present.barrier_index >= 1);
     let follower = (selected + 1) % 3;
     assert!(matches!(
         client
@@ -1837,7 +1909,7 @@ async fn minority_linear_reads_timeout_and_bounded_cancelled_waiters_release_adm
         }
     }
     // A completed read after recovery must contain the committed write, regardless
-    // of the legitimate current leader or the number of cancelled barrier entries.
+    // of the legitimate current leader or the number of cancelled read contexts.
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let i = leader(&nodes).await;
@@ -1922,7 +1994,7 @@ async fn tls_linear_read_rejects_unauthorized_or_malformed_calls_and_decodes_lar
         .await
         .unwrap();
     assert_eq!(read.entry, expected);
-    assert_eq!(read.barrier_index, 2);
+    assert_eq!(read.barrier_index, 1);
     let bytes = |group: &str, q: DirQuery, ms: u64| {
         bincode::serde::encode_to_vec((group, q, ms), bincode::config::standard()).unwrap()
     };
@@ -1972,7 +2044,7 @@ async fn tls_linear_read_rejects_unauthorized_or_malformed_calls_and_decodes_lar
         assert_eq!(used, bytes.len());
         assert!(result.is_err());
     }
-    assert_eq!(host.handle().observation().applied_index, 2);
+    assert_eq!(host.handle().observation().applied_index, 1);
     assert_eq!(
         host.handle().query_local(&query("worker")).await.unwrap(),
         expected

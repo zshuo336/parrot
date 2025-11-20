@@ -641,7 +641,9 @@ impl<T> Sender<T> {
                 // if it is not set. Thus, if `complete()` returned false, it is
                 // safe for us to access the value, because we know that the
                 // receiver will not.
-                return Err(inner.consume_value().unwrap());
+                let result = ReturnValue(Some(Err(inner.consume_value().unwrap())));
+                drop(inner);
+                return result.into_inner();
             }
         }
 
@@ -1202,8 +1204,9 @@ impl<T> Receiver<T> {
             Err(TryRecvError::Closed)
         };
 
+        let result = ReturnValue(Some(result));
         self.inner = None;
-        result
+        result.into_inner()
     }
 
     /// Blocking receive to call outside of asynchronous contexts.
@@ -1291,8 +1294,9 @@ impl<T> Future for Receiver<T> {
             panic!("called after complete");
         };
 
+        let ret = ReturnValue(Some(ret));
         this.inner = None;
-        Ready(ret)
+        Ready(ret.into_inner())
     }
 }
 
@@ -1443,19 +1447,64 @@ fn mut_load(this: &mut AtomicUsize) -> usize {
     this.with_mut(|v| *v)
 }
 
+// Releasing the last channel owner can run user waker destructors. Keep a
+// detached value independently disposable if that cleanup starts unwinding.
+struct ReturnValue<T>(Option<T>);
+
+impl<T> ReturnValue<T> {
+    fn into_inner(mut self) -> T {
+        self.0.take().unwrap()
+    }
+}
+
+impl<T> Drop for ReturnValue<T> {
+    fn drop(&mut self) {
+        let Some(value) = self.0.take() else {
+            return;
+        };
+        let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
+        else {
+            return;
+        };
+        if std::thread::panicking() {
+            discard_panic(payload);
+        } else {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+fn discard_panic(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+    {
+        // Do not recursively execute arbitrary panic-payload destructors.
+        std::mem::forget(secondary);
+    }
+}
+
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
         let state = State(mut_load(&mut self.state));
 
-        if state.is_rx_task_set() {
-            unsafe {
-                self.rx_task.drop_task();
-            }
-        }
-
-        if state.is_tx_task_set() {
-            unsafe {
-                self.tx_task.drop_task();
+        let mut failure = None;
+        for task in [
+            state.is_rx_task_set().then_some(&self.rx_task),
+            state.is_tx_task_set().then_some(&self.tx_task),
+        ]
+        .iter()
+        .flatten()
+        {
+            // Each initialized task owns a separate user waker. A failed
+            // destructor must not leak its sibling or overlap its unwind.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                task.drop_task();
+            }));
+            if let Err(payload) = result {
+                if failure.is_none() {
+                    failure = Some(payload);
+                } else {
+                    discard_panic(payload);
+                }
             }
         }
 
@@ -1466,6 +1515,13 @@ impl<T> Drop for Inner<T> {
             // we must ensure that the value must have been consumed by the receiver before
             // dropping the `Inner`.
             debug_assert!(self.consume_value().is_none());
+        }
+        if let Some(payload) = failure {
+            if std::thread::panicking() {
+                discard_panic(payload);
+            } else {
+                std::panic::resume_unwind(payload);
+            }
         }
     }
 }

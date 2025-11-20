@@ -19,6 +19,10 @@ use crate::registry::{CallbackRegistry, ReplyPayload};
 use crate::transport::FrameSender;
 use tracing::Instrument;
 
+#[cfg(test)]
+mod admin_trace_tests;
+#[cfg(test)]
+mod notification_contracts;
 pub(crate) mod unwind;
 use unwind::Cleanup;
 
@@ -263,8 +267,18 @@ impl Default for RelayTable {
     }
 }
 
+/// Route hints are control-plane cache entries, not an unbounded discovery
+/// database. Keep both cardinality and retained string bytes bounded even
+/// when an authenticated relay sends a steady stream of new identities.
+const ROUTE_HINT_MAX_ENTRIES: usize = 4096;
+const ROUTE_HINT_MAX_BYTES: usize = 1024 * 1024;
+
 pub struct Ingress {
     control_policy: crate::security::ControlPolicy,
+    /// Optional application route policy. When installed, every relay path
+    /// is checked before a frame is admitted to the next-hop sender. The
+    /// transport still authenticates the physical peer independently.
+    route_acl: std::sync::RwLock<Option<(crate::acl::RouteAcl, String)>>,
     durable_relays: std::sync::RwLock<std::collections::BTreeSet<String>>,
     // Admission and tracker registration share a fence with close: no task can
     // appear after close has observed an empty tracker.
@@ -300,6 +314,7 @@ pub struct Ingress {
         Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>>,
     reorder_tasks: tokio_util::task::TaskTracker,
     reorder_cancel: tokio_util::sync::CancellationToken,
+    reorder_closed: std::sync::atomic::AtomicBool,
     /// 重排旋钮（配置切面 [remote.reorder]——默认=原写死值 250ms/1024）。
     reorder_gap_timeout: std::sync::Mutex<std::time::Duration>,
     reorder_buffer_cap: std::sync::Mutex<usize>,
@@ -313,6 +328,27 @@ struct ResolvePending {
     min_version: u64,
     invalidated: bool,
     identity: Arc<()>,
+}
+
+impl ResolvePending {
+    fn notify(self, reply: Option<ReplyPayload>) {
+        let Self {
+            tx,
+            connection,
+            key,
+            cache_key,
+            identity,
+            ..
+        } = self;
+        let cleanup = Cleanup::default();
+        let _ = cleanup.call(|| match reply {
+            Some(reply) => {
+                let _ = tx.send(reply);
+            }
+            None => drop(tx),
+        });
+        cleanup.dispose((connection, key, cache_key, identity));
+    }
 }
 
 fn resolve_cache_key(source: &FrameSender, key: &str) -> String {
@@ -335,11 +371,17 @@ struct ResolvePendingLease {
 impl Drop for ResolvePendingLease {
     fn drop(&mut self) {
         let mut table = self.table.lock().unwrap();
-        if table
+        let removed = if table
             .get(&self.cid)
             .is_some_and(|slot| Arc::ptr_eq(&slot.identity, &self.identity))
         {
-            table.remove(&self.cid);
+            table.remove(&self.cid)
+        } else {
+            None
+        };
+        drop(table);
+        if let Some(slot) = removed {
+            slot.notify(None);
         }
     }
 }
@@ -410,6 +452,7 @@ impl Ingress {
         }
         Ok(Self {
             control_policy: Default::default(),
+            route_acl: std::sync::RwLock::new(None),
             durable_relays: Default::default(),
             ask_open: std::sync::Mutex::new(true),
             ask_slots: Arc::new(tokio::sync::Semaphore::new(capacity)),
@@ -431,6 +474,7 @@ impl Ingress {
             reorder_tx: Arc::new(std::sync::Mutex::new(Default::default())),
             reorder_tasks: tokio_util::task::TaskTracker::new(),
             reorder_cancel: tokio_util::sync::CancellationToken::new(),
+            reorder_closed: false.into(),
             reorder_gap_timeout: std::sync::Mutex::new(std::time::Duration::from_millis(250)),
             reorder_buffer_cap: std::sync::Mutex::new(1024),
         })
@@ -439,6 +483,47 @@ impl Ingress {
     pub fn with_control_policy(mut self, policy: crate::security::ControlPolicy) -> Self {
         self.control_policy = policy;
         self
+    }
+
+    /// Install the route policy used by business ASK/TELL/STOP relays.
+    ///
+    /// The supplied realm is this ingress's configured application principal,
+    /// not a realm inferred from each inbound connection. TLS/control policy
+    /// must authenticate peers separately. Replacement is atomic with that
+    /// principal; rejected input leaves the current policy unchanged.
+    pub fn set_route_acl(
+        &self,
+        acl: crate::acl::RouteAcl,
+        source_realm: impl Into<String>,
+    ) -> Result<(), String> {
+        acl.validate()?;
+        let source_realm = source_realm.into();
+        crate::acl::RouteAcl::validate_principal(&source_realm)?;
+        *self
+            .route_acl
+            .write()
+            .map_err(|_| "route ACL policy poisoned".to_owned())? = Some((acl, source_realm));
+        Ok(())
+    }
+
+    /// Remove route-prefix authorization for subsequent relay decisions.
+    /// Transport/control policy is unchanged. To replace an ACL without this
+    /// unrestricted interval, call `set_route_acl` directly instead.
+    pub fn clear_route_acl(&self) -> Result<(), String> {
+        *self
+            .route_acl
+            .write()
+            .map_err(|_| "route ACL policy poisoned".to_owned())? = None;
+        Ok(())
+    }
+
+    fn route_allowed(&self, target: &str) -> bool {
+        let Ok(policy) = self.route_acl.read() else {
+            return false;
+        };
+        policy.as_ref().is_none_or(|(acl, source_realm)| {
+            acl.check_route(source_realm, target) == crate::acl::AclDecision::Allow
+        })
     }
 
     /// Authorize these authenticated nodes to vouch for durable origins on
@@ -469,41 +554,61 @@ impl Ingress {
 
     /// Fence admission synchronously, then cancel all accepted ASK futures.
     pub fn close_asks(&self) {
-        let mut open = self.ask_open.lock().unwrap();
-        *open = false;
-        self.ask_cancel.cancel();
-        self.ask_tasks.close();
+        *self.ask_open.lock().unwrap() = false;
+        let cleanup = Cleanup::default();
+        let _ = cleanup.call(|| self.ask_tasks.close());
+        let _ = cleanup.call(|| self.ask_cancel.cancel());
     }
 
     /// Wait until every accepted ASK future has been dropped. Call close first.
     pub async fn wait_for_asks(&self) {
-        self.ask_tasks.wait().await;
+        crate::transport::notify_safely(self.ask_tasks.wait()).await;
+    }
+
+    /// Commit admission without invoking notification callbacks under owner locks.
+    pub(crate) fn close_admission(&self) {
+        let _map = self.reorder_tx.lock().unwrap();
+        self.reorder_closed.store(true, Ordering::Release);
+        drop(_map);
+        *self.ask_open.lock().unwrap() = false;
+        self.mirror_control.close_admission();
+        self.mirrors.close_admission();
     }
 
     /// Close ASK and TELL admission and cancel all owned asynchronous work.
     pub fn close(&self) {
-        self.mirror_control.close();
-        self.mirrors.close();
-        self.close_asks();
+        self.close_admission();
+        let retired = {
+            let mut map = self.reorder_tx.lock().unwrap();
+            std::mem::take(&mut *map)
+        };
         let pending = std::mem::take(&mut *self.resolve_pending.lock().unwrap());
+        let cleanup = Cleanup::default();
+        let _ = cleanup.call(|| self.reorder_tasks.close());
+        let _ = cleanup.call(|| self.ask_tasks.close());
+        let _ = cleanup.call(|| self.ask_cancel.cancel());
+        let _ = cleanup.call(|| self.reorder_cancel.cancel());
+        for sender in retired.into_values() {
+            cleanup.dispose(sender);
+        }
         for slot in pending.into_values() {
-            let _ = slot.tx.send(ReplyPayload::Err(
+            slot.notify(Some(ReplyPayload::Err(
                 ErrCode::Stopped,
                 "resolve ingress closed".into(),
-            ));
+            )));
         }
-        // This is also the registration fence used by reorder_tx_of.
-        let mut map = self.reorder_tx.lock().unwrap();
-        self.reorder_cancel.cancel();
-        self.reorder_tasks.close();
-        map.clear();
+        let _ = cleanup.call(|| self.mirror_control.close());
+        let _ = cleanup.call(|| self.mirrors.close());
     }
 
     /// Completion barrier for close; no retained reorder future remains afterwards.
     pub async fn wait_closed(&self) {
-        self.wait_for_asks().await;
-        self.reorder_tasks.wait().await;
-        self.mirrors.wait_closed().await;
+        crate::transport::notify_safely(async {
+            self.ask_tasks.wait().await;
+            self.reorder_tasks.wait().await;
+            self.mirrors.wait_closed().await;
+        })
+        .await;
     }
 
     /// 配置切面：重排旋钮注入（RemoteActorSystem 构造时下发）。
@@ -605,9 +710,13 @@ impl Ingress {
     /// calls it through bounded per-connection lanes; direct callers own their
     /// own ordering, admission and cancellation. ASK remains independently owned.
     pub async fn dispatch(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
+        crate::transport::notify_safely(self.dispatch_inner(frame, back, from_node)).await;
+    }
+
+    async fn dispatch_inner(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
         if frame.validate_payload_flags().is_err()
             || (frame.header.flags & crate::frame::flags::TRACE_CONTEXT != 0
-                && !back.supports_trace_context())
+                && !back.supports_trace_for(&frame))
             || (frame.header.flags & crate::frame::flags::MIRROR_SHADOW != 0
                 && (!back.supports_mirror_shadow() || !self.control_policy.allows(back)))
         {
@@ -653,6 +762,14 @@ impl Ingress {
             frame_type::RESOLVE_R => self.on_resolve_response(frame, back),
             frame_type::INVALIDATE => self.on_invalidate(frame, back),
             frame_type::SYSTEM_EVENT => {
+                let mut frame = frame;
+                let parent = match frame.take_trace_parent() {
+                    Ok(parent) => parent,
+                    Err(_) => {
+                        back.close();
+                        return;
+                    }
+                };
                 // P2 管理通道：admin/gossip/receptionist 同帧不同标签
                 match crate::admin::decode_sys_event(&frame.payload) {
                     Ok(event) => {
@@ -661,6 +778,9 @@ impl Ingress {
                             crate::admin::SysEvent::MembershipGossip(_)
                                 | crate::admin::SysEvent::MembershipProbe(_)
                                 | crate::admin::SysEvent::ReceptionistSync(_)
+                                | crate::admin::SysEvent::ReceptionistSegment(_)
+                                | crate::admin::SysEvent::ReceptionistRoutes(_)
+                                | crate::admin::SysEvent::ReceptionistRoutesSegment(_)
                         ) && !self.control_policy.allows_cluster(back)
                         {
                             back.close();
@@ -679,15 +799,40 @@ impl Ingress {
                                 return;
                             }
                         }
-                        if matches!(event, crate::admin::SysEvent::ReceptionistSync(_))
-                            && (back.peer_capabilities()
-                                & crate::handshake::caps::RECEPTIONIST_SYNC
-                                == 0
-                                || frame.header.correlation_id != 0
-                                || frame.header.flags != 0
-                                || frame.header.seq != crate::frame::SEQ_NONE
-                                || !frame.path.is_empty()
-                                || !frame.type_key.is_empty())
+                        if matches!(
+                            event,
+                            crate::admin::SysEvent::ReceptionistSync(_)
+                                | crate::admin::SysEvent::ReceptionistSegment(_)
+                                | crate::admin::SysEvent::ReceptionistRoutes(_)
+                                | crate::admin::SysEvent::ReceptionistRoutesSegment(_)
+                        ) && (back.peer_capabilities()
+                            & crate::handshake::caps::RECEPTIONIST_SYNC
+                            == 0
+                            || frame.header.correlation_id != 0
+                            || frame.header.flags != 0
+                            || frame.header.seq != crate::frame::SEQ_NONE
+                            || !frame.path.is_empty()
+                            || !frame.type_key.is_empty())
+                        {
+                            back.close();
+                            return;
+                        }
+                        if matches!(
+                            event,
+                            crate::admin::SysEvent::ReceptionistSegment(_)
+                                | crate::admin::SysEvent::ReceptionistRoutesSegment(_)
+                        ) && !back.supports_receptionist_segments()
+                        {
+                            back.close();
+                            return;
+                        }
+                        if matches!(
+                            event,
+                            crate::admin::SysEvent::ReceptionistRoutes(_)
+                                | crate::admin::SysEvent::ReceptionistRoutesSegment(_)
+                        ) && back.peer_capabilities()
+                            & crate::handshake::caps::RECEPTIONIST_ROUTES
+                            == 0
                         {
                             back.close();
                             return;
@@ -712,16 +857,29 @@ impl Ingress {
                         }
                         let hook = self.sys_event.read().unwrap().clone();
                         if let Some(hook) = hook {
-                            let cleanup = Cleanup::default();
-                            // A hook may already have sent a response. On failure,
-                            // close only its connection; never fabricate another.
-                            let _close = cleanup.close_on_failure(back);
-                            let mut hook = cleanup.owned(hook);
-                            let _ = unwind::run(&cleanup, || {
-                                hook.value().on_event(event, back, from_node)
+                            // Import a validated parent only for authorized V2
+                            // commands; untraced requests keep the explicit policy.
+                            let context =
+                                if matches!(&event, crate::admin::SysEvent::AdminCommandV2(_))
+                                    && crate::admin::admin_allowed(&self.control_policy, back)
+                                {
+                                    self.trace_recorder.context(parent)
+                                } else {
+                                    None
+                                };
+                            parrot_api::trace::scope(context, async {
+                                let cleanup = Cleanup::default();
+                                // A hook may already have sent a response. On failure,
+                                // close only its connection; never fabricate another.
+                                let _close = cleanup.close_on_failure(back);
+                                let mut hook = cleanup.owned(hook);
+                                let _ = unwind::run(&cleanup, || {
+                                    hook.value().on_event(event, back, from_node)
+                                })
+                                .await;
+                                hook.retire();
                             })
                             .await;
-                            hook.retire();
                         } else {
                             tracing::debug!("SYSTEM_EVENT ignored (no hook installed)");
                         }
@@ -945,10 +1103,11 @@ impl Ingress {
             .remove(&frame.header.correlation_id)
             .expect("slot checked under lock");
         if !valid {
-            let _ = pending.tx.send(ReplyPayload::Err(
+            drop(pending_map);
+            pending.notify(Some(ReplyPayload::Err(
                 ErrCode::ProtocolViolation,
                 "invalid resolve response or request binding".into(),
-            ));
+            )));
             return;
         }
         let response = response.unwrap();
@@ -958,16 +1117,17 @@ impl Ingress {
                 .as_ref()
                 .is_some_and(|entry| entry.version < pending.min_version)
         {
-            let _ = pending.tx.send(ReplyPayload::Err(
+            drop(pending_map);
+            pending.notify(Some(ReplyPayload::Err(
                 ErrCode::DirectoryStale,
                 "resolve result invalidated or older than requested version".into(),
-            ));
+            )));
             return;
         }
         let mut cache = self.resolve_cache.lock().unwrap();
         if let Some(entry) = &response.entry {
             cache.put_with_ttl(
-                pending.cache_key,
+                pending.cache_key.clone(),
                 entry.endpoints.clone(),
                 entry.version,
                 std::time::Duration::from_secs(entry.ttl_s as u64),
@@ -977,10 +1137,12 @@ impl Ingress {
             // An authoritative absence must not leave an earlier route usable.
             cache.invalidate(&pending.cache_key);
         }
-        let _ = pending.tx.send(ReplyPayload::Ok(
+        drop(cache);
+        drop(pending_map);
+        pending.notify(Some(ReplyPayload::Ok(
             frame.payload,
             crate::resolve::RESPONSE_KEY.to_owned(),
-        ));
+        )));
     }
 
     fn fail_resolve(&self, cid: u64, source: &FrameSender, code: ErrCode, detail: &str) -> bool {
@@ -994,7 +1156,8 @@ impl Ingress {
         let pending = pending_map
             .remove(&cid)
             .expect("pending checked under lock");
-        let _ = pending.tx.send(ReplyPayload::Err(code, detail.to_owned()));
+        drop(pending_map);
+        pending.notify(Some(ReplyPayload::Err(code, detail.to_owned())));
         true
     }
 
@@ -1042,6 +1205,22 @@ impl Ingress {
         min_version: u64,
         timeout: std::time::Duration,
     ) -> Result<Option<crate::roles::directory::DirEntry>, crate::RemoteError> {
+        crate::transport::notify_safely(self.resolve_remote_inner(
+            sender,
+            key,
+            min_version,
+            timeout,
+        ))
+        .await
+    }
+
+    async fn resolve_remote_inner(
+        &self,
+        sender: &FrameSender,
+        key: &str,
+        min_version: u64,
+        timeout: std::time::Duration,
+    ) -> Result<Option<crate::roles::directory::DirEntry>, crate::RemoteError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .filter(|_| !timeout.is_zero())
@@ -1064,8 +1243,9 @@ impl Ingress {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let identity = Arc::new(());
         {
+            let open = self.ask_open.lock().unwrap();
             let mut pending = self.resolve_pending.lock().unwrap();
-            if self.ask_cancel.is_cancelled() {
+            if !*open {
                 return Err(crate::RemoteError::Transport(
                     "resolve ingress closed".into(),
                 ));
@@ -1261,6 +1441,7 @@ impl Ingress {
             crate::durable::DURABLE_KEY
                 | crate::roles::directory::client::READ_KEY
                 | crate::roles::directory::client::CLIENT_KEY
+                | crate::roles::directory::ownership::KEY
                 | crate::roles::directory::network::RAFT_KEY
         ) {
             return;
@@ -1317,6 +1498,7 @@ impl Ingress {
             } else {
                 ErrCode::Stopped
             };
+            drop(open);
             // Do not create a waiting task for rejection. If even the error
             // cannot fit, disconnect this exact connection so callers observe
             // failure and a full writer cannot block the global dispatcher.
@@ -1419,6 +1601,10 @@ impl Ingress {
     }
 
     async fn on_request_scoped(&self, mut frame: Frame, back: &FrameSender) {
+        if frame.type_key == crate::roles::directory::ownership::KEY {
+            self.on_directory_ownership(frame, back).await;
+            return;
+        }
         if frame.type_key == crate::roles::directory::client::READ_KEY {
             self.on_directory_read(frame, back).await;
             return;
@@ -1748,6 +1934,36 @@ impl Ingress {
         };
         let _ = back.send(reply).await;
     }
+    async fn on_directory_ownership(&self, frame: Frame, back: &FrameSender) {
+        use crate::roles::directory::{network::NetworkDirectoryError, ownership};
+        let result = async {
+            self.authorize_directory_client(&frame, back, ownership::PATH)?;
+            let endpoint = self
+                .local
+                .directory_receiver()
+                .ok_or(NetworkDirectoryError::Closed)?;
+            let (_, payload) = frame
+                .split_reply_to()
+                .map_err(|e| NetworkDirectoryError::Invalid(e.to_string()))?;
+            ownership::receive(&endpoint, back.node_id(), payload).await
+        }
+        .await;
+        let reply = match bincode::serde::encode_to_vec(result, bincode::config::standard()) {
+            Ok(bytes) => Frame::reply(
+                frame.header.correlation_id,
+                "",
+                ownership::REPLY_KEY,
+                bytes::Bytes::from(bytes),
+            ),
+            Err(e) => Frame::reply_err(
+                frame.header.correlation_id,
+                &frame.path,
+                ErrCode::CodecError,
+                &e.to_string(),
+            ),
+        };
+        let _ = back.send(reply).await;
+    }
     async fn on_directory_request(&self, frame: Frame, back: &FrameSender) {
         use crate::roles::directory::network::{RAFT_ACK_KEY, RAFT_PATH};
         use crate::security::PeerAuthentication;
@@ -1937,6 +2153,15 @@ impl Ingress {
         let Some(target) = target_node(&frame.path) else {
             return Some(ErrCode::ActorNotFound);
         };
+        if !self.route_allowed(&frame.path) {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                &frame.path,
+                ErrCode::Forbidden,
+                "route ACL denied target prefix",
+            ));
+            return Some(ErrCode::Forbidden);
+        }
         // ② 路由能力未注入（非 hub 节点）或目标是本节点 → 常规 ActorNotFound
         let Some(router) = self
             .relay
@@ -2098,10 +2323,46 @@ impl Ingress {
     /// ROUTE_HINT 学习（方案 A）：hub 背书的直连地址入缓存；地址变化
     /// （节点重启换端口）覆盖旧值。拨号由 system 侧 watcher 异步执行。
     async fn on_route_hint(&self, node: &str, addr: &str, _back: &FrameSender) {
+        if parrot_config::endpoint::validate_node_id(node).is_err()
+            || addr
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .filter(|address| address.port() != 0)
+                .is_none()
+        {
+            tracing::warn!(%node, %addr, "route hint has invalid node or socket address");
+            return;
+        }
         let changed = {
             let mut g = self.learned.lock().unwrap();
             let changed = g.get(node).map(|a| a != addr).unwrap_or(true);
             if changed {
+                let replacing_bytes = g
+                    .get(node)
+                    .map(|old| old.len().saturating_add(node.len()))
+                    .unwrap_or(0);
+                let retained_bytes = g
+                    .iter()
+                    .map(|(known_node, known_addr)| {
+                        known_node.len().saturating_add(known_addr.len())
+                    })
+                    .sum::<usize>()
+                    .saturating_sub(replacing_bytes);
+                let new_bytes = retained_bytes
+                    .saturating_add(node.len())
+                    .saturating_add(addr.len());
+                if (!g.contains_key(node) && g.len() >= ROUTE_HINT_MAX_ENTRIES)
+                    || new_bytes > ROUTE_HINT_MAX_BYTES
+                {
+                    tracing::warn!(
+                        %node,
+                        %addr,
+                        entries = g.len(),
+                        bytes = new_bytes,
+                        "route hint cache budget exceeded"
+                    );
+                    return;
+                }
                 g.insert(node.to_string(), addr.to_string());
             }
             changed
@@ -2129,7 +2390,7 @@ impl Ingress {
     /// hub/直连切换的端到端 FIFO；等待窗口不能替代此保证。
     /// 背压：bounded channel 满则 dispatch 挂起 → 读循环挂起（RC8 贯通）。
     async fn on_tell(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
-        if self.reorder_cancel.is_cancelled() {
+        if self.reorder_closed.load(Ordering::Acquire) {
             DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -2174,7 +2435,7 @@ impl Ingress {
     /// Register at most one worker per source, atomically with the close fence.
     fn reorder_tx_of(self: &Arc<Self>, from: &str) -> Option<tokio::sync::mpsc::Sender<Frame>> {
         let mut map = self.reorder_tx.lock().unwrap();
-        if self.reorder_cancel.is_cancelled() {
+        if self.reorder_closed.load(Ordering::Acquire) {
             return None;
         }
         if let Some(tx) = map.get(from).filter(|tx| !tx.is_closed()) {
@@ -2460,6 +2721,10 @@ impl Ingress {
             );
             return false;
         };
+        if !self.route_allowed(&frame.path) {
+            tracing::debug!(target = %target, "TELL relay denied by route ACL");
+            return false;
+        }
         let Ok(g) = self.relay.read() else {
             return false;
         };
@@ -2524,13 +2789,16 @@ impl Ingress {
             .iter()
             .filter_map(|(cid, slot)| slot.connection.same_connection(connection).then_some(*cid))
             .collect();
-        for cid in ids {
-            if let Some(slot) = pending.remove(&cid) {
-                let _ = slot.tx.send(ReplyPayload::Err(
-                    ErrCode::ConnectionLost,
-                    "connection lost".into(),
-                ));
-            }
+        let retired: Vec<_> = ids
+            .into_iter()
+            .filter_map(|cid| pending.remove(&cid))
+            .collect();
+        drop(pending);
+        for slot in retired {
+            slot.notify(Some(ReplyPayload::Err(
+                ErrCode::ConnectionLost,
+                "connection lost".into(),
+            )));
         }
         for (cid, back) in self.relay_table.fail_connection(connection) {
             back.send_reply(Frame::reply_err(
@@ -2813,6 +3081,255 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn route_acl_is_enforced_before_ask_tell_and_stop_relay() {
+        let ingress = Ingress::new(
+            Arc::new(ApplicationAliases),
+            Arc::new(CallbackRegistry::new(8)),
+        );
+        let (out, mut frames) = tokio::sync::mpsc::channel(8);
+        let destination = FrameSender::anon(out);
+        *ingress.relay_slot() = Some(Arc::new(AliasRouter(destination)));
+        ingress
+            .set_route_acl(
+                crate::acl::RouteAcl::from_json(
+                    r#"{"routes":{"parrot://gateway/":["trusted-realm"]}}"#,
+                )
+                .unwrap(),
+                "untrusted-realm",
+            )
+            .unwrap();
+        let (tx, mut replies) = tokio::sync::mpsc::channel(8);
+        let back = FrameSender::anon(tx);
+        let request = Frame::ask(
+            91,
+            "parrot://gateway/user/actual",
+            "unknown:business",
+            Bytes::from_static(b"opaque"),
+            None,
+        );
+        ingress.on_request(request, &back).await;
+        let reply = replies
+            .recv()
+            .await
+            .expect("denied ASK must receive a receipt");
+        let (code, detail) = crate::error::decode_err_payload(&reply.payload).unwrap();
+        assert_eq!(code, ErrCode::Forbidden);
+        assert!(detail.contains("route ACL"));
+        assert!(
+            frames.try_recv().is_err(),
+            "denied ASK must never reach relay"
+        );
+
+        ingress
+            .tell_deliver_or_relay(
+                Frame::tell(
+                    "parrot://gateway/user/actual",
+                    "unknown:business",
+                    Bytes::from_static(b"opaque"),
+                ),
+                &back,
+            )
+            .await;
+        ingress
+            .on_stop(Frame::stop("parrot://gateway/user/actual"))
+            .await;
+        assert!(
+            frames.try_recv().is_err(),
+            "denied TELL/STOP must never relay"
+        );
+
+        ingress
+            .set_route_acl(
+                crate::acl::RouteAcl::from_json(
+                    r#"{"routes":{"parrot://gateway/":["untrusted-realm"]}}"#,
+                )
+                .unwrap(),
+                "untrusted-realm",
+            )
+            .unwrap();
+        ingress
+            .on_request(
+                Frame::ask(
+                    92,
+                    "parrot://gateway/user/actual",
+                    "unknown:business",
+                    Bytes::from_static(b"opaque"),
+                    None,
+                ),
+                &back,
+            )
+            .await;
+        let forwarded = frames.recv().await.expect("allowed ASK must relay");
+        assert_eq!(forwarded.header.correlation_id, 900);
+    }
+
+    fn route_acl_ingress() -> (Ingress, FrameSender, tokio::sync::mpsc::Receiver<Frame>) {
+        let ingress = Ingress::new(
+            Arc::new(ApplicationAliases),
+            Arc::new(CallbackRegistry::new(8)),
+        );
+        let (out, frames) = tokio::sync::mpsc::channel(8);
+        let destination = FrameSender::anon(out);
+        *ingress.relay_slot() = Some(Arc::new(AliasRouter(destination.clone())));
+        (ingress, destination, frames)
+    }
+
+    async fn check_route_acl_dispatch(
+        ingress: &Ingress,
+        destination: &FrameSender,
+        frames: &mut tokio::sync::mpsc::Receiver<Frame>,
+        allowed: bool,
+    ) {
+        let (tx, mut replies) = tokio::sync::mpsc::channel(8);
+        let back = FrameSender::anon(tx);
+        let payload = Bytes::from_static(b"opaque\0\xff");
+        let request = Frame::ask(71, "/user/alias", "unknown:business", payload.clone(), None);
+        let encoded_request = request.payload.clone();
+        ingress.on_request(request, &back).await;
+        if allowed {
+            let forwarded = frames.try_recv().expect("allowed ASK must relay");
+            assert_eq!(forwarded.path, "parrot://gateway/user/actual");
+            assert_eq!(forwarded.header.frame_type, frame_type::ASK);
+            assert_eq!(forwarded.payload, encoded_request);
+            ingress.on_reply(
+                Frame::reply(900, "", "unknown:reply", payload.clone()),
+                destination,
+            );
+            let reply = replies
+                .try_recv()
+                .expect("allowed ASK must retain its return mapping");
+            assert_eq!(reply.header.correlation_id, 71);
+            assert_eq!(reply.payload, payload);
+            assert!(ingress.relay_table.is_empty());
+        } else {
+            let reply = replies
+                .try_recv()
+                .expect("denied ASK must return a receipt");
+            assert_eq!(reply.header.correlation_id, 71);
+            assert_eq!(
+                crate::error::decode_err_payload(&reply.payload).unwrap().0,
+                ErrCode::Forbidden
+            );
+        }
+        for frame in [
+            Frame::tell("/user/alias", "unknown:business", payload.clone()),
+            Frame::stop("/user/alias"),
+        ] {
+            let kind = frame.header.frame_type;
+            if kind == frame_type::STOP {
+                ingress.on_stop(frame).await;
+            } else {
+                ingress.tell_deliver_or_relay(frame, &back).await;
+            }
+            if allowed {
+                let forwarded = frames.try_recv().expect("allowed TELL/STOP must relay");
+                assert_eq!(forwarded.path, "parrot://gateway/user/actual");
+                assert_eq!(forwarded.header.frame_type, kind);
+                assert_eq!(forwarded.header.hop_count, 1);
+            }
+        }
+        assert!(
+            frames.try_recv().is_err(),
+            "denied or already consumed frames must not remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_acl_rejected_updates_preserve_policy_and_principal() {
+        let (ingress, destination, mut frames) = route_acl_ingress();
+        let deny =
+            crate::acl::RouteAcl::from_json(r#"{"routes":{"parrot://gateway/":["trusted"]}}"#)
+                .unwrap();
+        let allow =
+            crate::acl::RouteAcl::from_json(r#"{"routes":{"parrot://gateway/":["*"]}}"#).unwrap();
+        ingress.set_route_acl(deny, "untrusted").unwrap();
+        check_route_acl_dispatch(&ingress, &destination, &mut frames, false).await;
+        for principal in ["", "*", "realm//bad", "realm/..", "realm%2ftrusted"] {
+            assert!(ingress.set_route_acl(allow.clone(), principal).is_err());
+            check_route_acl_dispatch(&ingress, &destination, &mut frames, false).await;
+        }
+        let mut invalid = allow.clone();
+        invalid
+            .routes
+            .insert("parrot://gateway/../".into(), vec!["*".into()]);
+        assert!(ingress.set_route_acl(invalid, "trusted").is_err());
+        check_route_acl_dispatch(&ingress, &destination, &mut frames, false).await;
+        ingress.set_route_acl(allow, "untrusted").unwrap();
+        check_route_acl_dispatch(&ingress, &destination, &mut frames, true).await;
+    }
+
+    #[tokio::test]
+    async fn route_acl_clear_restores_relay_and_reinstallation_denies_it_again() {
+        let (ingress, destination, mut frames) = route_acl_ingress();
+        ingress
+            .set_route_acl(crate::acl::RouteAcl::default(), "source")
+            .unwrap();
+        check_route_acl_dispatch(&ingress, &destination, &mut frames, false).await;
+        for _ in 0..2 {
+            ingress.clear_route_acl().unwrap();
+            check_route_acl_dispatch(&ingress, &destination, &mut frames, true).await;
+        }
+        ingress
+            .set_route_acl(crate::acl::RouteAcl::default(), "source")
+            .unwrap();
+        check_route_acl_dispatch(&ingress, &destination, &mut frames, false).await;
+    }
+
+    #[tokio::test]
+    async fn route_acl_poison_fails_closed_and_reports_replacement_errors() {
+        let (ingress, destination, mut frames) = route_acl_ingress();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ingress.route_acl.write().unwrap();
+            panic!("injected route policy writer failure");
+        }));
+        assert!(poisoned.is_err());
+        check_route_acl_dispatch(&ingress, &destination, &mut frames, false).await;
+        assert!(ingress.clear_route_acl().is_err());
+        assert!(ingress
+            .set_route_acl(crate::acl::RouteAcl::default(), "source")
+            .is_err());
+        check_route_acl_dispatch(&ingress, &destination, &mut frames, false).await;
+    }
+
+    #[test]
+    fn route_acl_concurrent_replacements_keep_policy_and_principal_together() {
+        let (ingress, _, _) = route_acl_ingress();
+        let policies = ["left", "right"].map(|principal| {
+            let mut acl = crate::acl::RouteAcl::default();
+            acl.routes
+                .insert("parrot://gateway/".into(), vec![principal.into()]);
+            acl
+        });
+        ingress.set_route_acl(policies[0].clone(), "left").unwrap();
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for (acl, principal) in policies.into_iter().zip(["left", "right"]) {
+                let ingress = &ingress;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..1024 {
+                        ingress.set_route_acl(acl.clone(), principal).unwrap();
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let ingress = &ingress;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..4096 {
+                        assert!(ingress.route_allowed("parrot://gateway/user/actual"));
+                        assert!(!ingress.route_allowed("parrot://gateway-other/user/actual"));
+                    }
+                });
+            }
+            start.wait();
+        });
+        assert!(ingress.route_allowed("parrot://gateway/user/actual"));
+    }
+
     #[test]
     fn local_path_strips_node_prefix() {
         assert_eq!(local_path("parrot://node-b/user/echo"), "/user/echo");
@@ -2834,6 +3351,25 @@ mod tests {
             Arc::new(Ingress::new(Arc::new(TestLookup), callbacks.clone())),
             callbacks,
         )
+    }
+
+    #[tokio::test]
+    async fn route_hint_cache_rejects_invalid_addresses_and_stays_bounded() {
+        let (ingress, _) = ingress();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let back = FrameSender::anon(tx);
+        ingress
+            .on_route_hint("bad-address", "not-a-socket", &back)
+            .await;
+        assert!(ingress.learned.lock().unwrap().is_empty());
+
+        for index in 0..=ROUTE_HINT_MAX_ENTRIES {
+            let node = format!("hint-{index:04}");
+            ingress.on_route_hint(&node, "127.0.0.1:1", &back).await;
+        }
+        let learned = ingress.learned.lock().unwrap();
+        assert_eq!(learned.len(), ROUTE_HINT_MAX_ENTRIES);
+        assert!(!learned.contains_key(&format!("hint-{ROUTE_HINT_MAX_ENTRIES:04}")));
     }
 
     /// 录制型 Lookup：按投递顺序记录 TELL payload 内容（重排测试观测点）。

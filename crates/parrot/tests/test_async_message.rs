@@ -9,7 +9,6 @@ use parrot_api::{
     address::ActorRefExt,
     errors::ActorError,
     match_message,
-    message::Message,
     types::{ActorResult, BoxedMessage},
 };
 use parrot_api_derive::{Message, ParrotActor};

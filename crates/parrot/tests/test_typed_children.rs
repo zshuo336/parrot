@@ -1031,11 +1031,35 @@ fn host_shutdown_isolates_parent_and_child_policy_capture_panics() {
         println!("POLICY_HOST_STOPPED");
         drop(system);
         stats.contexts.lock().unwrap().clear();
-        drop(actor);
-        // Final Arc disposal is synchronous here: counters alone would not
-        // detect an abort after a detached worker entered its destructor.
+        // Final system release hands cleanup to the independent lifecycle
+        // owner. Its receipt must follow both isolated policy destructors.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match actor.retirement_status() {
+                parrot_api::address::RetirementStatus::Retired(result) => {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("host cancelled supervision capture")
+                    );
+                    break;
+                }
+                parrot_api::address::RetirementStatus::Pending => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "host exit lost the typed actor's retirement owner"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                parrot_api::address::RetirementStatus::Unsupported => {
+                    panic!("managed actor must report actual retirement");
+                }
+            }
+        }
         assert_eq!(captures.load(Ordering::SeqCst), 2);
         assert_eq!(stats.drops.load(Ordering::SeqCst), 1);
+        drop(actor);
         println!("POLICY_HOST_RETIRED");
         return;
     }

@@ -95,7 +95,7 @@ pub struct ThreadContext<A: Actor + Send + Sync + 'static> {
     /// Weak reference to the actor system
     system: WeakSystemRef,
 
-    /// Handle to the Tokio runtime
+    /// Executor for generation-owned tasks, independent of the original host.
     runtime_handle: Handle,
     tasks: Arc<crate::context_tasks::ContextTasks>,
 
@@ -140,7 +140,7 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     ///
     /// # Parameters
     /// * `system` - Weak reference to the actor system
-    /// * `runtime_handle` - Handle to the Tokio runtime
+    /// * `runtime_handle` - Fallback executor for an unbound context
     /// * `path` - The actor's path
     /// * `parent_ref` - Optional reference to parent actor
     /// * `supervisor_strategy` - Supervision strategy for child actors
@@ -151,6 +151,11 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         parent_ref: Option<BoxedActorRef>,
         supervisor_strategy: SupervisorStrategy,
     ) -> Self {
+        // Dedicated and sharded actors can outlive their original host. Their
+        // admitted clocks, streams and registration scopes share that lifetime.
+        let runtime_handle = system
+            .upgrade()
+            .map_or(runtime_handle, |system| system.retirement_runtime().clone());
         let limit = system
             .upgrade()
             .map_or(crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS, |system| {
@@ -202,10 +207,12 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
             .as_ref()
             .map(|system| system.cleanup_slots.clone())
             .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(1)));
-        let actor = crate::owned_payload::OwnedPayload::new(actor, &self.runtime_handle, &slots);
-        let config = crate::owned_payload::OwnedPayload::new(config, &self.runtime_handle, &slots);
-        let strategy =
-            crate::owned_payload::OwnedPayload::new(strategy, &self.runtime_handle, &slots);
+        let runtime = system
+            .as_ref()
+            .map_or(&self.runtime_handle, |system| system.retirement_runtime());
+        let actor = crate::owned_payload::OwnedPayload::new(actor, runtime, &slots);
+        let config = crate::owned_payload::OwnedPayload::new(config, runtime, &slots);
+        let strategy = crate::owned_payload::OwnedPayload::new(strategy, runtime, &slots);
         Box::pin(parrot_api::trace::capture(async move {
             if self.mailbox.is_none() || system.is_none() {
                 let (actor, config, strategy) =
@@ -255,7 +262,7 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         match self.system() {
             Some(system) => crate::owned_payload::OwnedPayload::new(
                 value,
-                &self.runtime_handle,
+                system.retirement_runtime(),
                 &system.cleanup_slots,
             ),
             None => crate::owned_payload::OwnedPayload::unbound(value),
@@ -296,6 +303,7 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         let parent_mailbox = mailbox.clone();
         let path = self.path.path.clone();
         self.owned_children.bind_escalator(Arc::new(move |error| {
+            let error = crate::error_receipt::ActorReceipt::new(error);
             if let Some(system) = system.upgrade() {
                 system.runtime_spawn_escalation(path.clone(), parent_mailbox.clone(), error);
             }
@@ -340,6 +348,15 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     /// Get the weak system reference (M3 supervision hook plumbing).
     pub fn system_weak_ref(&self) -> WeakSystemRef {
         self.system.clone()
+    }
+
+    /// Bind trusted guest adapters to this exact actor generation's service
+    /// lifetime. Context retirement closes and joins the scope automatically;
+    /// retaining this Arc cannot authorize writes after the generation closes.
+    pub fn receptionist_registration_scope(
+        &self,
+    ) -> Arc<parrot_api::receptionist::RegistrationScope> {
+        self.tasks.registration_scope(&self.runtime_handle)
     }
 
     /// Adds a child actor reference.
@@ -782,10 +799,11 @@ impl<A: Actor + Send + Sync + 'static> ActorSpawner for ThreadContext<A> {
             .as_ref()
             .map(|system| system.cleanup_slots.clone())
             .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(1)));
-        let factory =
-            crate::owned_payload::OwnedPayload::new(factory, &self.runtime_handle, &slots);
-        let strategy =
-            crate::owned_payload::OwnedPayload::new(strategy, &self.runtime_handle, &slots);
+        let runtime = system
+            .as_ref()
+            .map_or(&self.runtime_handle, |system| system.retirement_runtime());
+        let factory = crate::owned_payload::OwnedPayload::new(factory, runtime, &slots);
+        let strategy = crate::owned_payload::OwnedPayload::new(strategy, runtime, &slots);
         Box::pin(async move {
             let error = if self.mailbox.is_none() || system.is_none() {
                 Some(ActorError::InitializationError(

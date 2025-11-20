@@ -10,6 +10,24 @@ mod probes;
 mod receptionist;
 mod seeds;
 
+#[cfg(test)]
+pub(crate) mod diagnostic_contracts;
+#[cfg(test)]
+pub(crate) mod lifecycle_diagnostic_contracts;
+#[cfg(test)]
+mod link_retirement_contracts;
+
+#[cfg(test)]
+mod admin_shutdown_contracts;
+#[cfg(test)]
+mod shutdown_notification_contracts;
+
+// A diagnostic subscriber is a user callback. Its panic (or payload disposal)
+// must not interrupt already committed cleanup or be reported recursively.
+pub(crate) fn diagnostic(report: impl FnOnce()) {
+    let _ = crate::ingress::unwind::Cleanup::default().call(report);
+}
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +41,7 @@ use crate::ingress::{Ingress, LocalLookup};
 use crate::node::{NodeAddr, NodeState, NodeStatus, NodeTable};
 use crate::ref_::{RemoteActorRef, RemoteInner};
 use crate::registry::CallbackRegistry;
-use crate::transport::{ConnectionHandle, FrameSender, OnDisconnect, Transport};
+use crate::transport::{ConnectionHandle, FrameSender, OnDisconnect, OwnedTransport};
 
 /// P1 配置（静态节点表；P2 增 gossip/集群字段——接口预留位）。
 #[derive(Clone)]
@@ -35,6 +53,13 @@ pub struct RemoteConfig {
     /// Node identity to service-key grants for local and incoming discovery.
     /// Denies all registrations/subscriptions unless explicitly configured.
     pub receptionist_acl: crate::acl::AclRules,
+    /// Additional relay/key grants for third-party service advertisements.
+    /// These delegate provenance to the authenticated relay, not to a claimed path.
+    pub receptionist_relay_acl: crate::acl::AclRules,
+    /// Retained service receivers and their queue reservations share this budget.
+    pub receptionist_subscriptions: parrot_config::receptionist::SubscriptionLimits,
+    /// Local and learned service entries share this node-wide table budget.
+    pub receptionist_registrations: parrot_config::receptionist::RegistrationLimits,
     pub bind: Option<SocketAddr>,
     pub seeds: Vec<NodeAddr>,
     /// Original configured seed sources, authoritative for bootstrap when nonempty.
@@ -55,7 +80,7 @@ pub struct RemoteConfig {
     /// 本节点可被直拨的监听地址 "host:port"（方案 A：握手时声明，hub 据此
     /// 向其他 spoke 注入 ROUTE_HINT；None = 不可直拨，只走 hub 中转）。
     pub direct_addr: Option<String>,
-    /// 连接层运行时旋钮（配置切面——None=编译期默认，等价迁移前行为）。
+    /// Connection settings; None selects the current bounded defaults.
     pub knobs: Option<crate::transport::RuntimeKnobs>,
     pub swim: crate::swim::SwimConfig,
 }
@@ -97,6 +122,9 @@ impl RemoteConfig {
             capture: None,
             security: Default::default(),
             receptionist_acl: Default::default(),
+            receptionist_relay_acl: Default::default(),
+            receptionist_subscriptions: Default::default(),
+            receptionist_registrations: Default::default(),
             bind,
             seeds: Vec::new(),
             seed_endpoints: Vec::new(),
@@ -156,6 +184,9 @@ impl RemoteConfig {
             capture: None,
             security: Default::default(),
             receptionist_acl: Default::default(),
+            receptionist_relay_acl: Default::default(),
+            receptionist_subscriptions: Default::default(),
+            receptionist_registrations: Default::default(),
             bind: None,
             seeds: Vec::new(),
             seed_endpoints: Vec::new(),
@@ -178,6 +209,9 @@ impl RemoteConfig {
             capture: None,
             security: Default::default(),
             receptionist_acl: Default::default(),
+            receptionist_relay_acl: Default::default(),
+            receptionist_subscriptions: Default::default(),
+            receptionist_registrations: Default::default(),
             bind,
             seeds: Vec::new(),
             seed_endpoints: Vec::new(),
@@ -297,6 +331,12 @@ impl RemoteConfig {
             roles: r.remote.receptionist.roles.clone().into_iter().collect(),
             default_deny: r.remote.receptionist.default_deny,
         };
+        cfg.receptionist_subscriptions = r.remote.receptionist.subscriptions;
+        cfg.receptionist_relay_acl = crate::acl::AclRules {
+            roles: r.remote.receptionist.relays.clone().into_iter().collect(),
+            default_deny: true,
+        };
+        cfg.receptionist_registrations = r.remote.receptionist.registrations;
         cfg.receptionist_acl
             .validate()
             .map_err(|error| config_error("remote.receptionist", error))?;
@@ -329,6 +369,8 @@ impl RemoteConfig {
         cfg.topology.relay_fallback = r.topology.relay_fallback;
         cfg.extra_caps = r.remote.extra_caps;
         cfg.knobs = Some(crate::transport::RuntimeKnobs {
+            connection_capacity: r.remote.transport.connection_capacity,
+            handshake_capacity: r.remote.transport.handshake_capacity,
             heartbeat_enabled: cfg.heartbeat_enabled,
             heartbeat_interval: Duration::from_millis(r.remote.transport.heartbeat_interval_ms),
             heartbeat_max_loss: r.remote.transport.heartbeat_max_loss,
@@ -397,11 +439,35 @@ impl RemoteConfig {
         self
     }
 
+    pub fn with_receptionist_registrations(
+        mut self,
+        limits: parrot_config::receptionist::RegistrationLimits,
+    ) -> Self {
+        self.receptionist_registrations = limits;
+        self
+    }
+
+    /// Explicitly delegate forwarded service keys to authenticated relay nodes.
+    pub fn with_receptionist_relay_acl(mut self, acl: crate::acl::AclRules) -> Self {
+        self.receptionist_relay_acl = acl;
+        self
+    }
+
+    pub fn with_receptionist_subscriptions(
+        mut self,
+        limits: parrot_config::receptionist::SubscriptionLimits,
+    ) -> Self {
+        self.receptionist_subscriptions = limits;
+        self
+    }
+
     fn handshake(&self) -> HandshakeBody {
         HandshakeBody {
             node_id: self.node_id.clone(),
             capabilities: crate::handshake::caps::BIN
+                | crate::handshake::caps::BATCH_FRAMES
                 | crate::handshake::caps::TRACE_CONTEXT
+                | crate::handshake::caps::ADMIN_TRACE_CONTEXT
                 | crate::handshake::caps::TELL_COMPLETION
                 | crate::handshake::caps::DURABLE_DELIVERY
                 | crate::handshake::caps::MEASURED_METRICS
@@ -413,6 +479,8 @@ impl RemoteConfig {
                         | crate::handshake::caps::MEMBERSHIP_PROBES
                         | crate::handshake::caps::RECEPTIONIST_SYNC
                         | crate::handshake::caps::RECEPTIONIST_NATIVE_PATHS
+                        | crate::handshake::caps::RECEPTIONIST_SEGMENTS
+                        | crate::handshake::caps::RECEPTIONIST_ROUTES
                 } else {
                     0
                 }
@@ -426,6 +494,9 @@ impl RemoteConfig {
 
     fn validate(&self) -> Result<(), RemoteError> {
         self.receptionist_acl
+            .validate()
+            .map_err(RemoteError::Transport)?;
+        self.receptionist_relay_acl
             .validate()
             .map_err(RemoteError::Transport)?;
         let invalid =
@@ -500,6 +571,8 @@ impl RemoteConfig {
             ));
         }
         for (name, limit) in [
+            ("connection_capacity", k.connection_capacity),
+            ("handshake_capacity", k.handshake_capacity),
             ("inbound_dispatch_capacity", k.inbound_dispatch_capacity),
             (
                 "inbound_dispatch_per_connection",
@@ -541,6 +614,67 @@ impl RemoteConfig {
     }
 }
 
+// Keep handshake metadata with its physical connection so retiring a newer
+// generation can restore the endpoint and role of the surviving generation.
+struct Link {
+    address: NodeAddr,
+    sender: FrameSender,
+    status: Arc<NodeStatus>,
+    role: crate::handshake::TopologyRole,
+    dial_addr: Option<String>,
+}
+
+impl Link {
+    fn node_id(&self) -> &str {
+        &self.address.node_id
+    }
+
+    fn is_uplink(&self, policy: &crate::security::ControlPolicy) -> bool {
+        !self.sender.is_closed()
+            && matches!(
+                self.role,
+                crate::handshake::TopologyRole::Hub | crate::handshake::TopologyRole::Border
+            )
+            && policy.allows_cluster(&self.sender)
+    }
+}
+
+// Field order releases the public mutex before the last system owner can close.
+struct MembershipOwner<'a> {
+    members: tokio::sync::MutexGuard<'a, crate::swim::Membership>,
+    system: Arc<RemoteActorSystem>,
+}
+
+#[cfg(test)]
+type MembershipAcquireObserver = Box<dyn FnOnce(&RemoteActorSystem)>;
+#[cfg(test)]
+thread_local! {
+    static MEMBERSHIP_ACQUIRE_OBSERVER: std::cell::RefCell<Option<MembershipAcquireObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl<'a> MembershipOwner<'a> {
+    async fn acquire(
+        weak: &std::sync::Weak<RemoteActorSystem>,
+        membership: &'a tokio::sync::Mutex<crate::swim::Membership>,
+    ) -> Option<Self> {
+        let members = membership.lock().await;
+        let system = weak.upgrade()?;
+        let owner = Self { members, system };
+        #[cfg(test)]
+        if let Some(observer) = MEMBERSHIP_ACQUIRE_OBSERVER.with(|slot| slot.borrow_mut().take()) {
+            observer(&owner.system);
+        }
+        Some(owner)
+    }
+
+    fn release(self) -> Arc<RemoteActorSystem> {
+        let Self { members, system } = self;
+        drop(members);
+        system
+    }
+}
+
 /// 远程系统（一个节点的远程面全部状态）。
 pub struct RemoteActorSystem {
     pub config: RemoteConfig,
@@ -551,12 +685,14 @@ pub struct RemoteActorSystem {
     /// K1/S1：SWIM 成员表（gossip 入站合并点——Arc 共享给钩子与驱动）。
     pub membership: Arc<tokio::sync::Mutex<crate::swim::Membership>>,
     pub(crate) receptionist: Arc<std::sync::Mutex<crate::receptionist::Receptionist>>,
+    receptionist_assemblies: std::sync::Mutex<receptionist::segments::Assemblies>,
+    receptionist_routes: std::sync::Mutex<receptionist::routes::Routes>,
     metrics: Arc<crate::metrics::TransportMetrics>,
-    transport: Arc<dyn Transport>,
+    transport: Arc<dyn OwnedTransport>,
     inbound_tx: mpsc::Sender<(Frame, FrameSender, String)>,
     inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(Frame, FrameSender, String)>>>,
-    /// 已建立连接（node_id → sender/status）
-    links: std::sync::RwLock<Vec<(String, FrameSender, Arc<NodeStatus>)>>,
+    /// Established physical connections, in registration order.
+    links: std::sync::RwLock<Vec<Link>>,
     /// 星型 uplink（07 §6）：hub/border 链路的 sender——目标不在直连表
     /// 时的默认路由出口。
     uplink: std::sync::RwLock<Option<FrameSender>>,
@@ -564,6 +700,8 @@ pub struct RemoteActorSystem {
     /// DIRECT_ADDR 声明维护）。
     dial_addrs: std::sync::Mutex<std::collections::HashMap<String, String>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    closing: std::sync::atomic::AtomicBool,
+    close_done: tokio::sync::watch::Sender<bool>,
     started: tokio::sync::Mutex<bool>,
     background: crate::transport::ConnectionTasks,
     direct_connections: crate::transport::ConnectionTasks,
@@ -650,7 +788,8 @@ impl RemoteActorSystem {
         // K1/S1：成员表挂系统（钩子合并 + 驱动读取同一实例）
         let membership = Arc::new(tokio::sync::Mutex::new(crate::swim::Membership::new(0)));
         let metrics = Arc::new(crate::metrics::TransportMetrics::default());
-        let transport: Box<dyn Transport> = match config.scheme {
+        let admission = crate::transport::ConnectionAdmission::new(knobs);
+        let transport: Box<dyn OwnedTransport> = match config.scheme {
             "mem" => Box::new(
                 crate::transport::memory::MemoryTransport::new(
                     handshake,
@@ -660,6 +799,7 @@ impl RemoteActorSystem {
                     config.knobs,
                 )?
                 .with_capture(config.capture.clone())
+                .with_admission(admission.clone())
                 .with_metrics(metrics.clone()),
             ),
             "quic" => {
@@ -677,6 +817,7 @@ impl RemoteActorSystem {
                         config.knobs,
                     )?
                     .with_capture(config.capture.clone())
+                    .with_admission(admission.clone())
                     .with_metrics(metrics.clone()),
                 )
             }
@@ -690,6 +831,7 @@ impl RemoteActorSystem {
                 )
                 .with_security(config.security.clone())?
                 .with_capture(config.capture.clone())
+                .with_admission(admission.clone())
                 .with_metrics(metrics.clone()),
             ),
             _ => unreachable!("validated transport"),
@@ -715,6 +857,8 @@ impl RemoteActorSystem {
                 }
             }
         }
+        let subscription_limits = config.receptionist_subscriptions;
+        let registration_limits = config.receptionist_registrations;
         let system = Arc::new(Self {
             config,
             nodes,
@@ -722,7 +866,14 @@ impl RemoteActorSystem {
             ingress,
             seq_counters: Default::default(),
             membership,
-            receptionist: Default::default(),
+            receptionist: Arc::new(std::sync::Mutex::new(
+                crate::receptionist::Receptionist::with_limits(
+                    subscription_limits,
+                    registration_limits,
+                ),
+            )),
+            receptionist_assemblies: Default::default(),
+            receptionist_routes: Default::default(),
             transport: Arc::from(transport),
             inbound_tx: in_tx,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(in_rx)),
@@ -730,9 +881,12 @@ impl RemoteActorSystem {
             uplink: std::sync::RwLock::new(None),
             dial_addrs: std::sync::Mutex::new(Default::default()),
             shutdown_tx,
+            closing: false.into(),
+            close_done: tokio::sync::watch::channel(false).0,
             started: tokio::sync::Mutex::new(false),
             background: Default::default(),
-            direct_connections: crate::transport::ConnectionTasks::with_metrics(metrics.clone()),
+            direct_connections: crate::transport::ConnectionTasks::with_metrics(metrics.clone())
+                .with_admission(admission),
             metrics,
             link_gate: Default::default(),
             discovery_gates: Default::default(),
@@ -754,8 +908,12 @@ impl RemoteActorSystem {
 
     /// 启动：listen（若配置）+ 入站分发循环 + 连接种子。
     pub async fn start(self: &Arc<Self>) -> Result<(), RemoteError> {
+        crate::transport::notify_safely(self.start_inner()).await
+    }
+
+    async fn start_inner(self: &Arc<Self>) -> Result<(), RemoteError> {
         let mut started = self.started.lock().await;
-        if *self.shutdown_tx.borrow() {
+        if self.is_closing() {
             return Err(RemoteError::Transport("system is shut down".into()));
         }
         if *started {
@@ -765,7 +923,7 @@ impl RemoteActorSystem {
         if let Some(bind) = self.config.bind {
             self.transport.listen(bind).await?;
         }
-        if *self.shutdown_tx.borrow() {
+        if self.is_closing() {
             return Err(RemoteError::Transport(
                 "system shut down during startup".into(),
             ));
@@ -862,28 +1020,11 @@ impl RemoteActorSystem {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     ticker.tick().await;
-                    // Never retain the system while waiting on a public mutex.
-                    let routes: Vec<_> = membership
-                        .lock()
-                        .await
-                        .members
-                        .values()
-                        .filter_map(crate::swim::member_route)
-                        .collect();
-                    let Some(system) = weak.upgrade() else {
+                    let Some(owner) = MembershipOwner::acquire(&weak, &membership).await else {
                         break;
                     };
-                    let routes = routes
-                        .into_iter()
-                        .filter(|route| {
-                            route.node_id() != system.config.node_id
-                                && route.scheme() == system.config.scheme
-                                && route.address().is_none_or(|address| {
-                                    system.config.validate_peer_address(address).is_ok()
-                                })
-                        })
-                        .collect();
-                    system.nodes.reconcile_membership(routes);
+                    let _gate = owner.system.link_gate.lock().unwrap();
+                    owner.system.reconcile_membership_routes(&owner.members);
                 }
             });
         }
@@ -915,9 +1056,35 @@ impl RemoteActorSystem {
         {
             let weak = Arc::downgrade(self);
             let transport = self.transport.clone();
+            // Bound waiting accepts as well as active handshakes. A slow peer
+            // must not monopolize the sole accept future for its whole deadline.
+            let parallel = self
+                .config
+                .knobs
+                .unwrap_or_default()
+                .handshake_capacity
+                .min(64);
             self.spawn_background(async move {
+                use futures::{stream::FuturesUnordered, StreamExt};
+                let accept = || {
+                    let transport = transport.clone();
+                    async move {
+                        let result = transport.accept().await;
+                        if result.is_err() {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        result
+                    }
+                };
+                let mut pending = FuturesUnordered::new();
+                for _ in 0..parallel {
+                    pending.push(accept());
+                }
                 loop {
-                    match transport.accept().await {
+                    let Some(result) = pending.next().await else {
+                        return;
+                    };
+                    match result {
                         Ok(conn) => {
                             let Some(this) = weak.upgrade() else {
                                 conn.sender.close();
@@ -926,10 +1093,11 @@ impl RemoteActorSystem {
                             let _ = this.register_link(conn);
                         }
                         Err(error) => {
-                            tracing::warn!(%error, "remote accept failed");
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            diagnostic(|| tracing::warn!(%error, "remote accept failed"));
                         }
                     }
+                    pending.push(accept());
+                    tokio::task::consume_budget().await;
                 }
             });
         }
@@ -962,6 +1130,8 @@ impl RemoteActorSystem {
                 "connect_mem_pair requires two memory systems".into(),
             ));
         }
+        let (mine_capacity, _mine_handshake) = self.direct_connections.admit()?;
+        let (their_capacity, _their_handshake) = peer.direct_connections.admit()?;
         let (client, server) = tokio::io::duplex(64 * 1024);
         let build = |system: &Arc<Self>, side| crate::transport::ConnParams {
             side,
@@ -983,7 +1153,7 @@ impl RemoteActorSystem {
         let mine = self
             .direct_connections
             .run(crate::transport::run_connection_captured(
-                client,
+                crate::transport::AdmittedIo::new(client, mine_capacity),
                 build(self, crate::transport::ConnSide::Connect),
                 Some(&self.direct_connections),
                 crate::security::PeerTrust::InProcess.expecting(&peer.config.node_id),
@@ -992,7 +1162,7 @@ impl RemoteActorSystem {
         let theirs = peer
             .direct_connections
             .run(crate::transport::run_connection_captured(
-                server,
+                crate::transport::AdmittedIo::new(server, their_capacity),
                 build(peer, crate::transport::ConnSide::Accept),
                 Some(&peer.direct_connections),
                 crate::security::PeerTrust::InProcess,
@@ -1032,11 +1202,24 @@ impl RemoteActorSystem {
         addr: &NodeAddr,
         retain_numeric_seed: bool,
     ) -> Result<String, RemoteError> {
+        crate::transport::notify_safely(Self::connect_weak_identity_inner(
+            weak,
+            addr,
+            retain_numeric_seed,
+        ))
+        .await
+    }
+
+    async fn connect_weak_identity_inner(
+        weak: &std::sync::Weak<Self>,
+        addr: &NodeAddr,
+        retain_numeric_seed: bool,
+    ) -> Result<String, RemoteError> {
         let (transport, mut shutdown) = {
             let this = weak
                 .upgrade()
                 .ok_or_else(crate::transport::ConnectionTasks::error)?;
-            if *this.shutdown_tx.borrow() {
+            if this.is_closing() {
                 return Err(crate::transport::ConnectionTasks::error());
             }
             this.config.validate_peer_address(addr)?;
@@ -1066,7 +1249,8 @@ impl RemoteActorSystem {
         seed: Option<&NodeAddr>,
     ) -> Result<(), RemoteError> {
         let _gate = self.link_gate.lock().unwrap();
-        if *self.shutdown_tx.borrow() {
+        if self.is_closing() {
+            drop(_gate);
             conn.sender.close();
             return Err(crate::transport::ConnectionTasks::error());
         }
@@ -1075,45 +1259,33 @@ impl RemoteActorSystem {
         }
         let status = Arc::new(NodeStatus::default());
         status.set(NodeState::Connected);
-        self.links.write().unwrap().push((
-            conn.node_id.clone(),
-            conn.sender.clone(),
-            status.clone(),
-        ));
+        let link = Link {
+            address: NodeAddr {
+                node_id: conn.node_id.clone(),
+                identity_is_explicit: true,
+                scheme: conn.info.scheme.to_string(),
+                addr: conn
+                    .info
+                    .peer
+                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+            },
+            sender: conn.sender.clone(),
+            status: status.clone(),
+            role: conn.peer_role,
+            dial_addr: conn.peer_dial_addr.clone(),
+        };
         // 星型 uplink 记录（07 §6）：对端角色是 hub/border → 此链路可做
-        // 默认路由（目标不在直连表时经它中转）。多个 hub 取最新（hub
-        // 主备是 P5 拓扑管理的职责）。
-        if self
-            .config
-            .security
-            .control_policy()
-            .allows_cluster(&conn.sender)
-            && matches!(
-                conn.peer_role,
-                crate::handshake::TopologyRole::Hub | crate::handshake::TopologyRole::Border
-            )
-        {
+        // 默认路由（目标不在直连表时经它中转）。多个 hub 取最新存活链路。
+        let is_uplink = link.is_uplink(&self.config.security.control_policy());
+        if is_uplink {
             let mut g = self.uplink.write().unwrap();
             *g = Some(conn.sender.clone());
-            tracing::info!(node = %conn.node_id, role = ?conn.peer_role, "uplink set");
         }
         // 方案 A：对端声明的直拨地址入表（hub 中转时作为 ROUTE_HINT 数据源）
-        if let Some(d) = &conn.peer_dial_addr {
-            self.dial_addrs
-                .lock()
-                .unwrap()
-                .insert(conn.node_id.clone(), d.clone());
-        }
+        self.set_link_address(&conn.node_id, Some(&link));
         // NodeTable 同步（remote_ref require 校验通过）
-        self.nodes.connected(NodeAddr {
-            node_id: conn.node_id.clone(),
-            identity_is_explicit: true,
-            scheme: conn.info.scheme.to_string(),
-            addr: conn
-                .info
-                .peer
-                .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
-        });
+        self.nodes.connected(link.address.clone());
+        self.links.write().unwrap().push(link);
         if let Some((_, node_status)) = self.nodes.get(&conn.node_id) {
             node_status.set(NodeState::Connected);
         }
@@ -1145,13 +1317,15 @@ impl RemoteActorSystem {
             metadata: bytes::Bytes::new(),
         };
         self.spawn_background(async move {
-            let mut membership = membership.lock().await;
-            let Some(system) = weak.upgrade() else {
+            let Some(mut owner) = MembershipOwner::acquire(&weak, &membership).await else {
                 return;
             };
-            if !registered_sender.is_closed() && system.direct_sender_of(&member.node_id).is_some()
+            if !registered_sender.is_closed()
+                && owner.system.direct_sender_of(&member.node_id).is_some()
             {
-                membership.merge_event(&crate::swim::MemberEvent::Upsert(member));
+                owner
+                    .members
+                    .merge_event(&crate::swim::MemberEvent::Upsert(member));
             }
         });
         // 关闭信号 → 移除 link + Disconnected（回调可能早于 NodeTable 填充——容忍）
@@ -1161,35 +1335,44 @@ impl RemoteActorSystem {
         let closed_sender = conn.sender.clone();
         self.spawn_background(async move {
             let _ = (&mut closed).await;
-            tracing::debug!(node = %node_id, "connection closed (register_link watcher)");
             status.set(NodeState::Disconnected);
             let Some(this) = weak.upgrade() else {
+                diagnostic(|| tracing::debug!(node = %node_id, "connection closed (register_link watcher)"));
                 return;
             };
-            {
+            let (has_replacement, cleared_uplink) = {
                 let _gate = this.link_gate.lock().unwrap();
-                let has_replacement = {
-                    let mut links = this.links.write().unwrap();
-                    links.retain(|(_, sender, _)| !sender.tx.same_channel(&closed_sender.tx));
-                    links.iter().any(|(node, _, _)| node == &node_id)
-                };
+                let mut links = this.links.write().unwrap();
+                links.retain(|link| !link.sender.same_connection(&closed_sender));
+                let replacement = links
+                    .iter()
+                    .rev()
+                    .find(|link| link.node_id() == node_id && !link.sender.is_closed());
                 // An old connection closing must not remove a newer connection
                 // or mark its node disconnected.
-                if has_replacement {
-                    return;
+                this.set_link_address(&node_id, replacement);
+                if let Some(link) = replacement {
+                    this.nodes.connected(link.address.clone());
+                } else {
+                    this.nodes.disconnected(&node_id);
                 }
-                // 直拨地址随链路失效清除（节点重启换端口后由新握手重新声明）
-                this.dial_addrs.lock().unwrap().remove(&node_id);
-                // uplink 失效清理（该 hub 断连——读侧 try_send 失败自然兜底）
-                let mut g = this.uplink.write().unwrap();
-                if g.as_ref()
-                    .map(|s| s.tx.same_channel(&closed_sender.tx))
-                    .unwrap_or(false)
-                {
-                    *g = None;
-                    tracing::info!(node = %node_id, "uplink cleared");
-                }
-                this.nodes.disconnected(&node_id);
+                let mut uplink = this.uplink.write().unwrap();
+                let policy = this.config.security.control_policy();
+                let selected = links
+                    .iter()
+                    .rev()
+                    .find(|link| link.is_uplink(&policy))
+                    .map(|link| link.sender.clone());
+                let cleared_uplink = uplink.is_some() && selected.is_none();
+                *uplink = selected;
+                (replacement.is_some(), cleared_uplink)
+            };
+            diagnostic(|| tracing::debug!(node = %node_id, "connection closed (register_link watcher)"));
+            if cleared_uplink {
+                diagnostic(|| tracing::info!(node = %node_id, "uplink cleared"));
+            }
+            if has_replacement || this.is_closing() {
+                return;
             }
             let membership = this.membership.clone();
             let timeout = this.config.swim.suspect_timeout;
@@ -1206,16 +1389,21 @@ impl RemoteActorSystem {
             {
                 return;
             }
-            let mut membership = membership.lock().await;
-            let Some(this) = weak.upgrade() else {
+            let Some(mut owner) = MembershipOwner::acquire(&weak, &membership).await else {
                 return;
             };
-            if this.direct_sender_of(&node_id).is_none()
-                && membership.members.get(&node_id) == observed.as_ref()
+            if owner.system.direct_sender_of(&node_id).is_none()
+                && owner.members.members.get(&node_id) == observed.as_ref()
             {
-                membership.mark_suspect_with_timeout(&node_id, timeout);
+                owner.members.mark_suspect_with_timeout(&node_id, timeout);
             }
         });
+        drop(_gate);
+        if is_uplink {
+            diagnostic(
+                || tracing::info!(node = %conn.node_id, role = ?conn.peer_role, "uplink set"),
+            );
+        }
         Ok(())
     }
 
@@ -1227,7 +1415,28 @@ impl RemoteActorSystem {
 
     /// 已建链路快照（测试/诊断观测点——node_id + sender + 状态）。
     pub async fn links_snapshot(&self) -> Vec<(String, FrameSender, Arc<NodeStatus>)> {
-        self.links.read().unwrap().clone()
+        self.links
+            .read()
+            .unwrap()
+            .iter()
+            .map(|link| {
+                (
+                    link.node_id().to_owned(),
+                    link.sender.clone(),
+                    link.status.clone(),
+                )
+            })
+            .collect()
+    }
+
+    // Caller holds link_gate, preserving registration/retirement ordering.
+    fn set_link_address(&self, node: &str, link: Option<&Link>) {
+        let mut addresses = self.dial_addrs.lock().unwrap();
+        if let Some(address) = link.and_then(|link| link.dial_addr.as_ref()) {
+            addresses.insert(node.to_owned(), address.clone());
+        } else {
+            addresses.remove(node);
+        }
     }
 
     /// Required identities without a currently open, handshaken direct link.
@@ -1235,7 +1444,7 @@ impl RemoteActorSystem {
     /// This is a local observation, not an application health check or a lease:
     /// a connection may close immediately after the check. No dialing occurs.
     pub fn missing_direct_connections<'a>(&self, required: &[&'a str]) -> Vec<&'a str> {
-        if *self.shutdown_tx.borrow() {
+        if self.is_closing() {
             return required.to_vec();
         }
         let links = self.links.read().unwrap();
@@ -1245,7 +1454,7 @@ impl RemoteActorSystem {
             .filter(|node| {
                 !links
                     .iter()
-                    .any(|(id, sender, _)| id == node && !sender.is_closed())
+                    .any(|link| link.node_id() == *node && !link.sender.is_closed())
             })
             .collect()
     }
@@ -1298,11 +1507,32 @@ impl RemoteActorSystem {
     /// Restore this node's exact engine-local path from a canonical discovery
     /// address. Foreign, malformed and closed-system paths do not resolve.
     pub fn local_actor_path<'a>(&self, path: &'a str) -> Option<&'a str> {
-        if *self.shutdown_tx.borrow() {
+        if self.is_closing() {
             return None;
         }
         let (node, local) = crate::actor_path::split(path)?;
         (node == self.config.node_id).then_some(local)
+    }
+
+    // Callers retain membership and link guards through projection, fencing
+    // delayed snapshots against both newer endpoints and system shutdown.
+    fn reconcile_membership_routes(&self, members: &crate::swim::Membership) {
+        if self.is_closing() {
+            return;
+        }
+        let routes = members
+            .members
+            .values()
+            .filter_map(crate::swim::member_route)
+            .filter(|route| {
+                route.node_id() != self.config.node_id
+                    && route.scheme() == self.config.scheme
+                    && route
+                        .address()
+                        .is_none_or(|address| self.config.validate_peer_address(address).is_ok())
+            })
+            .collect();
+        self.nodes.reconcile_membership(routes);
     }
 
     pub fn remote_ref(self: &Arc<Self>, path: &str) -> Result<RemoteActorRef, RemoteError> {
@@ -1317,7 +1547,7 @@ impl RemoteActorSystem {
             .read()
             .unwrap()
             .iter()
-            .any(|(n, sender, _)| n == node && !sender.is_closed());
+            .any(|link| link.node_id() == node && !link.sender.is_closed());
         if !self.nodes.contains(node) && !in_links && !has_uplink {
             return Err(RemoteError::UnknownNode(node.to_string()));
         }
@@ -1353,12 +1583,12 @@ impl RemoteActorSystem {
             .unwrap()
             .iter()
             .rev()
-            .find(|(id, sender, _)| id == node && !sender.is_closed())
-            .map(|(_, sender, _)| sender.clone())
+            .find(|link| link.node_id() == node && !link.sender.is_closed())
+            .map(|link| link.sender.clone())
     }
 
     pub(crate) fn sender_of(&self, node: &str) -> Option<FrameSender> {
-        if *self.shutdown_tx.borrow() {
+        if self.is_closing() {
             return None;
         }
         use crate::topology::TopologyMode;
@@ -1378,11 +1608,22 @@ impl RemoteActorSystem {
     }
 
     fn relay_sender(&self) -> Option<FrameSender> {
-        self.uplink
+        let cached = self
+            .uplink
             .read()
             .unwrap()
             .clone()
-            .filter(|s| !s.is_closed())
+            .filter(|s| !s.is_closed());
+        cached.or_else(|| {
+            let policy = self.config.security.control_policy();
+            self.links
+                .read()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|link| link.is_uplink(&policy))
+                .map(|link| link.sender.clone())
+        })
     }
 
     fn may_dial_business(&self) -> bool {
@@ -1415,8 +1656,16 @@ impl RemoteActorSystem {
         node: &str,
         allow_uplink: bool,
     ) -> Option<FrameSender> {
+        crate::transport::notify_safely(Self::resolve_sender_inner(weak, node, allow_uplink)).await
+    }
+
+    async fn resolve_sender_inner(
+        weak: &std::sync::Weak<Self>,
+        node: &str,
+        allow_uplink: bool,
+    ) -> Option<FrameSender> {
         let existing = |system: &Self| {
-            if *system.shutdown_tx.borrow() {
+            if system.is_closing() {
                 None
             } else {
                 system.direct_sender_of(node)
@@ -1424,7 +1673,7 @@ impl RemoteActorSystem {
         };
         let (gate, slots, mut shutdown) = {
             let system = weak.upgrade()?;
-            if *system.shutdown_tx.borrow() {
+            if system.is_closing() {
                 return None;
             }
             if allow_uplink
@@ -1644,6 +1893,7 @@ impl RemoteActorSystem {
         timeout: Duration,
         required_caps: u32,
     ) -> Result<R, RemoteError> {
+        let context = parrot_api::trace::TraceContext::current();
         let mut shutdown = self.shutdown_tx.subscribe();
         let frame = Frame {
             header: crate::frame::FrameHeader {
@@ -1660,13 +1910,19 @@ impl RemoteActorSystem {
             type_key: String::new(),
             payload,
         };
-        let operation = async {
+        let operation = parrot_api::trace::scope(context, async {
             let sender = Self::resolve_sender(&Arc::downgrade(self), node, false)
                 .await
                 .ok_or_else(|| RemoteError::UnknownNode(node.into()))?;
+            let frame = if frame.payload.first() == Some(&crate::admin::sys_event_tag::ADMIN_CMD_V2)
+            {
+                sender.trace_request(frame)?
+            } else {
+                frame
+            };
             let (rx, _guard) = {
                 let _gate = self.link_gate.lock().unwrap();
-                if *self.shutdown_tx.borrow() {
+                if self.is_closing() {
                     return Err(RemoteError::Transport("system is shut down".into()));
                 }
                 if sender.peer_capabilities() & required_caps != required_caps {
@@ -1686,12 +1942,14 @@ impl RemoteActorSystem {
                 result = rx => result.map_err(|_| RemoteError::Transport("admin reply channel closed".into())),
                 _ = sender.closed() => Err(RemoteError::Transport("admin connection lost".into())),
             }
-        };
-        tokio::select! {
-            biased;
-            result = tokio::time::timeout(timeout, operation) => result.map_err(|_| RemoteError::Transport(format!("admin timeout {}s", timeout.as_secs())))?,
-            _ = shutdown.wait_for(|closed| *closed) => Err(RemoteError::Transport("system is shut down".into())),
-        }
+        });
+        crate::transport::notify_safely(async {
+            tokio::select! {
+                biased;
+                result = tokio::time::timeout(timeout, operation) => result.map_err(|_| RemoteError::Transport(format!("admin timeout {}s", timeout.as_secs())))?,
+                _ = shutdown.wait_for(|closed| *closed) => Err(RemoteError::Transport("system is shut down".into())),
+            }
+        }).await
     }
 
     // ── B1（DEV_09 §3.2）：admin-v2 组件级部署三方法 ──────────
@@ -1699,6 +1957,28 @@ impl RemoteActorSystem {
     /// 安装目标节点组件执行器（方言挂接点：parrot Executor / 网关 admin 分支）。
     pub fn set_component_executor(&self, ex: Option<Arc<dyn crate::admin_v2::ComponentExecutor>>) {
         *self.component_executor.write().unwrap() = ex;
+    }
+
+    /// Install or atomically replace an application route-prefix ACL.
+    ///
+    /// The ACL is evaluated on every business relay (ASK/TELL/STOP). TLS or
+    /// another transport identity remains the source of authentication; the
+    /// supplied realm only selects the policy principal for this node, not for
+    /// each inbound peer. Install the initial policy before starting listeners;
+    /// a rejected replacement preserves the installed policy and principal.
+    pub fn set_route_acl(
+        &self,
+        acl: crate::acl::RouteAcl,
+        source_realm: impl Into<String>,
+    ) -> Result<(), String> {
+        self.ingress.set_route_acl(acl, source_realm)
+    }
+
+    /// Remove application route-prefix authorization for subsequent relays.
+    /// To replace a policy without an unrestricted interval, use `set_route_acl`
+    /// directly. Transport authentication and control policy remain enforced.
+    pub fn clear_route_acl(&self) -> Result<(), String> {
+        self.ingress.clear_route_acl()
     }
 
     /// v2 命令往返（与 v1 admin_roundtrip 同构——挂起表/超时独立）。
@@ -1792,6 +2072,7 @@ impl RemoteActorSystem {
     }
 
     /// 排空组件（优雅停——在途消息处理完或超时；返回 (drained, aborted)）。
+    /// Whole milliseconds are sent, saturating at u64::MAX; peers may cap the budget.
     pub async fn drain_component(
         self: &Arc<Self>,
         node: &str,
@@ -1804,7 +2085,7 @@ impl RemoteActorSystem {
                 crate::admin_v2::AdminCommandV2::DrainComponent {
                     req_id: 0,
                     path_prefix: prefix.into(),
-                    timeout_ms: timeout.as_millis() as u64,
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
                 },
             )
             .await?;
@@ -1945,26 +2226,59 @@ impl RemoteActorSystem {
     /// Fence all owned work synchronously. Safe without an active Tokio runtime.
     pub(crate) fn begin_close(&self) {
         let _gate = self.link_gate.lock().unwrap();
-        self.ingress.close();
-        self.shutdown_tx.send_replace(true);
-        let retired_receptionist = std::mem::take(&mut *self.receptionist.lock().unwrap());
-        self.probes.close();
-        self.admin_pending.close("system shutdown");
-        self.admin_pending_v2.close("system shutdown");
-        self.background.close();
-        self.direct_connections.close();
-        self.transport.close();
-        for (node, sender, status) in self.links.write().unwrap().drain(..) {
-            sender.close();
-            status.set(NodeState::Disconnected);
-            self.nodes.disconnected(&node);
+        if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
         }
-        *self.uplink.write().unwrap() = None;
+        self.ingress.close_admission();
+        self.probes.close_admission();
+        self.admin_pending.close_admission();
+        self.admin_pending_v2.close_admission();
+        self.callbacks.close_admission();
+        self.background.close_admission();
+        self.direct_connections.close_admission();
+        self.transport.close_admission();
+        let retired_receptionist = self.receptionist.lock().unwrap().retire_contents();
+        let retired_assemblies = std::mem::take(&mut *self.receptionist_assemblies.lock().unwrap());
+        let retired_routes = std::mem::take(&mut *self.receptionist_routes.lock().unwrap());
+        self.nodes.reconcile_membership(Vec::new());
+        let retired_links = std::mem::take(&mut *self.links.write().unwrap());
+        for link in &retired_links {
+            link.sender.close_admission();
+            link.status.set(NodeState::Disconnected);
+            self.nodes.disconnected(link.node_id());
+        }
+        let retired_uplink = self.uplink.write().unwrap().take();
         self.dial_addrs.lock().unwrap().clear();
-        self.callbacks
-            .fail_all(crate::error::ErrCode::ConnectionLost, "system shutdown");
         drop(_gate);
-        drop(retired_receptionist);
+
+        // Every admission fence and route retirement precedes external callbacks.
+        // Keep each owner independent so one failing callback cannot skip another.
+        let cleanup = crate::ingress::unwind::Cleanup::default();
+        let _ = cleanup.call(|| self.shutdown_tx.send_replace(true));
+        let _ = cleanup.call(|| self.ingress.close());
+        let _ = cleanup.call(|| self.probes.close());
+        let _ = cleanup.call(|| self.background.close());
+        let _ = cleanup.call(|| self.direct_connections.close());
+        let _ = cleanup.call(|| self.transport.close());
+        for link in retired_links {
+            let _ = cleanup.call(|| link.sender.close());
+            cleanup.dispose(link);
+        }
+        cleanup.dispose(retired_uplink);
+        let _ = cleanup.call(|| self.admin_pending.close("system shutdown"));
+        let _ = cleanup.call(|| self.admin_pending_v2.close("system shutdown"));
+        let _ = cleanup.call(|| {
+            self.callbacks
+                .fail_all(crate::error::ErrCode::ConnectionLost, "system shutdown")
+        });
+        cleanup.dispose(retired_assemblies);
+        cleanup.dispose(retired_routes);
+        cleanup.dispose(retired_receptionist);
+        let _ = cleanup.call(|| self.close_done.send_replace(true));
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn shutdown_signal(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -1973,7 +2287,13 @@ impl RemoteActorSystem {
 
     /// Cancel owned work and wait for its futures and sockets to be released.
     pub async fn shutdown(&self) -> Result<(), RemoteError> {
+        crate::transport::notify_safely(self.shutdown_inner()).await
+    }
+
+    async fn shutdown_inner(&self) -> Result<(), RemoteError> {
         self.begin_close();
+        let mut closed = self.close_done.subscribe();
+        let _ = closed.wait_for(|done| *done).await;
         let _lifecycle = self.started.lock().await;
         // Tracker ownership survives cancellation of this shutdown caller.
         self.background.wait().await;
@@ -2093,7 +2413,7 @@ impl crate::ingress::SysEventHook for AdminHook {
         self.pending.fail_from(id, code, detail, source)
             || self.pending_v2.fail_from(id, code, detail, source)
     }
-    async fn on_event(&self, event: crate::admin::SysEvent, back: &FrameSender, _from: &str) {
+    async fn on_event(&self, event: crate::admin::SysEvent, back: &FrameSender, from: &str) {
         match event {
             crate::admin::SysEvent::AdminCommand(cmd) => {
                 if !crate::admin::admin_allowed(&self.control_policy, back) {
@@ -2197,10 +2517,29 @@ impl crate::ingress::SysEventHook for AdminHook {
             crate::admin::SysEvent::ReceptionistSync(body) => {
                 receptionist::receive(self.system.clone(), &body, back).await;
             }
+            crate::admin::SysEvent::ReceptionistSegment(body) => {
+                receptionist::receive_segment(self.system.clone(), &body, back, false).await;
+            }
+            crate::admin::SysEvent::ReceptionistRoutes(body) => {
+                receptionist::receive_routes(self.system.clone(), &body, back).await;
+            }
+            crate::admin::SysEvent::ReceptionistRoutesSegment(body) => {
+                receptionist::receive_segment(self.system.clone(), &body, back, true).await;
+            }
             // K1/S1：入站 gossip 两级语义（DEV_06 §2）
             crate::admin::SysEvent::MembershipGossip(body) => {
                 let Ok(g) = crate::swim::decode_gossip(&body) else {
-                    tracing::warn!("gossip decode failed (from {_from})");
+                    diagnostic(|| tracing::warn!("gossip decode failed (from {from})"));
+                    return;
+                };
+                if !crate::swim::authenticated_origin(&g, from) {
+                    diagnostic(|| {
+                        tracing::warn!(
+                            peer = from,
+                            declared = %g.seen_from,
+                            "gossip origin does not match authenticated peer"
+                        )
+                    });
                     return;
                 };
                 let need_full = {
@@ -2245,7 +2584,7 @@ impl crate::ingress::SysEventHook for AdminHook {
 
 impl RemoteGatewayImpl {
     pub fn lookup(&self, path: &str) -> Option<Box<dyn parrot_api::address::ActorRef>> {
-        if *self.0.shutdown_tx.borrow() {
+        if self.0.is_closing() {
             return None;
         }
         crate::actor_path::split(path)?;
@@ -2274,11 +2613,7 @@ impl crate::ingress::RelayRouter for SystemRelay {
         let sys = self.system.upgrade()?;
         // Registry critical sections contain no awaits. Contention must not
         // turn an existing route into a spurious RouteUnreachable error.
-        let g = sys.links.read().unwrap();
-        g.iter()
-            .rev()
-            .find(|(n, sender, _)| n == node && !sender.is_closed())
-            .map(|(_, s, _)| s.clone())
+        sys.direct_sender_of(node)
     }
 
     fn next_cid(&self) -> u64 {
@@ -2310,11 +2645,7 @@ impl crate::ingress::RelayRouter for SystemRelay {
             return;
         }
         // 已有该节点直连链路 → 无需动作（新地址不同时也重拨：先移除旧链）
-        let already = sys
-            .links
-            .read()
-            .map(|g| g.iter().any(|(n, _, _)| n == node))
-            .unwrap_or(false);
+        let already = sys.direct_sender_of(node).is_some();
         if already {
             return;
         }

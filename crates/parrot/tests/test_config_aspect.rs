@@ -7,6 +7,8 @@
 //! - golden vectors 与默认路径零扰动（回归保护）
 
 mod common;
+#[path = "support/network.rs"]
+mod network_support;
 use parrot::system::ParrotActorSystem;
 use parrot::thread::config::{ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
@@ -126,6 +128,9 @@ impl Drop for TmpToml {
 // ===========================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cfg1_file_driven_star_topology() {
+    if network_support::skip_tcp("config-driven TCP topology") {
+        return;
+    }
     // hub 配置文件：角色 hub + 自定义心跳/队列
     let hub_toml = TmpToml::new(
         r#"

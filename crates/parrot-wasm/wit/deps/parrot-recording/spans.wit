@@ -1,0 +1,16 @@
+package parrot:recording@0.1.0;
+
+interface spans {
+    use parrot:trace/context@0.1.0.{parent};
+    enum status { ok, error, cancelled, panicked }
+    enum recording-error { disabled, limit, invalid-target, unknown-handle, exhausted }
+    record started { handle: u64, parent: parent }
+
+    /// Optional parent handle must still be active in this invocation.
+    /// At most 256 spans may be admitted per message, including finished spans.
+    /// Target must contain 1..256 UTF-8 bytes. Handles are instance-local and
+    /// never reused, including after recovery. None chooses the message parent.
+    start: func(parent-handle: option<u64>, target: string) -> result<started, recording-error>;
+    /// Finishing twice or using a retired/unknown handle is an error.
+    finish: func(handle: u64, outcome: status) -> result<_, recording-error>;
+}

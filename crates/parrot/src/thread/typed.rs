@@ -50,9 +50,10 @@ impl Drop for TypedRegistration {
 
 pub(crate) struct TypedControl {
     tree: crate::typed_context::TypedTree,
-    escalated: Mutex<Option<Arc<ActorError>>>,
+    escalated: Mutex<Option<crate::error_receipt::ActorReceipt>>,
     escalation_changed: tokio::sync::Notify,
     explicit_stop: std::sync::atomic::AtomicBool,
+    stop_context: crate::stop_context::StopContext,
     channel: TypedChannelState,
     lifetime: Arc<crate::children::ChildLifetime>,
     deadline: Mutex<Option<tokio::time::Instant>>,
@@ -60,11 +61,42 @@ pub(crate) struct TypedControl {
     completion: StopCompletion,
     retirement: StopCompletion,
     timeout: Duration,
+    creation_timeout: Duration,
+    message_timeout: Duration,
+    creation_limit: Duration,
+    initialization_deadline: Mutex<Option<tokio::time::Instant>>,
     policy_slots: Arc<tokio::sync::Semaphore>,
     death_watch: parrot_api::death_watch::DeathWatch,
     pub(crate) legacy_watch: parrot_api::death_watch::DeathWatch,
 }
 impl TypedControl {
+    fn initialization_deadline(&self) -> Option<tokio::time::Instant> {
+        *self.initialization_deadline.lock().unwrap()
+    }
+    fn finish_initialization(&self) {
+        self.initialization_deadline.lock().unwrap().take();
+    }
+    #[cfg(test)]
+    pub(crate) fn escalation_hook(&self) -> crate::children::Escalate {
+        self.tree.escalation_hook()
+    }
+    #[cfg(test)]
+    pub(crate) fn check_escalation_locks(&self) {
+        drop(self.escalated.lock().unwrap());
+        drop(self.deadline.lock().unwrap());
+    }
+    #[cfg(test)]
+    pub(crate) fn pending_escalation_error(&self) -> Option<Arc<ActorError>> {
+        self.escalated
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|error| Arc::clone(error))
+    }
+    #[cfg(test)]
+    pub(crate) async fn escalation_deadline_waiter(&self) {
+        self.expired().await;
+    }
     async fn group_recovery(&self) -> Arc<crate::children::recovery::Recovery> {
         loop {
             let changed = self.escalation_changed.notified();
@@ -76,7 +108,7 @@ impl TypedControl {
             changed.await;
         }
     }
-    async fn escalation(&self) -> Arc<ActorError> {
+    async fn escalation(&self) -> crate::error_receipt::ActorReceipt {
         loop {
             let changed = self.escalation_changed.notified();
             tokio::pin!(changed);
@@ -112,11 +144,14 @@ impl TypedControl {
                         // Coordinate clearing the signal and its timer with the
                         // producer. A concurrent signal cannot rearm a stale timer.
                         let mut signal = self.escalated.lock().unwrap();
-                        if signal.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, &error))
-                            && self.construction_complete(deadline).unwrap_or(false) {
-                            signal.take();
-                            true
-                        } else { false }
+                        let completed = if signal.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, &error)) {
+                            self.construction_complete_quiet(deadline)
+                        } else { Ok(false) };
+                        let removed = if matches!(completed, Ok(true)) { signal.take() } else { None };
+                        drop(signal);
+                        self.deadline_changed.notify_waiters();
+                        if completed.is_err() { self.request_stop(deadline); }
+                        removed.is_some()
                     } else { false };
                     if !resumed { return Step::Escalated(error); }
                     // Resume the same pinned future: no replay, lost reply,
@@ -128,6 +163,7 @@ impl TypedControl {
     }
 
     pub(crate) fn request_stop(&self, deadline: tokio::time::Instant) {
+        self.stop_context.claim_current();
         self.explicit_stop
             .store(true, std::sync::atomic::Ordering::Release);
         self.begin_cleanup(deadline);
@@ -208,6 +244,9 @@ impl TypedControl {
     }
 }
 impl TypedActorLifecycle for TypedControl {
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.lifetime.retirement_status()
+    }
     fn death_watch(&self) -> Option<parrot_api::death_watch::DeathWatch> {
         Some(self.death_watch.clone())
     }
@@ -215,12 +254,12 @@ impl TypedActorLifecycle for TypedControl {
         &self.channel
     }
     fn stop(&self) -> BoxedFuture<'_, ActorResult<()>> {
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             self.request_stop(tokio::time::Instant::now() + self.timeout);
             await_stop(self.completion())
                 .await
                 .map_err(ActorError::from)
-        })
+        }))
     }
 }
 
@@ -326,7 +365,7 @@ struct TypedExit {
     result: Result<(), SystemError>,
     reason: DeathReason,
     cleanup_failed: bool,
-    failure: Option<Arc<ActorError>>,
+    failure: Option<crate::error_receipt::ActorReceipt>,
 }
 
 /// All user polls and destructors in this future execute in isolation. A stop
@@ -349,13 +388,14 @@ async fn run_typed_actor<A: ParrotTypedDispatch>(
     let mut execution = std::panic::AssertUnwindSafe(async {
         if control.channel.is_sealed() { return Ok(()); }
         use crate::typed_supervision::Step;
-        match control.wait_typed_stage(parrot_api::trace::scope(inputs.creation_context.take(), crate::typed_supervision::lifecycle_stage(|| actor.init_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed))), &runtime).await {
+        match control.wait_typed_stage(parrot_api::trace::scope(inputs.creation_context.take(), crate::typed_supervision::recorded_lifecycle_stage(parrot_api::trace::SpanKind::ActorInit, context.path(), || actor.init_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed).with_deadline(control.initialization_deadline()))), &runtime).await {
             Step::Stopped => return Ok(()),
             Step::Escalated(error) => { was_escalated=true;failure=Some(error.clone());return Err(escalation_error(&error)); },
             Step::Recovery(group) => { group.abort("non-repeatable parent cannot recover");return Err(SystemError::WorkerStateError("non-repeatable parent cannot recover".into())); },
-            Step::Ready(initialized) => initialized.map_err(|message| {failure=Some(Arc::new(ActorError::Panic(message.clone())));SystemError::Panic(message)})?.map_err(|error| {let error=Arc::new(error);let result=operation_error(&error,true);failure=Some(error);result})?,
+            Step::Ready(initialized) => initialized.result.map_err(|message| {failure=Some(crate::error_receipt::ActorReceipt::from_error(ActorError::Panic(message.clone())));SystemError::Panic(message)})?.map_err(|error| {let error=crate::error_receipt::ActorReceipt::from_error(error);let result=operation_error(&error,true);failure=Some(error);result})?,
         }
         let mut reductions = 0;
+        control.finish_initialization();
         loop {
             let message = match control.wait_typed_stage(receiver.recv_async(), &runtime).await {
                 Step::Stopped => break,
@@ -365,7 +405,7 @@ async fn run_typed_actor<A: ParrotTypedDispatch>(
                 Step::Ready(Err(_)) => break,
             };
             control.channel.notify_capacity();
-            match control.wait_typed_stage(crate::typed_supervision::dispatch(actor, message, &control.lifetime, &runtime, control.timeout, Some(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed)), &runtime).await {
+            match control.wait_typed_stage(crate::typed_supervision::dispatch(actor, message, &control.lifetime, &runtime, control.timeout, Some(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed).with_timeout(control.message_timeout)), &runtime).await {
                 Step::Stopped => break,
                 Step::Escalated(error) => {was_escalated=true;failure=Some(error.clone());return Err(escalation_error(&error));},
                 Step::Recovery(group) => {group.abort("non-repeatable parent cannot recover");return Err(SystemError::WorkerStateError("non-repeatable parent cannot recover".into()));},
@@ -397,7 +437,7 @@ async fn run_typed_actor<A: ParrotTypedDispatch>(
         tokio::select! {
             biased;
             _ = control.expired() => Err(SystemError::Timeout("typed stop hook exceeded configured deadline".into())),
-            result = crate::typed_supervision::lifecycle_stage(|| actor.before_stop_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed)) => result.map_err(SystemError::Panic).and_then(|result| result.map_err(|error| SystemError::Other(anyhow::Error::new(error)))),
+            result = parrot_api::trace::scope(control.stop_context.take(), crate::typed_supervision::recorded_lifecycle_stage(parrot_api::trace::SpanKind::ActorBeforeStop, context.path(), || actor.before_stop_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed))) => result.result.map_err(SystemError::Panic).and_then(|result| result.map_err(|error| SystemError::Other(anyhow::Error::new(error)))),
         }
     }).catch_unwind().await.map_err(typed_panic);
     let children = control
@@ -427,7 +467,9 @@ async fn run_typed_actor<A: ParrotTypedDispatch>(
         }
         Err(message) => {
             if failure.is_none() && !cleanup_failed {
-                failure = Some(Arc::new(ActorError::Panic(message.clone())));
+                failure = Some(crate::error_receipt::ActorReceipt::from_error(
+                    ActorError::Panic(message.clone()),
+                ));
             }
             (
                 Err(SystemError::Panic(message.clone())),
@@ -492,6 +534,71 @@ impl ThreadActorSystem {
         self.spawn_typed_source(Some(actor), None, path, strategy)
     }
 
+    /// Admit a static instance into a root group. A OneForAll Restart stops
+    /// the entire selected group if any member has no repeatable factory.
+    pub fn spawn_typed_in_cohort<'a, A, M>(
+        self: &'a Arc<Self>,
+        actor: A,
+        path: &'a str,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> impl std::future::Future<Output = ActorResult<TypedActorRef<A, M>>> + Send + 'a
+    where
+        A: ParrotTypedDispatch,
+        M: ParrotMsgVariant<A>,
+    {
+        let payload = crate::owned_payload::OwnedPayload::new(
+            actor,
+            self.retirement_runtime(),
+            &self.cleanup_slots,
+        );
+        let policy = crate::owned_payload::OwnedPayload::new(
+            None,
+            self.retirement_runtime(),
+            &self.cleanup_slots,
+        );
+        parrot_api::trace::capture(self.spawn_typed_owned_source(
+            Some(payload),
+            None,
+            path,
+            policy,
+            None,
+            Some(cohort),
+        ))
+    }
+
+    /// Admit a repeatable static root into the group's shared recovery barriers.
+    pub fn spawn_typed_factory_in_cohort<'a, A, M, F>(
+        self: &'a Arc<Self>,
+        factory: F,
+        path: &'a str,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> impl std::future::Future<Output = ActorResult<TypedActorRef<A, M>>> + Send + 'a
+    where
+        A: ParrotTypedDispatch,
+        M: ParrotMsgVariant<A>,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        let factory = factory::OwnedFactory::new(
+            factory,
+            self.factory_slots.clone(),
+            self.cleanup_slots.clone(),
+            self.retirement_runtime().clone(),
+        );
+        let policy = crate::owned_payload::OwnedPayload::new(
+            None,
+            self.retirement_runtime(),
+            &self.cleanup_slots,
+        );
+        parrot_api::trace::capture(self.spawn_typed_owned_source(
+            None,
+            Some(factory),
+            path,
+            policy,
+            None,
+            Some(cohort),
+        ))
+    }
+
     fn spawn_typed_source<'a, A, M>(
         self: &'a Arc<Self>,
         actor: Option<A>,
@@ -506,17 +613,17 @@ impl ThreadActorSystem {
         let payload = actor.map(|actor| {
             crate::owned_payload::OwnedPayload::new(
                 actor,
-                &self.runtime_handle,
+                self.retirement_runtime(),
                 &self.cleanup_slots,
             )
         });
         let policy = crate::owned_payload::OwnedPayload::new(
             Some(strategy),
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         parrot_api::trace::capture(
-            self.spawn_typed_owned_source(payload, factory, path, policy, None),
+            self.spawn_typed_owned_source(payload, factory, path, policy, None, None),
         )
     }
 
@@ -538,9 +645,9 @@ impl ThreadActorSystem {
             factory.take(),
             self.factory_slots.clone(),
             self.cleanup_slots.clone(),
-            self.runtime_handle.clone(),
+            self.retirement_runtime().clone(),
         );
-        self.spawn_typed_owned_source(None, Some(factory), path, policy, Some(parent))
+        self.spawn_typed_owned_source(None, Some(factory), path, policy, Some(parent), None)
             .await
     }
 
@@ -557,7 +664,7 @@ impl ThreadActorSystem {
         A: ParrotTypedDispatch,
         M: ParrotMsgVariant<A>,
     {
-        self.spawn_typed_owned_source(Some(actor), None, path, policy, Some(parent))
+        self.spawn_typed_owned_source(Some(actor), None, path, policy, Some(parent), None)
             .await
     }
 
@@ -570,12 +677,29 @@ impl ThreadActorSystem {
             Option<parrot_api::supervisor::SupervisorStrategyType>,
         >,
         parent: Option<&crate::typed_context::ManagedContext>,
+        cohort: Option<&crate::root_cohort::RootCohort>,
     ) -> ActorResult<TypedActorRef<A, M>>
     where
         A: ParrotTypedDispatch,
         M: ParrotMsgVariant<A>,
     {
         let creation_context = parrot_api::trace::TraceContext::current();
+        let cohort = cohort.or_else(|| {
+            parent
+                .is_none()
+                .then(|| self.root_cohorts.guardian())
+                .flatten()
+        });
+        let policy = if cohort.is_some() {
+            policy.retire().await?;
+            crate::owned_payload::OwnedPayload::new(
+                None,
+                self.retirement_runtime(),
+                &self.cleanup_slots,
+            )
+        } else {
+            policy
+        };
         let mut payload = payload;
         let mut factory = factory;
         let mut policy = Some(policy);
@@ -598,14 +722,19 @@ impl ThreadActorSystem {
                         }
                     }),
                     escalate: Arc::new(move |error| {
+                        let error = crate::error_receipt::ActorReceipt::new(error);
                         if let Some(control) = escalated.upgrade()
                             && !control.channel.is_sealed()
                         {
                             let mut signal = control.escalated.lock().unwrap();
-                            signal.get_or_insert(error);
-                            control
-                                .begin_construction(tokio::time::Instant::now() + control.timeout);
+                            if signal.is_none() {
+                                *signal = Some(error.clone());
+                            }
+                            control.begin_construction_quiet(
+                                tokio::time::Instant::now() + control.timeout,
+                            );
                             drop(signal);
+                            control.deadline_changed.notify_waiters();
                             control.escalation_changed.notify_waiters();
                         }
                     }),
@@ -623,6 +752,7 @@ impl ThreadActorSystem {
                     escalated: Mutex::new(None),
                     escalation_changed: tokio::sync::Notify::new(),
                     explicit_stop: std::sync::atomic::AtomicBool::new(false),
+                    stop_context: Default::default(),
                     channel: TypedChannelState::default(),
                     lifetime: lifetime.unwrap_or_else(|| {
                         crate::children::ChildLifetime::with_policy(
@@ -636,6 +766,14 @@ impl ThreadActorSystem {
                     completion,
                     retirement,
                     timeout: self.config().shutdown_timeout,
+                    creation_timeout: self.creation_timeout(),
+                    message_timeout: self.operation_timeouts.message_handling,
+                    creation_limit: self.operation_timeouts.actor_creation,
+                    initialization_deadline: Mutex::new(
+                        (!self.operation_timeouts.actor_creation.is_zero()).then(|| {
+                            tokio::time::Instant::now() + self.operation_timeouts.actor_creation
+                        }),
+                    ),
                     policy_slots: self.cleanup_slots.clone(),
                     death_watch: parrot_api::death_watch::DeathWatch::new(1024),
                     legacy_watch: parrot_api::death_watch::DeathWatch::new(1024),
@@ -648,7 +786,8 @@ impl ThreadActorSystem {
                         if control.channel.is_sealed() {
                             group.abort("static factory member is stopping");
                         }
-                        control.begin_construction(group.deadline);
+                        control.begin_construction_quiet(group.deadline);
+                        control.deadline_changed.notify_waiters();
                         control.escalation_changed.notify_waiters();
                     } else {
                         group.abort("static factory member owner disappeared");
@@ -709,13 +848,14 @@ impl ThreadActorSystem {
                         control: control.clone(),
                         retired: Some(input_retired),
                     },
-                    &self.runtime_handle,
+                    self.retirement_runtime(),
                     &self.cleanup_slots,
                 );
                 let unpublished_inputs = inputs.receipt();
-                self.runtime_handle.spawn(async move {
+                let execution_runtime = self.runtime_handle.clone();
+                self.retirement_runtime().spawn(async move {
                 let task_control = control.clone();
-                let execution = tokio::spawn(async move {
+                let execution = execution_runtime.spawn(async move {
                     let permit = slots.clone().acquire_owned().await?;
                     crate::thread::scheduler::shared::poll_isolated(
                         async move {
@@ -748,7 +888,7 @@ impl ThreadActorSystem {
                             input_retirement.changed().await.map_err(|_| SystemError::ShutdownError("typed input owner exited without retirement receipt".into()))?;
                         }
                     }.await;
-                    let factory = match factory { Some(factory) => factory.retire().await, None => Ok(()) };
+                    let factory = match factory { Some(factory) => factory.retire_in_lifecycle().await, None => Ok(()) };
                     let children = control.tree.join().await;
                     let failure = failure.or_else(|| control.escalated.lock().unwrap().take());
                     let mut supervised=Ok(());
@@ -813,29 +953,36 @@ impl ThreadActorSystem {
             }
             Ok(actor_ref)
         };
-        let admission = if let Some(parent) = parent {
-            let mut reference = None;
-            let result = parent.scope.spawn(|lifetime| {
-                let actor = admit(Some(lifetime.clone()))?;
-                let erased = actor.clone().into_dyn();
-                let stop = erased.clone_boxed();
-                reference = Some(actor);
-                Ok((
-                    erased,
-                    Arc::new(move || {
-                        let actor = stop.clone_boxed();
-                        let lifetime = lifetime.clone();
-                        Box::pin(async move {
-                            let _ = actor.stop().await;
-                            lifetime.wait().await
-                        })
-                    }),
-                ))
+        let admission = cohort
+            .map_or(Ok(()), |cohort| cohort.validate(&self.root_cohorts))
+            .and_then(|()| {
+                if let Some(scope) = parent
+                    .map(|parent| &parent.scope)
+                    .or_else(|| cohort.map(|cohort| &cohort.scope))
+                {
+                    let mut reference = None;
+                    let result = scope.spawn(|lifetime| {
+                        let actor = admit(Some(lifetime.clone()))?;
+                        let erased = actor.clone().into_dyn();
+                        let stop = erased.clone_boxed();
+                        reference = Some(actor);
+                        Ok((
+                            erased,
+                            Arc::new(move || {
+                                let actor = stop.clone_boxed();
+                                let lifetime = lifetime.clone();
+                                Box::pin(async move {
+                                    let _ = actor.stop().await;
+                                    lifetime.wait().await
+                                })
+                            }),
+                        ))
+                    });
+                    result.map(|_| reference.expect("admitted typed child"))
+                } else {
+                    admit(None)
+                }
             });
-            result.map(|_| reference.expect("admitted typed child"))
-        } else {
-            admit(None)
-        };
         match admission {
             Ok(reference) => Ok(reference),
             Err(error) => {

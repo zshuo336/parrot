@@ -20,6 +20,11 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+#[cfg(test)]
+mod diagnostic_contracts;
+#[cfg(test)]
+mod pending_contracts;
+
 pub const RAFT_KEY: &str = "parrot:directory:raft#v1";
 pub const RAFT_ACK_KEY: &str = "parrot:directory:raft-accepted#v1";
 pub const RAFT_PATH: &str = "/_directory/raft/v1";
@@ -108,7 +113,9 @@ fn decode(bytes: &[u8], group: &str, peer: &str) -> Result<RaftRpc> {
     }
     let claimed = match &wire.rpc {
         RaftRpc::RequestVote { candidate, .. } => Some(candidate),
-        RaftRpc::AppendEntries { leader, .. } => Some(leader),
+        RaftRpc::AppendEntries { leader, .. }
+        | RaftRpc::ReadIndex { leader, .. }
+        | RaftRpc::InstallSnapshot { leader, .. } => Some(leader),
         _ => None,
     };
     if claimed.is_some_and(|id| id != peer) {
@@ -152,6 +159,11 @@ enum Request {
         Bytes,
         oneshot::Sender<Result<super::DirectoryRequestStatus>>,
     ),
+    Ownership(
+        String,
+        Bytes,
+        oneshot::Sender<Result<super::ownership::OwnershipStatus>>,
+    ),
     Propose(Vec<u8>, oneshot::Sender<Result<DurableDirectoryProposal>>),
     Receive(String, Bytes, oneshot::Sender<Result<()>>),
     Query(DirQuery, oneshot::Sender<Result<Option<DirEntry>>>),
@@ -159,6 +171,7 @@ enum Request {
         DurableDirectoryProposal,
         oneshot::Sender<Result<DurableDirectoryStatus>>,
     ),
+    Compact(oneshot::Sender<Result<u64>>),
 }
 struct Command {
     request: Request,
@@ -187,6 +200,12 @@ pub struct DirectoryHandle {
     pid: u32,
 }
 impl DirectoryHandle {
+    /// Schedule a durable application checkpoint on the group's disk owner.
+    pub async fn compact(&self) -> Result<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.submit(Request::Compact(tx), 1)?;
+        self.response(rx).await
+    }
     /// Admitted linear reads, including queued commands and pending quorum waits.
     /// Released after completion, cancellation cleanup or owner shutdown.
     pub fn pending_linear_reads(&self) -> usize {
@@ -195,8 +214,8 @@ impl DirectoryHandle {
     pub(crate) fn group(&self) -> &str {
         &self.group
     }
-    /// A fresh log barrier per invocation. The deadline covers admission and
-    /// quorum wait; timeout/cancellation can leave a harmless committed barrier.
+    /// A fresh ReadIndex confirmation per invocation. The deadline covers
+    /// admission and quorum wait; term initialization may append one barrier.
     pub async fn query_linearizable(
         &self,
         query: &DirQuery,
@@ -230,6 +249,17 @@ impl DirectoryHandle {
         let size = payload.len() + client.len();
         let (tx, rx) = oneshot::channel();
         self.submit(Request::Client(client.into(), payload, tx), size)?;
+        self.response(rx).await
+    }
+    pub(crate) async fn ownership_request(
+        &self,
+        client: &str,
+        payload: Bytes,
+    ) -> Result<super::ownership::OwnershipStatus> {
+        self.check()?;
+        let size = payload.len() + client.len();
+        let (tx, rx) = oneshot::channel();
+        self.submit(Request::Ownership(client.into(), payload, tx), size)?;
         self.response(rx).await
     }
     fn check(&self) -> Result<()> {
@@ -694,6 +724,21 @@ fn apply(
                 let _ = reply.send(result);
             }
         }
+        Request::Ownership(client, bytes, reply) => {
+            if !reply.is_closed() {
+                let result = super::ownership::wire_decode(&bytes, group).and_then(|operation| {
+                    match operation {
+                        super::ownership::Operation::Submit { id, command } => owner
+                            .submit_ownership(&client, &id, &command)
+                            .map_err(durable_error),
+                        super::ownership::Operation::Status { id, digest } => owner
+                            .ownership_status(&client, &id, digest)
+                            .map_err(durable_error),
+                    }
+                });
+                let _ = reply.send(result);
+            }
+        }
         Request::Propose(bytes, reply) => {
             if !reply.is_closed() {
                 let result = DirCmd::decode(&bytes)
@@ -714,6 +759,11 @@ fn apply(
         }
         Request::Status(receipt, reply) => {
             let _ = reply.send(owner.proposal_status(&receipt).map_err(operation));
+        }
+        Request::Compact(reply) => {
+            if !reply.is_closed() {
+                let _ = reply.send(owner.compact().map_err(durable_error));
+            }
         }
     }
 }
@@ -770,9 +820,7 @@ async fn pump(
                         return Err(NetworkDirectoryError::Forbidden);
                     }
                     let cid = system.callbacks.next_cid();
-                    let (tx, reply) = oneshot::channel();
-                    system.callbacks.insert_on(cid, node_id.clone(), tx, &sender).map_err(operation)?;
-                    let _pending = system.callbacks.guard(cid);
+                    let (reply, _pending) = system.callbacks.register_on(cid, node_id.clone(), &sender).map_err(operation)?;
                     sender.send(Frame::ask(cid, &format!("parrot://{}{RAFT_PATH}", node_id), RAFT_KEY, payload, None)).await.map_err(operation)?;
                     let response = tokio::select! {
                         biased;
@@ -789,7 +837,7 @@ async fn pump(
                     _ = stop.cancelled() => break,
                     result = tokio::time::timeout(attempt_timeout, attempt) => {
                         if !matches!(result, Ok(Ok(()))) {
-                            tracing::debug!(peer = %node_id, ?result, "Directory Raft delivery failed; protocol will retry");
+                            crate::system::diagnostic(|| tracing::debug!(peer = %node_id, ?result, "Directory Raft delivery failed; protocol will retry"));
                         }
                     },
                 }

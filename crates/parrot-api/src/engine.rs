@@ -41,10 +41,12 @@ pub use local_runtime::{
     AsyncLocalActorSpawner, AsyncLocalRuntime, LocalActor, LocalRuntimeActor, LocalRuntimeFactory,
 };
 mod async_runtime;
+mod root_cohort;
 pub use async_runtime::{
     AsyncActorSpawner, AsyncEngineRuntime, AsyncFactoryRuntime, FactoryOptions, InstanceConfig,
     RuntimeActor, RuntimeFactory, SpawnOptions,
 };
+pub use root_cohort::{AsyncCohortRuntime, AsyncLocalRootCohort, AsyncRootCohort};
 mod async_catalog;
 pub use async_catalog::{AsyncEngineCatalog, AsyncEngineRegistration};
 

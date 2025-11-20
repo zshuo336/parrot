@@ -6,7 +6,7 @@ use crate::{
         ThreadPropsSpawner,
     },
     manifest::AppManifest,
-    planner::{plan, LocalTopology},
+    planner::{plan, LocalNodeTopology},
 };
 use parrot::thread::{config::ThreadActorSystemConfig, system::ThreadActorSystem};
 use parrot_remote::{RemoteActorSystem, RemoteConfig};
@@ -15,6 +15,19 @@ use std::{
     sync::Arc,
 };
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+fn next_path(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    flag: &str,
+) -> Result<PathBuf, Error> {
+    let path = args
+        .next()
+        .ok_or_else(|| format!("{flag} requires a path"))?;
+    if path.is_empty() {
+        return Err(format!("{flag} path must not be empty").into());
+    }
+    Ok(path.into())
+}
 
 /// Run the shared application command line in an active Tokio runtime.
 /// Applications with inventory-registered Props/codecs can call this same entry
@@ -26,7 +39,7 @@ pub async fn execute(arguments: impl IntoIterator<Item = std::ffi::OsString>) ->
             Some("trace") => return trace_query::execute(args).await,
             Some("run") => false,
             Some("replay") => true,
-            _ => return Err("usage: parrot-app run --manifest <path> [--bind <ip:port>] [--record <new-path>] [--trace-otlp <https-url>] [--trace-allow-http] [--trace-capacity <1..=65536>] [--trace-socket <private-dir/socket>] [--gateway-process-limit <positive-integer>] [--wasm-epoch-ticks <1..=4294967295>] [--trust-native-sha256 <hex64>]...; or parrot-app trace <app> --socket <path> [--follow [--interval-ms <100..=60000>]] (Unix only); or parrot-app replay --manifest <path> --input <complete-capture> --report <new-path> [--direction rx|tx] [--tell-mode completion|admission] [--target-node <original-node>] [--call-timeout-ms <1..=86400000>] [--allow-legacy-log] (host options also apply; native trust executes code and dependencies in this process)".into()),
+            _ => return Err("usage: parrot-app run --manifest <path> [--bind <ip:port>] [--record <new-path>] [--trace-otlp <https-url>] [--trace-allow-http] [--trace-capacity <1..=65536>] [--trace-socket <private-dir/socket>] [--gateway-process-limit <positive-integer>] [--wasm-epoch-ticks <1..=4294967295>] [--wasm-messaging-policy <operator-toml>] [--wasm-service-policy <operator-toml>] [--native-messaging-policy <operator-toml>] [--native-service-policy <operator-toml>] [--trust-native-sha256 <hex64>]...; or parrot-app trace <app> --socket <path> [--follow [--interval-ms <100..=60000>]] (Unix only); or parrot-app replay --manifest <path> --input <complete-capture> --report <new-path> [--direction rx|tx] [--tell-mode completion|admission] [--target-node <original-node>] [--call-timeout-ms <1..=86400000>] [--allow-legacy-log] (host options also apply; native trust executes code and dependencies in this process)".into()),
         };
     let mut input = None;
     let mut report = None;
@@ -39,7 +52,11 @@ pub async fn execute(arguments: impl IntoIterator<Item = std::ffi::OsString>) ->
     let mut bind = None;
     let mut record = None;
     let mut wasm_epoch_ticks = None;
+    let mut wasm_policy_path = None;
+    let mut wasm_service_policy_path = None;
     let mut trusted_native = Vec::new();
+    let mut native_policy_path = None;
+    let mut native_service_policy_path = None;
     let mut gateway_process_limit = None;
     let mut trace_endpoint = None;
     let mut trace_allow_http = false;
@@ -47,13 +64,35 @@ pub async fn execute(arguments: impl IntoIterator<Item = std::ffi::OsString>) ->
     let mut trace_socket = None;
     while let Some(argument) = args.next() {
         match argument.to_str() {
+            Some("--native-service-policy") if native_service_policy_path.is_none() => {
+                if !cfg!(feature = "dylib") {
+                    return Err("--native-service-policy requires the dylib feature".into());
+                }
+                native_service_policy_path = Some(next_path(&mut args, "--native-service-policy")?);
+            }
+            Some("--native-messaging-policy") if native_policy_path.is_none() => {
+                if !cfg!(feature = "dylib") {
+                    return Err("--native-messaging-policy requires the dylib feature".into());
+                }
+                native_policy_path = Some(next_path(&mut args, "--native-messaging-policy")?);
+            }
+            Some("--wasm-service-policy") if wasm_service_policy_path.is_none() => {
+                if !cfg!(feature = "wasm") {
+                    return Err("--wasm-service-policy requires the wasm feature".into());
+                }
+                wasm_service_policy_path = Some(next_path(&mut args, "--wasm-service-policy")?);
+            }
+            Some("--wasm-messaging-policy") if wasm_policy_path.is_none() => {
+                if !cfg!(feature = "wasm") {
+                    return Err("--wasm-messaging-policy requires the wasm feature".into());
+                }
+                wasm_policy_path = Some(next_path(&mut args, "--wasm-messaging-policy")?);
+            }
             Some("--trace-socket") if !replay_mode && trace_socket.is_none() => {
                 if !cfg!(unix) {
                     return Err("--trace-socket requires Unix".into());
                 }
-                trace_socket = Some(PathBuf::from(
-                    args.next().ok_or("--trace-socket requires a path")?,
-                ));
+                trace_socket = Some(next_path(&mut args, "--trace-socket")?);
             }
             Some("--trace-otlp") if !replay_mode && trace_endpoint.is_none() => {
                 trace_endpoint = Some(
@@ -79,12 +118,10 @@ pub async fn execute(arguments: impl IntoIterator<Item = std::ffi::OsString>) ->
                 trace_allow_http = true;
             }
             Some("--input") if replay_mode && input.is_none() => {
-                input = Some(PathBuf::from(args.next().ok_or("--input requires a path")?));
+                input = Some(next_path(&mut args, "--input")?);
             }
             Some("--report") if replay_mode && report.is_none() => {
-                report = Some(PathBuf::from(
-                    args.next().ok_or("--report requires a new path")?,
-                ));
+                report = Some(next_path(&mut args, "--report")?);
             }
             Some("--direction") if replay_mode && direction.is_none() => {
                 direction = Some(
@@ -135,14 +172,10 @@ pub async fn execute(arguments: impl IntoIterator<Item = std::ffi::OsString>) ->
                 allow_legacy = true;
             }
             Some("--manifest") if manifest.is_none() => {
-                manifest = Some(PathBuf::from(
-                    args.next().ok_or("--manifest requires a path")?,
-                ));
+                manifest = Some(next_path(&mut args, "--manifest")?);
             }
             Some("--record") if record.is_none() && !replay_mode => {
-                record = Some(PathBuf::from(
-                    args.next().ok_or("--record requires a path")?,
-                ));
+                record = Some(next_path(&mut args, "--record")?);
             }
             Some("--bind") if bind.is_none() => {
                 bind = Some(
@@ -202,13 +235,42 @@ pub async fn execute(arguments: impl IntoIterator<Item = std::ffi::OsString>) ->
             }
         }
     }
-    if (trace_allow_http || trace_capacity.is_some() || trace_socket.is_some())
-        && trace_endpoint.is_none()
-    {
-        return Err("trace options require --trace-otlp".into());
-    }
     let manifest = manifest.ok_or("--manifest is required")?;
-    let replay = if replay_mode {
+    // Reject incomplete commands and invalid budgets before policy/capture I/O
+    // or reserving the replay report. Effective manifest failures are reported
+    // later through the ordinary replay teardown/report path.
+    let replay_paths = if replay_mode {
+        Some((
+            input.ok_or("--input is required")?,
+            report.ok_or("--report is required")?,
+        ))
+    } else {
+        None
+    };
+    let budget = Arc::new(GatewayProcessBudget::new(
+        gateway_process_limit.unwrap_or(GatewayProcessBudget::DEFAULT_MAX_GROUPS),
+    )?);
+    #[cfg(feature = "dylib")]
+    let native_messaging = match native_policy_path {
+        Some(path) => Some(crate::host::dylib::NativeMessagingPolicy::load_file(path).await?),
+        None => None,
+    };
+    #[cfg(feature = "dylib")]
+    let native_services = match native_service_policy_path {
+        Some(path) => Some(crate::host::dylib::NativeServicePolicy::load_file(path).await?),
+        None => None,
+    };
+    #[cfg(feature = "wasm")]
+    let wasm_messaging = match wasm_policy_path {
+        Some(path) => Some(crate::host::wasm::WasmMessagingPolicy::load_file(path).await?),
+        None => None,
+    };
+    #[cfg(feature = "wasm")]
+    let wasm_services = match wasm_service_policy_path {
+        Some(path) => Some(crate::host::wasm::WasmServicePolicy::load_file(path).await?),
+        None => None,
+    };
+    let replay = if let Some((input, report)) = replay_paths {
         let mut options = crate::debug::ReplayOptions {
             direction: direction.unwrap_or_default(),
             tell_mode: tell_mode.unwrap_or(crate::debug::ReplayTellMode::Completion),
@@ -218,15 +280,7 @@ pub async fn execute(arguments: impl IntoIterator<Item = std::ffi::OsString>) ->
         if let Some(timeout) = call_timeout {
             options.call_timeout = timeout;
         }
-        Some(
-            replay_command::ReplayCommand::prepare(
-                input.ok_or("--input is required")?,
-                report.ok_or("--report is required")?,
-                options,
-                allow_legacy,
-            )
-            .await?,
-        )
+        Some(replay_command::ReplayCommand::prepare(input, report, options, allow_legacy).await?)
     } else {
         None
     };
@@ -241,9 +295,19 @@ pub async fn execute(arguments: impl IntoIterator<Item = std::ffi::OsString>) ->
             capacity: trace_capacity,
             socket: trace_socket.as_deref(),
         },
-        wasm_epoch_ticks,
-        &trusted_native,
-        gateway_process_limit.unwrap_or(GatewayProcessBudget::DEFAULT_MAX_GROUPS),
+        RunHost {
+            wasm_epoch_ticks,
+            trusted_native: &trusted_native,
+            #[cfg(feature = "dylib")]
+            native_messaging,
+            #[cfg(feature = "dylib")]
+            native_services,
+            budget,
+            #[cfg(feature = "wasm")]
+            wasm_messaging,
+            #[cfg(feature = "wasm")]
+            wasm_services,
+        },
         replay_command::Execution {
             command: replay.as_ref(),
             result: &mut replay_result,
@@ -268,15 +332,40 @@ struct RunTracing<'a> {
     socket: Option<&'a Path>,
 }
 
+struct RunHost<'a> {
+    wasm_epoch_ticks: Option<u64>,
+    trusted_native: &'a [String],
+    #[cfg(feature = "dylib")]
+    native_messaging: Option<crate::host::dylib::NativeMessagingPolicy>,
+    #[cfg(feature = "dylib")]
+    native_services: Option<crate::host::dylib::NativeServicePolicy>,
+    budget: Arc<GatewayProcessBudget>,
+    #[cfg(feature = "wasm")]
+    wasm_messaging: Option<crate::host::wasm::WasmMessagingPolicy>,
+    #[cfg(feature = "wasm")]
+    wasm_services: Option<crate::host::wasm::WasmServicePolicy>,
+}
+
 async fn cmd_run(
     path: &Path,
     bind: Option<&str>,
     tracing: RunTracing<'_>,
-    wasm_epoch_ticks: Option<u64>,
-    trusted_native: &[String],
-    gateway_process_limit: usize,
+    host: RunHost<'_>,
     replay: replay_command::Execution<'_>,
 ) -> Result<(), Error> {
+    let RunHost {
+        wasm_epoch_ticks,
+        trusted_native,
+        #[cfg(feature = "dylib")]
+        native_messaging,
+        #[cfg(feature = "dylib")]
+        native_services,
+        budget,
+        #[cfg(feature = "wasm")]
+        wasm_messaging,
+        #[cfg(feature = "wasm")]
+        wasm_services,
+    } = host;
     let replay_command::Execution {
         command: replay,
         result: replay_result,
@@ -285,27 +374,21 @@ async fn cmd_run(
     let _ = wasm_epoch_ticks;
     #[cfg(not(feature = "dylib"))]
     let _ = trusted_native;
-    let budget = Arc::new(GatewayProcessBudget::new(gateway_process_limit)?);
     let manifest = AppManifest::from_file(path)?;
-    let plan = plan(&manifest, &LocalTopology)?;
-    // Reject invalid collector configuration before owning actors, sockets or files.
-    let trace_config = tracing
-        .endpoint
-        .map(|endpoint| {
-            let mut config = crate::debug::TraceExportConfig::new(endpoint, &manifest.name);
-            config.allow_insecure_http = tracing.allow_http;
-            if let Some(capacity) = tracing.capacity {
-                config.capacity = capacity;
-            }
-            config.validate()?;
-            Ok::<_, crate::debug::TraceExportStartError>(config)
-        })
-        .transpose()?;
-    #[cfg(unix)]
-    if let Some(path) = tracing.socket {
-        trace_query::validate_path(path)?;
-    }
     let mut base = parrot_config::ParrotConfig::builder().load_default_locations()?;
+    if let Some(endpoint) = tracing.endpoint {
+        base.tracing.otlp_endpoint = Some(endpoint.into());
+        base.tracing.enabled = Some(true);
+    }
+    if tracing.allow_http {
+        base.tracing.allow_insecure_http = Some(true);
+    }
+    if let Some(capacity) = tracing.capacity {
+        base.tracing.capacity = Some(capacity);
+    }
+    if let Some(socket) = tracing.socket {
+        base.tracing.socket = Some(socket.to_owned());
+    }
     if let Some(bind) = bind {
         base.remote.node.bind = Some(bind.into());
     }
@@ -316,6 +399,16 @@ async fn cmd_run(
     );
     // Application overlay is the highest priority, including explicit --bind (Y3).
     let resolved = effective_config(&manifest, &base)?;
+    let topology = LocalNodeTopology::from_resolved(&resolved);
+    let plan = plan(&manifest, &topology)?;
+    // Validate effective tracing before owning actors, sockets or files. Replay
+    // keeps its original execution policy even when the manifest enables tracing.
+    let trace_config = if replay.is_none() {
+        trace_session::configuration(&resolved.tracing, &manifest.name)?
+    } else {
+        None
+    };
+    let trace_socket = resolved.tracing.socket.as_deref();
     let mut remote_config =
         RemoteConfig::from_resolved_async(&resolved, std::time::Duration::from_secs(5)).await?;
     #[cfg(unix)]
@@ -370,6 +463,26 @@ async fn cmd_run(
         ProcessGatewayFactory::new_with_routes_and_budget(root, remote.clone(), routes, budget);
     let spawner = ThreadPropsSpawner::with_remote(thread.clone(), remote.clone());
     #[cfg(feature = "dylib")]
+    let spawner = match native_messaging {
+        Some(policy) => spawner.with_dylib_messaging(policy.grants().to_vec())?,
+        None => spawner,
+    };
+    #[cfg(feature = "dylib")]
+    let spawner = match native_services {
+        Some(policy) => spawner.with_dylib_services(policy.grants().to_vec())?,
+        None => spawner,
+    };
+    #[cfg(feature = "wasm")]
+    let spawner = match wasm_messaging {
+        Some(policy) => spawner.with_wasm_messaging(policy.grants().to_vec())?,
+        None => spawner,
+    };
+    #[cfg(feature = "wasm")]
+    let spawner = match wasm_services {
+        Some(policy) => spawner.with_wasm_services(policy.grants().to_vec())?,
+        None => spawner,
+    };
+    #[cfg(feature = "dylib")]
     let spawner = {
         let mut spawner = spawner;
         for digest in trusted_native {
@@ -393,7 +506,7 @@ async fn cmd_run(
         spawner
     };
     let deployer = LocalDeployer {
-        topology: &LocalTopology,
+        topology: &topology,
         gateway_factory: &gateway,
         parrot_spawner: &spawner,
     };
@@ -415,7 +528,7 @@ async fn cmd_run(
         } => if replay.is_some() { signal.and_then(|()| Err("replay interrupted; execution may already have occurred".into())) } else { signal },
         result = async {
             if let Some(config) = trace_config {
-                trace_session = Some(trace_session::Session::start(config, &remote, tracing.socket).await?);
+                trace_session = Some(trace_session::Session::start(config, &remote, trace_socket).await?);
             }
             tokio::select! {
                 error = async {

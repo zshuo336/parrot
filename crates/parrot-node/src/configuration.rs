@@ -5,6 +5,73 @@ use std::{ffi::OsString, path::PathBuf};
 /// Bound for native trust metadata; parsing this list does not authorize code.
 pub const MAX_NATIVE_TRUST_DIGESTS: usize = 256;
 
+/// Select discovery authority separately from execution and messaging authority.
+pub fn native_service_policy_request(
+    value: Option<OsString>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    value
+        .map(|path| {
+            let variable = "PARROT_NATIVE_SERVICE_POLICY";
+            if !cfg!(feature = "dylib") {
+                return Err(invalid(variable, "requires the dylib feature"));
+            }
+            if path.is_empty() {
+                return Err(invalid(variable, "path must not be empty"));
+            }
+            Ok(PathBuf::from(path))
+        })
+        .transpose()
+}
+
+/// Select messaging authority separately from execution trust and Admin input.
+pub fn native_messaging_policy_request(
+    value: Option<OsString>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    value
+        .map(|path| {
+            let variable = "PARROT_NATIVE_MESSAGING_POLICY";
+            if !cfg!(feature = "dylib") {
+                return Err(invalid(variable, "requires the dylib feature"));
+            }
+            if path.is_empty() {
+                return Err(invalid(variable, "path must not be empty"));
+            }
+            Ok(PathBuf::from(path))
+        })
+        .transpose()
+}
+
+/// Select an executable-owned authority file, outside NodeSettings and Admin.
+pub fn wasm_messaging_policy_request(
+    value: Option<OsString>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    wasm_policy_request(value, "PARROT_WASM_MESSAGING_POLICY")
+}
+
+/// Select discovery authority outside ordinary config and remote Admin input.
+pub fn wasm_service_policy_request(
+    value: Option<OsString>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    wasm_policy_request(value, "PARROT_WASM_SERVICE_POLICY")
+}
+
+fn wasm_policy_request(
+    value: Option<OsString>,
+    variable: &str,
+) -> Result<Option<PathBuf>, ConfigError> {
+    value
+        .map(|path| {
+            if !cfg!(feature = "wasm") {
+                return Err(invalid(variable, "requires the wasm feature"));
+            }
+            if path.is_empty() {
+                return Err(invalid(variable, "path must not be empty"));
+            }
+            Ok(PathBuf::from(path))
+        })
+        .transpose()
+}
+
 /// Parse the executable's explicit operator request. This returns ordinary
 /// strings, never execution authority. Library embedders must separately make
 /// the unsafe NativeTrust grant; NodeSettings/RunningNode::start do not do so.
@@ -117,9 +184,10 @@ impl NodeSettings {
                     "PARROT_DIRECTORY_PATH" => section.storage_dir = Some(value),
                     "PARROT_DIRECTORY_GROUP" => section.group = Some(value),
                     "PARROT_DIRECTORY_PEERS" => {
-                        section.peers = Some(seed_strings(
+                        section.peers = Some(seed_strings_for(
                             &value,
                             cfg.remote.node.scheme.as_deref().unwrap_or("tcp"),
+                            key,
                         )?)
                     }
                     _ => {
@@ -193,7 +261,19 @@ impl NodeSettings {
     }
     /// Validate all process settings, including directly constructed values.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.resolved.thread.validate()?;
         self.validate_directory()?;
+        let known = crate::builtin_manifest_components_from(None);
+        let mut seen = std::collections::BTreeSet::new();
+        for (index, name) in self.actors.iter().enumerate() {
+            let key = format!("PARROT_ACTORS[{index}]");
+            if !known.contains(name) {
+                return Err(invalid(&key, format!("unknown builtin actor: {name:?}")));
+            }
+            if !seen.insert(name) {
+                return Err(invalid(&key, format!("duplicate builtin actor: {name:?}")));
+            }
+        }
         if let Some(ticks) = self.wasm_epoch_ticks {
             if ticks == 0 {
                 return Err(invalid(
@@ -245,6 +325,10 @@ fn invalid(key: &str, reason: impl Into<String>) -> ConfigError {
 
 /// Legacy id=host:port and normal scheme://id@host:port share one validator.
 pub fn seed_strings(value: &str, scheme: &str) -> Result<Vec<String>, ConfigError> {
+    seed_strings_for(value, scheme, "PARROT_SEEDS")
+}
+
+fn seed_strings_for(value: &str, scheme: &str, variable: &str) -> Result<Vec<String>, ConfigError> {
     if value.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -259,10 +343,10 @@ pub fn seed_strings(value: &str, scheme: &str) -> Result<Vec<String>, ConfigErro
                 raw.to_owned()
             };
             let parsed = parrot_config::endpoint::SeedEndpoint::parse(&endpoint, scheme)
-                .map_err(|e| invalid(&format!("PARROT_SEEDS[{index}]"), e))?;
+                .map_err(|e| invalid(&format!("{variable}[{index}]"), e))?;
             if parsed.scheme != scheme {
                 return Err(invalid(
-                    "PARROT_SEEDS",
+                    &format!("{variable}[{index}]"),
                     "seed transport must match node transport",
                 ));
             }

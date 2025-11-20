@@ -46,6 +46,20 @@ pub enum SpanKind {
     StreamFinished,
     StreamError,
     Application,
+    /// Explicit guest operation admitted by the Wasm host recording capability.
+    WasmGuest,
+    /// Explicit native guest operation admitted by the host recording capability.
+    NativeGuest,
+    /// An actual Wasm host startup or drain hook, distinct from message dispatch.
+    WasmLifecycle,
+    /// Actual native worker load, construction, drain or unload, through return.
+    NativeLifecycle,
+    /// One admitted actor initialization hook, through future disposal.
+    ActorInit,
+    /// One admitted before_stop hook, through future disposal.
+    ActorBeforeStop,
+    /// Local stream installation following successful local actor initialization.
+    ActorInitLocalStreams,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,6 +378,11 @@ impl Drop for Owner {
 #[must_use = "retain the guard until the invocation completes"]
 pub struct SpanGuard(Option<Box<Owner>>);
 impl SpanGuard {
+    /// Whether this guard owns an admitted recording lifetime.
+    pub fn is_recording(&self) -> bool {
+        self.0.is_some()
+    }
+
     /// Returns an inert guard when no recorder is attached or admission is closed.
     pub fn current(kind: SpanKind, target: &str) -> Self {
         Self(Owner::current(kind, target).map(Box::new))

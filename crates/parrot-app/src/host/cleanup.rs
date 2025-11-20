@@ -155,12 +155,12 @@ impl Scope {
     }
 }
 async fn stop(actor: &dyn ActorRef) -> Outcome {
-    match std::panic::AssertUnwindSafe(async { actor.stop().await })
+    match std::panic::AssertUnwindSafe(async { parrot_api::address::stop_for_cleanup(actor).await })
         .catch_unwind()
         .await
     {
-        Ok(Ok(())) | Ok(Err(ActorError::ActorNotFound(_))) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(crate::disposal::actor_error_detail(error)),
         Err(payload) => {
             crate::disposal::drop_catching(payload);
             Err("actor stop panicked".into())
@@ -243,6 +243,14 @@ impl std::fmt::Debug for CleanupRef {
     }
 }
 impl ActorRef for CleanupRef {
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        // This adapter also owns journal and batch-reservation retirement.
+        if self.0.state.lock().unwrap().done {
+            parrot_api::address::RetirementStatus::Retired(Ok(()))
+        } else {
+            parrot_api::address::RetirementStatus::Pending
+        }
+    }
     fn send<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         self.0.actor.send(message)
     }

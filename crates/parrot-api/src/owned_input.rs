@@ -2,24 +2,25 @@
 use crate::{errors::ActorError, types::ActorResult};
 
 pub(crate) fn call<T>(callback: impl FnOnce() -> T) -> ActorResult<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).map_err(|payload| {
-        let text = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("non-string panic payload");
-        let mut message: String = text.chars().take(1024).collect();
-        if message.len() < text.len() {
-            message.push('…');
-        }
-        if let Err(secondary) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
-        {
-            message.push_str("; panic payload destructor panicked");
-            std::mem::forget(secondary);
-        }
-        ActorError::Panic(message)
-    })
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).map_err(panic_error)
+}
+
+pub(crate) fn panic_error(payload: Box<dyn std::any::Any + Send>) -> ActorError {
+    let text = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    let mut message: String = text.chars().take(1024).collect();
+    if message.len() < text.len() {
+        message.push('…');
+    }
+    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+    {
+        message.push_str("; panic payload destructor panicked");
+        std::mem::forget(secondary);
+    }
+    ActorError::Panic(message)
 }
 
 pub(crate) struct Input<T>(Option<T>);

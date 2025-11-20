@@ -193,7 +193,9 @@ async fn scenario(entry: Entry, traced: bool, poll_traced: bool) {
         assert_eq!(phase("traced-handler"), Some(observed));
         let actual: Vec<_> = ["constructor", "init-call", "init-poll", "init-resumed", "factory-drop"]
             .into_iter().map(|name| (name, phase(name))).collect();
-        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, called.clone())).collect();
+        let initialization = phase("init-call");
+        lifecycle_identity::assert_child(initialization.as_ref(), called.as_ref());
+        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, if name.starts_with("init-") { initialization.clone() } else { called.clone() })).collect();
         assert_eq!(actual, expected, "Actix factory creation must preserve its call identity");
         println!("PARROT_ACTIX_FACTORY_CREATION_CASE_OK entry={entry:?} traced={traced} poll_traced={poll_traced}");
     }).await.expect("Actix factory creation independent liveness bound");
@@ -216,3 +218,5 @@ case!(erased_factory_untraced, Erased, false);
 case!(erased_factory_traced, Erased, true);
 case!(child_factory_untraced, Child, false);
 case!(child_factory_traced, Child, true);
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;

@@ -59,35 +59,44 @@ if mode in ('success','wrong-cpu','missing-overflow','wrong-recovery','wrong-ech
  peer,_=s.accept();decoder=FrameDecoder();cpu=[];echo=[]
  def receipt():
   Path(os.environ['PROBE_REQUESTS']).write_text(json.dumps(dict(cpu=cpu,echo=echo)))
- while True:
-  chunk=peer.recv(65536)
-  if not chunk:break
-  decoder.feed(chunk)
-  while (frame:=decoder.next_frame()) is not None:
-   if frame.ft==FT_HANDSHAKE:
-    hello=decode_handshake(frame.payload)
-    peer.sendall(build_frame(FT_HANDSHAKE_ACK,frame.cid,'','__handshake__',handshake_ack_body('jvm-gw-1',chosen_codec=hello['chosen_codec'])))
-   elif frame.ft==FT_HEARTBEAT:peer.sendall(build_frame(FT_HEARTBEAT_ACK,frame.cid,'','',b''))
-   elif frame.ft==FT_ASK:
-    reply_to,payload=split_reply_to(frame.payload);n=decode(payload);assert encode(n)==payload
-    if frame.type_key=='bin:parrot.interop.Cpu#v1':
-     cpu.append(n);receipt()
-     if n==(1<<64)-1 and mode!='missing-overflow':
-      peer.sendall(build_frame(FT_REPLY_ERR,frame.cid,reply_to,'',encode_err_payload(ERR_CODEC_ERROR,'CPU overflow')));continue
-     value=0 if mode=='wrong-cpu' or n==(1<<64)-1 or (mode=='wrong-recovery' and len(cpu)==19) else n+1
-     key='bin:parrot.interop.Echoed#v1' if mode=='wrong-type' else 'bin:parrot.interop.CpuResult#v1'
-    elif frame.type_key=='bin:parrot.interop.Echo#v1':
-     echo.append(n);value=n+1 if mode=='wrong-echo' else n;key='bin:parrot.interop.Echoed#v1'
-     if mode=='slow-rtt':time.sleep(.0005)
-     if (mode=='wrong-echo' and len(echo)==1) or len(echo)==2500:receipt()
-    else:raise AssertionError('unexpected request key')
-    peer.sendall(build_frame(FT_REPLY,frame.cid,reply_to,key,encode(value)))
- peer.close()
+ reason='eof'
+ try:
+  while True:
+   chunk=peer.recv(65536)
+   if not chunk:break
+   decoder.feed(chunk)
+   while (frame:=decoder.next_frame()) is not None:
+    if frame.ft==FT_HANDSHAKE:
+     hello=decode_handshake(frame.payload)
+     peer.sendall(build_frame(FT_HANDSHAKE_ACK,frame.cid,'','__handshake__',handshake_ack_body('jvm-gw-1',chosen_codec=hello['chosen_codec'])))
+    elif frame.ft==FT_HEARTBEAT:peer.sendall(build_frame(FT_HEARTBEAT_ACK,frame.cid,'','',b''))
+    elif frame.ft==FT_ASK:
+     reply_to,payload=split_reply_to(frame.payload);n=decode(payload);assert encode(n)==payload
+     if frame.type_key=='bin:parrot.interop.Cpu#v1':
+      cpu.append(n);receipt()
+      if n==(1<<64)-1 and mode!='missing-overflow':
+       peer.sendall(build_frame(FT_REPLY_ERR,frame.cid,reply_to,'',encode_err_payload(ERR_CODEC_ERROR,'CPU overflow')));continue
+      value=0 if mode=='wrong-cpu' or n==(1<<64)-1 or (mode=='wrong-recovery' and len(cpu)==19) else n+1
+      key='bin:parrot.interop.Echoed#v1' if mode=='wrong-type' else 'bin:parrot.interop.CpuResult#v1'
+     elif frame.type_key=='bin:parrot.interop.Echo#v1':
+      echo.append(n);value=n+1 if mode=='wrong-echo' else n;key='bin:parrot.interop.Echoed#v1'
+      if mode=='slow-rtt':time.sleep(.0005)
+      if (mode=='wrong-echo' and len(echo)==1) or len(echo)==2500:receipt()
+     else:raise AssertionError('unexpected request key')
+     peer.sendall(build_frame(FT_REPLY,frame.cid,reply_to,key,encode(value)))
+ except (ConnectionResetError,BrokenPipeError):
+  reason='reset'
+ finally:
+  peer.close()
+ if os.environ.get('PROBE_PEER_CLOSED'):
+  Path(os.environ['PROBE_PEER_CLOSED']).write_text(json.dumps(dict(reason=reason,requests=len(cpu)+len(echo))))
 while True:time.sleep(.05)
 """.replace('CHILD_CODE',repr(CHILD))
 
 
 def run(out):
+    from test_matrix_peer_retirement import run_contracts
+    run_contracts(out / 'peer-contracts')
     root=out/'root';(root/'tools/parrot-obs').mkdir(parents=True)
     shutil.copy2(ROOT/'tools/parrot-obs/gateway_worker.py',root/'tools/parrot-obs/gateway_worker.py')
     tools=out/'bin';tools.mkdir();java=tools/'java';java.write_text('#!'+sys.executable+'\n'+FIXTURE);java.chmod(0o755)

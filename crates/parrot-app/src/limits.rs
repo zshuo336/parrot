@@ -17,7 +17,8 @@ pub struct ApplicationLimits {
     pub max_diagnostic_bytes: u64,
     pub max_config_depth: u64,
     pub max_config_values: u64,
-    /// Sum of concrete path and selected node string bytes plus String headers.
+    /// Concrete paths, selected nodes and unique cached hook key strings,
+    /// including their String headers. This is not a total allocator/RSS bound.
     pub max_expanded_bytes: u64,
     /// Checked on a trusted provider's returned Vec, before sorting or cloning.
     pub max_candidates: u64,
@@ -87,6 +88,70 @@ fn product(resource: &'static str, a: u64, b: u64) -> Result<u64, AdmissionError
 }
 
 impl ApplicationLimits {
+    #[cfg(feature = "host")]
+    pub(crate) fn check_host_request(
+        &self,
+        artifact: &ArtifactRef,
+        paths: &[String],
+        config: Option<&toml::Table>,
+    ) -> Result<(), AdmissionError> {
+        let runtime_env = match artifact {
+            ArtifactRef::PyModule { runtime_env, .. } => runtime_env.as_ref(),
+            _ => None,
+        };
+        self.check_host_inputs(paths, config, runtime_env)?;
+        self.check_metadata(&(artifact, paths, config))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn check_host_props(
+        &self,
+        factory: &str,
+        paths: &[String],
+        config: Option<&toml::Table>,
+    ) -> Result<(), AdmissionError> {
+        // Match ArtifactRef's encoding without first copying the factory name.
+        #[derive(serde::Serialize)]
+        enum BorrowedArtifact<'a> {
+            Props { factory: &'a str },
+        }
+        self.check_host_inputs(paths, config, None)?;
+        self.check_metadata(&(BorrowedArtifact::Props { factory }, paths, config))
+    }
+
+    #[cfg(feature = "host")]
+    fn check_host_inputs(
+        &self,
+        paths: &[String],
+        config: Option<&toml::Table>,
+        runtime_env: Option<&toml::Value>,
+    ) -> Result<(), AdmissionError> {
+        check("instances", paths.len() as u64, self.max_instances)?;
+        let mut expanded = 0;
+        for path in paths {
+            add(
+                "expanded bytes",
+                &mut expanded,
+                path.len() as u64,
+                self.max_expanded_bytes,
+            )?;
+            add(
+                "expanded bytes",
+                &mut expanded,
+                std::mem::size_of::<String>() as u64,
+                self.max_expanded_bytes,
+            )?;
+        }
+        let mut values = 0;
+        if let Some(config) = config {
+            self.table(config, 1, &mut values)?;
+        }
+        if let Some(runtime_env) = runtime_env {
+            self.value(runtime_env, 1, &mut values)?;
+        }
+        Ok(())
+    }
+
     /// This check precedes graph construction, error cloning and instance expansion.
     pub fn check_manifest(&self, manifest: &AppManifest) -> Result<(), AdmissionError> {
         check(
@@ -117,7 +182,7 @@ impl ApplicationLimits {
             add(
                 "expanded bytes",
                 &mut expanded,
-                self.path_bytes(component)?,
+                self.component_expanded_bytes(component)?,
                 self.max_expanded_bytes,
             )?;
             self.component_values(component, &mut values)?;
@@ -133,9 +198,24 @@ impl ApplicationLimits {
             component.instances.instance_count() as u64,
             self.max_instances,
         )?;
-        self.path_bytes(component)?;
+        check(
+            "dependencies",
+            component.deps.len() as u64,
+            self.max_dependencies,
+        )?;
+        self.component_expanded_bytes(component)?;
         self.component_values(component, &mut 0)?;
         self.check_metadata(component)
+    }
+    pub(crate) fn check_artifact(&self, artifact: &ArtifactRef) -> Result<(), AdmissionError> {
+        if let ArtifactRef::PyModule {
+            runtime_env: Some(value),
+            ..
+        } = artifact
+        {
+            self.value(value, 1, &mut 0)?;
+        }
+        self.check_metadata(artifact)
     }
     fn component_values(
         &self,
@@ -259,6 +339,66 @@ impl ApplicationLimits {
         check("expanded bytes", bytes, self.max_expanded_bytes)?;
         Ok(bytes)
     }
+
+    pub(crate) fn component_expanded_bytes(
+        &self,
+        component: &ComponentSpec,
+    ) -> Result<u64, AdmissionError> {
+        let paths = self.path_bytes(component)?;
+        let mut expanded = paths;
+        add(
+            "expanded bytes",
+            &mut expanded,
+            self.hook_bytes(component, paths)?,
+            self.max_expanded_bytes,
+        )?;
+        Ok(expanded)
+    }
+
+    fn hook_bytes(&self, component: &ComponentSpec, paths: u64) -> Result<u64, AdmissionError> {
+        let n = component.instances.instance_count() as u64;
+        let name = (component.name.len() as u64)
+            .checked_add(std::mem::size_of::<String>() as u64)
+            .ok_or(AdmissionError::Overflow("expanded bytes"))?;
+        let mut seen = [None; 3];
+        let mut expanded = 0;
+        for (index, hook) in [
+            &component.hooks.on_start,
+            &component.hooks.on_drain,
+            &component.hooks.on_stop,
+        ]
+        .into_iter()
+        .flatten()
+        .enumerate()
+        {
+            // Invalid declarations have no cache entry; semantic validation
+            // reports their original BadHook error after bounded admission.
+            let Ok(suffix) = component.hook_suffix(hook) else {
+                continue;
+            };
+            if seen.contains(&Some(suffix)) {
+                continue;
+            }
+            seen[index] = Some(suffix);
+            let extra = name
+                .checked_add(suffix.len() as u64)
+                .and_then(|bytes| bytes.checked_add(u64::from(!suffix.is_empty())))
+                .ok_or(AdmissionError::Overflow("expanded bytes"))?;
+            add(
+                "expanded bytes",
+                &mut expanded,
+                paths,
+                self.max_expanded_bytes,
+            )?;
+            add(
+                "expanded bytes",
+                &mut expanded,
+                product("expanded bytes", n, extra)?,
+                self.max_expanded_bytes,
+            )?;
+        }
+        Ok(expanded)
+    }
 }
 
 impl ApplicationLimits {
@@ -303,10 +443,17 @@ impl ApplicationLimits {
                     )?;
                 }
             }
+            let generated_paths = self.path_bytes(&component.spec)?;
             add(
                 "expanded bytes",
                 &mut expanded,
-                supplied_paths.max(self.path_bytes(&component.spec)?),
+                supplied_paths.max(generated_paths),
+                self.max_expanded_bytes,
+            )?;
+            add(
+                "expanded bytes",
+                &mut expanded,
+                self.hook_bytes(&component.spec, generated_paths)?,
                 self.max_expanded_bytes,
             )?;
             add(

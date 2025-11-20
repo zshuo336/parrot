@@ -519,16 +519,17 @@ advanced!(
 
 enum Backend {
     Thread(Arc<parrot::thread::ThreadActorSystem>),
-    Actix(parrot::actix::ActixActorSystem),
+    Actix(Box<parrot::actix::ActixActorSystem>),
 }
 impl Backend {
     async fn new(index: usize, limit: usize) -> Self {
         if index == 0 {
-            Self::Actix(
+            Self::Actix(Box::new(
                 parrot::actix::ActixActorSystem::with_settings(
                     parrot::actix::system::ActixSystemSettings {
                         max_context_tasks: limit,
                         arbiter_count: 2,
+                        load_balancing: Default::default(),
                         mailbox_capacity: 2,
                         ask_timeout: Duration::from_millis(100),
                         shutdown_timeout: Duration::from_millis(100),
@@ -536,7 +537,7 @@ impl Backend {
                 )
                 .await
                 .unwrap(),
-            )
+            ))
         } else {
             let mode = match index {
                 1 => parrot::thread::SchedulingMode::SharedPool {

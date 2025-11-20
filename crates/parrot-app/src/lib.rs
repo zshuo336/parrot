@@ -7,12 +7,14 @@
 //! - `assemble`：AssemblingContext 依赖序装配 + 失败回滚（A3）
 //! - `cli`：`parrot-app run/replay` 共用本地组装宿主（需host feature）
 //!
-//! 分层铁律（09 §2.2）：不依赖 `parrot` 主 crate——应用包只依赖
-//! parrot-api + parrot-app；引擎访问经 parrot-remote 协议面。
+//! 默认库提供应用模型、规划及宿主注入接口，不直接依赖 `parrot` 主 crate。
+//! `host` feature 启用依赖 `parrot` 的本地 Runner；`wasm`/`dylib` 同时启用
+//! `host` 及对应制品适配器。网关组件通过 parrot-remote 协议面访问。
 
 pub mod debug;
 mod disposal;
 pub mod durable;
+mod encoding;
 
 pub mod assemble;
 pub mod cleanup;

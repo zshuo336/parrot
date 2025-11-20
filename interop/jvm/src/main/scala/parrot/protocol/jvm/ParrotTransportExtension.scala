@@ -69,18 +69,45 @@ final class ParrotTransportExtension(
     if (stopped.get()) { WireConnection.mark(ch); ch.close() }
   }
 
-  def listen(port0: Int): Unit = synchronized {
+  def listen(port0: Int): Unit = listenWithPortAllocator(port0, () => {
+    val candidate = new java.net.ServerSocket()
+    try {
+      candidate.setReuseAddress(false)
+      candidate.bind(new java.net.InetSocketAddress(0))
+      candidate.getLocalPort
+    } finally candidate.close()
+  })
+
+  private[jvm] def listenWithPortAllocator(port0: Int, allocatePort: () => Int): Unit = synchronized {
+    require(port0 >= 0 && port0 <= 65535, "invalid listener port")
     val owner = startGroup()
     try {
-      val bound = new ServerBootstrap().group(owner).channel(classOf[NioServerSocketChannel])
+      val bootstrap = new ServerBootstrap().group(owner).channel(classOf[NioServerSocketChannel])
         // Netty defaults to SO_REUSEADDR. On BSD/macOS that can let a wildcard
         // bind report success while a specific-address listener owns its port;
         // clients then reach that unrelated service. Require endpoint ownership.
         .option(io.netty.channel.ChannelOption.SO_REUSEADDR, java.lang.Boolean.FALSE)
         .childHandler(new ChannelInitializer[SocketChannel] {
           override def initChannel(ch: SocketChannel): Unit = pipeline(ch, client = false)
-        }).bind(port0).sync().channel()
-      channels.add(bound)
+        })
+      var bound: io.netty.channel.Channel = null
+      var attempts = 0
+      val limit = if (port0 == 0) 8 else 1
+      while (bound == null) {
+        val port = if (port0 == 0) allocatePort() else port0
+        require(port > 0 && port <= 65535, "invalid allocated listener port")
+        attempts += 1
+        try {
+          // On macOS bind(0) can select a specific-address listener's port even
+          // with reuse disabled. An explicit bind rejects that conflict. The
+          // allocation socket is only a hint; the final bind owns the endpoint.
+          val pending = bootstrap.bind(port)
+          channels.add(pending.channel())
+          bound = pending.sync().channel()
+        } catch {
+          case _: java.net.BindException if attempts < limit => ()
+        }
+      }
       boundPort = bound.localAddress().asInstanceOf[java.net.InetSocketAddress].getPort
     } catch { case scala.util.control.NonFatal(error) => shutdown(); throw error }
   }

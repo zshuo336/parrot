@@ -58,6 +58,10 @@ impl Drop for QuicTransport {
 }
 
 impl QuicTransport {
+    pub(crate) fn with_admission(mut self, admission: super::ConnectionAdmission) -> Self {
+        self.tasks.admission = admission;
+        self
+    }
     pub(crate) fn with_metrics(mut self, metrics: Arc<crate::metrics::TransportMetrics>) -> Self {
         self.tasks.metrics = metrics;
         self
@@ -91,7 +95,7 @@ impl QuicTransport {
             .local_addr()
             .map_err(|e| RemoteError::Transport(format!("quic local address: {e}")))?;
         Ok(Self {
-            tasks: ConnectionTasks::default(),
+            tasks: ConnectionTasks::with_knobs(knobs),
             capture: None,
             verified_mtls: false,
             handshake,
@@ -163,6 +167,12 @@ impl QuicTransport {
     async fn open_uni(&self, _conn: &quinn::Connection) {}
 }
 
+impl super::OwnedTransport for QuicTransport {
+    fn close_admission(&self) {
+        self.tasks.close_admission();
+    }
+}
+
 #[async_trait::async_trait]
 impl Transport for QuicTransport {
     async fn connect(&self, addr: &NodeAddr) -> Result<ConnectionHandle, RemoteError> {
@@ -173,6 +183,7 @@ impl Transport for QuicTransport {
         }
         self.tasks
             .run(crate::security::handshake_deadline(async {
+                let (connection, _handshake) = self.tasks.admit()?;
                 // Outbound routing must not inherit a loopback-only listener
                 // bind. Own the client endpoint through handshake and driver.
                 let bind = if addr.addr.is_ipv6() {
@@ -231,11 +242,14 @@ impl Transport for QuicTransport {
                     .await
                     .map_err(|e| RemoteError::Transport(format!("quic open_bi: {e}")))?;
                 run_connection_captured(
-                    QuicIo {
-                        io: tokio::io::join(recv, send),
-                        connection: conn,
-                        client: Some(client),
-                    },
+                    super::AdmittedIo::new(
+                        QuicIo {
+                            io: tokio::io::join(recv, send),
+                            connection: conn,
+                            client: Some(client),
+                        },
+                        connection,
+                    ),
                     ConnParams {
                         side: ConnSide::Connect,
                         local_addr: Some(local),
@@ -276,6 +290,7 @@ impl Transport for QuicTransport {
                 let Some(incoming) = endpoint.accept().await else {
                     return Err(RemoteError::Transport("quic endpoint closed".into()));
                 };
+                let (connection, _handshake) = self.tasks.admit()?;
                 crate::security::handshake_deadline(async {
                     let conn = incoming
                         .await
@@ -287,11 +302,14 @@ impl Transport for QuicTransport {
                         .map_err(|e| RemoteError::Transport(format!("quic accept_bi: {e}")))?;
                     let peer = conn.remote_address();
                     run_connection_captured(
-                        QuicIo {
-                            io: tokio::io::join(recv, send),
-                            connection: conn,
-                            client: None,
-                        },
+                        super::AdmittedIo::new(
+                            QuicIo {
+                                io: tokio::io::join(recv, send),
+                                connection: conn,
+                                client: None,
+                            },
+                            connection,
+                        ),
                         ConnParams {
                             side: ConnSide::Accept,
                             local_addr: Some(self.local_addr()),
@@ -315,16 +333,22 @@ impl Transport for QuicTransport {
     }
 
     fn close(&self) {
+        self.tasks.close_admission();
+        let endpoint = self.endpoint.lock().unwrap().take();
+        let clients = self.clients.lock().unwrap().take();
+        let cleanup = crate::ingress::unwind::Cleanup::default();
         self.tasks.close();
-        if let Some(endpoint) = self.endpoint.lock().unwrap().take() {
-            endpoint.close(0u32.into(), b"transport shutdown");
+        if let Some(endpoint) = endpoint {
+            let _ = cleanup.call(|| endpoint.close(0u32.into(), b"transport shutdown"));
+            cleanup.dispose(endpoint);
         }
-        if let Some(clients) = self.clients.lock().unwrap().take() {
+        if let Some(clients) = clients {
             for endpoint in clients.into_values() {
-                endpoint.close(0u32.into(), b"transport shutdown");
+                let _ = cleanup.call(|| endpoint.close(0u32.into(), b"transport shutdown"));
+                cleanup.dispose(endpoint);
             }
         }
-        self.runtime_tasks.close();
+        let _ = cleanup.call(|| self.runtime_tasks.close());
     }
 
     async fn shutdown(&self) {

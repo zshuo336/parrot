@@ -419,11 +419,7 @@ fn verify(
         origin,
         "original creation identity"
     );
-    assert_eq!(
-        phase(0, "init-call"),
-        origin,
-        "original initialization identity"
-    );
+    lifecycle_identity::assert_child(phase(0, "init-call").as_ref(), origin.as_ref());
     if engine == 2 {
         let owner = events
             .iter()
@@ -439,21 +435,32 @@ fn verify(
         );
     }
     let mut actual = Vec::new();
+    let mut expected = Vec::new();
     for generation in 0..2 {
-        actual.push(phase(generation, "failure"));
+        let failure = phase(generation, "failure");
+        assert_eq!(failure, phase(generation, "init-call"));
+        let replacement = phase(generation + 1, "init-call");
+        lifecycle_identity::assert_child(replacement.as_ref(), failure.as_ref());
+        actual.push(failure.clone());
         actual.push(phase(generation, "policy"));
         actual.push(phase(generation + 1, "constructor"));
+        expected.extend([failure.clone(), failure.clone(), failure]);
         actual.push(phase(generation + 1, "init-call"));
+        expected.push(replacement.clone());
         if state.point != 0 || generation == 1 {
             actual.push(phase(generation + 1, "init-poll"));
+            expected.push(replacement.clone());
         }
         if state.point == 2 || generation == 1 {
             actual.push(phase(generation + 1, "init-resumed"));
+            expected.push(replacement);
         }
     }
-    let expected = vec![origin; actual.len()];
     (actual, expected)
 }
+
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;
 async fn scenario(
     engine: usize,
     child: bool,

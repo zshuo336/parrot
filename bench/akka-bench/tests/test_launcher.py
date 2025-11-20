@@ -72,6 +72,29 @@ class LauncherContracts(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stdout)
         self.assertEqual(self.records(), [])
 
+    def check_finished_tool_cleanup(self, fail):
+        try:
+            result = self.run_launcher('--check', BENCH_LEAVE_CHILD='javac',
+                                       BENCH_FAIL='javac' if fail else '')
+            self.assertEqual(result.returncode != 0, fail, result.stdout)
+            pids = json.loads(self.pids.read_text())
+            self.assertEqual(len(pids), 1)
+            deadline = time.monotonic() + 5
+            while self.alive(pids[0]) and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertFalse(self.alive(pids[0]), 'exited tool left its child running')
+        finally:
+            if self.pids.exists():
+                for pid in json.loads(self.pids.read_text()):
+                    if self.alive(pid):
+                        os.kill(pid, signal.SIGKILL)
+
+    def test_successful_tool_exit_retires_remaining_child(self):
+        self.check_finished_tool_cleanup(False)
+
+    def test_failed_tool_exit_retires_remaining_child(self):
+        self.check_finished_tool_cleanup(True)
+
     def test_sigterm_retires_active_tool_group_and_private_directory(self):
         process = subprocess.Popen([sys.executable, str(ROOT / 'run_bench.py'), '--check'],
                                    env=dict(self.environment, BENCH_BLOCK='javac'),

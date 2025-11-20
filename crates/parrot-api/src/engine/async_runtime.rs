@@ -63,6 +63,11 @@ impl SpawnOptions {
 /// Any lets facades preserve native identity and recognize known facade cycles.
 /// Existing static implementations require no additional method.
 pub trait AsyncEngineRuntime: Any + Send + Sync {
+    /// Optional explicit root supervision groups, bound to this runtime.
+    fn cohort_runtime(&self) -> Option<&dyn super::AsyncCohortRuntime> {
+        None
+    }
+
     /// Optional owner-thread capability. Absence does not consume any inputs.
     /// Local state is constructed on the selected owner, never moved into a Send actor.
     fn local_runtime(&self) -> Option<&dyn super::AsyncLocalRuntime> {
@@ -82,7 +87,9 @@ pub trait AsyncEngineRuntime: Any + Send + Sync {
         options: SpawnOptions,
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>>;
 
-    /// Resolve the actual local registry identity, including pending admission.
+    /// Resolve an actual registry identity, including pending admission. Native
+    /// Thread/Actix engines also support explicit remote paths when a message
+    /// gateway is injected. A reference does not establish remote liveness.
     fn get_actor<'a>(&'a self, path: &'a str) -> BoxedFuture<'a, Option<BoxedActorRef>>;
 
     /// Snapshot the runtime's current native status.

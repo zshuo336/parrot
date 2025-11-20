@@ -1150,7 +1150,8 @@ class _GatewayResources:
 
 
 def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
-          parrot_addr: str | None = None, *, shutdown_timeout=10.0, trace_config=None) -> None:
+          parrot_addr: str | None = None, *, shutdown_timeout=10.0, trace_config=None,
+          owned_workers=False) -> None:
     """启动网关（阻塞）。
 
     - ray.init 参数可注入（测试用 num_cpus=2 / include_dashboard=False）
@@ -1176,7 +1177,11 @@ def serve(port: int, dispatcher=None, ray_kwargs: dict | None = None,
         if ray_kwargs:
             raise ValueError('ray_kwargs cannot reconfigure an existing Ray runtime')
     else:
-        initialize(ray, ray_kwargs or {"num_cpus": 2, "include_dashboard": False, "log_to_driver": False})
+        options = ray_kwargs or {"num_cpus": 2, "include_dashboard": False, "log_to_driver": False}
+        if owned_workers:
+            initialize(ray, options, owned_workers=True)
+        else:
+            initialize(ray, options)
 
     dispatch = dispatcher or ParrotDispatcher()
 
@@ -1647,7 +1652,7 @@ def _serve_connection(sock, dispatch, worker, ray, admin_state=None, *, lease,
                     print(f"[ray-gw] frame dispatch error: {error!r}", file=sys.stderr, flush=True)
 
 
-def main(argv: list[str], *, ray_kwargs: dict | None = None) -> None:
+def main(argv: list[str], *, ray_kwargs: dict | None = None, owned_workers=False) -> None:
     from .gateway_cli import parse_gateway_arguments
     port, parrot_addr, trace_config = parse_gateway_arguments(argv)
     d = ParrotDispatcher()
@@ -1671,7 +1676,8 @@ def main(argv: list[str], *, ray_kwargs: dict | None = None) -> None:
     already_initialized = ray.is_initialized()
     with graceful_sigterm():
         try:
-            serve(port, d, ray_kwargs=ray_kwargs, parrot_addr=parrot_addr, trace_config=trace_config)
+            serve(port, d, ray_kwargs=ray_kwargs, parrot_addr=parrot_addr, trace_config=trace_config,
+                  owned_workers=owned_workers)
         except KeyboardInterrupt:
             pass
         finally:

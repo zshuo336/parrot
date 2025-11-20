@@ -91,7 +91,7 @@ impl Wake for PanicWake {
         panic!("reply wake failed");
     }
 }
-fn install_panicking_waker<T>(receiver: &mut tokio::sync::oneshot::Receiver<T>) {
+fn install_panicking_waker(receiver: &mut (impl Future + Unpin)) {
     let waker = Waker::from(Arc::new(PanicWake));
     assert!(
         Pin::new(receiver)

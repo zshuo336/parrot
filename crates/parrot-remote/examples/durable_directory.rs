@@ -60,6 +60,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         before.version,
         before.endpoints
     );
+    let checkpoint = node.compact()?;
+    if checkpoint != receipt.index()
+        || node.proposal_status(&receipt)? != DurableDirectoryStatus::Applied
+    {
+        return Err("compaction changed the applied proposal proof".into());
+    }
     drop(node);
     let reopened = DurableDirectory::open(
         &directory,
@@ -71,9 +77,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if reopened.query_local(&query)? != Some(before) {
         return Err("recovery changed the directory entry".into());
     }
+    if reopened.snapshot_index() != checkpoint {
+        return Err("recovery lost the application checkpoint".into());
+    }
     println!(
-        "reopen verified revision={}",
-        reopened.state_local()?.version
+        "reopen verified revision={} snapshot_index={}",
+        reopened.state_local()?.version,
+        reopened.snapshot_index()
     );
     Ok(())
 }

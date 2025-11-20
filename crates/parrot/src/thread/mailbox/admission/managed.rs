@@ -75,6 +75,7 @@ impl ManagedAdmission {
 }
 impl MessageAdmission for ManagedAdmission {
     fn prepare(&self, message: BoxedMessage) -> Result<BoxedMessage, MailboxError> {
+        let message = OwnedPayload::unbound(message);
         let lease = {
             let mut state = self.owner.state.lock().unwrap();
             if state.closed {
@@ -99,7 +100,7 @@ impl MessageAdmission for ManagedAdmission {
             .policy
             .as_ref()
             .expect("live admission lease")
-            .prepare(message)
+            .prepare(message.take())
     }
 }
 impl Drop for Lease {
@@ -242,5 +243,42 @@ mod tests {
                 .unwrap_err()
                 .contains("panic payload destructor panicked")
         );
+    }
+
+    #[tokio::test]
+    async fn retired_policy_proxy_owns_hostile_rejected_input() {
+        struct Hostile(Arc<AtomicUsize>);
+        impl Drop for Hostile {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("retired policy input destructor");
+            }
+        }
+        let policy = ManagedAdmission::new(
+            Arc::new(Policy {
+                drops: Arc::new(AtomicUsize::new(0)),
+                callback: None,
+                entered: None,
+            }),
+            &tokio::runtime::Handle::current(),
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        );
+        let _ = policy.close().await;
+        let drops = Arc::new(AtomicUsize::new(0));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            policy.prepare(Box::new(Hostile(drops.clone())))
+        }));
+        assert!(
+            matches!(outcome, Ok(Err(MailboxError::Closed))),
+            "retired proxy must preserve Closed without unwinding producer"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while drops.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rejected proxy input must retire");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

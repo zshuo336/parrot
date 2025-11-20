@@ -289,7 +289,19 @@ async fn scenario(
         let owner = events[0].3;
         assert!(events.iter().filter(|event| event.1 != "policy").all(|event| event.3 == owner), "local lifecycle and sources remain on the owner thread");
         let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        let mut creation = origin;
         for generation in 0..generations {
+            let event = |name| {
+                let found: Vec<_> = events.iter().filter(|event| event.0 == generation && event.1 == name).collect();
+                assert_eq!(found.len(), 1, "each lifecycle phase occurs once: {generation}/{name}");
+                found[0].2.clone()
+            };
+            let initialization = event("init-call");
+            let streams = event("streams-call");
+            lifecycle_identity::assert_child(initialization.as_ref(), creation.as_ref());
+            lifecycle_identity::assert_child(streams.as_ref(), creation.as_ref());
+            if let (Some(init), Some(streams)) = (&initialization, &streams) { assert_ne!(init.span_id(), streams.span_id()); }
             let mut phases = vec!["constructor", "init-call", "init-poll", "init-resumed", "streams-call", "source-drop"];
             if generation == expected_generation || point != Some(0) { phases.push("streams-poll"); }
             if generation == expected_generation || point == Some(2) { phases.push("streams-resumed"); }
@@ -299,13 +311,17 @@ async fn scenario(
                 let found: Vec<_> = events.iter().filter(|event| event.0 == generation && event.1 == phase).collect();
                 assert_eq!(found.len(), 1, "each actual lifecycle phase occurs once: {generation}/{phase}");
                 actual.push(found[0].2.clone());
+                expected.push(if phase == "constructor" { creation.clone() } else if phase.starts_with("init-") { initialization.clone() } else { streams.clone() });
             }
+            creation = streams;
         }
-        let expected = vec![origin; actual.len()];
         println!("PARROT_LOCAL_STREAM_INIT_RETIRED factory={factory} child={child} point={point:?} panic={panic} traced={traced} poll_traced={poll_traced}");
         (actual, expected)
     }).await.expect("local stream initialization independent liveness bound")
 }
+
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;
 async fn matrix(factory: bool, child: bool, point: Option<usize>, panic: bool) {
     let mut actual = Vec::new();
     let mut expected = Vec::new();

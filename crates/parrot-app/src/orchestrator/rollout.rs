@@ -4,13 +4,13 @@
 //!
 //! ```text
 //! Pending ──PlanReady──▶ Planning ──(自动)──▶ Draining
-//! Draining ──Drained{0 aborted}──▶ Deploying
+//! Draining ──Drained──▶ Deploying
 //! Deploying ──DeployOk──▶ Verifying
-//! Verifying ──VerifyOk──▶ Switching ──SwitchDone──▶ Running ──(自动)──▶ Done
+//! Verifying ──VerifyOk──▶ Switching ──SwitchDone──▶ Running ──ObservationComplete──▶ Done
 //!
 //! 异常弧：
-//! Verifying ──VerifyFail──▶ RollingBack ──(自动)──▶ Done（回滚完成）
-//! Draining/Deploying/Verifying ──NodeLost──▶ RollingBack（任何非终态）
+//! Verifying ──VerifyFail──▶ RollingBack ──RollbackComplete──▶ Done
+//! 非终态 ──NodeLost──▶ RollingBack；已回滚时忽略重复节点丢失
 //! 未知事件/非法转移 ──▶ RolloutError::InvalidTransition（状态保持）
 //! ```
 
@@ -80,10 +80,15 @@ pub enum RolloutEvent {
     VerifyOk,
     /// 验证失败（原因串——触发回滚）。
     VerifyFail(String),
-    /// 节点失联（非终态一律回滚）。
+    /// 节点失联（非终态进入回滚；回滚中的重复通知无动作）。
     NodeLost(String),
     /// 路由切换完成。
     SwitchDone,
+    /// 新版本观察窗由宿主确认结束；不能用重复路由切换回执替代。
+    ObservationComplete,
+    /// 宿主确认回滚恢复完成，aborted只计本次回滚新增的中止数。
+    /// 正向Drained回执不能证明旧版本已恢复。
+    RollbackComplete { aborted: usize },
 }
 
 /// 转移产出动作（宿主执行面）。
@@ -114,6 +119,8 @@ pub enum RolloutError {
     AlreadyTerminal,
     #[error("unknown component: {0}")]
     UnknownComponent(String),
+    #[error("rollout aborted count overflow: current {current}, additional {additional}")]
+    AbortedCountOverflow { current: usize, additional: usize },
 }
 
 /// 升级追踪器（单组件粒度——多组件由宿主按依赖序持有多个 tracker）。
@@ -145,6 +152,16 @@ impl RolloutTracker {
         self.phase = p;
     }
 
+    fn add_aborted(&mut self, additional: usize) -> Result<(), RolloutError> {
+        self.aborted_total = self.aborted_total.checked_add(additional).ok_or(
+            RolloutError::AbortedCountOverflow {
+                current: self.aborted_total,
+                additional,
+            },
+        )?;
+        Ok(())
+    }
+
     /// 事件驱动转移（转移表唯一入口——非法事件报错且状态不变）。
     pub fn advance(&mut self, event: RolloutEvent) -> Result<RolloutAction, RolloutError> {
         use RolloutPhase as P;
@@ -164,7 +181,7 @@ impl RolloutTracker {
                 })
             }
             (P::Draining, RolloutEvent::Drained { aborted }) => {
-                self.aborted_total += aborted;
+                self.add_aborted(aborted)?;
                 self.enter(P::Deploying);
                 Ok(RolloutAction::StartDeploy { comp })
             }
@@ -180,8 +197,8 @@ impl RolloutTracker {
                 self.enter(P::Running);
                 Ok(RolloutAction::None)
             }
-            (P::Running, RolloutEvent::SwitchDone) => {
-                // Running 观察窗结束信号（复用 SwitchDone 语义：切换稳态）
+            (P::Running, RolloutEvent::SwitchDone) => Ok(RolloutAction::None),
+            (P::Running, RolloutEvent::ObservationComplete) => {
                 self.enter(P::Done);
                 Ok(RolloutAction::Finished)
             }
@@ -191,16 +208,15 @@ impl RolloutTracker {
                 self.enter(P::RollingBack);
                 Ok(RolloutAction::Rollback { comp, reason })
             }
+            (P::RollingBack, RolloutEvent::NodeLost(_)) => Ok(RolloutAction::None),
             (p, RolloutEvent::NodeLost(node)) if !p.is_terminal() => {
                 let reason = format!("node lost: {node}");
                 self.rollback_reason = Some(reason.clone());
                 self.enter(P::RollingBack);
                 Ok(RolloutAction::Rollback { comp, reason })
             }
-            (P::RollingBack, RolloutEvent::Drained { aborted }) => {
-                // 回滚排空完成 → 回滚部署旧版 → 直达终态（简化弧：
-                // 旧版本恢复由 Rollback 动作同步完成）
-                self.aborted_total += aborted;
+            (P::RollingBack, RolloutEvent::RollbackComplete { aborted }) => {
+                self.add_aborted(aborted)?;
                 self.enter(P::Done);
                 Ok(RolloutAction::Finished)
             }
@@ -218,11 +234,8 @@ impl RolloutTracker {
     }
 }
 
-/// 多组件升级编排（依赖序驱动——E2 宿主侧组合器）。
-///
-/// HotSwap：全部组件单 tracker 串行；
-/// Rolling：分片逐个（tracker per 分片——同 HotSwap 复用）；
-/// Recreate：全停全起（Drain 全部 → Deploy 全部——phase 共享）。
+/// 多组件状态机集合。广播按组件名排序，收集每项结果，不提供原子事务、
+/// 依赖调度或真实升级动作；宿主分别实现HotSwap/Rolling/Recreate策略。
 pub struct MultiRollout {
     pub trackers: BTreeMap<String, RolloutTracker>,
 }
@@ -299,7 +312,7 @@ mod tests {
         );
         assert!(t.in_phase(RolloutPhase::Running));
         assert_eq!(
-            t.advance(RolloutEvent::SwitchDone).unwrap(),
+            t.advance(RolloutEvent::ObservationComplete).unwrap(),
             RolloutAction::Finished
         );
         assert!(t.in_phase(RolloutPhase::Done));
@@ -336,7 +349,9 @@ mod tests {
         t.advance(RolloutEvent::Drained { aborted: 0 }).unwrap();
         t.advance(RolloutEvent::DeployOk).unwrap();
         t.advance(RolloutEvent::VerifyFail("bad".into())).unwrap();
-        let a = t.advance(RolloutEvent::Drained { aborted: 1 }).unwrap();
+        let a = t
+            .advance(RolloutEvent::RollbackComplete { aborted: 1 })
+            .unwrap();
         assert_eq!(a, RolloutAction::Finished);
         assert!(t.in_phase(RolloutPhase::Done));
         assert_eq!(t.aborted_total, 1);
@@ -391,7 +406,7 @@ mod tests {
         t.advance(RolloutEvent::DeployOk).unwrap();
         t.advance(RolloutEvent::VerifyOk).unwrap();
         t.advance(RolloutEvent::SwitchDone).unwrap();
-        t.advance(RolloutEvent::SwitchDone).unwrap();
+        t.advance(RolloutEvent::ObservationComplete).unwrap();
         for e in [
             RolloutEvent::PlanReady,
             RolloutEvent::Drained { aborted: 0 },
@@ -460,7 +475,7 @@ mod tests {
         m.broadcast(RolloutEvent::DeployOk);
         m.broadcast(RolloutEvent::VerifyOk);
         m.broadcast(RolloutEvent::SwitchDone);
-        m.broadcast(RolloutEvent::SwitchDone);
+        m.broadcast(RolloutEvent::ObservationComplete);
         assert!(m.all_done());
         assert!(!m.any_rollback());
     }

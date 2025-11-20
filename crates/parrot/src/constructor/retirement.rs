@@ -1,7 +1,13 @@
 //! Capture retirement has one receipt, including executor/task cancellation.
 use super::*;
 
+#[cfg(test)]
+mod pending_contracts;
+#[cfg(test)]
+mod saturation_contracts;
+
 type Finished = watch::Sender<Option<Result<(), String>>>;
+type Receipt = watch::Receiver<Option<Result<(), String>>>;
 
 // Moved out of FactoryState under its lock, then destroyed outside that lock.
 // Installed before waiting on capacity or scheduling blocking work.
@@ -10,17 +16,26 @@ struct CaptureDisposal<A> {
     function: Option<Arc<dyn Fn() -> A + Send + Sync>>,
     failure: Option<String>,
     finished: Option<Finished>,
+    cleanup: Option<tokio::sync::OwnedSemaphorePermit>,
+    _pending: Option<crate::owned_payload::PendingCleanupPermit>,
 }
 impl<A> CaptureDisposal<A> {
-    fn take(state: &mut FactoryState<A>, finished: Option<Finished>) -> Self {
+    fn take(
+        state: &mut FactoryState<A>,
+        finished: Option<Finished>,
+        cleanup: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
         Self {
             context: state.capture_context.take(),
             function: state.function.take(),
             failure: state.retirement_failure.clone(),
             finished,
+            cleanup,
+            _pending: state.retirement_pending.take(),
         }
     }
     fn retire(&mut self) -> Result<(), String> {
+        let _scope = crate::owned_payload::DisposalScope::enter();
         parrot_api::trace::in_scope(self.context.clone(), || {
             let captures = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 drop(self.function.take());
@@ -37,6 +52,7 @@ impl<A> CaptureDisposal<A> {
             if let Some(finished) = self.finished.take() {
                 finished.send_replace(Some(result.clone()));
             }
+            drop(self.cleanup.take());
             result
         })
     }
@@ -53,6 +69,8 @@ impl<A> Drop for FactoryState<A> {
             function: self.function.take(),
             failure: self.retirement_failure.take(),
             finished: self.fallback.take(),
+            cleanup: None,
+            _pending: self.retirement_pending.take(),
         });
     }
 }
@@ -70,7 +88,38 @@ impl<A> Retirement<A> {
         Some(CaptureDisposal::take(
             &mut state,
             Some(self.finished.take().expect("one retirement owner")),
+            None,
         ))
+    }
+}
+impl<A: Send + 'static> Retirement<A> {
+    fn dispatch(
+        mut self,
+        pending: crate::owned_payload::PendingCleanupPermit,
+        runtime: tokio::runtime::Handle,
+        changed: Arc<tokio::sync::Notify>,
+        slots: Arc<Semaphore>,
+    ) {
+        // The last invocation inherits this quota if the host cancels us.
+        self.state.lock().unwrap().retirement_pending = Some(pending);
+        runtime.spawn(async move {
+            let captures = loop {
+                let notified = changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(captures) = self.take_if_idle() {
+                    break captures;
+                }
+                notified.await;
+            };
+            let permit = slots.acquire_owned().await;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                drop(captures);
+            })
+            .await
+            .map_err(crate::owned_payload::join_error);
+        });
     }
 }
 impl<A> Drop for Retirement<A> {
@@ -81,7 +130,7 @@ impl<A> Drop for Retirement<A> {
         let captures = {
             let mut state = self.state.lock().unwrap();
             if state.active == 0 {
-                Some(CaptureDisposal::take(&mut state, Some(finished)))
+                Some(CaptureDisposal::take(&mut state, Some(finished), None))
             } else {
                 // A prepared output or blocking constructor still holds an
                 // invocation. Its last release must finish actual cleanup;
@@ -97,6 +146,7 @@ impl<A> Drop for Retirement<A> {
 pub(super) fn invocation_finished<A>(invocation: &mut Invocation<A>) -> Result<(), String> {
     // Both explicit retirement and Drop may visit the same invocation.
     if invocation.function.is_none() {
+        drop(invocation.cleanup.take());
         return Ok(());
     }
     drop(invocation.function.take());
@@ -105,15 +155,25 @@ pub(super) fn invocation_finished<A>(invocation: &mut Invocation<A>) -> Result<(
         state.active -= 1;
         if state.active == 0 {
             if let Some(finished) = state.fallback.take() {
-                Some(CaptureDisposal::take(&mut state, Some(finished)))
+                Some(CaptureDisposal::take(
+                    &mut state,
+                    Some(finished),
+                    invocation.cleanup.take(),
+                ))
             } else if Arc::strong_count(&invocation.state) == 1 {
                 // No Factory or retirement owner survives: the prepared
                 // output's discard receipt must include this last capture.
-                Some(CaptureDisposal::take(&mut state, None))
+                Some(CaptureDisposal::take(
+                    &mut state,
+                    None,
+                    invocation.cleanup.take(),
+                ))
             } else {
+                drop(invocation.cleanup.take());
                 None
             }
         } else {
+            drop(invocation.cleanup.take());
             None
         }
     };
@@ -122,6 +182,58 @@ pub(super) fn invocation_finished<A>(invocation: &mut Invocation<A>) -> Result<(
 }
 
 impl<A: Send + 'static> Factory<A> {
+    fn begin_retirement(&self) -> (Receipt, Option<Retirement<A>>) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(receipt) = &state.disposal {
+            (receipt.clone(), None)
+        } else {
+            let (finished, receipt) = watch::channel(None);
+            state.disposal = Some(receipt.clone());
+            (
+                receipt,
+                Some(Retirement {
+                    state: self.state.clone(),
+                    finished: Some(finished),
+                }),
+            )
+        }
+    }
+
+    /// A retained lifecycle operation waits in place before creating a cleanup
+    /// task. Calling this seals construction immediately. Its owner must be
+    /// retained through completion; dropping it uses the synchronous fallback.
+    pub(crate) fn retire_in_lifecycle(&self) -> BoxedFuture<'static, Result<(), String>> {
+        self.retire_in_lifecycle_on(tokio::runtime::Handle::try_current().ok())
+    }
+
+    pub(super) fn retire_in_lifecycle_on(
+        &self,
+        runtime: Option<tokio::runtime::Handle>,
+    ) -> BoxedFuture<'static, Result<(), String>> {
+        let (receipt, owner) = self.begin_retirement();
+        let runtime = runtime.filter(|_| !crate::owned_payload::DisposalScope::active());
+        let Some(runtime) = runtime else {
+            drop(owner);
+            return wait(receipt);
+        };
+        let slots = self.cleanup.clone();
+        let changed = self.changed.clone();
+        let Some(owner) = owner else {
+            return wait(receipt);
+        };
+        // Start admitted cleanup at call time; only saturated ownership needs
+        // the retained lifecycle future to wait for admission.
+        if let Some(pending) = crate::owned_payload::try_pending_cleanup_permit(&slots) {
+            owner.dispatch(pending, runtime, changed, slots);
+            return wait(receipt);
+        }
+        Box::pin(async move {
+            let pending = crate::owned_payload::pending_cleanup_permit(&slots).await;
+            owner.dispatch(pending, runtime, changed, slots);
+            wait(receipt).await
+        })
+    }
+
     /// Start once at call time. The waiter never owns cleanup execution.
     pub(crate) fn retire(&self) -> BoxedFuture<'static, Result<(), String>> {
         self.retire_on(tokio::runtime::Handle::try_current().ok())
@@ -130,47 +242,24 @@ impl<A: Send + 'static> Factory<A> {
         &self,
         runtime: Option<tokio::runtime::Handle>,
     ) -> BoxedFuture<'static, Result<(), String>> {
-        let (receipt, owner) = {
-            let mut state = self.state.lock().unwrap();
-            if let Some(receipt) = &state.disposal {
-                (receipt.clone(), None)
+        let (receipt, owner) = self.begin_retirement();
+        if let Some(owner) = owner {
+            if let Some(runtime) =
+                runtime.filter(|_| !crate::owned_payload::DisposalScope::active())
+            {
+                let Some(pending) = crate::owned_payload::try_pending_cleanup_permit(&self.cleanup)
+                else {
+                    // Do not create another waiter when cleanup ownership is
+                    // saturated. Dropping the owner either retires idle
+                    // captures synchronously or leaves the same receipt on
+                    // the final active invocation.
+                    drop(owner);
+                    return wait(receipt);
+                };
+                owner.dispatch(pending, runtime, self.changed.clone(), self.cleanup.clone());
             } else {
-                let (finished, receipt) = watch::channel(None);
-                state.disposal = Some(receipt.clone());
-                (
-                    receipt,
-                    Some(Retirement {
-                        state: self.state.clone(),
-                        finished: Some(finished),
-                    }),
-                )
-            }
-        };
-        if let Some(mut owner) = owner {
-            if let Some(runtime) = runtime {
-                let changed = self.changed.clone();
-                let slots = self.cleanup.clone();
-                runtime.spawn(async move {
-                    let captures = loop {
-                        let notified = changed.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
-                        if let Some(captures) = owner.take_if_idle() {
-                            break captures;
-                        }
-                        notified.await;
-                    };
-                    let permit = slots.acquire_owned().await;
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        drop(captures);
-                    })
-                    .await
-                    .map_err(crate::owned_payload::join_error);
-                });
-            } else {
-                // No executor: retire synchronously if idle, otherwise transfer
-                // the receipt to the last invocation. No hidden worker/runtime.
+                // No executor or nested disposal: retire idle captures here.
+                // An active invocation keeps its own final-disposal receipt.
                 drop(owner);
             }
         }

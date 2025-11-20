@@ -513,17 +513,25 @@ async fn aborted_local_cohort_cancels_capacity_waiters_without_starting_late_con
     // Both arbiter owners are available, but unrelated Send constructors own
     // all permits. Stopping one cohort member must abort the other waiter now,
     // without first releasing those constructors or waiting for the deadline.
-    // The interrupted recovery reports Stopped/cohort cancellation on this
-    // member; successful disposal is observed through scope retirement below.
-    assert!(children[0].stop().await.is_err());
+    // Cancelling accepted recovery is a healthy stop. The prior failed
+    // request must not become a synthetic cleanup error.
+    children[0].stop().await.unwrap();
     tokio::time::timeout(
         Duration::from_millis(500),
         until(|| ctx.children().is_empty()),
     )
     .await
     .expect("aborted Local cohort retained a constructor-capacity waiter");
+    for child in &children {
+        child.stop().await.unwrap();
+        assert!(matches!(
+            child.retirement_status(),
+            parrot_api::address::RetirementStatus::Retired(Ok(()))
+        ));
+    }
     for stat in &stats {
         assert_eq!(stat.next.load(Ordering::SeqCst), 1);
+        assert_eq!(stat.phases("drop"), 1);
     }
     gate.release();
     for worker in workers {

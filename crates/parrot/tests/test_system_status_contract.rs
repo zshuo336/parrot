@@ -168,7 +168,7 @@ async fn facade_counts_actix_clones_and_mixed_engines_without_alias_duplication(
     use parrot_api::system::SystemState;
     assert_eq!(
         (running.active_actors, running.resources.thread_count),
-        (2, 2)
+        (2, 3) // Two business arbiters plus their retirement owner, counted once.
     );
     assert_eq!(
         (

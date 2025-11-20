@@ -1,6 +1,12 @@
 //! Engine-neutral bounded constructors and cancellation-safe capture retirement.
+#[cfg(test)]
+mod budget_contracts;
+#[cfg(test)]
+mod direct_retirement_contracts;
 pub(crate) mod owned;
 pub(crate) mod prepared;
+#[cfg(test)]
+mod reentrant_cleanup_contracts;
 mod retirement;
 use crate::owned_payload::{join_error, panic_message};
 use parrot_api::types::BoxedFuture;
@@ -8,7 +14,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 #[derive(Debug)]
 pub(crate) enum ConstructionError<E> {
@@ -23,14 +29,28 @@ pub(crate) enum ConstructionError<E> {
 pub(crate) struct ConstructionControl {
     cancelled: AtomicBool,
     deadline: Option<tokio::time::Instant>,
+    parent: Option<Arc<ConstructionControl>>,
     notify: tokio::sync::Notify,
 }
 impl ConstructionControl {
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
     pub(crate) fn with_deadline(deadline: tokio::time::Instant) -> Self {
         Self {
             deadline: Some(deadline),
             ..Self::default()
         }
+    }
+    pub(crate) fn bounded(self: &Arc<Self>, deadline: tokio::time::Instant) -> Arc<Self> {
+        Arc::new(Self {
+            deadline: Some(
+                self.deadline
+                    .map_or(deadline, |parent| parent.min(deadline)),
+            ),
+            parent: Some(self.clone()),
+            ..Self::default()
+        })
     }
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
@@ -38,6 +58,10 @@ impl ConstructionControl {
     }
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.is_cancelled())
             || self
                 .deadline
                 .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
@@ -49,12 +73,20 @@ impl ConstructionControl {
         if self.is_cancelled() {
             return;
         }
-        match self.deadline {
-            Some(deadline) => tokio::select! {
-                _ = changed => {},
-                _ = tokio::time::sleep_until(deadline) => {},
-            },
-            None => changed.await,
+        tokio::select! {
+            _ = changed => {},
+            _ = async {
+                match &self.parent {
+                    Some(parent) => Box::pin(parent.cancelled()).await,
+                    None => std::future::pending().await,
+                }
+            } => {},
+            _ = async {
+                match self.deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {},
         }
     }
 }
@@ -66,17 +98,29 @@ struct FactoryState<A> {
     active: usize,
     retirement_failure: Option<String>,
     fallback: Option<watch::Sender<Option<Result<(), String>>>>,
+    retirement_pending: Option<crate::owned_payload::PendingCleanupPermit>,
 }
 pub(crate) struct Factory<A> {
     state: Arc<Mutex<FactoryState<A>>>,
     changed: Arc<tokio::sync::Notify>,
     workers: Arc<Semaphore>,
+    admission: Arc<Semaphore>,
     cleanup: Arc<Semaphore>,
 }
 struct Invocation<A> {
     function: Option<Arc<dyn Fn() -> A + Send + Sync>>,
     state: Arc<Mutex<FactoryState<A>>>,
     changed: Arc<tokio::sync::Notify>,
+    cleanup: Option<OwnedSemaphorePermit>,
+}
+impl<A> Invocation<A> {
+    fn record_failure(&self, error: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .retirement_failure
+            .get_or_insert_with(|| error.to_owned());
+    }
 }
 impl<A> Drop for Invocation<A> {
     fn drop(&mut self) {
@@ -89,6 +133,11 @@ impl<A: Send + 'static> Factory<A> {
         workers: Arc<Semaphore>,
         cleanup: Arc<Semaphore>,
     ) -> Arc<Self> {
+        // Keep one staging lease in addition to the normal construction
+        // workers. Prepared outputs release a worker before publication, so
+        // the extra lease preserves the existing one-worker staging contract
+        // while still bounding retained invocation owners.
+        let admission_capacity = workers.available_permits().saturating_add(1).max(1);
         Arc::new(Self {
             state: Arc::new(Mutex::new(FactoryState {
                 capture_context: parrot_api::trace::TraceContext::current(),
@@ -97,9 +146,11 @@ impl<A: Send + 'static> Factory<A> {
                 active: 0,
                 retirement_failure: None,
                 fallback: None,
+                retirement_pending: None,
             })),
             changed: Arc::default(),
             workers,
+            admission: Arc::new(Semaphore::new(admission_capacity)),
             cleanup,
         })
     }
@@ -110,6 +161,23 @@ impl<A: Send + 'static> Factory<A> {
         publish: impl FnOnce(A) -> Result<T, E> + Send + 'static,
     ) -> impl std::future::Future<Output = Result<T, ConstructionError<E>>> + Send + '_ {
         parrot_api::trace::capture(async move {
+            // Reserve invocation ownership before publishing an active
+            // invocation. Reentrant cleanup cannot wait for a permit it
+            // already owns.
+            let cleanup = if crate::owned_payload::DisposalScope::active() {
+                self.admission.clone().try_acquire_owned().map_err(|_| {
+                    ConstructionError::WorkerFailed(
+                        "cleanup capacity unavailable during reentrant construction".into(),
+                    )
+                })?
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = control.cancelled() => return Err(ConstructionError::Cancelled),
+                    permit = self.admission.clone().acquire_owned() => permit
+                        .map_err(|error| ConstructionError::WorkerFailed(error.to_string()))?,
+                }
+            };
             let invocation = {
                 let mut state = self.state.lock().unwrap();
                 if state.disposal.is_some() {
@@ -121,6 +189,7 @@ impl<A: Send + 'static> Factory<A> {
                     function: Some(function),
                     state: self.state.clone(),
                     changed: self.changed.clone(),
+                    cleanup: Some(cleanup),
                 }
             };
             let permit = tokio::select! {
@@ -152,6 +221,7 @@ impl<A: Send + 'static> Factory<A> {
                             // failed construction is not itself failed resource cleanup.
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 if control.is_cancelled() {
+                                    let _scope = crate::owned_payload::DisposalScope::enter();
                                     drop(actor);
                                     Err(ConstructionError::Cancelled)
                                 } else {
@@ -166,6 +236,9 @@ impl<A: Send + 'static> Factory<A> {
                             })
                         })
                     };
+                    if let Err(ConstructionError::DisposalPanicked(error)) = &result {
+                        invocation.record_failure(error);
+                    }
                     // Keep the invocation (and its function clone) inside the bounded
                     // worker until publication/discard has really returned.
                     drop(invocation);

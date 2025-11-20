@@ -308,7 +308,7 @@ fn test_mpsc_bounded<S: Sender>(b: &mut Bencher, bound: usize, thread_num: usize
             for _ in 0..thread_num {
                 let tx = tx.clone();
                 scope.spawn(move |_| {
-                    for _ in 0..msgs / thread_num as usize {
+                    for _ in 0..msgs / thread_num {
                         tx.send(Default::default());
                     }
                 });
@@ -316,7 +316,7 @@ fn test_mpsc_bounded<S: Sender>(b: &mut Bencher, bound: usize, thread_num: usize
 
             scope.spawn(move |_| {
                 // Remainder
-                for _ in 0..msgs - (msgs / thread_num as usize * thread_num) {
+                for _ in 0..msgs - (msgs / thread_num * thread_num) {
                     tx.send(Default::default());
                 }
             });
@@ -332,27 +332,27 @@ fn test_mpsc_bounded<S: Sender>(b: &mut Bencher, bound: usize, thread_num: usize
 }
 
 fn create(b: &mut Criterion) {
-    b.bench_function("create-flume", |b| test_create::<flume::Sender<u32>>(b));
+    b.bench_function("create-flume", test_create::<flume::Sender<u32>>);
     b.bench_function("create-crossbeam", |b| {
         test_create::<crossbeam_channel::Sender<u32>>(b)
     });
-    b.bench_function("create-std", |b| test_create::<mpsc::Sender<u32>>(b));
+    b.bench_function("create-std", test_create::<mpsc::Sender<u32>>);
 }
 
 fn oneshot(b: &mut Criterion) {
-    b.bench_function("oneshot-flume", |b| test_oneshot::<flume::Sender<u32>>(b));
+    b.bench_function("oneshot-flume", test_oneshot::<flume::Sender<u32>>);
     b.bench_function("oneshot-crossbeam", |b| {
         test_oneshot::<crossbeam_channel::Sender<u32>>(b)
     });
-    b.bench_function("oneshot-std", |b| test_oneshot::<mpsc::Sender<u32>>(b));
+    b.bench_function("oneshot-std", test_oneshot::<mpsc::Sender<u32>>);
 }
 
 fn inout(b: &mut Criterion) {
-    b.bench_function("inout-flume", |b| test_inout::<flume::Sender<u32>>(b));
+    b.bench_function("inout-flume", test_inout::<flume::Sender<u32>>);
     b.bench_function("inout-crossbeam", |b| {
         test_inout::<crossbeam_channel::Sender<u32>>(b)
     });
-    b.bench_function("inout-std", |b| test_inout::<mpsc::Sender<u32>>(b));
+    b.bench_function("inout-std", test_inout::<mpsc::Sender<u32>>);
 }
 
 fn hydra_32t_1m(b: &mut Criterion) {

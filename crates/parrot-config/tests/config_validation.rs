@@ -24,6 +24,90 @@ impl Drop for File {
 }
 
 #[test]
+fn transport_channel_limits_fail_during_build() {
+    let channel_max = usize::MAX >> 3;
+    for capacity in [channel_max + 1, usize::MAX] {
+        let error = ParrotConfig::builder()
+            .remote_outbound_queue(capacity)
+            .build()
+            .expect_err("channel capacity must be rejected before runtime startup");
+        assert!(error
+            .to_string()
+            .contains("remote.transport.outbound_queue"));
+    }
+    for capacity in [1, channel_max] {
+        assert_eq!(
+            ParrotConfig::builder()
+                .remote_outbound_queue(capacity)
+                .build()
+                .unwrap()
+                .remote
+                .transport
+                .outbound_queue,
+            capacity
+        );
+    }
+}
+
+#[test]
+fn heartbeat_loss_deadline_overflow_fails_during_build() {
+    let error = ParrotConfig::builder()
+        .remote_heartbeat_interval_ms(u64::MAX)
+        .remote_heartbeat_max_loss(u32::MAX)
+        .build()
+        .expect_err("heartbeat loss deadline overflows Duration on every platform");
+    assert!(error
+        .to_string()
+        .contains("remote.transport.heartbeat_interval_ms"));
+    let file = File::new(
+        "[remote.transport]\nheartbeat_interval_ms = 9223372036854775807\nheartbeat_max_loss = 4294967295",
+    );
+    assert!(file.load().unwrap().build().is_err());
+    // Validate the effective layer, so a safe explicit override repairs a
+    // well-typed but unusable lower-priority duration.
+    let repaired = ParrotConfig::builder()
+        .remote_heartbeat_interval_ms(1)
+        .load_file(&file.0)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(repaired.remote.transport.heartbeat_interval_ms, 1);
+    assert_eq!(repaired.remote.transport.heartbeat_max_loss, u32::MAX);
+}
+
+#[test]
+fn advertised_endpoints_are_validated_without_dns_or_identity_rewriting() {
+    for address in [
+        "",
+        "tcp://localhost:9800",
+        "other@localhost:9800",
+        "localhost:0",
+        "localhost:65536",
+        "localhost:9800/path",
+        "localhost:9800?query",
+        "::1:9800",
+        "[invalid]:9800",
+        "host name:9800",
+    ] {
+        let error = ParrotConfig::builder()
+            .remote_direct_addr(address)
+            .build()
+            .expect_err(address);
+        assert!(
+            error.to_string().contains("remote.node.direct_addr"),
+            "{error}"
+        );
+    }
+    for address in ["127.0.0.1:9800", "[::1]:9800", "unresolved.invalid.:9800"] {
+        let resolved = ParrotConfig::builder()
+            .remote_direct_addr(address)
+            .build()
+            .unwrap();
+        assert_eq!(resolved.remote.node.direct_addr.as_deref(), Some(address));
+    }
+}
+
+#[test]
 fn malformed_known_values_never_fall_back_to_defaults() {
     for (body, key) in [
         ("[thread]\nshared_pool_size = -1", "shared_pool_size"),

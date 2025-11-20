@@ -19,6 +19,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[cfg(test)]
+mod signal_contracts;
+
 #[derive(Clone)]
 pub(crate) struct Identity {
     pub path: String,
@@ -43,13 +46,94 @@ pub(crate) struct ManagedContext {
     hooks: Hooks,
     runtime: tokio::runtime::Handle,
     cleanup: Arc<tokio::sync::Semaphore>,
+    registrations: Arc<crate::context_tasks::ContextTasks>,
 }
 impl ManagedContext {
+    fn close(&self) {
+        self.scope.close();
+        self.registrations.close();
+    }
+    fn receptionist_gateway(
+        &self,
+    ) -> Option<Arc<dyn parrot_api::receptionist::ReceptionistGateway>> {
+        match &self.system {
+            Backend::Thread(system) => system.upgrade()?.receptionist_gateway(),
+            Backend::Actix(system) => system.upgrade().ok()?.receptionist_gateway(),
+        }
+    }
     pub(crate) fn own(&self) -> Option<Weak<dyn ActorRef>> {
         self.identity.own.get().cloned()
     }
+    fn registration_scope(&self) -> Option<Arc<parrot_api::receptionist::RegistrationScope>> {
+        let runtime = match &self.system {
+            Backend::Thread(system) => system.upgrade()?.retirement_runtime().clone(),
+            Backend::Actix(system) => system
+                .upgrade()
+                .ok()?
+                .root_cohorts
+                .retirement_runtime()
+                .clone(),
+        };
+        Some(self.registrations.registration_scope(&runtime))
+    }
 }
 impl TypedContextServices for ManagedContext {
+    fn receptionist_register(
+        &self,
+        key: parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<()>> {
+        let gateway = self.receptionist_gateway();
+        let scope = gateway.as_ref().and_then(|_| self.registration_scope());
+        let path = self.identity.path.clone();
+        Box::pin(async move {
+            match (gateway, scope) {
+                (Some(gateway), Some(scope)) => gateway.register_scoped(key, path, scope).await,
+                _ => Err(ActorError::InternalError("receptionist not enabled".into())),
+            }
+        })
+    }
+    fn receptionist_deregister(
+        &self,
+        key: &parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<()>> {
+        let gateway = self.receptionist_gateway();
+        let scope = gateway.as_ref().and_then(|_| self.registration_scope());
+        let path = self.identity.path.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            match (gateway, scope) {
+                (Some(gateway), Some(scope)) => gateway.deregister_scoped(key, path, scope).await,
+                _ => Err(ActorError::InternalError("receptionist not enabled".into())),
+            }
+        })
+    }
+    fn receptionist_subscribe(
+        &self,
+        key: parrot_api::receptionist::ReceptionistKey,
+    ) -> BoxedFuture<'static, ActorResult<parrot_api::receptionist::ReceptionistStream>> {
+        let gateway = self.receptionist_gateway();
+        let scope = self.scope.clone();
+        Box::pin(async move {
+            if scope.is_closed() {
+                return Err(ActorError::Stopped);
+            }
+            match gateway {
+                Some(gateway) => gateway.subscribe(key).await,
+                None => Err(ActorError::InternalError("receptionist not enabled".into())),
+            }
+        })
+    }
+
+    fn resolve_actor(&self, path: &str) -> Option<BoxedActorRef> {
+        if self.scope.is_closed() {
+            return None;
+        }
+        match &self.system {
+            Backend::Thread(system) => system.upgrade()?.resolve_actor(path),
+            Backend::Actix(system) => system.upgrade().ok()?.resolve_actor(path),
+        }
+    }
+
     fn local_spawner(&self) -> Option<&dyn parrot_api::engine::AsyncLocalActorSpawner> {
         matches!(&self.system, Backend::Actix(_)).then_some(self)
     }
@@ -87,11 +171,20 @@ impl TypedContextServices for ManagedContext {
 pub(crate) struct TypedTree {
     current: Mutex<Arc<ManagedContext>>,
     stopped: AtomicBool,
-    pending_failure: Mutex<Option<(Arc<ActorError>, crate::children::FailurePolicy)>>,
+    pending_failure: Mutex<
+        Option<(
+            crate::error_receipt::ActorReceipt,
+            crate::children::FailurePolicy,
+        )>,
+    >,
     timeout: Duration,
     slots: Arc<tokio::sync::Semaphore>,
 }
 impl TypedTree {
+    #[cfg(test)]
+    pub(crate) fn escalation_hook(&self) -> crate::children::Escalate {
+        self.current.lock().unwrap().hooks.escalate.clone()
+    }
     pub(crate) fn new(system: &Arc<ThreadActorSystem>, identity: Identity, hooks: Hooks) -> Self {
         Self::new_backend(
             Backend::Thread(Arc::downgrade(system)),
@@ -122,6 +215,7 @@ impl TypedTree {
                 hooks,
                 runtime,
                 cleanup,
+                registrations: crate::context_tasks::ContextTasks::new(0),
             })),
             stopped: AtomicBool::new(false),
             pending_failure: Mutex::new(None),
@@ -131,12 +225,22 @@ impl TypedTree {
     }
     pub(crate) fn defer_failure(
         &self,
-        error: Arc<ActorError>,
+        error: crate::error_receipt::ActorReceipt,
         policy: crate::children::FailurePolicy,
     ) {
-        *self.pending_failure.lock().unwrap() = Some((error, policy));
+        let removed = self
+            .pending_failure
+            .lock()
+            .unwrap()
+            .replace((error, policy));
+        drop(removed);
     }
-    pub(crate) fn take_failure(&self) -> Option<(Arc<ActorError>, crate::children::FailurePolicy)> {
+    pub(crate) fn take_failure(
+        &self,
+    ) -> Option<(
+        crate::error_receipt::ActorReceipt,
+        crate::children::FailurePolicy,
+    )> {
         self.pending_failure.lock().unwrap().take()
     }
     pub(crate) fn context(&self) -> TypedContext {
@@ -150,16 +254,19 @@ impl TypedTree {
         // Atomic with next_generation: a stop authorized by the old generation
         // cannot be delayed until after a replacement has been installed.
         self.stopped.store(true, Ordering::Release);
-        scope.close();
+        current.close();
         true
     }
     pub(crate) fn close(&self) {
         self.stopped.store(true, Ordering::Release);
-        self.current.lock().unwrap().scope.close();
+        self.current.lock().unwrap().close();
     }
     pub(crate) async fn join(&self) -> ActorResult<()> {
-        let scope = self.current.lock().unwrap().scope.clone();
-        scope.join().await
+        let current = self.current.lock().unwrap().clone();
+        current.close();
+        let (children, registrations) =
+            tokio::join!(current.scope.join(), current.registrations.join());
+        children.and(registrations)
     }
     /// Called only after the old scope has joined and old instance has retired.
     pub(crate) fn next_generation(&self) -> ActorResult<()> {
@@ -176,6 +283,7 @@ impl TypedTree {
             hooks: current.hooks.clone(),
             runtime: current.runtime.clone(),
             cleanup: current.cleanup.clone(),
+            registrations: crate::context_tasks::ContextTasks::new(0),
         });
         Ok(())
     }

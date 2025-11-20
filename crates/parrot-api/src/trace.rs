@@ -5,7 +5,13 @@
 //! for each handler invocation. Arbitrary spawned tasks do not inherit it: use
 //! [`capture`] when that task is intentionally part of the current operation.
 
-use std::{future::Future, sync::Arc};
+use std::{
+    cell::Cell,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 #[path = "trace/forest.rs"]
 mod forest;
@@ -59,8 +65,65 @@ impl TraceParent {
     }
 }
 
-tokio::task_local! {
-    static CURRENT: Option<TraceContext>;
+// The active context belongs to the synchronous scope or future, never TLS.
+// A const, no-drop slot avoids glibc TLS destructor registration on cold
+// workers while a native finalizer owns the process loader lock.
+thread_local! {
+    static CURRENT: Cell<*const Option<TraceContext>> = const { Cell::new(std::ptr::null()) };
+}
+
+fn with_current<R>(context: &Option<TraceContext>, operation: impl FnOnce() -> R) -> R {
+    struct Reset<'a> {
+        slot: &'a Cell<*const Option<TraceContext>>,
+        previous: *const Option<TraceContext>,
+    }
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            self.slot.set(self.previous);
+        }
+    }
+    CURRENT.with(|slot| {
+        let _reset = Reset {
+            slot,
+            previous: slot.replace(context),
+        };
+        operation()
+    })
+}
+
+pin_project_lite::pin_project! {
+    struct Scoped<F> {
+        context: Option<TraceContext>,
+        #[pin]
+        future: Option<F>,
+    }
+
+    impl<F> PinnedDrop for Scoped<F> {
+        fn drop(this: Pin<&mut Self>) {
+            let mut this = this.project();
+            with_current(this.context, || this.future.set(None));
+        }
+    }
+}
+
+impl<F: Future> Future for Scoped<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let mut future = this.future;
+        with_current(this.context, || {
+            let result = future
+                .as_mut()
+                .as_pin_mut()
+                .expect("trace scope polled after completion")
+                .poll(cx);
+            if result.is_ready() {
+                future.set(None);
+            }
+            result
+        })
+    }
 }
 
 fn span_id() -> [u8; 8] {
@@ -133,13 +196,23 @@ impl TraceContext {
     }
 
     pub fn current() -> Option<Self> {
-        CURRENT.try_with(Clone::clone).ok().flatten()
+        CURRENT.with(|slot| {
+            let context = slot.get();
+            if context.is_null() {
+                None
+            } else {
+                // SAFETY: with_current installs an immutable reference only for
+                // the synchronous call, restoring it before its owner can move
+                // or drop, including unwind. No pointer escapes this TLS read.
+                unsafe { (&*context).clone() }
+            }
+        })
     }
 
     /// Set this context while the closure runs, restoring the caller even if
     /// the closure unwinds. Do not use a thread guard across an async await.
     pub fn in_scope<R>(&self, operation: impl FnOnce() -> R) -> R {
-        CURRENT.sync_scope(Some(self.clone()), operation)
+        in_scope(Some(self.clone()), operation)
     }
 
     /// Set this context on every poll and during disposal of the future.
@@ -155,7 +228,10 @@ pub fn scope<F: Future>(
     context: Option<TraceContext>,
     future: F,
 ) -> impl Future<Output = F::Output> {
-    CURRENT.scope(context, future)
+    Scoped {
+        context,
+        future: Some(future),
+    }
 }
 
 /// Capture at future construction, so later polling in another task/context
@@ -167,5 +243,5 @@ pub fn capture<F: Future>(future: F) -> impl Future<Output = F::Output> {
 /// Run synchronous construction or a handler with explicit context isolation.
 /// `None` clears ambient context and unwinding restores the previous scope.
 pub fn in_scope<R>(context: Option<TraceContext>, operation: impl FnOnce() -> R) -> R {
-    CURRENT.sync_scope(context, operation)
+    with_current(&context, operation)
 }

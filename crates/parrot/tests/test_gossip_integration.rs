@@ -17,6 +17,9 @@ use parrot_remote::swim::{
 };
 use parrot_remote::{LocalLookup, RemoteActorSystem, RemoteConfig};
 
+#[path = "support/network.rs"]
+mod network_support;
+
 struct NopLookup;
 
 #[async_trait::async_trait]
@@ -246,6 +249,9 @@ async fn full_syncs_before_barrier(
 /// connection's serialized control lane, so no fixed sleep proves absence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s1_int_steady_state_no_full_sync() {
+    if network_support::skip_tcp("gossip TCP steady-state") {
+        return;
+    }
     use parrot_remote::handshake::{HandshakeBody, caps};
     use parrot_remote::transport::{Transport, tcp::TcpTransport};
 

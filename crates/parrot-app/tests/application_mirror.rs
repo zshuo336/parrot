@@ -106,6 +106,50 @@ struct Host {
     context: AssemblingContext,
     spawner: ThreadPropsSpawner,
 }
+
+#[tokio::test]
+async fn mirrored_component_receipt_survives_teardown_and_same_path_replacement() {
+    use parrot_api::address::{stop_for_cleanup, RetirementStatus};
+    let mut host = Host::new();
+    host.assemble(&manifest()).await.unwrap();
+    let component = host.context.component_ref("primary").unwrap().clone_boxed();
+    let clone = component.clone_boxed();
+    let connection = host.context.wired_ref("shadow:/user/out").unwrap();
+    assert!(matches!(
+        component.retirement_status(),
+        RetirementStatus::Pending
+    ));
+    assert!(matches!(
+        connection.retirement_status(),
+        RetirementStatus::Unsupported
+    ));
+    assert!(connection.stop().await.is_err());
+    let reply = component.send(Box::new(Work(7))).await.unwrap();
+    assert_eq!(reply.downcast::<Work>().unwrap().0, 8);
+    host.teardown().await;
+    for observer in [&*component, &*clone] {
+        assert!(matches!(
+            observer.retirement_status(),
+            RetirementStatus::Retired(Ok(()))
+        ));
+    }
+    let replacement = host
+        .engine
+        .spawn_at(
+            Observer { seen: Vec::new() },
+            "/user/primary",
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    stop_for_cleanup(&*component).await.unwrap();
+    let reply = replacement.send(Box::new(Work(8))).await.unwrap();
+    assert_eq!(reply.downcast::<Work>().unwrap().0, 9);
+    replacement.stop().await.unwrap();
+    host.close().await;
+}
+
 impl Host {
     fn new() -> Self {
         let engine = ThreadActorSystem::shared(Default::default());
@@ -186,6 +230,56 @@ impl Host {
 fn uuidless() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+async fn explicit_local_mirror_policy(component: usize) {
+    let mut host = Host::new();
+    let limits = parrot_app::ApplicationLimits {
+        max_config_depth: 65,
+        ..Default::default()
+    };
+    host.context = AssemblingContext::new_with_limits(limits).with_mirror_host(&host.remote);
+    host.spawner = host.spawner.clone().with_application_limits(limits);
+    let mut m = manifest();
+    let mut value = toml::Value::Integer(1);
+    for _ in 2..65 {
+        value = toml::Value::Array(vec![value]);
+    }
+    m.components[component].config = Some(toml::Table::from_iter([("value".into(), value)]));
+    assert!(parrot_app::validate(&m).is_err());
+    let plan = parrot_app::plan_with_limits(&m, &LocalTopology, &limits).unwrap();
+    let deployer = LocalDeployer {
+        topology: &LocalTopology,
+        gateway_factory: &NoGateway,
+        parrot_spawner: &host.spawner,
+    };
+    let result = host
+        .context
+        .assemble(&plan, &deployer, &m, &Default::default())
+        .await;
+    if result.is_ok() {
+        let reply = host
+            .context
+            .component_ref("primary")
+            .unwrap()
+            .send(Box::new(Work(651)))
+            .await
+            .unwrap();
+        assert_eq!(reply.downcast::<Work>().unwrap().0, 652);
+        assert_eq!(host.expect_count("/user/primary", 1).await[0].value, 651);
+        assert_eq!(host.expect_count("/user/shadow", 1).await[0].value, 651);
+    }
+    host.close().await;
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn local_mirror_expansion_preserves_explicit_source_config_policy() {
+    explicit_local_mirror_policy(0).await;
+}
+#[tokio::test]
+async fn local_mirror_expansion_preserves_explicit_shadow_config_policy() {
+    explicit_local_mirror_policy(1).await;
 }
 
 async fn component_stop_case(mirrored: bool, cloned: bool) {

@@ -3,10 +3,136 @@ use parrot_api::{
     errors::ActorError,
     types::{ActorResult, BoxedFuture},
 };
-use std::sync::Arc;
-use tokio::sync::{Semaphore, watch};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 type Receipt = watch::Receiver<Option<Result<(), String>>>;
+
+/// A cleanup executor has two different resources: workers that are actively
+/// dropping values, and owners waiting for one of those workers. The latter
+/// must have a finite bound as well; otherwise a saturated executor can retain
+/// an unbounded number of inputs in suspended tasks.
+pub(crate) const MAX_PENDING_CLEANUPS_PER_SLOT: usize = 1024;
+/// Bound retained cleanup owners across all independent runtime executors.
+/// Per-executor limits alone still permit an unbounded process-wide backlog
+/// when many systems are alive at once.
+pub(crate) const MAX_PENDING_CLEANUPS_GLOBAL: usize = 8192;
+
+struct PendingPool {
+    // Retain the allocation identity even after the executor's last strong
+    // owner exits. A still-live pending pool must not alias a reused address.
+    active: Weak<Semaphore>,
+    pending: Weak<Semaphore>,
+}
+static PENDING_CLEANUP_POOLS: OnceLock<Mutex<HashMap<usize, PendingPool>>> = OnceLock::new();
+static GLOBAL_PENDING_CLEANUPS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn global_pending_cleanup_slots() -> Arc<Semaphore> {
+    GLOBAL_PENDING_CLEANUPS
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_PENDING_CLEANUPS_GLOBAL)))
+        .clone()
+}
+
+fn pending_cleanup_slots(active: &Arc<Semaphore>) -> Arc<Semaphore> {
+    let pools = PENDING_CLEANUP_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = Arc::as_ptr(active) as usize;
+    let mut pools = pools.lock().unwrap();
+    pools.retain(|_, pool| pool.pending.strong_count() != 0);
+    if let Some(pool) = pools
+        .get(&key)
+        .filter(|pool| pool.active.ptr_eq(&Arc::downgrade(active)))
+        .and_then(|pool| pool.pending.upgrade())
+    {
+        return pool;
+    }
+    // `available_permits` can be zero while the first owner is already
+    // executing. Keep at least one queue slot in that case.
+    let capacity = active
+        .available_permits()
+        .max(1)
+        .saturating_mul(MAX_PENDING_CLEANUPS_PER_SLOT);
+    let pool = Arc::new(Semaphore::new(capacity));
+    pools.insert(
+        key,
+        PendingPool {
+            active: Arc::downgrade(active),
+            pending: Arc::downgrade(&pool),
+        },
+    );
+    pool
+}
+
+/// Reserve a bounded owner slot before spawning a cleanup waiter. `None`
+/// means the caller must apply synchronous backpressure or leave the receipt
+/// with an already-live owner; it must not create another suspended task.
+pub(crate) struct PendingCleanupPermit {
+    _local: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
+pub(crate) fn try_pending_cleanup_permit(active: &Arc<Semaphore>) -> Option<PendingCleanupPermit> {
+    let local = pending_cleanup_slots(active).try_acquire_owned().ok()?;
+    let global = match global_pending_cleanup_slots().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            drop(local);
+            return None;
+        }
+    };
+    Some(PendingCleanupPermit {
+        _local: local,
+        _global: global,
+    })
+}
+
+/// Wait before transferring a value out of an existing owner. Cancelling this
+/// admission releases any partial reservation and leaves the value in place.
+pub(crate) async fn pending_cleanup_permit(active: &Arc<Semaphore>) -> PendingCleanupPermit {
+    let local = pending_cleanup_slots(active)
+        .acquire_owned()
+        .await
+        .expect("private pending cleanup pool remains open");
+    let global = global_pending_cleanup_slots()
+        .acquire_owned()
+        .await
+        .expect("private global pending cleanup pool remains open");
+    PendingCleanupPermit {
+        _local: local,
+        _global: global,
+    }
+}
+
+#[cfg(test)]
+mod publication_contracts;
+
+std::thread_local! {
+    static DISPOSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct DisposalScope(Option<bool>);
+impl DisposalScope {
+    pub(crate) fn enter() -> Self {
+        Self(DISPOSING.try_with(|active| active.replace(true)).ok())
+    }
+    pub(crate) fn active() -> bool {
+        DISPOSING.try_with(std::cell::Cell::get).unwrap_or(false)
+    }
+}
+impl Drop for DisposalScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0 {
+            let _ = DISPOSING.try_with(|active| active.set(previous));
+        }
+    }
+}
+
+/// Retire on the current thread even when it has entered an async runtime.
+/// Nested cleanup shares this disposal scope instead of awaiting its own pool.
+pub(crate) fn retire_synchronously<T>(value: T) -> ActorResult<()> {
+    let _scope = DisposalScope::enter();
+    PublicationInput::new(value).retire()
+}
 
 /// Input ownership inside an already bounded, synchronous publication owner.
 /// Do not acquire another executor permit here: factory/child publication may
@@ -30,6 +156,7 @@ impl<T> PublicationInput<T> {
         self.dispose()
     }
     fn dispose(&mut self) -> ActorResult<()> {
+        let _scope = (self.0.is_some() && std::mem::needs_drop::<T>()).then(DisposalScope::enter);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.0.take()))).map_err(
             |payload| {
                 ActorError::InternalError(format!(
@@ -80,9 +207,13 @@ struct Disposal<T> {
     context: Option<parrot_api::trace::TraceContext>,
     value: Option<T>,
     finished: watch::Sender<Option<Result<(), String>>>,
+    reservation: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    pending: Option<OwnedSemaphorePermit>,
+    global_pending: Option<OwnedSemaphorePermit>,
 }
 impl<T> Drop for Disposal<T> {
     fn drop(&mut self) {
+        let _scope = DisposalScope::enter();
         parrot_api::trace::in_scope(self.context.clone(), || {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.value.take())))
@@ -92,6 +223,9 @@ impl<T> Drop for Disposal<T> {
                             panic_message(payload)
                         )
                     });
+            drop(self.reservation.take());
+            drop(self.pending.take());
+            drop(self.global_pending.take());
             self.finished.send_replace(Some(result));
         });
     }
@@ -103,6 +237,8 @@ pub(crate) struct OwnedPayload<T: Send + 'static> {
     value: Option<T>,
     runtime: Option<tokio::runtime::Handle>,
     slots: Arc<Semaphore>,
+    pending: Arc<Semaphore>,
+    reservation: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     // Inputs transferred without an observer need no completion allocation.
     finished: std::sync::OnceLock<watch::Sender<Option<Result<(), String>>>>,
 }
@@ -113,8 +249,29 @@ impl<T: Send + 'static> OwnedPayload<T> {
             value: Some(value),
             runtime: Some(runtime.clone()),
             slots: slots.clone(),
+            pending: pending_cleanup_slots(slots),
+            reservation: None,
             finished: std::sync::OnceLock::new(),
         }
+    }
+    /// Only the fixed-size instance input bundle shares this reservation.
+    /// Disposal retains it independently of the submitting future or waiter.
+    pub(crate) fn with_reservation(
+        mut self,
+        reservation: &Arc<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
+        self.reservation = Some(reservation.clone());
+        self
+    }
+    pub(crate) fn with_executor(
+        mut self,
+        runtime: &tokio::runtime::Handle,
+        slots: &Arc<Semaphore>,
+    ) -> Self {
+        self.runtime = Some(runtime.clone());
+        self.slots = slots.clone();
+        self.pending = pending_cleanup_slots(slots);
+        self
     }
     /// Unbound contexts have no system cleanup executor. Use the caller's
     /// executor when present, with a shared bounded pool. Without an executor,
@@ -126,14 +283,28 @@ impl<T: Send + 'static> OwnedPayload<T> {
             value: Some(value),
             runtime: tokio::runtime::Handle::try_current().ok(),
             slots: SLOTS.get_or_init(|| Arc::new(Semaphore::new(1))).clone(),
+            pending: pending_cleanup_slots(SLOTS.get_or_init(|| Arc::new(Semaphore::new(1)))),
+            reservation: None,
             finished: std::sync::OnceLock::new(),
         }
     }
     pub(crate) fn value(&self) -> &T {
         self.value.as_ref().expect("unconsumed payload")
     }
+    pub(crate) fn protect<R: Send + 'static>(&self, value: R) -> OwnedPayload<R> {
+        OwnedPayload {
+            context: self.context.clone(),
+            value: Some(value),
+            runtime: self.runtime.clone(),
+            slots: self.slots.clone(),
+            pending: self.pending.clone(),
+            reservation: None,
+            finished: std::sync::OnceLock::new(),
+        }
+    }
     pub(crate) fn take(mut self) -> T {
         let value = self.value.take().expect("unconsumed payload");
+        drop(self.reservation.take());
         if let Some(finished) = self.finished.get() {
             finished.send_replace(Some(Ok(())));
         }
@@ -165,6 +336,7 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
         };
         if !std::mem::needs_drop::<T>() {
             drop(value);
+            drop(self.reservation.take());
             if let Some(finished) = self.finished.get() {
                 finished.send_replace(Some(Ok(())));
             }
@@ -172,11 +344,57 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
         }
         let slots = self.slots.clone();
         let finished = self.completion().clone();
+        let reservation = self.reservation.take();
+        let pending = match self.pending.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                // Do not enqueue another owner once the bounded pending
+                // queue is full. Dropping this owner synchronously applies
+                // backpressure while preserving the same receipt and
+                // destructor isolation as the asynchronous path.
+                drop(Disposal {
+                    context: self.context.clone(),
+                    value: Some(value),
+                    finished,
+                    reservation,
+                    pending: None,
+                    global_pending: None,
+                });
+                return;
+            }
+        };
+        let global_pending = match global_pending_cleanup_slots().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                // The process-wide owner budget is exhausted. Release the
+                // local reservation before applying synchronous backpressure;
+                // the value still receives the same isolated receipt.
+                drop(pending);
+                drop(Disposal {
+                    context: self.context.clone(),
+                    value: Some(value),
+                    finished,
+                    reservation,
+                    pending: None,
+                    global_pending: None,
+                });
+                return;
+            }
+        };
         let disposal = Disposal {
             context: self.context.clone(),
             value: Some(value),
             finished: finished.clone(),
+            reservation,
+            pending,
+            global_pending,
         };
+        // Reentrant cleanup already owns a bounded disposal executor. Waiting
+        // for another permit can deadlock a destructor closing another owner.
+        if DisposalScope::active() {
+            drop(disposal);
+            return;
+        }
         let Some(runtime) = &self.runtime else {
             drop(disposal);
             return;
@@ -184,16 +402,25 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
         runtime.spawn(async move {
             // These private pools remain open through system retirement.
             let permit = slots.acquire_owned().await;
-            let result = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                drop(disposal);
-            })
-            .await
-            .map_err(join_error);
+            // Spawn can panic before returning a JoinHandle (OS exhaustion or
+            // a worker-builder callback). Failed dispatch retires its captures;
+            // retain that actual result instead of unwinding this cleanup task.
+            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    drop(disposal);
+                })
+            }));
+            let result = match dispatched {
+                Ok(worker) => worker.await.map_err(join_error),
+                Err(payload) => Err(panic_message(payload)),
+            };
             if let Err(error) = result {
                 // Disposal normally publishes the more specific payload result.
                 if finished.borrow().is_none() {
                     finished.send_replace(Some(Err(error)));
+                } else {
+                    tracing::warn!(error = %error, "cleanup executor dispatch failed; actual disposal receipt retained");
                 }
             }
         });
@@ -218,6 +445,34 @@ fn wait(mut receipt: Receipt) -> BoxedFuture<'static, ActorResult<()>> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn retired_executor_pool_cannot_reduce_a_new_executors_cleanup_budget() {
+        crate::test_support::isolated(
+            "owned_payload::tests::retired_executor_pool_cannot_reduce_a_new_executors_cleanup_budget",
+            || {
+                let mut previous = None;
+                for generation in 0..64 {
+                    let active = Arc::new(Semaphore::new(1));
+                    let mut current = Vec::new();
+                    for index in 0..MAX_PENDING_CLEANUPS_PER_SLOT {
+                        current.push(try_pending_cleanup_permit(&active).unwrap_or_else(|| {
+                            panic!(
+                                "new executor generation {generation} admitted only {index} cleanup owners"
+                            )
+                        }));
+                    }
+                    assert!(try_pending_cleanup_permit(&active).is_none());
+                    // Keep a pending owner alive after its executor exits. A
+                    // subsequent executor still needs its full independent quota.
+                    drop(previous.take());
+                    previous = current.pop();
+                    drop(current);
+                    drop(active);
+                }
+            },
+        );
+    }
 
     struct Hostile(Arc<AtomicUsize>);
     impl Drop for Hostile {
@@ -310,6 +565,97 @@ mod receipt_contracts {
             }
         }
     }
+
+    #[test]
+    fn worker_builder_failure_preserves_actual_cleanup_receipts_and_recovery() {
+        for hostile in [false, true] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let called = attempts.clone();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_name_fn(move || {
+                    if called.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("cleanup worker builder failure");
+                    }
+                    "healthy-cleanup-worker".to_owned()
+                })
+                .build()
+                .unwrap();
+            let count = Arc::new(AtomicUsize::new(0));
+            let value: Box<dyn Send> = if hostile {
+                Box::new(Hostile(count.clone()))
+            } else {
+                Box::new(Counted(count.clone()))
+            };
+            let input = OwnedPayload::new(value, runtime.handle(), &Arc::new(Semaphore::new(1)));
+            let observer = input.receipt();
+            let returned = input.retire();
+            runtime.block_on(async {
+                for receipt in [observer, returned] {
+                    let result = tokio::time::timeout(Duration::from_secs(2), receipt)
+                        .await
+                        .expect("worker startup failure must still complete actual disposal");
+                    if hostile {
+                        assert!(
+                            result
+                                .unwrap_err()
+                                .to_string()
+                                .contains("receipt contract disposal failed")
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                }
+            });
+            assert_eq!(runtime.block_on(runtime.spawn_blocking(|| 91)).unwrap(), 91);
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_retirement_completes_nested_cleanup_with_exhausted_pool() {
+        struct Nested {
+            count: Arc<AtomicUsize>,
+            runtime: tokio::runtime::Handle,
+            slots: Arc<Semaphore>,
+        }
+        impl Drop for Nested {
+            fn drop(&mut self) {
+                let input =
+                    OwnedPayload::new(Hostile(self.count.clone()), &self.runtime, &self.slots);
+                let error = ready(input.retire()).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("receipt contract disposal failed")
+                );
+                panic!("outer synchronous disposal failure");
+            }
+        }
+        let slots = Arc::new(Semaphore::new(1));
+        let _permit = slots.clone().acquire_owned().await.unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        assert!(!DisposalScope::active());
+        let error = retire_synchronously(Nested {
+            count: count.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            slots,
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outer synchronous disposal failure")
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(
+            !DisposalScope::active(),
+            "restore the caller's disposal scope"
+        );
+    }
+
     #[tokio::test]
     async fn take_resolves_polled_and_unpolled_receipts_without_disposal() {
         let count = Arc::new(AtomicUsize::new(0));
@@ -334,6 +680,101 @@ mod receipt_contracts {
         drop(transferred);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn saturated_cleanup_does_not_enqueue_unbounded_owners() {
+        let slots = Arc::new(Semaphore::new(1));
+        let active = slots.clone().acquire_owned().await.unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let runtime = tokio::runtime::Handle::current();
+
+        // Keep the only active worker occupied. The first owner consumes one
+        // bounded pending slot; later overflow owners must retire inline.
+        let first = OwnedPayload::new(Counted(count.clone()), &runtime, &slots);
+        drop(first.retire());
+        tokio::task::yield_now().await;
+        for _ in 0..=MAX_PENDING_CLEANUPS_PER_SLOT {
+            let input = OwnedPayload::new(Counted(count.clone()), &runtime, &slots);
+            drop(input.retire());
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "overflow owners must not become waiting cleanup tasks"
+        );
+
+        drop(active);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while count.load(Ordering::SeqCst) != MAX_PENDING_CLEANUPS_PER_SLOT + 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded cleanup queue did not drain");
+    }
+
+    #[test]
+    fn global_cleanup_budget_bounds_many_independent_executors() {
+        const FLAG: &str = "PARROT_GLOBAL_CLEANUP_BUDGET_CASE";
+        if std::env::var(FLAG).as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "owned_payload::receipt_contracts::global_cleanup_budget_bounds_many_independent_executors",
+                    "--nocapture",
+                ])
+                .env(FLAG, "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "global cleanup budget child failed: {status}"
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(4)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut active = Vec::with_capacity(MAX_PENDING_CLEANUPS_GLOBAL + 1);
+            for _ in 0..=MAX_PENDING_CLEANUPS_GLOBAL {
+                let slots = Arc::new(Semaphore::new(1));
+                active.push(slots.clone().acquire_owned().await.unwrap());
+                let input = OwnedPayload::new(Counted(count.clone()), runtime.handle(), &slots);
+                drop(input.retire());
+            }
+
+            assert_eq!(
+                global_pending_cleanup_slots().available_permits(),
+                0,
+                "all process-wide pending cleanup permits must be accounted for"
+            );
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "the owner beyond the global bound must retire synchronously"
+            );
+
+            drop(active);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while count.load(Ordering::SeqCst) != MAX_PENDING_CLEANUPS_GLOBAL + 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("global cleanup owners did not drain");
+            assert_eq!(
+                global_pending_cleanup_slots().available_permits(),
+                MAX_PENDING_CLEANUPS_GLOBAL,
+                "global cleanup permits must recover after actual disposal"
+            );
+        });
+    }
+
     #[test]
     fn simultaneous_receipts_share_one_terminal_result() {
         let runtime = tokio::runtime::Builder::new_current_thread()

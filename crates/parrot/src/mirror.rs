@@ -112,19 +112,21 @@ type CopyMessage = dyn Fn(&BoxedMessage) -> Result<BoxedMessage, String> + Send 
 #[derive(Clone)]
 pub struct MirrorCopier {
     type_id: TypeId,
-    measure: Arc<Measure>,
-    copy: Arc<CopyMessage>,
+    measure: Option<Arc<Measure>>,
+    copy: Option<Arc<CopyMessage>>,
 }
 impl MirrorCopier {
     // Fields may own unrelated hostile captures. Dispose each independently.
-    fn retire(self) -> Result<(), String> {
+    fn retire(mut self) -> Result<(), String> {
+        self.dispose()
+    }
+    fn dispose(&mut self) -> Result<(), String> {
         fn dispose<T>(value: T) -> Result<(), String> {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
                 .map_err(crate::owned_payload::panic_message)
         }
-        let Self { measure, copy, .. } = self;
-        let measure = dispose(measure);
-        let copy = dispose(copy);
+        let measure = dispose(self.measure.take());
+        let copy = dispose(self.copy.take());
         match (measure, copy) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(a), Err(b)) => Err(format!("measure: {a}; copy: {b}")),
@@ -138,21 +140,30 @@ impl MirrorCopier {
     ) -> Self {
         Self {
             type_id: TypeId::of::<T>(),
-            measure: Arc::new(move |msg| {
+            measure: Some(Arc::new(move |msg| {
                 msg.downcast_ref::<T>()
                     .map(&measure)
                     .ok_or_else(|| "copier type mismatch".into())
-            }),
-            copy: Arc::new(move |msg| {
+            })),
+            copy: Some(Arc::new(move |msg| {
                 let value = msg.downcast_ref::<T>().ok_or("copier type mismatch")?;
                 Ok(Box::new(copy(value)?) as BoxedMessage)
-            }),
+            })),
         }
     }
     pub fn cloned<T: Clone + Send + 'static>(
         measure: impl Fn(&T) -> usize + Send + Sync + 'static,
     ) -> Self {
         Self::new(measure, |value: &T| Ok(value.clone()))
+    }
+}
+impl Drop for MirrorCopier {
+    fn drop(&mut self) {
+        if let Err(reason) = self.dispose()
+            && !std::thread::panicking()
+        {
+            panic!("mirror copier disposal failed: {reason}");
+        }
     }
 }
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +218,9 @@ impl MirrorRef {
 }
 #[async_trait::async_trait]
 impl ActorRef for MirrorRef {
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.inner.retirement_status()
+    }
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(parrot_api::trace::capture(async move {
             self.handle

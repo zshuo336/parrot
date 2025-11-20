@@ -13,6 +13,9 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+#[cfg(test)]
+mod timeout_contracts;
+
 type ErasedStream = Box<dyn Stream<Item = BoxedMessage> + Send>;
 pub(crate) trait StreamRecipient: Send + Sync {
     fn deliver(&self, event: StreamEvent) -> BoxedFuture<'_, ActorResult<()>>;
@@ -226,26 +229,57 @@ impl<T> Drop for StreamInput<T> {
 
 // Keep a user future outside its polling unwind boundary. Cancellation and a
 // completed future's Drop have their own boundary and the same cleanup receipt.
-struct StreamFuture<'a, 'r, T> {
+struct StreamFuture<'a, 'r, 'c, T> {
     recording: Option<&'r mut Option<parrot_api::trace::SpanGuard>>,
     future: StreamInput<BoxedFuture<'a, ActorResult<T>>>,
     supervise_panic: bool,
+    cleanup: Option<crate::typed_supervision::DispatchCleanup<'c>>,
+    deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
-impl<T> std::future::Future for StreamFuture<'_, '_, T> {
+impl<T> std::future::Future for StreamFuture<'_, '_, '_, T> {
     type Output = ActorResult<T>;
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         use std::task::Poll;
-        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.future.value_mut().as_mut().poll(cx)
-        })) {
+        let expired = self.deadline.as_mut().is_some_and(|timer| {
+            tokio::time::Instant::now() >= timer.deadline() || timer.as_mut().poll(cx).is_ready()
+        });
+        let polled = if expired {
+            Ok(Poll::Ready(Err(ActorError::Timeout)))
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.future.value_mut().as_mut().poll(cx)
+            }))
+        };
+        let timed_out = self
+            .deadline
+            .as_ref()
+            .is_some_and(|timer| tokio::time::Instant::now() >= timer.deadline());
+        let polled = if timed_out {
+            match polled {
+                Ok(Poll::Ready(result)) => {
+                    let mut result = StreamInput::new(result, &self.future.failures);
+                    if let Some(message) = result.dispose() {
+                        self.record_disposal(message, false);
+                    }
+                }
+                Err(payload) => {
+                    let _ = crate::owned_payload::panic_message(payload);
+                }
+                Ok(Poll::Pending) => {}
+            }
+            Ok(Poll::Ready(Err(ActorError::Timeout)))
+        } else {
+            polled
+        };
+        let result = match polled {
             Ok(Poll::Pending) => return Poll::Pending,
             Ok(Poll::Ready(result)) => result.map_err(crate::error_receipt::protect_actor),
             Err(payload) => {
                 let message = crate::owned_payload::panic_message(payload);
-                self.future.dispose();
+                self.dispose_future(false);
                 self.finish_recording(parrot_api::trace::SpanStatus::Panicked);
                 if self.supervise_panic {
                     std::panic::resume_unwind(Box::new(message));
@@ -253,8 +287,13 @@ impl<T> std::future::Future for StreamFuture<'_, '_, T> {
                 Err(ActorError::Panic(message))
             }
         };
-        let disposal = self.future.dispose();
-        if disposal.is_some() {
+        let disposal = self.dispose_future(timed_out);
+        if disposal.is_some()
+            || self
+                .cleanup
+                .as_ref()
+                .is_some_and(|cleanup| cleanup.failed())
+        {
             self.finish_recording(parrot_api::trace::SpanStatus::Panicked);
         }
         match disposal {
@@ -266,17 +305,29 @@ impl<T> std::future::Future for StreamFuture<'_, '_, T> {
         }
     }
 }
-impl<T> StreamFuture<'_, '_, T> {
+impl<T> StreamFuture<'_, '_, '_, T> {
+    fn record_disposal(&mut self, message: String, cancelled: bool) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.record_stream_disposal(message, cancelled);
+        }
+    }
+    fn dispose_future(&mut self, cancelled: bool) -> Option<String> {
+        let failure = self.future.dispose();
+        if let Some(message) = failure.as_ref() {
+            self.record_disposal(message.clone(), cancelled);
+        }
+        failure
+    }
     fn finish_recording(&mut self, status: parrot_api::trace::SpanStatus) {
         if let Some(recording) = self.recording.as_mut().and_then(|slot| slot.take()) {
             recording.finish(status);
         }
     }
 }
-impl<T> Drop for StreamFuture<'_, '_, T> {
+impl<T> Drop for StreamFuture<'_, '_, '_, T> {
     fn drop(&mut self) {
         if self.future.value.is_some() {
-            let failed = self.future.dispose().is_some();
+            let failed = self.dispose_future(true).is_some();
             self.finish_recording(if failed || std::thread::panicking() {
                 parrot_api::trace::SpanStatus::Panicked
             } else {
@@ -287,14 +338,23 @@ impl<T> Drop for StreamFuture<'_, '_, T> {
 }
 async fn recorded_actor_stage<'a, T>(
     failures: &InputFailures,
+    timeout: std::time::Duration,
+    cleanup: crate::typed_supervision::DispatchCleanup<'_>,
     recording: parrot_api::trace::SpanGuard,
     construct: impl FnOnce() -> BoxedFuture<'a, ActorResult<T>>,
     finish: impl FnOnce(T) -> ActorResult<()>,
 ) -> ActorResult<()> {
     let mut recording = Some(recording);
-    let result = isolated_stage_recorded(failures, construct, true, Some(&mut recording))
-        .await
-        .and_then(finish);
+    let result = isolated_stage_recorded(
+        failures,
+        construct,
+        true,
+        Some(&mut recording),
+        timeout,
+        Some(cleanup),
+    )
+    .await
+    .and_then(finish);
     if let Some(recording) = recording {
         recording.finish_result(&result);
     }
@@ -308,29 +368,44 @@ async fn stage<'a, T>(
 }
 async fn actor_stage<'a, T>(
     failures: &InputFailures,
+    timeout: std::time::Duration,
+    cleanup: crate::typed_supervision::DispatchCleanup<'_>,
     construct: impl FnOnce() -> BoxedFuture<'a, ActorResult<T>>,
 ) -> ActorResult<T> {
-    isolated_stage(failures, construct, true).await
+    isolated_stage_recorded(failures, construct, true, None, timeout, Some(cleanup)).await
 }
 async fn isolated_stage<'a, T>(
     failures: &InputFailures,
     construct: impl FnOnce() -> BoxedFuture<'a, ActorResult<T>>,
     supervise_panic: bool,
 ) -> ActorResult<T> {
-    isolated_stage_recorded(failures, construct, supervise_panic, None).await
+    isolated_stage_recorded(
+        failures,
+        construct,
+        supervise_panic,
+        None,
+        std::time::Duration::ZERO,
+        None,
+    )
+    .await
 }
 async fn isolated_stage_recorded<'a, T>(
     failures: &InputFailures,
     construct: impl FnOnce() -> BoxedFuture<'a, ActorResult<T>>,
     supervise_panic: bool,
     recording: Option<&mut Option<parrot_api::trace::SpanGuard>>,
+    timeout: std::time::Duration,
+    cleanup: Option<crate::typed_supervision::DispatchCleanup<'_>>,
 ) -> ActorResult<T> {
+    let deadline = (!timeout.is_zero()).then(|| Box::pin(tokio::time::sleep(timeout)));
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(construct)) {
         Ok(future) => {
             StreamFuture {
                 recording,
                 future: StreamInput::new(future, failures),
                 supervise_panic,
+                cleanup,
+                deadline,
             }
             .await
         }
@@ -416,13 +491,19 @@ async fn run_owned(
     }
 }
 
-struct CallbackCleanup {
+struct CallbackCleanup<'a, 'c> {
     recording: Option<parrot_api::trace::SpanGuard>,
     first: Option<String>,
     failures: InputFailures,
+    engine: &'a mut crate::typed_supervision::DispatchCleanup<'c>,
+    completed: bool,
 }
-impl CallbackCleanup {
+impl CallbackCleanup<'_, '_> {
     fn finish(&mut self, result: &ActorResult<()>) {
+        self.completed = !matches!(
+            result,
+            Err(ActorError::Timeout | ActorError::TimeoutDetail(_))
+        );
         if let Some(recording) = self.recording.take() {
             recording.finish(if self.first.is_some() {
                 parrot_api::trace::SpanStatus::Panicked
@@ -432,7 +513,7 @@ impl CallbackCleanup {
         }
     }
 }
-impl Drop for CallbackCleanup {
+impl Drop for CallbackCleanup<'_, '_> {
     fn drop(&mut self) {
         if let Some(recording) = self.recording.take() {
             recording.finish(if self.first.is_some() || std::thread::panicking() {
@@ -442,6 +523,8 @@ impl Drop for CallbackCleanup {
             });
         }
         if let Some(message) = self.first.take() {
+            self.engine
+                .record_stream_disposal(message.clone(), !self.completed);
             self.failures.record(message);
         }
     }
@@ -451,6 +534,8 @@ pub(crate) fn dispatch<A>(
     mut event: StreamEvent,
     actor: &mut A,
     ctx: &mut A::Context,
+    timeout: std::time::Duration,
+    mut stage_cleanup: crate::typed_supervision::DispatchCleanup<'_>,
 ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>>
 where
     A: Actor,
@@ -475,29 +560,56 @@ where
                     recording: Some(recording),
                     first: None,
                     failures: failures.clone(),
+                    engine: &mut stage_cleanup,
+                    completed: false,
                 };
-                let result = actor_stage(&failures, || {
+                let result = actor_stage(&failures, timeout, cleanup.engine.reborrow(), || {
                     handler.call_with_cleanup(event.callback.take(), &mut view, &mut cleanup.first)
                 })
                 .await;
                 cleanup.finish(&result);
                 result
             } else {
-                default_callback(actor, ctx, event.callback, &failures, parent).await
+                default_callback(
+                    actor,
+                    ctx,
+                    event.callback,
+                    &failures,
+                    parent,
+                    timeout,
+                    stage_cleanup.reborrow(),
+                )
+                .await
             }
         };
         // Stop closes the source worker's receipt. Release suspended callbacks
         // before actor retirement waits for their serial execution lock.
         let result = tokio::select! {
             biased;
-            _ = event.completion.closed() => return Ok(Box::new(()) as BoxedMessage),
-            result = work => result,
+            _ = event.completion.closed() => None,
+            result = work => Some(result),
         };
-        let _ = event.completion.send(StreamReply {
-            handler: event.handler,
-            result: StreamInput::new(result, &failures),
-        });
-        Ok(Box::new(()) as BoxedMessage)
+        let acknowledged = if let Some(result) = result {
+            event
+                .completion
+                .send(StreamReply {
+                    handler: event.handler,
+                    result: StreamInput::new(result, &failures),
+                })
+                .is_ok()
+        } else {
+            false
+        };
+        // A closed source receipt means stop already owns cancellation. Keep
+        // its cleanup receipt without terminating a dedicated worker before
+        // its in-flight stop hook can publish that same cleanup failure.
+        if !acknowledged {
+            return Ok(Box::new(()) as BoxedMessage);
+        }
+        match stage_cleanup.failure_error() {
+            Some(error) => Err(error),
+            None => Ok(Box::new(()) as BoxedMessage),
+        }
     })
 }
 fn callback_kind(event: &StreamCallback) -> parrot_api::trace::SpanKind {
@@ -515,6 +627,8 @@ async fn default_callback<A>(
     event: StreamInput<StreamCallback>,
     failures: &InputFailures,
     parent: Option<parrot_api::trace::TraceContext>,
+    timeout: std::time::Duration,
+    mut cleanup: crate::typed_supervision::DispatchCleanup<'_>,
 ) -> ActorResult<()>
 where
     A: Actor,
@@ -526,28 +640,54 @@ where
     );
     let result = match event.take() {
         StreamCallback::Started => {
-            recorded_actor_stage(failures, recording, || actor.stream_started(ctx), Ok).await
-        }
-        StreamCallback::Item(item) => {
             recorded_actor_stage(
                 failures,
+                timeout,
+                cleanup.reborrow(),
+                recording,
+                || actor.stream_started(ctx),
+                Ok,
+            )
+            .await
+        }
+        StreamCallback::Item(item) => {
+            let mut disposal = None;
+            let result = recorded_actor_stage(
+                failures,
+                timeout,
+                cleanup.reborrow(),
                 recording,
                 || actor.handle_stream(item, ctx),
                 |reply| {
                     let mut reply = StreamInput::new(reply, failures);
-                    reply
-                        .dispose()
+                    disposal = reply.dispose();
+                    disposal
+                        .clone()
                         .map_or(Ok(()), |message| Err(ActorError::Panic(message)))
                 },
             )
-            .await
+            .await;
+            if let Some(message) = disposal {
+                cleanup.record_stream_disposal(message, false);
+            }
+            result
         }
         StreamCallback::Finished => {
-            recorded_actor_stage(failures, recording, || actor.stream_finished(ctx), Ok).await
+            recorded_actor_stage(
+                failures,
+                timeout,
+                cleanup.reborrow(),
+                recording,
+                || actor.stream_finished(ctx),
+                Ok,
+            )
+            .await
         }
         StreamCallback::Error(error) => {
             return recorded_actor_stage(
                 failures,
+                timeout,
+                cleanup.reborrow(),
                 recording,
                 || actor.stream_error(error, ctx),
                 Ok,
@@ -558,13 +698,23 @@ where
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
+            if cleanup.failed() {
+                return Err(error);
+            }
             parrot_api::trace::scope(parent.map(|parent| parent.child()), async {
                 let recording = parrot_api::trace::SpanGuard::current(
                     parrot_api::trace::SpanKind::StreamError,
                     parrot_api::context::ActorContext::path(ctx).path(),
                 );
-                recorded_actor_stage(failures, recording, || actor.stream_error(error, ctx), Ok)
-                    .await
+                recorded_actor_stage(
+                    failures,
+                    timeout,
+                    cleanup.reborrow(),
+                    recording,
+                    || actor.stream_error(error, ctx),
+                    Ok,
+                )
+                .await
             })
             .await
         }

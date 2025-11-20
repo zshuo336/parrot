@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() < 8 {
         return Err(
-            "usage: network_directory DIR GROUP NODE BIND CERT KEY CA SECONDS [PEER@IP:PORT ...]"
+            "usage: network_directory DIR GROUP NODE BIND CERT KEY CA SECONDS [--admin-node=NODE ...] [PEER@IP:PORT ...]"
                 .into(),
         );
     }
@@ -28,13 +28,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !(5..=3600).contains(&seconds) {
         return Err("SECONDS must be 5..3600".into());
     }
-    let peers = args[8..]
-        .iter()
-        .map(|s| {
+    let mut peers = Vec::new();
+    let mut admin_nodes = Vec::new();
+    for s in &args[8..] {
+        if let Some(node) = s.strip_prefix("--admin-node=") {
+            parrot_config::endpoint::validate_node_id(node)?;
+            admin_nodes.push(node.to_owned());
+        } else {
             let (id, address) = s.split_once('@').ok_or("expected PEER@IP:PORT")?;
-            Ok(NodeAddr::tcp(id, address.parse()?))
-        })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            peers.push(NodeAddr::tcp(id, address.parse()?));
+        }
+    }
     let credentials = TlsConfig {
         cert_pem: std::fs::read(&args[4])?,
         key_pem: std::fs::read(&args[5])?,
@@ -54,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut owner = NetworkDirectory::start(
         directory,
         &args[1],
-        RemoteConfig::tcp(&args[2], Some(bind)).with_mtls(credentials, []),
+        RemoteConfig::tcp(&args[2], Some(bind)).with_mtls(credentials, admin_nodes),
         peers,
         Arc::new(Empty),
     )

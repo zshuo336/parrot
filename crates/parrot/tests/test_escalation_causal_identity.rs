@@ -24,11 +24,13 @@ use std::{
 struct Identity {
     trace: [u8; 16],
     span: [u8; 8],
+    parent: Option<[u8; 8]>,
 }
 fn identity() -> Option<Identity> {
     TraceContext::current().map(|context| Identity {
         trace: context.trace_id(),
         span: context.span_id(),
+        parent: context.parent_span_id(),
     })
 }
 type Event = (usize, &'static str, Option<Identity>);
@@ -248,8 +250,10 @@ async fn scenario(mode: SchedulingMode, traced: bool, tell: bool, panic: bool, m
         };
         let initial = phase(0, "constructor").unwrap();
         assert_eq!(initial.trace, original.trace_id());
+        let initial_hook = phase(0, "init-call");
+        assert_hook(initial_hook, Some(initial));
         for name in ["init-call", "init-poll", "init-resumed"] {
-            assert_eq!(phase(0, name), Some(initial), "initial creation ancestry");
+            assert_eq!(phase(0, name), initial_hook, "initial creation ancestry");
         }
         let failed = phase(0, "failure-handler");
         assert_eq!(phase(0, "failure-resumed"), failed);
@@ -267,13 +271,27 @@ async fn scenario(mode: SchedulingMode, traced: bool, tell: bool, panic: bool, m
         } else {
             assert!(!events.iter().any(|row| row.1 == "parent-decider"));
         }
+        let replacement = phase(1, "init-call");
+        assert_hook(replacement, failed);
         for name in ["constructor", "init-call", "init-poll", "init-resumed"] {
             actual.push((name, phase(1, name)));
         }
-        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, failed)).collect();
+        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, if name.starts_with("init-") { replacement } else { failed })).collect();
         assert_eq!(actual, expected, "escalation decisions and replacement must inherit the child failure identity");
         println!("PARROT_ESCALATION_CAUSAL_CASE_OK {mode:?}/traced={traced}/tell={tell}/panic={panic}/managed={managed}");
     }).await.expect("causal escalation must complete within the liveness bound");
+}
+
+fn assert_hook(child: Option<Identity>, parent: Option<Identity>) {
+    match (child, parent) {
+        (Some(child), Some(parent)) => {
+            assert_eq!(child.trace, parent.trace);
+            assert_eq!(child.parent, Some(parent.span));
+            assert_ne!(child.span, parent.span);
+        }
+        (None, None) => {}
+        mismatch => panic!("hook ancestry differs: {mismatch:?}"),
+    }
 }
 async fn matrix(tell: bool, panic: bool, managed: bool) {
     for mode in [

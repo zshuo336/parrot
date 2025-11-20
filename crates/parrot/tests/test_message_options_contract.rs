@@ -18,6 +18,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+#[path = "support/network.rs"]
+mod network_support;
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Request {
     id: u32,
@@ -327,6 +330,9 @@ impl parrot_remote::LocalLookup for Lookup {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_priority_reaches_real_mailbox_after_wire_ordering_and_retry_executes() {
+    if network_support::skip_tcp("wire message-options priority") {
+        return;
+    }
     let state = Arc::new(State::default());
     let (sys, local) = thread(state.clone(), Default::default()).await;
     use parrot_remote::{NodeAddr, RemoteActorSystem, RemoteConfig};

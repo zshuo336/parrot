@@ -184,6 +184,9 @@ impl TypedChannelState {
 /// Engine-owned lifecycle of a managed typed channel. The callback must join
 /// owned cleanup; dropping a stop caller must not cancel the operation.
 pub trait TypedActorLifecycle: Send + Sync {
+    fn retirement_status(&self) -> crate::address::RetirementStatus {
+        crate::address::RetirementStatus::Unsupported
+    }
     fn death_watch(&self) -> Option<crate::death_watch::DeathWatch> {
         None
     }
@@ -275,13 +278,25 @@ where
 
     /// Stop the managed actor and await cleanup. Raw channels constructed with
     /// `new` have no lifecycle owner and report an error instead of false success.
-    pub async fn stop(&self) -> ActorResult<()> {
-        match &self.lifecycle {
-            Some(lifecycle) => lifecycle.stop().await,
-            None => Err(ActorError::InternalError(
-                "typed channel has no lifecycle owner".into(),
-            )),
-        }
+    /// Captures trace context at construction; stop admission begins on polling.
+    pub fn stop(&self) -> impl std::future::Future<Output = ActorResult<()>> + Send + '_ {
+        crate::trace::capture(async move {
+            match &self.lifecycle {
+                Some(lifecycle) => lifecycle.stop().await,
+                None => Err(ActorError::InternalError(
+                    "typed channel has no lifecycle owner".into(),
+                )),
+            }
+        })
+    }
+
+    /// Actual engine-owned cleanup, independent of a cached stop deadline.
+    pub fn retirement_status(&self) -> crate::address::RetirementStatus {
+        self.lifecycle
+            .as_ref()
+            .map_or(crate::address::RetirementStatus::Unsupported, |lifecycle| {
+                lifecycle.retirement_status()
+            })
     }
 
     async fn enqueue(&self, envelope: TypedEnvelope<A>) -> ActorResult<()> {
@@ -611,7 +626,7 @@ where
     }
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move { self.inner.stop().await })
+        Box::pin(self.inner.stop())
     }
 
     fn path(&self) -> String {
@@ -633,6 +648,10 @@ where
             .lifecycle
             .as_ref()
             .and_then(|lifecycle| lifecycle.death_watch())
+    }
+
+    fn retirement_status(&self) -> crate::address::RetirementStatus {
+        self.inner.retirement_status()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

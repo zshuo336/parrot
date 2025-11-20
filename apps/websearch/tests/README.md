@@ -8,7 +8,7 @@ python3 -m unittest discover -s apps/websearch/tests -p 'test_*.py' -v
 bash apps/websearch/jvm/test.sh
 ```
 
-`--no-build`显式测试已有debug制品，适合先单独构建后的排查；不能据此称为新源码构建通过。`--fast`保留为旧调用方的兼容别名，两种方式均输出`Scope: host processes. Container matrix NOT RUN.`。未知参数失败。旧固定容器名的compose分支不再自动运行；独立容器入口为 `python3 scripts/verify_websearch_images.py`，准备步骤与范围见 [镜像说明](../../../deploy/images/README.md)。这里没有把Docker不可用记成通过，也不把主机测试计入容器结果。
+默认构建从Cargo回执选择当前源、非test、唯一bin产物；自定义target时不回退旧`target/debug/websearch`，缺失或歧义拒绝。`--no-build`显式测试已有debug制品，可附`--binary /absolute/websearch`指定路径；实际执行与哈希均绑定该程序，不能据此称为新源码构建通过。`--fast`保留为兼容别名，两种方式均输出`Scope: host processes. Container matrix NOT RUN.`。未知参数失败。独立容器入口为 `python3 scripts/verify_websearch_images.py`，准备步骤见 [镜像说明](../../../deploy/images/README.md)；主机成绩不计入容器结果。
 
 ## 判据
 
@@ -17,7 +17,7 @@ bash apps/websearch/jvm/test.sh
 - direct和registry分别使用真实握手、部署、frontier、tokenizer、index和Web入口；registry使用系统分配的监听端口。
 - `--keep`保留已有文档并加入一页；重启整个JVM进程后，URL和BM25分数必须与重启前完全一致，且serve-only不能再次抓取。
 - 冷启动必须清除旧磁盘与内存结果，相同种子冷启动必须重新抓取。分页不仅看显示页码，还检查真正的末页行；零和极大分页参数不得导致运算溢出。另验证空库、晚到网关、由本测试主动占用的端口和端口0的实际服务地址。多个排队种子下的硬预算，以及失败消耗预算且不回填，分别通过业务与HTTP计数断言。
-- 11项真实故障注入覆盖Clear/Push/DocumentsAck/Terms/Flush坏载荷、文档确认数量和回复类型，以及分词结果中外部docId、重复词、零词频和空词；要求非零退出、无panic、无完成标记，拒绝的Push不能污染去重文件。代理按type-key只改一条实际业务回复，不改握手或管理帧。`--faults-only`可单独执行完整故障组。
+- 13项真实故障注入覆盖Clear/Push/DocumentsAck/Terms/Checkpoint/爬虫状态坏载荷、checkpoint代次、文档确认数量和回复类型，以及分词结果中外部docId、重复词、零词频和空词；要求非零退出、无panic、无完成标记，拒绝的Push不能污染去重文件。代理按type-key只改一条实际业务回复，不改握手或管理帧。`--faults-only`可单独执行完整故障组。
 - 所有抓取次数最终精确对账。Rust 抓取器忽略环境代理；验收显式传入 `--crawl-origin`，将页面和 robots 请求（含重定向）限制到本次拥有的语料 origin，并关闭内置种子回填。域名仍不能解析到私网；显式 IP origin 只授权该协议/IP/端口。网关的环境代理与 Ray 元数据探测代理分别记录辅助请求。这不是完整网络沙箱。
 - Rust JSON契约覆盖四种回复的schema、Unicode转义、截断与尾部、精确u64计数、HTML属性/链接方案、高亮重叠；真实TCP对端将坏JSON传到HTTP四入口，错误必须返回5xx，随后同一网关连接的合法回复必须恢复200。
 - JVM契约测试新增全部32种控制字符保留转义与德语数字Locale，且恢复测试前Locale。
@@ -42,7 +42,7 @@ bash apps/websearch/jvm/test.sh
 
 `python3 -m unittest discover -s apps/websearch/tests -p test_launcher.py -v`驱动生产启动流程，使用真实子进程、HTTP和持有监听socket的后代。覆盖构建失败、死进程日志、慢响应总期限、错误健康结构、退出码、参数边界、serve-only、并发隔离、TERM／重复信号／SIGKILL与不相关进程保护。夹具替换网关命令，不证明多语言业务。新增Rust `cli_validation_process`验证`--validate-only`在真实端口被占用时仍无绑定／数据副作用，且坏参数仍拒绝。
 
-`python3 apps/websearch/tests/run_launcher_integration.py`是常规真实入口门禁，构建当前dev制品，验证direct／registry业务和serve-only重启恢复，结果默认保存在打印的私有运行目录。CI已接入全部Python发现、优化模式所有权测试和这个真实入口门禁；本次只在本机执行，未冒称远程Linux CI已经通过。审计证据位于`docs/review/independent-2026-10-08/websearch-launcher-221`。该门禁独立核对精确索引、搜索URL／分数、HTTP请求及拥有的guardian回收，Ray元数据探测使用独立拒绝代理。它没有执行整个发布或容器矩阵。
+`python3 apps/websearch/tests/run_launcher_integration.py`是常规真实入口门禁，构建当前dev制品，验证direct／registry业务和serve-only重启恢复，结果默认保存在打印的私有运行目录。direct记录启动器选择的实际程序，随后registry和serve-only显式复用同一路径，支持自定义target；最终记录该程序哈希，首次构建失败也保留原错误。CI已接入全部Python发现、优化模式所有权测试和这个真实入口门禁；接线不代表托管CI通过。历史审计证据位于`docs/review/independent-2026-10-08/websearch-launcher-221`。该门禁独立核对精确索引、搜索URL／分数、HTTP请求及guardian回收，没有执行整个发布或容器矩阵。
 
 ## 可迁移分发与URI边界
 
@@ -208,3 +208,11 @@ JVM契约另覆盖摘要格式/每字节截断/完整CRC坏祖先/真实10万摘
 `run_portable_host.py --archive FILE --report FILE`用生产接收器安装后改名，再运行真实业务；`--release DIR`测试已有只读发布目录。`--hidden-checkout /repo`明确要求指定构建目录不可见；隐藏 checkout/Maven 缓存和只读挂载由外层隔离容器提供，普通 `--archive` 本身不证明文件系统隔离。CI执行release打包和迁移后业务，不等于已执行完整OS/架构矩阵。
 
 判据包括真实爬取和精确搜索分数、双实例独立索引/编译目录、全新JVM回放、SIGKILL后全部观察到的进程和监听退出、恢复不重抓已提交页面、显式runtime优先级及缺失runtime无存储副作用、真实业务编译失败的清理、安装文件摘要不变和无新增文件。含被robots拒绝链接的日志恢复时应重新读取robots，不能错误断言所有HTTP都为零；已全部完成的独立日志则要求零HTTP。测试保留失败报告，不将缺依赖记为跳过。
+
+## 使用者教程原语料
+
+`python3 apps/websearch/tests/run_tutorial_integration.py` 默认构建当前 dev 应用与网关，使用 `documents/examples/websearch-site` 原文件和真实 shell 启动器。显式 `--no-build --binary /absolute/path/to/websearch` 可复用已有产物，报告记录路径和 SHA-256，不代表本轮新构建。结果与失败数据保留在打印的 `/tmp/ws-tutorial-*` 目录。
+
+断言精确三页及 URL、中文查询、`BM25`/`bm25`/`Bm25` 相同结果和分数、禁止词零结果；HTTP 请求恰好为 robots、根页和两个子页各一次，不允许 `/index.html` 别名或禁止页请求。正常停止整个进程组后，serve-only 启动全新 JVM，结果分数不变且无新增抓取，并核对应用退出0、启动器信号退出143及各 guardian 退休。
+
+索引侧在 jieba 前统一 ASCII 字母为小写，与 JVM 查询对齐；不宣称完整 Unicode 折叠或两种 jieba 的中文切词完全一致。原大写词项索引需新目录冷重建，keep/serve-only 不会自动重新分词。`apps/test_support/test_python_components.py` 另以独立字节向量验证大小写合并 TF 和大写停用词过滤。

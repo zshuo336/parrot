@@ -139,15 +139,17 @@ async fn scenario(phase: Phase, panic: bool, traced: bool, poll_traced: bool) {
         };
         assert_eq!(event(0, "constructor"), creation);
         let failure = event(0, "failure");
-        assert_eq!(failure, creation, "initialization failure must belong to the creation call");
+        lifecycle_identity::assert_child(failure.as_ref(), creation.as_ref());
         for name in ["init-call", "init-poll", "init-resumed"] {
             let present = name == "init-call" || phase != Phase::Call && (name != "init-resumed" || phase == Phase::Resume);
-            if present { assert_eq!(event(0, name), creation); }
+            if present { assert_eq!(event(0, name), failure); }
             else { assert!(!events.iter().any(|event| event.0 == 0 && event.1 == name)); }
         }
         let actual: Vec<_> = [(0, "policy"), (1, "constructor"), (1, "init-call"), (1, "init-poll"), (1, "init-resumed")]
             .into_iter().map(|(generation, name)| (name, event(generation, name))).collect();
-        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, failure.clone())).collect();
+        let replacement = event(1, "init-call");
+        lifecycle_identity::assert_child(replacement.as_ref(), failure.as_ref());
+        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, if name.starts_with("init-") { replacement.clone() } else { failure.clone() })).collect();
         assert_eq!(actual, expected, "Actix initialization recovery must preserve the failure identity");
         println!("PARROT_ACTIX_INITIALIZATION_CAUSAL_CASE_OK phase={phase:?} panic={panic} traced={traced} poll_traced={poll_traced}");
     }).await.expect("Actix initialization recovery independent liveness bound");
@@ -173,3 +175,5 @@ case!(poll_error, Poll, false);
 case!(poll_panic, Poll, true);
 case!(resume_error, Resume, false);
 case!(resume_panic, Resume, true);
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;

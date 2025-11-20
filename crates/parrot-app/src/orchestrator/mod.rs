@@ -3,7 +3,7 @@
 //! - [`supervisor`]（E1）：AppSupervisor——desired/observed 差分调和
 //!   （diff 五形态 + 幂等；注入 Clock；desired 持久化 trait）
 //! - [`rollout`]（E2）：RolloutTracker——升级状态机（显式 enum + 转移表，
-//!   全弧含 Rollback；HotSwap/Rolling/Recreate 三策略）
+//!   独立观察/回滚完成回执；具体升级策略与动作由宿主执行）
 //! - [`health`]（E3）：HealthWatch——链接差分 + 状态轮询 → observed 更新
 
 #[cfg(unix)]

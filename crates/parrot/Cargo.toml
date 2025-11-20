@@ -16,7 +16,8 @@ actix = "0.13"
 async-trait = "0.1"
 thiserror = "2.0"
 futures = "0.3"
-tokio = { version = "1.0", features = ["full"] }
+fastrand = "2.5"
+tokio = { version = "1.0", features = ["full", "parrot-blocking-ownership"] }
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 anyhow = "1.0"
@@ -28,6 +29,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "jso
 downcast-rs = "2.0.0"
 
 [dev-dependencies]
+tempfile = "3"
 libloading = "0.8.9"
 tokio = { workspace = true, features = ["test-util"] }
 parrot-remote = { path = "../parrot-remote" }
@@ -36,6 +38,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rumqttc = { path = "../../vendor/rumqttc", default-features = false, features = ["use-rustls-no-provider"] }
 bincode = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
 
 
 [[example]]

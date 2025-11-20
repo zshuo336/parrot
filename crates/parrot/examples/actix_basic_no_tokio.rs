@@ -17,7 +17,10 @@ use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::fmt::Debug;
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// A simple message that carries a string payload
 #[derive(Debug, Clone)]
@@ -44,6 +47,7 @@ struct TestActor {
     name: String,
     /// Current actor state
     state: ActorState,
+    retired: Arc<AtomicUsize>,
 }
 
 impl TestActor {
@@ -52,7 +56,14 @@ impl TestActor {
         Self {
             name,
             state: ActorState::Starting,
+            retired: Arc::default(),
         }
+    }
+}
+
+impl Drop for TestActor {
+    fn drop(&mut self) {
+        self.retired.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -126,6 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Create actor instances
         let actor = TestActor::new("TestActor1".to_string());
+        let retired = actor.retired.clone();
 
         // Spawn actor using spawn_root_typed method
         let actor_ref = system
@@ -142,12 +154,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ask(message)
             .await
             .expect("Failed to get response");
-
+        assert_eq!(
+            response,
+            "Hello from TestActor1: received Hello, Actor World!"
+        );
         println!("Got response: {}", response);
 
-        // Wait a bit to ensure messages are processed
-        println!("Waiting for message processing to complete...");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        actor_ref.stop().await.expect("Failed to stop actor");
+        assert!(!actor_ref.is_alive().await);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+        assert_eq!(system.status().active_actors, 0);
 
         // Shutdown the system
         println!("Shutting down actor system...");

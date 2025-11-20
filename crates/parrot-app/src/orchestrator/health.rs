@@ -210,14 +210,20 @@ impl HealthWatch {
         self.limits
             .check_metadata(&comps)
             .map_err(|e| e.to_string())?;
-        let wanted: std::collections::BTreeSet<_> = comps.iter().cloned().collect();
+        let wanted: std::collections::BTreeSet<_> = comps.iter().map(String::as_str).collect();
         if wanted.len() != comps.len() {
             return Err("duplicate health component assignment".into());
         }
-        let mut next = self.assignments.clone();
-        next.retain(|c, n| n != node || wanted.contains(c));
-        for c in comps {
-            next.insert(c, node.to_string());
+        // Admit the final mapping before copying repeated node names or any
+        // retained assignment payloads. Borrowed maps preserve JSON map sizing.
+        let mut next: BTreeMap<&str, &str> = self
+            .assignments
+            .iter()
+            .map(|(component, node)| (component.as_str(), node.as_str()))
+            .collect();
+        next.retain(|c, n| *n != node || wanted.contains(*c));
+        for c in &comps {
+            next.insert(c.as_str(), node);
         }
         crate::limits::check(
             "health assignments",
@@ -228,6 +234,10 @@ impl HealthWatch {
         self.limits
             .check_metadata(&next)
             .map_err(|e| e.to_string())?;
+        let next: BTreeMap<String, String> = next
+            .into_iter()
+            .map(|(component, node)| (component.to_owned(), node.to_owned()))
+            .collect();
         let changed: Vec<_> = self
             .assignments
             .keys()
@@ -408,8 +418,8 @@ mod tests {
 
     #[test]
     fn gateway_down_degrades_its_components() {
-        // MG9-10 语义面：网关 kill → 该节点组件 observed 降级 →
-        // supervisor 下轮 reconcile 触发重建
+        // Model a departed link: invalidate the receipt without authorizing
+        // deployment on another node. No process is killed by this test.
         let mut h = HealthWatch::new(vec!["erl-gw-1".into()]).unwrap();
         h.register_node_components("erl-gw-1", vec!["frontier".into()])
             .unwrap();

@@ -1,33 +1,43 @@
+/// Box a response while checking the selected message's associated result type.
+/// No trait imports are required at the invocation site. A mismatched response
+/// remains a compilation error:
+///
+/// ```compile_fail
+/// struct Query;
+/// impl parrot_api::message::Message for Query { type Result = u64; }
+/// let result: parrot_api::types::ActorResult<parrot_api::types::BoxedMessage> =
+///     parrot_api::message_response_ok!(Query, String::from("wrong response"));
+/// ```
 #[macro_export]
 macro_rules! message_response_ok {
     ($type:ty, $value:expr) => {{
         // Compile-time type check - will fail compilation if types don't match
-        let _result_with_type: <$type as Message>::Result = $value;
+        let _result_with_type: <$type as $crate::message::Message>::Result = $value;
 
         // Wrap the result directly within the macro
-        let boxed_result: $crate::types::BoxedMessage =
-            Box::new(_result_with_type) as Box<dyn std::any::Any + Send>;
-        Ok(boxed_result)
+        let boxed_result: $crate::types::BoxedMessage = ::std::boxed::Box::new(_result_with_type);
+        ::core::result::Result::Ok(boxed_result)
     }};
 
     ("option", $type:ty, $value:expr) => {{
-        let _result_with_type: <$type as Message>::Result = $value;
-        let boxed_result: $crate::types::BoxedMessage =
-            Box::new(_result_with_type) as Box<dyn std::any::Any + Send>;
-        Some(Ok(boxed_result))
+        let _result_with_type: <$type as $crate::message::Message>::Result = $value;
+        let boxed_result: $crate::types::BoxedMessage = ::std::boxed::Box::new(_result_with_type);
+        ::core::option::Option::Some(::core::result::Result::Ok(boxed_result))
     }};
 
     ("result", $type:ty, $value:expr) => {{
-        let _result_with_type: <$type as Message>::Result = $value;
-        let boxed_result: $crate::types::BoxedMessage =
-            Box::new(_result_with_type) as Box<dyn std::any::Any + Send>;
-        Ok(boxed_result)
+        let _result_with_type: <$type as $crate::message::Message>::Result = $value;
+        let boxed_result: $crate::types::BoxedMessage = ::std::boxed::Box::new(_result_with_type);
+        ::core::result::Result::Ok(boxed_result)
     }};
 }
 
 /// Matches message types and dispatches to corresponding handler functions
 ///
 /// This macro is used in the Actor's handle_message method to call different handler functions based on message types
+/// The `"async"` form selects a handler synchronously and returns
+/// `ActorResult<BoxedFuture<'_, ActorResult<BoxedMessage>>>`. Its handler is
+/// invoked when that future is polled; unknown message types fail at selection.
 #[macro_export]
 macro_rules! match_message {
     // base version - return ActorResult<BoxedMessage>
@@ -42,7 +52,7 @@ macro_rules! match_message {
                     $crate::message_response_ok!($type, result)
                 }
             )*
-            _ => Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
+            _ => ::core::result::Result::Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
         }
     };
 
@@ -56,7 +66,7 @@ macro_rules! match_message {
                     $crate::message_response_ok!("option", $type, result)
                 }
             )*
-            _ => Some(Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string())))
+            _ => ::core::option::Option::Some(::core::result::Result::Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string())))
         }
     };
 
@@ -70,22 +80,26 @@ macro_rules! match_message {
                     $crate::message_response_ok!("result", $type, result)
                 }
             )*
-            _ => Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
+            _ => ::core::result::Result::Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
         }
     };
 
-    // async version - return ActorResult<BoxedFuture>
+    // Deferred selection uses one erased future type across all message branches.
     ("async", $self:ident, $msg:ident, $( $type:ty => $handler:expr ),* $(,)?) => {
         match () {
             $(
                 _ if $msg.downcast_ref::<$type>().is_some() => {
                     let handler_fn = $handler;
-                    let result = handler_fn($self, $msg.downcast_ref::<$type>().unwrap()).await;
-                    // return BoxedFuture
-                    Ok(Box::pin(result))
+                    let message = $msg.downcast_ref::<$type>().unwrap();
+                    let future: $crate::types::BoxedFuture<'_, $crate::types::ActorResult<$crate::types::BoxedMessage>> =
+                        ::std::boxed::Box::pin(async move {
+                            let result = handler_fn($self, message).await;
+                            $crate::message_response_ok!($type, result)
+                        });
+                    ::core::result::Result::Ok(future)
                 }
             )*
-            _ => Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
+            _ => ::core::result::Result::Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
         }
     };
 }
@@ -108,7 +122,7 @@ macro_rules! match_async_message {
                     $crate::message_response_ok!($type, result)
                 }
             )*
-            _ => Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
+            _ => ::core::result::Result::Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
         }
     };
 
@@ -122,7 +136,7 @@ macro_rules! match_async_message {
                     $crate::message_response_ok!("option", $type, result)
                 }
             )*
-            _ => Some(Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string())))
+            _ => ::core::option::Option::Some(::core::result::Result::Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string())))
         }
     };
 
@@ -136,7 +150,7 @@ macro_rules! match_async_message {
                     $crate::message_response_ok!("result", $type, result)
                 }
             )*
-            _ => Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
+            _ => ::core::result::Result::Err($crate::errors::ActorError::MessageHandlingError("Unknown message type".to_string()))
         }
     };
 }

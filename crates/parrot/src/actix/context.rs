@@ -443,6 +443,15 @@ impl<A> ActorContext for ActixContext<A>
 where
     A: actix::Actor<Context = ActixCtx<A>>,
 {
+    fn resolve_actor(&self, path: &str) -> Option<BoxedActorRef> {
+        self.spawner
+            .service
+            .as_ref()?
+            .upgrade()
+            .ok()?
+            .resolve_actor(path)
+    }
+
     /// Get the actor's self reference
     fn get_self_ref(&self) -> BoxedActorRef {
         self.path.target.clone_boxed()
@@ -677,7 +686,11 @@ where
             .spawner
             .service
             .as_ref()
-            .map(|service| self.tasks.registration_scope(&service.runtime));
+            .and_then(|service| service.upgrade().ok())
+            .map(|service| {
+                self.tasks
+                    .registration_scope(service.root_cohorts.retirement_runtime())
+            });
         let path = self.path.path().to_string();
         Box::pin(async move {
             match (gateway, scope) {
@@ -700,7 +713,11 @@ where
             .spawner
             .service
             .as_ref()
-            .map(|service| self.tasks.registration_scope(&service.runtime));
+            .and_then(|service| service.upgrade().ok())
+            .map(|service| {
+                self.tasks
+                    .registration_scope(service.root_cohorts.retirement_runtime())
+            });
         let key = key.clone();
         let path = self.path.path().to_string();
         Box::pin(async move {

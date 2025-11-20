@@ -33,7 +33,9 @@ def test_actual_module_cli_exports_before_exit_in_both_network_modes(tmp_path,tr
                '--trace-capacity','4','--trace-batch-size','1','--trace-interval','0.01']
         python=[sys.executable]+(['-O'] if sys.flags.optimize else [])
         process=subprocess.Popen(python+[str(fixture),str(root)]+argv,
-            env=dict(os.environ,PYTHONUNBUFFERED='1'),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+            env=dict(os.environ,PYTHONUNBUFFERED='1',
+                     PYTHONPATH=str(Path(__file__).resolve().parents[1])),
+            stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         try:
             if transport=='listen':
                 def ready():

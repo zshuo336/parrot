@@ -1,108 +1,141 @@
-//! S4 · federation-lab CLI（DEV_06 §5.1）。
-//!
-//! 子命令：
-//! - `composegen`：生成 50 集群 compose 拓扑（--out docker-compose.yml）
-//! - `twin`：数字孪生本地目录契约（分批注册/提交/查询）
-//! - `twin --sample N`：抽样遍历（CI 模式）
-//! - `report`：输出 SCALE_REPORT 数据（收敛/路由/带宽指标占位——实测行）
-
+//! Local directory checks and topology planning; network scale gates remain separate.
 use federation_lab::composegen::{ComposeGenConfig, Output};
+use std::{collections::HashSet, ffi::OsString, io::Write, path::PathBuf};
 mod twin_cli;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
-    match cmd {
-        "composegen" => {
-            let mut cfg = ComposeGenConfig::fifty_clusters();
-            parse_common(
-                &args,
-                &mut cfg.clusters,
-                &mut cfg.nodes_per_cluster,
-                &mut cfg.fold,
-            );
-            if let Some(pos) = args.iter().position(|a| a == "--out") {
-                cfg.output = Output::File(args[pos + 1].clone());
-            }
-            match cfg.write_out() {
-                Ok((stats, bytes)) => {
-                    println!("composegen 完成：{stats:?}（{bytes}B）");
-                }
-                Err(e) => {
-                    eprintln!("写盘失败：{e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        "twin" => {
-            if let Err(error) = twin_cli::run(&args[2..]) {
-                eprintln!("twin failed: {error}");
-                std::process::exit(2);
-            }
-        }
-        "twin-app" => {
-            // F4（DEV_09 §3.6）：App 孪生门禁——Manifest 输入
-            let path = args
-                .iter()
-                .position(|a| a == "--manifest")
-                .and_then(|p| args.get(p + 1))
-                .cloned()
-                .unwrap_or_else(|| "crawler.app.toml".into());
-            let m = match parrot_app::manifest::AppManifest::from_file(std::path::Path::new(&path))
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("manifest 读取失败（{path}）：{e}");
-                    std::process::exit(1);
-                }
-            };
-            let r = federation_lab::twin_app::twin_app(&m);
-            println!(
-                "App 孪生门禁 [{}]：components={} wires={} topo={:?}",
-                r.app, r.components, r.wires, r.topo_order
-            );
-            println!("  节点映射：{:?}", r.node_map);
-            println!("  升级矩阵：{:?}", r.upgrade_matrix);
-            if !r.passed {
-                for f in &r.failures {
-                    eprintln!("门禁失败：{f}");
-                }
-                std::process::exit(1);
-            }
-            println!("App 孪生门禁通过（≤100 组件 / DAG / 全分支枚举）");
-        }
-        "help" | "--help" | "-h" => {
-            println!("federation-lab：S4 仿真基建（composegen / twin / report / twin-app）");
-            println!("  composegen [--clusters N] [--nodes-per-cluster N] [--fold K] [--out FILE]");
-            println!("  twin [--clusters N] [--nodes N] [--sample N] [--shards N] [--realm NAME]");
-            println!("  twin-app [--manifest FILE]");
-        }
-        other => {
-            eprintln!("未知子命令：{other}（federation-lab help 查看）");
-            std::process::exit(1);
+fn main() -> std::process::ExitCode {
+    match run(std::env::args_os().skip(1).collect()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("federation-lab: {error}");
+            std::process::ExitCode::from(2)
         }
     }
 }
 
-fn parse_common(
-    args: &[String],
-    clusters: &mut usize,
-    nodes_per_cluster: &mut usize,
-    fold: &mut usize,
-) {
-    let flag = |name: &str| -> Option<usize> {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|p| args.get(p + 1))
-            .and_then(|v| v.parse().ok())
-    };
-    if let Some(v) = flag("--clusters") {
-        *clusters = v;
+fn run(args: Vec<OsString>) -> Result<(), String> {
+    let command = args.first().map(|arg| arg.to_str());
+    let rest = args.get(1..).unwrap_or_default();
+    match command {
+        Some(Some("composegen")) => {
+            let cfg = parse_compose(rest)?;
+            match cfg.output {
+                Output::Buffer => {
+                    let text = cfg.render_yaml().map_err(|error| error.to_string())?;
+                    std::io::stdout()
+                        .lock()
+                        .write_all(text.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                }
+                Output::File(_) => {
+                    let (stats, bytes) = cfg.write_out().map_err(|error| error.to_string())?;
+                    eprintln!("composegen: {stats:?}, {bytes} bytes (topology plan; network runtime not certified)");
+                }
+            }
+            Ok(())
+        }
+        Some(Some("twin")) => {
+            let args = rest
+                .iter()
+                .map(|arg| {
+                    arg.clone()
+                        .into_string()
+                        .map_err(|_| "twin options must be UTF-8".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            twin_cli::run(&args)
+        }
+        Some(Some("twin-app")) => {
+            let path = parse_manifest(rest)?;
+            let manifest = parrot_app::manifest::AppManifest::from_file(&path)
+                .map_err(|error| format!("manifest {}: {error}", path.display()))?;
+            let result = federation_lab::twin_app::twin_app(&manifest);
+            if !result.passed {
+                return Err(format!("app model failed: {:?}", result.failures));
+            }
+            println!(
+                "App model passed [{}]: components={} wires={} topo={:?}",
+                result.app, result.components, result.wires, result.topo_order
+            );
+            println!("  node map: {:?}", result.node_map);
+            println!("  upgrade matrix: {:?}", result.upgrade_matrix);
+            Ok(())
+        }
+        None | Some(Some("help" | "--help" | "-h")) if rest.is_empty() => {
+            println!("federation-lab: local directory checks and topology planning");
+            println!("  composegen [--clusters N] [--nodes-per-cluster N] [--fold 1..4] [--realm NAME] [--out FILE]");
+            println!("  twin [--clusters N] [--nodes N] [--sample N] [--shards N] [--realm NAME]");
+            println!("  twin-app [--manifest FILE]");
+            Ok(())
+        }
+        _ => Err("unknown command or extra arguments; run federation-lab help".into()),
     }
-    if let Some(v) = flag("--nodes-per-cluster") {
-        *nodes_per_cluster = v;
+}
+
+fn parse_compose(args: &[OsString]) -> Result<ComposeGenConfig, String> {
+    let mut cfg = ComposeGenConfig::fifty_clusters();
+    let mut seen = HashSet::new();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let flag = flag.to_str().ok_or("option names must be UTF-8")?;
+        if ![
+            "--clusters",
+            "--nodes-per-cluster",
+            "--fold",
+            "--realm",
+            "--out",
+        ]
+        .contains(&flag)
+        {
+            return Err(format!("unknown composegen option: {flag}"));
+        }
+        if !seen.insert(flag) {
+            return Err(format!("duplicate option: {flag}"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        if value.is_empty() || value.to_str().is_some_and(|text| text.starts_with("--")) {
+            return Err(format!("missing value for {flag}"));
+        }
+        if flag == "--out" {
+            cfg.output = Output::File(PathBuf::from(value));
+            continue;
+        }
+        let value = value
+            .to_str()
+            .ok_or_else(|| format!("{flag} must be UTF-8"))?;
+        if flag == "--realm" {
+            cfg.realm = value.to_string();
+            continue;
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!("{flag} requires an unsigned decimal integer"));
+        }
+        let value = value
+            .parse()
+            .map_err(|_| format!("{flag} integer overflow"))?;
+        match flag {
+            "--clusters" => cfg.clusters = value,
+            "--nodes-per-cluster" => cfg.nodes_per_cluster = value,
+            "--fold" => cfg.fold = value,
+            _ => unreachable!("validated option"),
+        }
     }
-    if let Some(v) = flag("--fold") {
-        *fold = v;
+    cfg.stats().map_err(|error| error.to_string())?;
+    Ok(cfg)
+}
+
+fn parse_manifest(args: &[OsString]) -> Result<PathBuf, String> {
+    match args {
+        [] => Ok(PathBuf::from("apps/crawler-lab/crawler.app.toml")),
+        [flag, path]
+            if flag == "--manifest"
+                && !path.is_empty()
+                && !path.to_str().is_some_and(|text| text.starts_with("--")) =>
+        {
+            Ok(PathBuf::from(path))
+        }
+        _ => Err("twin-app accepts exactly one optional --manifest <path>".into()),
     }
 }

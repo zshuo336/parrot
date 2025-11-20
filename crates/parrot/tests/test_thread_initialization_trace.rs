@@ -169,59 +169,121 @@ async fn case<C: ActorConfig>(
     let mode_name = format!("{mode:?}");
     tokio::time::timeout(Duration::from_secs(15), async {
         let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
-            shared_pool_size: 1, shared_burst_workers_max: 0, max_dedicated_threads: 2,
+            shared_pool_size: 1,
+            shared_burst_workers_max: 0,
+            max_dedicated_threads: 2,
             ..Default::default()
         });
-        let sink = system.spawn_at(Sink, "/init-trace/sink", None, Default::default()).await.unwrap();
+        let sink = system
+            .spawn_at(Sink, "/init-trace/sink", None, Default::default())
+            .await
+            .unwrap();
         let state = Arc::new(State::default());
         let recorder = TraceRecorder::new(8).unwrap();
         let origin = recorder.root();
-        let expected = traced.then_some(Identity { trace: origin.trace_id(), span: origin.span_id() });
+        let expected = traced.then_some(Identity {
+            trace: origin.trace_id(),
+            span: origin.span_id(),
+        });
         let ambient = TraceContext::root();
         let actor = InitProbe::<C> {
-            state: state.clone(), sink: Box::new(sink), hold, config: PhantomData,
+            state: state.clone(),
+            sink: Box::new(sink),
+            hold,
+            config: PhantomData,
         };
         // Build under A (or explicitly None), then poll under B. The operation
         // must retain its construction-time parent across both owner paths.
         let creation = parrot_api::trace::in_scope(traced.then(|| origin.clone()), || {
-            system.spawn_typed_with_config(actor, config(&state), ThreadActorConfig {
-                scheduling_mode: Some(mode), ..Default::default()
-            })
+            system.spawn_typed_with_config(
+                actor,
+                config(&state),
+                ThreadActorConfig {
+                    scheduling_mode: Some(mode),
+                    ..Default::default()
+                },
+            )
         });
-        let reference = ambient.scope(async {
-            let reference = creation.await;
-            assert_eq!(identity(), Some(Identity {
-                trace: ambient.trace_id(), span: ambient.span_id(),
-            }), "returning from creation must restore the polling task context");
-            reference
-        }).await.unwrap();
+        let reference = ambient
+            .scope(async {
+                let reference = creation.await;
+                assert_eq!(
+                    identity(),
+                    Some(Identity {
+                        trace: ambient.trace_id(),
+                        span: ambient.span_id(),
+                    }),
+                    "returning from creation must restore the polling task context"
+                );
+                reference
+            })
+            .await
+            .unwrap();
         assert!(TraceContext::current().is_none());
         state.entered.notified().await;
-        assert_eq!(state.config_disposed.load(Ordering::SeqCst),
+        assert_eq!(
+            state.config_disposed.load(Ordering::SeqCst),
             usize::from(std::mem::needs_drop::<C>()),
-            "configuration retirement must precede user initialization");
+            "configuration retirement must precede user initialization"
+        );
         if !hold {
-            let receipt = reference.send(Box::new(1u64)).await.unwrap()
-                .downcast::<Receipt>().unwrap();
+            let receipt = reference
+                .send(Box::new(1u64))
+                .await
+                .unwrap()
+                .downcast::<Receipt>()
+                .unwrap();
             assert_eq!(receipt.value, 19);
-            assert!(receipt.identity.is_none(), "initialization parent must not leak into later messages");
+            assert!(
+                receipt.identity.is_none(),
+                "initialization parent must not leak into later messages"
+            );
         }
-        reference.stop().await.expect("instance stop must join initialization disposal");
+        reference
+            .stop()
+            .await
+            .expect("instance stop must join initialization disposal");
         assert_eq!(state.disposed.load(Ordering::SeqCst), 1);
-        assert_eq!(state.stops.load(Ordering::SeqCst), usize::from(!hold),
-            "only a fully initialized actor admits the normal Stop hook");
+        assert_eq!(
+            state.stops.load(Ordering::SeqCst),
+            usize::from(!hold),
+            "only a fully initialized actor admits the normal Stop hook"
+        );
         let phases = state.phases.lock().unwrap().clone();
         system.shutdown_internal().await.unwrap();
         assert_eq!(system.actor_count(), 0);
         assert!(TraceContext::current().is_none());
         let names: Vec<_> = phases.iter().map(|row| row.0).collect();
         if hold {
-            assert_eq!(names, ["init-call", "init-poll", "init-resumed", "init-future-drop"]);
+            assert_eq!(
+                names,
+                ["init-call", "init-poll", "init-resumed", "init-future-drop"]
+            );
         } else {
-            assert_eq!(names, ["init-call", "init-poll", "init-resumed", "init-complete", "init-future-drop"]);
+            assert_eq!(
+                names,
+                [
+                    "init-call",
+                    "init-poll",
+                    "init-resumed",
+                    "init-complete",
+                    "init-future-drop"
+                ]
+            );
         }
-        assert!(phases.iter().all(|(_, actual)| *actual == expected),
-            "initialization and its future disposal must retain construction-time parent: {phases:?}");
+        let initialization = phases[0].1;
+        match (initialization, expected) {
+            (Some(child), Some(parent)) => {
+                assert_eq!(child.trace, parent.trace);
+                assert_ne!(child.span, parent.span);
+            }
+            (None, None) => {}
+            mismatch => panic!("initialization lost its admitted parent: {mismatch:?}"),
+        }
+        assert!(
+            phases.iter().all(|(_, actual)| *actual == initialization),
+            "initialization and its future disposal must retain the hook identity: {phases:?}"
+        );
         recorder.close();
         let snapshot = recorder.drain();
         assert!(snapshot.terminal);
@@ -229,26 +291,56 @@ async fn case<C: ActorConfig>(
         assert_eq!(snapshot.counts.overwritten, 0);
         assert_eq!(snapshot.retained, 0);
         assert!(!snapshot.counts.counters_overflowed);
-        let records = u64::from(traced && !hold);
+        let records = u64::from(traced) + u64::from(traced && !hold);
         assert_eq!(snapshot.counts.started, records);
         assert_eq!(snapshot.counts.completed, records);
-        assert_eq!(snapshot.counts.ok, records);
+        assert_eq!(snapshot.counts.ok, records - u64::from(traced && hold));
+        assert_eq!(snapshot.counts.cancelled, u64::from(traced && hold));
         assert_eq!(snapshot.counts.drained, records);
+        if traced {
+            let record = snapshot
+                .records
+                .iter()
+                .find(|record| record.kind == SpanKind::ActorInit)
+                .unwrap();
+            assert_eq!(record.span_id, initialization.unwrap().span);
+            assert_eq!(record.trace_id, origin.trace_id());
+            assert_eq!(record.parent_span_id, Some(origin.span_id()));
+            assert_eq!(
+                record.status,
+                if hold {
+                    SpanStatus::Cancelled
+                } else {
+                    SpanStatus::Ok
+                }
+            );
+        }
         if traced && !hold {
-            assert_eq!(snapshot.records.len(), 1,
-                "real init business call must preserve the recording context across publication");
-            let record = &snapshot.records[0];
+            assert_eq!(
+                snapshot.records.len(),
+                2,
+                "real init business call must preserve the recording context across publication"
+            );
+            let record = snapshot
+                .records
+                .iter()
+                .find(|record| record.kind == SpanKind::DynamicHandler)
+                .unwrap();
             assert_eq!(record.kind, SpanKind::DynamicHandler);
             assert_eq!(record.status, SpanStatus::Ok);
             assert_eq!(record.target, "/init-trace/sink");
             assert_eq!(record.trace_id, origin.trace_id());
-            assert_eq!(record.parent_span_id, Some(origin.span_id()));
-        } else {
+            assert_eq!(record.parent_span_id, Some(initialization.unwrap().span));
+        } else if !traced {
             assert!(snapshot.records.is_empty());
         }
-        eprintln!("PARROT_INIT_TRACE_CASE_OK mode={mode_name} config={} traced={traced} held={hold}",
-            std::any::type_name::<C>());
-    }).await.expect("initialization trace independent liveness watchdog");
+        eprintln!(
+            "PARROT_INIT_TRACE_CASE_OK mode={mode_name} config={} traced={traced} held={hold}",
+            std::any::type_name::<C>()
+        );
+    })
+    .await
+    .expect("initialization trace independent liveness watchdog");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

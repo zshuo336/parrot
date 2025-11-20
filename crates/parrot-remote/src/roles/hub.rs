@@ -1,11 +1,11 @@
-//! F3 · RelayHub actor（DEV_05 §3 / 07 §6.4）。
+//! Standalone relay decision and bounded CID-map helpers (DEV_05 / 07 §6.4).
 //!
 //! hub 节点常驻路由器：收 ASK/TELL → RouteTable 最长前缀 → 换 cid 转发 +
 //! 回程映射（cid_map 有界 65536 LRU——E2.2 防慢回程方撑爆内存）；
 //! REPLY 回程查映射还原 orig_cid。
 //!
-//! POC p4b 已实证全路径（JVM→hub→Erlang 中继 + cid 改写）——本模块是其
-//! actor 化 + RouteGossip 表驱动转正。
+//! This helper creates no actor or network driver. The running system uses
+//! Ingress and ForwardMap for physical connection-bound request forwarding.
 
 use std::collections::HashMap;
 
@@ -92,13 +92,17 @@ impl RelayHub {
     }
 
     fn alloc_cid(&mut self) -> u64 {
-        self.next_cid += 1;
-        self.next_cid
+        loop {
+            self.next_cid = self.next_cid.wrapping_add(1);
+            if self.next_cid != 0 && !self.cid_map.map.contains_key(&self.next_cid) {
+                return self.next_cid;
+            }
+        }
     }
 
     /// 入站 ASK 中继决策。
     ///
-    /// 返回 `(转发目标 next_hop, 改写后的帧参数 (new_cid, payload))`；
+    /// Returns `(next_hop, new_cid, next_hop_count)`; the caller owns the payload.
     /// 无路由 / hop 超限 → Err（调用方回 REPLY_ERR code=7）。
     ///
     /// payload 透传不变形（加密/压缩标志由帧层 flags 携带——中继不触碰）。
@@ -175,6 +179,32 @@ mod tests {
         let (orig, reply_to) = hub.relay_reply(new_cid).unwrap();
         assert_eq!(orig, 777);
         assert_eq!(reply_to, "cloud/_remote");
+    }
+
+    #[test]
+    fn cid_wrap_skips_zero_and_live_return_mappings() {
+        let mut hub = hub_with_routes();
+        hub.cid_map.insert(1, (101, "first-origin".into()));
+        hub.cid_map.insert(2, (202, "second-origin".into()));
+        hub.next_cid = u64::MAX - 1;
+        let (_, last, _) = hub
+            .relay_ask(303, "parrot://eu-1/x", b"last", "last-origin", 0, 8)
+            .unwrap();
+        assert_eq!(last, u64::MAX);
+        let (_, wrapped, _) = hub
+            .relay_ask(404, "parrot://eu-1/x", b"next", "next-origin", 0, 8)
+            .unwrap();
+        assert_eq!(wrapped, 3);
+        for (cid, original, path) in [
+            (1, 101, "first-origin"),
+            (2, 202, "second-origin"),
+            (last, 303, "last-origin"),
+            (wrapped, 404, "next-origin"),
+        ] {
+            assert_eq!(hub.relay_reply(cid), Some((original, path.into())));
+        }
+        assert_eq!(hub.cid_map.len(), 4);
+        assert!(hub.relay_reply(0).is_none());
     }
 
     // F3：无路由 → NoRoute（REPLY_ERR code 7）
@@ -284,12 +314,23 @@ mod tests {
     fn late_reply_dropped() {
         let mut hub = hub_with_routes();
         hub.cid_map = CidMap::new(2);
+        let mut admitted = Vec::new();
         for i in 0..5u64 {
             let (_, new_cid, _) = hub
                 .relay_ask(i, "parrot://eu-1/x", b"", "rt", 0, 8)
                 .unwrap();
-            let _ = new_cid;
+            admitted.push(new_cid);
         }
-        assert!(hub.relay_reply(1).is_none() || hub.relay_reply(2).is_none());
+        for &cid in &admitted[..3] {
+            assert_eq!(
+                hub.relay_reply(cid),
+                None,
+                "evicted reply remained routable"
+            );
+        }
+        for (&cid, original) in admitted[3..].iter().zip(3..5) {
+            assert_eq!(hub.relay_reply(cid), Some((original, "rt".into())));
+        }
+        assert_eq!(hub.cid_map.len(), 2);
     }
 }

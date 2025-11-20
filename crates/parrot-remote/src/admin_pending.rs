@@ -12,6 +12,9 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+#[cfg(test)]
+mod notification_contracts;
+
 pub static WRONG_ADMIN_REPLY_SOURCE: AtomicU64 = AtomicU64::new(0);
 pub static LATE_ADMIN_REPLY: AtomicU64 = AtomicU64::new(0);
 
@@ -35,6 +38,49 @@ struct Slot<R> {
     identity: Arc<()>,
 }
 
+impl<R> Slot<R> {
+    fn notify(self, reply: impl FnOnce() -> Option<R>) -> bool {
+        let Self {
+            tx,
+            connection,
+            identity,
+        } = self;
+        let cleanup = crate::ingress::unwind::Cleanup::default();
+        let mut tx = cleanup.owned(tx);
+        let sent = match cleanup.call(reply) {
+            Ok(Some(reply)) => match cleanup.call(|| tx.take().send(reply)) {
+                Ok(Ok(())) => true,
+                Ok(Err(reply)) => {
+                    cleanup.dispose(reply);
+                    false
+                }
+                // The slot has committed even if its receiver Waker unwinds.
+                Err(()) => true,
+            },
+            Ok(None) | Err(()) => false,
+        };
+        tx.retire();
+        cleanup.dispose(connection);
+        cleanup.dispose(identity);
+        sent
+    }
+}
+
+impl<R> Drop for Pending<R> {
+    fn drop(&mut self) {
+        let slots = std::mem::take(
+            &mut self
+                .state
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner())
+                .slots,
+        );
+        for slot in slots.into_values() {
+            slot.notify(|| None);
+        }
+    }
+}
+
 pub(crate) struct PendingRequest<'a, R> {
     registry: &'a Pending<R>,
     request_id: u64,
@@ -48,7 +94,11 @@ impl<R> Drop for PendingRequest<'_, R> {
             .get(&self.request_id)
             .is_some_and(|slot| Arc::ptr_eq(&slot.identity, &self.identity))
         {
-            state.slots.remove(&self.request_id);
+            let removed = state.slots.remove(&self.request_id);
+            drop(state);
+            if let Some(slot) = removed {
+                slot.notify(|| None);
+            }
         }
     }
 }
@@ -74,7 +124,18 @@ impl<R> Pending<R> {
         self.len() == 0
     }
     pub fn remove(&self, id: u64) -> bool {
-        self.state.lock().unwrap().slots.remove(&id).is_some()
+        let removed = self.state.lock().unwrap().slots.remove(&id);
+        if let Some(slot) = removed {
+            slot.notify(|| None);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Fence admission under an outer lifecycle lock; notify after releasing it.
+    pub(crate) fn close_admission(&self) {
+        self.state.lock().unwrap().closed = true;
     }
 
     /// Trusted process-local registration. Unbound slots cannot receive network replies.
@@ -96,6 +157,8 @@ impl<R> Pending<R> {
         tx: oneshot::Sender<R>,
         connection: Option<FrameSender>,
     ) -> Result<Arc<()>, RemoteError> {
+        let cleanup = crate::ingress::unwind::Cleanup::default();
+        let mut tx = cleanup.owned(tx);
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return Err(RemoteError::Transport("admin registry is shut down".into()));
@@ -115,7 +178,7 @@ impl<R> Pending<R> {
         state.slots.insert(
             id,
             Slot {
-                tx,
+                tx: tx.take(),
                 connection,
                 identity: identity.clone(),
             },
@@ -142,12 +205,9 @@ impl<R> Pending<R> {
 impl<R: AdminResponse> Pending<R> {
     /// Trusted local completion. Network ingress must use complete_from.
     pub fn complete(&self, reply: R) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .slots
-            .remove(&reply.request_id())
-            .is_some_and(|slot| slot.tx.send(reply).is_ok())
+        let id = reply.request_id();
+        let removed = self.state.lock().unwrap().slots.remove(&id);
+        removed.is_some_and(|slot| slot.notify(|| Some(reply)))
     }
     pub fn complete_from(&self, reply: R, source: &FrameSender) -> bool {
         self.consume_from(reply.request_id(), source, true, |_| reply)
@@ -178,42 +238,41 @@ impl<R: AdminResponse> Pending<R> {
             return false;
         }
         let slot = state.slots.remove(&id).expect("checked under lock");
-        let _ = slot.tx.send(reply(id));
+        drop(state);
+        slot.notify(|| Some(reply(id)));
         true
     }
     pub fn fail_connection(&self, connection: &FrameSender, detail: &str) {
-        let mut state = self.state.lock().unwrap();
-        let ids: Vec<_> = state
+        let selected: Vec<_> = self
+            .state
+            .lock()
+            .unwrap()
             .slots
-            .iter()
-            .filter(|(_, slot)| {
+            .extract_if(|_, slot| {
                 slot.connection
                     .as_ref()
                     .is_some_and(|owner| owner.same_connection(connection))
             })
-            .map(|(id, _)| *id)
             .collect();
-        for id in ids {
-            let slot = state.slots.remove(&id).expect("checked under lock");
-            let _ = slot
-                .tx
-                .send(R::failure(id, ErrCode::ConnectionLost, detail));
+        for (id, slot) in selected {
+            slot.notify(|| Some(R::failure(id, ErrCode::ConnectionLost, detail)));
         }
     }
 
     pub fn fail_all(&self, detail: &str) {
-        Self::fail_slots(&mut self.state.lock().unwrap(), detail);
+        let slots = std::mem::take(&mut self.state.lock().unwrap().slots);
+        Self::fail_slots(slots, detail);
     }
     pub fn close(&self, detail: &str) {
         let mut state = self.state.lock().unwrap();
         state.closed = true;
-        Self::fail_slots(&mut state, detail);
+        let slots = std::mem::take(&mut state.slots);
+        drop(state);
+        Self::fail_slots(slots, detail);
     }
-    fn fail_slots(state: &mut State<R>, detail: &str) {
-        for (id, slot) in state.slots.drain() {
-            let _ = slot
-                .tx
-                .send(R::failure(id, ErrCode::ConnectionLost, detail));
+    fn fail_slots(slots: HashMap<u64, Slot<R>>, detail: &str) {
+        for (id, slot) in slots {
+            slot.notify(|| Some(R::failure(id, ErrCode::ConnectionLost, detail)));
         }
     }
 }

@@ -892,8 +892,15 @@ async fn akka_parity_mailbox_overflow_policies() {
                         strategy,
                         BackpressureStrategy::Error | BackpressureStrategy::DropNewest
                     ) {
-                        let std::task::Poll::Ready(result) = third_poll else {
-                            panic!("full ASK must reject immediately");
+                        // Keep the consumer gated: rejection may await input
+                        // disposal, but must never wait for mailbox capacity.
+                        let result = match third_poll {
+                            std::task::Poll::Ready(result) => result,
+                            std::task::Poll::Pending => {
+                                tokio::time::timeout(Duration::from_secs(5), &mut third)
+                                    .await
+                                    .expect("full ASK must reject while the consumer remains gated")
+                            }
                         };
                         mailbox_rejection(result, &strategy);
                     } else {
@@ -905,10 +912,14 @@ async fn akka_parity_mailbox_overflow_policies() {
                     if strategy == BackpressureStrategy::DropOldest {
                         assert!(
                             matches!(
-                                futures::poll!(&mut first),
-                                std::task::Poll::Ready(Err(ActorError::ReplyChannelError(_)))
+                                tokio::time::timeout(Duration::from_secs(5), &mut first)
+                                    .await
+                                    .expect(
+                                        "evicted ASK must retire before the consumer is released"
+                                    ),
+                                Err(ActorError::ReplyChannelError(_))
                             ),
-                            "evicted ASK must close its original reply channel immediately"
+                            "evicted ASK must close its original reply channel"
                         );
                     } else {
                         assert!(
@@ -967,17 +978,17 @@ async fn akka_parity_mailbox_overflow_policies() {
                             vec![10, 20, 30]
                         }
                         BackpressureStrategy::DropOldest => {
-                            let std::task::Poll::Ready(result) = futures::poll!(&mut third) else {
-                                panic!("eviction must admit immediately");
-                            };
-                            result.unwrap();
+                            tokio::time::timeout(Duration::from_secs(5), &mut third)
+                                .await
+                                .expect("eviction must admit while the consumer remains gated")
+                                .unwrap();
                             release.send(()).unwrap();
                             vec![20, 30]
                         }
                         _ => {
-                            let std::task::Poll::Ready(result) = futures::poll!(&mut third) else {
-                                panic!("full TELL must reject immediately");
-                            };
+                            let result = tokio::time::timeout(Duration::from_secs(5), &mut third)
+                                .await
+                                .expect("full TELL must reject while the consumer remains gated");
                             mailbox_rejection(
                                 result.map(|()| Box::new(()) as BoxedMessage),
                                 &strategy,

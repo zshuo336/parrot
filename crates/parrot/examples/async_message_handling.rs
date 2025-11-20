@@ -6,17 +6,15 @@ use parrot::actix as __parrot_engine;
 use std::time::Duration;
 
 use actix::{AsyncContext, Context as ActixBaseContext};
-use anyhow::Error;
-use parrot::actix::message::ActixMessageWrapper;
 use parrot::actix::{ActixActor, ActixActorSystem, ActixContext};
 use parrot::system::ParrotActorSystem;
 use parrot_api::{
     actor::{ActorState, EmptyConfig},
     address::ActorRefExt,
+    context::ActorContext,
     errors::ActorError,
     match_message,
-    message::Message,
-    system::ActorSystemConfig,
+    system::{ActorSystem, ActorSystemConfig},
     types::{ActorResult, BoxedMessage},
 };
 use parrot_api_derive::{Message, ParrotActor};
@@ -52,6 +50,7 @@ struct SaveTaskResult(String);
 #[ParrotActor(engine = "actix")]
 struct AsyncActor {
     processed_tasks: Vec<String>,
+    completed: Option<tokio::sync::oneshot::Sender<()>>,
     #[allow(dead_code)]
     state: ActorState,
 }
@@ -69,34 +68,31 @@ impl AsyncActor {
         )))
     }
 
-    pub fn new() -> Self {
+    pub fn new(completed: tokio::sync::oneshot::Sender<()>) -> Self {
         Self {
             processed_tasks: Vec::new(),
+            completed: Some(completed),
             state: ActorState::Starting,
         }
     }
 
     // Simulate an asynchronous operation, wait for specified time and return result
-    async fn do_async_work(
-        name: String,
-        duration_ms: u64,
-        processed_tasks: &mut Vec<String>,
-    ) -> Result<String, Error> {
+    async fn do_async_work(name: String, duration_ms: u64) -> String {
         println!("Starting async task: {}", name);
-        processed_tasks.push(name.clone());
         sleep(Duration::from_millis(duration_ms)).await;
         println!("Async task completed: {}", name);
-        Ok(format!("{} completed", name))
+        format!("{} completed", name)
     }
 
     // Engine-specific message handling method
     fn handle_message_engine(
         &mut self,
         msg: BoxedMessage,
-        _ctx: &mut ActixContext<ActixActor<Self>>,
-        engine_ctx: parrot_api::actor::EngineContextHandle,
+        ctx: &mut ActixContext<ActixActor<Self>>,
+        mut engine_ctx: parrot_api::actor::EngineContextHandle,
     ) -> Option<ActorResult<BoxedMessage>> {
-        let actix_ctx = engine_ctx.downcast_ref::<ActixBaseContext<ActixActor<Self>>>();
+        let self_ref = ctx.get_self_ref();
+        let actix_ctx = engine_ctx.downcast_mut::<ActixBaseContext<ActixActor<Self>>>();
         assert!(actix_ctx.is_some());
         let actix_ctx = actix_ctx.unwrap();
 
@@ -106,30 +102,14 @@ impl AsyncActor {
                 println!("Received SpawnAsyncTask message: {}", task.name);
                 let task_name = task.name.clone();
                 let duration = task.duration_ms;
-                // Clone address before async closure, instead of directly using context
-                let addr = actix_ctx.address().clone();
-
-                // Use actix::Arbiter to execute async task
-                actix::Arbiter::current().spawn(async move {
-                    println!("address: {:?}", addr);
-                    // Execute async operation - don't use self reference
-                    let mut tasks = Vec::new();
-                    let result = Self::do_async_work(task_name.clone(), duration, &mut tasks).await;
-
-                    // If we need to save results, we should send a message back to the actor
-                    match result {
-                        Ok(result) => {
-                            println!("Async task [{}] executed successfully: {}", task_name, result);
-                            // Properly wrap message when sending back to actor
-                            let msg = SaveTaskResult(task_name.clone());
-                            // Use create_envelope helper function
-                            let envelope = parrot::actix::message::create_envelope(msg);
-                            let wrapper = ActixMessageWrapper { envelope };
-                            addr.do_send(wrapper);
-                        },
-                        Err(e) => println!("Async task [{}] failed: {}", task_name, e),
+                // The native context owns this future and cancels it on stop.
+                actix_ctx.spawn(actix::fut::wrap_future::<_, ActixActor<Self>>(async move {
+                    let result = Self::do_async_work(task_name.clone(), duration).await;
+                    println!("Async task [{task_name}] executed successfully: {result}");
+                    if let Err(error) = self_ref.deliver(Box::new(SaveTaskResult(task_name))).await {
+                        eprintln!("saving async result failed: {error}");
                     }
-                });
+                }));
 
                 // Since the task is async, we return immediately without waiting for the result
 
@@ -143,7 +123,10 @@ impl AsyncActor {
             // Handle save task result message
             SaveTaskResult => |actor: &mut Self, msg: &SaveTaskResult| {
                 actor.processed_tasks.push(msg.0.clone());
-
+                if actor.processed_tasks.len() == 2
+                    && let Some(completed) = actor.completed.take() {
+                    let _ = completed.send(());
+                }
             }
         )
     }
@@ -176,41 +159,44 @@ async fn run_async_example() -> Result<(), Box<dyn std::error::Error>> {
         .register_actix_system("actix".to_string(), actix_system, true)
         .await?;
 
-    // Create async processing Actor
-    let actor = AsyncActor::new();
-    let actor_ref = system.spawn_root_actix(actor, EmptyConfig).await?;
+    let result = async {
+        // Completion is emitted by the actor after both saved results are applied.
+        let (completed, received) = tokio::sync::oneshot::channel();
+        let actor = AsyncActor::new(completed);
+        let actor_ref = system.spawn_root_actix(actor, EmptyConfig).await?;
 
-    println!("1. Testing async task spawning (without waiting for results)");
-    // Send multiple async task messages
-    actor_ref
-        .ask(SpawnAsyncTask {
-            name: "Task A".to_string(),
-            duration_ms: 2000,
-        })
-        .await?;
+        println!("1. Testing async task spawning (without waiting for results)");
+        // Send multiple async task messages
+        actor_ref
+            .ask(SpawnAsyncTask {
+                name: "Task A".to_string(),
+                duration_ms: 20,
+            })
+            .await?;
 
-    actor_ref
-        .ask(SpawnAsyncTask {
-            name: "Task B".to_string(),
-            duration_ms: 1000,
-        })
-        .await?;
+        actor_ref
+            .ask(SpawnAsyncTask {
+                name: "Task B".to_string(),
+                duration_ms: 10,
+            })
+            .await?;
 
-    // Wait some time for async tasks to execute
-    println!("Waiting for async tasks to execute...");
-    tokio::time::sleep(Duration::from_millis(5000)).await;
+        tokio::time::timeout(Duration::from_secs(5), received).await??;
 
-    // Get list of processed tasks
-    let processed_tasks = actor_ref.ask(GetProcessedTasks).await?;
-    println!("\nList of processed tasks:");
-    for task in processed_tasks {
-        println!("- {}", task);
+        // Get list of processed tasks
+        let mut processed_tasks = actor_ref.ask(GetProcessedTasks).await?;
+        processed_tasks.sort();
+        assert_eq!(processed_tasks, ["Task A", "Task B"]);
+        println!("\nList of processed tasks:");
+        for task in processed_tasks {
+            println!("- {}", task);
+        }
+
+        Ok::<_, Box<dyn std::error::Error>>(())
     }
-
-    // Wait enough time for all async tasks to complete
-    println!("\nWaiting for all async tasks to complete...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    println!("Example completed, exiting program");
+    .await;
+    ActorSystem::shutdown(system).await?;
+    result?;
+    println!("async tasks=2; saved=2; system retired");
     Ok(())
 }

@@ -5,8 +5,7 @@ edition = "2021"
 description = "Parrot 应用体系：AppManifest 声明式应用模型 + Planner + AssemblingContext（DEV_09 A 阶段）"
 license = "MIT"
 
-# 分层铁律（09 §2.2）：应用定义与本地组装。不依赖 parrot 主 crate
-# （引擎访问经 parrot-remote facade 协议 / PropsFactory 机制）。
+# 默认库提供应用定义和宿主注入接口；host feature 启用直接依赖 parrot 的 Runner。
 [dependencies]
 parrot-api = { path = "../parrot-api", features = ["remote"] }
 parrot-config = { path = "../parrot-config" }
@@ -17,13 +16,14 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 httpdate = "1.0.3"
 toml = "0.8"
+toml_edit = { version = "0.22", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 async-trait = "0.1"
 futures = "0.3"
 bytes = { version = "1", features = ["serde"] }
 
-# 宿主形态（09 §2.2 分层：宿主 Runner 依赖引擎；lib 本体零引擎依赖）。
+# 可选宿主形态：host/wasm/dylib 启用相应引擎适配器。
 parrot = { path = "../parrot", optional = true }
 parrot-wasm = { path = "../parrot-wasm", features = ["runtime"], optional = true }
 parrot-abi = { path = "../parrot-abi", features = ["loader"], optional = true }
@@ -65,6 +65,10 @@ required-features = ["wasm"]
 
 [[example]]
 name = "dylib_manifest"
+required-features = ["dylib"]
+
+[[example]]
+name = "native_services"
 required-features = ["dylib"]
 
 [[example]]

@@ -75,6 +75,45 @@ fn configured_transport_is_preserved() {
         );
     }
 }
+
+#[test]
+fn receptionist_relay_grants_are_wired_with_independent_default_deny() {
+    use parrot_remote::acl::AclDecision;
+    let mut config = resolved("tcp", "relay-config");
+    config.remote.receptionist.default_deny = false;
+    config.remote.receptionist.relays = [("relay".into(), vec!["edge/public".into()])].into();
+    let runtime = RemoteConfig::from_resolved(&config).unwrap();
+    assert_eq!(
+        runtime.receptionist_acl.check("owner", "edge/private"),
+        AclDecision::Allow
+    );
+    assert_eq!(
+        runtime
+            .receptionist_relay_acl
+            .check("relay", "edge/public/service"),
+        AclDecision::Allow
+    );
+    assert_eq!(
+        runtime
+            .receptionist_relay_acl
+            .check("relay", "edge/private"),
+        AclDecision::Deny
+    );
+    assert_eq!(
+        runtime
+            .receptionist_relay_acl
+            .check("ungranted", "edge/public"),
+        AclDecision::Deny
+    );
+    config.remote.receptionist.relays.clear();
+    assert_eq!(
+        RemoteConfig::from_resolved(&config)
+            .unwrap()
+            .receptionist_relay_acl
+            .check("relay", "edge/public"),
+        AclDecision::Deny
+    );
+}
 #[test]
 fn memory_seed_is_not_silently_discarded() {
     let mut cfg = resolved("mem", "memory-client");
@@ -323,6 +362,22 @@ fn direct_configs_reject_invalid_values_before_transport_side_effects() {
         parrot_remote::NodeAddr::tcp("peer", "127.0.0.1:0".parse().unwrap()),
     ]));
     for knobs in [
+        parrot_remote::transport::RuntimeKnobs {
+            connection_capacity: 0,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
+            connection_capacity: usize::MAX,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
+            handshake_capacity: 0,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
+            handshake_capacity: usize::MAX,
+            ..Default::default()
+        },
         parrot_remote::transport::RuntimeKnobs {
             inbound_ask_capacity: 0,
             ..Default::default()

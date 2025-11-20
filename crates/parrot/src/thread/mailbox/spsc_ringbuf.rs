@@ -42,6 +42,7 @@ pub struct SpscRingbufMailbox {
     wake_hook: StdMutex<Option<crate::thread::mailbox::WakeHook>>,
     /// Scheduling slot state (single-owner processing guard).
     schedule_state: crate::thread::mailbox::ScheduleState,
+    close_state: Arc<crate::thread::mailbox::CloseState>,
 }
 
 type HeapProd = <HeapRb<BoxedMessage> as Split>::Prod;
@@ -75,6 +76,7 @@ impl SpscRingbufMailbox {
             processor: StdMutex::new(None),
             wake_hook: StdMutex::new(None),
             schedule_state: crate::thread::mailbox::ScheduleState::default(),
+            close_state: Arc::new(crate::thread::mailbox::CloseState::new()),
         }
     }
 
@@ -88,14 +90,35 @@ impl SpscRingbufMailbox {
         self.is_closed.load(Ordering::SeqCst)
     }
 
-    /// Push helper: returns Err(()) when the ring rejected the item.
-    fn try_push_msg(producer: &mut HeapProd, msg: BoxedMessage) -> Result<(), ()> {
-        producer.try_push(msg).map_err(|_| ())
-    }
-
     fn notify_ready(&self) {
         self.notify.notify_one();
         self.fire_wake_hook();
+    }
+}
+
+impl Drop for SpscRingbufMailbox {
+    fn drop(&mut self) {
+        self.is_closed.store(true, Ordering::SeqCst);
+        let consumer = self.consumer.get_mut();
+        let mut drained = Vec::new();
+        while let Some(message) = consumer.try_pop() {
+            drained.push(message);
+        }
+        for message in drained {
+            super::retire_on_drop(message, "message");
+        }
+        let processor = self
+            .processor
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let hook = self
+            .wake_hook
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        super::retire_on_drop(processor, "processor");
+        super::retire_on_drop(hook, "wake hook");
     }
 }
 
@@ -106,48 +129,61 @@ impl Mailbox for SpscRingbufMailbox {
         msg: BoxedMessage,
         strategy: BackpressureStrategy,
     ) -> Result<(), MailboxError> {
-        loop {
-            let mut evicted = None;
-            let available = self.capacity_notify.notified();
-            tokio::pin!(available);
-            available.as_mut().enable();
-            if self.closed() {
-                return Err(MailboxError::Closed);
-            }
-            let mut producer = self.producer.lock().await;
-            // Close also owns this lock, so no producer can publish after drain.
-            if self.closed() {
-                return Err(MailboxError::Closed);
-            }
-            if producer.is_full() {
-                match strategy {
-                    BackpressureStrategy::DropNewest => {
-                        return Err(MailboxError::Dropped {
-                            capacity: self.capacity,
-                        });
-                    }
-                    BackpressureStrategy::Error => {
-                        return Err(MailboxError::Full {
-                            capacity: self.capacity,
-                        });
-                    }
-                    BackpressureStrategy::DropOldest => {
-                        evicted = self.consumer.lock().await.try_pop();
-                    }
-                    BackpressureStrategy::Block => {
-                        drop(producer);
-                        available.await;
-                        continue;
+        let mut msg = Some(super::Input::unbound(msg));
+        let mut evicted = None;
+        let result = async {
+            loop {
+                let available = self.capacity_notify.notified();
+                tokio::pin!(available);
+                available.as_mut().enable();
+                if self.closed() {
+                    return Err(MailboxError::Closed);
+                }
+                let mut producer = self.producer.lock().await;
+                // Close also owns this lock, so no producer can publish after drain.
+                if self.closed() {
+                    return Err(MailboxError::Closed);
+                }
+                if producer.is_full() {
+                    match strategy {
+                        BackpressureStrategy::DropNewest => {
+                            return Err(MailboxError::Dropped {
+                                capacity: self.capacity,
+                            });
+                        }
+                        BackpressureStrategy::Error => {
+                            return Err(MailboxError::Full {
+                                capacity: self.capacity,
+                            });
+                        }
+                        BackpressureStrategy::DropOldest => {
+                            evicted = self
+                                .consumer
+                                .lock()
+                                .await
+                                .try_pop()
+                                .map(super::Input::unbound);
+                        }
+                        BackpressureStrategy::Block => {
+                            drop(producer);
+                            available.await;
+                            continue;
+                        }
                     }
                 }
+                if let Err(returned) = producer.try_push(msg.take().unwrap().take()) {
+                    msg = Some(super::Input::unbound(returned));
+                    return Err(MailboxError::PushError("ring buffer push failed".into()));
+                }
+                drop(producer);
+                return Ok(());
             }
-            Self::try_push_msg(&mut producer, msg)
-                .map_err(|()| MailboxError::PushError("ring buffer push failed".into()))?;
-            drop(producer);
-            drop(evicted);
-            self.notify_ready();
-            return Ok(());
         }
+        .await;
+        if result.is_ok() {
+            self.notify_ready();
+        }
+        super::finish_push(result, msg, evicted).await
     }
 
     async fn pop(&self) -> Option<BoxedMessage> {
@@ -186,16 +222,43 @@ impl Mailbox for SpscRingbufMailbox {
 
     async fn close(&self) {
         self.seal();
-        let drained = {
-            let _producer = self.producer.lock().await;
-            let mut consumer = self.consumer.lock().await;
-            let mut drained = Vec::new();
-            while let Some(message) = consumer.try_pop() {
-                drained.push(message);
+        let mut reservation = None;
+        let drained = loop {
+            let attempt = {
+                let _producer = self.producer.lock().await;
+                let mut consumer = self.consumer.lock().await;
+                match self
+                    .close_state
+                    .claim(!consumer.is_empty(), reservation.is_some())
+                {
+                    super::CloseAttempt::Owned(()) => {
+                        let mut drained = Vec::new();
+                        while let Some(message) = consumer.try_pop() {
+                            drained.push(message);
+                        }
+                        super::CloseAttempt::Owned(drained)
+                    }
+                    super::CloseAttempt::Reservation => super::CloseAttempt::Reservation,
+                    super::CloseAttempt::Observing => super::CloseAttempt::Observing,
+                }
+            };
+            match attempt {
+                super::CloseAttempt::Owned(values) => break Some(values),
+                super::CloseAttempt::Observing => break None,
+                super::CloseAttempt::Reservation => {
+                    reservation = self.close_state.reserve().await;
+                    if reservation.is_none() {
+                        break None;
+                    }
+                }
             }
-            drained
         };
-        drop(drained);
+        if let Some(drained) = drained {
+            self.close_state.start_drain(drained, reservation);
+        } else {
+            drop(reservation);
+        }
+        self.close_state.wait().await;
     }
 
     async fn is_closed(&self) -> bool {
@@ -203,7 +266,8 @@ impl Mailbox for SpscRingbufMailbox {
     }
 
     fn set_processor(&self, processor: Arc<dyn ProcessorInterface>) {
-        *self.processor.lock().unwrap() = Some(processor);
+        let old = self.processor.lock().unwrap().replace(processor);
+        drop(old);
     }
 
     fn get_processor(&self) -> Option<Arc<dyn ProcessorInterface>> {
@@ -215,13 +279,13 @@ impl Mailbox for SpscRingbufMailbox {
     }
 
     fn set_wake_hook(&self, hook: crate::thread::mailbox::WakeHook) {
-        *self.wake_hook.lock().unwrap() = Some(hook);
+        let old = self.wake_hook.lock().unwrap().replace(hook);
+        drop(old);
     }
 
     fn fire_wake_hook(&self) {
-        if let Some(hook) = self.wake_hook.lock().unwrap().as_ref() {
-            hook();
-        }
+        let hook = self.wake_hook.lock().unwrap().clone();
+        super::invoke_wake_hook(hook);
     }
 
     fn schedule_state(&self) -> &crate::thread::mailbox::ScheduleState {
@@ -235,6 +299,7 @@ mod tests {
     use parrot_api::address::ActorRef;
     use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, WeakActorTarget};
     use std::any::Any;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     /// Mock implementation of ActorRef for testing
@@ -404,5 +469,97 @@ mod tests {
         assert!(matches!(result, Err(MailboxError::Closed)));
 
         assert_eq!(mailbox.len().await, 0);
+    }
+
+    struct LockedInput(Arc<AtomicUsize>);
+    impl Drop for LockedInput {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("ring lock-wait input");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_wait_for_producer_lock_retires_input_after_unlock() {
+        let mailbox = SpscRingbufMailbox::new(2, create_test_actor_path("lock-wait"));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let _producer = mailbox.producer.lock().await;
+        let mut pending = Box::pin(mailbox.push(
+            Box::new(LockedInput(drops.clone())),
+            BackpressureStrategy::Block,
+        ));
+        assert!(futures::poll!(&mut pending).is_pending());
+        drop(pending);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while drops.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled lock waiter must retire its input");
+        drop(_producer);
+        mailbox
+            .push(Box::new(91_u64), BackpressureStrategy::Error)
+            .await
+            .unwrap();
+        assert_eq!(*mailbox.pop().await.unwrap().downcast::<u64>().unwrap(), 91);
+    }
+
+    async fn retry_cancelled_close_lock_wait(producer: bool) {
+        struct CountDrop(Arc<AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mailbox = SpscRingbufMailbox::new(2, create_test_actor_path("close-lock-wait"));
+        let drops = Arc::new(AtomicUsize::new(0));
+        mailbox
+            .push(
+                Box::new(CountDrop(drops.clone())),
+                BackpressureStrategy::Error,
+            )
+            .await
+            .unwrap();
+        let producer_guard = if producer {
+            Some(mailbox.producer.lock().await)
+        } else {
+            None
+        };
+        let consumer_guard = if producer {
+            None
+        } else {
+            Some(mailbox.consumer.lock().await)
+        };
+        for _ in 0..3 {
+            let mut close = Box::pin(mailbox.close());
+            assert!(futures::poll!(&mut close).is_pending());
+            drop(close);
+            assert!(mailbox.is_closed().await);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        let mut retry = Box::pin(mailbox.close());
+        assert!(futures::poll!(&mut retry).is_pending());
+        drop(consumer_guard);
+        drop(producer_guard);
+        tokio::time::timeout(Duration::from_secs(2), retry)
+            .await
+            .expect("cancelled lock waiter must not strand close ownership");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(mailbox.len().await, 0);
+        tokio::time::timeout(Duration::from_secs(2), mailbox.close())
+            .await
+            .expect("completed close must remain repeatable");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_waiting_for_producer_lock_can_be_retried() {
+        retry_cancelled_close_lock_wait(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_waiting_for_consumer_lock_can_be_retried() {
+        retry_cancelled_close_lock_wait(false).await;
     }
 }

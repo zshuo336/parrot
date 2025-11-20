@@ -7,6 +7,12 @@ use std::{
 };
 use tokio::{sync::watch, time::Instant};
 use uuid::Uuid;
+#[cfg(test)]
+#[path = "recovery_budget_contracts.rs"]
+mod budget_contracts;
+#[cfg(test)]
+#[path = "prepared_saturation_contracts.rs"]
+mod prepared_saturation_contracts;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -26,6 +32,8 @@ struct State {
     phase: u8,
     committed: bool,
     error: Option<String>,
+    cancelled: bool,
+    creation_deadline: Option<Instant>,
 }
 type Release = Box<dyn FnOnce(bool) + Send + 'static>;
 pub(crate) struct Recovery {
@@ -65,6 +73,8 @@ impl Recovery {
                 phase: 0,
                 committed: false,
                 error: None,
+                cancelled: false,
+                creation_deadline: None,
             }),
             progress: watch::channel(Progress::Phase(0)).0,
             release: Mutex::new(Some(release)),
@@ -74,6 +84,38 @@ impl Recovery {
     pub(crate) fn on_activation(&self, publish: Box<dyn FnOnce() + Send>) {
         self.publications.lock().unwrap().push(publish);
     }
+    /// Admit a new generation only after all old generations retired. The
+    /// earliest member budget also bounds the final publication vote.
+    pub(crate) fn creation_control(
+        &self,
+        member: Uuid,
+        deadline: Instant,
+    ) -> Result<Arc<ConstructionControl>, String> {
+        let deadline = deadline.min(self.deadline);
+        {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = &state.error {
+                return Err(error.clone());
+            }
+            if state.committed || state.phase != 1 || state.next.get(&member) != Some(&1) {
+                return Err("cohort construction admitted outside preparation".into());
+            }
+            state.creation_deadline = Some(
+                state
+                    .creation_deadline
+                    .map_or(deadline, |old| old.min(deadline)),
+            );
+        }
+        self.progress.send_modify(|_| {});
+        Ok(self.control.bounded(deadline))
+    }
+    fn deadline(&self) -> Instant {
+        self.state
+            .lock()
+            .unwrap()
+            .creation_deadline
+            .unwrap_or(self.deadline)
+    }
     fn release(&self, committed: bool) {
         let release = self.release.lock().unwrap().take();
         // Engine/topology callbacks run outside the epoch lock.
@@ -82,14 +124,26 @@ impl Recovery {
         }
     }
     pub(crate) fn abort(&self, error: impl Into<String>) {
+        self.terminate(error.into(), false);
+    }
+    pub(crate) fn cancel(&self, reason: impl Into<String>) {
+        self.terminate(reason.into(), true);
+    }
+    pub(crate) fn was_cancelled(&self) -> bool {
+        self.state.lock().unwrap().cancelled
+    }
+    pub(crate) fn failure_reason(&self) -> Option<String> {
+        self.state.lock().unwrap().error.clone()
+    }
+    fn terminate(&self, error: String, cancelled: bool) {
         let mut state = self.state.lock().unwrap();
         // The last valid publication acknowledgement commits the cohort. A
         // later explicit member stop belongs to the new live generation.
         if state.committed || state.error.is_some() {
             return;
         }
-        let error = error.into();
         state.error = Some(error.clone());
+        state.cancelled = cancelled;
         self.control.cancel();
         self.progress.send_replace(Progress::Aborted(error));
     }
@@ -106,7 +160,7 @@ impl Recovery {
             if let Some(error) = &state.error {
                 return Err(error.clone());
             }
-            if Instant::now() >= self.deadline {
+            if Instant::now() >= state.creation_deadline.unwrap_or(self.deadline) {
                 Some("cohort recovery deadline expired".to_owned())
             } else if state.phase != step as u8 || state.next.get(&member) != Some(&(step as u8)) {
                 Some(format!(
@@ -168,7 +222,7 @@ impl Recovery {
             } else {
                 tokio::select! {
                     changed = receipt.changed() => { changed.map_err(|_| "cohort owner disappeared".to_owned())?; },
-                    _ = tokio::time::sleep_until(self.deadline) => self.abort("cohort recovery deadline expired"),
+                    _ = tokio::time::sleep_until(self.deadline()) => self.abort("cohort recovery deadline expired"),
                 }
             }
         }
@@ -285,6 +339,23 @@ mod tests {
         recovery.retired_after_abort(ids[1]);
         recovery.retired_after_abort(ids[1]);
         assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn cancellation_is_distinct_from_failure_and_first_cause_wins() {
+        let (cancelled, _, _) = fixture();
+        cancelled.cancel("explicit stop");
+        cancelled.abort("late participant failure");
+        assert!(cancelled.was_cancelled());
+        assert_eq!(cancelled.activation().await.unwrap_err(), "explicit stop");
+
+        let (failed, _, _) = fixture();
+        failed.abort("constructor failure");
+        failed.cancel("late stop");
+        assert!(!failed.was_cancelled());
+        assert_eq!(
+            failed.activation().await.unwrap_err(),
+            "constructor failure"
+        );
     }
     #[tokio::test]
     async fn duplicate_arrival_cannot_supply_a_missing_siblings_vote() {

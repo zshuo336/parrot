@@ -333,12 +333,17 @@ fn sandbox_fuel_metrics_counted() {
 // background ticker here races fuel exhaustion and tests OS scheduling.
 
 #[test]
-fn sandbox_trap_does_not_corrupt_host() {
+fn guest_business_errors_preserve_state_and_host_progress() {
     let r = rt(100_000);
     let mut c = inst(&r);
-    // 多次 trap 后宿主仍正常
+    c.tell("bump", &[7]).unwrap();
+    // A guest Result::Err is not a Wasmtime trap and must not reset its Store.
     for _ in 0..3 {
-        let _ = c.handle("err", &[]).unwrap_err();
+        assert_eq!(
+            c.handle("err", &[]),
+            Err(ComponentError::Trap("fixture-err".into()))
+        );
+        assert_eq!(c.handle("counter", &[]).unwrap(), 7u64.to_le_bytes());
     }
     let out = c.handle("up", &0u64.to_le_bytes()).unwrap();
     assert_eq!(u64::from_le_bytes(out.try_into().unwrap()), 1);
@@ -373,10 +378,10 @@ fn state_drop_rebuild_no_residual() {
 }
 
 #[test]
-fn lifecycle_on_start_once() {
+fn repeated_explicit_startup_preserves_guest_started_flag() {
     let r = rt(100_000);
     let mut c = inst(&r);
-    // 重复调用幂等（fixture 标记型——多次 set true 不变）
+    // This fixture observes a flag, not invocation count or runtime idempotence.
     c.on_start().unwrap();
     let out = c.handle("started", &[]).unwrap();
     assert_eq!(out, vec![1]);
@@ -461,13 +466,20 @@ fn metrics_instantiate_time_recorded() {
 }
 
 #[test]
-fn metrics_fuel_scales_with_work() {
+fn metrics_fuel_is_recorded_for_each_payload_size() {
     let r = rt(100_000);
     let mut c = inst(&r);
-    let _ = c.handle("echo", &[0u8; 64]).unwrap(); // 小载荷
-    let _ = c.handle("echo", &[0u8; 4096]).unwrap(); // 大载荷
-    let m = c.take_metrics();
-    assert!(m.fuel_consumed > 0);
+    c.take_metrics();
+    for size in [64, 4096] {
+        let payload = vec![0u8; size];
+        assert_eq!(c.handle("echo", &payload).unwrap(), payload);
+        let metrics = c.take_metrics();
+        assert_eq!(metrics.messages, 1);
+        assert!(metrics.fuel_consumed > 0, "unmetered payload size={size}");
+        assert_eq!(metrics.out_of_fuel_count, 0);
+        assert_eq!(metrics.trap_count, 0);
+        assert_eq!(c.take_metrics(), WasmMetrics::default());
+    }
 }
 
 // ════════════════════════════════════════════════════════════

@@ -2,6 +2,7 @@
 use super::*;
 use crate::actix::lifecycle::ActorExit;
 use crate::owned_payload::OwnedPayload;
+use crate::typed_supervision::Restart;
 use parrot_api::supervisor::{
     BasicDecisionFn, OneForOneStrategy, SupervisionDecision, SupervisorStrategyType,
 };
@@ -154,50 +155,86 @@ where
     use crate::children::recovery::Step;
     let _abort = AbortGroup(group.clone());
     let control = inputs.control.clone();
-    control.begin_construction(group.deadline);
+    control.begin_construction_quiet(group.deadline);
+    control.construction_changed();
     let member = control.lifetime.id;
     let work = async {
         retire_generation(inputs).await?;
-        group
-            .arrive(member, Step::Retired)
-            .await
-            .map_err(ActorError::InternalError)?;
-        inputs.actor = parrot_api::trace::scope(
+        if let Err(error) = group.arrive(member, Step::Retired).await {
+            return if group.was_cancelled() {
+                Ok(false)
+            } else {
+                Err(ActorError::InternalError(error))
+            };
+        }
+        let deadline = control.begin_reconstruction(group.deadline);
+        let construction = match group.creation_control(member, deadline) {
+            Ok(control) => control,
+            Err(_) if group.was_cancelled() => return Ok(false),
+            Err(error) => return Err(ActorError::InternalError(error)),
+        };
+        let prepared = parrot_api::trace::scope(
             group.failure_context.clone(),
             prepare(
                 factory,
                 &control,
                 inputs.constructor_slots.clone(),
-                group.deadline,
-                Some(&group.control),
+                deadline,
+                Some(&construction),
             ),
         )
-        .await?;
+        .await;
+        inputs.actor = match prepared {
+            Ok(actor) => actor,
+            Err(ActorError::Stopped) if group.was_cancelled() => return Ok(false),
+            Err(ActorError::Stopped) if group.failure_reason().is_some() => {
+                return Err(ActorError::InternalError(group.failure_reason().unwrap()));
+            }
+            Err(error) => return Err(error),
+        };
         if inputs.actor.is_none() {
-            return Err(ActorError::Stopped);
+            return Ok(false);
         }
-        group
-            .arrive(member, Step::Prepared)
-            .await
-            .map_err(ActorError::InternalError)?;
-        if group.control.is_cancelled() || control.channel.is_sealed() {
-            return Err(ActorError::Stopped);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(control.enforce_deadline());
         }
-        control.escalated.lock().unwrap().take();
+        if let Err(error) = group.arrive(member, Step::Prepared).await {
+            return if group.was_cancelled() {
+                Ok(false)
+            } else {
+                Err(ActorError::InternalError(error))
+            };
+        }
+        if construction.is_cancelled() || control.channel.is_sealed() {
+            return if group.was_cancelled() {
+                Ok(false)
+            } else {
+                Err(ActorError::InternalError(
+                    group
+                        .failure_reason()
+                        .unwrap_or_else(|| "Local cohort stopped before publication".into()),
+                ))
+            };
+        }
+        let removed = control.escalated.lock().unwrap().take();
+        drop(removed);
         control.typed_tree().next_generation()?;
         inputs.creation_context = group.failure_context.clone();
-        group
-            .arrive(member, Step::Published)
-            .await
-            .map_err(ActorError::InternalError)?;
-        control.construction_complete(group.deadline)
+        if let Err(error) = group.arrive(member, Step::Published).await {
+            return if group.was_cancelled() {
+                Ok(false)
+            } else {
+                Err(ActorError::InternalError(error))
+            };
+        }
+        control.construction_complete(deadline)
     };
     tokio::pin!(work);
     tokio::select! {
         biased;
         result = &mut work => result,
-        _ = control.channel.closed() => { group.abort("explicit stop cancelled Local cohort"); work.await },
-        _ = tokio::time::sleep_until(group.deadline) => { group.abort("Local cohort recovery deadline elapsed"); control.begin_cleanup(group.deadline); work.await },
+        _ = control.channel.closed() => { group.cancel("explicit stop cancelled Local cohort"); work.await },
+        _ = control.expired() => { group.abort("Local cohort creation/recovery deadline elapsed"); control.begin_cleanup(control.cleanup_deadline().unwrap_or(group.deadline)); work.await },
     }
 }
 async fn retire_generation<A: LocalTypedDispatch>(
@@ -240,14 +277,14 @@ async fn retire_generation<A: LocalTypedDispatch>(
 async fn restart<A: LocalTypedDispatch, F: Fn() -> A + Send + 'static>(
     inputs: &mut TypedInputs<A>,
     factory: &crate::owned_payload::OwnedPayload<F>,
-    error: Arc<ActorError>,
+    error: crate::error_receipt::ActorReceipt,
     deadline: tokio::time::Instant,
     runtime: &tokio::runtime::Handle,
-) -> ActorResult<bool> {
+) -> ActorResult<Restart> {
     let control = inputs.control.clone();
     if control.channel.is_sealed() || tokio::time::Instant::now() >= deadline {
         control.begin_cleanup(deadline);
-        return Ok(false);
+        return Ok(Restart::Declined);
     }
     let policy = control
         .lifetime
@@ -255,27 +292,38 @@ async fn restart<A: LocalTypedDispatch, F: Fn() -> A + Send + 'static>(
         .await?;
     let failure_context = if let Some(policy) = policy {
         if let Some(group) = policy.recovery.clone() {
-            return rebuild_group(inputs, factory, group, runtime).await;
+            return rebuild_group(inputs, factory, group, runtime)
+                .await
+                .map(Restart::constructed);
         }
         if policy.decision != SupervisionDecision::Restart {
             control.typed_tree().defer_failure(error, policy);
-            return Ok(false);
+            return Ok(Restart::Declined);
         }
         policy.failure_context
     } else {
-        return Ok(false);
+        return Ok(Restart::Declined);
     };
     parrot_api::trace::scope(failure_context.clone(), async move {
-        let deadline = control.begin_construction(deadline);
+        control.begin_construction_quiet(deadline);
+        control.construction_changed();
         retire_generation(inputs).await?;
-        if control.channel.is_sealed() || tokio::time::Instant::now() >= deadline {
+        let deadline = control.begin_reconstruction(deadline);
+        if control.channel.is_sealed() {
             control.begin_cleanup(deadline);
-            return Ok(false);
+            return Ok(Restart::Stopped);
         }
-        control.escalated.lock().unwrap().take();
+        if tokio::time::Instant::now() >= deadline {
+            control.begin_cleanup(deadline);
+            return Err(control.enforce_deadline());
+        }
+        let removed = control.escalated.lock().unwrap().take();
+        drop(removed);
         control.typed_tree().next_generation()?;
         inputs.creation_context = failure_context;
-        construct(inputs, factory, deadline, runtime).await
+        construct(inputs, factory, deadline, runtime)
+            .await
+            .map(Restart::constructed)
     })
     .await
 }
@@ -290,7 +338,7 @@ where
     A: LocalTypedDispatch,
     F: Fn() -> A + Send + 'static,
 {
-    use crate::typed_supervision::{DispatchCleanup, Step, guarded_stage};
+    use crate::typed_supervision::{DispatchCleanup, Step, recorded_lifecycle_stage};
     let mut hook_started = false;
     let outcome = std::panic::AssertUnwindSafe(async {
         if control.channel.is_sealed() {
@@ -301,7 +349,7 @@ where
             construct(
                 &mut inputs,
                 factory,
-                tokio::time::Instant::now() + control.timeout,
+                tokio::time::Instant::now() + control.creation_timeout,
                 &runtime,
             ),
         )
@@ -315,12 +363,14 @@ where
             if control.channel.is_sealed() {
                 return Ok(());
             }
-            let initialization_context = inputs.creation_context.take();
+            let mut initialization_context = inputs.creation_context.take();
             let initialized = match control
                 .wait_typed_stage(
                     parrot_api::trace::scope(
                         initialization_context.clone(),
-                        guarded_stage(
+                        recorded_lifecycle_stage(
+                            parrot_api::trace::SpanKind::ActorInit,
+                            context.path(),
                             || {
                                 inputs
                                     .actor
@@ -331,7 +381,8 @@ where
                             DispatchCleanup::new(
                                 &mut inputs.cleanup_error,
                                 &mut inputs.dispatch_cancel_failed,
-                            ),
+                            )
+                            .with_deadline(control.initialization_deadline()),
                         ),
                     ),
                     &runtime,
@@ -349,17 +400,26 @@ where
                     let deadline = control
                         .cleanup_deadline()
                         .unwrap_or_else(|| tokio::time::Instant::now() + control.timeout);
-                    if restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
-                        continue 'generation;
+                    match restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
+                        Restart::Ready => continue 'generation,
+                        Restart::Stopped => return Ok(()),
+                        Restart::Declined => {
+                            return Err(crate::supervision_policy::reply_error(error));
+                        }
                     }
-                    return Err(crate::supervision_policy::reply_error(error));
                 }
-                Step::Ready(result) => {
-                    result.unwrap_or_else(|message| Err(ActorError::Panic(message)))
+                Step::Ready(outcome) => {
+                    if !matches!(&outcome.result, Ok(Ok(()))) {
+                        initialization_context = outcome.context;
+                    }
+                    outcome
+                        .result
+                        .unwrap_or_else(|message| Err(ActorError::Panic(message)))
                 }
             };
             if let Err(error) = initialized {
-                let error = Arc::new(error);
+                control.finish_initialization();
+                let error = crate::error_receipt::ActorReceipt::from_error(error);
                 let deadline = tokio::time::Instant::now() + control.timeout;
                 let resume = parrot_api::trace::scope(
                     initialization_context,
@@ -368,10 +428,12 @@ where
                         .resume_message(error.clone(), deadline, false, &runtime),
                 )
                 .await;
-                if !resume
-                    && restart(&mut inputs, factory, error.clone(), deadline, &runtime).await?
-                {
-                    continue;
+                if !resume {
+                    match restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
+                        Restart::Ready => continue,
+                        Restart::Stopped => return Ok(()),
+                        Restart::Declined => {}
+                    }
                 }
                 return Err(crate::supervision_policy::reply_error(error));
             }
@@ -381,7 +443,9 @@ where
                     .wait_typed_stage(
                         parrot_api::trace::scope(
                             initialization_context.clone(),
-                            guarded_stage(
+                            recorded_lifecycle_stage(
+                                parrot_api::trace::SpanKind::ActorInitLocalStreams,
+                                context.path(),
                                 || {
                                     inputs
                                         .actor
@@ -392,7 +456,8 @@ where
                                 DispatchCleanup::new(
                                     &mut inputs.cleanup_error,
                                     &mut inputs.dispatch_cancel_failed,
-                                ),
+                                )
+                                .with_deadline(control.initialization_deadline()),
                             ),
                         ),
                         &runtime,
@@ -410,18 +475,29 @@ where
                         let deadline = control
                             .cleanup_deadline()
                             .unwrap_or_else(|| tokio::time::Instant::now() + control.timeout);
-                        if restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
-                            continue 'generation;
+                        match restart(&mut inputs, factory, error.clone(), deadline, &runtime)
+                            .await?
+                        {
+                            Restart::Ready => continue 'generation,
+                            Restart::Stopped => return Ok(()),
+                            Restart::Declined => {
+                                return Err(crate::supervision_policy::reply_error(error));
+                            }
                         }
-                        return Err(crate::supervision_policy::reply_error(error));
                     }
-                    Step::Ready(result) => {
-                        result.unwrap_or_else(|message| Err(ActorError::Panic(message)))
+                    Step::Ready(outcome) => {
+                        if !matches!(&outcome.result, Ok(Ok(()))) {
+                            initialization_context = outcome.context;
+                        }
+                        outcome
+                            .result
+                            .unwrap_or_else(|message| Err(ActorError::Panic(message)))
                     }
                 }
             };
+            control.finish_initialization();
             if let Err(error) = streams_initialized {
-                let error = Arc::new(error);
+                let error = crate::error_receipt::ActorReceipt::from_error(error);
                 let deadline = tokio::time::Instant::now() + control.timeout;
                 let resume = parrot_api::trace::scope(
                     initialization_context,
@@ -430,10 +506,12 @@ where
                         .resume_message(error.clone(), deadline, false, &runtime),
                 )
                 .await;
-                if !resume
-                    && restart(&mut inputs, factory, error.clone(), deadline, &runtime).await?
-                {
-                    continue;
+                if !resume {
+                    match restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
+                        Restart::Ready => continue,
+                        Restart::Stopped => return Ok(()),
+                        Restart::Declined => {}
+                    }
                 }
                 return Err(crate::supervision_policy::reply_error(error));
             }
@@ -487,10 +565,15 @@ where
                         let deadline = control
                             .cleanup_deadline()
                             .unwrap_or_else(|| tokio::time::Instant::now() + control.timeout);
-                        if restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
-                            continue 'generation;
+                        match restart(&mut inputs, factory, error.clone(), deadline, &runtime)
+                            .await?
+                        {
+                            Restart::Ready => continue 'generation,
+                            Restart::Stopped => return Ok(()),
+                            Restart::Declined => {
+                                return Err(crate::supervision_policy::reply_error(error));
+                            }
                         }
-                        return Err(crate::supervision_policy::reply_error(error));
                     }
                     Step::Ready(work) => work,
                 };
@@ -504,6 +587,7 @@ where
                                 &context,
                                 &mut inputs.cleanup_error,
                                 &mut inputs.dispatch_cancel_failed,
+                                control.message_timeout,
                             ),
                             &runtime,
                         )
@@ -517,17 +601,24 @@ where
                             return Ok(());
                         }
                         Step::Escalated(error) => Err(error),
-                        Step::Ready(result) => result.map_err(Arc::new),
+                        Step::Ready(result) => {
+                            result.map_err(crate::error_receipt::ActorReceipt::from_error)
+                        }
                     };
                     if let Err(error) = dispatched {
                         let deadline = control
                             .lifetime
                             .decision_deadline()
                             .unwrap_or_else(|| tokio::time::Instant::now() + control.timeout);
-                        if restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
-                            continue 'generation;
+                        match restart(&mut inputs, factory, error.clone(), deadline, &runtime)
+                            .await?
+                        {
+                            Restart::Ready => continue 'generation,
+                            Restart::Stopped => return Ok(()),
+                            Restart::Declined => {
+                                return Err(crate::supervision_policy::reply_error(error));
+                            }
                         }
-                        return Err(crate::supervision_policy::reply_error(error));
                     }
                     continue;
                 }
@@ -553,7 +644,8 @@ where
                             DispatchCleanup::new(
                                 &mut inputs.cleanup_error,
                                 &mut inputs.dispatch_cancel_failed,
-                            ),
+                            )
+                            .with_timeout(control.message_timeout),
                         ),
                         &runtime,
                     )
@@ -574,10 +666,13 @@ where
                         .lifetime
                         .decision_deadline()
                         .unwrap_or_else(|| tokio::time::Instant::now() + control.timeout);
-                    if restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
-                        continue 'generation;
+                    match restart(&mut inputs, factory, error.clone(), deadline, &runtime).await? {
+                        Restart::Ready => continue 'generation,
+                        Restart::Stopped => return Ok(()),
+                        Restart::Declined => {
+                            return Err(crate::supervision_policy::reply_error(error));
+                        }
                     }
-                    return Err(crate::supervision_policy::reply_error(error));
                 }
                 reductions += 1;
                 if reductions >= 10 {
@@ -604,10 +699,12 @@ where
         tokio::select! {
             biased;
             _ = control.expired() => Err(control.enforce_deadline()),
-            result = guarded_stage(
+            result = parrot_api::trace::scope(control.take_stop_context(), recorded_lifecycle_stage(
+                parrot_api::trace::SpanKind::ActorBeforeStop,
+                context.path(),
                 || inputs.actor.as_mut().expect("initialized actor").before_stop(&context),
                 DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed),
-            ) => result.unwrap_or_else(|message| Err(ActorError::Panic(message))),
+            )) => result.result.unwrap_or_else(|message| Err(ActorError::Panic(message))),
         }
     })
     .catch_unwind()

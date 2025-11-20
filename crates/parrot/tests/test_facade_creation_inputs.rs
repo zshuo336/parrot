@@ -306,8 +306,11 @@ fn facade_unpolled_cleanup_survives_host_exit() {
     config.hostile = true;
     let future = facade.spawn_root_thread(actor, config);
     drop(runtime);
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(future)));
-    assert!(outcome.is_ok());
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    observer.block_on(cancelled(future, &count));
     assert_eq!(count.load(Ordering::SeqCst), 2);
 }
 

@@ -16,10 +16,16 @@ use crate::manifest::{
 
 /// 拓扑视图（测试替身友好——真实实现查 SWIM/Directory）。
 pub trait TopologyView: Send + Sync {
-    /// 约束下的候选节点集（真实实现：拓扑角色/realm 过滤 + 负载排序）。
+    /// 约束下的候选节点集。提供方负责 realm 过滤及元数据来源；Planner 复核 role/label。
+    /// 每次查询须返回唯一、非空且不含控制字符的节点身份。
     fn candidates(&self, c: &PlacementConstraint) -> Vec<CandidateNode>;
     /// 本节点是否满足角色（本地部署过滤用）。
     fn self_is(&self, role: Option<&str>) -> bool;
+    /// 本机是否满足全部元数据约束；反亲和容量由部署器另行检查。
+    /// 旧提供方仅能证明角色，不能默认接受未知 realm/label。
+    fn self_matches(&self, c: &PlacementConstraint) -> bool {
+        c.realm.is_none() && c.label.is_none() && self.self_is(c.role.as_deref())
+    }
 }
 
 /// 候选节点描述。
@@ -32,12 +38,15 @@ pub struct CandidateNode {
     pub load: f32,
 }
 
-/// 空拓扑（本地单机形态：一切约束在本机满足）。
+/// 默认本机：身份 local、角色 normal，无 realm 和 label。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LocalTopology;
 
 impl TopologyView for LocalTopology {
-    fn candidates(&self, _c: &PlacementConstraint) -> Vec<CandidateNode> {
+    fn candidates(&self, c: &PlacementConstraint) -> Vec<CandidateNode> {
+        if !self.self_matches(c) {
+            return Vec::new();
+        }
         vec![CandidateNode {
             node_id: "local".into(),
             role: "normal".into(),
@@ -51,12 +60,72 @@ impl TopologyView for LocalTopology {
     }
 }
 
+/// 操作方显式提供的本机元数据快照；不发现或认证远端节点。
+#[derive(Debug, Clone)]
+pub struct LocalNodeTopology {
+    node: CandidateNode,
+    realm: Option<String>,
+}
+
+impl LocalNodeTopology {
+    pub fn new(node: CandidateNode, realm: Option<String>) -> Self {
+        Self { node, realm }
+    }
+
+    /// 使用最终生效配置的身份和角色；配置没有声明的 realm/label 保持未知。
+    pub fn from_resolved(config: &parrot_config::Resolved) -> Self {
+        Self::new(
+            CandidateNode {
+                node_id: config
+                    .remote
+                    .node
+                    .node_id
+                    .clone()
+                    .unwrap_or_else(|| "parrot-node".into()),
+                role: config.remote.node.topology_role.as_str().into(),
+                labels: Vec::new(),
+                load: 0.0,
+            },
+            None,
+        )
+    }
+}
+
+impl TopologyView for LocalNodeTopology {
+    fn candidates(&self, c: &PlacementConstraint) -> Vec<CandidateNode> {
+        if self.self_matches(c) {
+            vec![self.node.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn self_is(&self, role: Option<&str>) -> bool {
+        role.is_none_or(|role| role == self.node.role)
+    }
+
+    fn self_matches(&self, c: &PlacementConstraint) -> bool {
+        matches_candidate_metadata(c, &self.node)
+            && c.realm
+                .as_ref()
+                .is_none_or(|realm| Some(realm) == self.realm.as_ref())
+    }
+}
+
+// CandidateNode has no realm: that dimension must be checked by its provider.
+fn matches_candidate_metadata(c: &PlacementConstraint, node: &CandidateNode) -> bool {
+    c.role.as_ref().is_none_or(|role| role == &node.role)
+        && c.label
+            .as_ref()
+            .is_none_or(|label| node.labels.contains(label))
+}
+
 /// 规划产物。
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Plan {
     /// 依赖序装配序列（Kahn 确定性）。
     pub order: Vec<PlannedComponent>,
-    /// 非致命告警（如 anti_affinity 无多候选降级）。
+    /// 非致命告警；放置约束无法满足时返回错误，不降级为告警。
     pub warnings: Vec<String>,
 }
 
@@ -66,7 +135,7 @@ pub struct PlannedComponent {
     pub spec: ComponentSpec,
     /// Sharded/Pool 的实例路径分配（None = Singleton 单路径）。
     pub shard_plan: Option<Vec<String>>,
-    /// placement 选中的节点（首期单候选；Sharded 多实例逐节点分配）。
+    /// placement选中的节点；反亲和时每实例一个不同节点，否则整个cohort共置首选节点。
     pub nodes: Vec<String>,
 }
 
@@ -97,7 +166,7 @@ pub fn plan_with_limits(
         add(
             "expanded bytes",
             &mut expanded,
-            limits.path_bytes(component)?,
+            limits.component_expanded_bytes(component)?,
             limits.max_expanded_bytes,
         )?;
     }
@@ -132,13 +201,8 @@ pub fn plan_with_limits(
     while let Some(&name) = ready.iter().next() {
         ready.remove(&name);
         let c = by_name[name];
-        out.order.push(plan_component(
-            c,
-            topology,
-            &mut out.warnings,
-            limits,
-            &mut expanded,
-        )?);
+        out.order
+            .push(plan_component(c, topology, limits, &mut expanded)?);
         emitted += 1;
         for &dep in dependents.get(name).into_iter().flatten() {
             let e = indegree.get_mut(dep).expect("indegree entry exists");
@@ -163,7 +227,6 @@ pub fn plan_with_limits(
 fn plan_component(
     c: &ComponentSpec,
     topology: &dyn TopologyView,
-    warnings: &mut Vec<String>,
     limits: &ApplicationLimits,
     expanded: &mut u64,
 ) -> Result<PlannedComponent, PlanError> {
@@ -174,6 +237,7 @@ fn plan_component(
         limits.max_candidates,
     )?;
     let mut bytes = 0;
+    let mut identities = BTreeSet::new();
     for node in &cands {
         add(
             "candidate bytes",
@@ -198,7 +262,21 @@ fn plan_component(
                 reason: "candidate load must be finite and in 0..=1".into(),
             });
         }
+        if node.node_id.is_empty() || node.node_id.chars().any(char::is_control) {
+            return Err(PlanError::Unplaceable {
+                comp: c.name.clone(),
+                reason: "invalid candidate node identity".into(),
+            });
+        }
+        if !identities.insert(node.node_id.as_str()) {
+            return Err(PlanError::Unplaceable {
+                comp: c.name.clone(),
+                reason: "duplicate candidate node identity".into(),
+            });
+        }
     }
+    // Validate and account for every supplied candidate before filtering.
+    cands.retain(|node| matches_candidate_metadata(&c.placement, node));
     if cands.is_empty() {
         return Err(PlanError::Unplaceable {
             comp: c.name.clone(),
@@ -208,20 +286,31 @@ fn plan_component(
             ),
         });
     }
-    // 低负载优先（placement 规约：SWIM 元数据过滤后选水位最低）
-    cands.sort_by(|a, b| a.load.total_cmp(&b.load));
     let n = c.instances.instance_count();
+    if c.placement.anti_affinity && cands.len() < n {
+        return Err(PlanError::Unplaceable {
+            comp: c.name.clone(),
+            reason: format!(
+                "anti_affinity requires {n} distinct nodes, only {} candidates available",
+                cands.len()
+            ),
+        });
+    }
+    // Equal watermarks (including signed zero) use identity, not discovery order.
+    cands.sort_by(|a, b| {
+        if a.load == b.load {
+            a.node_id.cmp(&b.node_id)
+        } else {
+            a.load.total_cmp(&b.load)
+        }
+    });
     // Admit all selected node clones before allocating paths or assignments.
     if c.placement.anti_affinity && n > 1 {
-        for (i, node) in cands.iter().enumerate().take(n) {
-            let copies = n / cands.len() + usize::from(i < n % cands.len());
-            let charge = (node.node_id.len() as u64 + std::mem::size_of::<String>() as u64)
-                .checked_mul(copies as u64)
-                .ok_or(AdmissionError::Overflow("expanded bytes"))?;
+        for node in cands.iter().take(n) {
             add(
                 "expanded bytes",
                 expanded,
-                charge,
+                node.node_id.len() as u64 + std::mem::size_of::<String>() as u64,
                 limits.max_expanded_bytes,
             )?;
         }
@@ -240,16 +329,12 @@ fn plan_component(
         _ => None,
     };
 
-    // 节点分配：anti_affinity 时逐实例轮转不同节点；否则首选节点
+    // 节点分配：anti_affinity 时每实例独占一个候选；否则首选节点
     let nodes = if c.placement.anti_affinity && n > 1 {
-        if cands.len() < n {
-            warnings.push(format!(
-                "component {:?}: anti_affinity requested {} nodes but only {} candidates — reusing nodes",
-                c.name, n, cands.len()
-            ));
-        }
-        (0..n)
-            .map(|i| cands[i % cands.len()].node_id.clone())
+        cands
+            .iter()
+            .take(n)
+            .map(|node| node.node_id.clone())
             .collect()
     } else {
         vec![cands[0].node_id.clone()]
@@ -499,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_anti_affinity_spreads_nodes() {
+    fn plan_anti_affinity_rejects_insufficient_nodes() {
         let topo = FixedTopology(vec![
             CandidateNode {
                 node_id: "n1".into(),
@@ -517,9 +602,9 @@ mod tests {
         let mut m = manifest(vec![comp("a", &[])]);
         m.components[0].instances = InstancePolicy::Sharded(4);
         m.components[0].placement.anti_affinity = true;
-        let p = plan(&m, &topo).unwrap();
-        assert_eq!(p.order[0].nodes, vec!["n1", "n2", "n1", "n2"]);
-        assert_eq!(p.warnings.len(), 1, "4 实例 2 候选降级告警");
+        let error = plan(&m, &topo).unwrap_err();
+        assert!(matches!(error, PlanError::Unplaceable { comp, reason }
+            if comp == "a" && reason.contains("anti_affinity") && reason.contains('4') && reason.contains('2')));
     }
 
     #[test]

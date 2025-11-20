@@ -1,10 +1,48 @@
 //! Publication fencing and retirement receipts for one actor generation.
 use crate::{errors::ActorError, owned_input, receptionist::ReceptionistKey, types::ActorResult};
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex},
+    task::{Context, Wake, Waker},
+};
 use tokio::sync::Notify;
 
 type Binding = (usize, ReceptionistKey, String);
 type Cleanup = Box<dyn FnMut() -> ActorResult<()> + Send>;
+
+struct NotificationWake(owned_input::Input<Waker>);
+impl Wake for NotificationWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = owned_input::call(|| self.0.value().wake_by_ref());
+    }
+}
+
+// A throwing observer must not interrupt retirement or discard sibling wakes
+// from Notify's bulk wake list. The owned input also contains Waker disposal.
+async fn notify_safely<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut notification: Option<Arc<NotificationWake>> = None;
+    std::future::poll_fn(|cx| {
+        let notification = notification.get_or_insert_with(|| {
+            Arc::new(NotificationWake(owned_input::Input::new(
+                cx.waker().clone(),
+            )))
+        });
+        if !notification.0.value().will_wake(cx.waker()) {
+            *notification = Arc::new(NotificationWake(owned_input::Input::new(
+                cx.waker().clone(),
+            )));
+        }
+        let waker = Waker::from(notification.clone());
+        future.as_mut().poll(&mut Context::from_waker(&waker))
+    })
+    .await
+}
 
 #[derive(Default)]
 struct State {
@@ -110,6 +148,10 @@ impl RegistrationScope {
     }
 
     pub async fn closed(&self) {
+        notify_safely(self.closed_inner()).await;
+    }
+
+    async fn closed_inner(&self) {
         let notified = self.closed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -160,6 +202,10 @@ impl RegistrationScope {
     }
 
     pub async fn join(&self) -> ActorResult<()> {
+        notify_safely(self.join_inner()).await
+    }
+
+    async fn join_inner(&self) -> ActorResult<()> {
         loop {
             let notified = self.finished.notified();
             tokio::pin!(notified);

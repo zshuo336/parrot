@@ -14,6 +14,21 @@ from owned_process import _exit_observer
 
 
 class RunnerContracts(unittest.TestCase):
+    def test_manifest_runner_reports_missing_binary_as_actionable_cli_error(self):
+        script = Path(__file__).with_name("run_manifest_integration.py")
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "websearch"
+            result = subprocess.run(
+                [sys.executable, str(script), "--binary", str(missing)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("websearch binary not found", result.stderr)
+        self.assertIn("cargo build --locked -p websearch", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_owned_group_cleanup_preserves_unrelated_process(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

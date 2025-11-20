@@ -3,8 +3,10 @@
 //! 分层：parrot-api 定义 key/event/stream；本地表、订阅流和独立快照合并
 //! 在 parrot-remote `receptionist.rs`；托管 Thread/Actix context 均经依赖注入转发。
 //! 独立本地网关不联网；RemoteActorSystem 的网关支持获授权直连的完整快照同步。
-//! 内置网关自动撤销托管 Thread/Actix actor 旧代注册；任意稀疏拓扑传播
-//! 和应用自动装配仍待完成。
+//! 内置网关自动撤销托管 Thread/Actix 动态、typed 和非 Send Local 旧代注册。
+//! Thread 组件宿主 with_remote 注入服务及消息网关；任意稀疏拓扑传播、
+//! 订阅数量/声明队列字节按接收端寿命准入，节点总注册按条数/声明表字节准入；
+//! 可选 Wasm/native guest 服务生命周期由应用宿主以独立授权接入。
 //!
 //! wire 编解码在 `remote` feature 下，解码复用 key 构造校验；核心类型无 feature 门
 //! （context trait 三方法引用——默认实现可用）。
@@ -20,11 +22,21 @@ use serde::{Deserialize, Serialize};
 pub struct ReceptionistKey(String);
 
 impl ReceptionistKey {
-    /// 非法字符（空格/`*`/`#`）在构造和 wire 解码时拒绝（DEV_02 §9.6）。
+    /// Construct a canonical namespace key.
+    ///
+    /// Keys use the same segment grammar as the receptionist ACL. Rejecting
+    /// ambiguous forms here keeps low-level tables, custom gateways and wire
+    /// decoding consistent with the authorization layer.
     pub fn new(s: impl Into<String>) -> Result<Self, String> {
         let s: String = s.into();
-        if s.contains(' ') || s.contains('*') || s.contains('#') {
-            return Err(format!("illegal chars in receptionist key: {s:?}"));
+        if s.is_empty()
+            || s.chars().any(|c| {
+                c.is_whitespace() || c.is_control() || matches!(c, '%' | '?' | '#' | '*' | '\\')
+            })
+            || s.split('/')
+                .any(|segment| matches!(segment, "" | "." | ".."))
+        {
+            return Err(format!("invalid receptionist key: {s:?}"));
         }
         Ok(Self(s))
     }
@@ -60,7 +72,8 @@ pub enum ReceptionistEvent {
 /// 订阅流：先回放完整快照，再按顺序传递实时事件；路径去重由消费者负责。
 /// 流关闭时已排队的事件仍可消费。需要持续追踪的消费者应重新订阅并用新
 /// 快照重建状态，因为关闭也可能表示消费者过慢、已错过后续事件。
-pub type ReceptionistStream = tokio::sync::mpsc::Receiver<ReceptionistEvent>;
+pub use stream::ReceptionistStream;
+mod stream;
 
 /// Receptionist 网关 trait（K2 注入面——倒置依赖，同 RemoteGateway 模式）。
 ///
@@ -130,5 +143,9 @@ mod tests {
         assert!(ReceptionistKey::new("bad key").is_err());
         assert!(ReceptionistKey::new("star*").is_err());
         assert!(ReceptionistKey::new("hash#").is_err());
+        for invalid in ["", "edge/", "edge//x", "edge/.", "edge/..", "edge/%2e"] {
+            assert!(ReceptionistKey::new(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(ReceptionistKey::new("edge/服务").is_ok());
     }
 }

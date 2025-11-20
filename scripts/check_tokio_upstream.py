@@ -16,7 +16,9 @@ import uuid
 
 SUITES = {'io_async_fd': {'Linux': 27, 'Darwin': 24},
           'sync_mpsc': {'Linux': 107, 'Darwin': 107},
-          'sync_oneshot': {'Linux': 22, 'Darwin': 22}}
+          'sync_oneshot': {'Linux': 22, 'Darwin': 22},
+          'task_blocking': {'Linux': 16, 'Darwin': 16},
+          'rt_spawn_blocking': {'Linux': 1, 'Darwin': 1}}
 MINIMAL = 'parrot-minimal-sync-contract'
 COMPLETED = 'PARROT_MINIMAL_SYNC_PARKING_LOT_CONTRACT_PASSED'
 
@@ -192,10 +194,10 @@ class Check:
             saved = self.save_binary('minimal-' + profile, binaries[MINIMAL])
             log = self.run('minimal-' + profile, [str(saved)], timeout=60)
             require(log.splitlines() == [COMPLETED], 'minimal sync/parking_lot runtime contract did not complete')
-        require(len(self.rows) == 16 and self.capture() == self.inputs and len(self.artifacts) == 8 and
+        require(len(self.rows) == 20 and self.capture() == self.inputs and len(self.artifacts) == 12 and
                 all(sha(self.output / item['path']) == item['sha256'] for item in self.artifacts),
                 'runtime gate stage/source/artifact selection changed')
-        save(self.output / 'verified.json', dict(status='verified', platform=system, stages=16, cargo_build_jobs=2,
+        save(self.output / 'verified.json', dict(status='verified', platform=system, stages=20, cargo_build_jobs=2,
              upstream_tests_per_profile=sum(counts[system] for counts in SUITES.values()),
              minimal_sync_profiles=2, resolutions=self.resolutions, artifacts=self.artifacts,
              source_unchanged=True, test_sources='actual-vendored-upstream', commands=self.rows))

@@ -32,23 +32,25 @@ impl std::ops::Deref for ReferenceOwner {
 impl Drop for ReferenceOwner {
     fn drop(&mut self) {
         if !drop_catching(self.value.take()) {
-            tracing::warn!(path = %self.path, "Node reference destructor panicked");
+            let _ = call_catching(|| {
+                tracing::warn!(path = %self.path, "Node reference destructor panicked");
+            });
         }
     }
 }
 
 pub(super) fn drop_catching<T>(value: T) -> bool {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))) {
-        Ok(()) => true,
-        Err(payload) => {
-            // Bound even a throwing panic_any payload. Never forget the actor
-            // reference itself; only a second throwing payload is leaked.
-            if let Err(nested) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
-            {
-                std::mem::forget(nested);
-            }
-            false
+    call_catching(|| drop(value)).is_ok()
+}
+
+pub(super) fn call_catching<T>(operation: impl FnOnce() -> T) -> Result<T, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|payload| {
+        // Bound even a throwing panic_any payload. Never forget the actor
+        // reference itself; only a second throwing payload is leaked.
+        if let Err(nested) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+        {
+            std::mem::forget(nested);
         }
-    }
+    })
 }

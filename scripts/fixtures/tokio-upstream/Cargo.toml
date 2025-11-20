@@ -8,9 +8,10 @@ autotests = false
 [workspace]
 
 [features]
-default = ["full", "sync"]
+default = ["full", "sync", "test-util"]
 full = ["tokio/full"]
 sync = ["tokio/sync"]
+test-util = ["tokio/test-util"]
 
 [dependencies]
 tokio = { version = "=1.53.3", features = ["test-util", "parking_lot"] }
@@ -18,7 +19,7 @@ tokio = { version = "=1.53.3", features = ["test-util", "parking_lot"] }
 [dev-dependencies]
 libc = "=0.2.191"
 futures = "=0.3.34"
-nix = { version = "=0.31.3", default-features = false, features = ["aio", "fs", "socket"] }
+nix = { version = "=0.31.3", default-features = false, features = ["fs", "socket"] }
 tokio-test = "=0.4.6"
 tokio-stream = "=0.1.19"
 
@@ -33,6 +34,14 @@ path = "../../../vendor/tokio/tests/sync_mpsc.rs"
 [[test]]
 name = "sync_oneshot"
 path = "../../../vendor/tokio/tests/sync_oneshot.rs"
+
+[[test]]
+name = "task_blocking"
+path = "../../../vendor/tokio/tests/task_blocking.rs"
+
+[[test]]
+name = "rt_spawn_blocking"
+path = "../../../vendor/tokio/tests/rt_spawn_blocking.rs"
 
 [patch.crates-io]
 tokio = { path = "../../../vendor/tokio" }

@@ -18,9 +18,13 @@ use crate::thread::config::ThreadActorConfig;
 use crate::thread::context::ThreadContext;
 use crate::thread::error::SystemError;
 use crate::thread::mailbox::Mailbox;
+use crate::thread::native_budget::{NativeWorkerBudget, NativeWorkerReservation};
 use crate::thread::processor::ProcessorInterface;
-use crate::thread::scheduler::StopHookRequest;
 use crate::thread::scheduler::ThreadScheduler;
+use crate::thread::scheduler::{ControlEnqueueError, StopHookRequest};
+
+#[cfg(test)]
+mod configuration_contracts;
 
 /// Configuration for the dedicated thread scheduler.
 #[derive(Debug, Clone)]
@@ -50,6 +54,47 @@ impl Default for DedicatedThreadConfig {
             max_messages_per_batch: 16,
             default_thread_stack_size: 3 * 1024 * 1024, // 3 MB
         }
+    }
+}
+
+impl DedicatedThreadConfig {
+    pub fn validate(&self) -> Result<(), SystemError> {
+        use super::configuration::{count, duration};
+        count(
+            "scheduler.dedicated.max_threads",
+            self.max_threads,
+            0,
+            parrot_config::ThreadResolved::MAX_WORKERS,
+        )?;
+        count(
+            "scheduler.dedicated.max_messages_per_batch",
+            self.max_messages_per_batch,
+            1,
+            super::MAX_MESSAGES_PER_BATCH,
+        )?;
+        count(
+            "scheduler.dedicated.default_thread_stack_size",
+            self.default_thread_stack_size,
+            0,
+            ThreadActorConfig::MAX_THREAD_STACK_SIZE,
+        )?;
+        duration(
+            "scheduler.dedicated.idle_sleep_duration",
+            self.idle_sleep_duration,
+        )
+    }
+
+    fn apply_defaults(&self, mut config: ThreadActorConfig) -> ThreadActorConfig {
+        config
+            .idle_sleep_duration
+            .get_or_insert(self.idle_sleep_duration);
+        config
+            .yield_after_each_message
+            .get_or_insert(self.yield_after_each_message);
+        config
+            .thread_stack_size
+            .get_or_insert(self.default_thread_stack_size);
+        config
     }
 }
 
@@ -100,12 +145,28 @@ pub struct DedicatedThreadScheduler {
 
     /// Runtime handle (used to join worker threads through blocking tasks)
     runtime_handle: Option<Handle>,
+
+    /// Process-wide admission shared with Sharded and Actix workers.
+    native_budget: Arc<NativeWorkerBudget>,
 }
 
 impl DedicatedThreadScheduler {
     /// Create a new dedicated thread scheduler.
     pub fn new(config: Option<DedicatedThreadConfig>) -> Self {
+        Self::try_new(config).expect("invalid dedicated scheduler configuration")
+    }
+
+    /// Construct a scheduler without silently accepting invalid defaults.
+    pub fn try_new(config: Option<DedicatedThreadConfig>) -> Result<Self, SystemError> {
+        Self::try_new_with_budget(config, NativeWorkerBudget::global())
+    }
+
+    pub(crate) fn try_new_with_budget(
+        config: Option<DedicatedThreadConfig>,
+        native_budget: Arc<NativeWorkerBudget>,
+    ) -> Result<Self, SystemError> {
         let config = config.unwrap_or_default();
+        config.validate()?;
         let scheduler = Self {
             workers: Mutex::new(HashMap::new()),
             receipts: Mutex::new(DedicatedReceipts::default()),
@@ -113,9 +174,10 @@ impl DedicatedThreadScheduler {
             status: Arc::new(AtomicUsize::new(0)),
             config,
             runtime_handle: None,
+            native_budget,
         };
         scheduler.status.store(1, Ordering::SeqCst); // Running
-        scheduler
+        Ok(scheduler)
     }
 
     /// Attach a runtime handle (used for join bookkeeping).
@@ -146,6 +208,9 @@ impl DedicatedThreadScheduler {
     where
         F: FnOnce() + Send + 'static,
     {
+        config
+            .validate()
+            .map_err(|error| SystemError::ConfigError(error.to_string()))?;
         if self.is_shutting_down.load(Ordering::Relaxed) {
             return Err(SystemError::ShuttingDown);
         }
@@ -175,12 +240,17 @@ impl DedicatedThreadScheduler {
             )));
         }
 
-        let worker = Arc::new(DedicatedWorker::new(
+        // Reserve before constructing or spawning the OS worker. The lease is
+        // moved into the worker and released only after its join completes.
+        let reservation = self.native_budget.try_reserve()?;
+
+        let worker = Arc::new(DedicatedWorker::new_with_reservation(
             path.to_string(),
             mailbox,
             processor,
-            config,
+            self.config.apply_defaults(config),
             self.config.max_messages_per_batch,
+            Some(reservation),
         ));
 
         worker.start_with_startup(startup).map_err(|e| {
@@ -252,24 +322,51 @@ impl DedicatedThreadScheduler {
         result
     }
 
-    pub(crate) fn enqueue_stop_hook(&self, request: StopHookRequest) -> Result<(), SystemError> {
+    fn try_enqueue_stop_hook(&self, request: StopHookRequest) -> Result<(), ControlEnqueueError> {
         let worker = self
             .workers
             .lock()
             .unwrap()
             .get(&request.path)
             .cloned()
-            .ok_or_else(|| SystemError::ActorNotFound(request.path.clone()))?;
+            .ok_or_else(|| {
+                ControlEnqueueError::Rejected(SystemError::ActorNotFound(request.path.clone()))
+            })?;
         if !Arc::ptr_eq(&worker.processor, &request.processor) {
-            return Err(SystemError::ActorNotFound(request.path));
+            return Err(ControlEnqueueError::Rejected(SystemError::ActorNotFound(
+                request.path,
+            )));
         }
         if worker.shutdown_flag.load(Ordering::Acquire) {
-            return Err(SystemError::ShuttingDown);
+            return Err(ControlEnqueueError::Rejected(SystemError::ShuttingDown));
         }
-        worker
-            .stop_tx
-            .send(request)
-            .map_err(|_| SystemError::ShutdownError("dedicated control channel closed".into()))
+        match worker.stop_tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(flume::TrySendError::Full(request)) => Err(ControlEnqueueError::Full(request)),
+            Err(flume::TrySendError::Disconnected(_)) => Err(ControlEnqueueError::Disconnected),
+        }
+    }
+
+    pub(crate) async fn enqueue_stop_hook_until(
+        &self,
+        request: StopHookRequest,
+    ) -> Result<(), SystemError> {
+        let mut request = request;
+        loop {
+            match self.try_enqueue_stop_hook(request) {
+                Ok(()) => return Ok(()),
+                Err(ControlEnqueueError::Full(next)) => {
+                    request = next;
+                    tokio::task::yield_now().await;
+                }
+                Err(ControlEnqueueError::Disconnected) => {
+                    return Err(SystemError::ShutdownError(
+                        "dedicated control channel closed".into(),
+                    ));
+                }
+                Err(ControlEnqueueError::Rejected(error)) => return Err(error),
+            }
+        }
     }
 
     fn remove_finished(&self, path: &str, worker: &Arc<DedicatedWorker>, result: DedicatedExit) {
@@ -459,7 +556,9 @@ type DedicatedExit = Result<(), String>;
 struct DedicatedJoinJob {
     handle: Option<std::thread::JoinHandle<DedicatedExit>>,
     receipt: Arc<Mutex<Option<DedicatedExit>>>,
+    reservation: Option<NativeWorkerReservation>,
 }
+
 impl Drop for DedicatedJoinJob {
     fn drop(&mut self) {
         let Some(handle) = self.handle.take() else {
@@ -469,6 +568,9 @@ impl Drop for DedicatedJoinJob {
             .map_err(crate::owned_payload::panic_message)
             .and_then(|joined| joined.map_err(crate::owned_payload::panic_message))
             .and_then(|result| result);
+        if let Some(reservation) = self.reservation.take() {
+            reservation.release_after_join();
+        }
         *self.receipt.lock().unwrap() = Some(result);
     }
 }
@@ -548,6 +650,7 @@ struct DedicatedWorker {
     join_slot: Mutex<Option<std::thread::JoinHandle<DedicatedExit>>>,
     join_claimed: AtomicBool,
     join_receipt: Arc<Mutex<Option<DedicatedExit>>>,
+    reservation: Mutex<Option<NativeWorkerReservation>>,
     stop_tx: flume::Sender<StopHookRequest>,
     stop_rx: Mutex<Option<flume::Receiver<StopHookRequest>>>,
 }
@@ -666,7 +769,9 @@ fn notify_dedicated_failure(
         processor.notify_system_panic(message);
     })) {
         let message = crate::owned_payload::panic_message(payload);
-        tracing::error!(%message, "dedicated failure notification panicked");
+        super::failure_diagnostic(|| {
+            tracing::error!(%message, "dedicated failure notification panicked");
+        });
     }
 }
 
@@ -682,6 +787,7 @@ fn notify_dedicated_error(
 }
 
 impl DedicatedWorker {
+    #[cfg(test)]
     fn new(
         path: String,
         mailbox: Arc<dyn Mailbox>,
@@ -689,7 +795,18 @@ impl DedicatedWorker {
         config: ThreadActorConfig,
         batch_size: usize,
     ) -> Self {
-        let (stop_tx, stop_rx) = flume::unbounded();
+        Self::new_with_reservation(path, mailbox, processor, config, batch_size, None)
+    }
+
+    fn new_with_reservation(
+        path: String,
+        mailbox: Arc<dyn Mailbox>,
+        processor: Arc<dyn ProcessorInterface>,
+        config: ThreadActorConfig,
+        batch_size: usize,
+        reservation: Option<NativeWorkerReservation>,
+    ) -> Self {
+        let (stop_tx, stop_rx) = flume::bounded(super::MAX_CONTROL_QUEUE);
         Self {
             path,
             mailbox,
@@ -702,6 +819,7 @@ impl DedicatedWorker {
             join_slot: Mutex::new(None),
             join_claimed: AtomicBool::new(false),
             join_receipt: Arc::new(Mutex::new(None)),
+            reservation: Mutex::new(reservation),
             stop_tx,
             stop_rx: Mutex::new(Some(stop_rx)),
         }
@@ -758,7 +876,9 @@ impl DedicatedWorker {
                             state.store(WorkerState::Error as usize, Ordering::Relaxed);
                             let receipt = crate::error_receipt::SystemReceipt::new(error);
                             let message = crate::error_receipt::system_summary(receipt.error());
-                            error!(actor_path = %path, error = %message, "Failed to initialize dedicated actor");
+                            super::failure_diagnostic(|| {
+                                error!(actor_path = %path, error = %message, "Failed to initialize dedicated actor");
+                            });
                             notify_dedicated_failure(&*processor, message);
                             return;
                         }
@@ -865,6 +985,18 @@ impl DedicatedWorker {
         self.shutdown_notify.notify_one();
     }
 
+    fn detach_for_drop(&self) {
+        let owned = {
+            let mut slot = self.join_slot.lock().unwrap();
+            let Some(handle) = slot.take() else {
+                return;
+            };
+            self.join_claimed.store(true, Ordering::Release);
+            (handle, self.reservation.lock().unwrap().take())
+        };
+        crate::thread::native_budget::retire_join(owned.0, owned.1);
+    }
+
     async fn stop_until(&self, deadline: tokio::time::Instant) -> Result<(), SystemError> {
         self.request_stop();
         loop {
@@ -900,6 +1032,7 @@ impl DedicatedWorker {
                     Some(DedicatedJoinJob {
                         handle: slot.take(),
                         receipt: self.join_receipt.clone(),
+                        reservation: self.reservation.lock().unwrap().take(),
                     })
                 }
                 None if !self.join_claimed.load(Ordering::Acquire) => return Some(Ok(())),
@@ -907,8 +1040,9 @@ impl DedicatedWorker {
             }
         };
         if let Some(job) = job {
-            // No scheduler/worker mutex and no async executor poll owns join or
-            // defensive payload disposal. A waiter only observes its receipt.
+            // Keep the retirement owner on the lifecycle executor. A finished
+            // OS handle can still carry thread-local destruction ordering that
+            // must not be completed by the scheduler caller itself.
             if let Ok(handle) = Handle::try_current() {
                 drop(handle.spawn_blocking(move || drop(job)));
             } else {
@@ -916,6 +1050,17 @@ impl DedicatedWorker {
             }
         }
         self.join_result()
+    }
+}
+
+impl Drop for DedicatedThreadScheduler {
+    fn drop(&mut self) {
+        let workers = self.workers.get_mut().unwrap();
+        for worker in workers.values() {
+            worker.request_stop();
+            worker.detach_for_drop();
+        }
+        workers.clear();
     }
 }
 
@@ -975,6 +1120,111 @@ mod tests {
         ));
         mailbox.set_processor(processor.clone() as Arc<dyn ProcessorInterface>);
         (mailbox, processor)
+    }
+
+    #[tokio::test]
+    async fn dedicated_control_queue_is_bounded_and_rejects_overflow() {
+        let (mailbox, processor) = build_actor_stack("test/dedicated/control-queue");
+        let worker = DedicatedWorker::new(
+            "test/dedicated/control-queue".into(),
+            mailbox,
+            processor.clone(),
+            ThreadActorConfig::default(),
+            1,
+        );
+        assert_eq!(
+            worker.stop_tx.capacity(),
+            Some(super::super::MAX_CONTROL_QUEUE)
+        );
+
+        for index in 0..=super::super::MAX_CONTROL_QUEUE {
+            let (completion, _result) = tokio::sync::oneshot::channel();
+            let request = StopHookRequest {
+                trace_context: None,
+                path: format!("/control/{index}"),
+                processor: processor.clone(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                completion,
+                retire_only: false,
+            };
+            let result = worker.stop_tx.try_send(request);
+            if index < super::super::MAX_CONTROL_QUEUE {
+                assert!(result.is_ok(), "request {index} should fit in the queue");
+            } else {
+                let Err(flume::TrySendError::Full(request)) = result else {
+                    panic!("the first request beyond the bound must be rejected");
+                };
+                assert_eq!(request.path, "/control/128");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_control_queue_retries_original_request_after_slot_release() {
+        let (mailbox, processor) = build_actor_stack("test/dedicated/control-retry");
+        let worker = Arc::new(DedicatedWorker::new(
+            "test/dedicated/control-retry".into(),
+            mailbox,
+            processor.clone(),
+            ThreadActorConfig::default(),
+            1,
+        ));
+        let receiver = worker.stop_rx.lock().unwrap().take().unwrap();
+        for index in 0..super::super::MAX_CONTROL_QUEUE {
+            let (completion, _result) = tokio::sync::oneshot::channel();
+            worker
+                .stop_tx
+                .try_send(StopHookRequest {
+                    trace_context: None,
+                    path: format!("/control/{index}"),
+                    processor: processor.clone(),
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                    completion,
+                    retire_only: false,
+                })
+                .unwrap();
+        }
+
+        let scheduler = DedicatedThreadScheduler::new(None);
+        scheduler
+            .workers
+            .lock()
+            .unwrap()
+            .insert("test/dedicated/control-retry".into(), worker.clone());
+
+        let (completion, _result) = tokio::sync::oneshot::channel();
+        let request = StopHookRequest {
+            trace_context: None,
+            path: "test/dedicated/control-retry".into(),
+            processor,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+            completion,
+            retire_only: false,
+        };
+        let mut enqueue = Box::pin(scheduler.enqueue_stop_hook_until(request));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut enqueue)
+                .await
+                .is_err(),
+            "a full control queue must retain the request while no slot is available"
+        );
+
+        let released = receiver.recv_async().await.unwrap();
+        assert_eq!(released.path, "/control/0");
+        enqueue.await.unwrap();
+        assert_eq!(worker.stop_tx.len(), super::super::MAX_CONTROL_QUEUE);
+
+        let mut retried = false;
+        while let Ok(request) = receiver.try_recv() {
+            if request.path == "test/dedicated/control-retry" {
+                retried = true;
+                break;
+            }
+        }
+        assert!(
+            retried,
+            "the original request must be queued after capacity recovers"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1761,6 +2011,28 @@ mod stage_ownership_contracts {
         run(Phase::Batch, Mode::PendingDrop, false, false).await;
     }
     #[tokio::test]
+    async fn dedicated_notification_logging_failure_is_contained() {
+        crate::thread::scheduler::notification_contracts::isolated(
+            "dedicated_notification_logging_failure_is_contained",
+            || {
+                let p = Processor::new(Phase::Init, Mode::Healthy, true, false);
+                notify_dedicated_failure(&*p, "original dedicated failure".into());
+                assert_eq!(&*p.notices.lock().unwrap(), &["original dedicated failure"]);
+                assert_eq!(p.payload_drops.load(Ordering::SeqCst), 1);
+            },
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn dedicated_stage_notification_logging_failure_preserves_retirement() {
+        crate::thread::scheduler::notification_contracts::isolated_async(
+            "dedicated_stage_notification_logging_failure_preserves_retirement",
+            run(Phase::Init, Mode::Plain, true, false),
+            2,
+        )
+        .await;
+    }
+    #[tokio::test]
     async fn failure_notification_panic_cannot_skip_retirement() {
         run(Phase::Batch, Mode::Plain, true, false).await;
     }
@@ -2293,19 +2565,23 @@ mod join_owner_contracts {
                 Err("late thread failure".into())
             });
             let report = Arc::new(Mutex::new(None));
+            let budget = Arc::new(NativeWorkerBudget::with_capacity(1));
             let job = DedicatedJoinJob {
                 handle: Some(handle),
                 receipt: report.clone(),
+                reservation: Some(budget.try_reserve().unwrap()),
             };
             let queued = tokio::task::spawn_blocking(move || drop(job));
             queued.abort();
             drop(pool_release);
             assert!(report.lock().unwrap().clone().is_none());
             assert!(!exited.load(Ordering::Acquire));
+            assert!(budget.try_reserve().is_err());
             drop(actor_release);
             assert!(queued.await.unwrap_err().is_cancelled());
             blocker.await.unwrap();
             assert!(exited.load(Ordering::Acquire));
+            assert!(budget.try_reserve().is_ok());
             assert_eq!(
                 report.lock().unwrap().clone(),
                 Some(Err("late thread failure".into()))
@@ -2330,6 +2606,7 @@ mod join_owner_contracts {
         drop(DedicatedJoinJob {
             handle: Some(handle),
             receipt: report.clone(),
+            reservation: None,
         });
         let error = report.lock().unwrap().clone().unwrap().unwrap_err();
         assert!(error.contains("panic payload destructor panicked"));

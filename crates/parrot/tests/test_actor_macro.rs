@@ -6,7 +6,6 @@ use parrot_api::{
     actor::{ActorState, EmptyConfig},
     address::ActorRefExt,
     match_message,
-    message::Message,
     types::{ActorResult, BoxedMessage},
 };
 use parrot_api_derive::{Message, ParrotActor};

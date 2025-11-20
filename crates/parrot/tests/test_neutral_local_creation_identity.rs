@@ -302,9 +302,14 @@ async fn scenario(
         let lifecycle: Vec<_> = events.iter().filter(|event| matches!(event.0, "constructor" | "init-call" | "init-poll" | "init-resumed")).collect();
         assert_eq!(lifecycle.iter().map(|event| event.0).collect::<Vec<_>>(), ["constructor", "init-call", "init-poll", "init-resumed"]);
         println!("PARROT_NEUTRAL_LOCAL_CREATION_RETIRED flavor={flavor} explicit={explicit} traced={traced} poll_traced={poll_traced}");
-        (lifecycle.iter().map(|event| event.1.clone()).collect(), vec![origin; 4])
+        let initialization = lifecycle[1].1.clone();
+        lifecycle_identity::assert_child(initialization.as_ref(), origin.as_ref());
+        (lifecycle.iter().map(|event| event.1.clone()).collect(), vec![origin, initialization.clone(), initialization.clone(), initialization])
     }).await.expect("neutral Local creation independent liveness bound")
 }
+
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;
 async fn matrix(flavor: usize, explicit: bool) {
     let mut observed = Vec::new();
     let mut expected = Vec::new();

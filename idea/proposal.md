@@ -1,9 +1,47 @@
 # ActixContextExt Implementation Proposal
 
-## Objective
+## Status And Current Contract (2026-11-20)
+
+This is a historical design proposal, not the current API specification. The
+original alternatives and follow-up ideas remain below for decision history;
+their mention does not promise that every alternative will be implemented.
+
+The current synchronous extension is `parrot_api::actor::ActixEngineExt`.
+`receive_message_with_engine` receives an `EngineContextHandle<'_>` borrowing
+the live native context exclusively. Its safe `downcast_ref` / `downcast_mut`
+methods cannot extend that borrow across an independently owned async future.
+The production adapter constructs it from `&mut actix::Context<_>`; no stored raw
+context pointer or lifetime extension is needed for this path. The unsafe
+`from_raw` escape hatch retains its caller-side validity and exclusivity duties.
+
+The default Actix dispatch calls this synchronous handler. `None` is an explicit
+unhandled-message error, not an async fallback: the input has already moved into
+the synchronous method. Actors that need async business handling opt in with
+`#[ParrotActor(async_handler = true)]` or `Actor::use_async_handler() == true`.
+The adapter then owns actor/context state inside the in-flight future, keeps
+business calls serial, and restores state on completion. Returning `Pending`
+allows other actors to run; it does not make this actor reentrant. The Thread
+engine always selects the async business handler, but its scheduling and
+lifecycle contracts are not thereby identical to Actix.
+
+There is no current public `ActixContextExt::with_native_context` method. Use the
+current extension for synchronous native access and the common context APIs for
+portable services. The sketches below are alternatives, not compilable current
+interfaces. Actix futures are local to their arbiter, so thread migration is not
+the general explanation for rejecting TLS: TLS still cannot establish the
+exclusive borrow and lifetime required when independent futures interleave.
+
+See `crates/parrot-api/src/actor.rs`, `crates/parrot/src/actix/actor.rs`,
+`crates/parrot/tests/test_derive_dispatch_paths.rs` and
+`crates/parrot/tests/test_actix_owned_dispatch.rs`. The handle's compile-fail
+doctests reject escaping, overlapping and local dangling borrows. These focused
+contracts do not replace the full runtime cancellation, host-exit and lifecycle
+matrix tracked by K11/K21; public API compatibility remains K25.
+
+## Historical Objective
 Allow access to the underlying Actix context within ParrotActor's `receive_message` method, enabling users to directly utilize Actix-specific features.
 
-## Current Design
+## Historical Design
 - `ActixContextExt` trait has been defined, providing the `actix_addr` method to obtain the Actix address, and the `with_native_context` method to access the native Actix context
 - Currently, `with_native_context` is implemented as empty, returning None
 

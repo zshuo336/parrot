@@ -8,12 +8,14 @@
 //! 实现）；③ Replica 封装（RaftNode + DirectorySm + client 语义）。
 //! 传输挂接与 DirectoryApi（RESOLVE_Q 应答）在 F7 解析管线集成。
 
+mod checkpoint;
 mod command;
 mod durable;
 mod request;
 pub use request::{directory_command_digest, DirectoryRequestStatus};
 pub mod client;
 pub mod network;
+pub mod ownership;
 pub use command::DirectoryApplyError;
 pub use durable::{
     DirectoryRead, DirectoryReadTicket, DurableDirectory, DurableDirectoryError,
@@ -154,13 +156,21 @@ impl DirectoryReplica {
 
     /// 驱动：apply 已提交条目到状态机（宿主周期调用）。
     pub fn apply_committed(&mut self) -> Result<usize, DirectoryApplyError> {
-        let commands = self.sm.prepare(self.raft.pending_committed())?;
+        let commands = self.prepare_committed()?;
         let n = commands.len();
         self.raft.committed();
         for cmd in commands {
             self.sm.apply_validated(cmd);
         }
         Ok(n)
+    }
+    fn prepare_committed(&self) -> Result<Vec<DirCmd>, DirectoryApplyError> {
+        if self.raft.pending_snapshot().is_some() {
+            return Err(DirectoryApplyError::Invalid(
+                "apply the embedded application's snapshot before its retained log".into(),
+            ));
+        }
+        self.sm.prepare(self.raft.pending_committed())
     }
 
     /// client 读（线性一致读的先决条件是读经 leader+lease——本实现
@@ -389,7 +399,7 @@ impl DirectoryShards {
     }
 
     /// Admit a command to its authoritative shard, or Remove to every shard.
-    /// All configured participants must be present and leaders before any append.
+    /// All participants must be present, leaders and able to append before admission.
     /// Admission is synchronous in this embedded host; Raft commitment remains
     /// independent per shard. Retain the entire receipt and wait for all positions.
     pub fn propose(&mut self, cmd: &DirCmd) -> Result<DirectoryProposal, DirectoryWriteError> {
@@ -415,6 +425,9 @@ impl DirectoryShards {
                     shard: id.clone(),
                     leader: shard.raft.leader_hint.clone(),
                 });
+            }
+            if shard.raft.last_log_index() == u64::MAX {
+                return Err(DirectoryWriteError::Unavailable(id.clone()));
             }
         }
         let command_digest = Sha256::digest(&bytes).into();
@@ -459,9 +472,13 @@ impl DirectoryShards {
             let Some(shard) = self.shards.get(&position.shard) else {
                 return DirectoryProposalStatus::Unavailable;
             };
+            if position.index <= shard.raft.snapshot_index() {
+                return DirectoryProposalStatus::Unavailable;
+            }
             let Some(slot) = position
                 .index
-                .checked_sub(1)
+                .checked_sub(shard.raft.snapshot_index())
+                .and_then(|n| n.checked_sub(1))
                 .and_then(|n| usize::try_from(n).ok())
             else {
                 return DirectoryProposalStatus::Unavailable;
@@ -493,10 +510,7 @@ impl DirectoryShards {
         // it does not make independent Raft-group commitment atomic.
         let mut prepared = Vec::with_capacity(self.shards.len());
         for (id, shard) in &self.shards {
-            prepared.push((
-                id.clone(),
-                shard.sm.prepare(shard.raft.pending_committed())?,
-            ));
+            prepared.push((id.clone(), shard.prepare_committed()?));
         }
         let mut n = 0;
         for (id, commands) in prepared {

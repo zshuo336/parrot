@@ -224,8 +224,19 @@ async fn scenario(
         assert_eq!(events.iter().map(|event| event.0).collect::<Vec<_>>(),
                    ["constructor", "init-call", "init-poll", "init-resumed"]);
         if engine == 2 { assert!(events.iter().all(|event| event.2 == events[0].2), "Local construction and init stay on the owning arbiter"); }
-        assert_eq!(events.iter().map(|event| event.1.clone()).collect::<Vec<_>>(), vec![origin; 4],
-                   "typed factory construction and initialization must retain their call-time identity");
+        assert_eq!(events[0].1, origin, "constructor must retain the creation call's identity");
+        let initialization = events[1].1.as_ref();
+        match (initialization, origin.as_ref()) {
+            (Some(child), Some(parent)) => {
+                assert_eq!(child.trace_id(), parent.trace_id());
+                assert_eq!(child.parent_span_id(), Some(parent.span_id()));
+                assert_ne!(child.span_id(), parent.span_id());
+            }
+            (None, None) => {}
+            mismatch => panic!("initialization lost its admitted parent: {mismatch:?}"),
+        }
+        assert!(events[1..].iter().all(|event| event.1.as_ref() == initialization),
+                "init construction and every poll must retain the recorded hook identity");
         println!("PARROT_TYPED_FACTORY_CREATION_CASE_OK engine={engine} repeatable={repeatable} explicit={explicit} traced={traced} poll_traced={poll_traced}");
     }).await.expect("typed factory creation independent liveness bound");
 }

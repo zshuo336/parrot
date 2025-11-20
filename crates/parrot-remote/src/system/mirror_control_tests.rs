@@ -15,11 +15,13 @@ async fn old_peer_is_rejected_before_sending_or_reserving_a_callback() {
     )
     .unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    sys.links.write().unwrap().push((
-        "old-peer".into(),
-        FrameSender::new(tx, "old-peer"),
-        Arc::new(NodeStatus::default()),
-    ));
+    sys.links.write().unwrap().push(Link {
+        address: NodeAddr::mem("old-peer"),
+        sender: FrameSender::new(tx, "old-peer"),
+        status: Arc::new(NodeStatus::default()),
+        role: crate::handshake::TopologyRole::Normal,
+        dial_addr: None,
+    });
     let error = sys
         .control_mirror(
             "old-peer",

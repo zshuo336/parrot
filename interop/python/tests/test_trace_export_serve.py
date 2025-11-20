@@ -22,7 +22,8 @@ def test_actual_serve_exports_handler_before_successful_signal_exit(tmp_path):
     fixture = Path(__file__).with_name('support')/'export_gateway.py'
     with collector() as sink, log_path.open('xb') as log:
         command = [sys.executable, '-B'] + ['-O'] * sys.flags.optimize + [str(fixture), str(root), sink.endpoint]
-        process = subprocess.Popen(command, env=dict(os.environ, PYTHONUNBUFFERED='1'), stdout=log,
+        process = subprocess.Popen(command, env=dict(os.environ, PYTHONUNBUFFERED='1',
+                                   PYTHONPATH=str(Path(__file__).resolve().parents[1])), stdout=log,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         try:
             def ready():

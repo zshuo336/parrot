@@ -144,6 +144,25 @@ fn isolated(name: &str, body: impl FnOnce()) {
         .as_deref()
         == Some(name)
     {
+        // Expected nested panics force std's symbolic backtrace even with
+        // RUST_BACKTRACE=0; keep that diagnostic work out of actor deadlines.
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().is::<Payload>() {
+                return;
+            }
+            let text = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str));
+            if !matches!(
+                text,
+                Some("payload destructor" | "source destructor 0" | "source destructor 1")
+            ) {
+                original(info);
+            }
+        }));
         body();
         return;
     }

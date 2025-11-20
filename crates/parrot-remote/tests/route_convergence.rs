@@ -185,3 +185,55 @@ fn reflector_and_table_choose_identical_winners_for_all_arrival_orders() {
     );
     assert_eq!(visited, 720);
 }
+
+#[test]
+fn local_advertisements_and_reflections_share_one_monotonic_preference() {
+    let winner = route("parrot://node/", "a", 3, 8);
+    let mut visited = 0;
+    permutations(
+        vec![
+            winner.clone(),
+            route("parrot://node/", "z", 3, 8),
+            route("parrot://node/", "b", 3, 8),
+            route("parrot://node/", "0", 4, 8),
+            route("parrot://node/", "0", 0, 7),
+            route("parrot://node/", "0", u32::MAX, 0),
+        ],
+        |arrivals| {
+            for local_first in [false, true] {
+                let mut reflector = RouteReflector::new("rr", vec!["source".into(), "peer".into()]);
+                let mut table = RouteTable::new();
+                for (index, entry) in arrivals.iter().enumerate() {
+                    let update = gossip(vec![entry.clone()]);
+                    let accepted = table.merge(&update) == 1;
+                    let local = (index % 2 == 0) == local_first;
+                    let sent = if local {
+                        reflector.advertise_local(entry.clone())
+                    } else {
+                        reflector.reflect_from("source", &update, "origin")
+                    };
+                    let expected = if !accepted {
+                        Vec::new()
+                    } else if local {
+                        vec![
+                            ("source".into(), vec![entry.clone()]),
+                            ("peer".into(), vec![entry.clone()]),
+                        ]
+                    } else {
+                        vec![("peer".into(), vec![entry.clone()])]
+                    };
+                    assert_eq!(sent, expected, "local={local}, arrival={index}");
+                    assert_eq!(
+                        reflector.table.get(&winner.prefix),
+                        table.resolve(&winner.prefix)
+                    );
+                }
+                assert_eq!(reflector.table.get(&winner.prefix), Some(&winner));
+                assert!(reflector.advertise_local(winner.clone()).is_empty());
+                assert_eq!(reflector.digest(), table.digest());
+                visited += 1;
+            }
+        },
+    );
+    assert_eq!(visited, 1440);
+}

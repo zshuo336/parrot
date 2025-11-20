@@ -52,13 +52,17 @@ impl Drop for ReleaseNative {
 }
 
 fn exercise(mode: &str, image: &std::path::Path) {
+    let traced = mode.starts_with("trace-");
     let worker = mode == "worker";
     let current = mode == "current";
     let synchronous = matches!(
         mode,
         "oneshot" | "bounded-recv" | "unbounded-recv" | "bounded-send" | "shutdown"
     );
-    assert!(worker || current || mode == "caller" || synchronous, "mode");
+    assert!(
+        worker || current || mode == "caller" || synchronous || traced,
+        "mode"
+    );
     let start = Arc::new((Mutex::new(false), Condvar::new()));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let mut builder = if !current {
@@ -161,7 +165,15 @@ fn exercise(mode: &str, image: &std::path::Path) {
         *start.0.lock().unwrap() = true;
         start.1.notify_all();
     };
-    let (elapsed, completed) = if synchronous {
+    let trace_context = parrot_api::trace::TraceContext::root();
+    let (elapsed, completed) = if traced {
+        begin_unload();
+        let started = Instant::now();
+        trace_entry(mode, &trace_context);
+        let result = (started.elapsed(), slots[7].load(Ordering::SeqCst));
+        slots[6].store(1, Ordering::SeqCst);
+        result
+    } else if synchronous {
         let done = Arc::new(AtomicBool::new(false));
         let finished = done.clone();
         let operation: Box<dyn FnOnce()> = match mode {
@@ -294,6 +306,52 @@ fn exercise(mode: &str, image: &std::path::Path) {
     );
 }
 
+fn trace_entry(mode: &str, context: &parrot_api::trace::TraceContext) {
+    use parrot_api::trace::{self, TraceContext};
+    fn ready(future: impl std::future::Future<Output = ()>) {
+        assert!(std::pin::pin!(future)
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_ready());
+    }
+    match mode {
+        "trace-current" => assert_eq!(TraceContext::current(), None),
+        "trace-sync" => context.in_scope(|| {
+            assert_eq!(TraceContext::current().as_ref(), Some(context));
+        }),
+        "trace-clear" => trace::in_scope(None, || assert_eq!(TraceContext::current(), None)),
+        "trace-poll" => ready(context.scope(async {
+            assert_eq!(TraceContext::current().as_ref(), Some(context));
+        })),
+        "trace-poll-clear" => ready(trace::scope(None, async {
+            assert_eq!(TraceContext::current(), None);
+        })),
+        "trace-capture" => ready(trace::capture(async {
+            assert_eq!(TraceContext::current(), None);
+        })),
+        "trace-drop" => {
+            struct Check(parrot_api::trace::TraceContext);
+            impl Drop for Check {
+                fn drop(&mut self) {
+                    assert_eq!(TraceContext::current().as_ref(), Some(&self.0));
+                }
+            }
+            let check = Check(context.clone());
+            drop(context.scope(async move { drop(check) }));
+        }
+        "trace-unwind" => {
+            assert!(std::panic::catch_unwind(|| {
+                context.in_scope(|| {
+                    assert_eq!(TraceContext::current().as_ref(), Some(context));
+                    panic!("deliberate scoped unwind");
+                });
+            })
+            .is_err());
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(TraceContext::current(), None, "scope leaked context");
+}
+
 fn contract(name: &str, mode: &str) {
     const CHILD: &str = "PARROT_NATIVE_RUNTIME_PROGRESS";
     if std::env::var(CHILD).as_deref() == Ok(name) {
@@ -403,3 +461,32 @@ fn native_finalizer_keeps_blocking_bounded_send_live() {
 fn native_finalizer_keeps_shutdown_timeout_live() {
     contract("native_finalizer_keeps_shutdown_timeout_live", "shutdown");
 }
+
+macro_rules! trace_contract {
+    ($name:ident, $mode:literal) => {
+        #[test]
+        fn $name() {
+            contract(stringify!($name), $mode);
+        }
+    };
+}
+trace_contract!(
+    native_finalizer_keeps_cold_trace_current_live,
+    "trace-current"
+);
+trace_contract!(native_finalizer_keeps_cold_trace_sync_live, "trace-sync");
+trace_contract!(native_finalizer_keeps_cold_trace_clear_live, "trace-clear");
+trace_contract!(native_finalizer_keeps_cold_trace_poll_live, "trace-poll");
+trace_contract!(
+    native_finalizer_keeps_cold_trace_poll_clear_live,
+    "trace-poll-clear"
+);
+trace_contract!(
+    native_finalizer_keeps_cold_trace_capture_live,
+    "trace-capture"
+);
+trace_contract!(native_finalizer_keeps_cold_trace_drop_live, "trace-drop");
+trace_contract!(
+    native_finalizer_keeps_cold_trace_unwind_live,
+    "trace-unwind"
+);

@@ -276,24 +276,35 @@ fn all_statuses_and_kinds_keep_their_recorded_meaning() {
         (SpanStatus::Panicked, "panicked"),
         (SpanStatus::Cancelled, "cancelled"),
     ] {
-        let r = TraceRecorder::new(16).unwrap();
         let kinds = [
+            (SpanKind::ActorInit, "actor_init"),
+            (SpanKind::ActorBeforeStop, "actor_before_stop"),
+            (SpanKind::ActorInitLocalStreams, "actor_init_local_streams"),
             (SpanKind::TypedHandler, "typed_handler"),
             (SpanKind::DynamicHandler, "dynamic_handler"),
             (SpanKind::BusinessBatch, "business_batch"),
+            (SpanKind::InboxTransaction, "inbox_transaction"),
+            (SpanKind::ManagedTask, "managed_task"),
             (SpanKind::StreamStarted, "stream_started"),
             (SpanKind::StreamItem, "stream_item"),
             (SpanKind::StreamFinished, "stream_finished"),
             (SpanKind::StreamError, "stream_error"),
             (SpanKind::Application, "application"),
+            (SpanKind::WasmGuest, "wasm_guest"),
+            (SpanKind::NativeGuest, "native_guest"),
+            (SpanKind::WasmLifecycle, "wasm_lifecycle"),
+            (SpanKind::NativeLifecycle, "native_lifecycle"),
         ];
+        let r = TraceRecorder::new(kinds.len()).unwrap();
         for (kind, _) in kinds {
             r.root()
                 .in_scope(|| SpanGuard::current(kind, "").finish(status));
         }
         r.close();
-        let value = export(&r.drain());
-        assert_eq!(spans(&value).len(), 8);
+        let snapshot = r.drain();
+        assert_eq!(snapshot.counts.overwritten, 0);
+        let value = export(&snapshot);
+        assert_eq!(spans(&value).len(), kinds.len());
         for (span, (_, kind_label)) in spans(&value).iter().zip(kinds) {
             assert_eq!(span["kind"], 1);
             assert_eq!(span["name"], kind_label);

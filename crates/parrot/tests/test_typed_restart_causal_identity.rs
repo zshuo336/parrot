@@ -417,10 +417,16 @@ fn verify(
         assert_eq!(found.len(), 1, "each actual lifecycle phase occurs once");
         found[0].2.clone()
     };
+    let initial_hook = phase(0, "init-call");
+    lifecycle_identity::assert_child(initial_hook.as_ref(), Some(origin));
     for phase_name in ["constructor", "init-call", "init-poll", "init-resumed"] {
         assert_eq!(
             phase(0, phase_name).as_ref(),
-            Some(origin),
+            if phase_name == "constructor" {
+                Some(origin)
+            } else {
+                initial_hook.as_ref()
+            },
             "initial creation identity"
         );
     }
@@ -456,9 +462,15 @@ fn verify(
             failure,
             "OneForOne policy sees its accepted failing handler"
         );
+        let replacement = phase(epoch + 1, "init-call");
+        lifecycle_identity::assert_child(replacement.as_ref(), failure.as_ref());
         for phase_name in ["constructor", "init-call", "init-poll", "init-resumed"] {
             actual.push(phase(epoch + 1, phase_name));
-            expected.push(failure.clone());
+            expected.push(if phase_name == "constructor" {
+                failure.clone()
+            } else {
+                replacement.clone()
+            });
         }
     }
     (actual, expected)
@@ -551,3 +563,5 @@ case!(local_child_ask_error, 2, true, false, false);
 case!(local_child_ask_panic, 2, true, false, true);
 case!(local_child_tell_error, 2, true, true, false);
 case!(local_child_tell_panic, 2, true, true, true);
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;

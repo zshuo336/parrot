@@ -1,6 +1,8 @@
 //! Own a scheduled processor future through polling AND destruction. Actor
-//! storage cannot retire until every execution lease has released its future.
+//! storage cannot retire until every execution lease has released its future
+//! and any completed outcome discarded after a future disposal failure.
 use super::*;
+use crate::owned_payload::PublicationInput;
 use std::task::{Context, Poll};
 
 #[derive(Debug, Default)]
@@ -9,6 +11,10 @@ pub(super) struct Executions {
     finished: tokio::sync::Notify,
 }
 impl Executions {
+    pub(super) fn input(self: &Arc<Self>) -> InputLease {
+        self.state.lock().unwrap().0 += 1;
+        InputLease(self.clone())
+    }
     pub(super) fn own<T: Send + 'static>(
         self: &Arc<Self>,
         future: BoxedProcessorFuture<Result<T, SystemError>>,
@@ -39,23 +45,44 @@ impl Executions {
         }
     }
 }
+pub(super) struct InputLease(Arc<Executions>);
+impl Drop for InputLease {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().0 -= 1;
+        self.0.finished.notify_waiters();
+    }
+}
 struct Execution<T> {
     future: Option<BoxedProcessorFuture<Result<T, SystemError>>>,
     state: Arc<Executions>,
     phase: &'static str,
 }
 impl<T> Execution<T> {
-    fn dispose(&mut self) -> Result<(), SystemError> {
+    fn dispose(
+        &mut self,
+        output: &mut Option<PublicationInput<Result<T, SystemError>>>,
+    ) -> Result<(), SystemError> {
         let Some(future) = self.future.take() else {
             return Ok(());
         };
-        let disposed = panic::catch_unwind(AssertUnwindSafe(|| drop(future))).map_err(|payload| {
-            format!(
-                "{} future destructor panicked: {}",
-                self.phase,
-                crate::owned_payload::panic_message(payload)
-            )
-        });
+        let mut disposed =
+            panic::catch_unwind(AssertUnwindSafe(|| drop(future))).map_err(|payload| {
+                format!(
+                    "{} future destructor panicked: {}",
+                    self.phase,
+                    crate::owned_payload::panic_message(payload)
+                )
+            });
+        // A failed delegate cannot publish its outcome. Retire that separate
+        // owner before releasing the lease or notifying storage retirement.
+        if let Err(message) = &mut disposed
+            && let Some(output) = output.take()
+            && let Err(error) = output.retire()
+        {
+            message.push_str(&format!(
+                "; discarded execution outcome disposal failed: {error}"
+            ));
+        }
         {
             let mut state = self.state.state.lock().unwrap();
             if let Err(error) = &disposed {
@@ -69,7 +96,7 @@ impl<T> Execution<T> {
 }
 impl<T> Drop for Execution<T> {
     fn drop(&mut self) {
-        let _ = self.dispose();
+        let _ = self.dispose(&mut None);
     }
 }
 impl<T> std::future::Future for Execution<T> {
@@ -91,8 +118,9 @@ impl<T> std::future::Future for Execution<T> {
                 crate::owned_payload::panic_message(payload)
             ))),
         };
-        match self.dispose() {
-            Ok(()) => Poll::Ready(result),
+        let mut output = Some(PublicationInput::new(result));
+        match self.dispose(&mut output) {
+            Ok(()) => Poll::Ready(output.as_mut().expect("completed execution outcome").take()),
             Err(error) => Poll::Ready(Err(error)),
         }
     }
@@ -190,3 +218,6 @@ mod recursive_panic_tests {
         check(true, true).await;
     }
 }
+
+#[cfg(test)]
+mod output_retirement_contracts;

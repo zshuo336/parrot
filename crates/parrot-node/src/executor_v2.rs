@@ -5,6 +5,7 @@ use futures::FutureExt;
 use parrot::thread::system::ThreadActorSystem;
 #[cfg(test)]
 use parrot_api::address::ActorRef;
+#[cfg(test)]
 use parrot_api::errors::ActorError;
 use parrot_app::{assemble::ParrotSpawner, host::ThreadPropsSpawner};
 use parrot_remote::admin_v2::{
@@ -18,9 +19,11 @@ use std::{
 };
 
 mod artifact;
+mod callback;
+mod operation;
 mod reference;
 pub use artifact::ArtifactChannel;
-use reference::{drop_catching, ReferenceOwner};
+use reference::{call_catching, drop_catching, ReferenceOwner};
 
 /// Admission bounds apply before path expansion or configuration parsing.
 pub const MAX_COMPONENT_INSTANCES: usize = 1024;
@@ -75,15 +78,13 @@ struct Owner {
 #[derive(Clone, PartialEq, Eq)]
 struct HostPolicy {
     epoch_ticks: u32,
-    #[cfg(feature = "dylib")]
-    native: crate::NativeTrust,
+    options: crate::HostOptions,
 }
 impl Default for HostPolicy {
     fn default() -> Self {
         Self {
             epoch_ticks: 1,
-            #[cfg(feature = "dylib")]
-            native: Default::default(),
+            options: Default::default(),
         }
     }
 }
@@ -129,17 +130,12 @@ impl NodeComponentExecutor {
     pub(crate) fn for_running_node(
         ts: Arc<ThreadActorSystem>,
         epoch_ticks: Option<u32>,
-        #[cfg(feature = "dylib")] native: &crate::NativeTrust,
+        options: &crate::HostOptions,
     ) -> Result<Self, String> {
         if !is_node_engine(&ts) {
             return Err("invalid Node component engine".into());
         }
-        Self::configured(
-            ts,
-            epoch_ticks,
-            #[cfg(feature = "dylib")]
-            native,
-        )
+        Self::with_host_options(ts, epoch_ticks, options)
     }
 
     /// Configure an independent executor using previously granted native trust.
@@ -152,13 +148,27 @@ impl NodeComponentExecutor {
         ts: Arc<ThreadActorSystem>,
         native: &crate::NativeTrust,
     ) -> Result<Self, String> {
-        Self::configured(ts, None, native)
+        Self::with_host_options(
+            ts,
+            None,
+            &crate::HostOptions {
+                native: native.clone(),
+                native_messaging: Default::default(),
+                native_services: Default::default(),
+                #[cfg(feature = "wasm")]
+                wasm_messaging: Default::default(),
+                #[cfg(feature = "wasm")]
+                wasm_services: Default::default(),
+            },
+        )
     }
 
-    fn configured(
+    /// Bind immutable operator authority and a finite Wasm epoch budget.
+    /// Existing NODE owners must have the same normalized authority and budget.
+    pub fn with_host_options(
         ts: Arc<ThreadActorSystem>,
         epoch_ticks: Option<u32>,
-        #[cfg(feature = "dylib")] native: &crate::NativeTrust,
+        options: &crate::HostOptions,
     ) -> Result<Self, String> {
         if epoch_ticks == Some(0) {
             return Err("invalid Node Wasm budget".into());
@@ -169,8 +179,7 @@ impl NodeComponentExecutor {
         }
         let policy = HostPolicy {
             epoch_ticks: epoch_ticks.unwrap_or(1),
-            #[cfg(feature = "dylib")]
-            native: native.clone(),
+            options: options.clone(),
         };
         let spawner = ThreadPropsSpawner::new(ts.clone());
         #[cfg(feature = "wasm")]
@@ -185,8 +194,20 @@ impl NodeComponentExecutor {
         } else {
             spawner
         };
+        #[cfg(feature = "wasm")]
+        let spawner = spawner
+            .with_wasm_messaging(options.wasm_messaging.grants().to_vec())
+            .and_then(|spawner| spawner.with_wasm_services(options.wasm_services.grants().to_vec()))
+            .map_err(|error| error.to_string())?;
         #[cfg(feature = "dylib")]
-        let spawner = native.configure(spawner)?;
+        let spawner = options.native.configure(spawner)?;
+        #[cfg(feature = "dylib")]
+        let spawner = spawner
+            .with_dylib_messaging(options.native_messaging.grants().to_vec())
+            .and_then(|spawner| {
+                spawner.with_dylib_services(options.native_services.grants().to_vec())
+            })
+            .map_err(|error| error.to_string())?;
         let candidate = Arc::new(Owner::with_spawner(spawner, policy.clone()));
         let owner = if is_node_engine(&ts) {
             NODE_OWNER.get_or_init(|| candidate).clone()
@@ -204,34 +225,29 @@ impl NodeComponentExecutor {
     async fn owned(
         &self,
         req_id: u64,
+        target: &'static str,
         work: impl std::future::Future<Output = R> + Send + 'static,
     ) -> R {
+        let mut operation = operation::Operation::new(work, target);
         let permit = match self.owner.admission.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return failed_v2(
+                return operation.finish_reply(failed_v2(
                     req_id,
                     v2_err::SPAWN_FAILED,
                     "node management operation limit reached",
-                )
+                ));
             }
         };
+        operation.permit = Some(permit);
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.ts.runtime_handle().spawn(async move {
-            let _permit = permit;
-            let reply = std::panic::AssertUnwindSafe(work)
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|payload| {
-                    drop_catching(payload);
-                    failed_v2(
-                        req_id,
-                        v2_err::SPAWN_FAILED,
-                        "node management operation panicked",
-                    )
-                });
-            let _ = sender.send(reply);
-        });
+        let context = operation.context.clone();
+        self.ts
+            .runtime_handle()
+            .spawn(parrot_api::trace::scope(context, async move {
+                let reply = operation.run(req_id).await;
+                let _ = sender.send(reply);
+            }));
         receiver.await.unwrap_or_else(|_| {
             failed_v2(
                 req_id,
@@ -239,6 +255,20 @@ impl NodeComponentExecutor {
                 "node management owner runtime stopped",
             )
         })
+    }
+
+    async fn query<F: std::future::Future<Output = R>>(
+        &self,
+        req_id: u64,
+        target: &'static str,
+        work: impl FnOnce(Arc<callback::Cleanup>) -> F,
+    ) -> R {
+        let cleanup = Arc::new(callback::Cleanup::default());
+        let mut operation = operation::Operation::query(work(cleanup.clone()), target, cleanup);
+        parrot_api::trace::scope(operation.context.clone(), async move {
+            operation.run(req_id).await
+        })
+        .await
     }
 
     fn operation_locks(&self, mut names: Vec<String>) -> Vec<Arc<tokio::sync::Mutex<()>>> {
@@ -376,7 +406,7 @@ impl NodeComponentExecutor {
         if let Some((same, instances)) = existing {
             let mut live = same && instances.len() == command.instances.instance_count();
             for instance in &instances {
-                live &= instance.cleanup_error.is_none() && instance_alive(instance).await;
+                live &= instance.cleanup_error.is_none() && instance_alive(instance, None).await;
             }
             return if live {
                 R::Deployed {
@@ -574,32 +604,45 @@ impl NodeComponentExecutor {
         };
         let mut instances = Vec::new();
         for path in paths {
-            let result = std::panic::AssertUnwindSafe(async { (factory.spawn)(path).await })
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|payload| {
-                    drop_catching(payload);
-                    Err(ActorError::Panic(format!(
-                        "Props factory {} panicked",
-                        factory.name
-                    )))
-                });
-            match result {
-                Ok(actor) => instances.push(Instance {
-                    path: path.clone(),
-                    actor: ReferenceOwner::new(path.clone(), Arc::from(actor)),
-                    cleanup_error: None,
-                }),
-                Err(error) => {
-                    let (retained, cleanup) = rollback(instances).await;
-                    return Err((
-                        (
-                            v2_err::SPAWN_FAILED,
-                            format!("spawn {path}: {error}{cleanup}"),
-                        ),
-                        retained,
-                    ));
+            let boundary = callback::Cleanup::default();
+            let result = callback::run(&boundary, || (factory.spawn)(path)).await;
+            let failure = match result {
+                Ok(Ok(actor)) => {
+                    // The factory may have completed an actor before its future's
+                    // destructor failed. Keep that actor in the rollback cohort.
+                    instances.push(Instance {
+                        path: path.clone(),
+                        actor: ReferenceOwner::new(path.clone(), Arc::from(actor)),
+                        cleanup_error: None,
+                    });
+                    None
                 }
+                Ok(Err(error)) => {
+                    let mut error = boundary.owned(error);
+                    let detail = boundary.call(|| error.value().to_string()).ok();
+                    error.retire();
+                    detail
+                }
+                Err(()) => None,
+            };
+            let failure = if boundary.failed() {
+                let panic = format!("Props factory {} panicked", factory.name);
+                Some(match failure {
+                    Some(detail) if !detail.is_empty() => format!("{detail}; {panic}"),
+                    _ => panic,
+                })
+            } else {
+                failure
+            };
+            if let Some(failure) = failure {
+                let (retained, cleanup) = rollback(instances).await;
+                return Err((
+                    (
+                        v2_err::SPAWN_FAILED,
+                        format!("spawn {path}: {failure}{cleanup}"),
+                    ),
+                    retained,
+                ));
             }
         }
         Ok(instances)
@@ -653,13 +696,7 @@ impl NodeComponentExecutor {
             } else {
                 match std::panic::AssertUnwindSafe(async {
                     let operation = async {
-                        instance
-                            .actor
-                            .send(Box::new(
-                                parrot::thread::envelope::ControlMessage::HealthCheck,
-                            ))
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        health_check(&instance).await?;
                         stop_instance(&instance).await
                     };
                     tokio::time::timeout_at(deadline, operation).await.ok()
@@ -708,7 +745,7 @@ impl NodeComponentExecutor {
         }
     }
 
-    async fn states(&self, prefix: &str) -> Vec<ComponentStateReport> {
+    async fn states(&self, prefix: &str, cleanup: &callback::Cleanup) -> Vec<ComponentStateReport> {
         // Snapshot identity and version under one lock; a later redeploy must
         // not label an old instance with the replacement's version.
         let rows = {
@@ -750,7 +787,7 @@ impl NodeComponentExecutor {
             let state = match instance {
                 None => "deploying",
                 Some(instance) if instance.cleanup_error.is_some() => "cleanup_failed",
-                Some(instance) if instance_alive(&instance).await => "running",
+                Some(instance) if instance_alive(&instance, Some(cleanup)).await => "running",
                 Some(_) => "unavailable",
             };
             result.push(ComponentStateReport {
@@ -760,6 +797,22 @@ impl NodeComponentExecutor {
             });
         }
         result
+    }
+
+    async fn metrics_snapshot(&self, cleanup: &callback::Cleanup) -> MetricsSnapshot {
+        let states = self.states("/user/", cleanup).await;
+        let components = self.owner.records.lock().unwrap().len() as u64;
+        MetricsSnapshot {
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
+            runtime: format!("parrot/{}", env!("CARGO_PKG_VERSION")),
+            components,
+            component_states: states,
+            processes: self.ts.actor_count() as u64,
+            ..Default::default()
+        }
     }
 }
 
@@ -847,32 +900,42 @@ fn parse_config(bytes: Option<&[u8]>) -> Result<Option<toml::Table>, Failure> {
         .transpose()
 }
 
-async fn instance_alive(instance: &Instance) -> bool {
-    match std::panic::AssertUnwindSafe(async { instance.actor.is_alive().await })
-        .catch_unwind()
-        .await
-    {
-        Ok(alive) => alive,
-        Err(payload) => {
-            drop_catching(payload);
-            tracing::warn!(path = %instance.path, "Node liveness callback panicked");
+async fn instance_alive(instance: &Instance, parent: Option<&callback::Cleanup>) -> bool {
+    let cleanup = callback::Cleanup::default();
+    let _report = cleanup.report_to(parent);
+    match callback::run(&cleanup, || instance.actor.is_alive()).await {
+        Ok(alive) if !cleanup.failed() => alive,
+        _ => {
+            let _ = call_catching(|| {
+                tracing::warn!(path = %instance.path, "Node liveness callback panicked");
+            });
             false
         }
     }
 }
 
 async fn stop_instance(instance: &Instance) -> Result<(), String> {
-    match std::panic::AssertUnwindSafe(async { instance.actor.stop().await })
-        .catch_unwind()
-        .await
-    {
-        Ok(Ok(())) | Ok(Err(ActorError::ActorNotFound(_))) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(payload) => {
-            drop_catching(payload);
-            Err("actor stop panicked".into())
-        }
-    }
+    callback::discard(
+        || parrot_api::address::stop_for_cleanup(&**instance.actor),
+        |result| match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        },
+        "actor stop panicked",
+    )
+    .await
+}
+async fn health_check(instance: &Instance) -> Result<(), String> {
+    callback::discard(
+        || {
+            instance.actor.send(Box::new(
+                parrot::thread::envelope::ControlMessage::HealthCheck,
+            ))
+        },
+        |result| result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        "actor drain callback panicked",
+    )
+    .await
 }
 async fn rollback(instances: Vec<Instance>) -> (Vec<Instance>, String) {
     let mut retained = Vec::new();
@@ -899,70 +962,71 @@ impl ComponentExecutor for NodeComponentExecutor {
         }
         let owner = self.clone();
         let command = command.clone();
-        self.owned(
-            req_id,
-            async move { owner.deploy_owned(req_id, command).await },
-        )
+        self.owned(req_id, "node/deploy", async move {
+            owner.deploy_owned(req_id, command).await
+        })
         .await
     }
     async fn stop(&self, req_id: u64, prefix: &str) -> R {
         let owner = self.clone();
         let prefix = prefix.to_owned();
-        self.owned(
-            req_id,
-            async move { owner.stop_owned(req_id, prefix).await },
-        )
+        self.owned(req_id, "node/stop", async move {
+            owner.stop_owned(req_id, prefix).await
+        })
         .await
     }
     async fn drain(&self, req_id: u64, prefix: &str, timeout_ms: u64) -> R {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms.min(60_000));
         let owner = self.clone();
         let prefix = prefix.to_owned();
-        self.owned(req_id, async move {
+        self.owned(req_id, "node/drain", async move {
             owner.drain_owned(req_id, prefix, deadline).await
         })
         .await
     }
     async fn status(&self, req_id: u64, prefix: &str) -> R {
-        let states = self.states(prefix).await;
-        if states.is_empty() {
-            not_found(req_id, prefix)
-        } else {
-            R::Status { req_id, states }
-        }
+        self.query(req_id, "node/status", |cleanup| async move {
+            let states = self.states(prefix, &cleanup).await;
+            if states.is_empty() {
+                not_found(req_id, prefix)
+            } else {
+                R::Status { req_id, states }
+            }
+        })
+        .await
     }
     async fn metrics(&self, req_id: u64) -> R {
-        let states = self.states("/user/").await;
-        let components = self.owner.records.lock().unwrap().len() as u64;
-        R::Metrics {
-            req_id,
-            snapshot: MetricsSnapshot {
-                ts_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or_default(),
-                runtime: format!("parrot/{}", env!("CARGO_PKG_VERSION")),
-                components,
-                component_states: states,
-                processes: self.ts.actor_count() as u64,
-                ..Default::default()
-            },
-        }
+        self.query(req_id, "node/metrics", |cleanup| async move {
+            R::Metrics {
+                req_id,
+                snapshot: self.metrics_snapshot(&cleanup).await,
+            }
+        })
+        .await
     }
     async fn measured_metrics(&self) -> parrot_remote::metrics::MeasuredMetrics {
         use parrot_remote::metrics::{field, MeasuredMetrics};
-        let R::Metrics { snapshot, .. } = self.metrics(0).await else {
-            unreachable!()
-        };
-        MeasuredMetrics {
-            snapshot,
-            available: field::TS_MS
-                | field::RUNTIME
-                | field::COMPONENTS
-                | field::COMPONENT_STATES
-                | field::PROCESSES,
-            epoch: String::new(),
-            process_kind: "parrot_actor_entries".into(),
+        let reply = self
+            .query(0, "node/measured_metrics", |cleanup| async move {
+                R::MeasuredMetrics {
+                    req_id: 0,
+                    metrics: MeasuredMetrics {
+                        snapshot: self.metrics_snapshot(&cleanup).await,
+                        available: field::TS_MS
+                            | field::RUNTIME
+                            | field::COMPONENTS
+                            | field::COMPONENT_STATES
+                            | field::PROCESSES,
+                        epoch: String::new(),
+                        process_kind: "parrot_actor_entries".into(),
+                    },
+                }
+            })
+            .await;
+        match reply {
+            R::MeasuredMetrics { metrics, .. } => metrics,
+            // The trait has no failure reply. Leave all fields unavailable.
+            _ => MeasuredMetrics::default(),
         }
     }
 }
@@ -1021,5 +1085,9 @@ pub async fn exec_command_v2(ts: &Arc<ThreadActorSystem>, command: AdminCommandV
     }
 }
 
+#[cfg(test)]
+mod operation_tests;
+#[cfg(test)]
+mod query_tests;
 #[cfg(test)]
 mod selection_tests;

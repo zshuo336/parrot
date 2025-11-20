@@ -4,14 +4,22 @@
 // Actix as the underlying execution engine, while maintaining the ParrotActor API.
 
 pub mod actor;
+mod cancellation_executor;
+mod cohort;
 pub mod context;
 mod disposal;
+mod distribution;
 mod factory;
 mod lifecycle;
+#[cfg(test)]
+pub(crate) use lifecycle::ActorControl;
 mod local_runtime;
 pub mod local_typed;
 pub mod message;
+mod pool_retirement;
+mod pool_startup;
 pub mod reference;
+mod settings;
 pub mod system;
 pub mod typed;
 pub mod types;

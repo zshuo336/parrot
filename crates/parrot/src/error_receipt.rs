@@ -12,6 +12,12 @@ impl<E: Send + Sync + 'static> Drop for Storage<E> {
     }
 }
 pub(crate) struct Receipt<E: Send + Sync + 'static>(Arc<Storage<E>>);
+impl<E: Send + Sync + 'static> std::ops::Deref for Receipt<E> {
+    type Target = E;
+    fn deref(&self) -> &E {
+        self.error()
+    }
+}
 impl<E: Send + Sync + 'static> Clone for Receipt<E> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -32,6 +38,11 @@ impl<E: Send + Sync + 'static> Receipt<E> {
 }
 
 pub(crate) type ActorReceipt = Receipt<Arc<ActorError>>;
+impl From<Arc<ActorError>> for ActorReceipt {
+    fn from(error: Arc<ActorError>) -> Self {
+        Self::new(error)
+    }
+}
 impl ActorReceipt {
     pub(crate) fn from_error(error: ActorError) -> Self {
         Self::new(Arc::new(error))
@@ -114,22 +125,40 @@ impl std::error::Error for SystemCause {
     }
 }
 
+/// Preserve the native error and its protected final owner across public facades.
+pub(crate) fn public_system_error(error: SystemError) -> parrot_api::system::SystemError {
+    parrot_api::system::SystemError::Other(anyhow::Error::new(SystemCause(SystemReceipt::new(
+        error,
+    ))))
+}
+
 // Inspect only framework-owned representations. Walking arbitrary Error::source
 // or formatting an unknown business error would execute user code at retirement.
 enum Diagnostic<'a> {
     Actor(&'a ActorError),
     System(&'a SystemError),
+    Public(&'a parrot_api::system::SystemError),
 }
-fn diagnostic(mut current: Diagnostic<'_>) -> String {
+fn diagnostic(mut current: Diagnostic<'_>, native_prefixes: bool) -> String {
     const OPAQUE: &str = "actor operation failed (original error retained in source chain)";
+    let mut prefix = String::new();
     // Both receipt wrappers and nested ActorError/SystemError values are safe
     // to inspect. Bound adversarial nesting without recursive stack growth.
     for _ in 0..64 {
+        if native_prefixes && matches!(current, Diagnostic::System(SystemError::Other(_))) {
+            prefix.push_str("Internal system error: ");
+        }
         let other = match current {
             Diagnostic::Actor(ActorError::Other(error))
-            | Diagnostic::System(SystemError::Other(error)) => error,
-            Diagnostic::Actor(error) => return error.to_string(),
-            Diagnostic::System(error) => return error.to_string(),
+            | Diagnostic::System(SystemError::Other(error))
+            | Diagnostic::Public(parrot_api::system::SystemError::Other(error)) => error,
+            Diagnostic::Public(parrot_api::system::SystemError::ActorError(error)) => {
+                current = Diagnostic::Actor(error);
+                continue;
+            }
+            Diagnostic::Actor(error) => return format!("{prefix}{error}"),
+            Diagnostic::System(error) => return format!("{prefix}{error}"),
+            Diagnostic::Public(error) => return format!("{prefix}{error}"),
         };
         current = if let Some(cause) = other.downcast_ref::<ActorCause>() {
             Diagnostic::Actor(cause.0.error().as_ref())
@@ -139,17 +168,28 @@ fn diagnostic(mut current: Diagnostic<'_>) -> String {
             Diagnostic::Actor(error)
         } else if let Some(error) = other.downcast_ref::<SystemError>() {
             Diagnostic::System(error)
+        } else if let Some(error) = other.downcast_ref::<parrot_api::system::SystemError>() {
+            Diagnostic::Public(error)
+        } else if let Some(error) = other.downcast_ref::<crate::broadcast::Failure>() {
+            return format!("{prefix}{error}");
+        } else if let Some(message) = other.downcast_ref::<String>() {
+            return format!("{prefix}{message}");
+        } else if let Some(message) = other.downcast_ref::<&'static str>() {
+            return format!("{prefix}{message}");
         } else {
-            return OPAQUE.into();
+            return format!("{prefix}{OPAQUE}");
         };
     }
-    OPAQUE.into()
+    format!("{prefix}{OPAQUE}")
 }
 pub(crate) fn actor_summary(error: &ActorError) -> String {
-    diagnostic(Diagnostic::Actor(error))
+    diagnostic(Diagnostic::Actor(error), false)
 }
 pub(crate) fn system_summary(error: &SystemError) -> String {
-    diagnostic(Diagnostic::System(error))
+    diagnostic(Diagnostic::System(error), false)
+}
+pub(crate) fn public_system_summary(error: &parrot_api::system::SystemError) -> String {
+    diagnostic(Diagnostic::Public(error), true)
 }
 
 /// A hook's business error can be superseded by a later resource cleanup error.

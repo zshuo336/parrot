@@ -32,6 +32,8 @@ CARGO_BUILD_JOBS=2 cargo test --locked -p parrot-api --test integration_test tes
 
 - `actor_test.rs`、`actor_factory_test.rs`、`actor_config_test.rs`：actor、factory 与配置接口；生产引擎的注册、重启及退休由引擎层测试覆盖。
 - `address_test.rs`、`message_test.rs`、`errors_test.rs`：引用、消息与错误类型行为。
+- `placeholder_input_contract.rs`：无 runtime 时占位引用的拒绝、未 poll 取消及输入恰好清理一次；析构 panic 不替换原拒绝。
+- `declarative_macro_contract.rs`：声明宏的调用方名称隔离、关联回复类型、未知消息和延迟异步分派；未 poll 的 handler 不运行。
 - `context_test.rs`、`runtime_test.rs`、`system_test.rs`、`config_test.rs`：API 及配置数据契约；构造配置对象不等于真实运行时执行该政策。
 - `tell_contract.rs`、`typed_bridge_input_contract.rs`、`message_conversion_contract.rs`、`delegate_future_contract.rs`：投递、转换、委托 future 与输入所有权。
 - `engine_catalog*.rs`、`local_stream_registry.rs`、`test_watch_inputs.rs`：目录、stream 与 watch 的拥有、取消和清理边界。

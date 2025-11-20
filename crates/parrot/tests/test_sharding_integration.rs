@@ -1,11 +1,17 @@
-//! P4 集成验收（DEV_04 §6 DoD）：
-//! - `sharding_kill_node`：3 节点 kill 1 → 5s 内实体重建 + 消息零丢失
+//! P4 state-machine scenarios and local facade tests. The sharding membership
+//! changes and singleton time below are injected; these are not real node-kill,
+//! network partition or distributed singleton takeover acceptance tests.
+//! - `sharding_membership_removal`：注入成员移除及精确代次退休状态
 //! - `sharding_affinity_l1`：同 key 连续消息命中同宿主
-//! - `sharding_rebalance_drain`：迁移期消息不丢不重
-//! - `singleton_takeover`：≤13s 新 singleton（D2 状态机时序门禁）
+//! - `sharding_local_retirement_and_state_transfer`：本地实例退休及显式状态恢复
+//! - `singleton_takeover`：注入时钟下的本地租约接管
 //! - `facade_prefix_route`：`/user/entity-*` 前缀通配（§7.1）
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use parrot::system::ParrotActorSystem;
@@ -13,10 +19,10 @@ use parrot::thread::config::ThreadActorConfig;
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, EmptyConfig};
-use parrot_api::address::{ActorPath, ActorRef};
+use parrot_api::address::{ActorPath, ActorRef, RetirementStatus, stop_for_owned_cleanup};
 use parrot_api::system::{ActorSystem, ActorSystemConfig};
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
-use parrot_remote::sharding::{ShardCoordinator, entity_key_of};
+use parrot_remote::sharding::{EntityStatus, ShardCoordinator, entity_key_of};
 use parrot_remote::singleton::{
     Candidate, LeaseParams, SingletonLease, SingletonState, SingletonTransition,
 };
@@ -38,8 +44,7 @@ macro_rules! reg {
                     Ok(m.0.to_le_bytes().to_vec())
                 },
                 decode: |b: &[u8]| {
-                    let mut a = [0u8; 8];
-                    a.copy_from_slice(&b[..8]);
+                    let a: [u8; 8] = b.try_into().map_err(|_| "Tick requires exactly eight bytes")?;
                     Ok(Box::new(<$t>::from_bytes(u64::from_le_bytes(a))) as BoxedMessage)
                 },
             }
@@ -55,9 +60,55 @@ impl Tick {
 
 reg!(Tick, "bin:u:Tick");
 
-/// 计数 actor：ASK 返回累计值（per-entity 计数器）。
+fn tick_codec() -> &'static parrot_api::message::CodecRegistration {
+    parrot_api::message::inventory::iter::<parrot_api::message::CodecRegistration>
+        .into_iter()
+        .find(|codec| codec.type_key == "bin:u:Tick")
+        .expect("registered Tick codec")
+}
+
+#[test]
+fn tick_codec_rejects_short_payloads_without_panicking() {
+    let codec = tick_codec();
+    for length in 0..8 {
+        let bytes = vec![0; length];
+        let result = std::panic::catch_unwind(|| (codec.decode)(&bytes));
+        assert!(result.is_ok(), "short fixture payload must not unwind");
+        assert!(result.unwrap().is_err());
+    }
+}
+
+#[test]
+fn tick_codec_rejects_trailing_bytes_and_preserves_exact_values() {
+    let codec = tick_codec();
+    for length in [9, 16, 1024] {
+        assert!((codec.decode)(&vec![0; length]).is_err());
+    }
+    for value in [0, 1, u64::MAX] {
+        let message = Box::new(Tick(value)) as BoxedMessage;
+        let bytes = (codec.encode)(&message).unwrap();
+        assert_eq!(bytes, value.to_le_bytes());
+        let decoded = (codec.decode)(&bytes).unwrap();
+        assert_eq!(decoded.downcast_ref::<Tick>(), Some(&Tick(value)));
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CounterState(Vec<u64>);
+struct Apply(u64);
+struct Snapshot;
+
+/// The test host explicitly transfers this ordered effect log. The runtime
+/// does not persist or deduplicate it on behalf of a distributed shard router.
 struct Counter {
-    count: u64,
+    state: CounterState,
+    disposed: Arc<AtomicUsize>,
+}
+
+impl Drop for Counter {
+    fn drop(&mut self) {
+        self.disposed.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Actor for Counter {
@@ -69,9 +120,12 @@ impl Actor for Counter {
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            if let Some(Tick(n)) = msg.downcast_ref::<Tick>() {
-                self.count += n;
-                return Ok(Box::new(Tick(self.count)) as BoxedMessage);
+            if let Some(Apply(id)) = msg.downcast_ref::<Apply>() {
+                self.state.0.push(*id);
+                return Ok(Box::new(()) as BoxedMessage);
+            }
+            if msg.is::<Snapshot>() {
+                return Ok(Box::new(self.state.clone()) as BoxedMessage);
             }
             Err(parrot_api::errors::ActorError::MessageHandlingError(
                 "unhandled".into(),
@@ -84,77 +138,77 @@ impl Actor for Counter {
 }
 
 async fn spawn_entity(
-    facade: &Arc<ParrotActorSystem>,
     ts: &Arc<ThreadActorSystem>,
     key: &str,
+    state: CounterState,
+    disposed: Arc<AtomicUsize>,
 ) -> Box<dyn ActorRef> {
-    ts.spawn_at(
-        Counter { count: 0 },
-        &format!("/user/entity-{key}"),
-        None,
-        ThreadActorConfig::default(),
-    )
-    .await
-    .unwrap();
-    facade
-        .get_actor(&ActorPath::placeholder(
-            format!("/user/entity-{key}").as_str(),
-        ))
+    Box::new(
+        ts.spawn_at(
+            Counter { state, disposed },
+            &format!("/user/entity-{key}"),
+            None,
+            ThreadActorConfig::default(),
+        )
         .await
-        .unwrap()
+        .unwrap(),
+    )
 }
 
 // ── D1 · sharding ───────────────────────────────────────
 
-/// kill 1/3 节点 → 5s 内分片实体在新 holder 重建 + 计数不丢（零丢失口径）。
+/// Inject membership removal and acknowledge retirement before local readmission.
 #[test]
-fn sharding_kill_node() {
+fn sharding_membership_removal() {
     let nodes = vec!["n1".to_string(), "n2".into(), "n3".into()];
     let coord = ShardCoordinator::new(&nodes);
 
-    // 激活 100 实体
+    let mut leases = BTreeMap::new();
     for i in 0..100 {
         let key = format!("k{i}");
-        let node = coord.route(&key).expect("route");
-        coord.activated(&key, &node);
+        let lease = coord.begin_activation(&key).unwrap();
+        assert!(coord.activated(&lease));
+        leases.insert(key, lease);
     }
-
-    // kill n2：Alive = {n1, n3}
-    let t0 = Instant::now();
-    let moves = coord.rebalance(&["n1".to_string(), "n3".into()]);
-    let elapsed = t0.elapsed();
-
-    // 门禁 1：5s 内完成重建决策（本地决策路径——网络收敛由 SWIM ≤3.5s 另测）
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "rebalance took {elapsed:?}"
+    let before = coord.entities();
+    let expected: BTreeSet<_> = before
+        .iter()
+        .filter(|(_, state)| state.node == "n2")
+        .map(|(key, _)| key.clone())
+        .collect();
+    assert!(!expected.is_empty());
+    let moves = coord.rebalance(&["n1".into(), "n3".into()]).unwrap();
+    assert_eq!(moves.len(), expected.len());
+    assert_eq!(
+        moves
+            .iter()
+            .map(|item| item.owner.key().to_owned())
+            .collect::<BTreeSet<_>>(),
+        expected
     );
-
-    // 门禁 2：原 n2 上的实体全部有新宿主
-    let entities = coord.entities();
-    let orphaned = entities.values().filter(|st| st.node.is_empty()).count();
-    assert_eq!(orphaned, 0, "orphaned entities after kill");
-    // n2 宿主不再存在
-    assert!(
-        !entities.values().any(|st| st.node == "n2"),
-        "dead node still holds entities"
-    );
-    // 迁移集与 n2 实体集一致
-    let on_n2_before: usize = 0; // 初始分布未知——用 moves 非空 + 全部去向 ∈ {n1,n3} 断言
-    let _ = on_n2_before;
-    for (key, to) in &moves {
-        assert!(
-            to == "n1" || to == "n3",
-            "entity {key} moved to dead/invalid {to}"
-        );
+    let draining = coord.entities();
+    for (key, state) in &before {
+        assert_eq!(draining[key].node, state.node);
+        if expected.contains(key) {
+            assert_eq!(draining[key].status, EntityStatus::Migrating);
+            assert!(coord.begin_activation(key).is_none());
+        } else {
+            assert_eq!(draining[key], *state);
+        }
     }
-    // 路由一致性：重建后 route(key) == 记录宿主
-    for (key, st) in &entities {
-        assert_eq!(
-            &coord.route(key).unwrap(),
-            &st.node,
-            "route drift for {key}"
-        );
+    for item in moves {
+        assert_eq!(item.owner, leases[item.owner.key()]);
+        assert_eq!(item.owner.node(), "n2");
+        assert!(matches!(item.target.as_deref(), Some("n1" | "n3")));
+        assert!(coord.passivated(&item.owner));
+        let replacement = coord.begin_activation(item.owner.key()).unwrap();
+        assert_eq!(Some(replacement.node()), item.target.as_deref());
+        assert!(coord.activated(&replacement));
+        assert!(!coord.passivated(&item.owner));
+    }
+    for (key, state) in coord.entities() {
+        assert_eq!(state.status, EntityStatus::Active);
+        assert_eq!(coord.route(&key).as_ref(), Some(&state.node));
     }
 }
 
@@ -170,50 +224,89 @@ fn sharding_affinity_l1() {
     }
 }
 
-/// 迁移 drain：迁移期消息不丢不重（本地 drain 窗口语义断言）。
+/// Two real local instances with explicit checkpoint transfer. This is not a
+/// network drain, automatic routing, durable recovery or retry/deduplication gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sharding_rebalance_drain() {
-    let facade = Arc::new(
-        ParrotActorSystem::new(ActorSystemConfig::default())
-            .await
-            .unwrap(),
-    );
-    let ts = ThreadActorSystem::shared(Default::default());
-    facade
-        .register_thread_system("eng".into(), ts.clone(), true)
-        .await
-        .unwrap();
-
-    let coord = ShardCoordinator::new(&["n1".into(), "n2".into(), "n3".into()]);
+async fn sharding_local_retirement_and_state_transfer() {
+    let old_system = ThreadActorSystem::shared(Default::default());
+    let new_system = ThreadActorSystem::shared(Default::default());
+    let coord = ShardCoordinator::new(&["n1".into()]);
     let key = "drain-1";
-    let entity = spawn_entity(&facade, &ts, key).await;
-    coord.activated(key, &coord.route(key).unwrap());
-
-    // 迁移前发 10 条（drain 窗口起点）
-    for _ in 0..10 {
-        entity.deliver(Box::new(Tick(1))).await.unwrap();
+    let old_lease = coord.begin_activation(key).unwrap();
+    let old_disposed = Arc::new(AtomicUsize::new(0));
+    let old = spawn_entity(
+        &old_system,
+        key,
+        CounterState::default(),
+        old_disposed.clone(),
+    )
+    .await;
+    assert!(coord.activated(&old_lease));
+    for id in 1..=10 {
+        old.deliver(Box::new(Apply(id))).await.unwrap();
     }
-    // 迁移决策（membership 变化）
-    coord.rebalance(&["n1".into(), "n2".into()]);
-    // drain 窗口内消息（旧 holder 处理完存量后转移——本地形态语义等价：
-    // 实体路径不变、计数状态在实体内延续，新 holder 即"同 key 再激活"）
-    for _ in 0..5 {
-        entity.deliver(Box::new(Tick(1))).await.unwrap();
-    }
-    coord.activated(key, &coord.route(key).unwrap());
-
-    // ASK 结算：15 条不丢（per-entity 至少一次；drain 语义 = 不丢不重）
-    let r = tokio::time::timeout(Duration::from_secs(3), entity.send(Box::new(Tick(0))))
+    let moves = coord.rebalance(&["n2".into()]).unwrap();
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].owner, old_lease);
+    assert_eq!(moves[0].target.as_deref(), Some("n2"));
+    assert!(coord.begin_activation(key).is_none());
+    assert_eq!(old_disposed.load(Ordering::SeqCst), 0);
+    // The host closes admission here, then reads the already admitted work.
+    let checkpoint = tokio::time::timeout(Duration::from_secs(3), old.send(Box::new(Snapshot)))
         .await
-        .expect("settle ask timeout")
+        .unwrap()
         .unwrap();
-    let total = r.downcast_ref::<Tick>().unwrap().0;
-    assert_eq!(total, 15, "messages lost during drain (got {total})");
+    let checkpoint = *checkpoint.downcast::<CounterState>().unwrap();
+    assert_eq!(checkpoint.0, (1..=10).collect::<Vec<_>>());
+    tokio::time::timeout(Duration::from_secs(3), stop_for_owned_cleanup(old.as_ref()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        old.retirement_status(),
+        RetirementStatus::Retired(Ok(()))
+    ));
+    assert_eq!(old_disposed.load(Ordering::SeqCst), 1);
+    assert!(old.send(Box::new(Apply(999))).await.is_err());
+    assert!(coord.passivated(&old_lease));
+
+    let new_lease = coord.begin_activation(key).unwrap();
+    assert_eq!(new_lease.node(), "n2");
+    assert_ne!(old_lease, new_lease);
+    let new_disposed = Arc::new(AtomicUsize::new(0));
+    let replacement = spawn_entity(&new_system, key, checkpoint, new_disposed.clone()).await;
+    assert!(coord.activated(&new_lease));
+    assert!(!coord.passivated(&old_lease));
+    for id in 11..=15 {
+        replacement.deliver(Box::new(Apply(id))).await.unwrap();
+    }
+    let restored =
+        tokio::time::timeout(Duration::from_secs(3), replacement.send(Box::new(Snapshot)))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        restored.downcast_ref::<CounterState>().unwrap().0,
+        (1..=15).collect::<Vec<_>>()
+    );
+    assert_eq!(new_disposed.load(Ordering::SeqCst), 0);
+    assert_eq!(coord.entities()[key].status, EntityStatus::Active);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        stop_for_owned_cleanup(replacement.as_ref()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(new_disposed.load(Ordering::SeqCst), 1);
+    assert!(coord.passivated(&new_lease));
+    old_system.shutdown_internal().await.unwrap();
+    new_system.shutdown_internal().await.unwrap();
 }
 
 // ── D2 · singleton ──────────────────────────────────────
 
-/// kill 持有者 → ≤13s 接管（lease 10s + 确认 3s——06 P4.2 门禁）。
+/// Local model with injected confirmations/time; no process or network is killed.
 #[test]
 fn singleton_takeover() {
     let mut follower = SingletonLease::new(
@@ -248,11 +341,11 @@ fn singleton_takeover() {
         },
     );
     assert_eq!(follower.state(), SingletonState::Follower);
-    // a 死亡（不再续约）。b 每 3s tick：
+    // Stop feeding observations of a; drive only b's injected clock.
     let mut took_over_at: Option<Duration> = None;
     for s in 1..=6u64 {
         let t = t0 + Duration::from_secs(s * 3);
-        // a 的租约在此期间过期（无续约——holder 视角已死）
+        // Missing model observations eventually expire b's local view.
         if let Some(SingletonTransition::Acquired(me)) = follower.tick(t, true) {
             assert_eq!(me.node, "b");
             took_over_at = Some(t.duration_since(t0));
@@ -262,7 +355,7 @@ fn singleton_takeover() {
     let wait = took_over_at.expect("no takeover within 18s");
     assert!(
         wait <= Duration::from_secs(13),
-        "takeover wait {wait:?} > 13s gate (lease 10s + confirm 3s)"
+        "model takeover wait {wait:?} exceeds the configured lease/tick schedule"
     );
     assert_eq!(follower.state(), SingletonState::Leader);
 }
@@ -283,9 +376,7 @@ async fn facade_prefix_route() {
         .await
         .unwrap();
 
-    // ShardRouter：前缀处理器（计数转发到本地已 spawn 实体——惰性激活模拟）
-    let router_ts = ts.clone();
-    let facade_c = facade.clone();
+    // A local echo handler verifies prefix selection only.
     struct Router;
     impl Actor for Router {
         type Config = EmptyConfig;
@@ -309,7 +400,6 @@ async fn facade_prefix_route() {
             parrot_api::actor::ActorState::Running
         }
     }
-    let _ = (router_ts, facade_c);
     let router = ts
         .spawn_at(
             Router,
@@ -351,6 +441,8 @@ async fn facade_prefix_route() {
             .register_prefix_handler("/user/entity", router_arc.clone())
             .is_err()
     );
+    stop_for_owned_cleanup(router_arc.as_ref()).await.unwrap();
+    ts.shutdown_internal().await.unwrap();
 }
 
 /// entity_key_of：`/user/entity-{key}` → key 提取。

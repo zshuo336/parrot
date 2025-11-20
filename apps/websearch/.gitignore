@@ -4,3 +4,10 @@ data/
 # 构建产物
 jvm/target/
 erlang/*.beam
+
+# Keep the application guides despite the root's generic docs/ ignore rule.
+!docs/
+docs/*
+!docs/ARCHITECTURE.md
+!docs/PARROT_USAGE.md
+!docs/OPERATIONS.md

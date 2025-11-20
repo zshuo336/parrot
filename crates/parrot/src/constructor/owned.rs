@@ -28,6 +28,12 @@ impl<A: Send + 'static> OwnedFactory<A> {
         let receipt = self.factory.retire_on(Some(self.runtime.clone()));
         Box::pin(async move { receipt.await.map_err(ActorError::InternalError) })
     }
+    pub(crate) fn retire_in_lifecycle(self) -> BoxedFuture<'static, ActorResult<()>> {
+        let receipt = self
+            .factory
+            .retire_in_lifecycle_on(Some(self.runtime.clone()));
+        Box::pin(async move { receipt.await.map_err(ActorError::InternalError) })
+    }
 }
 impl<A: Send + 'static> Drop for OwnedFactory<A> {
     fn drop(&mut self) {

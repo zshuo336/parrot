@@ -1,6 +1,7 @@
 use super::disposal::{OwnedPayload, RejectedSpawn};
 use crate::actix::lifecycle::{ActorControl, ActorExit, Completion, Outcome, await_completion};
 use crate::actix::{actor::ActixActor, context::ActixContext, reference::ActixActorRef};
+use crate::thread::native_budget::NativeWorkerBudget;
 use actix::prelude::ArbiterHandle;
 use futures::FutureExt;
 use parrot_api::{
@@ -23,26 +24,21 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "system_shutdown.rs"]
+mod shutdown;
+
 struct ArbiterOwners {
     workers: Vec<ArbiterHandle>,
-    owners: Mutex<Option<Vec<actix::Arbiter>>>,
+    threads: Vec<std::thread::ThreadId>,
+    retirement: super::pool_retirement::Retirement,
+    distribution: Arc<super::distribution::Distribution>,
 }
 impl Drop for ArbiterOwners {
     fn drop(&mut self) {
         for worker in &self.workers {
             worker.stop();
         }
-        // Dropping the last pool must not join on an arbiter or async worker.
-        // Explicit shutdown joins these owners before reporting success.
-        if let Some(owners) = self.owners.get_mut().unwrap().take() {
-            let _ = std::thread::Builder::new()
-                .name("parrot-actix-retire".into())
-                .spawn(move || {
-                    for owner in owners {
-                        let _ = owner.join();
-                    }
-                });
-        }
+        self.retirement.request();
     }
 }
 
@@ -50,52 +46,90 @@ impl Drop for ArbiterOwners {
 #[derive(Clone)]
 pub struct ArbiterPool {
     inner: Arc<ArbiterOwners>,
-    next: Arc<AtomicUsize>,
 }
 impl ArbiterPool {
     /// Build workers within the current Actix System. Zero selects one worker.
+    /// Panics on invalid settings, a missing host, or worker setup failure after
+    /// joining any partially created pool; use `try_new` for errors.
     pub fn new(size: usize) -> Self {
-        let owners: Vec<_> = (0..size.max(1)).map(|_| actix::Arbiter::new()).collect();
-        Self {
-            inner: Arc::new(ArbiterOwners {
-                workers: owners.iter().map(actix::Arbiter::handle).collect(),
-                owners: Mutex::new(Some(owners)),
-            }),
-            next: Arc::new(AtomicUsize::new(0)),
+        Self::try_new(size).expect("invalid Actix worker count or missing Actix System")
+    }
+    /// Validate the worker limit and host before creating any worker. Setup
+    /// failures stop and join all previously created workers before returning.
+    /// A separate retirement thread is established before returning a live pool.
+    /// This synchronous constructor can block while retiring a failed pool.
+    pub fn try_new(size: usize) -> Result<Self, SystemError> {
+        Self::with_distribution(size, parrot_api::runtime::LoadBalancingStrategy::RoundRobin)
+    }
+    fn with_distribution(
+        size: usize,
+        strategy: parrot_api::runtime::LoadBalancingStrategy,
+    ) -> Result<Self, SystemError> {
+        Self::with_distribution_and_budget(size, strategy, NativeWorkerBudget::global())
+    }
+
+    pub(crate) fn with_distribution_and_budget(
+        size: usize,
+        strategy: parrot_api::runtime::LoadBalancingStrategy,
+        native_budget: Arc<crate::thread::native_budget::NativeWorkerBudget>,
+    ) -> Result<Self, SystemError> {
+        super::settings::validate_workers(size)?;
+        if actix::System::try_current().is_none() {
+            return Err(SystemError::InitializationError(
+                "ArbiterPool requires a running Actix System".into(),
+            ));
         }
+        let threads = Arc::new(Mutex::new(Vec::with_capacity(size.max(1))));
+        let reservations = Arc::new(Mutex::new(Vec::with_capacity(size.max(1))));
+        let owners = super::pool_startup::build(size.max(1), |_| {
+            let reservation = native_budget
+                .try_reserve()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let threads = threads.clone();
+            let owner = actix::Arbiter::try_with_tokio_rt(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                threads.lock().unwrap().push(std::thread::current().id());
+                Ok(runtime)
+            })?;
+            reservations.lock().unwrap().push(reservation);
+            Ok(owner)
+        })?;
+        let threads = std::mem::take(&mut *threads.lock().unwrap());
+        let reservations = std::mem::take(&mut *reservations.lock().unwrap());
+        let workers = owners.iter().map(actix::Arbiter::handle).collect();
+        let retirement =
+            super::pool_retirement::Retirement::new_with_reservations(owners, reservations)?;
+        Ok(Self {
+            inner: Arc::new(ArbiterOwners {
+                workers,
+                threads,
+                retirement,
+                distribution: super::distribution::Distribution::new(size.max(1), strategy),
+            }),
+        })
     }
     pub fn size(&self) -> usize {
         self.inner.workers.len()
     }
+    #[cfg(test)]
     pub(crate) fn next_arbiter(&self) -> ArbiterHandle {
-        self.inner.workers[self.next.fetch_add(1, Ordering::Relaxed) % self.size()].clone()
+        self.reserve_arbiter().worker
+    }
+    pub(super) fn reserve_arbiter(&self) -> super::distribution::Assignment {
+        let lease = self.inner.distribution.reserve();
+        super::distribution::Assignment {
+            worker: self.inner.workers[lease.index].clone(),
+            lease,
+        }
     }
     async fn stop_and_join(&self) -> ActorResult<()> {
         for worker in &self.inner.workers {
             worker.stop();
         }
-        let owners = self.inner.owners.lock().unwrap().take();
-        if let Some(owners) = owners {
-            let (send, receive) = tokio::sync::oneshot::channel();
-            std::thread::Builder::new()
-                .name("parrot-actix-retire".into())
-                .spawn(move || {
-                    let mut failed = false;
-                    for owner in owners {
-                        failed |= owner.join().is_err();
-                    }
-                    let _ = send.send(failed);
-                })
-                .map_err(|e| {
-                    ActorError::InternalError(format!("cannot join Actix workers: {e}"))
-                })?;
-            if receive.await.unwrap_or(true) {
-                return Err(ActorError::InternalError(
-                    "Actix worker failed during shutdown".into(),
-                ));
-            }
-        }
-        Ok(())
+        self.inner.retirement.request();
+        self.inner.retirement.join().await
     }
 }
 impl std::fmt::Debug for ArbiterPool {
@@ -106,12 +140,37 @@ impl std::fmt::Debug for ArbiterPool {
     }
 }
 
+#[cfg(test)]
+#[path = "pool_retirement/pool_contracts.rs"]
+mod retirement_contracts;
+
+#[cfg(test)]
+#[path = "pool_retirement/host_exit_contracts.rs"]
+mod host_exit_contracts;
+
+#[cfg(test)]
+#[path = "pool_retirement/worker_shutdown_contracts.rs"]
+mod worker_shutdown_contracts;
+
+#[cfg(test)]
+#[path = "system/last_owner_contracts.rs"]
+mod last_owner_contracts;
+#[cfg(test)]
+#[path = "system/native_budget_contracts.rs"]
+mod native_budget_contracts;
+
 /// Resource and deadline settings for managed Actix actors.
 #[derive(Debug, Clone)]
 pub struct ActixSystemSettings {
+    /// Owned worker count, at most 4096. Zero preserves the one-worker fallback.
     pub arbiter_count: usize,
+    /// Actor placement, counting reserved executions through final disposal.
+    /// LeastLoaded counts actors (including idle ones), not messages or CPU.
+    pub load_balancing: parrot_api::runtime::LoadBalancingStrategy,
+    /// Per-actor mailbox admission limit in 1..=1048576.
     pub mailbox_capacity: usize,
-    /// Maximum outstanding user timers and streams per actor. Zero disables both.
+    /// Maximum outstanding user timers and streams per actor, in 0..=65536.
+    /// Zero disables both.
     /// One internal receive-timeout worker has a separate reserved slot.
     pub max_context_tasks: usize,
     pub ask_timeout: Duration,
@@ -121,6 +180,7 @@ impl Default for ActixSystemSettings {
     fn default() -> Self {
         Self {
             arbiter_count: num_cpus::get(),
+            load_balancing: Default::default(),
             mailbox_capacity: 1024,
             max_context_tasks: crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS,
             ask_timeout: Duration::from_secs(5),
@@ -181,15 +241,27 @@ pub(crate) struct Registry {
     shutdown: Option<Completion>,
 }
 
-type ReceptionistSlot = RwLock<Option<Arc<dyn crate::system::ReceptionistGateway>>>;
+type ReceptionistSlot =
+    crate::system::registrations::Registry<Option<Arc<dyn crate::system::ReceptionistGateway>>>;
+type RemoteSlot =
+    crate::system::registrations::Registry<Option<Arc<dyn crate::system::RemoteGateway>>>;
 
 /// A Parrot system owns its registry and arbiter pool, never the host Actix System.
-#[derive(Clone)]
+/// Native systems reserve one of 4096 process-wide cancellation slots until the
+/// last system handle and any handed-off cleanup have been released. Releasing
+/// the last handle starts the same owned drain as explicit shutdown. Two shared
+/// process-lifetime threads perform owned-worker cancellation joins.
 pub struct ActixActorSystem {
+    leases: Arc<AtomicUsize>,
+    cancellation: Arc<super::cancellation_executor::Reservation>,
+    pub(crate) operation_timeouts: parrot_api::system::SystemTimeouts,
+    pub(crate) root_cohorts: Arc<crate::root_cohort::RootCohorts>,
     pub(crate) registry: Arc<RwLock<Registry>>,
     receptionist: Arc<ReceptionistSlot>,
+    remote: Arc<RemoteSlot>,
     pub(crate) settings: ActixSystemSettings,
     arbiters: ArbiterPool,
+    // Constructors and retirement outlive the host; business stays on arbiters.
     pub(super) runtime: tokio::runtime::Handle,
     started: Instant,
     pub(super) policy_slots: Arc<tokio::sync::Semaphore>,
@@ -198,13 +270,31 @@ pub struct ActixActorSystem {
     pub(super) notification_slots: Arc<tokio::sync::Semaphore>,
 }
 
+impl Clone for ActixActorSystem {
+    fn clone(&self) -> Self {
+        self.downgrade().upgrade().expect("live Actix system lease")
+    }
+}
+
+impl Drop for ActixActorSystem {
+    fn drop(&mut self) {
+        if self.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
+            drop(self.begin_shutdown());
+        }
+    }
+}
+
 /// Contexts hold weak system resources: retaining an actor never retains its registry.
 #[derive(Clone)]
 pub(crate) struct WeakSystem {
+    leases: Weak<AtomicUsize>,
+    cancellation: Weak<super::cancellation_executor::Reservation>,
+    operation_timeouts: parrot_api::system::SystemTimeouts,
+    root_cohorts: Weak<crate::root_cohort::RootCohorts>,
     registry: Weak<RwLock<Registry>>,
     receptionist: Weak<ReceptionistSlot>,
+    remote: Weak<RemoteSlot>,
     owners: Weak<ArbiterOwners>,
-    next: Arc<AtomicUsize>,
     settings: ActixSystemSettings,
     pub(super) runtime: tokio::runtime::Handle,
     started: Instant,
@@ -221,13 +311,33 @@ impl WeakSystem {
     }
 
     pub(crate) fn upgrade(&self) -> ActorResult<ActixActorSystem> {
+        let leases = self.leases.upgrade().ok_or(ActorError::Stopped)?;
+        let cancellation = self.cancellation.upgrade().ok_or(ActorError::Stopped)?;
+        let root_cohorts = self.root_cohorts.upgrade().ok_or(ActorError::Stopped)?;
+        let registry = self.registry.upgrade().ok_or(ActorError::Stopped)?;
+        let receptionist = self.receptionist.upgrade().ok_or(ActorError::Stopped)?;
+        let remote = self.remote.upgrade().ok_or(ActorError::Stopped)?;
+        let owners = self.owners.upgrade().ok_or(ActorError::Stopped)?;
+        // Resource observers and in-flight cleanup can retain individual Arcs.
+        // Only a still-live system lease may authorize another public handle.
+        leases
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                if count == 0 {
+                    None
+                } else {
+                    count.checked_add(1)
+                }
+            })
+            .map_err(|_| ActorError::Stopped)?;
         Ok(ActixActorSystem {
-            registry: self.registry.upgrade().ok_or(ActorError::Stopped)?,
-            receptionist: self.receptionist.upgrade().ok_or(ActorError::Stopped)?,
-            arbiters: ArbiterPool {
-                inner: self.owners.upgrade().ok_or(ActorError::Stopped)?,
-                next: self.next.clone(),
-            },
+            leases,
+            cancellation,
+            operation_timeouts: self.operation_timeouts.clone(),
+            root_cohorts,
+            registry,
+            receptionist,
+            remote,
+            arbiters: ArbiterPool { inner: owners },
             settings: self.settings.clone(),
             runtime: self.runtime.clone(),
             started: self.started,
@@ -364,6 +474,9 @@ impl ParrotActor for BoxedActixActor {
 impl ActixEngineExt for BoxedActixActor {}
 
 impl parrot_api::engine::AsyncEngineRuntime for ActixActorSystem {
+    fn cohort_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncCohortRuntime> {
+        Some(self)
+    }
     fn local_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncLocalRuntime> {
         Some(self)
     }
@@ -378,7 +491,7 @@ impl parrot_api::engine::AsyncEngineRuntime for ActixActorSystem {
     ) -> parrot_api::types::BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
         let actor = OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots);
         let config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             if let Err(error) = options.validate() {
                 let (actor, config) = tokio::join!(actor.retire(), config.retire());
                 actor.and(config).map_err(SystemError::ActorError)?;
@@ -399,14 +512,14 @@ impl parrot_api::engine::AsyncEngineRuntime for ActixActorSystem {
                     Err(rejected.error)
                 }
             }
-        })
+        }))
     }
 
     fn get_actor<'a>(
         &'a self,
         path: &'a str,
     ) -> parrot_api::types::BoxedFuture<'a, Option<BoxedActorRef>> {
-        Box::pin(async move { self.get_actor(&path.to_owned()).await })
+        Box::pin(async move { self.resolve_actor(path) })
     }
 
     fn status(&self) -> SystemStatus {
@@ -419,6 +532,56 @@ impl parrot_api::engine::AsyncEngineRuntime for ActixActorSystem {
 }
 
 impl ActixActorSystem {
+    /// Create a system with automatic supervision of ordinary root actors.
+    pub fn with_guardian(
+        settings: ActixSystemSettings,
+        guardian: parrot_api::system::GuardianConfig,
+    ) -> BoxedFuture<'static, Result<Self, SystemError>> {
+        Self::with_guardian_and_timeouts(settings, guardian, Default::default())
+    }
+
+    pub(crate) fn with_guardian_and_timeouts(
+        mut settings: ActixSystemSettings,
+        guardian: parrot_api::system::GuardianConfig,
+        timeouts: parrot_api::system::SystemTimeouts,
+    ) -> BoxedFuture<'static, Result<Self, SystemError>> {
+        let guardian = crate::owned_payload::OwnedPayload::unbound(guardian);
+        Box::pin(parrot_api::trace::capture(async move {
+            if let Err(error) = crate::system::startup::validate_timeouts(&timeouts) {
+                guardian.retire().await?;
+                return Err(error);
+            }
+            if !timeouts.system_shutdown.is_zero() {
+                settings.shutdown_timeout = timeouts.system_shutdown;
+            }
+            if let Err(error) = settings.validate() {
+                guardian.retire().await?;
+                return Err(error);
+            }
+            let strategy = crate::root_cohort::guardian_strategy(guardian).await?;
+            let strategy = crate::owned_payload::OwnedPayload::unbound(strategy);
+            let system = match Self::with_settings(settings).await {
+                Ok(mut system) => {
+                    system.operation_timeouts = timeouts;
+                    system
+                }
+                Err(error) => {
+                    strategy.retire().await?;
+                    return Err(error);
+                }
+            };
+            system
+                .root_cohorts
+                .install_guardian(
+                    strategy.take(),
+                    system.settings.shutdown_timeout,
+                    system.policy_slots.clone(),
+                )
+                .await?;
+            Ok(system)
+        }))
+    }
+
     pub async fn new() -> Result<Self, SystemError> {
         Self::with_settings(Default::default()).await
     }
@@ -441,27 +604,36 @@ impl ActixActorSystem {
         let adapter = BoxedActixActor { inner: actor };
         self.spawn_root_typed(adapter, config)
     }
+    /// Validate native resource limits and deadlines before allocating workers.
+    /// A running host Actix System is required even for an empty actor registry.
     pub async fn with_settings(mut settings: ActixSystemSettings) -> Result<Self, SystemError> {
-        if settings.mailbox_capacity == 0 {
-            return Err(SystemError::Other(anyhow::anyhow!(
-                "Actix mailbox capacity must be positive"
-            )));
-        }
+        settings.validate()?;
         if actix::System::try_current().is_none() {
             return Err(SystemError::Other(anyhow::anyhow!(
                 "ActixActorSystem requires a running Actix System"
             )));
         }
         settings.arbiter_count = settings.arbiter_count.max(1);
+        let root_cohorts = Arc::new(crate::root_cohort::RootCohorts::new()?);
+        let runtime = root_cohorts.retirement_runtime().clone();
+        let cancellation = super::cancellation_executor::Reservation::new()?;
         // Construct on the host thread; later spawns may originate on foreign
         // Tokio threads where Actix's thread-local System is absent.
-        let arbiters = ArbiterPool::new(settings.arbiter_count);
+        let arbiters = ArbiterPool::with_distribution(
+            settings.arbiter_count,
+            settings.load_balancing.clone(),
+        )?;
         Ok(Self {
+            leases: Arc::new(AtomicUsize::new(1)),
+            cancellation,
+            operation_timeouts: Default::default(),
+            root_cohorts,
             registry: Arc::new(RwLock::new(Registry::default())),
-            receptionist: Arc::new(RwLock::new(None)),
+            receptionist: Arc::new(ReceptionistSlot::new(None)),
+            remote: Arc::new(RemoteSlot::new(None)),
             settings,
             arbiters: arbiters.clone(),
-            runtime: tokio::runtime::Handle::current(),
+            runtime,
             started: Instant::now(),
             policy_slots: Arc::new(tokio::sync::Semaphore::new(arbiters.size())),
             constructor_slots: Arc::new(tokio::sync::Semaphore::new(arbiters.size())),
@@ -471,6 +643,23 @@ impl ActixActorSystem {
     }
     pub fn arbiter_size(&self) -> usize {
         self.settings.arbiter_count
+    }
+    /// Reserved actor executions per arbiter, including queued dispatch and idle
+    /// actors through execution-future disposal. This is not a CPU/backlog sample.
+    pub fn arbiter_loads(&self) -> Vec<usize> {
+        self.arbiters.inner.distribution.loads()
+    }
+
+    /// Create an explicit supervision group for roots on this system.
+    pub fn root_cohort(
+        &self,
+        strategy: parrot_api::supervisor::SupervisorStrategyType,
+    ) -> BoxedFuture<'static, ActorResult<crate::root_cohort::RootCohort>> {
+        self.root_cohorts.create(
+            strategy,
+            self.settings.shutdown_timeout,
+            self.policy_slots.clone(),
+        )
     }
     pub(crate) fn arbiter_pool(&self) -> ArbiterPool {
         self.arbiters.clone()
@@ -493,12 +682,29 @@ impl ActixActorSystem {
         self.receptionist.read().unwrap().clone()
     }
 
+    /// Install a message gateway without running its retired owner's destructor
+    /// under an engine lock. Gateways that refer back to the engine must be weak.
+    pub fn set_remote_gateway(&self, gateway: Arc<dyn crate::system::RemoteGateway>) {
+        drop(self.swap_remote_gateway(gateway));
+    }
+
+    pub(crate) fn swap_remote_gateway(
+        &self,
+        gateway: Arc<dyn crate::system::RemoteGateway>,
+    ) -> Option<Arc<dyn crate::system::RemoteGateway>> {
+        self.remote.write().unwrap().replace(gateway)
+    }
+
     pub(super) fn downgrade(&self) -> WeakSystem {
         WeakSystem {
+            leases: Arc::downgrade(&self.leases),
+            cancellation: Arc::downgrade(&self.cancellation),
+            operation_timeouts: self.operation_timeouts.clone(),
+            root_cohorts: Arc::downgrade(&self.root_cohorts),
             registry: Arc::downgrade(&self.registry),
             receptionist: Arc::downgrade(&self.receptionist),
+            remote: Arc::downgrade(&self.remote),
             owners: Arc::downgrade(&self.arbiters.inner),
-            next: self.arbiters.next.clone(),
             settings: self.settings.clone(),
             runtime: self.runtime.clone(),
             started: self.started,
@@ -551,6 +757,16 @@ impl ActixActorSystem {
         let config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
         let strategy = OwnedPayload::new(strategy, &self.runtime, &self.cleanup_slots);
         async move {
+            if self.root_cohorts.guardian().is_some() {
+                strategy.retire().await.map_err(SystemError::ActorError)?;
+                return match self.spawn_managed(actor.take(), config.take(), None, None) {
+                    Ok(ticket) => ticket.wait().await.map_err(SystemError::ActorError),
+                    Err(rejected) => {
+                        rejected.retired.await.map_err(SystemError::ActorError)?;
+                        Err(rejected.error)
+                    }
+                };
+            }
             let lifetime = crate::children::ChildLifetime::with_policy(
                 std::sync::Weak::new(),
                 Some(strategy.take()),
@@ -574,6 +790,90 @@ impl ActixActorSystem {
                 }
             }
         }
+    }
+
+    /// Admit a dynamic instance at an exact root path in a supervision group.
+    pub fn spawn_root_in_cohort<'a, A>(
+        &'a self,
+        actor: A,
+        config: A::Config,
+        path: &'a str,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> impl std::future::Future<Output = ActorResult<BoxedActorRef>> + Send + 'a
+    where
+        A: ParrotActor<Context = ActixContext<ActixActor<A>>>
+            + parrot_api::actor::ActixEngineExt<Context = ActixContext<ActixActor<A>>>
+            + Unpin
+            + 'static,
+    {
+        let mut actor = Some(OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots));
+        let mut config = Some(OwnedPayload::new(
+            config,
+            &self.runtime,
+            &self.cleanup_slots,
+        ));
+        parrot_api::trace::capture(async move {
+            let mut ticket = None;
+            let mut rejection = None;
+            let admitted = cohort.validate(&self.root_cohorts).and_then(|()| {
+                cohort.scope.spawn(|lifetime| {
+                    let pending = self
+                        .spawn_managed_at(
+                            actor.take().unwrap().take(),
+                            config.take().unwrap().take(),
+                            None,
+                            Some(lifetime.clone()),
+                            Some(path.to_owned()),
+                        )
+                        .map_err(|rejected| {
+                            rejection = Some(rejected);
+                            ActorError::Stopped
+                        })?;
+                    let reference = pending.actor_ref.clone_boxed();
+                    let control = pending.control.clone();
+                    ticket = Some(pending);
+                    Ok((
+                        reference,
+                        Arc::new(move || {
+                            control.request_stop(tokio::time::Instant::now() + control.timeout);
+                            let lifetime = lifetime.clone();
+                            Box::pin(async move { lifetime.wait().await })
+                        }),
+                    ))
+                })
+            });
+            if let Err(error) = admitted {
+                let actor = async {
+                    match actor {
+                        Some(actor) => actor.retire().await,
+                        None => Ok(()),
+                    }
+                };
+                let config = async {
+                    match config {
+                        Some(config) => config.retire().await,
+                        None => Ok(()),
+                    }
+                };
+                let rejected = async {
+                    match rejection {
+                        Some(rejected) => {
+                            rejected
+                                .retired
+                                .await
+                                .and(Err(ActorError::InitializationError(
+                                    rejected.error.to_string(),
+                                )))
+                        }
+                        None => Ok(()),
+                    }
+                };
+                let (actor, config, rejected) = tokio::join!(actor, config, rejected);
+                actor.and(config).and(rejected)?;
+                return Err(error);
+            }
+            ticket.expect("admitted root instance").wait().await
+        })
     }
 
     pub(super) fn spawn_managed<A>(
@@ -608,6 +908,75 @@ impl ActixActorSystem {
     {
         let actor = OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots);
         let config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
+        if parent.is_none()
+            && lifetime.is_none()
+            && let Some(guardian) = self.root_cohorts.guardian()
+        {
+            let mut actor = Some(actor);
+            let mut config = Some(config);
+            let mut ticket = None;
+            let mut rejection = None;
+            let admitted = guardian.scope.spawn(|lifetime| {
+                let pending = self
+                    .spawn_managed_at(
+                        actor.take().unwrap().take(),
+                        config.take().unwrap().take(),
+                        None,
+                        Some(lifetime.clone()),
+                        path,
+                    )
+                    .map_err(|rejected| {
+                        rejection = Some(rejected);
+                        ActorError::Stopped
+                    })?;
+                let reference = pending.actor_ref.clone_boxed();
+                let control = pending.control.clone();
+                ticket = Some(pending);
+                Ok((
+                    reference,
+                    Arc::new(move || {
+                        control.request_stop(tokio::time::Instant::now() + control.timeout);
+                        let lifetime = lifetime.clone();
+                        Box::pin(async move { lifetime.wait().await })
+                    }),
+                ))
+            });
+            return match admitted {
+                Ok(()) => Ok(ticket.expect("admitted guardian instance")),
+                Err(error) => {
+                    let (error, rejected_retirement) = match rejection {
+                        Some(rejected) => (rejected.error, Some(rejected.retired)),
+                        None => (SystemError::ActorError(error), None),
+                    };
+                    Err(RejectedSpawn {
+                        error,
+                        retired: Box::pin(async move {
+                            let (actor, config, rejected) = tokio::join!(
+                                async {
+                                    match actor {
+                                        Some(actor) => actor.retire().await,
+                                        None => Ok(()),
+                                    }
+                                },
+                                async {
+                                    match config {
+                                        Some(config) => config.retire().await,
+                                        None => Ok(()),
+                                    }
+                                },
+                                async {
+                                    match rejected_retirement {
+                                        Some(retired) => retired.await,
+                                        None => Ok(()),
+                                    }
+                                },
+                            );
+                            actor.and(config).and(rejected)
+                        }),
+                    })
+                }
+            };
+        }
         let config_retirement = config.receipt();
         let mut registry = self.registry.write().unwrap();
         let rejection = if registry.shutting_down {
@@ -652,6 +1021,7 @@ impl ActixActorSystem {
             lifetime,
             self.policy_slots.clone(),
         );
+        ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
         let (ready, gate) = tokio::sync::watch::channel(None);
         Arc::get_mut(&mut control)
             .expect("unpublished instance control")
@@ -682,14 +1052,14 @@ impl ActixActorSystem {
         let tasks = control.tasks.clone();
         let children = control.children.clone();
         let cleanup_control = control.clone();
-        if !self.arbiter_pool().next_arbiter().spawn_fn(move || {
+        if !self.arbiter_pool().reserve_arbiter().spawn_fn(move || {
             let actor_base = dispatched
                 .lock()
                 .unwrap()
                 .take()
                 .expect("one instance dispatch")
                 .take();
-            actix::spawn(async move {
+            async move {
                 // Construct the !Send Actix context only after arriving on its owner.
                 // Await and dispose the complete context future, including its mailbox,
                 // before acknowledging stop to the system monitor.
@@ -712,7 +1082,7 @@ impl ActixActorSystem {
                 let tasks_result = tasks.join().await;
                 let children_result = children.join().await;
                 let stop_result = cleanup_control
-                    .stop_failure
+                    .cleanup_failure
                     .lock()
                     .unwrap()
                     .take()
@@ -724,7 +1094,7 @@ impl ActixActorSystem {
                         .and(children_result)
                         .and(stop_result),
                 });
-            });
+            }
         }) {
             return Err(RejectedSpawn {
                 error: SystemError::ActorError(ActorError::InternalError(
@@ -749,7 +1119,7 @@ impl ActixActorSystem {
         let pending = control.clone();
         let reply = created.clone();
         let published = actor_ref.clone_boxed();
-        let deadline = tokio::time::Instant::now() + control.timeout;
+        let deadline = tokio::time::Instant::now() + control.creation_timeout;
         self.runtime.spawn(async move {
             if activation.await.is_err() { pending.request_stop(deadline); }
             let retirement = config.retire();
@@ -807,7 +1177,7 @@ impl ActixActorSystem {
         let registry = Arc::downgrade(&self.registry);
         let pool = self.arbiters.clone();
         let policy_slots = self.policy_slots.clone();
-        self.runtime.spawn(async move {
+        self.root_cohorts.retirement_runtime().spawn(async move {
             let _pool_owner = pool;
             let cleanup = async {
                 let mut execution = result.await;
@@ -834,12 +1204,12 @@ impl ActixActorSystem {
                         let mut retirement = cleanup.clone();
                         let planned = control.typed_tree.get().and_then(|tree| tree.take_failure());
                         let error = match outcome {
-                            Err(error) => Some(Arc::new(error)),
+                            Err(error) => Some(crate::error_receipt::ActorReceipt::from_error(error)),
                             Ok(()) => escalated.clone(),
                         };
                         let mut status = match cleanup {
                             Err(error) => Outcome::Failed(error),
-                            Ok(()) => error.as_ref().map_or(Outcome::Stopped, |error| Outcome::Failed(crate::error_receipt::ActorReceipt::new(error.clone()))),
+                            Ok(()) => error.as_ref().map_or(Outcome::Stopped, |error| Outcome::Failed(error.clone())),
                         };
                         let mut failure_policy = None;
                         if (control.supervision_failed.load(Ordering::Acquire) || planned.is_some())
@@ -929,55 +1299,111 @@ impl ActixActorSystem {
             }
         });
     }
+    // Preserve the legacy signature, including callers using `&"path".into()`.
+    // New callers can use resolve_actor(&str) without allocating a String.
+    #[allow(clippy::ptr_arg)]
     pub async fn get_actor(&self, path: &String) -> Option<BoxedActorRef> {
-        self.registry
-            .read()
-            .unwrap()
-            .actors
-            .get(path)
-            .map(|entry| entry.actor_ref.clone_boxed())
+        if path.starts_with("parrot://") {
+            return self.resolve_actor(path);
+        }
+        // Legacy local lookup also observes registrations still owned by a
+        // timed-out shutdown. Message admission remains the reference's concern.
+        self.local_actor(path)
     }
-    pub async fn stop_actor(&self, path: &str) -> ActorResult<()> {
+
+    fn local_actor(&self, path: &str) -> Option<BoxedActorRef> {
         let actor = self
             .registry
             .read()
             .unwrap()
             .actors
-            .get(path)
-            .map(|entry| entry.actor_ref.clone())
-            .ok_or_else(|| ActorError::ActorNotFound(path.into()))?;
-        actor.stop().await
+            .get(path)?
+            .actor_ref
+            .clone();
+        crate::system::lookup_owned(actor, |actor| Some(actor.clone_boxed()))
+    }
+
+    /// Resolve an exact local identity or explicit remote address. Gateway and
+    /// reference callbacks execute after all registry/gateway guards are released.
+    pub fn resolve_actor(&self, path: &str) -> Option<BoxedActorRef> {
+        if self.registry.read().unwrap().shutting_down {
+            return None;
+        }
+        if path.starts_with("parrot://") {
+            let gateway = self.remote.read().unwrap().clone()?;
+            return crate::system::lookup_owned(gateway, |gateway| gateway.lookup(path));
+        }
+        self.local_actor(path)
+    }
+    pub fn stop_actor<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = ActorResult<()>> + Send + 'a {
+        parrot_api::trace::capture(async move {
+            let actor = self
+                .registry
+                .read()
+                .unwrap()
+                .actors
+                .get(path)
+                .map(|entry| entry.actor_ref.clone())
+                .ok_or_else(|| ActorError::ActorNotFound(path.into()))?;
+            actor.stop().await
+        })
     }
     /// Complete mailbox admission for each recipient and propagate any delivery failure.
-    pub async fn broadcast<M: Message + Clone + 'static>(&self, msg: M) -> Result<(), SystemError> {
-        let actors: Vec<_> = {
-            let registry = self.registry.read().unwrap();
-            if registry.shutting_down {
-                return Err(SystemError::ShuttingDown);
+    pub fn broadcast<M: Message + Clone + 'static>(
+        &self,
+        msg: M,
+    ) -> impl std::future::Future<Output = Result<(), SystemError>> + Send + '_ {
+        let mut source = crate::broadcast::Input::new(
+            OwnedPayload::new(msg, &self.runtime, &self.cleanup_slots),
+            self.constructor_slots.clone(),
+        );
+        parrot_api::trace::capture(async move {
+            let result = async {
+                let actors: Vec<_> = {
+                    let registry = self.registry.read().unwrap();
+                    if registry.shutting_down {
+                        return Err(SystemError::ShuttingDown);
+                    }
+                    registry
+                        .actors
+                        .values()
+                        .map(|entry| entry.actor_ref.clone())
+                        .collect()
+                };
+                // Keep each prepared copy protected until its delivery future owns it.
+                let mut deliveries = Vec::with_capacity(actors.len());
+                for actor in actors {
+                    let message = source.copy().await?;
+                    deliveries.push(async move { actor.deliver(Box::new(message.take())).await });
+                }
+                let results = futures::future::join_all(deliveries).await;
+                for result in results {
+                    result?;
+                }
+                Ok(())
             }
-            registry
-                .actors
-                .values()
-                .map(|entry| entry.actor_ref.clone())
-                .collect()
-        };
-        let results = futures::future::join_all(actors.into_iter().map(|actor| {
-            let msg = msg.clone();
-            async move { actor.deliver(Box::new(msg)).await }
-        }))
-        .await;
-        for result in results {
-            result?;
-        }
-        Ok(())
+            .await;
+            crate::broadcast::finish(source, result, crate::error_receipt::public_system_summary)
+                .await
+        })
     }
     /// Close admission, stop all actors, and join only this system's workers.
     /// Concurrent callers share one owned operation; cancelling a caller does not cancel cleanup.
     pub async fn shutdown(self) -> Result<(), SystemError> {
-        let completion = {
+        await_completion(self.begin_shutdown())
+            .await
+            .map_err(SystemError::from)
+    }
+
+    fn begin_shutdown(&self) -> tokio::sync::watch::Receiver<Option<Outcome>> {
+        self.root_cohorts.close();
+        let (completion, start) = {
             let mut registry = self.registry.write().unwrap();
             if let Some(completion) = &registry.shutdown {
-                completion.clone()
+                (completion.clone(), None)
             } else {
                 registry.shutting_down = true;
                 let deadline = tokio::time::Instant::now() + self.settings.shutdown_timeout;
@@ -991,54 +1417,48 @@ impl ActixActorSystem {
                         (entry.actor_ref.clone(), entry.control.lifetime.clone())
                     })
                     .collect();
-                let state = self.registry.clone();
-                let pool = self.arbiters.clone();
-                let mut execution = self.runtime.spawn(async move {
-                    let results = futures::future::join_all(actors.into_iter().map(
-                        |(actor, lifetime)| async move {
-                            let stopped = actor.stop().await;
-                            // A public stop deadline only limits waiting. Keep
-                            // the arbiters and registry owned until each actor's
-                            // resources (including policy captures) truly retire.
-                            let retired = lifetime.wait().await;
-                            stopped.and(retired)
-                        },
-                    ))
-                    .await;
-                    let joined = pool.stop_and_join().await;
-                    {
-                        let mut state = state.write().unwrap();
-                        state.actors.clear();
-                        state.stopped = true;
-                    }
-                    joined?;
-                    for result in results {
-                        result?;
-                    }
-                    Ok(())
-                });
-                self.runtime.spawn(async move {
-                    let outcome = tokio::select! {
-                        biased;
-                        result = &mut execution => {
-                            // Protect the completed error even when its public
-                            // receipt must now be the expired deadline instead.
-                            let outcome = Outcome::from_result(result.unwrap_or_else(|e| Err(ActorError::InternalError(format!("Actix shutdown task failed: {e}")))));
-                            (tokio::time::Instant::now() < deadline).then_some(outcome)
-                        },
-                        _ = tokio::time::sleep_until(deadline) => None,
-                    };
-                    // A timed-out join continues owning its workers and actor cleanup.
-                    finished.send_replace(Some(outcome.unwrap_or_else(|| Outcome::Timeout(
-                        "Actix system shutdown exceeded configured deadline".into(),
-                    ))));
-                });
-                completion
+                (completion, Some((finished, deadline, actors)))
             }
         };
-        await_completion(completion)
-            .await
-            .map_err(SystemError::from)
+        // Retirement must remain owned when the caller's executor exits.
+        // Dispatch after releasing the registry lock.
+        if let Some((finished, deadline, actors)) = start {
+            let owner = shutdown::ShutdownOwner::new(
+                self.arbiters.clone(),
+                self.registry.clone(),
+                deadline,
+                finished,
+                self.cancellation.clone(),
+                self.root_cohorts.clone(),
+            );
+            let pool = self.arbiters.clone();
+            let root_cohorts = self.root_cohorts.clone();
+            let timer = owner.timer();
+            self.root_cohorts.retirement_runtime().spawn(async move {
+                let results = futures::future::join_all(actors.into_iter().map(
+                    |(actor, lifetime)| async move {
+                        let stopped = actor.stop().await;
+                        // A public stop deadline only limits waiting. Keep
+                        // the arbiters and registry owned until each actor's
+                        // resources (including policy captures) truly retire.
+                        let retired = lifetime.wait().await;
+                        stopped.and(retired)
+                    },
+                ))
+                .await;
+                let cohorts = root_cohorts.join().await;
+                let joined = pool.stop_and_join().await;
+                let result = joined.and(cohorts).and(
+                    results
+                        .into_iter()
+                        .collect::<ActorResult<Vec<_>>>()
+                        .map(|_| ()),
+                );
+                owner.finish(result);
+            });
+            self.root_cohorts.retirement_runtime().spawn(timer);
+        }
+        completion
     }
     pub fn status(&self) -> SystemStatus {
         let registry = self.registry.read().unwrap();
@@ -1055,12 +1475,119 @@ impl ActixActorSystem {
             resources: SystemResources {
                 cpu_usage: 0.0,
                 memory_usage: 0,
-                thread_count: if registry.stopped {
-                    0
-                } else {
-                    self.arbiters.size()
-                },
+                thread_count: self
+                    .arbiters
+                    .inner
+                    .retirement
+                    .owned_threads(self.arbiters.size()),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "system/creation_deadline_contracts.rs"]
+mod creation_deadline_contracts;
+
+#[cfg(test)]
+mod lookup_retirement_tests {
+    use super::*;
+    struct LookupRef {
+        clone: Option<Box<dyn Fn() + Send + Sync>>,
+        retired: Arc<AtomicUsize>,
+    }
+    impl std::fmt::Debug for LookupRef {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("LookupRef")
+        }
+    }
+    impl Drop for LookupRef {
+        fn drop(&mut self) {
+            self.retired.fetch_add(1, Ordering::SeqCst);
+            panic!("local lookup ref retirement");
+        }
+    }
+    impl ActorRef for LookupRef {
+        fn send<'a>(&'a self, _: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async { unreachable!() })
+        }
+        fn send_with_timeout<'a>(
+            &'a self,
+            message: BoxedMessage,
+            _: Option<Duration>,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            self.send(message)
+        }
+        fn deliver<'a>(&'a self, _: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { unreachable!() })
+        }
+        fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { unreachable!() })
+        }
+        fn path(&self) -> String {
+            "/lookup".into()
+        }
+        fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+            Box::pin(async { true })
+        }
+        fn clone_boxed(&self) -> BoxedActorRef {
+            if let Some(callback) = &self.clone {
+                callback();
+            }
+            Box::new(Self {
+                clone: None,
+                retired: self.retired.clone(),
+            })
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    #[actix::test]
+    async fn local_lookup_protects_last_owner_and_unpublished_clone_retirement() {
+        for callback_panics in [false, true] {
+            let system = ActixActorSystem::with_arbiter_count(1).await.unwrap();
+            let registry = Arc::downgrade(&system.registry);
+            let count = Arc::new(AtomicUsize::new(0));
+            let actor: Arc<dyn ActorRef> = Arc::new(LookupRef {
+                clone: Some(Box::new(move || {
+                    drop(
+                        registry
+                            .upgrade()
+                            .unwrap()
+                            .write()
+                            .unwrap()
+                            .actors
+                            .remove("/lookup"),
+                    );
+                    if callback_panics {
+                        panic!("local lookup clone callback");
+                    }
+                })),
+                retired: count.clone(),
+            });
+            let (control, _finished) = ActorControl::new(Duration::from_secs(1));
+            system.registry.write().unwrap().actors.insert(
+                "/lookup".into(),
+                Registration {
+                    actor_ref: actor,
+                    control,
+                },
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                system.resolve_actor("/lookup")
+            }));
+            assert!(
+                result.is_err(),
+                "retirement failure cannot publish a local clone"
+            );
+            drop(result);
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                if callback_panics { 1 } else { 2 }
+            );
+            assert!(system.resolve_actor("/lookup").is_none());
+            system.shutdown().await.unwrap();
         }
     }
 }
@@ -1200,7 +1727,7 @@ mod rejection_tests {
     #[actix::test]
     async fn shutdown_joins_pool_and_reports_no_live_workers() {
         let system = ActixActorSystem::with_arbiter_count(2).await.unwrap();
-        assert_eq!(system.status().resources.thread_count, 2);
+        assert_eq!(system.status().resources.thread_count, 3);
         system.clone().shutdown().await.unwrap();
         let status = system.status();
         assert_eq!(status.state, SystemState::Stopped);
@@ -1220,13 +1747,17 @@ mod shutdown_deadline_tests {
         Result<(), SystemError>,
         SystemState,
     ) {
-        let system = ActixActorSystem::with_settings(ActixSystemSettings {
+        let mut system = ActixActorSystem::with_settings(ActixSystemSettings {
             arbiter_count: 1,
             shutdown_timeout: Duration::from_millis(10),
             ..Default::default()
         })
         .await
         .unwrap();
+        // Use the paused test clock for lifecycle work as well.
+        Arc::get_mut(&mut system.root_cohorts)
+            .unwrap()
+            .set_test_retirement_runtime(tokio::runtime::Handle::current());
         // Workers may have retired before shutdown is requested. Make cleanup
         // immediately ready without replacing or mocking the actual owner.
         system.arbiters.stop_and_join().await.unwrap();

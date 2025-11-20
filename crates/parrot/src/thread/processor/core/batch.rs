@@ -1,33 +1,43 @@
 //! Opt-in contiguous business batches. Reply channels stay with the processor;
 //! engine controls and actor-declared barriers never enter a business batch.
 use super::*;
+#[cfg(test)]
+use crate::thread::reply::ReplyReceiver;
 use crate::thread::{envelope::AskEnvelope, mailbox::MailboxItem};
 use futures::FutureExt;
 use tokio::sync::oneshot;
 
 struct Pending {
     trace_context: Option<parrot_api::trace::TraceContext>,
-    message: BoxedMessage,
+    message: DispatchInput,
     reply: Option<oneshot::Sender<ActorResult<BoxedMessage>>>,
 }
 impl Pending {
-    fn from_item(item: MailboxItem) -> Self {
+    fn from_item(
+        item: MailboxItem,
+        failures: &Arc<StageFailures>,
+        executions: &Arc<execution::Executions>,
+    ) -> Self {
         match item {
             MailboxItem::Ask(mut envelope) => {
                 let reply = envelope.take_reply();
                 Self {
                     trace_context: envelope.trace_context,
-                    message: envelope.payload.into_boxed(),
+                    message: DispatchInput::new(
+                        envelope.payload.into_boxed(),
+                        failures,
+                        executions,
+                    ),
                     reply,
                 }
             }
             MailboxItem::Plain(message) => match message.downcast::<AskEnvelope>() {
-                Ok(envelope) => Self::from_item(MailboxItem::Ask(*envelope)),
+                Ok(envelope) => Self::from_item(MailboxItem::Ask(*envelope), failures, executions),
                 Err(message) => {
                     let (message, trace_context) =
                         crate::thread::envelope::TraceEnvelope::unpack(message);
                     Self {
-                        message,
+                        message: DispatchInput::new(message, failures, executions),
                         trace_context,
                         reply: None,
                     }
@@ -47,7 +57,7 @@ where
         max_messages: usize,
         yield_after_each_message: bool,
     ) -> Result<(usize, usize), SystemError> {
-        if self.get_status() != ProcessorStatus::Running {
+        if !self.dispatch_allowed() {
             return Err(SystemError::WorkerStateError(format!(
                 "Actor at {} is not running",
                 self.path
@@ -63,37 +73,66 @@ where
         let mut lookahead: Option<Pending> = None;
         while processed < max_messages {
             self.escalation.ready().await;
-            if self.get_status() != ProcessorStatus::Running || mailbox.is_closed().await {
-                if let Some(reply) = lookahead.take().and_then(|item| item.reply) {
-                    let _ = reply.send(Err(ActorError::Stopped));
+            if !self.dispatch_allowed() || mailbox.is_closed().await {
+                if let Some(mut item) = lookahead.take() {
+                    let error = self.reject_dispatch(item.message.take());
+                    let fatal = self
+                        .message_failed()
+                        .then(|| crate::error_receipt::actor_summary(&error));
+                    if let Some(reply) = item.reply {
+                        let _ = reply.send(Err(error));
+                    }
+                    processed += 1;
+                    errors += 1;
+                    if let Some(reason) = fatal {
+                        return Err(SystemError::WorkerStateError(reason));
+                    }
                 }
                 break;
             }
             let first = match lookahead.take() {
                 Some(item) => item,
                 None => match mailbox.pop_item().await {
-                    Some(item) => Pending::from_item(item),
+                    Some(item) => Pending::from_item(item, &self.stage_failures, &self.executions),
                     None => break,
                 },
             };
+            // Declare all pending owners before the execution guards. Cancelling
+            // collection must release this call's locks before user input Drop.
+            let mut group = vec![first];
             let mut actor_slot = self.actor.lock().await;
-            let Some(actor) = actor_slot.as_mut() else {
+            if !self.dispatch_allowed() {
+                drop(actor_slot);
+                let mut first = group.pop().expect("first batch input");
+                let error = self.reject_dispatch(first.message.take());
+                let fatal = self
+                    .message_failed()
+                    .then(|| crate::error_receipt::actor_summary(&error));
                 if let Some(reply) = first.reply {
+                    let _ = reply.send(Err(error));
+                }
+                return fatal.map_or(Ok((processed + 1, errors + 1)), |reason| {
+                    Err(SystemError::WorkerStateError(reason))
+                });
+            }
+            let Some(actor) = actor_slot.as_mut() else {
+                if let Some(reply) = group[0].reply.take() {
                     let _ = reply.send(Err(ActorError::Stopped));
                 }
                 break;
             };
-            let parent = first.trace_context.clone();
+            let parent = group[0].trace_context.clone();
             let trace_context = parent.as_ref().map(parrot_api::trace::TraceContext::child);
             let eligible = panic::catch_unwind(AssertUnwindSafe(|| {
                 parrot_api::trace::in_scope(trace_context.clone(), || {
-                    actor.can_batch_message(&first.message)
+                    actor.can_batch_message(group[0].message.value())
                 })
             }));
             if matches!(eligible, Ok(false)) {
                 drop(actor_slot);
+                let mut first = group.pop().expect("fallback batch input");
                 let outcome = self
-                    .process_message_with_context(first.message, trace_context)
+                    .process_message_with_context(first.message.take(), trace_context)
                     .await;
                 let fatal = if self.message_failed() {
                     outcome
@@ -108,9 +147,10 @@ where
                 } else {
                     self.consecutive_reductions.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(reply) = first.reply {
-                    let _ = reply.send(outcome);
-                }
+                self.publish_dispatch_outcome(
+                    DispatchOutcome::new(outcome, &self.stage_failures),
+                    first.reply,
+                )?;
                 processed += 1;
                 if let Some(reason) = fatal {
                     return Err(SystemError::WorkerStateError(reason));
@@ -121,16 +161,19 @@ where
                 continue;
             }
             let mut fatal = eligible.err().map(|e| panic_message(e, &self.path));
-            let mut group = vec![first];
             let group_limit = limit.min(max_messages - processed);
             while fatal.is_none() && group.len() < group_limit {
-                if self.get_status() != ProcessorStatus::Running || mailbox.is_closed().await {
+                if !self.dispatch_allowed() || mailbox.is_closed().await {
                     break;
                 }
                 let Some(item) = mailbox.pop_item().await else {
                     break;
                 };
-                let next = Pending::from_item(item);
+                let next = Pending::from_item(item, &self.stage_failures, &self.executions);
+                if !self.dispatch_allowed() {
+                    group.push(next);
+                    break;
+                }
                 // A business batch is one invocation. Never invent one parent
                 // for messages from distinct causal operations or untraced work.
                 if next.trace_context != parent {
@@ -139,7 +182,7 @@ where
                 }
                 match panic::catch_unwind(AssertUnwindSafe(|| {
                     parrot_api::trace::in_scope(trace_context.clone(), || {
-                        actor.can_batch_message(&next.message)
+                        actor.can_batch_message(next.message.value())
                     })
                 })) {
                     Ok(true) => group.push(next),
@@ -154,74 +197,104 @@ where
                 }
             }
             let count = group.len();
-            let (messages, replies): (Vec<_>, Vec<_>) = group
-                .into_iter()
-                .map(|item| (item.message, item.reply))
-                .unzip();
             let mut invalid_count = false;
+            let mut discarded_outcomes = None;
+            let mut admission_rejected = false;
             let outcomes = if let Some(reason) = &fatal {
                 (0..count)
                     .map(|_| Err(ActorError::Panic(reason.clone())))
                     .collect::<Vec<_>>()
-            } else if self.get_status() != ProcessorStatus::Running {
-                (0..count).map(|_| Err(ActorError::Stopped)).collect()
             } else {
                 let mut context_slot = self.context.lock().await;
                 let context = context_slot
                     .as_mut()
                     .ok_or_else(|| SystemError::ActorNotFound(self.path.clone()))?;
-                match parrot_api::trace::scope(trace_context.clone(), async {
-                    let recording = parrot_api::trace::SpanGuard::current(
-                        parrot_api::trace::SpanKind::BusinessBatch,
-                        &self.path,
-                    );
-                    let result = AssertUnwindSafe(async {
-                        actor.process_business_batch(messages, context).await
-                    })
-                    .catch_unwind()
-                    .await;
-                    let status = match &result {
-                        Err(_) => parrot_api::trace::SpanStatus::Panicked,
-                        Ok(outcomes) => {
-                            if outcomes
-                                .iter()
-                                .any(|outcome| matches!(outcome, Err(ActorError::Panic(_))))
-                            {
-                                parrot_api::trace::SpanStatus::Panicked
-                            } else if outcomes.len() != count || outcomes.iter().any(Result::is_err)
-                            {
-                                parrot_api::trace::SpanStatus::Error
-                            } else {
-                                parrot_api::trace::SpanStatus::Ok
+                if !self.dispatch_allowed() {
+                    admission_rejected = true;
+                    Vec::new()
+                } else {
+                    match parrot_api::trace::scope(trace_context.clone(), async {
+                        let mut cleanup = StageCleanup::new(self.stage_failures.clone());
+                        cleanup.recording = Some(parrot_api::trace::SpanGuard::current(
+                            parrot_api::trace::SpanKind::BusinessBatch,
+                            &self.path,
+                        ));
+                        let messages = group.iter_mut().map(|item| item.message.take()).collect();
+                        let result = AssertUnwindSafe(async {
+                            actor.process_business_batch(messages, context).await
+                        })
+                        .catch_unwind()
+                        .await;
+                        let status = match &result {
+                            Err(_) => parrot_api::trace::SpanStatus::Panicked,
+                            Ok(outcomes) => {
+                                if outcomes
+                                    .iter()
+                                    .any(|outcome| matches!(outcome, Err(ActorError::Panic(_))))
+                                {
+                                    parrot_api::trace::SpanStatus::Panicked
+                                } else if outcomes.len() != count
+                                    || outcomes.iter().any(Result::is_err)
+                                {
+                                    parrot_api::trace::SpanStatus::Error
+                                } else {
+                                    parrot_api::trace::SpanStatus::Ok
+                                }
                             }
+                        };
+                        cleanup.finish_recording(status);
+                        result
+                    })
+                    .await
+                    {
+                        Ok(outcomes) if outcomes.len() == count => outcomes,
+                        Ok(outcomes) => {
+                            invalid_count = true;
+                            let reason = format!(
+                                "batch handler at {} returned {} results for {count} messages",
+                                self.path,
+                                outcomes.len()
+                            );
+                            discarded_outcomes = Some(outcomes);
+                            (0..count)
+                                .map(|_| Err(ActorError::MessageHandlingError(reason.clone())))
+                                .collect()
                         }
-                    };
-                    recording.finish(status);
-                    result
-                })
-                .await
-                {
-                    Ok(outcomes) if outcomes.len() == count => outcomes,
-                    Ok(outcomes) => {
-                        invalid_count = true;
-                        let reason = format!(
-                            "batch handler at {} returned {} results for {count} messages",
-                            self.path,
-                            outcomes.len()
-                        );
-                        (0..count)
-                            .map(|_| Err(ActorError::MessageHandlingError(reason.clone())))
-                            .collect()
-                    }
-                    Err(e) => {
-                        let reason = panic_message(e, &self.path);
-                        (0..count)
-                            .map(|_| Err(ActorError::Panic(reason.clone())))
-                            .collect()
+                        Err(e) => {
+                            let reason = panic_message(e, &self.path);
+                            (0..count)
+                                .map(|_| Err(ActorError::Panic(reason.clone())))
+                                .collect()
+                        }
                     }
                 }
             };
             drop(actor_slot);
+            let (messages, replies): (Vec<_>, Vec<_>) = group
+                .into_iter()
+                .map(|item| (item.message, item.reply))
+                .unzip();
+            // Protect every result before any supervision await or disposal.
+            // Invalid cardinality does not transfer these values to callers.
+            let discarded = discarded_outcomes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|outcome| DispatchOutcome::new(outcome, &self.stage_failures))
+                .collect::<Vec<_>>();
+            drop(discarded);
+            let outcomes = if admission_rejected {
+                messages
+                    .into_iter()
+                    .map(|mut message| Err(self.reject_dispatch(message.take())))
+                    .collect()
+            } else {
+                drop(messages);
+                outcomes
+            };
+            let outcomes = outcomes
+                .into_iter()
+                .map(|outcome| DispatchOutcome::new(outcome, &self.stage_failures))
+                .collect::<Vec<_>>();
             self.stats
                 .messages_processed
                 .fetch_add(count, Ordering::SeqCst);
@@ -229,11 +302,19 @@ where
             let mut decided = false;
             fatal = None;
             for (mut outcome, reply) in outcomes.into_iter().zip(replies) {
-                if outcome.is_err() {
+                if outcome.result().is_err() {
                     errors += 1;
                     self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
-                    if !decided {
-                        let error = outcome.unwrap_err();
+                    if admission_rejected {
+                        if self.message_failed() {
+                            fatal.get_or_insert_with(|| {
+                                crate::error_receipt::actor_summary(
+                                    outcome.result().as_ref().unwrap_err(),
+                                )
+                            });
+                        }
+                    } else if !decided {
+                        let error = outcome.take().unwrap_err();
                         // The batch invocation has completed, but its first error
                         // still owns the supervision and replacement identity.
                         let error = parrot_api::trace::scope(trace_context.clone(), async {
@@ -249,19 +330,26 @@ where
                         if self.message_failed() {
                             fatal = Some(crate::error_receipt::actor_summary(&error));
                         }
-                        outcome = Err(error);
+                        outcome.replace(Err(error));
                         decided = true;
                     }
                 } else {
                     self.consecutive_reductions.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(reply) = reply {
-                    let _ = reply.send(outcome);
+                let failed = outcome.result().is_err();
+                if let Err(error) = self.publish_dispatch_outcome(outcome, reply) {
+                    if !failed {
+                        errors += 1;
+                    }
+                    fatal.get_or_insert_with(|| error.to_string());
                 }
             }
             if let Some(reason) = fatal {
-                if let Some(reply) = lookahead.take().and_then(|item| item.reply) {
-                    let _ = reply.send(Err(ActorError::Stopped));
+                if let Some(mut item) = lookahead.take() {
+                    let error = self.reject_dispatch(item.message.take());
+                    if let Some(reply) = item.reply {
+                        let _ = reply.send(Err(error));
+                    }
                 }
                 return Err(SystemError::WorkerStateError(reason));
             }
@@ -319,6 +407,11 @@ mod tests {
                 if message.is::<&'static str>() {
                     self.events.lock().unwrap().push(vec![99]);
                     return Ok(Box::new(99u64) as BoxedMessage);
+                }
+                if self.mode == "nested" {
+                    let value = *message.downcast_ref::<u64>().unwrap();
+                    self.events.lock().unwrap().push(vec![value]);
+                    return Ok(message);
                 }
                 panic!("eligible message must reach batch handler");
             })
@@ -409,7 +502,7 @@ mod tests {
         mailbox: &Arc<dyn Mailbox>,
         message: BoxedMessage,
         legacy: bool,
-    ) -> oneshot::Receiver<ActorResult<BoxedMessage>> {
+    ) -> ReplyReceiver {
         let (envelope, reply) = AskEnvelope::with_boxed(message);
         if legacy {
             mailbox
@@ -427,7 +520,7 @@ mod tests {
         }
         reply
     }
-    async fn number(reply: oneshot::Receiver<ActorResult<BoxedMessage>>) -> u64 {
+    async fn number(reply: ReplyReceiver) -> u64 {
         *reply.await.unwrap().unwrap().downcast::<u64>().unwrap()
     }
 
@@ -471,6 +564,119 @@ mod tests {
         );
         assert!(mailbox.is_empty().await);
         assert_eq!(p.stats.messages_processed.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn watch_and_unwatch_are_barriers_even_when_user_policy_allows_every_control() {
+        for delivery in 0..3 {
+            let Fixture {
+                p, mailbox, events, ..
+            } = fixture("normal", 4).await;
+            let first = request(&mailbox, Box::new(1u64), false).await;
+            let watch = Box::new(crate::thread::system::WatchRequest {
+                watcher_path: "/watcher".into(),
+            });
+            let watch_reply = if delivery == 0 {
+                mailbox
+                    .push(watch, crate::thread::BackpressureStrategy::Block)
+                    .await
+                    .unwrap();
+                None
+            } else {
+                Some(request(&mailbox, watch, delivery == 2).await)
+            };
+            let second = request(&mailbox, Box::new(2u64), false).await;
+            let unwatch = Box::new(crate::thread::system::UnwatchRequest {
+                watcher_path: "/watcher".into(),
+            });
+            let unwatch_reply = if delivery == 0 {
+                mailbox
+                    .push(unwatch, crate::thread::BackpressureStrategy::Block)
+                    .await
+                    .unwrap();
+                None
+            } else {
+                Some(request(&mailbox, unwatch, delivery == 2).await)
+            };
+            let third = request(&mailbox, Box::new(3u64), false).await;
+            assert_eq!(
+                p.process_coalesced(&mailbox, 2, false).await.unwrap(),
+                (2, 0)
+            );
+            assert_eq!(number(first).await, 1);
+            if let Some(reply) = watch_reply {
+                assert!(reply.await.unwrap().unwrap().is::<()>());
+            }
+            assert!(
+                p.actor
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .watchers()
+                    .contains("/watcher")
+            );
+            assert_eq!(*events.lock().unwrap(), vec![vec![1]]);
+            assert_eq!(mailbox.len().await, 3);
+            assert_eq!(
+                p.process_coalesced(&mailbox, 2, false).await.unwrap(),
+                (2, 0)
+            );
+            assert_eq!(number(second).await, 2);
+            if let Some(reply) = unwatch_reply {
+                assert!(reply.await.unwrap().unwrap().is::<()>());
+            }
+            assert!(
+                !p.actor
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .watchers()
+                    .contains("/watcher")
+            );
+            assert_eq!(*events.lock().unwrap(), vec![vec![1], vec![2]]);
+            assert_eq!(mailbox.len().await, 1);
+            assert_eq!(
+                p.process_coalesced(&mailbox, 1, false).await.unwrap(),
+                (1, 0)
+            );
+            assert_eq!(number(third).await, 3);
+            assert_eq!(*events.lock().unwrap(), vec![vec![1], vec![2], vec![3]]);
+            assert_eq!(p.stats.messages_processed.load(Ordering::SeqCst), 5);
+            assert!(mailbox.is_empty().await);
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_ask_envelopes_preserve_both_replies_without_entering_a_business_batch() {
+        for legacy in [false, true] {
+            let Fixture {
+                p, mailbox, events, ..
+            } = fixture("nested", 4).await;
+            let first = request(&mailbox, Box::new(1u64), false).await;
+            let (inner, inner_reply) = AskEnvelope::with_boxed(Box::new(2u64));
+            let outer_reply = request(&mailbox, Box::new(inner), legacy).await;
+            let third = request(&mailbox, Box::new(3u64), false).await;
+            assert_eq!(
+                p.process_coalesced(&mailbox, 2, false).await.unwrap(),
+                (2, 0)
+            );
+            assert_eq!(number(first).await, 1);
+            assert_eq!(number(inner_reply).await, 2);
+            assert!(outer_reply.await.unwrap().unwrap().is::<()>());
+            assert_eq!(*events.lock().unwrap(), vec![vec![1], vec![2]]);
+            assert_eq!(mailbox.len().await, 1);
+            assert_eq!(p.stats.messages_processed.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                p.process_coalesced(&mailbox, 1, false).await.unwrap(),
+                (1, 0)
+            );
+            assert_eq!(number(third).await, 3);
+            assert_eq!(*events.lock().unwrap(), vec![vec![1], vec![2], vec![3]]);
+            assert_eq!(p.stats.messages_processed.load(Ordering::SeqCst), 3);
+            assert!(mailbox.is_empty().await);
+        }
     }
 
     #[tokio::test]

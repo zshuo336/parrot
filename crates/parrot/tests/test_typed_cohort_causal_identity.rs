@@ -311,10 +311,16 @@ fn verify(state: &State, origins: &[TraceContext], causes: &[Option<TraceContext
         found[0].3.clone()
     };
     for (member, origin) in origins.iter().enumerate() {
+        let initialization = phase(member, 0, "init-call");
+        lifecycle_identity::assert_child(initialization.as_ref(), Some(origin));
         for phase_name in ["constructor", "init-call", "init-poll", "init-resumed"] {
             assert_eq!(
                 phase(member, 0, phase_name).as_ref(),
-                Some(origin),
+                if phase_name == "constructor" {
+                    Some(origin)
+                } else {
+                    initialization.as_ref()
+                },
                 "initial typed child creation identity"
             );
         }
@@ -354,6 +360,8 @@ fn verify(state: &State, origins: &[TraceContext], causes: &[Option<TraceContext
             "typed cohort policy sees its actual cause"
         );
         for member in 0..2 {
+            let initialization = phase(member, epoch + 1, "init-call");
+            lifecycle_identity::assert_child(initialization.as_ref(), failure.as_ref());
             for phase_name in ["constructor", "init-call", "init-poll", "init-resumed"] {
                 let observed = phase(member, epoch + 1, phase_name);
                 if cause.is_none() {
@@ -363,7 +371,16 @@ fn verify(state: &State, origins: &[TraceContext], causes: &[Option<TraceContext
                     );
                 }
                 actual.push((epoch, member, phase_name, observed));
-                expected.push((epoch, member, phase_name, failure.clone()));
+                expected.push((
+                    epoch,
+                    member,
+                    phase_name,
+                    if phase_name == "constructor" {
+                        failure.clone()
+                    } else {
+                        initialization.clone()
+                    },
+                ));
             }
         }
         if cause.is_none() {
@@ -467,3 +484,5 @@ case!(local_ask_error, 2, false, false);
 case!(local_ask_panic, 2, false, true);
 case!(local_tell_error, 2, true, false);
 case!(local_tell_panic, 2, true, true);
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;

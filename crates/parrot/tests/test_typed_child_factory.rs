@@ -1230,6 +1230,18 @@ async fn abort_keeps_parent_child_admission_closed_until_blocked_member_really_r
         assert_eq!(invoked.load(Ordering::SeqCst), 0);
         gate.release();
         until(|| ctx.children().is_empty()).await;
+        // Membership removal precedes the recovery admission release receipt.
+        until(|| {
+            matches!(
+                second.retirement_status(),
+                parrot_api::address::RetirementStatus::Retired(_)
+            )
+        })
+        .await;
+        assert!(matches!(
+            second.retirement_status(),
+            parrot_api::address::RetirementStatus::Retired(Ok(()))
+        ));
         let third = spawn(&ctx, &a).await;
         third.ask(Op::Read).await.unwrap();
         root.stop().await.unwrap();

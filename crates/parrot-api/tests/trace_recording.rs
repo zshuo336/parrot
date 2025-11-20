@@ -22,6 +22,31 @@ fn context_only_and_untraced_calls_are_inert() {
     SpanGuard::current(SpanKind::Application, "/none").finish(SpanStatus::Ok);
     assert_eq!(recorder.snapshot().counts.started, 0);
 }
+
+#[test]
+fn admission_query_distinguishes_identity_from_owned_recording() {
+    assert!(!SpanGuard::current(SpanKind::Application, "none").is_recording());
+    TraceContext::root().in_scope(|| {
+        assert!(!SpanGuard::current(SpanKind::Application, "identity").is_recording());
+    });
+    let recorder = TraceRecorder::new(1).unwrap();
+    let root = recorder.root();
+    let active = root.in_scope(|| SpanGuard::current(SpanKind::Application, "accepted"));
+    assert!(active.is_recording());
+    recorder.close();
+    assert!(
+        active.is_recording(),
+        "closing must preserve an accepted owner"
+    );
+    root.in_scope(|| {
+        assert!(!SpanGuard::current(SpanKind::Application, "closed").is_recording());
+    });
+    active.finish(SpanStatus::Ok);
+    let snapshot = recorder.snapshot();
+    assert!(snapshot.terminal);
+    assert_eq!(snapshot.counts.started, 1);
+    assert_eq!(snapshot.counts.rejected_after_close, 1);
+}
 #[test]
 fn descendants_preserve_ids_without_reusing_root_span() {
     let recorder = TraceRecorder::new(4).unwrap();

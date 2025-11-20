@@ -121,7 +121,16 @@ fn spawn(
             )
             .await;
         match root {
-            Ok(root) => Ok(Box::new(root) as BoxedActorRef),
+            Ok(root) => {
+                // This factory owns two independent roots. Its cleanup hook is
+                // usable only after the returned root has really initialized.
+                if let Err(error) = root.ask(Box::new(Observe)).await {
+                    let _ = root.stop().await;
+                    child.stop().await?;
+                    return Err(error);
+                }
+                Ok(Box::new(root) as BoxedActorRef)
+            }
             Err(error) => {
                 child.stop().await?;
                 Err(parrot_api::errors::ActorError::InternalError(

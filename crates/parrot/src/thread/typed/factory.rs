@@ -1,6 +1,7 @@
 //! Static root reconstruction preserves the original concrete mailbox.
 use super::*;
 use crate::constructor::{ConstructionControl, ConstructionError};
+use crate::typed_supervision::Restart;
 use parrot_api::supervisor::{
     BasicDecisionFn, OneForOneStrategy, SupervisionDecision, SupervisorStrategyType,
 };
@@ -71,7 +72,7 @@ impl ThreadActorSystem {
                 factory,
                 self.factory_slots.clone(),
                 self.cleanup_slots.clone(),
-                self.runtime_handle.clone(),
+                self.retirement_runtime().clone(),
             )),
             path,
             SupervisorStrategyType::OneForOne(strategy),
@@ -120,17 +121,56 @@ impl ThreadActorSystem {
 }
 
 impl TypedControl {
+    fn begin_reconstruction(&self, recovery: tokio::time::Instant) -> tokio::time::Instant {
+        let deadline = if self.creation_limit.is_zero() {
+            recovery
+        } else {
+            recovery.min(tokio::time::Instant::now() + self.creation_limit)
+        };
+        let deadline = self.begin_construction_quiet(deadline);
+        *self.initialization_deadline.lock().unwrap() =
+            (!self.creation_limit.is_zero()).then_some(deadline);
+        self.deadline_changed.notify_waiters();
+        deadline
+    }
     pub(super) fn begin_construction(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        let deadline = if self.creation_limit.is_zero() {
+            deadline
+        } else {
+            let mut current = self.initialization_deadline.lock().unwrap();
+            let deadline = deadline
+                .min(current.unwrap_or_else(|| tokio::time::Instant::now() + self.creation_limit));
+            *current = Some(deadline);
+            deadline
+        };
+        let deadline = self.begin_construction_quiet(deadline);
+        self.deadline_changed.notify_waiters();
+        deadline
+    }
+    pub(super) fn begin_construction_quiet(
         &self,
         deadline: tokio::time::Instant,
     ) -> tokio::time::Instant {
         let mut current = self.deadline.lock().unwrap();
         let deadline = current.map_or(deadline, |old| old.min(deadline));
         *current = Some(deadline);
-        self.deadline_changed.notify_waiters();
         deadline
     }
     pub(super) fn construction_complete(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, SystemError> {
+        let result = self.construction_complete_quiet(deadline);
+        if result.is_err() {
+            self.request_stop(deadline);
+        }
+        self.deadline_changed.notify_waiters();
+        result
+    }
+    pub(super) fn construction_complete_quiet(
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<bool, SystemError> {
@@ -143,8 +183,6 @@ impl TypedControl {
             return Ok(false);
         }
         if tokio::time::Instant::now() >= deadline {
-            drop(current);
-            self.request_stop(deadline);
             return Err(SystemError::Timeout(
                 "typed factory publication stopped or expired".into(),
             ));
@@ -152,7 +190,6 @@ impl TypedControl {
         if *current == Some(deadline) {
             *current = None;
         }
-        self.deadline_changed.notify_waiters();
         Ok(true)
     }
 }
@@ -257,41 +294,78 @@ async fn rebuild_group<A: ParrotTypedDispatch>(
     use crate::children::recovery::Step;
     let _abort = AbortGroup(group.clone());
     let control = inputs.control.clone();
-    control.begin_construction(group.deadline);
+    control.begin_construction_quiet(group.deadline);
+    control.deadline_changed.notify_waiters();
     let member = control.lifetime.id;
     let work = async {
         retire_generation(inputs).await?;
-        group
-            .arrive(member, Step::Retired)
-            .await
-            .map_err(SystemError::ShutdownError)?;
+        if let Err(error) = group.arrive(member, Step::Retired).await {
+            return if group.was_cancelled() {
+                Ok(false)
+            } else {
+                Err(SystemError::ShutdownError(error))
+            };
+        }
+        let deadline = control.begin_reconstruction(group.deadline);
         let factory = inputs.factory.as_ref().expect("repeatable source").clone();
-        let construction = group.control.clone();
+        let construction = match group.creation_control(member, deadline) {
+            Ok(control) => control,
+            Err(_) if group.was_cancelled() => return Ok(false),
+            Err(error) => return Err(SystemError::ShutdownError(error)),
+        };
+        let publication = construction.clone();
         let prepared = runtime
             .spawn(parrot_api::trace::scope(
                 group.failure_context.clone(),
                 async move { factory.prepare::<()>(construction).await },
             ))
             .await
-            .map_err(|error| SystemError::ShutdownError(error.to_string()))?
-            .map_err(construction_error)?;
+            .map_err(|error| SystemError::ShutdownError(error.to_string()))?;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            // Aborting an epoch cancels every constructor. Before its actual
+            // deadline this is a stopped generation, not a construction timeout.
+            Err(ConstructionError::Cancelled) if group.was_cancelled() => return Ok(false),
+            Err(ConstructionError::Cancelled) if tokio::time::Instant::now() >= deadline => {
+                return Err(SystemError::Timeout(
+                    "static cohort creation deadline elapsed".into(),
+                ));
+            }
+            Err(ConstructionError::Cancelled) if tokio::time::Instant::now() < group.deadline => {
+                return Err(SystemError::ShutdownError(
+                    group
+                        .failure_reason()
+                        .unwrap_or_else(|| "static cohort construction cancelled".into()),
+                ));
+            }
+            Err(error) => return Err(construction_error(error)),
+        };
         if let Err(error) = group.arrive(member, Step::Prepared).await {
             prepared
                 .discard()
                 .await
                 .map_err(SystemError::ShutdownError)?;
-            return Err(SystemError::ShutdownError(error));
+            return if group.was_cancelled() {
+                Ok(false)
+            } else {
+                Err(SystemError::ShutdownError(error))
+            };
         }
-        if group.control.is_cancelled() || control.channel.is_sealed() {
+        if publication.is_cancelled() || control.channel.is_sealed() {
             prepared
                 .discard()
                 .await
                 .map_err(SystemError::ShutdownError)?;
-            return Err(SystemError::ShutdownError(
-                "static cohort stopped before publication".into(),
-            ));
+            return if group.was_cancelled() {
+                Ok(false)
+            } else {
+                Err(SystemError::ShutdownError(
+                    "static cohort stopped before publication".into(),
+                ))
+            };
         }
-        control.escalated.lock().unwrap().take();
+        let removed = control.escalated.lock().unwrap().take();
+        drop(removed);
         control
             .tree
             .next_generation()
@@ -300,18 +374,21 @@ async fn rebuild_group<A: ParrotTypedDispatch>(
         // allowed until every sibling has installed its replacement input.
         inputs.actor = Some(prepared.adopt());
         inputs.creation_context = group.failure_context.clone();
-        group
-            .arrive(member, Step::Published)
-            .await
-            .map_err(SystemError::ShutdownError)?;
-        control.construction_complete(group.deadline)
+        if let Err(error) = group.arrive(member, Step::Published).await {
+            return if group.was_cancelled() {
+                Ok(false)
+            } else {
+                Err(SystemError::ShutdownError(error))
+            };
+        }
+        control.construction_complete(deadline)
     };
     tokio::pin!(work);
     tokio::select! {
         biased;
         result=&mut work => result,
-        _=control.channel.closed()=>{group.abort("explicit stop cancelled static cohort");work.await},
-        _=tokio::time::sleep_until(group.deadline)=>{group.abort("static cohort recovery deadline elapsed");control.begin_cleanup(group.deadline);work.await},
+        _=control.channel.closed()=>{group.cancel("explicit stop cancelled static cohort");work.await},
+        _=control.expired()=>{group.abort("static cohort creation/recovery deadline elapsed");control.begin_cleanup(control.deadline());work.await},
     }
 }
 
@@ -320,14 +397,14 @@ fn actor_error(error: &Arc<ActorError>) -> SystemError {
 }
 async fn restart<A: ParrotTypedDispatch>(
     inputs: &mut TypedInputs<A>,
-    error: Arc<ActorError>,
+    error: crate::error_receipt::ActorReceipt,
     deadline: tokio::time::Instant,
     runtime: &tokio::runtime::Handle,
-) -> Result<bool, SystemError> {
+) -> Result<Restart, SystemError> {
     let control = inputs.control.clone();
     if control.channel.is_sealed() || tokio::time::Instant::now() >= deadline {
         control.begin_cleanup(deadline);
-        return Ok(false);
+        return Ok(Restart::Declined);
     }
     let policy = control
         .lifetime
@@ -336,30 +413,43 @@ async fn restart<A: ParrotTypedDispatch>(
         .map_err(|error| SystemError::Other(anyhow::Error::new(error)))?;
     let failure_context = if let Some(policy) = policy {
         if let Some(group) = policy.recovery.clone() {
-            return rebuild_group(inputs, group, runtime).await;
+            return rebuild_group(inputs, group, runtime)
+                .await
+                .map(Restart::constructed);
         }
         if policy.decision != SupervisionDecision::Restart {
             control.tree.defer_failure(error, policy);
-            return Ok(false);
+            return Ok(Restart::Declined);
         }
         policy.failure_context
     } else {
-        return Ok(false);
+        return Ok(Restart::Declined);
     };
     parrot_api::trace::scope(failure_context.clone(), async move {
-        let deadline = control.begin_construction(deadline);
+        control.begin_construction_quiet(deadline);
+        control.deadline_changed.notify_waiters();
         retire_generation(inputs).await?;
-        if control.channel.is_sealed() || tokio::time::Instant::now() >= deadline {
+        let deadline = control.begin_reconstruction(deadline);
+        if control.channel.is_sealed() {
             control.begin_cleanup(deadline);
-            return Ok(false);
+            return Ok(Restart::Stopped);
         }
-        control.escalated.lock().unwrap().take();
+        if tokio::time::Instant::now() >= deadline {
+            control.begin_cleanup(deadline);
+            return Err(SystemError::Timeout(
+                "typed reconstruction recovery deadline elapsed".into(),
+            ));
+        }
+        let removed = control.escalated.lock().unwrap().take();
+        drop(removed);
         control
             .tree
             .next_generation()
             .map_err(|error| SystemError::Other(anyhow::Error::new(error)))?;
         inputs.creation_context = failure_context;
-        construct(inputs, deadline, runtime).await
+        construct(inputs, deadline, runtime)
+            .await
+            .map(Restart::constructed)
     })
     .await
 }
@@ -373,26 +463,33 @@ pub(super) async fn run<A: ParrotTypedDispatch>(
     let mut hook_started = false;
     let mut execution = std::panic::AssertUnwindSafe(async {
         if control.channel.is_sealed() { return Ok(()); }
-        if !parrot_api::trace::scope(inputs.creation_context.clone(), construct(&mut inputs, tokio::time::Instant::now() + control.timeout, &runtime)).await? { return Ok(()); }
+        if !parrot_api::trace::scope(inputs.creation_context.clone(), construct(&mut inputs, tokio::time::Instant::now() + control.creation_timeout, &runtime)).await? { return Ok(()); }
         let mut reductions = 0;
         'generation: loop {
             let context=control.tree.context();
             if control.channel.is_sealed() { return Ok(()); }
             use crate::typed_supervision::Step;
-            let initialization_context = inputs.creation_context.take();
-            let initialized=match control.wait_typed_stage(parrot_api::trace::scope(initialization_context.clone(), crate::typed_supervision::lifecycle_stage(|| inputs.actor.as_mut().expect("constructed actor").init_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed))), &runtime).await {
+            let mut initialization_context = inputs.creation_context.take();
+            let initialized=match control.wait_typed_stage(parrot_api::trace::scope(initialization_context.clone(), crate::typed_supervision::recorded_lifecycle_stage(parrot_api::trace::SpanKind::ActorInit, context.path(), || inputs.actor.as_mut().expect("constructed actor").init_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed).with_deadline(control.initialization_deadline()))), &runtime).await {
                 Step::Stopped=>return Ok(()),
                 Step::Recovery(group)=>{if rebuild_group(&mut inputs,group,&runtime).await? {continue 'generation;} return Ok(());},
-                Step::Escalated(error)=>{let deadline=control.deadline();if restart(&mut inputs,error.clone(),deadline,&runtime).await?{continue 'generation;}return Err(actor_error(&error));},
-                Step::Ready(result)=>result.unwrap_or_else(|message|Err(ActorError::Panic(message))),
+                Step::Escalated(error)=>{let deadline=control.deadline();match restart(&mut inputs,error.clone(),deadline,&runtime).await? { Restart::Ready=>continue 'generation, Restart::Stopped=>return Ok(()), Restart::Declined=>return Err(actor_error(&error)), }},
+                Step::Ready(outcome)=>{initialization_context=outcome.context;outcome.result.unwrap_or_else(|message|Err(ActorError::Panic(message)))},
             };
+            control.finish_initialization();
             if let Err(error) = initialized {
-                let error = Arc::new(error);
+                let error = crate::error_receipt::ActorReceipt::from_error(error);
                 let deadline = tokio::time::Instant::now() + control.timeout;
                 // Own the decider across explicit stop/cancellation, just as for
                 // handler failures. Initialization Resume never activates a failed instance.
                 let resume = parrot_api::trace::scope(initialization_context, control.lifetime.resume_message(error.clone(), deadline, false, &runtime)).await;
-                if !resume && restart(&mut inputs, error.clone(), deadline, &runtime).await? { continue; }
+                if !resume {
+                    match restart(&mut inputs, error.clone(), deadline, &runtime).await? {
+                        Restart::Ready => continue,
+                        Restart::Stopped => return Ok(()),
+                        Restart::Declined => {},
+                    }
+                }
                 return Err(actor_error(&error));
             }
             drop(initialization_context);
@@ -400,12 +497,12 @@ pub(super) async fn run<A: ParrotTypedDispatch>(
                 let message=match control.wait_typed_stage(inputs.receiver.as_ref().expect("typed mailbox").recv_async(), &runtime).await {
                     Step::Stopped=>break 'generation,
                     Step::Recovery(group)=>{if rebuild_group(&mut inputs,group,&runtime).await? {continue 'generation;} return Ok(());},
-                    Step::Escalated(error)=>{let deadline=control.deadline();if restart(&mut inputs,error.clone(),deadline,&runtime).await?{continue 'generation;}return Err(actor_error(&error));},
+                    Step::Escalated(error)=>{let deadline=control.deadline();match restart(&mut inputs,error.clone(),deadline,&runtime).await? { Restart::Ready=>continue 'generation, Restart::Stopped=>return Ok(()), Restart::Declined=>return Err(actor_error(&error)), }},
                     Step::Ready(Ok(message))=>message,
                     Step::Ready(Err(_))=>break 'generation,
                 };
                 control.channel.notify_capacity();
-                let dispatched=match control.wait_typed_stage(crate::typed_supervision::dispatch(inputs.actor.as_mut().expect("live actor"),message,&control.lifetime,&runtime,control.timeout,Some(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed)), &runtime).await {
+                let dispatched=match control.wait_typed_stage(crate::typed_supervision::dispatch(inputs.actor.as_mut().expect("live actor"),message,&control.lifetime,&runtime,control.timeout,Some(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed).with_timeout(control.message_timeout)), &runtime).await {
                     Step::Stopped=>break 'generation,
                     Step::Recovery(group)=>{if rebuild_group(&mut inputs,group,&runtime).await? {continue 'generation;} return Ok(());},
                     Step::Escalated(error)=>Err(error),
@@ -413,8 +510,11 @@ pub(super) async fn run<A: ParrotTypedDispatch>(
                 };
                 if let Err(error) = dispatched {
                     let deadline = control.lifetime.decision_deadline().unwrap_or_else(|| tokio::time::Instant::now() + control.timeout);
-                    if restart(&mut inputs, error.clone(), deadline, &runtime).await? { continue 'generation; }
-                    return Err(actor_error(&error));
+                    match restart(&mut inputs, error.clone(), deadline, &runtime).await? {
+                        Restart::Ready => continue 'generation,
+                        Restart::Stopped => return Ok(()),
+                        Restart::Declined => return Err(actor_error(&error)),
+                    }
                 }
                 reductions += 1;
                 if reductions >= batch_size.max(1) { reductions = 0; tokio::task::yield_now().await; }
@@ -430,7 +530,7 @@ pub(super) async fn run<A: ParrotTypedDispatch>(
         tokio::select! {
             biased;
             _ = control.expired() => Err(SystemError::Timeout("typed stop hook exceeded configured deadline".into())),
-            result = crate::typed_supervision::lifecycle_stage(|| inputs.actor.as_mut().expect("initialized actor").before_stop_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed)) => result.map_err(SystemError::Panic).and_then(|result| result.map_err(|error| SystemError::Other(anyhow::Error::new(error)))),
+            result = parrot_api::trace::scope(control.stop_context.take(), crate::typed_supervision::recorded_lifecycle_stage(parrot_api::trace::SpanKind::ActorBeforeStop, context.path(), || inputs.actor.as_mut().expect("initialized actor").before_stop_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed))) => result.result.map_err(SystemError::Panic).and_then(|result| result.map_err(|error| SystemError::Other(anyhow::Error::new(error)))),
         }
     }).catch_unwind().await.unwrap_or_else(|panic| Err(SystemError::Panic(typed_panic(panic))));
     let children = control

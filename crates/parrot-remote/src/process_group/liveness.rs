@@ -11,6 +11,30 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn any_live_member<T>(
+    members: impl IntoIterator<Item = T>,
+    deadline: Instant,
+    mut observe: impl FnMut(T) -> Result<bool, String>,
+) -> Result<bool, String> {
+    let mut failure = None;
+    for member in members {
+        check_deadline(deadline)?;
+        let result = observe(member);
+        check_deadline(deadline)?;
+        match result {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    // One observed live member proves liveness. Proving absence requires every
+    // member to be observable, so an earlier read error must survive this scan.
+    failure.map_or(Ok(false), Err)
+}
+
 #[cfg(target_os = "linux")]
 fn disappeared(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
@@ -166,10 +190,9 @@ fn has_live_scope(group: u32, session_scope: bool, deadline: Instant) -> Result<
         }
         break result as usize / std::mem::size_of::<i32>();
     };
-    for pid in &pids[..count] {
-        check_deadline(deadline)?;
+    any_live_member(&pids[..count], deadline, |pid| {
         if *pid <= 0 {
-            continue;
+            return Ok(false);
         }
         if session_scope {
             // Filter before requesting BSD process details for unrelated users.
@@ -177,12 +200,12 @@ fn has_live_scope(group: u32, session_scope: bool, deadline: Instant) -> Result<
             if sid == -1 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::ESRCH) {
-                    continue;
+                    return Ok(false);
                 }
                 return Err(format!("read gateway session: {error}"));
             }
             if sid != group as i32 {
-                continue;
+                return Ok(false);
             }
         }
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
@@ -199,7 +222,7 @@ fn has_live_scope(group: u32, session_scope: bool, deadline: Instant) -> Result<
         if bytes as usize != expected {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
-                continue;
+                return Ok(false);
             }
             return Err(format!("read gateway group member: {error}"));
         }
@@ -210,7 +233,7 @@ fn has_live_scope(group: u32, session_scope: bool, deadline: Instant) -> Result<
             if sid == -1 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::ESRCH) {
-                    continue;
+                    return Ok(false);
                 }
                 return Err(format!("read gateway session: {error}"));
             }
@@ -218,11 +241,8 @@ fn has_live_scope(group: u32, session_scope: bool, deadline: Instant) -> Result<
         } else {
             info.pbi_pgid == group
         };
-        if same_scope && info.pbi_status != libc::SZOMB {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        Ok(same_scope && info.pbi_status != libc::SZOMB)
+    })
 }
 
 /// Observe a pinned process group without signalling any enumerated PID.
@@ -235,4 +255,48 @@ pub fn has_live_group(group: u32, deadline: Instant) -> Result<bool, String> {
 /// receives signals. A member that escaped the group can cause a failure receipt.
 pub(super) fn has_live_session(session: u32, deadline: Instant) -> Result<bool, String> {
     has_live_scope(session, true, deadline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn scan(results: impl IntoIterator<Item = Result<bool, String>>) -> Result<bool, String> {
+        any_live_member(results, Instant::now() + Duration::from_secs(5), |r| r)
+    }
+
+    #[test]
+    fn inaccessible_member_does_not_hide_a_later_live_member() {
+        assert_eq!(
+            scan([Err("permission denied".into()), Ok(false), Ok(true)]),
+            Ok(true)
+        );
+        assert_eq!(scan([Ok(true), Err("permission denied".into())]), Ok(true));
+    }
+
+    #[test]
+    fn read_failures_never_prove_a_group_is_empty() {
+        assert_eq!(
+            scan([Ok(false), Err("permission denied".into()), Ok(false)]),
+            Err("permission denied".into())
+        );
+        assert_eq!(scan([Err("io failure".into())]), Err("io failure".into()));
+        assert_eq!(scan([Ok(false), Ok(false)]), Ok(false));
+        assert_eq!(scan([]), Ok(false));
+    }
+
+    #[test]
+    fn a_live_result_after_the_deadline_does_not_hide_the_timeout() {
+        let deadline = Instant::now();
+        assert!(any_live_member([true], deadline, |_| panic!("already expired")).is_err());
+        let deadline = Instant::now() + Duration::from_millis(10);
+        assert!(any_live_member([true], deadline, |_| {
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            Ok(true)
+        })
+        .is_err());
+    }
 }

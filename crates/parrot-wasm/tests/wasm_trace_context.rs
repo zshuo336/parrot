@@ -49,8 +49,8 @@ fn legacy_guest_preserves_business_errors_and_tells_with_explicit_parents() {
     let mut guest = runtime
         .instantiate(&fixture(false), HostCtx::default())
         .unwrap();
-    guest.on_start().unwrap();
     let [first, second] = parents();
+    guest.on_start_with_trace(Some(&first)).unwrap();
     assert_eq!(
         guest
             .handle_with_trace("echo", b"legacy", Some(&first))
@@ -65,7 +65,7 @@ fn legacy_guest_preserves_business_errors_and_tells_with_explicit_parents() {
     );
     guest.tell_with_trace("bump", &[7], Some(&first)).unwrap();
     assert_eq!(guest.handle("counter", b"").unwrap(), 7u64.to_le_bytes());
-    guest.on_drain().unwrap();
+    guest.on_drain_with_trace(Some(&second)).unwrap();
     assert_eq!(
         guest
             .handle_with_trace("drained", b"", Some(&second))
@@ -100,6 +100,71 @@ fn guest_import_observes_each_message_but_lifecycle_has_no_message_parent() {
         .is_empty());
     guest.on_start().unwrap();
     assert!(guest.handle("start-parent", b"").unwrap().is_empty());
+}
+
+#[test]
+fn explicit_lifecycle_parents_are_isolated_and_do_not_count_as_messages() {
+    let runtime = runtime();
+    let mut guest = runtime
+        .instantiate(&fixture(true), HostCtx::default())
+        .unwrap();
+    let [first, second] = parents();
+    guest.on_start_with_trace(Some(&first)).unwrap();
+    guest.on_drain_with_trace(Some(&second)).unwrap();
+    assert_eq!(guest.take_metrics().messages, 0);
+    assert_eq!(
+        guest.handle("start-parent", b"").unwrap(),
+        bytes(Some(&first))
+    );
+    assert_eq!(
+        guest.handle("drain-parent", b"").unwrap(),
+        bytes(Some(&second))
+    );
+    assert!(guest.handle("parent", b"").unwrap().is_empty());
+    guest.on_start().unwrap();
+    guest.on_drain().unwrap();
+    assert!(guest.handle("start-parent", b"").unwrap().is_empty());
+    assert!(guest.handle("drain-parent", b"").unwrap().is_empty());
+}
+
+#[test]
+fn invalid_lifecycle_parents_cannot_run_hooks_or_poisoned_store_recovery() {
+    let runtime = runtime();
+    let mut guest = runtime
+        .instantiate(&fixture(true), HostCtx::default())
+        .unwrap();
+    guest.on_start().unwrap();
+    assert!(guest.handle("trap", b"").is_err());
+    guest.take_metrics();
+    for invalid in [
+        TraceParent {
+            trace_id: [0; 16],
+            span_id: [1; 8],
+        },
+        TraceParent {
+            trace_id: [1; 16],
+            span_id: [0; 8],
+        },
+    ] {
+        assert_eq!(
+            guest.on_start_with_trace(Some(&invalid)),
+            Err(ComponentError::InvalidTraceParent)
+        );
+        assert_eq!(
+            guest.on_drain_with_trace(Some(&invalid)),
+            Err(ComponentError::InvalidTraceParent)
+        );
+    }
+    let metrics = guest.take_metrics();
+    assert_eq!(metrics.messages, 0);
+    assert_eq!(metrics.fuel_consumed, 0);
+    guest.on_drain_with_trace(Some(&parents()[0])).unwrap();
+    assert!(guest.handle("start-parent", b"").unwrap().is_empty());
+    assert_eq!(
+        guest.handle("drain-parent", b"").unwrap(),
+        bytes(Some(&parents()[0]))
+    );
+    assert!(guest.handle("parent", b"").unwrap().is_empty());
 }
 
 #[test]

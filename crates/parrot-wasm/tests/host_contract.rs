@@ -4,6 +4,7 @@
 use parrot_wasm::runtime::WasmRuntime;
 use parrot_wasm::{ComponentError, HostCtx, WasmConfig};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 fn runtime() -> WasmRuntime {
@@ -72,6 +73,127 @@ fn clock_is_elapsed_monotonic_time_across_recovery() {
     );
     let upper_bound = elapsed.elapsed().as_millis() as u64 + 1;
     assert!(recovered - first <= upper_bound);
+}
+
+struct LogEvents(Arc<Mutex<Vec<tracing::Level>>>);
+
+impl tracing::Subscriber for LogEvents {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().target() == "parrot_wasm" {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn log_expectations() -> [Vec<tracing::Level>; 5] {
+    use tracing::Level;
+    [
+        vec![Level::ERROR],
+        vec![Level::ERROR, Level::WARN],
+        vec![Level::ERROR, Level::WARN, Level::INFO],
+        vec![Level::ERROR, Level::WARN, Level::INFO, Level::DEBUG],
+        vec![
+            Level::ERROR,
+            Level::WARN,
+            Level::INFO,
+            Level::DEBUG,
+            Level::TRACE,
+        ],
+    ]
+}
+
+#[test]
+fn guest_logs_obey_each_host_threshold_before_and_after_recovery() {
+    let runtime = runtime();
+    for (threshold, expected) in log_expectations().into_iter().enumerate() {
+        let mut component = runtime
+            .instantiate(
+                &fixture(),
+                HostCtx {
+                    log_level: threshold as u8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for round in 0..2 {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            tracing::subscriber::with_default(LogEvents(events.clone()), || {
+                for level in 0..=4 {
+                    assert_eq!(component.handle("log", &[level, b'x']).unwrap(), b"logged");
+                }
+            });
+            assert_eq!(
+                *events.lock().unwrap(),
+                expected,
+                "threshold={threshold} round={round}"
+            );
+            if round == 0 {
+                assert_eq!(
+                    component.handle("spin", &[]),
+                    Err(ComponentError::OutOfFuel)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn async_guest_logs_obey_each_host_threshold_before_and_after_recovery() {
+    use tracing::instrument::WithSubscriber;
+
+    let runtime = runtime();
+    let bytes = std::fs::read(fixture()).unwrap();
+    for (threshold, expected) in log_expectations().into_iter().enumerate() {
+        let mut component = runtime
+            .prepare_bytes(&bytes)
+            .unwrap()
+            .instantiate_async(
+                HostCtx {
+                    log_level: threshold as u8,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        for round in 0..2 {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            async {
+                for level in 0..=4 {
+                    assert_eq!(
+                        component
+                            .handle_async("log", &[level, b'x'], None)
+                            .await
+                            .unwrap(),
+                        b"logged"
+                    );
+                }
+            }
+            .with_subscriber(LogEvents(events.clone()))
+            .await;
+            assert_eq!(
+                *events.lock().unwrap(),
+                expected,
+                "threshold={threshold} round={round}"
+            );
+            if round == 0 {
+                assert_eq!(
+                    component.handle_async("spin", &[], None).await,
+                    Err(ComponentError::OutOfFuel)
+                );
+            }
+        }
+    }
 }
 
 struct PanickingLog;

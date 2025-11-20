@@ -607,6 +607,27 @@ class Suite:
         require(not failures, "; ".join(failures))
 
 
+def built_application(output):
+    candidates = []
+    for line in output.splitlines():
+        if not line.startswith('{'):
+            continue
+        event = json.loads(line)
+        if not isinstance(event, dict) or event.get("reason") != "compiler-artifact":
+            continue
+        target = event.get("target", {})
+        if (target.get("name") == "websearch" and target.get("kind") == ["bin"]
+                and target.get("src_path") == str(APP / "src/main.rs")
+                and event.get("profile", {}).get("test") is False):
+            executable = event.get("executable")
+            if isinstance(executable, str) and Path(executable).is_absolute():
+                candidates.append(Path(executable))
+    require(len(candidates) == 1 and candidates[0].is_file()
+            and os.access(candidates[0], os.X_OK),
+            "Cargo did not identify exactly one runnable websearch application")
+    return candidates[0]
+
+
 def build(root):
     # Required dependencies fail before expensive builds; no warning-only success.
     for executable in ("cargo", "java", "erl", "erlc", "mvn", "jar", "unzip"):
@@ -617,24 +638,31 @@ def build(root):
         ["erlc", "-o", "interop/erlang", "interop/erlang/parrot_gw.erl", "interop/erlang/parrot_component_runtime.erl",
          "interop/erlang/parrot_beam_snapshot.erl", "interop/erlang/parrot_trace.erl", "interop/erlang/parrot_beam_guest.erl",
          "interop/erlang/parrot_beam_host.erl"],
-        ["bash", "apps/websearch/build.sh", "--profile", "dev"],
+        ["bash", "apps/websearch/build.sh", "--profile", "dev", "--bin", "websearch", "--message-format=json"],
         ["bash", "apps/websearch/jvm/test.sh"],
     ]
+    binary = None
     for i, command in enumerate(commands):
         process = Process(root, f"build-{i}", command)
         try:
             rc = process.child.wait(timeout=1200)
             require(rc == 0, f"build exited {rc}: {process.log}\n{process.text()[-4000:]}")
+            if i == 3:
+                binary = built_application(process.text())
         finally:
             process.stop()
+    return binary
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fast", action="store_true", help="compatibility alias: this runner covers host processes only")
     parser.add_argument("--no-build", action="store_true", help="explicitly test existing debug artifacts; default builds current sources")
+    parser.add_argument("--binary", type=Path, help="existing executable; requires --no-build")
     parser.add_argument("--faults-only", action="store_true", help="run all acknowledgement failure paths against real gateways")
     args = parser.parse_args()
+    if args.binary is not None and not args.no_build:
+        parser.error("--binary requires --no-build")
     # macOS's default TMPDIR exceeds Ray's Unix socket pathname budget.
     root = Path(tempfile.mkdtemp(prefix="ws-e2e-", dir="/tmp"))
     print(f"Artifacts: {root}\nScope: host processes. Container matrix NOT RUN.", flush=True)
@@ -646,9 +674,11 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupted)
     try:
-        if not args.no_build:
-            build(root)
-        inputs = ["target/debug/websearch", "interop/jvm/target/parrot-protocol-jvm-0.1.0.jar", "interop/erlang/parrot_gw.beam", "apps/websearch/erlang/frontier.beam", "apps/websearch/jvm/target/websearch-jvm-1.0.0.jar", "apps/websearch/python/tokenizer.py", "interop/python/parrot_protocol/ray_gw.py"]
+        binary = ((args.binary or REPO / "target/debug/websearch").resolve()
+                  if args.no_build else build(root))
+        require(binary.is_file() and os.access(binary, os.X_OK), f"missing executable: {binary}")
+        report["binary"] = str(binary)
+        inputs = [str(binary), "interop/jvm/target/parrot-protocol-jvm-0.1.0.jar", "interop/erlang/parrot_gw.beam", "apps/websearch/erlang/frontier.beam", "apps/websearch/jvm/target/websearch-jvm-1.0.0.jar", "apps/websearch/python/tokenizer.py", "interop/python/parrot_protocol/ray_gw.py"]
         report["artifact_sha256"] = {}
         for relative in inputs:
             digest = hashlib.sha256()
@@ -657,7 +687,7 @@ def main():
                     digest.update(block)
             report["artifact_sha256"][relative] = digest.hexdigest()
         with ExitStack() as stack:
-            suite = Suite(root, REPO / "target/debug/websearch", stack)
+            suite = Suite(root, binary, stack)
             if not args.faults_only:
                 suite.run()
             suite.run_faults()

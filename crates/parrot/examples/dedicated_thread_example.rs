@@ -3,7 +3,10 @@
 //! Demonstrates the `DedicatedThreadScheduler`: one OS thread per actor,
 //! each with its own single-threaded Tokio runtime.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use parrot::thread::actor::ThreadActor;
@@ -23,11 +26,21 @@ use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 /// A compute-heavy actor that folds numbers.
 struct ComputeActor {
     counter: u64,
+    retired: Arc<AtomicUsize>,
 }
 
 impl ComputeActor {
-    fn new() -> Self {
-        Self { counter: 0 }
+    fn new(retired: Arc<AtomicUsize>) -> Self {
+        Self {
+            counter: 0,
+            retired,
+        }
+    }
+}
+
+impl Drop for ComputeActor {
+    fn drop(&mut self) {
+        self.retired.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -59,7 +72,7 @@ impl Actor for ComputeActor {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     // 1. Create the dedicated-thread scheduler.
     let scheduler = DedicatedThreadScheduler::new(Some(DedicatedThreadConfig {
         max_threads: 4,
@@ -73,8 +86,9 @@ async fn main() {
     let mailbox = Arc::new(MpscMailbox::new(1024, actor_path.clone()));
 
     let context = ThreadContext::<ComputeActor>::new_for_test(path_str);
+    let retired = Arc::new(AtomicUsize::new(0));
     let processor = Arc::new(ActorProcessor::<ComputeActor>::new(
-        ThreadActor::new_for_test(ComputeActor::new()),
+        ThreadActor::new_for_test(ComputeActor::new(retired.clone())),
         context,
         path_str.to_string(),
         ThreadActorConfig::default(),
@@ -104,21 +118,26 @@ async fn main() {
         None,
     );
 
-    for value in [100u64, 250, 33] {
-        let result = actor_ref.ask(Box::new(value) as BoxedMessage).await;
-        match result {
-            Ok(reply) => {
-                let total = reply.downcast_ref::<u64>().copied().unwrap_or(0);
-                println!("after adding {value}: total = {total}");
-            }
-            Err(e) => {
-                eprintln!("ask failed: {e}");
-                break;
-            }
+    let result = async {
+        for (value, expected) in [(100u64, 100), (250, 350), (33, 383)] {
+            let reply = actor_ref.ask(Box::new(value) as BoxedMessage).await?;
+            let total = *reply
+                .downcast::<u64>()
+                .map_err(|_| anyhow::anyhow!("unexpected compute reply type"))?;
+            anyhow::ensure!(
+                total == expected,
+                "after adding {value}: expected {expected}, got {total}"
+            );
+            println!("after adding {value}: total = {total}");
         }
+        Ok(())
     }
+    .await;
 
     // 5. Shut the scheduler down.
-    scheduler.shutdown().await.expect("shutdown failed");
+    scheduler.shutdown().await?;
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
+    assert_eq!(scheduler.worker_count(), 0);
     println!("dedicated-thread example finished");
+    result
 }

@@ -3,7 +3,7 @@
 //! stack or run effectively forever. A ready signal excludes executable startup
 //! time from the decoding deadline.
 use parrot_api::message::serde_remote_deserialize;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -27,12 +27,22 @@ fn attack_must_be_rejected(case: &str) {
             .unwrap(),
     );
     let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
     let (ready_tx, ready_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
+    let stdout_reader = std::thread::spawn(move || {
         let mut output = String::new();
         for line in BufReader::new(stdout).lines() {
             let line = line.unwrap();
-            if line == "DECODER_READY" {
+            output.push_str(&line);
+            output.push('\n');
+        }
+        output
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if line == "DECODER_READY" || line.contains("DECODER_READY") {
                 let _ = ready_tx.send(());
             }
             output.push_str(&line);
@@ -56,15 +66,8 @@ fn attack_must_be_rejected(case: &str) {
         let _ = child.0.kill();
         child.0.wait().unwrap();
     }
-    let stdout = reader.join().unwrap();
-    let mut stderr = String::new();
-    child
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
+    let stdout = stdout_reader.join().unwrap();
+    let stderr = stderr_reader.join().unwrap();
     assert!(
         ready.is_ok(),
         "child did not reach decoder: {stdout}\n{stderr}"
@@ -100,8 +103,8 @@ fn decode_attack_child() {
     let Ok(case) = std::env::var("PARROT_DECODE_ATTACK") else {
         return;
     };
-    println!("DECODER_READY");
-    std::io::stdout().flush().unwrap();
+    eprintln!("DECODER_READY");
+    std::io::stderr().flush().unwrap();
     match case.as_str() {
         "elements" => {
             // bincode standard varint: marker 253 followed by a LE u64 length.

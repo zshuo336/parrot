@@ -14,6 +14,41 @@ use parrot_api::{actor::Actor, address::ActorRef};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{oneshot, watch};
 
+#[cfg(test)]
+mod admission_contracts;
+
+/// Call-time rejection from [`ThreadActorSystem::try_spawn_typed_with_config`].
+/// All inputs remain caller-owned; rejecting a request submits no cleanup task.
+pub struct InstanceAdmissionError<A: Actor> {
+    pub actor: A,
+    pub config: A::Config,
+    pub engine: ThreadActorConfig,
+    pub reason: InstanceAdmissionFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InstanceAdmissionFailure {
+    #[error("pending instance creation capacity exhausted")]
+    Full,
+    #[error("actor system is shutting down")]
+    ShuttingDown,
+}
+
+impl<A: Actor> std::fmt::Display for InstanceAdmissionError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+impl<A: Actor> std::error::Error for InstanceAdmissionError<A> {}
+
+impl<A: Actor> std::fmt::Debug for InstanceAdmissionError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceAdmissionError")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
 type CreationSender = oneshot::Sender<Result<(), SpawnError>>;
 enum CreationState {
     Waiting(CreationSender),
@@ -53,6 +88,7 @@ impl CreationReply {
 }
 
 pub(crate) struct PendingInstance {
+    pub(super) _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub stop_request: super::address::StopRequest,
     pub reference: Arc<dyn ActorRef>,
     pub address: Arc<Mutex<WeakMailboxRef>>,
@@ -91,6 +127,74 @@ async fn retire_inputs<A: Send + 'static>(
 }
 
 impl ThreadActorSystem {
+    /// Maximum admitted dynamic instance creation bundles per system through
+    /// [`Self::try_spawn_typed_with_config`], including unpolled and cleaning inputs.
+    pub const MAX_PENDING_INSTANCE_CREATIONS: usize = 1024;
+
+    /// Reserve one creation bundle before accepting actor/config ownership.
+    /// Rejection returns every original input without scheduling work or running
+    /// user destructors. Each admitted bundle contains at most four protected
+    /// inputs; cancellation retains its reservation until their disposal ends.
+    /// Publication retains it until the creation owner finishes the handoff.
+    /// Live actors use their normal actor/mailbox budgets after that handoff.
+    ///
+    /// Legacy spawn methods retain their existing cleanup semantics and are not
+    /// included in this admission limit. Callers needing bounded pending input
+    /// ownership must use this fallible entry and apply backpressure on `Full`.
+    #[allow(clippy::type_complexity, clippy::result_large_err)]
+    pub fn try_spawn_typed_with_config<A>(
+        self: &Arc<Self>,
+        actor: A,
+        config: A::Config,
+        engine: ThreadActorConfig,
+    ) -> Result<
+        parrot_api::types::BoxedFuture<'_, Result<ThreadActorRef<A>, SpawnError>>,
+        InstanceAdmissionError<A>,
+    >
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
+        let reservation = if self.is_shutting_down() {
+            Err(InstanceAdmissionFailure::ShuttingDown)
+        } else {
+            self.instance_admission
+                .clone()
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    tokio::sync::TryAcquireError::Closed => InstanceAdmissionFailure::ShuttingDown,
+                    tokio::sync::TryAcquireError::NoPermits => InstanceAdmissionFailure::Full,
+                })
+        };
+        let reservation = match reservation {
+            Ok(permit) => Arc::new(permit),
+            Err(reason) => {
+                return Err(InstanceAdmissionError {
+                    actor,
+                    config,
+                    engine,
+                    reason,
+                });
+            }
+        };
+        let runtime = self.retirement_runtime();
+        let actor =
+            OwnedPayload::new(actor, runtime, &self.cleanup_slots).with_reservation(&reservation);
+        let config = OwnedPayload::new(Some(config), runtime, &self.cleanup_slots)
+            .with_reservation(&reservation);
+        let engine =
+            OwnedPayload::new(engine, runtime, &self.cleanup_slots).with_reservation(&reservation);
+        let parent =
+            OwnedPayload::new(None, runtime, &self.cleanup_slots).with_reservation(&reservation);
+        Ok(Box::pin(self.spawn_owned_instance_inputs(
+            actor,
+            config,
+            engine,
+            None,
+            parent,
+            None,
+            Some(reservation),
+        )))
+    }
     /// Both admission paths use the same bounded blocking publication owner.
     #[allow(clippy::too_many_arguments)]
     fn submit_instance_publication<A>(
@@ -108,7 +212,7 @@ impl ThreadActorSystem {
     {
         let system = self.clone();
         let trace = parrot_api::trace::TraceContext::current();
-        self.runtime_handle.spawn_blocking(move || {
+        self.retirement_runtime().spawn_blocking(move || {
             parrot_api::trace::in_scope(trace, || {
                 let result = {
                     let _permit = permit;
@@ -173,79 +277,184 @@ impl ThreadActorSystem {
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
-        let actor = OwnedPayload::new(actor, &self.runtime_handle, &self.cleanup_slots);
-        let config = OwnedPayload::new(config, &self.runtime_handle, &self.cleanup_slots);
-        let engine = OwnedPayload::new(engine, &self.runtime_handle, &self.cleanup_slots);
-        let parent = OwnedPayload::new(parent, &self.runtime_handle, &self.cleanup_slots);
+        self.spawn_owned_instance_in_scope(actor, config, engine, path, parent, None)
+    }
+
+    /// Admit a dynamic instance into an explicit root supervision group.
+    pub fn spawn_in_cohort<'a, A>(
+        self: &'a Arc<Self>,
+        actor: A,
+        config: A::Config,
+        engine: ThreadActorConfig,
+        path: String,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> impl std::future::Future<Output = Result<ThreadActorRef<A>, SpawnError>> + Send + 'a
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
+        self.spawn_owned_instance_in_scope(
+            actor,
+            Some(config),
+            engine,
+            Some(path),
+            None,
+            Some(cohort),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_owned_instance_in_scope<'a, A>(
+        self: &'a Arc<Self>,
+        actor: A,
+        config: Option<A::Config>,
+        engine: ThreadActorConfig,
+        path: Option<String>,
+        parent: Option<parrot_api::types::BoxedActorRef>,
+        cohort: Option<&'a crate::root_cohort::RootCohort>,
+    ) -> impl std::future::Future<Output = Result<ThreadActorRef<A>, SpawnError>> + Send + 'a
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
+        let actor = OwnedPayload::new(actor, self.retirement_runtime(), &self.cleanup_slots);
+        let config = OwnedPayload::new(config, self.retirement_runtime(), &self.cleanup_slots);
+        let engine = OwnedPayload::new(engine, self.retirement_runtime(), &self.cleanup_slots);
+        let parent = OwnedPayload::new(parent, self.retirement_runtime(), &self.cleanup_slots);
+        self.spawn_owned_instance_inputs(actor, config, engine, path, parent, cohort, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_owned_instance_inputs<'a, A>(
+        self: &'a Arc<Self>,
+        actor: OwnedPayload<A>,
+        config: OwnedPayload<Option<A::Config>>,
+        engine: OwnedPayload<ThreadActorConfig>,
+        path: Option<String>,
+        parent: OwnedPayload<Option<parrot_api::types::BoxedActorRef>>,
+        cohort: Option<&'a crate::root_cohort::RootCohort>,
+        reservation: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> impl std::future::Future<Output = Result<ThreadActorRef<A>, SpawnError>> + Send + 'a
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
         parrot_api::trace::capture(async move {
-            let path = path.unwrap_or_else(|| format!("/user/{}", uuid::Uuid::new_v4().simple()));
-            let address = Arc::new(Mutex::new(Weak::<MpscMailbox>::new() as WeakMailboxRef));
-            let watches = ThreadWatches::dynamic(&address);
-            let reference = ThreadActorRef::<A>::registered(
-                path.clone(),
-                address.clone(),
-                Default::default(),
-                Arc::downgrade(self),
-                engine
+            let cohort = cohort.or_else(|| {
+                parent
                     .value()
-                    .backpressure_strategy
-                    .clone()
-                    .unwrap_or_else(|| self.config().default_backpressure_strategy.clone()),
-                engine
-                    .value()
-                    .ask_timeout
-                    .unwrap_or(self.config().default_ask_timeout),
-            )
-            .with_death_watch(watches.common.clone());
-            let timeout = self.config().shutdown_timeout;
-            let deadline = tokio::time::Instant::now() + timeout;
-            let pending = Arc::new(PendingInstance {
-                stop_request: reference.stop_request(),
-                reference: Arc::new(reference.clone()),
-                address,
-                watches,
-                control: Arc::new(ConstructionControl::with_deadline(deadline)),
-                finished: watch::channel(None).0,
-                retired: watch::channel(None).0,
-                lifetime: crate::children::ChildLifetime::new(Weak::new()),
+                    .is_none()
+                    .then(|| self.root_cohorts.guardian())
+                    .flatten()
             });
-            let admission = {
-                let mut registry = self.registry.write().unwrap();
-                if self.is_shutting_down() {
-                    Err(SpawnError::SystemShutdown)
-                } else if engine
-                    .value()
-                    .message_batch_size
-                    .is_some_and(|n| !(1..=256).contains(&n))
-                {
-                    Err(SpawnError::InvalidConfig(
-                        "message_batch_size must be in 1..=256".into(),
-                    ))
-                } else if self.self_weak().is_none() {
-                    Err(SpawnError::SchedulerError(
-                        "System self reference not initialized".into(),
-                    ))
-                } else if registry.contains_key(&path) {
-                    Err(SpawnError::ActorPathAlreadyExists(path.clone()))
-                } else {
-                    registry.insert(path.clone(), ActorRegistryEntry::Instance(pending.clone()));
-                    Ok(())
+            let path = path.unwrap_or_else(|| format!("/user/{}", uuid::Uuid::new_v4().simple()));
+            let admit = |lifetime: Arc<crate::children::ChildLifetime>| {
+                let address = Arc::new(Mutex::new(Weak::<MpscMailbox>::new() as WeakMailboxRef));
+                let watches = ThreadWatches::dynamic(&address);
+                let reference = ThreadActorRef::<A>::registered(
+                    path.clone(),
+                    address.clone(),
+                    Default::default(),
+                    Arc::downgrade(self),
+                    engine
+                        .value()
+                        .backpressure_strategy
+                        .clone()
+                        .unwrap_or_else(|| self.config().default_backpressure_strategy.clone()),
+                    engine
+                        .value()
+                        .ask_timeout
+                        .unwrap_or(self.config().default_ask_timeout),
+                )
+                .with_death_watch(watches.common.clone())
+                .with_retirement(&lifetime);
+                let deadline = tokio::time::Instant::now() + self.creation_timeout();
+                let pending = Arc::new(PendingInstance {
+                    _admission: reservation.clone(),
+                    stop_request: reference.stop_request(),
+                    reference: Arc::new(reference.clone()),
+                    address,
+                    watches,
+                    control: Arc::new(ConstructionControl::with_deadline(deadline)),
+                    finished: watch::channel(None).0,
+                    retired: watch::channel(None).0,
+                    lifetime,
+                });
+                let admission = {
+                    let mut registry = self.registry.write().unwrap();
+                    if self.is_shutting_down() {
+                        Err(SpawnError::SystemShutdown)
+                    } else if let Err(error) = engine.value().validate() {
+                        Err(SpawnError::InvalidConfig(error.to_string()))
+                    } else if self.self_weak().is_none() {
+                        Err(SpawnError::SchedulerError(
+                            "System self reference not initialized".into(),
+                        ))
+                    } else if registry.contains_key(&path) {
+                        Err(SpawnError::ActorPathAlreadyExists(path.clone()))
+                    } else {
+                        registry
+                            .insert(path.clone(), ActorRegistryEntry::Instance(pending.clone()));
+                        Ok(())
+                    }
+                };
+                admission.map(|()| (reference, pending))
+            };
+            let admission = if let Some(cohort) = cohort {
+                let mut admitted = None;
+                let mut spawn_error = None;
+                cohort
+                    .validate(&self.root_cohorts)
+                    .and_then(|()| {
+                        cohort.scope.spawn(|lifetime| {
+                            let (reference, pending) =
+                                admit(lifetime.clone()).map_err(|error| {
+                                    spawn_error = Some(error);
+                                    parrot_api::errors::ActorError::Stopped
+                                })?;
+                            let erased = reference.clone_boxed();
+                            let address = pending.address.clone();
+                            let system = Arc::downgrade(self);
+                            let path = path.clone();
+                            admitted = Some((reference, pending));
+                            Ok((
+                                erased,
+                                Arc::new(move || {
+                                    if let Some(system) = system.upgrade() {
+                                        let _ = system.request_stop_ref(&path, &address);
+                                    }
+                                    let lifetime = lifetime.clone();
+                                    Box::pin(async move { lifetime.wait().await })
+                                }),
+                            ))
+                        })
+                    })
+                    .map(|()| admitted.expect("admitted root instance"))
+                    .map_err(|error| {
+                        spawn_error.unwrap_or_else(|| match error {
+                            parrot_api::errors::ActorError::Stopped => SpawnError::Cancelled,
+                            error => SpawnError::InvalidConfig(error.to_string()),
+                        })
+                    })
+            } else {
+                admit(crate::children::ChildLifetime::new(Weak::new()))
+            };
+            let (reference, pending) = match admission {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    let (actor, config, parent, engine) = tokio::join!(
+                        actor.retire(),
+                        config.retire(),
+                        parent.retire(),
+                        engine.retire()
+                    );
+                    actor
+                        .and(config)
+                        .and(parent)
+                        .and(engine)
+                        .map_err(|e| SpawnError::DisposalFailed(e.to_string()))?;
+                    return Err(error);
                 }
             };
-            if let Err(error) = admission {
-                let (actor, config, parent, engine) = tokio::join!(
-                    actor.retire(),
-                    config.retire(),
-                    parent.retire(),
-                    engine.retire()
-                );
-                actor
-                    .and(config)
-                    .and(parent)
-                    .and(engine)
-                    .map_err(|e| SpawnError::DisposalFailed(e.to_string()))?;
-                return Err(error);
-            }
+            let deadline = tokio::time::Instant::now() + self.creation_timeout();
+            let timeout = self.config().shutdown_timeout;
             let weak = Arc::downgrade(self);
             let registry = self.registry.clone();
             let mut cancel = CancelInstance {
@@ -281,7 +490,7 @@ impl ThreadActorSystem {
             } else {
                 None
             };
-            self.runtime_handle.spawn(parrot_api::trace::capture(async move {
+            self.retirement_runtime().spawn(parrot_api::trace::capture(async move {
             let work = async {
                 let result = if let Some(submitted) = submitted {
                     submitted.await.map_err(|e| SpawnError::DisposalFailed(crate::owned_payload::join_error(e))).and_then(|result| result)
@@ -794,10 +1003,20 @@ mod direct_receipt_contracts {
         let system = {
             let _entered = runtime.enter();
             tokio::time::pause();
-            ThreadActorSystem::shared(crate::thread::config::ThreadActorSystemConfig {
-                shutdown_timeout: Duration::from_secs(10),
-                ..Default::default()
-            })
+            let mut system =
+                ThreadActorSystem::new(crate::thread::config::ThreadActorSystemConfig {
+                    shutdown_timeout: Duration::from_secs(10),
+                    ..Default::default()
+                });
+            // These publication state-machine tests must freeze the cleanup owner
+            // and advance its clock. Production's shared owner runs independently;
+            // the public host-exit contracts verify that actual constructor wiring.
+            Arc::get_mut(&mut system.root_cohorts)
+                .unwrap()
+                .set_test_retirement_runtime(runtime.handle().clone());
+            let system = Arc::new(system);
+            system.set_self_weak(Arc::downgrade(&system));
+            system
         };
         let (release, blocked) = std::sync::mpsc::channel();
         let (entered, started) = std::sync::mpsc::channel();

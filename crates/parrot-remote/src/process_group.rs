@@ -59,9 +59,28 @@ impl PinnedProcess {
             }
             if unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) } == -1 {
                 let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    errors.push(format!("kill gateway group: {error}"));
-                    break;
+                match error.raw_os_error() {
+                    // The group may have become empty between the ownership
+                    // check and the final signal. POSIX permits EPERM when
+                    // no member can be signalled; verify that this is the
+                    // harmless, already-retired case before reporting an
+                    // actual permission failure.
+                    Some(libc::EPERM) => match liveness::has_live_session(child.id(), deadline) {
+                        Ok(false) => empty = true,
+                        Ok(true) => {
+                            errors.push(format!("kill gateway group: {error}"));
+                            break;
+                        }
+                        Err(observation) => {
+                            errors.push(format!("kill gateway group: {error}; {observation}"));
+                            break;
+                        }
+                    },
+                    Some(libc::ESRCH) => {}
+                    _ => {
+                        errors.push(format!("kill gateway group: {error}"));
+                        break;
+                    }
                 }
             }
             match liveness::has_live_session(child.id(), deadline) {

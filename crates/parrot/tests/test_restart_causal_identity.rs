@@ -22,11 +22,13 @@ use std::{
 struct Identity {
     trace: [u8; 16],
     span: [u8; 8],
+    parent: Option<[u8; 8]>,
 }
 fn identity() -> Option<Identity> {
     TraceContext::current().map(|context| Identity {
         trace: context.trace_id(),
         span: context.span_id(),
+        parent: context.parent_span_id(),
     })
 }
 type Event = (usize, &'static str, Option<Identity>);
@@ -223,10 +225,12 @@ async fn scenario(mode: SchedulingMode, traced: bool, tell: bool, panic: bool, b
             );
             matches[0].2
         };
+        let initial_hook = phase(0, "init-call");
+        assert_hook(initial_hook, initial_identity);
         for name in ["constructor", "init-call", "init-poll", "init-resumed"] {
             assert_eq!(
                 phase(0, name),
-                initial_identity,
+                if name == "constructor" { initial_identity } else { initial_hook },
                 "initial creation ancestry"
             );
         }
@@ -246,10 +250,12 @@ async fn scenario(mode: SchedulingMode, traced: bool, tell: bool, panic: bool, b
             (None, None) => {}
             mismatch => panic!("failure handler ancestry mismatch: {mismatch:?}"),
         }
+        let replacement = phase(1, "init-call");
+        assert_hook(replacement, failure_identity);
         for name in ["constructor", "init-call", "init-poll", "init-resumed"] {
             assert_eq!(
                 phase(1, name),
-                failure_identity,
+                if name == "constructor" { failure_identity } else { replacement },
                 "replacement generation must inherit the failing handler identity: {name}"
             );
         }
@@ -259,6 +265,18 @@ async fn scenario(mode: SchedulingMode, traced: bool, tell: bool, panic: bool, b
     })
     .await
     .expect("causal restart must complete within the liveness bound");
+}
+
+fn assert_hook(child: Option<Identity>, parent: Option<Identity>) {
+    match (child, parent) {
+        (Some(child), Some(parent)) => {
+            assert_eq!(child.trace, parent.trace);
+            assert_eq!(child.parent, Some(parent.span));
+            assert_ne!(child.span, parent.span);
+        }
+        (None, None) => {}
+        mismatch => panic!("hook ancestry differs: {mismatch:?}"),
+    }
 }
 
 async fn matrix(tell: bool, panic: bool, batched: bool) {

@@ -6,6 +6,9 @@
 //! 前置：cd interop/typescript-lite && npm ci
 //! 跑法：cargo test --locked -p parrot --test test_lite_interop -- --nocapture
 
+#[path = "support/network.rs"]
+mod network_support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,6 +88,9 @@ impl LocalLookup for Lookup {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lite_handshake_negotiation_with_rust() {
+    if network_support::skip_tcp("TypeScript TCP interop") {
+        return;
+    }
     struct OwnedBuild(std::path::PathBuf);
     impl Drop for OwnedBuild {
         fn drop(&mut self) {

@@ -14,11 +14,26 @@
 //! - Adaptability: Runtime selection of appropriate scheduler
 
 // Re-exported modules with unified organization
+mod configuration;
 pub mod dedicated_thread;
 pub mod queue;
 pub mod sharded;
 pub mod shared;
 pub mod steal;
+pub use configuration::MAX_MESSAGES_PER_BATCH;
+
+/// Maximum number of lifecycle control requests retained by one dedicated
+/// worker or affinity shard. Control work carries processor references and a
+/// completion sender, so an unbounded channel would bypass the scheduler's
+/// resource budgets during concurrent stop/retire storms.
+pub(crate) const MAX_CONTROL_QUEUE: usize = 128;
+
+#[cfg(test)]
+mod configuration_contracts;
+#[cfg(test)]
+mod global_budget_contracts;
+#[cfg(test)]
+mod notification_contracts;
 
 use std::error::Error;
 use std::fmt;
@@ -34,15 +49,30 @@ use crate::thread::scheduler::dedicated_thread::DedicatedThreadScheduler;
 use crate::thread::scheduler::sharded::ShardedScheduler;
 use crate::thread::scheduler::shared::SharedThreadPool;
 
+// Failure diagnostics run during cancellation and Drop, too. A subscriber is
+// another user callback; never retry logging a failure from that callback.
+fn failure_diagnostic(report: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(report)) {
+        let _ = crate::owned_payload::panic_message(payload);
+    }
+}
+
 /// Owned control work polled by the actor's assigned scheduler: an affinity
 /// runtime or an isolated shared-pool poll. Dropping its completion receiver
 /// cancels a queued or suspended hook without moving its user future.
 pub(crate) struct StopHookRequest {
+    trace_context: Option<parrot_api::trace::TraceContext>,
     path: String,
     processor: Arc<dyn ProcessorInterface>,
     deadline: tokio::time::Instant,
     completion: tokio::sync::oneshot::Sender<Result<(), SystemError>>,
     retire_only: bool,
+}
+
+pub(crate) enum ControlEnqueueError {
+    Full(StopHookRequest),
+    Disconnected,
+    Rejected(SystemError),
 }
 
 // The user future must remain outside an async state machine's unwind. A poll
@@ -147,7 +177,9 @@ impl Drop for ControlWork {
                 self.processor.notify_system_panic(message)
             })) {
                 let message = crate::owned_payload::panic_message(payload);
-                tracing::error!(%message, "control disposal failure notification panicked");
+                failure_diagnostic(|| {
+                    tracing::error!(%message, "control disposal failure notification panicked");
+                });
             }
         }
     }
@@ -243,20 +275,26 @@ impl Drop for CancellationObserver<'_> {
                 self.processor.notify_system_panic(message)
             })) {
                 let message = crate::owned_payload::panic_message(payload);
-                tracing::error!(%message,"cancellation disposal notification panicked");
+                failure_diagnostic(|| {
+                    tracing::error!(%message,"cancellation disposal notification panicked");
+                });
             }
         }
     }
 }
 
 impl StopHookRequest {
-    async fn run(self) {
+    fn run(self) -> impl std::future::Future<Output = ()> + Send {
+        parrot_api::trace::scope(self.trace_context.clone(), self.run_scoped())
+    }
+    async fn run_scoped(self) {
         let Self {
             path,
             processor,
             deadline,
             mut completion,
             retire_only,
+            trace_context: _,
         } = self;
         if retire_only {
             let result = ControlWork::new(processor, true).await;
@@ -364,6 +402,7 @@ impl SchedulerGroup {
         }
         let (completion, result) = tokio::sync::oneshot::channel();
         let request = StopHookRequest {
+            trace_context: parrot_api::trace::TraceContext::current(),
             path: path.into(),
             processor: processor.clone(),
             deadline,
@@ -430,6 +469,7 @@ impl SchedulerGroup {
             .run_control(
                 mode,
                 StopHookRequest {
+                    trace_context: parrot_api::trace::TraceContext::current(),
                     path: path.into(),
                     processor: processor.clone(),
                     deadline,
@@ -457,7 +497,9 @@ impl SchedulerGroup {
         let path = &request.path;
         match mode {
             SchedulingMode::DedicatedThread => {
-                self.dedicated_scheduler.enqueue_stop_hook(request)?
+                self.dedicated_scheduler
+                    .enqueue_stop_hook_until(request)
+                    .await?
             }
             SchedulingMode::Sharded { affinity_key } => {
                 let scheduler = self
@@ -466,7 +508,9 @@ impl SchedulerGroup {
                     .unwrap()
                     .clone()
                     .ok_or_else(|| SystemError::ActorNotFound(path.into()))?;
-                scheduler.enqueue_stop_hook(affinity_key, request)?;
+                scheduler
+                    .enqueue_stop_hook_until(affinity_key, request)
+                    .await?;
             }
             SchedulingMode::SharedPool { .. } => {
                 let permit = slots
@@ -492,13 +536,18 @@ impl SchedulerGroup {
 
     /// Get (or start) the sharded scheduler with the default shard count.
     pub fn sharded(&self) -> Arc<ShardedScheduler> {
+        self.try_sharded().expect("failed to start shard scheduler")
+    }
+
+    /// Start the lazy shard scheduler, retaining no failed construction.
+    pub fn try_sharded(&self) -> Result<Arc<ShardedScheduler>, SystemError> {
         let mut guard = self.sharded_scheduler.lock().unwrap();
         if let Some(s) = guard.as_ref() {
-            return s.clone();
+            return Ok(s.clone());
         }
-        let s = ShardedScheduler::start(self.sharded_default_size, 32);
+        let s = ShardedScheduler::try_start(self.sharded_default_size, 32)?;
         *guard = Some(s.clone());
-        s
+        Ok(s)
     }
 }
 
@@ -533,34 +582,38 @@ impl ThreadSchedulerFactory {
         config: Option<shared::SharedThreadPoolConfig>,
         dedicated_config: Option<dedicated_thread::DedicatedThreadConfig>,
     ) -> SchedulerGroup {
-        SchedulerGroup {
-            shared_scheduler: self.create_shared_pool(config),
-            dedicated_scheduler: self.create_dedicated_pool(dedicated_config),
-            sharded_scheduler: Mutex::new(None),
-            sharded_default_size: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8),
-        }
+        self.try_create_scheduler_group(config, dedicated_config)
+            .expect("invalid scheduler group configuration")
     }
 
-    /// Create a shared thread pool
-    fn create_shared_pool(
+    /// Validate every scheduler before creating any worker tasks.
+    pub fn try_create_scheduler_group(
         &self,
         config: Option<shared::SharedThreadPoolConfig>,
-    ) -> Arc<SharedThreadPool> {
-        let pool = SharedThreadPool::new(config, self.runtime_handle.clone());
-
-        Arc::new(pool)
-    }
-
-    /// Create a dedicated thread pool
-    fn create_dedicated_pool(
-        &self,
-        config: Option<dedicated_thread::DedicatedThreadConfig>,
-    ) -> Arc<DedicatedThreadScheduler> {
-        let scheduler =
-            DedicatedThreadScheduler::new(config).with_runtime_handle(self.runtime_handle.clone());
-        Arc::new(scheduler)
+        dedicated_config: Option<dedicated_thread::DedicatedThreadConfig>,
+    ) -> Result<SchedulerGroup, SystemError> {
+        let config = config.unwrap_or_default();
+        let dedicated_config = dedicated_config.unwrap_or_default();
+        config.validate()?;
+        dedicated_config.validate()?;
+        let sharded_default_size = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        ShardedScheduler::validate(sharded_default_size, 32)?;
+        let dedicated_scheduler = Arc::new(
+            DedicatedThreadScheduler::try_new(Some(dedicated_config))?
+                .with_runtime_handle(self.runtime_handle.clone()),
+        );
+        let shared_scheduler = Arc::new(SharedThreadPool::try_new(
+            Some(config),
+            self.runtime_handle.clone(),
+        )?);
+        Ok(SchedulerGroup {
+            shared_scheduler,
+            dedicated_scheduler,
+            sharded_scheduler: Mutex::new(None),
+            sharded_default_size,
+        })
     }
 }
 
@@ -617,6 +670,7 @@ mod lifecycle_tests {
             .unwrap();
         let (completion, result) = tokio::sync::oneshot::channel();
         let request = StopHookRequest {
+            trace_context: None,
             path: "/guard".into(),
             retire_only: false,
             processor,
@@ -867,6 +921,7 @@ mod control_panic_contracts {
         (
             StopHookRequest {
                 path: "/control-contract".into(),
+                trace_context: None,
                 processor: p.clone(),
                 retire_only: retire,
                 completion,
@@ -1012,6 +1067,32 @@ mod control_panic_contracts {
         assert_eq!(p.future_drops.load(Ordering::SeqCst), 1);
         assert_eq!(p.payload_drops.load(Ordering::SeqCst), 2);
         assert_eq!(p.notices.lock().unwrap().len(), 1);
+    }
+    async fn logging_failure(during_unwind: bool, name: &str) {
+        super::notification_contracts::isolated(name, || {
+            let p = Processor::new(Mode::PendingDrop);
+            p.panic_notice.store(true, Ordering::Relaxed);
+            let (request, _result) = request(&p, false);
+            let mut work = Box::pin(request.run());
+            assert!(work.as_mut().now_or_never().is_none());
+            super::notification_contracts::dispose(|| drop(work), during_unwind);
+            assert_eq!(p.future_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(p.payload_drops.load(Ordering::SeqCst), 2);
+            assert_eq!(p.notices.lock().unwrap().len(), 1);
+        })
+        .await;
+    }
+    #[tokio::test]
+    async fn control_notification_logging_failure_is_contained() {
+        logging_failure(false, "control_notification_logging_failure_is_contained").await;
+    }
+    #[tokio::test]
+    async fn control_notification_logging_failure_during_unwind_is_contained() {
+        logging_failure(
+            true,
+            "control_notification_logging_failure_during_unwind_is_contained",
+        )
+        .await;
     }
     #[tokio::test]
     async fn poll_and_drop_panics_cannot_abort_control_executor() {
@@ -1327,6 +1408,7 @@ mod cancellation_contracts {
         (
             StopHookRequest {
                 path: "/cancel-observer".into(),
+                trace_context: None,
                 processor: p.clone(),
                 deadline: tokio::time::Instant::now() + Duration::from_secs(2),
                 completion,
@@ -1547,6 +1629,31 @@ mod cancellation_contracts {
     #[tokio::test]
     async fn observer_disposal_notification_is_also_protected() {
         cancel(false, true).await;
+    }
+    async fn logging_failure(during_unwind: bool, name: &str) {
+        super::notification_contracts::isolated(name, || {
+            let p = Processor::new(Mode::PendingDrop, false, false, true);
+            let (req, _result) = request(&p);
+            let mut work = Box::pin(req.run());
+            assert!(work.as_mut().now_or_never().is_none());
+            super::notification_contracts::dispose(|| drop(work), during_unwind);
+            assert_eq!(p.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(p.payload_drops.load(Ordering::SeqCst), 2);
+            assert_eq!(p.notices.lock().unwrap().len(), 1);
+        })
+        .await;
+    }
+    #[tokio::test]
+    async fn observer_notification_logging_failure_is_contained() {
+        logging_failure(false, "observer_notification_logging_failure_is_contained").await;
+    }
+    #[tokio::test]
+    async fn observer_notification_logging_failure_during_unwind_is_contained() {
+        logging_failure(
+            true,
+            "observer_notification_logging_failure_during_unwind_is_contained",
+        )
+        .await;
     }
     #[tokio::test]
     async fn expired_or_closed_requests_do_not_construct_observers() {

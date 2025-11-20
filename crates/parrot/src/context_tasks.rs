@@ -10,19 +10,67 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    task::{Context, Poll},
+    task::{Context, Poll, Wake, Waker},
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 pub(crate) const DEFAULT_MAX_CONTEXT_TASKS: usize = parrot_config::Defaults::max_context_tasks();
+
+// Registration callbacks are synchronous user code. Keep their blocking
+// retirement separate from the shared Tokio queue and leave capacity for
+// actor/input cleanup owned by the same lifecycle runtime.
+const REGISTRATION_CLEANUP_CONCURRENCY: usize = 64;
+static REGISTRATION_CLEANUP_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn default_registration_cleanup_slots() -> Arc<Semaphore> {
+    REGISTRATION_CLEANUP_SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(REGISTRATION_CLEANUP_CONCURRENCY)))
+        .clone()
+}
 
 struct RegistrationWorker(Arc<parrot_api::receptionist::RegistrationScope>);
 impl Drop for RegistrationWorker {
     fn drop(&mut self) {
         self.0.retire();
     }
+}
+
+struct NotificationWake(crate::owned_payload::PublicationInput<Waker>);
+impl Wake for NotificationWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.0.value().wake_by_ref();
+        })) {
+            let _ = crate::owned_payload::panic_message(payload);
+        }
+    }
+}
+
+// Protect each observer so Notify's batch cannot lose sibling notifications.
+// Owning the original Waker also protects cancellation and replacement disposal.
+async fn notify_safely<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut notification: Option<Arc<NotificationWake>> = None;
+    std::future::poll_fn(|cx| {
+        let notification = notification.get_or_insert_with(|| {
+            Arc::new(NotificationWake(
+                crate::owned_payload::PublicationInput::new(cx.waker().clone()),
+            ))
+        });
+        if !notification.0.value().will_wake(cx.waker()) {
+            *notification = Arc::new(NotificationWake(
+                crate::owned_payload::PublicationInput::new(cx.waker().clone()),
+            ));
+        }
+        let waker = Waker::from(notification.clone());
+        future.as_mut().poll(&mut Context::from_waker(&waker))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -122,6 +170,10 @@ mod registration_contracts {
     }
 }
 
+#[cfg(test)]
+#[path = "context_tasks/registration_isolation.rs"]
+mod registration_isolation;
+
 #[derive(Debug, Default)]
 struct Status {
     closed: bool,
@@ -145,6 +197,9 @@ impl ScheduleCancellation {
         if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
+        notify_safely(self.wait_inner()).await;
+    }
+    async fn wait_inner(&self) {
         let notified = self.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -176,6 +231,9 @@ impl State {
         self.cancelled.notify_waiters();
     }
     async fn cancelled(&self) {
+        notify_safely(self.cancelled_inner()).await;
+    }
+    async fn cancelled_inner(&self) {
         let notified = self.cancelled.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -198,6 +256,7 @@ impl State {
 pub(crate) struct ContextTasks {
     state: Arc<State>,
     limit: usize,
+    cleanup_slots: Arc<Semaphore>,
     registrations: OnceLock<Arc<parrot_api::receptionist::RegistrationScope>>,
 }
 impl Drop for ContextTasks {
@@ -207,9 +266,14 @@ impl Drop for ContextTasks {
 }
 impl ContextTasks {
     pub(crate) fn new(limit: usize) -> Arc<Self> {
+        Self::with_cleanup_slots(limit, default_registration_cleanup_slots())
+    }
+
+    pub(crate) fn with_cleanup_slots(limit: usize, cleanup_slots: Arc<Semaphore>) -> Arc<Self> {
         Arc::new(Self {
             state: Arc::default(),
             limit,
+            cleanup_slots,
             registrations: OnceLock::new(),
         })
     }
@@ -233,9 +297,19 @@ impl ContextTasks {
                 // retire a worker that has never been polled. At spawn the scope is
                 // still empty, so synchronous rejection cannot call a table Waker.
                 let worker = RegistrationWorker(scope.clone());
-                runtime.spawn(async move {
+                let retirement_runtime = runtime.clone();
+                let cleanup_slots = self.cleanup_slots.clone();
+                retirement_runtime.clone().spawn(async move {
                     worker.0.closed().await;
-                    drop(worker);
+                    // Registry callbacks may block. Route the worker through the
+                    // bounded cleanup owner so a saturated callback set cannot
+                    // grow an unbounded Tokio blocking queue.
+                    let worker = crate::owned_payload::OwnedPayload::new(
+                        worker,
+                        &retirement_runtime,
+                        &cleanup_slots,
+                    );
+                    drop(worker.retire());
                 });
                 scope
             })
@@ -260,6 +334,9 @@ impl ContextTasks {
     }
 
     pub(crate) async fn join(&self) -> ActorResult<()> {
+        notify_safely(self.join_inner()).await
+    }
+    async fn join_inner(&self) -> ActorResult<()> {
         let tasks = loop {
             let finished = self.state.finished.notified();
             tokio::pin!(finished);
@@ -512,15 +589,15 @@ impl ContextTasks {
     }
 
     pub(crate) fn cancel_schedule(&self, id: Uuid) {
-        if let Some(token) = self
+        let token = self
             .state
             .status
             .lock()
             .unwrap()
             .scheduled
             .get(&id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(token) = token {
             token.cancel();
         }
     }
@@ -1826,6 +1903,8 @@ mod schedule_input_tests {
         let name = format!("context_tasks::schedule_input_tests::{case}");
         const FLAG: &str = "PARROT_SCHEDULE_INPUT_TEST";
         if std::env::var(FLAG).as_deref() == Ok(case) {
+            // Keep the deadline about cleanup, not forced nested-panic symbolization.
+            std::panic::set_hook(Box::new(|_| {}));
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2080,3 +2159,6 @@ mod trace_owner_tests {
 
 #[cfg(test)]
 mod recording_contracts;
+
+#[cfg(test)]
+mod notification_contracts;

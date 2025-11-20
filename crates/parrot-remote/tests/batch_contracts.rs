@@ -107,3 +107,121 @@ fn urgent_messages_must_not_enter_a_batch() {
     batch.header.flags |= flags::URGENT;
     assert!(batch.batch_frames().is_err());
 }
+
+fn decoded_batch(items: &[Frame]) -> Frame {
+    let mut encoded = bytes::BytesMut::new();
+    Frame::batch(items).unwrap().encode(&mut encoded).unwrap();
+    let batch = Frame::decode(&mut encoded).unwrap().unwrap();
+    assert!(encoded.is_empty());
+    batch
+}
+
+#[test]
+fn batch_iterator_tracks_every_member_and_remains_exhausted() {
+    use parrot_remote::frame::{frame_type, MAX_BATCH_ITEMS, PROTOCOL_VERSION};
+
+    fn require_iterator_contract<I: ExactSizeIterator<Item = Frame> + std::iter::FusedIterator>(
+        _: &I,
+    ) {
+    }
+
+    for operation in [frame_type::ASK, frame_type::TELL, frame_type::REPLY] {
+        for count in [1, 3, MAX_BATCH_ITEMS] {
+            let originals: Vec<_> = (0..count)
+                .map(|index| {
+                    let cid = 900 + index as u64;
+                    let payload = vec![index as u8; index % 5].into();
+                    let mut item = match operation {
+                        frame_type::ASK => Frame::ask(cid, "/sink", "bin:test", payload, None),
+                        frame_type::TELL => {
+                            let mut item = Frame::tell("/sink", "bin:test", payload);
+                            item.header.correlation_id = cid;
+                            item
+                        }
+                        frame_type::REPLY => Frame::reply(cid, "/sink", "bin:test", payload),
+                        _ => unreachable!(),
+                    };
+                    item.header.flags = flags::TRACING;
+                    item.header.hop_count = 2;
+                    item.header.hop_limit = 5;
+                    item
+                })
+                .collect();
+            let batch = decoded_batch(&originals);
+            let mut iter = batch.batch_frames().unwrap();
+            require_iterator_contract(&iter);
+            for (index, original) in originals.iter().enumerate() {
+                let remaining = count - index;
+                assert_eq!(iter.len(), remaining);
+                assert_eq!(iter.size_hint(), (remaining, Some(remaining)));
+                let item = iter.next().expect("every declared member must be yielded");
+                assert_eq!(item, *original);
+                assert_eq!(item.header.version, PROTOCOL_VERSION);
+                assert_eq!(item.header.frame_len, 0);
+                assert_eq!(iter.len(), remaining - 1);
+                assert_eq!(iter.size_hint(), (remaining - 1, Some(remaining - 1)));
+            }
+            for _ in 0..4 {
+                assert_eq!(iter.next(), None);
+                assert_eq!(iter.len(), 0);
+                assert_eq!(iter.size_hint(), (0, Some(0)));
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_member_payloads_share_the_wire_buffer_and_outlive_it() {
+    let originals: Vec<_> = [3, 129, 8193]
+        .into_iter()
+        .enumerate()
+        .map(|(index, len)| {
+            Frame::reply(
+                71 + index as u64,
+                "/sink",
+                "bin:test",
+                vec![0xA0 + index as u8; len].into(),
+            )
+        })
+        .collect();
+    let batch = decoded_batch(&originals);
+    let members: Vec<_> = batch.batch_frames().unwrap().collect();
+    // Wire layout: count:u64, then each cid:u64, length:u32 and payload.
+    let mut payload_offset = 8;
+    for (member, original) in members.iter().zip(&originals) {
+        payload_offset += 12;
+        let expected_slice =
+            &batch.payload[payload_offset..payload_offset + original.payload.len()];
+        assert_eq!(member.payload.as_ref(), original.payload.as_ref());
+        assert_eq!(member.payload.as_ptr(), expected_slice.as_ptr());
+        payload_offset += original.payload.len();
+    }
+    assert_eq!(payload_offset, batch.payload.len());
+    drop(batch);
+    for (member, original) in members.iter().zip(&originals) {
+        assert_eq!(member.payload, original.payload);
+    }
+}
+
+#[test]
+fn batch_member_metadata_and_collected_results_are_independent() {
+    let originals: Vec<_> = (0..3)
+        .map(|index| Frame::reply(11 + index, "/sink", "bin:test", vec![index as u8; 7].into()))
+        .collect();
+    let batch = decoded_batch(&originals);
+    let original_batch = batch.clone();
+    let mut iter = batch.batch_frames().unwrap();
+    let mut first = iter.next().unwrap();
+    first.path.push_str("/changed");
+    first.type_key.clear();
+    first.header.correlation_id = 999;
+    first.header.flags |= flags::URGENT;
+    first.payload = vec![0xFF].into();
+    for original in originals.iter().skip(1) {
+        assert_eq!(iter.next().as_ref(), Some(original));
+    }
+    assert_eq!(iter.next(), None);
+    assert_eq!(batch, original_batch);
+    assert_eq!(batch.iter_batch().unwrap(), originals);
+    assert_eq!(batch.batch_frames().unwrap().collect::<Vec<_>>(), originals);
+}

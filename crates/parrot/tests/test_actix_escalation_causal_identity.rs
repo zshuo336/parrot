@@ -227,8 +227,10 @@ async fn scenario(
         };
         let initial = phase(0, "constructor").unwrap();
         assert_eq!(initial.trace_id(), original.trace_id());
+        let initial_hook = phase(0, "init-call");
+        lifecycle_identity::assert_child(initial_hook.as_ref(), Some(&initial));
         for name in ["init-call", "init-poll", "init-resumed"] {
-            assert_eq!(phase(0, name), Some(initial.clone()));
+            assert_eq!(phase(0, name), initial_hook);
         }
         let failure = phase(0, "failure-call");
         assert_eq!(phase(0, "failure-resumed"), failure);
@@ -243,7 +245,9 @@ async fn scenario(
         let actual: Vec<_> = [(0, "child-policy"), (0, "parent-policy"), (1, "constructor"),
             (1, "init-call"), (1, "init-poll"), (1, "init-resumed")]
             .into_iter().map(|(generation, name)| (name, phase(generation, name))).collect();
-        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, failure.clone())).collect();
+        let replacement = phase(1, "init-call");
+        lifecycle_identity::assert_child(replacement.as_ref(), failure.as_ref());
+        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, if name.starts_with("init-") { replacement.clone() } else { failure.clone() })).collect();
         assert_eq!(actual, expected, "Actix escalation recovery must preserve the child failure identity");
         println!("PARROT_ACTIX_ESCALATION_CAUSAL_CASE_OK managed={managed} factory={factory} tell={tell} panic={panic} traced={traced} poll_traced={poll_traced}");
     }).await.expect("Actix escalation recovery independent liveness bound");
@@ -279,3 +283,5 @@ case!(managed_factory_ask_error, true, true, false, false);
 case!(managed_factory_tell_error, true, true, true, false);
 case!(managed_factory_ask_panic, true, true, false, true);
 case!(managed_factory_tell_panic, true, true, true, true);
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;

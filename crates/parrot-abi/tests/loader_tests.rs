@@ -486,15 +486,15 @@ fn load_error_display_forms() {
 // 8. Explicit performance reports; correctness is tested independently above.
 // ════════════════════════════════════════════════════════════
 
-#[test]
+#[tokio::test]
 #[ignore = "Performance report: run with --release --ignored --nocapture on a controlled host"]
-fn report_dylib_call_latency() {
+async fn report_dylib_call_latency() {
     let (_g, h) = load_good();
     let c = construct_good(&h);
     unsafe {
         // 预热
         for _ in 0..200 {
-            let _ = ask(&loader(), &h, c, "echo", b"w").unwrap();
+            assert_eq!(ask(&loader(), &h, c, "echo", b"w").unwrap(), b"w");
         }
         let n = 2000;
         let mut samples = Vec::with_capacity(n);
@@ -514,29 +514,72 @@ fn report_dylib_call_latency() {
             "dylib call latency p50 = {p50:?}; samples={n}; debug_assertions={}",
             cfg!(debug_assertions)
         );
+        assert_eq!(
+            ask(&loader(), &h, c, "msgs", &[]).unwrap(),
+            2201u64.to_le_bytes(),
+            "latency workload must execute every warmup and measured call"
+        );
     }
+    retire_benchmark(h).await;
 }
 
-#[test]
-#[ignore = "Performance report: run with --release --ignored --nocapture on a controlled host"]
-fn bench_report_up_and_echo() {
-    let (_g, h) = load_good();
-    let c = construct_good(&h);
+fn measure_variants(h: &parrot_abi::DylibHandle, c: *mut parrot_abi::AbiComponent, n: u32) {
+    assert!(n > 0, "empty native measurement");
     unsafe {
-        for (name, key, p) in [
-            ("echo", "echo", b"x".to_vec()),
-            ("up", "up", 41u64.to_le_bytes().to_vec()),
+        for (name, key, payload, expected) in [
+            ("echo", "echo", b"x".to_vec(), b"x".to_vec()),
+            (
+                "up",
+                "up",
+                41u64.to_le_bytes().to_vec(),
+                42u64.to_le_bytes().to_vec(),
+            ),
         ] {
-            let n = 500;
             let mut total = std::time::Duration::ZERO;
             for _ in 0..n {
                 let t0 = std::time::Instant::now();
-                let _ = ask(&loader(), &h, c, key, &p).unwrap();
+                let output = ask(&loader(), h, c, key, &payload).unwrap();
                 total += t0.elapsed();
+                assert_eq!(output, expected, "native benchmark reply: {name}");
             }
-            eprintln!("{name} avg: {:?}", total / n);
+            eprintln!(
+                "{name} avg: {:?}; calls={n}; replies_verified=true",
+                total / n
+            );
         }
+        assert_eq!(
+            ask(&loader(), h, c, "msgs", &[]).unwrap(),
+            (u64::from(n) * 2 + 1).to_le_bytes(),
+            "native measurement call count"
+        );
     }
+}
+
+async fn retire_benchmark(h: parrot_abi::DylibHandle) {
+    let report = loader().unload(h, Duration::from_secs(10)).await.unwrap();
+    assert_eq!(
+        (report.drained, report.aborted, report.force_closed),
+        (1, 0, false),
+        "native benchmark instance must retire"
+    );
+    eprintln!("[NATIVE-MEASUREMENT] retired=1 aborted=0 force_closed=false");
+}
+
+#[tokio::test]
+#[ignore = "Performance report: run with --release --ignored --nocapture on a controlled host"]
+async fn bench_report_up_and_echo() {
+    let (_g, h) = load_good();
+    let c = construct_good(&h);
+    measure_variants(&h, c, 500);
+    retire_benchmark(h).await;
+}
+
+#[tokio::test]
+async fn native_measurement_checks_payloads_counts_and_retirement() {
+    let (_g, h) = load_good();
+    let c = construct_good(&h);
+    measure_variants(&h, c, 3);
+    retire_benchmark(h).await;
 }
 
 fn counter_reply_capacity(key: &str) {

@@ -1,14 +1,23 @@
 //! Child instance admission precedes validation, input retirement and publication.
 #[cfg(test)]
+#[path = "child_instance_error_contracts.rs"]
+mod error_contracts;
+#[cfg(test)]
 #[path = "child_instance_trace_tests.rs"]
 mod initialization_trace_contracts;
+#[cfg(test)]
+#[path = "child_instance_reference_contracts.rs"]
+mod reference_contracts;
+#[cfg(test)]
+#[path = "child_instance_timeout_contracts.rs"]
+mod timeout_contracts;
 
 use super::{
     address::ThreadActorRef,
     config::ThreadActorConfig,
     context::ThreadContext,
     death_watch::ThreadWatches,
-    error::{SpawnError, SystemError},
+    error::SystemError,
     instance::PendingInstance,
     mailbox::{WeakMailboxRef, mpsc::MpscMailbox},
     system::{
@@ -61,8 +70,59 @@ impl Drop for CancelChild {
         }
     }
 }
-fn failure(error: impl std::fmt::Display) -> SpawnError {
-    SpawnError::DisposalFailed(error.to_string())
+// Creation is private to this ActorResult API. Retain bridge causes without
+// adding a public SpawnError variant or running business diagnostics at cleanup.
+#[derive(Clone, Debug, thiserror::Error)]
+enum CreationError {
+    #[error("Factory output disposal failed: {0}")]
+    DisposalFailed(String),
+    #[error("Factory output disposal failed: {}", crate::error_receipt::actor_summary(.0.error().as_ref()))]
+    Disposal(crate::error_receipt::ActorReceipt),
+    #[error("Actor creation was cancelled")]
+    Cancelled,
+    #[error("Actor creation timed out: {0}")]
+    Timeout(String),
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+    #[error("{}", crate::error_receipt::actor_summary(.0.error().as_ref()))]
+    Cause(crate::error_receipt::ActorReceipt),
+}
+impl CreationError {
+    fn cause(error: ActorError) -> Self {
+        let error = match error {
+            ActorError::Timeout => {
+                ActorError::TimeoutDetail("child bridge creation timed out".into())
+            }
+            error => error,
+        };
+        Self::Cause(crate::error_receipt::ActorReceipt::from_error(error))
+    }
+    fn receipt(&self) -> crate::error_receipt::ActorReceipt {
+        match self {
+            Self::Cause(error) => error.clone(),
+            error => crate::error_receipt::ActorReceipt::from_error(error.clone().into_error()),
+        }
+    }
+    fn into_error(self) -> ActorError {
+        match self {
+            Self::Cause(error) => error.into_error(),
+            Self::Disposal(error) if matches!(error.error().as_ref(), ActorError::Other(_)) => {
+                error.into_error()
+            }
+            Self::Disposal(error) => {
+                ActorError::Panic(crate::error_receipt::actor_summary(error.error().as_ref()))
+            }
+            Self::DisposalFailed(message) => ActorError::Panic(message),
+            Self::Cancelled => ActorError::Stopped,
+            Self::Timeout(message) => ActorError::TimeoutDetail(message),
+            Self::InvalidConfig(message) => {
+                ActorError::InitializationError(format!("Invalid configuration: {message}"))
+            }
+        }
+    }
+}
+fn failure(error: ActorError) -> CreationError {
+    CreationError::Disposal(crate::error_receipt::ActorReceipt::from_error(error))
 }
 
 impl ThreadActorSystem {
@@ -74,11 +134,11 @@ impl ThreadActorSystem {
         parent: BoxedActorRef,
         scope: &Arc<crate::children::ChildScope>,
     ) -> ActorResult<BoxedActorRef> {
-        let actor = OwnedPayload::new(actor, &self.runtime_handle, &self.cleanup_slots);
-        let config = OwnedPayload::new(config, &self.runtime_handle, &self.cleanup_slots);
+        let actor = OwnedPayload::new(actor, self.retirement_runtime(), &self.cleanup_slots);
+        let config = OwnedPayload::new(config, self.retirement_runtime(), &self.cleanup_slots);
         let mut strategy = Some(OwnedPayload::new(
             strategy,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         ));
         let path = format!(
@@ -99,11 +159,12 @@ impl ThreadActorSystem {
         .with_mailbox_cell(address.clone())
         .with_death_watch(watches.common.clone());
         let timeout = self.config().shutdown_timeout;
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now() + self.creation_timeout();
         let mut pending = None;
         let admitted = scope.spawn(|lifetime| {
             // No user callback/destructor executes under the topology lock.
             let entry = Arc::new(PendingInstance {
+                _admission: None,
                 stop_request: reference.stop_request(),
                 reference: Arc::from(reference.clone_boxed()),
                 address: address.clone(),
@@ -179,29 +240,33 @@ impl ThreadActorSystem {
                         let actor_retired = actor.receipt();
                         let config_retired = config.receipt();
                         let trace = parrot_api::trace::TraceContext::current();
+                        let validation_control = pending.control.clone();
                         match tokio::task::spawn_blocking(move || {
                             parrot_api::trace::in_scope(trace, || {
                             let _permit = permit;
                             let validation =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    if validation_control.is_cancelled() {
+                                        return Err(CreationError::Cancelled);
+                                    }
                                     let payload = actor
                                         .value()
                                         .downcast_ref::<ErasedSpawnBox>()
                                         .ok_or_else(|| {
-                                            SpawnError::InvalidConfig(
+                                            CreationError::InvalidConfig(
                                                 "Spawn payload is not a boxed spawnable actor"
                                                     .into(),
                                             )
                                         })?;
                                     if !payload.0.accepts_child_config(config.value()) {
-                                        return Err(SpawnError::InvalidConfig(
+                                        return Err(CreationError::InvalidConfig(
                                             "child configuration type mismatch".into(),
                                         ));
                                     }
                                     Ok(())
                                 }))
                                 .unwrap_or_else(|panic| {
-                                    Err(failure(crate::owned_payload::panic_message(panic)))
+                                    Err(CreationError::DisposalFailed(crate::owned_payload::panic_message(panic)))
                                 });
                             (actor, config, validation)
                             })
@@ -210,13 +275,13 @@ impl ThreadActorSystem {
                         {
                             Ok(inputs) => inputs,
                             Err(error) => {
-                                let error = failure(crate::owned_payload::join_error(error));
+                                let error = CreationError::DisposalFailed(crate::owned_payload::join_error(error));
                                 let (actor, config) = tokio::join!(actor_retired, config_retired);
                                 return actor.and(config).map_err(failure).and(Err(error));
                             }
                         }
                     } else {
-                        (actor, config, Err(SpawnError::Cancelled))
+                        (actor, config, Err(CreationError::Cancelled))
                     };
                     let config_result = config.retire().await.map_err(failure);
                     let ready = config_result.and(validation);
@@ -237,25 +302,47 @@ impl ThreadActorSystem {
                             let published = tokio::task::spawn_blocking(move || {
                                 parrot_api::trace::in_scope(trace, || {
                                 let _permit = permit;
+                                if publication.control.is_cancelled() {
+                                    return Err(CreationError::Cancelled);
+                                }
                                 let payload = actor
                                     .take()
                                     .downcast::<ErasedSpawnBox>()
                                     .expect("validated spawn payload");
-                                payload
+                                let reference = payload
                                     .0
                                     .spawn_child_on(
-                                        owner,
+                                        owner.clone(),
                                         ThreadActorConfig::default(),
                                         parent,
-                                        ChildSpawnReceipt(publication, committed),
+                                        ChildSpawnReceipt(publication.clone(), committed),
                                     )
-                                    .map_err(|error| {
-                                        SpawnError::InitializationFailed(error.to_string())
-                                    })
+                                    .map_err(CreationError::cause)?;
+                                let mut reference = crate::owned_payload::PublicationInput::new(reference);
+                                // Cloning is user code. Keep it on this bounded
+                                // publication worker, with the original protected
+                                // until both cloning and registry publication end.
+                                let registered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    reference.value().clone_boxed()
+                                }));
+                                match registered {
+                                    Ok(registered) => {
+                                        publication.lifetime.publish_reference(registered);
+                                        Ok(OwnedPayload::new(reference.take(), owner.retirement_runtime(), &owner.cleanup_slots))
+                                    }
+                                    Err(panic) => {
+                                        let mut message = format!("child reference clone failed: {}", crate::owned_payload::panic_message(panic));
+                                        if let Err(error) = reference.retire() {
+                                            message.push_str("; ");
+                                            message.push_str(&crate::error_receipt::actor_summary(&error));
+                                        }
+                                        Err(CreationError::DisposalFailed(message))
+                                    }
+                                }
                                 })
                             })
                             .await
-                            .map_err(|error| failure(crate::owned_payload::join_error(error)))
+                            .map_err(|error| CreationError::DisposalFailed(crate::owned_payload::join_error(error)))
                             .and_then(|result| result);
                             retired.await.map_err(failure).and(published)
                         } else {
@@ -263,7 +350,7 @@ impl ThreadActorSystem {
                                 .retire()
                                 .await
                                 .map_err(failure)
-                                .and(Err(SpawnError::Cancelled))
+                                .and(Err(CreationError::Cancelled))
                         }
                     }
                 }
@@ -271,28 +358,65 @@ impl ThreadActorSystem {
                     // A custom bridge can publish successfully and then fail while
                     // retiring its own captures. Failure must still stop that live
                     // generation, never finish its lifetime as an unpublished input.
-                    if let Ok(reference) = &result {
-                        pending.lifetime.publish_reference(reference.clone_boxed());
-                    }
                     let published = published.load(Ordering::Acquire);
+                    // Refusing a successfully produced reference is still
+                    // creation work: await its cleanup before releasing the
+                    // lifetime's publication barrier.
+                    let cancelled = result.is_ok() && pending.control.is_cancelled();
+                    let result = if cancelled {
+                        result
+                            .expect("successful cancelled creation")
+                            .retire()
+                            .await
+                            .map_err(failure)
+                            .and(Err(CreationError::Cancelled))
+                    } else {
+                        result
+                    };
                     let publication_result = if published {
-                        result.as_ref().map(|_| ()).map_err(ToString::to_string)
+                        match &result {
+                            Err(CreationError::Cancelled) if cancelled => Ok(()),
+                            result => result.as_ref().map(|_| ()).map_err(CreationError::receipt),
+                        }
                     } else {
                         Ok(())
                     };
-                    pending
-                        .lifetime
-                        .release_publication(publication_result.map_err(|message| {
-                            crate::error_receipt::ActorReceipt::from_error(
-                                parrot_api::errors::ActorError::InternalError(message),
-                            )
-                        }));
+                    pending.lifetime.release_publication(publication_result);
+                    if published && cancelled && matches!(result, Err(CreationError::Cancelled)) {
+                        let _ = system.request_stop_ref(&path, &pending.address);
+                        let retirement = pending
+                            .lifetime
+                            .wait()
+                            .await
+                            .map_err(crate::error_receipt::ActorReceipt::from_error);
+                        let outcome = StopOutcome::from_result(
+                            retirement.as_ref().map(|_| ()).map_err(|error| {
+                                SystemError::Other(anyhow::Error::new(error.clone().into_error()))
+                            }),
+                        );
+                        pending.retired.send_replace(Some(outcome.clone()));
+                        if pending.finished.borrow().is_none() {
+                            pending.finished.send_replace(Some(outcome));
+                        }
+                        return retirement.map_err(CreationError::Cause).and(result);
+                    }
                     if result.is_err() && published {
                         let _ = system.request_stop_ref(&path, &pending.address);
-                        let result = pending.lifetime.wait().await.map_err(failure).and(result);
-                        let outcome = StopOutcome::from_result(Err(SystemError::ShutdownError(
-                            result.as_ref().expect_err("creation failed").to_string(),
-                        )));
+                        let result = pending
+                            .lifetime
+                            .wait()
+                            .await
+                            .map_err(CreationError::cause)
+                            .and(result);
+                        let outcome =
+                            StopOutcome::from_result(Err(SystemError::Other(anyhow::Error::new(
+                                result
+                                    .as_ref()
+                                    .err()
+                                    .expect("creation failed")
+                                    .receipt()
+                                    .into_error(),
+                            ))));
                         pending.retired.send_replace(Some(outcome.clone()));
                         if pending.finished.borrow().is_none() {
                             pending.finished.send_replace(Some(outcome));
@@ -300,19 +424,6 @@ impl ThreadActorSystem {
                         return result;
                     }
                     if result.is_ok() {
-                        if pending.control.is_cancelled() {
-                            let _ = system.request_stop_ref(&path, &pending.address);
-                            let retirement = pending.lifetime.wait().await;
-                            let outcome =
-                                StopOutcome::from_result(retirement.as_ref().map(|_| ()).map_err(
-                                    |error| SystemError::ShutdownError(error.to_string()),
-                                ));
-                            pending.retired.send_replace(Some(outcome.clone()));
-                            if pending.finished.borrow().is_none() {
-                                pending.finished.send_replace(Some(outcome));
-                            }
-                            return retirement.map_err(failure).and(Err(SpawnError::Cancelled));
-                        }
                         pending.finished.send_replace(Some(StopOutcome::Stopped));
                         pending.retired.send_replace(Some(StopOutcome::Stopped));
                         return result;
@@ -325,7 +436,9 @@ impl ThreadActorSystem {
                         .map_err(failure)
                         .and(result);
                     let retirement = match &result {
-                        Err(SpawnError::DisposalFailed(message)) => Err(message.clone()),
+                        Err(
+                            error @ (CreationError::DisposalFailed(_) | CreationError::Disposal(_)),
+                        ) => Err(error.receipt()),
                         _ => Ok(()),
                     };
                     {
@@ -335,16 +448,10 @@ impl ThreadActorSystem {
                             registry.remove(&path);
                         }
                     }
-                    let notification =
-                        pending
-                            .lifetime
-                            .finish(retirement.clone().map_err(|message| {
-                                crate::error_receipt::ActorReceipt::from_error(
-                                    parrot_api::errors::ActorError::InternalError(message),
-                                )
-                            }));
-                    let outcome =
-                        StopOutcome::from_result(retirement.map_err(SystemError::ShutdownError));
+                    let notification = pending.lifetime.finish(retirement.clone());
+                    let outcome = StopOutcome::from_result(retirement.map_err(|error| {
+                        SystemError::Other(anyhow::Error::new(error.into_error()))
+                    }));
                     pending.retired.send_replace(Some(outcome.clone()));
                     if pending.finished.borrow().is_none() {
                         pending.finished.send_replace(Some(outcome));
@@ -360,20 +467,20 @@ impl ThreadActorSystem {
                         pending.control.cancel();
                         let error = "child instance creation exceeded deadline".to_string();
                         pending.finished.send_replace(Some(StopOutcome::TimedOut(error.clone())));
-                        if let Some(send) = send.take() { let _ = send.send(Err(SpawnError::Timeout(error))); }
+                        if let Some(send) = send.take() { let _ = send.send(Err(CreationError::Timeout(error))); }
                         work.await
                     }
                 }
             };
             let result = match result {
-                Err(SpawnError::Cancelled) if tokio::time::Instant::now() >= deadline => Err(
-                    SpawnError::Timeout("child instance creation exceeded deadline".into()),
+                Err(CreationError::Cancelled) if tokio::time::Instant::now() >= deadline => Err(
+                    CreationError::Timeout("child instance creation exceeded deadline".into()),
                 ),
                 result => result,
             };
             let reason = result.as_ref().err().map(|error| match error {
-                SpawnError::Cancelled => DeathReason::Normal,
-                SpawnError::Timeout(_) => DeathReason::Killed,
+                CreationError::Cancelled => DeathReason::Normal,
+                CreationError::Timeout(_) => DeathReason::Killed,
                 error => DeathReason::Failed(error.to_string()),
             });
             if let Some(send) = send {
@@ -403,12 +510,15 @@ impl ThreadActorSystem {
                 }
             });
         };
-        self.runtime_handle.spawn(parrot_api::trace::capture(owner));
+        self.retirement_runtime()
+            .spawn(parrot_api::trace::capture(owner));
         let result = receive.await.map_err(|_| {
             ActorError::InternalError("child creation owner lost its receipt".into())
         })?;
         cancel.armed = false;
-        result.map_err(ActorError::from)
+        result
+            .map(OwnedPayload::take)
+            .map_err(CreationError::into_error)
     }
 }
 

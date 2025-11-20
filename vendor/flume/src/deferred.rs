@@ -95,3 +95,15 @@ impl<T> Sender<T> {
         (result, wakes)
     }
 }
+
+impl<T> crate::Receiver<T> {
+    /// Disconnect the channel, returning notifications for delivery outside
+    /// caller-owned locks. Queued values remain available to receive or drain;
+    /// pending sends retain their unsent values and report disconnection.
+    ///
+    /// All endpoints observe disconnection before this method returns. Dropping
+    /// the guard notifies existing waiters. Repeated calls return an empty guard.
+    pub fn disconnect_deferred(&self) -> DeferredSendWakes<T> {
+        self.shared.disconnect_deferred()
+    }
+}

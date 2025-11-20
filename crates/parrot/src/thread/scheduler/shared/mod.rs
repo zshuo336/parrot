@@ -5,7 +5,7 @@
 //! and the multi-thread scheduler implementations.
 //!
 //! ## Key Concepts
-//! - Work stealing: Workers pull tasks from a shared queue
+//! - Central FIFO by default; optional worker-local FIFO requeues and stealing
 //! - Thread efficiency: Batch processing and optimal thread utilization
 //! - Health monitoring: Comprehensive metrics and worker status tracking
 //!

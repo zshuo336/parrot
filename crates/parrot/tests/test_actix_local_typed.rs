@@ -492,7 +492,13 @@ async fn local_stream_callback_error_retires_stream_and_notifies_actor() {
     system.as_ref().clone().shutdown().await.unwrap();
 }
 
-struct PanickingPollStream;
+struct PanickingPollStream(Arc<AtomicUsize>);
+
+impl Drop for PanickingPollStream {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 impl futures::Stream for PanickingPollStream {
     type Item = u32;
@@ -507,6 +513,14 @@ impl futures::Stream for PanickingPollStream {
 
 struct SourceErrorProbe {
     errors: Arc<AtomicUsize>,
+    source_drops: Arc<AtomicUsize>,
+    actor_drops: Arc<AtomicUsize>,
+}
+
+impl Drop for SourceErrorProbe {
+    fn drop(&mut self) {
+        self.actor_drops.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl LocalTypedDispatch for SourceErrorProbe {
@@ -518,7 +532,9 @@ impl LocalTypedDispatch for SourceErrorProbe {
         _: &'a TypedContext,
         streams: &'a mut parrot_api::local_typed::LocalStreamContext<'a>,
     ) -> LocalBoxedFuture<'a, ActorResult<()>> {
-        streams.add_stream(PanickingPollStream).unwrap();
+        streams
+            .add_stream(PanickingPollStream(self.source_drops.clone()))
+            .unwrap();
         Box::pin(async { Ok(()) })
     }
 
@@ -556,12 +572,18 @@ impl ParrotMsgVariant<LocalProtocol<SourceErrorProbe>> for Add {
 async fn local_stream_source_panic_notifies_and_retires_actor() {
     let system = Arc::new(ActixActorSystem::with_arbiter_count(1).await.unwrap());
     let errors = Arc::new(AtomicUsize::new(0));
+    let source_drops = Arc::new(AtomicUsize::new(0));
+    let actor_drops = Arc::new(AtomicUsize::new(0));
     let actor = system
         .spawn_local_typed::<SourceErrorProbe, Add, _>(
             {
                 let errors = errors.clone();
+                let source_drops = source_drops.clone();
+                let actor_drops = actor_drops.clone();
                 move || SourceErrorProbe {
                     errors: errors.clone(),
+                    source_drops: source_drops.clone(),
+                    actor_drops: actor_drops.clone(),
                 }
             },
             "/local/source-error",
@@ -577,7 +599,22 @@ async fn local_stream_source_panic_notifies_and_retires_actor() {
     .unwrap();
     assert_eq!(errors.load(Ordering::SeqCst), 1);
     assert!(actor.ask(Add(0)).await.is_err());
-    assert!(system.as_ref().clone().shutdown().await.is_err());
+    let error = actor.stop().await.unwrap_err();
+    assert!(
+        matches!(error, ActorError::Panic(ref message) if message.contains("local source poll failed")),
+        "{error}"
+    );
+    assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(actor_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(system.status().active_actors, 0);
+    // Shutdown joins the registrations it owns when requested. A previously
+    // retired actor retains its own failure receipt, not a system-wide failure.
+    system.as_ref().clone().shutdown().await.unwrap();
+    let repeated = actor.stop().await.unwrap_err();
+    assert!(
+        matches!(repeated, ActorError::Panic(ref message) if message.contains("local source poll failed")),
+        "{repeated}"
+    );
 }
 
 struct PendingDropStream {

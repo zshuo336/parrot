@@ -2,8 +2,10 @@
 //!
 //! Parrot 远程层：Wire 1.0 帧 + 传输 + 编解码注册表 + 远程 ref（DEV_01）。
 //!
-//! 分层（E5.2）：本 crate 只依赖 `parrot-api`；与 `parrot` facade 的集成经
-//! `RemoteGatewayImpl`（应用层组装注入）。所有布局/语义以 07 协议 1.0 为准。
+//! Workspace dependencies are `parrot-api` and `parrot-config`; this crate has
+//! no direct dependency on the `parrot` engine/facade. Applications inject
+//! `RemoteGatewayImpl` through the API traits. See the protocol and capability
+//! negotiation for the implemented Wire 1.0 layouts and extensions.
 
 pub mod acl;
 mod actor_path;

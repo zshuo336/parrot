@@ -22,6 +22,16 @@ use tracing::{debug, error, warn};
 use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::queue::SchedulingQueue;
 
+#[cfg(test)]
+#[path = "work_stealing_contracts.rs"]
+mod work_stealing_contracts;
+
+/// Bound diagnostic state independently of the number of short-lived actors.
+/// Panic counts are advisory metrics; retaining every historical path would
+/// turn a recoverable actor churn pattern into an unbounded worker allocation.
+const MAX_PANIC_PATHS: usize = 4096;
+const OVERFLOW_PANIC_PATH: &str = "<panic-path-overflow>";
+
 /// Worker status codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerStatus {
@@ -80,6 +90,21 @@ impl Default for WorkerConfig {
     }
 }
 
+impl WorkerConfig {
+    pub fn validate(&self) -> Result<(), crate::thread::error::SystemError> {
+        super::super::configuration::count(
+            "scheduler.worker.batch_size",
+            self.batch_size,
+            1,
+            super::super::MAX_MESSAGES_PER_BATCH,
+        )?;
+        super::super::configuration::duration(
+            "scheduler.worker.idle_sleep_duration",
+            self.idle_sleep_duration,
+        )
+    }
+}
+
 impl fmt::Debug for Worker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Worker")
@@ -132,6 +157,35 @@ impl Worker {
     /// - `shutdown_flag`: Signal for worker shutdown
     /// - `config`: Worker configuration
     pub fn new(
+        id: usize,
+        runtime_handle: Handle,
+        scheduling_queue: Arc<SchedulingQueue>,
+        shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+        config: WorkerConfig,
+    ) -> Self {
+        Self::try_new(id, runtime_handle, scheduling_queue, shutdown_flag, config)
+            .expect("invalid worker configuration")
+    }
+
+    /// Validate direct worker input before creating its runtime state.
+    pub fn try_new(
+        id: usize,
+        runtime_handle: Handle,
+        scheduling_queue: Arc<SchedulingQueue>,
+        shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+        config: WorkerConfig,
+    ) -> Result<Self, crate::thread::error::SystemError> {
+        config.validate()?;
+        Ok(Self::from_validated_config(
+            id,
+            runtime_handle,
+            scheduling_queue,
+            shutdown_flag,
+            config,
+        ))
+    }
+
+    pub(super) fn from_validated_config(
         id: usize,
         runtime_handle: Handle,
         scheduling_queue: Arc<SchedulingQueue>,
@@ -203,7 +257,7 @@ impl Worker {
                 // to priority selection, other workers and the elastic controller.
                 permit = slots.clone().acquire_owned(), if !self.scheduling_queue.is_empty() => {
                     let permit = permit.expect("worker semaphore stays open");
-                    if let Some(mailbox) = self.scheduling_queue.try_pop() {
+                    if let Some(mailbox) = self.scheduling_queue.try_pop_for_worker(self.id) {
                         let worker = self.clone();
                         let slots = slots.clone();
                         let poll_finished = poll_finished.clone();
@@ -227,7 +281,9 @@ impl Worker {
                                         Ok(())
                                     }, permit, slots, poll_finished).await;
                                 }
-                                error!(path = %mailbox.path().path, error = %message, "worker actor failed");
+                                crate::thread::scheduler::failure_diagnostic(|| {
+                                    error!(path = %mailbox.path().path, error = %message, "worker actor failed");
+                                });
                             }
                         });
                     }
@@ -321,7 +377,7 @@ impl Worker {
             Err(error) => Err(error),
         };
         match result {
-            Ok(true) => {}
+            Ok(true) => self.clear_panic(&actor_path),
             Ok(false) => {
                 lease.release();
                 return Ok(());
@@ -352,16 +408,28 @@ impl Worker {
             } else {
                 crate::thread::scheduler::queue::Lane::Normal
             };
-            self.scheduling_queue.enqueue_registered(mailbox, lane);
+            self.scheduling_queue
+                .enqueue_on_worker(mailbox, lane, Some(self.id));
         }
 
         Ok(())
     }
 
     /// Record a panic for a mailbox path (kept for metrics/future supervision).
+    ///
+    /// The table is deliberately bounded: the counts are diagnostic state and
+    /// must not grow with unbounded actor path churn.
     fn record_panic(&self, path: &str) {
         let mut counts = self.panic_counts.lock().unwrap();
+        if !counts.contains_key(path) && counts.len() >= MAX_PANIC_PATHS.saturating_sub(1) {
+            *counts.entry(OVERFLOW_PANIC_PATH.to_string()).or_insert(0) += 1;
+            return;
+        }
         *counts.entry(path.to_string()).or_insert(0) += 1;
+    }
+
+    fn clear_panic(&self, path: &str) {
+        self.panic_counts.lock().unwrap().remove(path);
     }
 
     /// Returns a reference to the worker's status
@@ -600,7 +668,9 @@ fn notify_shared_failure(
         processor.notify_system_panic(message);
     })) {
         let message = crate::owned_payload::panic_message(payload);
-        tracing::error!(%message, "shared failure notification panicked");
+        crate::thread::scheduler::failure_diagnostic(|| {
+            tracing::error!(%message, "shared failure notification panicked");
+        });
     }
 }
 
@@ -633,15 +703,17 @@ impl Drop for AbortQueuedPoll {
 struct IsolatedFuture<F: Future + Send + 'static> {
     future: Option<std::pin::Pin<Box<F>>>,
     runtime: tokio::runtime::Handle,
+    cleanup_slots: Arc<Semaphore>,
 }
 impl<F> IsolatedFuture<F>
 where
     F: Future + Send + 'static,
 {
-    fn new(future: F) -> Self {
+    fn new(future: F, cleanup_slots: Arc<Semaphore>) -> Self {
         Self {
             future: Some(Box::pin(future)),
             runtime: tokio::runtime::Handle::current(),
+            cleanup_slots,
         }
     }
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<F::Output> {
@@ -655,15 +727,15 @@ where
 impl<F: Future + Send + 'static> Drop for IsolatedFuture<F> {
     fn drop(&mut self) {
         if let Some(future) = self.future.take() {
-            let disposal = CaughtDisposal(Some(future));
-            // A queued blocking job can itself be destroyed under Tokio's
-            // blocking-pool shutdown mutex. Never re-enter spawn_blocking from
-            // that destructor. The async bridge submits cleanup only while the
-            // runtime can poll it; a rejected/cancelled bridge disposes safely
-            // during host-runtime shutdown, where no progress is promised.
-            self.runtime.spawn(async move {
-                let _ = tokio::task::spawn_blocking(move || drop(disposal)).await;
-            });
+            // A cancelled future may be one of many actor-owned captures.
+            // OwnedPayload bounds both active cleanup workers and pending
+            // owners. Its async bridge also avoids re-entering spawn_blocking
+            // from a queued blocking-pool destructor.
+            drop(crate::owned_payload::OwnedPayload::new(
+                CaughtDisposal(Some(future)),
+                &self.runtime,
+                &self.cleanup_slots,
+            ));
         }
     }
 }
@@ -691,7 +763,7 @@ where
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let mut future = IsolatedFuture::new(future);
+    let mut future = IsolatedFuture::new(future, slots.clone());
     let wake = Arc::new(PollWake(Notify::new()));
     let mut permit = Some(first_permit);
     loop {
@@ -775,6 +847,11 @@ mod tests {
         const CHILD: &str = "PARROT_QUEUED_DISPOSAL_SHUTDOWN_CHILD";
         const READY: &str = "parrot-queued-disposal-ready";
         if std::env::var_os(CHILD).is_some() {
+            // Emit and flush the probe marker before constructing the runtime.
+            // The parent must distinguish a selected child test from a test
+            // harness that exited without running this case.
+            eprintln!("{READY}");
+            std::io::Write::flush(&mut std::io::stderr()).unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .max_blocking_threads(1)
                 .enable_all()
@@ -805,9 +882,6 @@ mod tests {
                 );
                 drop(queued);
             });
-            // Parent starts the exit deadline after this marker, excluding slow
-            // platform loader startup from the runtime-shutdown assertion.
-            println!("{READY}");
             let unlock = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(100));
                 release.send(()).unwrap();
@@ -817,17 +891,31 @@ mod tests {
             return;
         }
         use std::io::BufRead;
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "thread::scheduler::shared::worker::tests::cancelled_queued_poll_does_not_deadlock_host_runtime_shutdown", "--nocapture"])
-            .env(CHILD, "1").stdout(std::process::Stdio::piped()).spawn().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut reader = std::io::BufReader::new(stdout);
+        let child_exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&child_exe)
+            // Use the unique leaf name so feature-specific module prefixes or
+            // harness path formatting cannot turn this into a zero-test child.
+            .args([
+                "cancelled_queued_poll_does_not_deadlock_host_runtime_shutdown",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("RUST_TEST_THREADS", "1")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut reader = std::io::BufReader::new(stderr);
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap() == 0 {
+                let mut remaining = String::new();
+                std::io::Read::read_to_string(&mut reader, &mut remaining).unwrap();
                 panic!(
-                    "shutdown child exited before probe startup: {:?}",
-                    child.wait()
+                    "shutdown child exited before probe startup: {:?}; exe: {}; output: {}",
+                    child.wait(),
+                    child_exe.display(),
+                    remaining
                 );
             }
             if line.trim() == READY {
@@ -902,6 +990,60 @@ mod tests {
                 "cancelled work must never begin"
             );
             assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn cancelled_isolated_future_cleanup_has_a_bounded_owner_queue() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                let _ = blocked.recv();
+            });
+            started.await.unwrap();
+
+            struct Guard(Arc<AtomicUsize>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let slots = Arc::new(Semaphore::new(0));
+            let count = crate::owned_payload::MAX_PENDING_CLEANUPS_PER_SLOT + 32;
+            for _ in 0..count {
+                let dropped = dropped.clone();
+                let guard = Guard(dropped);
+                let future = async move {
+                    let _guard = guard;
+                    futures::future::pending::<()>().await;
+                };
+                drop(IsolatedFuture::new(future, slots.clone()));
+            }
+            tokio::task::yield_now().await;
+            assert!(
+                dropped.load(Ordering::SeqCst) >= 32,
+                "cancelled isolated futures exceeded the pending-owner budget"
+            );
+
+            slots.add_permits(count);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while dropped.load(Ordering::SeqCst) != count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all isolated futures must eventually retire");
         });
     }
 
@@ -1020,6 +1162,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panic_diagnostics_are_bounded_and_clear_after_recovery() {
+        let worker = Worker::new(
+            0,
+            Handle::current(),
+            Arc::new(SchedulingQueue::new(1)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            WorkerConfig::default(),
+        );
+
+        worker.record_panic("/user/recovered");
+        assert_eq!(
+            worker.panic_counts.lock().unwrap().get("/user/recovered"),
+            Some(&1)
+        );
+        worker.clear_panic("/user/recovered");
+        assert!(worker.panic_counts.lock().unwrap().is_empty());
+
+        for index in 0..=MAX_PANIC_PATHS {
+            worker.record_panic(&format!("/user/transient-{index}"));
+        }
+        let counts = worker.panic_counts.lock().unwrap();
+        assert_eq!(counts.len(), MAX_PANIC_PATHS);
+        assert_eq!(counts.get(OVERFLOW_PANIC_PATH), Some(&2));
+    }
+
+    #[tokio::test]
     async fn test_worker_skips_mailbox_without_processor() {
         let queue = Arc::new(SchedulingQueue::new(100));
         let rt = Handle::current();
@@ -1042,22 +1210,13 @@ mod tests {
         assert!(!mailbox.is_empty().await);
     }
 
-    /// ADR-4 feasibility probe: does `batch_size` (default 10) amplify
-    /// head-of-line latency for a single actor?
-    ///
-    /// Setup: one mailbox pre-loaded with a backlog of ~20µs messages plus
-    /// one late probe; drain with batch sizes 1 / 10 / 50 and compare
-    /// total drain time. Within one actor, messages are serialized
-    /// regardless of batching, so the expectation is near-identical drain
-    /// times — documenting that ADR-4's cost is code complexity, not
-    /// single-actor HOL amplification. (Cross-actor fairness is the real
-    /// lever of the knob; see the shared-pool stress scenarios.)
-    #[derive(Debug, Default)]
-    struct SpinActor {
-        sink: u64,
+    #[derive(Debug)]
+    struct BatchActor {
+        observed: Arc<std::sync::Mutex<Vec<(u8, u64)>>>,
+        id: u8,
     }
 
-    impl Actor for SpinActor {
+    impl Actor for BatchActor {
         type Config = EmptyConfig;
         type Context = ThreadContext<Self>;
 
@@ -1071,11 +1230,8 @@ mod tests {
             _ctx: &'a mut Self::Context,
         ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
             Box::pin(async move {
-                let spin = std::time::Instant::now();
-                while spin.elapsed().as_micros() < 20 {}
-                if msg.downcast_ref::<u64>().is_some() {
-                    self.sink += 1;
-                }
+                let value = *msg.downcast_ref::<u64>().expect("batch probe message");
+                self.observed.lock().unwrap().push((self.id, value));
                 Ok(msg)
             })
         }
@@ -1085,80 +1241,104 @@ mod tests {
         }
     }
 
-    async fn drain_with_batch(batch: usize, backlog: usize) -> std::time::Duration {
+    async fn verify_batch_turns(batch: usize) {
+        let queue = Arc::new(SchedulingQueue::new(2));
         let worker = Worker::new(
             0,
             Handle::current(),
-            Arc::new(SchedulingQueue::new(1000)),
+            queue.clone(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             WorkerConfig {
                 batch_size: batch,
                 ..Default::default()
             },
         );
-        let path = mock_actor_path(&format!("bench/b{}", batch));
-        let mailbox = Arc::new(MpscMailbox::new(8192, path));
-        let context = ThreadContext::new_for_test("bench");
-        let processor = Arc::new(ActorProcessor::<SpinActor>::new(
-            ThreadActor::new_for_test(SpinActor::default()),
-            context,
-            "bench".to_string(),
-            ThreadActorConfig::default(),
-        ));
-        mailbox.set_processor(processor as Arc<dyn crate::thread::processor::ProcessorInterface>);
-
-        for i in 0..backlog {
-            mailbox
-                .push(
-                    Box::new(i as u64) as BoxedMessage,
-                    crate::thread::config::BackpressureStrategy::Block,
-                )
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let expected: Vec<_> = (0..200_u64).chain(std::iter::once(u64::MAX)).collect();
+        let mut mailboxes = Vec::new();
+        let mut processors = Vec::new();
+        for (id, messages) in [(0, expected.as_slice()), (1, &[73_u64][..])] {
+            let path = format!("/batch/{batch}/{id}");
+            let mailbox: Arc<dyn Mailbox> =
+                Arc::new(MpscMailbox::new(expected.len(), mock_actor_path(&path)));
+            let processor = Arc::new(ActorProcessor::new(
+                ThreadActor::new_for_test(BatchActor {
+                    observed: observed.clone(),
+                    id,
+                }),
+                ThreadContext::new_for_test(&path),
+                path,
+                ThreadActorConfig::default(),
+            ));
+            mailbox.set_processor(processor.clone());
+            for &message in messages {
+                mailbox
+                    .push(
+                        Box::new(message),
+                        crate::thread::config::BackpressureStrategy::Block,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(queue.register(&mailbox));
+            assert!(mailbox.schedule_state().try_enqueue());
+            assert!(queue.enqueue_registered(
+                mailbox.clone(),
+                crate::thread::scheduler::queue::Lane::Normal
+            ));
+            mailboxes.push(mailbox);
+            processors.push(processor);
+        }
+        let mut seen = Vec::new();
+        let mut completed = 0;
+        for turn in 0..expected.len().div_ceil(batch) + 1 {
+            let mailbox = queue
+                .try_pop()
+                .expect("backlogged actor lost its ready turn");
+            let peer_turn = turn == 1;
+            assert!(Arc::ptr_eq(&mailbox, &mailboxes[usize::from(peer_turn)]));
+            worker.process_mailbox(mailbox, batch).await.unwrap();
+            if peer_turn {
+                seen.push((1, 73));
+                assert!(mailboxes[1].is_empty().await);
+            } else {
+                let end = (completed + batch).min(expected.len());
+                seen.extend(expected[completed..end].iter().map(|&value| (0, value)));
+                completed = end;
+            }
+            assert_eq!(
+                *observed.lock().unwrap(),
+                seen,
+                "incorrect FIFO/batch budget at turn {turn}, batch {batch}"
+            );
+            assert_eq!(mailboxes[0].len().await, expected.len() - completed);
+            let ready = usize::from(completed < expected.len()) + usize::from(turn == 0);
+            assert_eq!(queue.len(), ready, "missing or duplicate ready owner");
+        }
+        assert_eq!(completed, expected.len());
+        assert!(queue.try_pop().is_none());
+        for (mailbox, processor) in mailboxes.iter().zip(processors) {
+            assert!(
+                mailbox.schedule_state().try_enqueue(),
+                "idle actor retained its scheduling lease"
+            );
+            mailbox.schedule_state().force_release();
+            crate::thread::processor::ProcessorInterface::stop_erased(processor.clone())
+                .await
+                .unwrap();
+            crate::thread::processor::ProcessorInterface::retire_erased(processor)
                 .await
                 .unwrap();
         }
-        mailbox
-            .push(
-                Box::new(u64::MAX) as BoxedMessage,
-                crate::thread::config::BackpressureStrategy::Block,
-            )
-            .await
-            .unwrap();
-
-        let t0 = std::time::Instant::now();
-        while !mailbox.is_empty().await {
-            worker
-                .process_mailbox(mailbox.clone(), batch)
-                .await
-                .unwrap();
-        }
-        t0.elapsed()
     }
 
     #[tokio::test]
-    async fn batch_size_hol_experiment() {
-        let backlog = 200usize;
-        let d1 = drain_with_batch(1, backlog).await;
-        let d10 = drain_with_batch(10, backlog).await;
-        let d50 = drain_with_batch(50, backlog).await;
-
-        println!(
-            "\n==== ADR-4 batch_size HOL experiment (backlog={}, ~20µs/msg) ====",
-            backlog
-        );
-        println!("batch_size= 1  drain={:?}", d1);
-        println!("batch_size=10  drain={:?}", d10);
-        println!("batch_size=50  drain={:?}", d50);
-        let (a, b, c) = (d1.as_secs_f64(), d10.as_secs_f64(), d50.as_secs_f64());
-        println!("ratios: b10/b1={:.2} b50/b1={:.2}", b / a, c / a);
-
-        // Expect near-invariance for a single serialized actor.
-        assert!(
-            c / a < 3.0 && a / c < 3.0,
-            "unexpected batch-size sensitivity: d1={:?} d10={:?} d50={:?}",
-            d1,
-            d10,
-            d50
-        );
+    async fn batch_size_preserves_fifo_budget_and_peer_turn() {
+        // Assert actual handler work and queue ownership; wall-clock ratios
+        // cannot establish FIFO, batch limits or cross-actor fairness.
+        for batch in [1, 10, 50] {
+            verify_batch_turns(batch).await;
+        }
     }
 }
 
@@ -1275,7 +1455,16 @@ mod recursive_contracts {
         .await
         .unwrap();
         assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
-        assert_eq!(slots.available_permits(), 1);
+        // The payload's destructor records its entry before the cleanup owner
+        // releases its worker/pending permits. Observe the actual capacity
+        // boundary instead of treating that intermediate state as completion.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup owner did not release its worker capacity");
         let permit = slots.clone().acquire_owned().await.unwrap();
         let result = poll_isolated(
             async { Ok::<_, anyhow::Error>(73) },
@@ -1773,6 +1962,29 @@ mod stage_contracts {
             true,
             true,
             "notification_panic_is_contained",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn shared_notification_logging_failure_is_contained() {
+        crate::thread::scheduler::notification_contracts::isolated(
+            "shared_notification_logging_failure_is_contained",
+            || {
+                let p = Processor::new(Mode::Healthy, true, true);
+                notify_shared_failure(&*p, "original shared failure".into());
+                assert_eq!(&*p.notices.lock().unwrap(), &["original shared failure"]);
+                assert_eq!(p.payloads.load(Ordering::SeqCst), 1);
+            },
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn shared_stage_notification_logging_failure_preserves_progress() {
+        crate::thread::scheduler::notification_contracts::isolated_async(
+            "shared_stage_notification_logging_failure_preserves_progress",
+            run(Mode::PollDrop, true, true),
+            // SharedWork reports internally and returns Ok to the outer driver.
+            1,
         )
         .await;
     }
@@ -2472,14 +2684,21 @@ mod cancellation_contracts {
                 assert!(notices[0].contains("original error retained"));
             }
         }
-        assert_eq!(
-            p.payloads.load(Ordering::SeqCst),
-            match mode {
-                Mode::PollDrop => 2,
-                Mode::Construct | Mode::Poll | Mode::ReadyDrop | Mode::PendingDrop => 1,
-                _ => 0,
-            } + usize::from(panic_notice)
-        );
+        let expected_payloads = match mode {
+            Mode::PollDrop => 2,
+            Mode::Construct | Mode::Poll | Mode::ReadyDrop | Mode::PendingDrop => 1,
+            _ => 0,
+        } + usize::from(panic_notice);
+        // Worker shutdown can transfer pending cleanup to its isolated owner.
+        // A notice is recorded before its panic payload has actually retired.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while p.payloads.load(Ordering::SeqCst) < expected_payloads {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shared observer panic payload cleanup did not finish");
+        assert_eq!(p.payloads.load(Ordering::SeqCst), expected_payloads);
         assert_ne!(
             *p.constructed_on.lock().unwrap(),
             Some(caller),

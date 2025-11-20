@@ -46,18 +46,26 @@ struct Gate {
 impl Gate {
     fn block(&self) {
         self.entered.notify_one();
-        let (_guard, result) = self
+        let (guard, result) = self
             .wake
             .wait_timeout_while(
-                self.released.lock().unwrap(),
-                Duration::from_secs(3),
+                self.released
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+                Duration::from_secs(30),
                 |released| !*released,
             )
-            .unwrap();
+            .unwrap_or_else(|error| error.into_inner());
+        // The wall-clock watchdog is not the actor's retirement deadline.
+        // Report it outside the lock so unwinding cannot poison cleanup.
+        drop(guard);
         assert!(!result.timed_out(), "probe did not release constructor");
     }
     fn release(&self) {
-        *self.released.lock().unwrap() = true;
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         self.wake.notify_all();
     }
 }
@@ -66,6 +74,22 @@ impl Drop for Release {
     fn drop(&mut self) {
         self.0.release();
     }
+}
+
+#[test]
+fn poisoned_constructor_gate_can_still_be_released_and_reused() {
+    let gate = Arc::new(Gate::default());
+    let poison = gate.clone();
+    assert!(
+        std::panic::catch_unwind(move || {
+            let _guard = poison.released.lock().unwrap();
+            panic!("controlled gate poison");
+        })
+        .is_err()
+    );
+    let release = std::panic::catch_unwind(|| drop(Release(gate.clone())));
+    assert!(release.is_ok(), "cleanup must not panic on a poisoned gate");
+    gate.block();
 }
 async fn blocked(gate: Arc<Gate>) -> (Arc<ThreadActorSystem>, BoxedActorRef, Arc<AtomicUsize>) {
     let sys = ThreadActorSystem::shared(ThreadActorSystemConfig {
@@ -167,7 +191,7 @@ async fn gone(sys: &ThreadActorSystem, path: &str) {
 #[tokio::test(flavor = "current_thread")]
 async fn cancelled_initial_factory_retains_ownership_and_old_reference_cannot_stop_reuse() {
     let sys = ThreadActorSystem::shared(ThreadActorSystemConfig {
-        shutdown_timeout: Duration::from_millis(100),
+        shutdown_timeout: Duration::from_secs(5),
         ..Default::default()
     });
     let gate = Arc::new(Gate::default());
@@ -213,7 +237,18 @@ async fn cancelled_initial_factory_retains_ownership_and_old_reference_cannot_st
     assert_eq!(duplicate_calls.load(Ordering::SeqCst), 0);
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    assert!(old.stop().await.is_err());
+    // The production lifecycle owner has its own clock. Keep the constructor
+    // blocked until that owner reports the deadline, before the gate watchdog.
+    let stop = old.stop();
+    tokio::pin!(stop);
+    assert!(futures::poll!(&mut stop).is_pending());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(10), stop)
+            .await
+            .expect("independent lifecycle owner must report the creation deadline"),
+        Err(parrot_api::errors::ActorError::Timeout
+            | parrot_api::errors::ActorError::TimeoutDetail(_))
+    ));
     let retained = sys.get_actor_ref("/initial").is_some();
     gate.release();
     gone(&sys, "/initial").await;

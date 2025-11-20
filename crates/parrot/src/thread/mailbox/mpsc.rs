@@ -55,6 +55,7 @@ pub struct MpscMailbox {
     /// Serializes enqueue/close and capacity decisions across both lanes.
     enqueue_gate: Mutex<()>,
     capacity_notify: Notify,
+    close_state: Arc<crate::thread::mailbox::CloseState>,
 }
 
 impl Debug for MpscMailbox {
@@ -98,6 +99,7 @@ impl MpscMailbox {
             normal_removed: AtomicU64::new(0),
             enqueue_gate: Mutex::new(()),
             capacity_notify: Notify::new(),
+            close_state: Arc::new(crate::thread::mailbox::CloseState::new()),
         }
     }
 
@@ -141,10 +143,11 @@ impl MpscMailbox {
 
     async fn enqueue(
         &self,
-        mut item: MailboxItem,
+        item: MailboxItem,
         strategy: BackpressureStrategy,
         high_priority: bool,
     ) -> Result<(), MailboxError> {
+        let mut item = Some(super::Input::unbound(item));
         loop {
             // Keep removed values outside the lock scope: Drop is user code
             // and may inspect or send to this mailbox again.
@@ -154,78 +157,127 @@ impl MpscMailbox {
             let available = self.capacity_notify.notified();
             tokio::pin!(available);
             available.as_mut().enable();
-            {
+            let outcome = {
                 let _gate = self.enqueue_gate.lock().unwrap();
                 if self.closed() {
-                    return Err(MailboxError::Closed);
-                }
-                let mut high = self.high_lane.lock().unwrap();
-                let full = self.normal_len() + high.len() >= self.capacity;
-                if full {
-                    match strategy {
-                        BackpressureStrategy::DropNewest => {
-                            return Err(MailboxError::Dropped {
+                    Some(Err(MailboxError::Closed))
+                } else {
+                    let mut high = self.high_lane.lock().unwrap();
+                    let full = self.normal_len() + high.len() >= self.capacity;
+                    let rejection = if full {
+                        match strategy {
+                            BackpressureStrategy::DropNewest => Some(MailboxError::Dropped {
                                 capacity: self.capacity,
-                            });
-                        }
-                        BackpressureStrategy::Error => {
-                            return Err(MailboxError::Full {
+                            }),
+                            BackpressureStrategy::Error => Some(MailboxError::Full {
                                 capacity: self.capacity,
-                            });
+                            }),
+                            BackpressureStrategy::DropOldest => {
+                                // Delivery priority must not redefine "oldest".
+                                // A high entry records how many normal items had
+                                // arrived before it; removals advance that frontier.
+                                let removed = self.normal_removed.load(Ordering::Relaxed);
+                                let high_is_oldest = high
+                                    .front()
+                                    .is_some_and(|(frontier, _)| *frontier == removed);
+                                if high_is_oldest {
+                                    evicted = high.pop_front().map(|(_, item)| item);
+                                } else {
+                                    evicted = self.pop_normal();
+                                }
+                                None
+                            }
+                            BackpressureStrategy::Block => None,
                         }
-                        BackpressureStrategy::DropOldest => {
-                            // Delivery priority must not redefine "oldest".
-                            // A high entry records how many normal items had
-                            // arrived before it; removals advance that frontier.
-                            let removed = self.normal_removed.load(Ordering::Relaxed);
-                            let high_is_oldest = high
-                                .front()
-                                .is_some_and(|(frontier, _)| *frontier == removed);
-                            if high_is_oldest {
-                                evicted = high.pop_front().map(|(_, item)| item);
-                            } else {
-                                evicted = self.pop_normal();
+                    } else {
+                        None
+                    };
+                    if let Some(error) = rejection {
+                        Some(Err(error))
+                    } else if !full || matches!(strategy, BackpressureStrategy::DropOldest) {
+                        if high_priority {
+                            let frontier = self
+                                .normal_removed
+                                .load(Ordering::Relaxed)
+                                .wrapping_add(self.normal_len() as u64);
+                            high.push_back((frontier, item.take().unwrap().take()));
+                            Some(Ok(()))
+                        } else {
+                            match self.sender.try_send(item.take().unwrap().take()) {
+                                Ok(()) => Some(Ok(())),
+                                Err(flume::TrySendError::Disconnected(returned)) => {
+                                    item = Some(super::Input::unbound(returned));
+                                    Some(Err(MailboxError::Closed))
+                                }
+                                Err(flume::TrySendError::Full(returned)) => {
+                                    item = Some(super::Input::unbound(returned));
+                                    if !matches!(strategy, BackpressureStrategy::Block) {
+                                        Some(Err(MailboxError::Full {
+                                            capacity: self.capacity,
+                                        }))
+                                    } else {
+                                        None
+                                    }
+                                }
                             }
                         }
-                        BackpressureStrategy::Block => {}
+                    } else {
+                        None
                     }
                 }
-                if !full || matches!(strategy, BackpressureStrategy::DropOldest) {
-                    if high_priority {
-                        let frontier = self
-                            .normal_removed
-                            .load(Ordering::Relaxed)
-                            .wrapping_add(self.normal_len() as u64);
-                        high.push_back((frontier, item));
-                        drop(high);
-                        drop(_gate);
-                        self.signal_ready_and_wake();
-                        return Ok(());
-                    }
-                    match self.sender.try_send(item) {
-                        Ok(()) => {
-                            drop(high);
-                            drop(_gate);
-                            self.signal_ready_and_wake();
-                            return Ok(());
-                        }
-                        Err(flume::TrySendError::Disconnected(_)) => {
-                            return Err(MailboxError::Closed);
-                        }
-                        Err(flume::TrySendError::Full(returned)) => {
-                            item = returned;
-                            if !matches!(strategy, BackpressureStrategy::Block) {
-                                return Err(MailboxError::Full {
-                                    capacity: self.capacity,
-                                });
-                            }
-                        }
-                    }
+            };
+            let evicted = evicted.map(super::Input::unbound);
+            if let Some(result) = outcome {
+                if result.is_ok() {
+                    self.signal_ready_and_wake();
                 }
+                return super::finish_push(result, item, evicted).await;
             }
-            drop(evicted);
             available.await;
         }
+    }
+}
+
+impl Drop for MpscMailbox {
+    fn drop(&mut self) {
+        self.is_closed.store(true, Ordering::SeqCst);
+        let receiver = self
+            .receiver
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let notifications = receiver.as_ref().map(Receiver::disconnect_deferred);
+        let normal = receiver
+            .as_ref()
+            .map(|receiver| receiver.drain().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let high = std::mem::take(
+            self.high_lane
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        // Disconnect before running any user destructor, including one which
+        // retained a low-level sender. Normal mailbox producers cannot outlive &self.
+        drop(receiver);
+        for item in normal
+            .into_iter()
+            .chain(high.into_iter().map(|(_, item)| item))
+        {
+            super::retire_on_drop(item, "message");
+        }
+        let processor = self
+            .processor
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let hook = self
+            .wake_hook
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        super::retire_on_drop(processor, "processor");
+        super::retire_on_drop(hook, "wake hook");
+        super::retire_on_drop(notifications, "disconnect notification");
     }
 }
 
@@ -354,22 +406,57 @@ impl Mailbox for MpscMailbox {
 
     async fn close(&self) {
         self.seal();
-        let (receiver, high) = {
-            let _gate = self.enqueue_gate.lock().unwrap();
-            let receiver = self.receiver.lock().unwrap().take();
-            let high = std::mem::take(&mut *self.high_lane.lock().unwrap());
-            (receiver, high)
+        let mut reservation = None;
+        let extracted = loop {
+            let attempt = {
+                let _gate = self.enqueue_gate.lock().unwrap();
+                let mut receiver = self.receiver.lock().unwrap();
+                let mut high = self.high_lane.lock().unwrap();
+                let has_values =
+                    receiver.as_ref().is_some_and(|queue| !queue.is_empty()) || !high.is_empty();
+                match self.close_state.claim(has_values, reservation.is_some()) {
+                    super::CloseAttempt::Owned(()) => {
+                        super::CloseAttempt::Owned((receiver.take(), std::mem::take(&mut *high)))
+                    }
+                    super::CloseAttempt::Reservation => super::CloseAttempt::Reservation,
+                    super::CloseAttempt::Observing => super::CloseAttempt::Observing,
+                }
+            };
+            match attempt {
+                super::CloseAttempt::Owned(values) => break Some(values),
+                super::CloseAttempt::Observing => break None,
+                super::CloseAttempt::Reservation => {
+                    reservation = self.close_state.reserve().await;
+                    if reservation.is_none() {
+                        break None;
+                    }
+                }
+            }
         };
+        let Some((receiver, high)) = extracted else {
+            drop(reservation);
+            self.close_state.wait().await;
+            return;
+        };
+        let notifications = receiver.as_ref().map(Receiver::disconnect_deferred);
         // Flume keeps queued values in the shared channel even after the last
         // receiver disconnects. Explicitly take them so they are disposed by
         // this cleanup operation, rather than by a later sender/mailbox drop.
         let normal = receiver
             .as_ref()
-            .map(|receiver| receiver.drain().collect::<Vec<_>>());
+            .map(|receiver| receiver.drain().collect::<Vec<_>>())
+            .unwrap_or_default();
         drop(receiver);
+        // Only the claimed owner executes disconnect callbacks. Concurrent
+        // close callers must also wait for those callbacks before completion.
+        super::retire_on_drop(notifications, "disconnect notification");
         // User destructors must never run while holding mailbox bookkeeping locks.
-        drop(normal);
-        drop(high);
+        let drained = normal
+            .into_iter()
+            .chain(high.into_iter().map(|(_, item)| item))
+            .collect();
+        self.close_state.start_drain(drained, reservation);
+        self.close_state.wait().await;
     }
 
     async fn is_closed(&self) -> bool {
@@ -378,7 +465,8 @@ impl Mailbox for MpscMailbox {
 
     /// associate a processor with this mailbox
     fn set_processor(&self, processor: Arc<dyn ProcessorInterface>) {
-        *self.processor.lock().unwrap() = Some(processor);
+        let old = self.processor.lock().unwrap().replace(processor);
+        drop(old);
     }
 
     /// get the associated processor
@@ -392,13 +480,13 @@ impl Mailbox for MpscMailbox {
     }
 
     fn set_wake_hook(&self, hook: crate::thread::mailbox::WakeHook) {
-        *self.wake_hook.lock().unwrap() = Some(hook);
+        let old = self.wake_hook.lock().unwrap().replace(hook);
+        drop(old);
     }
 
     fn fire_wake_hook(&self) {
-        if let Some(hook) = self.wake_hook.lock().unwrap().as_ref() {
-            hook();
-        }
+        let hook = self.wake_hook.lock().unwrap().clone();
+        super::invoke_wake_hook(hook);
     }
 
     fn schedule_state(&self) -> &crate::thread::mailbox::ScheduleState {

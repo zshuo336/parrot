@@ -237,6 +237,71 @@ async fn converge(owner: &mut MirrorSupervisor, host: &Host, observed: &Observed
     }
     panic!("bounded reconciliation did not converge");
 }
+async fn explicit_projection_policy(component: usize) {
+    let host = Host::new(false, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut m = manifest();
+    let mut value = toml::Value::Integer(1);
+    for _ in 2..65 {
+        value = toml::Value::Array(vec![value]);
+    }
+    m.components[component].config = Some(toml::Table::from_iter([("value".into(), value)]));
+    let limits = ApplicationLimits {
+        max_config_depth: 65,
+        ..Default::default()
+    };
+    assert!(parrot_app::validate(&m).is_err());
+    parrot_app::validate_with_limits(&m, &limits).unwrap();
+    let state = observed(&host);
+    let mut controller =
+        MirrorSupervisor::open(dir.path(), m.clone(), Arc::new(SystemClock), limits).unwrap();
+    let mut last = Default::default();
+    let mut converged = false;
+    for _ in 0..8 {
+        last = controller
+            .reconcile_once(&state, &host.client)
+            .await
+            .unwrap();
+        if last.converged {
+            converged = true;
+            break;
+        }
+    }
+    if converged {
+        let entry = &controller.responsibilities()[&host.node.config.node_id];
+        assert_eq!(entry.phase, MirrorIntentPhase::Applied);
+        assert_eq!(entry.policies[0].source_prefix, "/user/primary");
+        assert_eq!(entry.policies[0].shadow_path, "/user/shadow");
+        drop(controller);
+        controller = MirrorSupervisor::open(dir.path(), m, Arc::new(SystemClock), limits).unwrap();
+        assert!(
+            controller
+                .reconcile_once(&state, &host.client)
+                .await
+                .unwrap()
+                .converged
+        );
+        host.send(651).await;
+        host.wait("primary", 651).await;
+        host.wait("shadow", 651).await;
+    }
+    host.close().await;
+    assert!(
+        converged,
+        "explicit policy lost during mirror projection: {last:?}"
+    );
+}
+
+#[tokio::test]
+async fn mirror_projection_preserves_explicit_source_config_policy() {
+    explicit_projection_policy(0).await;
+}
+
+#[tokio::test]
+async fn mirror_projection_preserves_explicit_shadow_config_policy() {
+    explicit_projection_policy(1).await;
+}
+
 async fn durable_business(tcp: bool) {
     let host = Host::new(tcp, true).await;
     let dir = tempfile::tempdir().unwrap();
@@ -417,6 +482,135 @@ async fn stale_active_metadata_does_not_prove_current_policy_convergence() {
     host.wait("shadow", 45).await;
     host.close().await;
 }
+
+#[tokio::test]
+async fn transient_component_observation_does_not_retire_an_active_mirror() {
+    let host = Host::new(false, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let healthy = observed(&host);
+    let mut controller = owner(&dir);
+    converge(&mut controller, &host, &healthy).await;
+    let before = controller.responsibilities()[&host.node.config.node_id].clone();
+
+    // A missing/expired health snapshot is a temporary observation gap. It
+    // must not be interpreted as an intentional empty mirror projection.
+    let report = controller
+        .reconcile_once(&ObservedState::default(), &host.client)
+        .await
+        .unwrap();
+    assert!(!report.converged);
+    let after = &controller.responsibilities()[&host.node.config.node_id];
+    assert_eq!(after.session, before.session);
+    assert_eq!(after.phase, MirrorIntentPhase::Applied);
+    assert_eq!(
+        host.command(C::Status {
+            session: before.session,
+        })
+        .await,
+        R::Session {
+            session: before.session,
+            owner: before.owner.clone(),
+            revision: before.revision,
+            phase: Phase::Active,
+            policies: before.policies.clone(),
+        }
+    );
+
+    // Once the authenticated health view returns, the same policy remains
+    // converged without allocating a replacement session.
+    assert!(
+        controller
+            .reconcile_once(&healthy, &host.client)
+            .await
+            .unwrap()
+            .converged
+    );
+    assert_eq!(
+        controller.responsibilities()[&host.node.config.node_id].session,
+        before.session
+    );
+    host.close().await;
+}
+
+#[tokio::test]
+async fn transient_observation_cannot_suspend_persisted_mirror_retirement() {
+    for tcp in [false, true] {
+        for known_links in [false, true] {
+            let host = Host::new(tcp, true).await;
+            let dir = tempfile::tempdir().unwrap();
+            let healthy = observed(&host);
+            let mut controller = owner(&dir);
+            converge(&mut controller, &host, &healthy).await;
+            let entry = controller.responsibilities()[&host.node.config.node_id].clone();
+
+            // An external update invalidates convergence while the remote
+            // policy is still Active. Persist Closing before losing health.
+            let mut policies = entry.policies.clone();
+            policies[0].shadow_path = "/user/other".into();
+            assert!(matches!(
+                host.command(C::Apply {
+                    session: entry.session,
+                    revision: entry.revision + 1,
+                    policies,
+                })
+                .await,
+                R::Session {
+                    phase: Phase::Active,
+                    ..
+                }
+            ));
+            assert!(
+                !controller
+                    .reconcile_once(&healthy, &host.client)
+                    .await
+                    .unwrap()
+                    .converged
+            );
+            assert_eq!(
+                controller.responsibilities()[&host.node.config.node_id].phase,
+                MirrorIntentPhase::Closing
+            );
+            drop(controller);
+            let mut controller = owner(&dir);
+            let mut incomplete = ObservedState::default();
+            if known_links {
+                incomplete = healthy.clone();
+                incomplete.components.clear();
+            }
+            let report = controller
+                .reconcile_once(&incomplete, &host.client)
+                .await
+                .unwrap();
+            let retired = host
+                .command(C::Status {
+                    session: entry.session,
+                })
+                .await;
+            let cleared = controller.responsibilities().is_empty();
+            drop(controller);
+            let persisted_clear = owner(&dir).responsibilities().is_empty();
+            host.close().await;
+
+            assert!(!report.converged, "incomplete observations cannot converge");
+            assert_eq!(
+                retired,
+                R::Retired {
+                    session: entry.session
+                },
+                "tcp={tcp}, known_links={known_links}"
+            );
+            assert!(
+                cleared,
+                "retirement receipt must clear the local responsibility"
+            );
+            assert!(
+                persisted_clear,
+                "retirement must remain cleared after reopening"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn components_cannot_be_stopped_before_policy_retirement() {
     let host = Host::new(false, true).await;

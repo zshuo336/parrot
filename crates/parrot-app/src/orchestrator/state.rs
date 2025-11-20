@@ -12,35 +12,68 @@ pub struct PendingUpgrade {
     pub policy: UpgradePolicy,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct DesiredStateRecord {
     pub revision: u64,
     // TOML preserves NaN, infinities, signed zero and datetimes; JSON Value does not.
-    #[serde(with = "manifest_text")]
     pub manifest: AppManifest,
     pub pending: BTreeMap<String, PendingUpgrade>,
-    #[serde(default)]
     pub mirrors: BTreeMap<String, super::mirror::MirrorIntent>,
 }
-mod manifest_text {
-    use super::*;
-    pub fn serialize<S: serde::Serializer>(
-        m: &AppManifest,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        use serde::ser::Error;
-        serializer.serialize_str(&m.to_toml().map_err(S::Error::custom)?)
+impl serde::Serialize for DesiredStateRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize_with_limits(serializer, &ApplicationLimits::default())
     }
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<AppManifest, D::Error> {
-        use serde::{de::Error, Deserialize};
-        let source = String::deserialize(deserializer)?;
-        toml::from_str(&source).map_err(D::Error::custom)
+}
+impl<'de> serde::Deserialize<'de> for DesiredStateRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::deserialize_with_limits(deserializer, &ApplicationLimits::default())
     }
 }
 impl DesiredStateRecord {
+    pub(super) fn serialize_with_limits<S: serde::Serializer>(
+        &self,
+        serializer: S,
+        limits: &ApplicationLimits,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeStruct};
+        let manifest = self
+            .manifest
+            .to_toml_with_limits(limits)
+            .map_err(S::Error::custom)?;
+        let mut state = serializer.serialize_struct("DesiredStateRecord", 4)?;
+        state.serialize_field("revision", &self.revision)?;
+        state.serialize_field("manifest", &manifest)?;
+        state.serialize_field("pending", &self.pending)?;
+        state.serialize_field("mirrors", &self.mirrors)?;
+        state.end()
+    }
+
+    pub(super) fn deserialize_with_limits<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+        limits: &ApplicationLimits,
+    ) -> Result<Self, D::Error> {
+        use serde::{de::Error, Deserialize};
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "DesiredStateRecord", deny_unknown_fields)]
+        struct Wire {
+            revision: u64,
+            manifest: String,
+            pending: BTreeMap<String, PendingUpgrade>,
+            #[serde(default)]
+            mirrors: BTreeMap<String, super::mirror::MirrorIntent>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let manifest =
+            AppManifest::from_toml_with_limits(&wire.manifest, limits).map_err(D::Error::custom)?;
+        Ok(Self {
+            revision: wire.revision,
+            manifest,
+            pending: wire.pending,
+            mirrors: wire.mirrors,
+        })
+    }
+
     pub fn validate(&self, limits: &ApplicationLimits) -> Result<(), String> {
         crate::validate_with_limits(&self.manifest, limits).map_err(|e| format!("{e:?}"))?;
         if self.revision == 0 || self.pending.len() > self.manifest.components.len() {

@@ -234,8 +234,8 @@ where
     pub fn try_send(&self, msg: BoxedMessage) -> Result<(), SendError<BoxedMessage>> {
         let wrapper = self.create_envelope(msg, None, MessageOptions::default(), "unknown");
         self.addr.try_send(wrapper).map_err(|e| match e {
-            SendError::Full(wrapper) => SendError::Full(wrapper.envelope.payload),
-            SendError::Closed(wrapper) => SendError::Closed(wrapper.envelope.payload),
+            SendError::Full(wrapper) => SendError::Full(wrapper.into_payload()),
+            SendError::Closed(wrapper) => SendError::Closed(wrapper.into_payload()),
         })
     }
 }
@@ -269,23 +269,7 @@ where
 
     /// Fire-and-forget delivery: enqueue and return immediately.
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(parrot_api::trace::capture(async move {
-            if self
-                .control
-                .as_ref()
-                .is_some_and(|control| control.channel.is_sealed())
-            {
-                return Err(ActorError::Stopped);
-            }
-            let wrapper =
-                Self::create_envelope_static(msg, None, MessageOptions::default(), "tell");
-            self.addr.try_send(wrapper).map_err(|error| match error {
-                SendError::Closed(_) => ActorError::Stopped,
-                SendError::Full(_) => {
-                    ActorError::MessageHandlingError("Actix mailbox is full".into())
-                }
-            })
-        }))
+        self.deliver_with_options(msg, MessageOptions::default())
     }
 
     fn deliver_with_options<'a>(
@@ -293,12 +277,23 @@ where
         msg: BoxedMessage,
         options: MessageOptions,
     ) -> BoxedFuture<'a, ActorResult<()>> {
+        let wrapper = Self::create_envelope_static(msg, None, options, "tell");
         Box::pin(parrot_api::trace::capture(async move {
-            options.validate_single_attempt()?;
-            options.validate_fifo()?;
-            // Native try_send has no admission wait. Its receipt never claims
-            // that handler execution finished within the caller's timeout.
-            self.deliver(msg).await
+            wrapper.envelope.options.validate_single_attempt()?;
+            wrapper.envelope.options.validate_fifo()?;
+            if self
+                .control
+                .as_ref()
+                .is_some_and(|control| control.channel.is_sealed())
+            {
+                return Err(ActorError::Stopped);
+            }
+            self.addr.try_send(wrapper).map_err(|error| match error {
+                SendError::Closed(_) => ActorError::Stopped,
+                SendError::Full(_) => {
+                    ActorError::MessageHandlingError("Actix mailbox is full".into())
+                }
+            })
         }))
     }
 
@@ -316,11 +311,27 @@ where
         msg: BoxedMessage,
         timeout: Option<Duration>,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        // Create message envelope
-        let wrapper = self.create_envelope(msg, None, MessageOptions::default(), "unknown");
+        self.send_with_options(
+            msg,
+            MessageOptions {
+                timeout,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn send_with_options<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        let timeout = options.timeout;
+        let wrapper = self.create_envelope(msg, None, options, "unknown");
         let addr = self.addr.clone();
 
         Box::pin(parrot_api::trace::capture(async move {
+            wrapper.envelope.options.validate_single_attempt()?;
+            wrapper.envelope.options.validate_fifo()?;
             let request = async {
                 let request = addr.send(wrapper);
                 let result = match timeout {
@@ -335,7 +346,7 @@ where
                     }
                     None => request.await,
                 };
-                match result {
+                match result.map(|reply| reply.into_inner()) {
                     Ok(Some(result)) => result,
                     Ok(None) => Err(ActorError::MessageHandlingError(
                         "No response from actor".into(),
@@ -355,22 +366,9 @@ where
         }))
     }
 
-    fn send_with_options<'a>(
-        &'a self,
-        msg: BoxedMessage,
-        options: MessageOptions,
-    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(parrot_api::trace::capture(async move {
-            options.validate_single_attempt()?;
-            options.validate_fifo()?;
-            // Reuse the generation close fence as well as its deadline logic.
-            self.send_with_timeout(msg, options.timeout).await
-        }))
-    }
-
     /// Stop the actor
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             if let Some(control) = &self.control {
                 return control.stop().await;
             }
@@ -384,7 +382,7 @@ where
             })
             .await
             .map_err(|_| ActorError::TimeoutDetail("raw Actix actor did not stop".into()))
-        })
+        }))
     }
 
     /// Get the actor's path
@@ -424,6 +422,13 @@ where
             .as_ref()
             .map(|control| control.death_watch.clone())
     }
+
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.control.as_ref().map_or(
+            parrot_api::address::RetirementStatus::Unsupported,
+            |control| control.lifetime.retirement_status(),
+        )
+    }
 }
 
 // No strong Addr or ActorControl is retained by a subscription endpoint.
@@ -453,15 +458,17 @@ where
             };
             // Actix Request waits for capacity. Its cancellation removes a
             // still-waiting request; no unbounded do_send escape hatch is used.
-            addr.send(wrapper)
+            let reply = addr
+                .send(wrapper)
                 .await
                 .map_err(|_| ActorError::Stopped)?
+                .into_inner()
                 .ok_or_else(|| {
                     ActorError::MessageHandlingError(
                         "termination notification had no response".into(),
                     )
                 })??;
-            Ok(())
+            crate::owned_payload::PublicationInput::new(reply).retire()
         })
     }
 }

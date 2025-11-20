@@ -7,6 +7,9 @@
 //! 跑法：cargo test -p parrot --test test_cpp_interop -- --nocapture
 //! C++ 编译在测试内完成；需要 CXX 指定的编译器（默认 clang++），缺失会失败。
 
+#[path = "support/network.rs"]
+mod network_support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -171,6 +174,9 @@ async fn run_cpp(port: u16, source: &str) -> (bool, String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cpp_interop_ask() {
+    if network_support::skip_tcp("C++ TCP interop") {
+        return;
+    }
     let facade = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
             .await
@@ -352,6 +358,9 @@ async fn cpp_echo_selftest() {
 /// Exercise actual hostile peers through the C ABI; child ownership bounds hangs.
 #[tokio::test]
 async fn cpp_transport_adversarial_contracts() {
+    if network_support::skip_tcp("C++ transport adversarial contracts") {
+        return;
+    }
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../interop/cpp-lite/test_transport.py");
     let output = tokio::time::timeout(

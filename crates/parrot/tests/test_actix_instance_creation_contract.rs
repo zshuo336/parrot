@@ -435,7 +435,7 @@ async fn accepted_config_panic_retires_instance_without_running_init() {
 }
 
 #[actix::test]
-async fn completed_config_cannot_initialize_late_when_executor_resumes_after_deadline() {
+async fn config_finishing_after_creation_deadline_never_initializes() {
     let sys = system().await;
     let counts = Counts::default();
     let gate = Arc::new(Gate::default());
@@ -445,17 +445,19 @@ async fn completed_config_cannot_initialize_late_when_executor_resumes_after_dea
         config(&counts, Some(gate.clone()), false),
     ));
     tokio::select! { result = &mut create => panic!("early creation: {result:?}"), _ = gate.entered() => {} }
-    gate.release();
-    // Deliberately stall this current-thread executor: config completion and
-    // deadline become ready together before the owner can poll either branch.
+    // Keep actual cleanup pending beyond admission's deadline. Its owner is
+    // independent of this host and may continue while the host is stalled.
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(counts.config.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.config.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
+    gate.release();
+    dropped(&counts.config).await;
     let failed = create.await.is_err();
     let _ = sys.clone().shutdown().await;
     stopped(&sys).await;
     assert!(
         failed,
-        "ready cleanup result must not bypass the elapsed creation deadline"
+        "late cleanup result must not bypass the elapsed creation deadline"
     );
     assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
     assert_eq!(counts.actor.load(Ordering::SeqCst), 1);

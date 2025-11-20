@@ -14,6 +14,15 @@ import sys
 CRATES = ('parrot-app', 'parrot-abi', 'parrot-wasm')
 
 
+def no_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate JSON key: ' + key)
+        result[key] = value
+    return result
+
+
 def counts(summary, metric):
     value = summary.get(metric)
     if not isinstance(value, dict):
@@ -38,7 +47,8 @@ def evaluate(report, root, scope=None):
     # content bindings prevent a later executable body or removed cfg(test)
     # from silently inheriting the exclusion. Unknown files remain required.
     if scope is None:
-        scope = json.loads(Path(__file__).with_name('dev09_coverage_scope.json').read_text())
+        scope = json.loads(Path(__file__).with_name('dev09_coverage_scope.json').read_text(),
+                           object_pairs_hook=no_duplicate_keys)
     excluded = {}
     for name, classification in scope.items():
         if (not isinstance(classification, dict)
@@ -115,7 +125,8 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args(argv)
     try:
-        result = evaluate(json.loads(args.report.read_text()), args.root)
+        result = evaluate(json.loads(args.report.read_text(), object_pairs_hook=no_duplicate_keys),
+                          args.root)
     except (OSError, ValueError, TypeError) as error:
         print('coverage report rejected: ' + str(error), file=sys.stderr)
         return 2

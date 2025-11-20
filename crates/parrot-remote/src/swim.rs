@@ -577,6 +577,18 @@ pub fn decode_gossip(body: &[u8]) -> Result<MembershipGossip, crate::error::Remo
         .map_err(|e| crate::error::RemoteError::Codec(format!("gossip decode: {e}")))
 }
 
+/// Bind the self-reported gossip origin to the authenticated transport peer.
+///
+/// Membership events may describe other nodes, but the envelope itself must
+/// be authored by the node identified by the connection handshake. Without
+/// this check an authenticated peer could make its updates look as if they
+/// came from an arbitrary node and poison diagnostics or downstream routing.
+pub(crate) fn authenticated_origin(gossip: &MembershipGossip, peer: &str) -> bool {
+    !peer.is_empty()
+        && gossip.seen_from == peer
+        && parrot_config::endpoint::validate_node_id(peer).is_ok()
+}
+
 /// 入站 gossip 处理（S1 两级语义核心）。
 ///
 /// - 带事件 → 合并（push 半程）；
@@ -584,15 +596,66 @@ pub fn decode_gossip(body: &[u8]) -> Result<MembershipGossip, crate::error::Remo
 /// - digest 与本地不符 → 返回 true（调用方回 full_sync = pull 半程）。
 pub fn handle_gossip(membership: &mut Membership, g: &MembershipGossip) -> bool {
     for ev in &g.events {
-        membership.merge_event(ev);
+        if gossip_event_is_well_formed(ev) {
+            membership.merge_event(ev);
+        }
     }
     if let Some(full) = &g.full_sync {
         for member in full {
-            membership.merge_event(&MemberEvent::Upsert(member.clone()));
+            if valid_gossip_member(member) {
+                membership.merge_event(&MemberEvent::Upsert(member.clone()));
+            }
         }
         return false; // 对账已完成
     }
     g.digest != membership.digest()
+}
+
+/// Validate the semantic shape of a remote membership record before it enters
+/// the local state machine. Wire decoding only bounds bytes and nesting; it
+/// does not establish that the node identity, endpoint identity and endpoint
+/// scheme agree. Keeping malformed records out of `Membership` prevents later
+/// route projection from carrying poisoned state through the runtime.
+fn valid_gossip_member(member: &Member) -> bool {
+    if parrot_config::endpoint::validate_node_id(&member.node_id).is_err()
+        || member.addr.node_id != member.node_id
+    {
+        return false;
+    }
+    match member.addr.scheme.as_str() {
+        "mem" => true,
+        "tcp" | "quic" => {
+            // Both provisional links and outbound-only owners can lack a
+            // listener. Their identities still participate in discovery;
+            // member_route never turns this sentinel into a dial target.
+            if member.addr.host.is_empty() && member.addr.port == 0 {
+                return true;
+            }
+            if member.addr.port == 0 || member.addr.host.is_empty() || member.addr.host.len() > 253
+            {
+                return false;
+            }
+            if let Ok(ip) = member.addr.host.parse::<std::net::IpAddr>() {
+                return !ip.is_unspecified();
+            }
+            parrot_config::endpoint::SeedEndpoint::parse(
+                &format!(
+                    "{}://{}@{}:{}",
+                    member.addr.scheme, member.node_id, member.addr.host, member.addr.port
+                ),
+                "tcp",
+            )
+            .is_ok_and(|endpoint| endpoint.host.as_deref() == Some(member.addr.host.as_str()))
+        }
+        _ => false,
+    }
+}
+
+fn gossip_event_is_well_formed(event: &MemberEvent) -> bool {
+    match event {
+        MemberEvent::Upsert(member) => valid_gossip_member(member),
+        MemberEvent::Remove(node_id) => parrot_config::endpoint::validate_node_id(node_id).is_ok(),
+    }
 }
 
 /// Preserve a valid discovered hostname without inventing a socket address.
@@ -651,13 +714,8 @@ pub(crate) fn member_route(member: &Member) -> Option<crate::node::NodeEndpoint>
 /// Synchronize a complete endpoint snapshot without DNS. Static seeds and active
 /// connections keep their separate ownership when discovered routes retire.
 pub async fn sync_to_node_table(membership: &tokio::sync::Mutex<Membership>, table: &NodeTable) {
-    let routes = membership
-        .lock()
-        .await
-        .members
-        .values()
-        .filter_map(member_route)
-        .collect();
+    let members = membership.lock().await;
+    let routes = members.members.values().filter_map(member_route).collect();
     table.reconcile_membership(routes);
 }
 
@@ -1003,6 +1061,128 @@ mod tests {
         let got = decode_gossip(&b[1..]).unwrap();
         assert_eq!(got.digest, 42);
         assert_eq!(got.events.len(), 1);
+    }
+
+    #[test]
+    fn incoming_gossip_rejects_invalid_identity_and_endpoint_shapes() {
+        let mut membership = Membership::new(0);
+        let mut mismatched = member("peer", MemberStatus::Alive, 1);
+        mismatched.addr.node_id = "other".into();
+        let mut bad_scheme = member("bad-scheme", MemberStatus::Alive, 1);
+        bad_scheme.addr.scheme = "file".into();
+        let mut zero_port = member("zero-port", MemberStatus::Alive, 1);
+        zero_port.addr.scheme = "tcp".into();
+        zero_port.addr.port = 0;
+        let gossip = MembershipGossip {
+            events: vec![
+                MemberEvent::Upsert(mismatched),
+                MemberEvent::Upsert(bad_scheme),
+                MemberEvent::Upsert(zero_port),
+                MemberEvent::Remove("bad/id".into()),
+            ],
+            seen_from: "sender".into(),
+            digest: membership.digest(),
+            full_sync: None,
+        };
+
+        handle_gossip(&mut membership, &gossip);
+
+        assert!(membership.members.is_empty());
+    }
+
+    #[test]
+    fn invalid_full_sync_members_are_not_published() {
+        let mut membership = Membership::new(0);
+        let mut invalid = member("bad-full", MemberStatus::Alive, 1);
+        invalid.addr.node_id = "different".into();
+        let valid = member("good-full", MemberStatus::Alive, 1);
+        let gossip = MembershipGossip {
+            events: Vec::new(),
+            seen_from: "sender".into(),
+            digest: 0,
+            full_sync: Some(vec![invalid, valid]),
+        };
+
+        handle_gossip(&mut membership, &gossip);
+
+        assert!(!membership.members.contains_key("bad-full"));
+        assert!(membership.members.contains_key("good-full"));
+    }
+
+    #[test]
+    fn network_members_without_listeners_propagate_without_inventing_dial_routes() {
+        for scheme in ["tcp", "quic"] {
+            for incarnation in [0, 1, 253, u64::MAX] {
+                for status in [
+                    MemberStatus::Alive,
+                    MemberStatus::Suspect,
+                    MemberStatus::Dead,
+                ] {
+                    let mut provisional = member("connected-peer", status, incarnation);
+                    provisional.addr.scheme = scheme.into();
+                    provisional.addr.host.clear();
+                    provisional.addr.port = 0;
+                    let invalid = [
+                        Member {
+                            addr: NodeAddrWire {
+                                host: "127.0.0.1".into(),
+                                ..provisional.addr.clone()
+                            },
+                            ..provisional.clone()
+                        },
+                        Member {
+                            addr: NodeAddrWire {
+                                port: 9000,
+                                ..provisional.addr.clone()
+                            },
+                            ..provisional.clone()
+                        },
+                    ];
+                    for full_sync in [false, true] {
+                        let mut membership = Membership::new(0);
+                        let gossip = MembershipGossip {
+                            events: if full_sync {
+                                Vec::new()
+                            } else {
+                                vec![MemberEvent::Upsert(provisional.clone())]
+                            },
+                            seen_from: "relay".into(),
+                            digest: 0,
+                            full_sync: full_sync.then(|| vec![provisional.clone()]),
+                        };
+                        handle_gossip(&mut membership, &gossip);
+                        let expected = membership.local_member(&provisional);
+                        assert_eq!(membership.members.get("connected-peer"), Some(&expected));
+                        assert!(member_route(&provisional).is_none());
+                        for invalid in &invalid {
+                            assert!(!valid_gossip_member(invalid));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gossip_endpoints_preserve_the_same_host_as_route_projection() {
+        for scheme in ["tcp", "quic"] {
+            for host in ["127.0.0.1", "::1", "node.example.org", "node.example.org."] {
+                let mut advertised = member("owner", MemberStatus::Alive, 1);
+                advertised.addr = NodeAddrWire {
+                    node_id: advertised.node_id.clone(),
+                    scheme: scheme.into(),
+                    host: host.into(),
+                    port: 9000,
+                };
+                assert!(valid_gossip_member(&advertised), "{scheme} {host}");
+                assert!(member_route(&advertised).is_some(), "{scheme} {host}");
+                for invalid in ["", "0.0.0.0", "::", "[::1]", "bad/name", "bad host"] {
+                    let mut malformed = advertised.clone();
+                    malformed.addr.host = invalid.into();
+                    assert!(!valid_gossip_member(&malformed), "{scheme} {invalid}");
+                }
+            }
+        }
     }
 
     #[test]

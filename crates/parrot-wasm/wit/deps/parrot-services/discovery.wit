@@ -1,0 +1,26 @@
+package parrot:services@0.1.0;
+
+interface discovery {
+    enum service-error {
+        disabled,
+        denied,
+        invalid-request,
+        invalid-handle,
+        limit,
+        timeout,
+        closed,
+        failed,
+    }
+    record event {
+        registered: bool,
+        path: string,
+    }
+    /// Registers this admitted actor's own path, never a guest-selected path.
+    register: func(key: string, timeout-ms: u32) -> result<_, service-error>;
+    deregister: func(key: string, timeout-ms: u32) -> result<_, service-error>;
+    /// The handle owns a bounded event stream until close or Store retirement.
+    subscribe: func(key: string, timeout-ms: u32) -> result<u64, service-error>;
+    /// None denotes EOF. A timeout consumes no event and keeps the handle live.
+    next: func(handle: u64, timeout-ms: u32) -> result<option<event>, service-error>;
+    close: func(handle: u64) -> result<_, service-error>;
+}

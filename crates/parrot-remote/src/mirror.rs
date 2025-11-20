@@ -22,6 +22,9 @@ use std::{
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+#[cfg(test)]
+pub(crate) mod notification_contracts;
+
 /// Local source prefix matching; the longest policy wins. A shadow may be a
 /// canonical local path or a negotiated direct parrot://node/path destination.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,7 +199,9 @@ struct Entry {
 }
 // A worker may be destroyed while a synchronous encoder runs on another thread.
 // The shared receipt and worker slot retire only after both owners have finished.
+#[derive(Default)]
 struct Admission {
+    closed: bool,
     encoders: usize,
     worker_done: bool,
     permit: Option<OwnedSemaphorePermit>,
@@ -214,8 +219,9 @@ impl Entry {
         if let Some(permit) = permit {
             // A waiter owns its waker, which may synchronously reenter close.
             // Notify with no admission lock; retain the worker slot through wake.
-            self.done.send_replace(true);
-            drop(permit);
+            let cleanup = Cleanup::default();
+            let _ = cleanup.call(|| self.done.send_replace(true));
+            cleanup.dispose(permit);
         }
     }
 }
@@ -234,8 +240,8 @@ impl Drop for Encoding<'_> {
 pub struct WireMirrorHandle(Arc<Entry>);
 impl WireMirrorHandle {
     pub fn close(&self) {
-        let _gate = self.0.admission.lock().unwrap();
-        self.0.cancel.cancel();
+        let mut retiring = RetireMirrors::default();
+        retiring.fence(self);
     }
     /// Offer a local message through its registered codec without transferring
     /// primary ownership. Reserve a worst-case message budget before invoking
@@ -252,7 +258,7 @@ impl WireMirrorHandle {
         }
         let (_encoding, slot, mut bytes) = {
             let mut gate = entry.admission.lock().unwrap();
-            if entry.cancel.is_cancelled() {
+            if gate.closed {
                 return;
             }
             let permits = entry
@@ -298,8 +304,8 @@ impl WireMirrorHandle {
             return;
         };
         drop(bytes.split(entry.options.max_message_bytes - size));
-        let _gate = entry.admission.lock().unwrap();
-        if entry.cancel.is_cancelled() {
+        let gate = entry.admission.lock().unwrap();
+        if gate.closed {
             return;
         }
         let job = Job {
@@ -310,11 +316,15 @@ impl WireMirrorHandle {
             _slot: slot,
             _bytes: bytes,
         };
-        if entry.sender.try_send(job).is_ok() {
+        let (result, wakes) = entry.sender.try_send_deferred(job);
+        if result.is_ok() {
             entry.counters.enqueued.fetch_add(1, Ordering::Relaxed);
         } else {
             entry.counters.full.fetch_add(1, Ordering::Relaxed);
         }
+        drop(gate);
+        cleanup.dispose(wakes);
+        cleanup.dispose(result);
     }
     pub fn stats(&self) -> WireMirrorStats {
         self.0.counters.snapshot()
@@ -324,12 +334,37 @@ impl WireMirrorHandle {
     }
     /// Waits for all accepted jobs and user futures to retire, not just cancellation.
     pub async fn wait_closed(&self) {
-        let mut rx = self.0.closed.clone();
-        while !*rx.borrow_and_update() {
-            if rx.changed().await.is_err() {
-                break;
+        crate::transport::notify_safely(async {
+            let mut rx = self.0.closed.clone();
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
             }
+        })
+        .await;
+    }
+}
+// Commit every fence before notifying. Callers with an outer ownership lock
+// keep this owner outside that guard so early returns also unlock first.
+#[derive(Default)]
+pub(crate) struct RetireMirrors(Vec<WireMirrorHandle>);
+impl RetireMirrors {
+    fn fence(&mut self, handle: &WireMirrorHandle) {
+        handle.0.admission.lock().unwrap().closed = true;
+        self.0.push(handle.clone());
+    }
+    pub(crate) fn notify(&mut self) {
+        let cleanup = Cleanup::default();
+        for handle in self.0.drain(..) {
+            let _ = cleanup.call(|| handle.0.cancel.cancel());
+            cleanup.dispose(handle);
         }
+    }
+}
+impl Drop for RetireMirrors {
+    fn drop(&mut self) {
+        self.notify();
     }
 }
 /// Owns an atomically installed set of policies. Drop removes only these exact
@@ -348,7 +383,7 @@ impl WireMirrorGroup {
             let state = state.lock().unwrap();
             state.open
                 && self.handles.iter().all(|handle| {
-                    !handle.is_closed()
+                    !handle.0.admission.lock().unwrap().closed
                         && state
                             .entries
                             .get(&handle.0.policy.source_prefix)
@@ -364,6 +399,10 @@ impl WireMirrorGroup {
             .cloned()
     }
     pub fn cancel(&self) {
+        let mut retiring = RetireMirrors::default();
+        self.retire_into(&mut retiring);
+    }
+    pub(crate) fn retire_into(&self, retiring: &mut RetireMirrors) {
         if let Some(state) = self.state.upgrade() {
             let mut state = state.lock().unwrap();
             for handle in &self.handles {
@@ -375,14 +414,14 @@ impl WireMirrorGroup {
                 {
                     state.entries.remove(key);
                 }
-                handle.close();
+                retiring.fence(handle);
             }
             if let Some(enabled) = self.enabled.upgrade() {
                 enabled.store(!state.entries.is_empty(), Ordering::Release);
             }
         } else {
             for handle in &self.handles {
-                handle.close();
+                retiring.fence(handle);
             }
         }
     }
@@ -451,6 +490,7 @@ impl WireMirrorRegistry {
         options.validate()?;
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| WireMirrorError::NoRuntime)?;
+        let mut retiring = RetireMirrors::default();
         let mut state = self.state.lock().unwrap();
         if !state.open {
             return Err(WireMirrorError::Closed);
@@ -470,8 +510,7 @@ impl WireMirrorRegistry {
             .entries
             .insert(entry.policy.source_prefix.clone(), entry.clone())
         {
-            let _gate = old.admission.lock().unwrap();
-            old.cancel.cancel();
+            retiring.fence(&WireMirrorHandle(old));
         }
         self.enabled.store(true, Ordering::Release);
         Ok(WireMirrorHandle(entry))
@@ -488,9 +527,8 @@ impl WireMirrorRegistry {
         let entry = Arc::new(Entry {
             policy,
             admission: Mutex::new(Admission {
-                encoders: 0,
-                worker_done: false,
                 permit: Some(permit),
+                ..Admission::default()
             }),
             options,
             sender,
@@ -510,7 +548,8 @@ impl WireMirrorRegistry {
             receiver,
             active: None,
         };
-        self.tasks.spawn_on(worker.run(), runtime);
+        self.tasks
+            .spawn_on(crate::transport::notify_safely(worker.run()), runtime);
         entry
     }
     /// All-or-nothing ownership, without replacing an existing source policy.
@@ -526,6 +565,15 @@ impl WireMirrorRegistry {
         &self,
         previous: Option<&WireMirrorGroup>,
         policies: Vec<(WireMirrorPolicy, WireMirrorOptions)>,
+    ) -> Result<WireMirrorGroup, WireMirrorError> {
+        let mut retiring = RetireMirrors::default();
+        self.replace_group_deferred(previous, policies, &mut retiring)
+    }
+    pub(crate) fn replace_group_deferred(
+        &self,
+        previous: Option<&WireMirrorGroup>,
+        policies: Vec<(WireMirrorPolicy, WireMirrorOptions)>,
+        retiring: &mut RetireMirrors,
     ) -> Result<WireMirrorGroup, WireMirrorError> {
         if policies.len() > 64 {
             return Err(WireMirrorError::RegistryFull);
@@ -548,7 +596,7 @@ impl WireMirrorRegistry {
         if let Some(previous) = previous {
             if !Weak::ptr_eq(&previous.state, &Arc::downgrade(&self.state))
                 || previous.handles.iter().any(|handle| {
-                    handle.is_closed()
+                    handle.0.admission.lock().unwrap().closed
                         || !state
                             .entries
                             .get(&handle.0.policy.source_prefix)
@@ -586,7 +634,7 @@ impl WireMirrorRegistry {
         if let Some(previous) = previous {
             for handle in &previous.handles {
                 state.entries.remove(&handle.0.policy.source_prefix);
-                handle.close();
+                retiring.fence(handle);
             }
         }
         for (policy, options) in policies {
@@ -610,15 +658,14 @@ impl WireMirrorRegistry {
         })
     }
     pub(crate) fn remove(&self, prefix: &str) -> Option<WireMirrorHandle> {
+        let mut retiring = RetireMirrors::default();
         let mut state = self.state.lock().unwrap();
         let entry = state.entries.remove(prefix)?;
-        {
-            let _gate = entry.admission.lock().unwrap();
-            entry.cancel.cancel();
-        }
+        let handle = WireMirrorHandle(entry);
+        retiring.fence(&handle);
         self.enabled
             .store(!state.entries.is_empty(), Ordering::Release);
-        Some(WireMirrorHandle(entry))
+        Some(handle)
     }
     pub(crate) fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
@@ -640,8 +687,8 @@ impl WireMirrorRegistry {
         else {
             return;
         };
-        let _gate = entry.admission.lock().unwrap();
-        if source == entry.policy.shadow_path || entry.cancel.is_cancelled() {
+        let gate = entry.admission.lock().unwrap();
+        if source == entry.policy.shadow_path || gate.closed {
             return;
         }
         let size = payload
@@ -680,27 +727,44 @@ impl WireMirrorRegistry {
             _slot: slot,
             _bytes: bytes,
         };
-        if entry.sender.try_send(job).is_ok() {
+        let (result, wakes) = entry.sender.try_send_deferred(job);
+        if result.is_ok() {
             entry.counters.enqueued.fetch_add(1, Ordering::Relaxed);
         } else {
             entry.counters.full.fetch_add(1, Ordering::Relaxed);
         }
+        drop(gate);
+        drop(state);
+        let cleanup = Cleanup::default();
+        cleanup.dispose(wakes);
+        cleanup.dispose(result);
     }
-    pub(crate) fn close(&self) {
+    pub(crate) fn close_admission(&self) {
         let mut state = self.state.lock().unwrap();
         state.open = false;
         self.enabled.store(false, Ordering::Release);
         for entry in state.entries.values() {
-            let _gate = entry.admission.lock().unwrap();
-            entry.cancel.cancel();
+            entry.admission.lock().unwrap().closed = true;
         }
-        state.entries.clear();
-        self.tasks.close();
+    }
+    pub(crate) fn close(&self) {
+        let mut retiring = RetireMirrors::default();
+        let mut state = self.state.lock().unwrap();
+        state.open = false;
+        self.enabled.store(false, Ordering::Release);
+        for entry in std::mem::take(&mut state.entries).into_values() {
+            retiring.fence(&WireMirrorHandle(entry));
+        }
+        drop(state);
+        let _ = Cleanup::default().call(|| self.tasks.close());
     }
     pub(crate) async fn wait_closed(&self) {
-        self.tasks.wait().await;
-        // Includes local encoders outliving their worker/runtime.
-        let _retired = self.workers.clone().acquire_many_owned(64).await;
+        crate::transport::notify_safely(async {
+            self.tasks.wait().await;
+            // Includes local encoders outliving their worker/runtime.
+            let _retired = self.workers.clone().acquire_many_owned(64).await;
+        })
+        .await;
     }
 }
 impl Drop for WireMirrorRegistry {
@@ -775,23 +839,25 @@ impl Drop for PanicReceipt<'_> {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        let mut gate = self.entry.admission.lock().unwrap();
-        self.entry.cancel.cancel();
-        self.receiver.close();
-        if self.active.take().is_some() {
+        self.entry.admission.lock().unwrap().closed = true;
+        let cleanup = Cleanup::default();
+        let _ = cleanup.call(|| self.entry.cancel.cancel());
+        let _ = cleanup.call(|| self.receiver.close());
+        if let Some(job) = self.active.take() {
             self.entry
                 .counters
                 .cancelled
                 .fetch_add(1, Ordering::Relaxed);
+            cleanup.dispose(job);
         }
-        while self.receiver.try_recv().is_ok() {
+        while let Ok(job) = self.receiver.try_recv() {
             self.entry
                 .counters
                 .cancelled
                 .fetch_add(1, Ordering::Relaxed);
+            cleanup.dispose(job);
         }
-        gate.worker_done = true;
-        drop(gate);
+        self.entry.admission.lock().unwrap().worker_done = true;
         self.entry.finish();
     }
 }

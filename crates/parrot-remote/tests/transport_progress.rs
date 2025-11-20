@@ -470,6 +470,14 @@ async fn direct_connection_rejects_invalid_runtime_limits_without_handshake_or_p
             ..Default::default()
         },
         RuntimeKnobs {
+            outbound_queue: usize::MAX,
+            ..Default::default()
+        },
+        RuntimeKnobs {
+            outbound_queue: tokio::sync::Semaphore::MAX_PERMITS + 1,
+            ..Default::default()
+        },
+        RuntimeKnobs {
             heartbeat_interval: Duration::ZERO,
             ..Default::default()
         },

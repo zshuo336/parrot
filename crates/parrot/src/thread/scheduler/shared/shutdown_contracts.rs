@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicUsize;
 use tokio::sync::Notify;
 
 fn pool() -> Arc<SharedThreadPool> {
-    Arc::new(SharedThreadPool::new(
+    Arc::new(SharedThreadPool::new_unchecked_for_test(
         Some(SharedThreadPoolConfig {
             pool_size: 0,
             burst_workers_max: 0,
@@ -115,10 +115,53 @@ async fn cancelled_waiter_does_not_detach_owned_workers() {
 }
 
 #[tokio::test]
+async fn elastic_probe_preserves_large_backlog_thresholds() {
+    use crate::thread::mailbox::mpsc::MpscMailbox;
+    use parrot_api::address::ActorPath;
+    let cases = [
+        ("zero", Duration::ZERO, 1),
+        ("submicrosecond", Duration::from_nanos(999), 1),
+        ("ordinary", Duration::from_secs(1), 0),
+        ("largest u64 micros", Duration::from_micros(u64::MAX), 0),
+        (
+            "one more microsecond",
+            Duration::new(18_446_744_073_709, 551_616_000),
+            0,
+        ),
+        ("millisecond config", Duration::from_millis(1 << 61), 0),
+        ("Duration::MAX", Duration::MAX, 0),
+    ];
+    let mut observed = Vec::new();
+    let mut expected = Vec::new();
+    for (name, threshold, count) in cases {
+        let pool = SharedThreadPool::new_unchecked_for_test(
+            Some(SharedThreadPoolConfig {
+                pool_size: 0,
+                burst_workers_max: 1,
+                burst_backlog_threshold: threshold,
+                ..Default::default()
+            }),
+            Handle::current(),
+        );
+        let mailbox = Arc::new(MpscMailbox::new(1, ActorPath::placeholder("/threshold")));
+        assert!(pool.scheduling_queue.push(mailbox).is_ok());
+        pool.elastic_controller().probe();
+        observed.push((name, pool.metrics().burst_workers_alive));
+        expected.push((name, count));
+        pool.shutdown(0).await.unwrap();
+        assert_eq!(pool.metrics().burst_workers_alive, 0);
+    }
+    assert_eq!(
+        observed, expected,
+        "first pressure probe expanded prematurely"
+    );
+}
+
+#[tokio::test]
 async fn elastic_retirement_keeps_completed_worker_errors() {
     use crate::thread::mailbox::mpsc::MpscMailbox;
     use parrot_api::address::ActorPath;
-    let pool = SharedThreadPool::new(
+    let pool = SharedThreadPool::new_unchecked_for_test(
         Some(SharedThreadPoolConfig {
             pool_size: 0,
             burst_workers_max: 1,
@@ -260,7 +303,7 @@ async fn forced_abort_is_success_only_after_future_destruction() {
 
 #[tokio::test]
 async fn shutdown_retires_long_sleeping_patrol() {
-    let pool = SharedThreadPool::new(
+    let pool = SharedThreadPool::new_unchecked_for_test(
         Some(SharedThreadPoolConfig {
             pool_size: 0,
             burst_workers_max: 1,
@@ -342,7 +385,7 @@ async fn all_failed_workers_are_consumed_but_diagnostics_stay_bounded() {
 async fn repeated_elastic_retirement_keeps_ownership_and_bounded_history() {
     use crate::thread::mailbox::mpsc::MpscMailbox;
     use parrot_api::address::ActorPath;
-    let pool = SharedThreadPool::new(
+    let pool = SharedThreadPool::new_unchecked_for_test(
         Some(SharedThreadPoolConfig {
             pool_size: 0,
             burst_workers_max: 1,
@@ -447,6 +490,25 @@ struct HostileMailbox {
     disposed: Arc<AtomicUsize>,
     release_panics: bool,
     drop_panics: bool,
+    close_dependency: Option<Arc<CloseDependency>>,
+}
+#[derive(Debug)]
+struct CloseDependency {
+    entered: Notify,
+    retired: tokio::sync::watch::Receiver<bool>,
+    calls: AtomicUsize,
+    cancelled: AtomicUsize,
+}
+struct CloseAttempt<'a> {
+    dependency: &'a CloseDependency,
+    complete: bool,
+}
+impl Drop for CloseAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.dependency.cancelled.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 impl Drop for HostileMailbox {
     fn drop(&mut self) {
@@ -501,6 +563,19 @@ impl Mailbox for HostileMailbox {
         self.inner.seal();
     }
     async fn close(&self) {
+        if let Some(dependency) = &self.close_dependency {
+            let mut attempt = CloseAttempt {
+                dependency,
+                complete: false,
+            };
+            dependency.calls.fetch_add(1, Ordering::SeqCst);
+            dependency.entered.notify_one();
+            let mut retired = dependency.retired.clone();
+            while !*retired.borrow_and_update() {
+                retired.changed().await.unwrap();
+            }
+            attempt.complete = true;
+        }
         self.inner.close().await;
     }
     fn set_processor(&self, processor: Arc<dyn crate::thread::processor::ProcessorInterface>) {
@@ -553,6 +628,7 @@ async fn mailbox_release_and_destructor_failures_do_not_skip_other_resources() {
                 disposed: disposed.clone(),
                 release_panics,
                 drop_panics,
+                close_dependency: None,
             }),
             None,
         )
@@ -568,6 +644,299 @@ async fn mailbox_release_and_destructor_failures_do_not_skip_other_resources() {
     assert_eq!(releases.load(Ordering::SeqCst), 3);
     assert_eq!(pool.status(), SchedulerStatus::Shutdown);
     assert_eq!(result, error(pool.shutdown(0).await));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_shutdown_closes_queued_mailbox_before_releasing_its_arc() {
+    use crate::thread::config::BackpressureStrategy;
+    use crate::thread::mailbox::mpsc::MpscMailbox;
+    use parrot_api::address::ActorPath;
+
+    struct Held {
+        entered: Arc<Notify>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.entered.notify_one();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .expect("host shutdown release");
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let pool = pool();
+    let mailbox = Arc::new(MpscMailbox::new(1, ActorPath::placeholder("/host-drain")));
+    let entered = Arc::new(Notify::new());
+    let (release, held) = std::sync::mpsc::channel();
+    let drops = Arc::new(AtomicUsize::new(0));
+    mailbox
+        .push(
+            Box::new(Held {
+                entered: entered.clone(),
+                release: std::sync::Mutex::new(held),
+                drops: drops.clone(),
+            }),
+            BackpressureStrategy::Error,
+        )
+        .await
+        .unwrap();
+    assert!(pool.scheduling_queue.push(mailbox.clone()).is_ok());
+
+    let owner = pool.clone();
+    let shutdown = tokio::spawn(async move { owner.shutdown(5_000).await });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("host shutdown must use mailbox close cleanup");
+    assert!(!shutdown.is_finished());
+    release.send(()).unwrap();
+    shutdown.await.unwrap().unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(mailbox.is_closed().await);
+    assert_eq!(mailbox.len().await, 0);
+}
+
+async fn expired_grace_keeps_mailbox_drain(kind: usize, hostile: bool) {
+    use crate::thread::{
+        BackpressureStrategy,
+        mailbox::{mpsc::MpscMailbox, spsc::SpscMailbox, spsc_ringbuf::SpscRingbufMailbox},
+        scheduler::queue::Lane,
+    };
+    use parrot_api::address::ActorPath;
+
+    struct Held {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        drops: Arc<AtomicUsize>,
+        hostile: bool,
+    }
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.entered.take().unwrap().send(());
+            self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.hostile, "late mailbox disposal failure");
+        }
+    }
+    struct Release(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+    for source in 0..4 {
+        for cancel in [false, true] {
+            let mut owned = SharedThreadPool::new_unchecked_for_test(
+                Some(SharedThreadPoolConfig {
+                    pool_size: 0,
+                    burst_workers_max: 0,
+                    ..Default::default()
+                }),
+                Handle::current(),
+            );
+            owned.scheduling_queue = Arc::new(SchedulingQueue::with_workers(1, 1));
+            let pool = Arc::new(owned);
+            let path = ActorPath::placeholder("/expired-host-drain");
+            let mailbox: Arc<dyn Mailbox> = match kind {
+                0 => Arc::new(MpscMailbox::new(1, path)),
+                1 => Arc::new(SpscMailbox::new(1, path)),
+                _ => Arc::new(SpscRingbufMailbox::new(1, path)),
+            };
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let release = Release(Some(release));
+            let drops = Arc::new(AtomicUsize::new(0));
+            mailbox
+                .push(
+                    Box::new(Held {
+                        entered: Some(entered),
+                        release: held,
+                        drops: drops.clone(),
+                        hostile,
+                    }),
+                    BackpressureStrategy::Error,
+                )
+                .await
+                .unwrap();
+            match source {
+                0 => pool.scheduling_queue.push(mailbox.clone()).unwrap(),
+                1 | 2 => {
+                    assert!(pool.scheduling_queue.register(&mailbox));
+                    assert!(mailbox.schedule_state().try_enqueue());
+                    if source == 2 {
+                        pool.scheduling_queue
+                            .push(Arc::new(MpscMailbox::new(
+                                1,
+                                ActorPath::placeholder("/resident-filler"),
+                            )))
+                            .unwrap();
+                    }
+                    assert!(pool.scheduling_queue.enqueue_on_worker(
+                        mailbox.clone(),
+                        Lane::Normal,
+                        Some(0),
+                    ));
+                    assert_eq!(pool.scheduling_queue.local_len(), usize::from(source == 1));
+                    assert_eq!(
+                        pool.scheduling_queue.deferred_len(),
+                        usize::from(source == 2)
+                    );
+                }
+                _ => {
+                    // No resident entry: the host path index must also be drained.
+                    pool.scheduled_paths
+                        .lock()
+                        .unwrap()
+                        .insert("/registered".into(), mailbox.clone());
+                }
+            }
+            let owner = pool.clone();
+            let first = tokio::spawn(async move { owner.shutdown(0).await });
+            tokio::time::timeout(Duration::from_secs(3), started)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                first.abort();
+            }
+            // An external fence remains runnable while the destructor is held.
+            let (fence, observed) = tokio::sync::oneshot::channel();
+            let observer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = fence.send(());
+            });
+            let early = tokio::select! {
+                result = pool.shutdown(0) => Some(result),
+                _ = observed => None,
+            };
+            let status = pool.status();
+            let before_release = drops.load(Ordering::SeqCst);
+            drop(release);
+            observer.join().unwrap();
+            let first = first.await;
+            let terminal = tokio::time::timeout(Duration::from_secs(3), pool.shutdown(0))
+                .await
+                .unwrap();
+            let retired_before_terminal = drops.load(Ordering::SeqCst);
+            // This extra close cannot conceal a premature pool completion.
+            let closed = std::panic::AssertUnwindSafe(mailbox.close())
+                .catch_unwind()
+                .await;
+            assert!(
+                early.is_none(),
+                "premature host receipt: kind={kind} source={source} cancel={cancel}"
+            );
+            assert_eq!(status, SchedulerStatus::ShuttingDown);
+            assert_eq!(before_release, 0);
+            assert_eq!(retired_before_terminal, 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(mailbox.is_closed().await);
+            assert_eq!(mailbox.len().await, 0);
+            let message = if hostile {
+                let message = error(terminal);
+                assert!(
+                    message.contains("late mailbox disposal failure"),
+                    "{message}"
+                );
+                assert_eq!(message, error(pool.shutdown(0).await));
+                assert!(closed.is_err());
+                Some(message)
+            } else {
+                terminal.unwrap();
+                closed.unwrap();
+                None
+            };
+            if cancel {
+                assert!(first.unwrap_err().is_cancelled());
+            } else if let Some(message) = message {
+                assert_eq!(error(first.unwrap()), message);
+            } else {
+                first.unwrap().unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_grace_keeps_mpsc_drain_owned_through_cancel_and_repeated_shutdown() {
+    expired_grace_keeps_mailbox_drain(0, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_grace_keeps_spsc_drain_owned_through_cancel_and_repeated_shutdown() {
+    expired_grace_keeps_mailbox_drain(1, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_grace_keeps_ring_drain_owned_through_cancel_and_repeated_shutdown() {
+    expired_grace_keeps_mailbox_drain(2, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_grace_preserves_late_disposal_errors_for_all_shutdown_waiters() {
+    for kind in 0..3 {
+        expired_grace_keeps_mailbox_drain(kind, true).await;
+    }
+}
+
+#[tokio::test]
+async fn grace_expiry_joins_workers_before_finishing_the_original_mailbox_close() {
+    use crate::thread::mailbox::mpsc::MpscMailbox;
+    use parrot_api::address::ActorPath;
+    struct WorkerExit(tokio::sync::watch::Sender<bool>);
+    impl Drop for WorkerExit {
+        fn drop(&mut self) {
+            self.0.send_replace(true);
+        }
+    }
+    let pool = pool();
+    let (retire, retired) = tokio::sync::watch::channel(false);
+    let dependency = Arc::new(CloseDependency {
+        entered: Notify::new(),
+        retired,
+        calls: AtomicUsize::new(0),
+        cancelled: AtomicUsize::new(0),
+    });
+    pool.schedule_now(
+        "/worker-dependent-close",
+        Arc::new(HostileMailbox {
+            inner: MpscMailbox::new(1, ActorPath::placeholder("/worker-dependent-close")),
+            pool: Arc::downgrade(&pool),
+            releases: Arc::default(),
+            disposed: Arc::default(),
+            release_panics: false,
+            drop_panics: false,
+            close_dependency: Some(dependency.clone()),
+        }),
+        None,
+    )
+    .unwrap();
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        let _exit = WorkerExit(retire);
+        started.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    entered.await.unwrap();
+    pool.workers.lock().unwrap().push(worker);
+    tokio::time::timeout(Duration::from_secs(3), pool.shutdown(0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(*dependency.retired.borrow());
+    assert_eq!(dependency.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        dependency.cancelled.load(Ordering::SeqCst),
+        0,
+        "grace expiry must retain the original close futures, not cancel or restart them"
+    );
+    pool.shutdown(0).await.unwrap();
 }
 
 #[tokio::test]
@@ -606,7 +975,7 @@ async fn blocked_retirement_does_not_allow_unbounded_burst_handle_accumulation()
             let _ = self.release.recv_timeout(Duration::from_secs(5));
         }
     }
-    let pool = SharedThreadPool::new(
+    let pool = SharedThreadPool::new_unchecked_for_test(
         Some(SharedThreadPoolConfig {
             pool_size: 0,
             burst_workers_max: 1,

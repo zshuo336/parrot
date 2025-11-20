@@ -1,9 +1,11 @@
 //! Open runtime dispatch through the existing application-facing facade.
 use super::{ActorSystemImpl, ParrotActorSystem, retire_registrations};
+use crate::owned_payload::PublicationInput;
 use parrot_api::{
     engine::{
-        AsyncEngineRuntime, AsyncFactoryRuntime, AsyncLocalRuntime, FactoryOptions, InstanceConfig,
-        LocalRuntimeFactory, RuntimeActor, RuntimeFactory, SpawnOptions,
+        AsyncCohortRuntime, AsyncEngineRuntime, AsyncFactoryRuntime, AsyncLocalRuntime,
+        AsyncRootCohort, FactoryOptions, InstanceConfig, LocalRuntimeFactory, RuntimeActor,
+        RuntimeFactory, SpawnOptions,
     },
     system::{ActorSystem, SystemError, SystemStatus},
     types::{BoxedActorRef, BoxedFuture},
@@ -53,46 +55,85 @@ impl ParrotActorSystem {
         let child_topology = (runtime.as_ref() as &dyn Any)
             .downcast_ref::<Self>()
             .map(|facade| facade.topology.clone());
-        let system = ActorSystemImpl::from_runtime(runtime);
-        let topology = super::topology::mutation();
-        let lifecycle = self.lifecycle.receipt.lock().unwrap();
-        if lifecycle.is_some() {
+        self.register_system(
+            name,
+            PublicationInput::new(ActorSystemImpl::from_runtime(runtime)),
+            child_topology,
+            set_as_default,
+        )
+    }
+    pub(super) fn register_system(
+        &self,
+        name: String,
+        mut system: PublicationInput<ActorSystemImpl>,
+        child_topology: Option<Arc<super::topology::Node>>,
+        set_as_default: bool,
+    ) -> Result<Option<ActorSystemImpl>, SystemError> {
+        // Keep rejected and displaced inputs outside every registry lock scope.
+        let mut retired_gateway = PublicationInput::new(None);
+        let mut retired_remote = PublicationInput::new(None);
+        let mut old = PublicationInput::new(None);
+        let result = (|| {
+            let topology = super::topology::mutation();
+            let lifecycle = self.lifecycle.receipt.lock().unwrap();
+            if lifecycle.is_some() {
+                drop(lifecycle);
+                return Err(SystemError::ShuttingDown);
+            }
+            if child_topology
+                .as_ref()
+                .is_some_and(|child| !self.topology.accepts(child))
+            {
+                return Err(SystemError::InitializationError(
+                    "facade runtime registration would create an ownership cycle".into(),
+                ));
+            }
+            let mut systems = self
+                .systems
+                .write()
+                .map_err(|_| SystemError::Other(anyhow::anyhow!("systems lock poisoned")))?;
+            *retired_gateway.value_mut() = match system.value() {
+                ActorSystemImpl::Thread(thread) => self
+                    .receptionist_gateway()
+                    .and_then(|gateway| thread.swap_receptionist_gateway(gateway)),
+                ActorSystemImpl::Actix(actix) => self
+                    .receptionist_gateway()
+                    .and_then(|gateway| actix.swap_receptionist_gateway(gateway)),
+                ActorSystemImpl::Runtime(_) => None,
+            };
+            *retired_remote.value_mut() = match system.value() {
+                ActorSystemImpl::Thread(thread) => self
+                    .remote_engine_gateway()
+                    .and_then(|gateway| thread.swap_remote_gateway(gateway)),
+                ActorSystemImpl::Actix(actix) => self
+                    .remote_engine_gateway()
+                    .and_then(|gateway| actix.swap_remote_gateway(gateway)),
+                ActorSystemImpl::Runtime(_) => None,
+            };
+            *old.value_mut() = systems.insert(name.clone(), system.take());
+            if set_as_default || self.default_system.read().unwrap().is_none() {
+                *self.default_system.write().unwrap() = Some(name.clone());
+            }
+            self.topology.set(&name, child_topology.as_ref());
+            drop(systems);
             drop(lifecycle);
-            return Err(SystemError::ShuttingDown);
-        }
-        if child_topology
-            .as_ref()
-            .is_some_and(|child| !self.topology.accepts(child))
+            drop(topology);
+            Ok(())
+        })();
+        let input_cleanup = system.retire().map_err(SystemError::ActorError);
+        let service_cleanup = retire_registrations([retired_gateway.take()]);
+        let remote_cleanup = retire_registrations([retired_remote.take()]);
+        if let Err(error) = input_cleanup
+            .and(result)
+            .and(service_cleanup)
+            .and(remote_cleanup)
         {
-            return Err(SystemError::InitializationError(
-                "facade runtime registration would create an ownership cycle".into(),
-            ));
-        }
-        let mut systems = self.systems.write().unwrap();
-        let retired_gateway = match &system {
-            ActorSystemImpl::Thread(thread) => self
-                .receptionist_gateway()
-                .and_then(|gateway| thread.swap_receptionist_gateway(gateway)),
-            ActorSystemImpl::Actix(actix) => self
-                .receptionist_gateway()
-                .and_then(|gateway| actix.swap_receptionist_gateway(gateway)),
-            ActorSystemImpl::Runtime(_) => None,
-        };
-        let old = systems.insert(name.clone(), system);
-        if set_as_default || self.default_system.read().unwrap().is_none() {
-            *self.default_system.write().unwrap() = Some(name.clone());
-        }
-        self.topology.set(&name, child_topology.as_ref());
-        drop(systems);
-        drop(lifecycle);
-        drop(topology);
-        if let Err(error) = retire_registrations([retired_gateway]) {
             // An old registration still belongs to this result path. Retire it
             // outside locks, even when the propagated gateway failed disposal.
-            let _ = retire_registrations([old]);
+            let _ = retire_registrations([old.take()]);
             return Err(error);
         }
-        Ok(old)
+        Ok(old.take())
     }
     /// Capture a runtime without retaining a facade registry lock. Discovery
     /// does not transfer exclusive ownership or bypass the runtime's shutdown.
@@ -131,12 +172,60 @@ impl ParrotActorSystem {
         }
     }
     pub(super) fn own<T: Send + 'static>(&self, value: T) -> crate::owned_payload::OwnedPayload<T> {
-        match &self.runtime {
-            Some(runtime) => {
-                crate::owned_payload::OwnedPayload::new(value, runtime, &self.cleanup_slots)
+        crate::owned_payload::OwnedPayload::new(value, &self.runtime, &self.cleanup_slots)
+    }
+    /// Create a root group on a named engine captured at call time. The group
+    /// retains that engine even when registrations or the default later change.
+    pub fn root_cohort_on(
+        &self,
+        name: &str,
+        strategy: parrot_api::supervisor::SupervisorStrategyType,
+    ) -> BoxedFuture<'_, Result<Arc<dyn AsyncRootCohort>, SystemError>> {
+        self.cohort_selected(self.get_cohort_system(Some(name)), strategy)
+    }
+
+    fn get_cohort_system(&self, name: Option<&str>) -> Result<ActorSystemImpl, SystemError> {
+        let mut system = self.get_creation_system(name)?;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if !seen.insert(system.identity()) {
+                return Err(SystemError::InitializationError(
+                    "facade root cohort selection revisited a runtime".into(),
+                ));
             }
-            None => crate::owned_payload::OwnedPayload::unbound(value),
+            let nested = (system.runtime() as &dyn Any)
+                .downcast_ref::<Self>()
+                .map(|facade| facade.get_creation_system(None));
+            match nested {
+                Some(selected) => system = selected?,
+                None => return Ok(system),
+            }
         }
+    }
+
+    fn cohort_selected(
+        &self,
+        system: Result<ActorSystemImpl, SystemError>,
+        strategy: parrot_api::supervisor::SupervisorStrategyType,
+    ) -> BoxedFuture<'_, Result<Arc<dyn AsyncRootCohort>, SystemError>> {
+        let strategy = self.own(strategy);
+        Box::pin(parrot_api::trace::capture(async move {
+            let system = match system {
+                Ok(system) if !self.lifecycle.started() => system,
+                result => {
+                    let error = result.err().unwrap_or(SystemError::ShuttingDown);
+                    strategy.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(error);
+                }
+            };
+            let Some(runtime) = system.runtime().cohort_runtime() else {
+                strategy.retire().await.map_err(SystemError::ActorError)?;
+                return Err(SystemError::ActorCreationError(
+                    "selected runtime does not expose root cohorts".into(),
+                ));
+            };
+            runtime.root_cohort(strategy.take()).await
+        }))
     }
     /// Named engine creation with a real underlying path. Selection is captured
     /// at call time; later replacement does not redirect this pending creation.
@@ -158,7 +247,7 @@ impl ParrotActorSystem {
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
         let actor = self.own(actor);
         let config = self.own(config);
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             let system = match system {
                 Ok(system) if !self.lifecycle.started() => system,
                 result => {
@@ -177,7 +266,7 @@ impl ParrotActorSystem {
                 .runtime()
                 .spawn(actor.take(), config.take(), options)
                 .await
-        })
+        }))
     }
     /// Named-engine factory creation, preserving the selected runtime's real
     /// logical identity and parent-independent root supervision.
@@ -196,7 +285,7 @@ impl ParrotActorSystem {
         options: FactoryOptions,
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
         let factory = self.own(factory);
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             let system = match system {
                 Ok(system) if !self.lifecycle.started() => system,
                 result => {
@@ -216,7 +305,7 @@ impl ParrotActorSystem {
                 ));
             };
             runtime.spawn_factory(factory.take(), options).await
-        })
+        }))
     }
     /// Named-engine Local factory creation, preserving the selected runtime's real
     /// logical identity and parent-independent root supervision.
@@ -235,7 +324,7 @@ impl ParrotActorSystem {
         options: FactoryOptions,
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
         let factory = self.own(factory);
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             let system = match system {
                 Ok(system) if !self.lifecycle.started() => system,
                 result => {
@@ -255,10 +344,19 @@ impl ParrotActorSystem {
                 ));
             };
             runtime.spawn_local_factory(factory.take(), options).await
-        })
+        }))
     }
 }
 impl AsyncEngineRuntime for ParrotActorSystem {
+    fn cohort_runtime(&self) -> Option<&dyn AsyncCohortRuntime> {
+        self.get_creation_system(None).ok().and_then(|system| {
+            system
+                .runtime()
+                .cohort_runtime()
+                .is_some()
+                .then_some(self as &dyn AsyncCohortRuntime)
+        })
+    }
     fn local_runtime(&self) -> Option<&dyn AsyncLocalRuntime> {
         self.get_creation_system(None).ok().and_then(|system| {
             system
@@ -323,6 +421,15 @@ impl AsyncFactoryRuntime for ParrotActorSystem {
         options: FactoryOptions,
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
         self.factory_selected(self.get_creation_system(None), factory, options)
+    }
+}
+
+impl AsyncCohortRuntime for ParrotActorSystem {
+    fn root_cohort(
+        &self,
+        strategy: parrot_api::supervisor::SupervisorStrategyType,
+    ) -> BoxedFuture<'_, Result<Arc<dyn AsyncRootCohort>, SystemError>> {
+        self.cohort_selected(self.get_cohort_system(None), strategy)
     }
 }
 

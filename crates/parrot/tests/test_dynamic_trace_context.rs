@@ -1036,6 +1036,7 @@ fn native_actix_envelope_constructors_retain_creation_context() {
                 let reply = bounded(poller.scope(native.get_addr().send(wrapper)))
                     .await
                     .unwrap()
+                    .into_inner()
                     .unwrap()
                     .unwrap();
                 assert_eq!(*reply.downcast::<usize>().unwrap(), id);

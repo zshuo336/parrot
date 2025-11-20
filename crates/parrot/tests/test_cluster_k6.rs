@@ -4,6 +4,9 @@
 
 mod common;
 
+#[path = "support/network.rs"]
+mod network_support;
+
 #[allow(unused_imports)]
 use common::*;
 use parrot::system::ParrotActorSystem;
@@ -230,6 +233,9 @@ async fn k6_stopping_one_peer_preserves_other_connection() {
 /// QUIC 全链路冒烟（K3）：A --QUIC--> B ask/echo。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn k6_quic_smoke() {
+    if network_support::skip_udp("QUIC smoke test") {
+        return;
+    }
     // provider 安装在 QuicTransport 构造侧（幂等）
     // B：echo（QUIC listen :0——经 local_addr 取真实端口，消除端口探测竞态）
     let (b, fb, tsb) = spawn_node_quic("k6-qb").await;

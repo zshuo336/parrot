@@ -53,6 +53,7 @@ where
     death_watch: Option<parrot_api::death_watch::DeathWatch>,
     registered: bool,
     stop_request: StopRequest,
+    retirement: Option<crate::children::RetirementReceipt>,
 
     /// Default backpressure strategy for sends
     default_strategy: BackpressureStrategy,
@@ -89,6 +90,7 @@ where
             death_watch: None,
             registered: false,
             stop_request: Default::default(),
+            retirement: None,
             default_strategy,
             default_timeout,
             scheduler,
@@ -119,6 +121,7 @@ where
             death_watch: None,
             registered: true,
             stop_request,
+            retirement: None,
             default_strategy,
             default_timeout,
             scheduler: None,
@@ -128,6 +131,11 @@ where
 
     pub(crate) fn with_death_watch(mut self, watch: parrot_api::death_watch::DeathWatch) -> Self {
         self.death_watch = Some(watch);
+        self
+    }
+
+    pub(crate) fn with_retirement(mut self, lifetime: &crate::children::ChildLifetime) -> Self {
+        self.retirement = Some(lifetime.retirement_receipt());
         self
     }
 
@@ -183,6 +191,17 @@ where
         self.weak_mailbox().upgrade().ok_or(ActorError::Stopped)
     }
 
+    fn own_input<T: Send + 'static>(&self, value: T) -> crate::owned_payload::OwnedPayload<T> {
+        match self.system.upgrade() {
+            Some(system) => crate::owned_payload::OwnedPayload::new(
+                value,
+                &system.runtime_handle,
+                &system.cleanup_slots,
+            ),
+            None => crate::owned_payload::OwnedPayload::unbound(value),
+        }
+    }
+
     fn enqueue_error(
         &self,
         error: crate::thread::error::MailboxError,
@@ -203,9 +222,10 @@ where
         msg: BoxedMessage,
         strategy: BackpressureStrategy,
     ) -> impl std::future::Future<Output = ActorResult<()>> + '_ {
+        let msg = self.own_input(msg);
         parrot_api::trace::capture(async move {
-            let msg = crate::thread::envelope::TraceEnvelope::capture(msg);
             let mailbox = self.mailbox()?;
+            let msg = crate::thread::envelope::TraceEnvelope::capture(msg.take());
             mailbox
                 .push(msg, strategy)
                 .await
@@ -226,9 +246,10 @@ where
         strategy: BackpressureStrategy,
         high_priority: bool,
     ) -> impl std::future::Future<Output = ActorResult<()>> + '_ {
+        let msg = self.own_input(msg);
         parrot_api::trace::capture(async move {
-            let msg = crate::thread::envelope::TraceEnvelope::capture(msg);
             let mailbox = self.mailbox()?;
+            let msg = crate::thread::envelope::TraceEnvelope::capture(msg.take());
             mailbox
                 .push_with_priority(msg, strategy, high_priority)
                 .await
@@ -242,10 +263,7 @@ where
         &self,
         msg: BoxedMessage,
     ) -> impl std::future::Future<Output = ActorResult<()>> + '_ {
-        parrot_api::trace::capture(async move {
-            self.send_with_strategy(msg, self.default_strategy.clone())
-                .await
-        })
+        self.send_with_strategy(msg, self.default_strategy.clone())
     }
 
     /// Ask with explicit strategy and timeout (request-response semantics).
@@ -263,49 +281,53 @@ where
         strategy: BackpressureStrategy,
         timeout_duration: Duration,
     ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + '_ {
+        let msg = self.own_input(msg);
         parrot_api::trace::capture(async move {
-            let (envelope, reply_rx) = AskEnvelope::with_boxed(msg);
+            let (envelope, reply_rx) = AskEnvelope::with_boxed(msg.take());
             self.ask_envelope_with_timeout(envelope, reply_rx, strategy, timeout_duration)
                 .await
         })
     }
 
-    async fn ask_with_options(
+    fn ask_with_options(
         &self,
         msg: BoxedMessage,
         options: MessageOptions,
-    ) -> ActorResult<BoxedMessage> {
-        options.validate_single_attempt()?;
-        let mailbox = self.mailbox()?;
-        if !mailbox.supports_high_priority() {
-            options.validate_fifo()?;
-        }
-        let timeout = options.timeout;
-        let (envelope, reply_rx) = AskEnvelope::with_boxed_options(msg, options);
-        let exchange = async {
-            mailbox
-                .push_ask(envelope, self.default_strategy.clone())
-                .await
-                .map_err(|error| self.enqueue_error(error, "ask"))?;
-            reply_rx.await.map_err(|_| {
-                ActorError::ReplyChannelError(format!(
-                    "Reply channel closed for ask to {}",
-                    self.path
-                ))
-            })?
-        };
-        match timeout {
-            Some(duration) => tokio::time::timeout(duration, exchange)
-                .await
-                .map_err(|_| {
-                    ActorError::TimeoutDetail(format!(
-                        "Request to actor {} timed out after {}ms",
-                        self.path,
-                        duration.as_millis()
+    ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + '_ {
+        let msg = self.own_input(msg);
+        parrot_api::trace::capture(async move {
+            options.validate_single_attempt()?;
+            let mailbox = self.mailbox()?;
+            if !mailbox.supports_high_priority() {
+                options.validate_fifo()?;
+            }
+            let timeout = options.timeout;
+            let (envelope, reply_rx) = AskEnvelope::with_boxed_options(msg.take(), options);
+            let exchange = async {
+                mailbox
+                    .push_ask(envelope, self.default_strategy.clone())
+                    .await
+                    .map_err(|error| self.enqueue_error(error, "ask"))?;
+                reply_rx.await.map_err(|_| {
+                    ActorError::ReplyChannelError(format!(
+                        "Reply channel closed for ask to {}",
+                        self.path
                     ))
-                })?,
-            None => exchange.await,
-        }
+                })?
+            };
+            match timeout {
+                Some(duration) => tokio::time::timeout(duration, exchange)
+                    .await
+                    .map_err(|_| {
+                        ActorError::TimeoutDetail(format!(
+                            "Request to actor {} timed out after {}ms",
+                            self.path,
+                            duration.as_millis()
+                        ))
+                    })?,
+                None => exchange.await,
+            }
+        })
     }
 
     /// Ask with an inline payload, with one deadline for enqueue and reply.
@@ -314,8 +336,9 @@ where
         msg: P,
         timeout_duration: Duration,
     ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + '_ {
+        let msg = self.own_input(msg);
         parrot_api::trace::capture(async move {
-            let (envelope, reply_rx) = AskEnvelope::new_inline(msg);
+            let (envelope, reply_rx) = AskEnvelope::new_inline(msg.take());
             self.ask_envelope_with_timeout(
                 envelope,
                 reply_rx,
@@ -329,14 +352,15 @@ where
     async fn ask_envelope_with_timeout(
         &self,
         envelope: AskEnvelope,
-        reply_rx: tokio::sync::oneshot::Receiver<ActorResult<BoxedMessage>>,
+        reply_rx: crate::thread::reply::ReplyReceiver,
         strategy: BackpressureStrategy,
         timeout_duration: Duration,
     ) -> ActorResult<BoxedMessage> {
+        let envelope = self.own_input(envelope);
         let exchange = async {
             let mailbox = self.mailbox()?;
             mailbox
-                .push_ask(envelope, strategy)
+                .push_ask(envelope.take(), strategy)
                 .await
                 .map_err(|error| self.enqueue_error(error, "ask"))?;
             reply_rx.await.map_err(|_| {
@@ -362,14 +386,7 @@ where
         &self,
         msg: BoxedMessage,
     ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + '_ {
-        parrot_api::trace::capture(async move {
-            self.ask_with_strategy_and_timeout(
-                msg,
-                self.default_strategy.clone(),
-                self.default_timeout,
-            )
-            .await
-        })
+        self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), self.default_timeout)
     }
 
     /// Unbounded ask: enqueue the AskEnvelope and await the reply channel
@@ -382,11 +399,11 @@ where
         msg: BoxedMessage,
         strategy: BackpressureStrategy,
     ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + '_ {
+        let msg = self.own_input(msg);
         parrot_api::trace::capture(async move {
             let mailbox = self.mailbox()?;
 
-            let (envelope, reply_rx) = AskEnvelope::with_boxed(msg);
-
+            let (envelope, reply_rx) = AskEnvelope::with_boxed(msg.take());
             mailbox
                 .push_ask(envelope, strategy)
                 .await
@@ -408,10 +425,7 @@ where
         msg: BoxedMessage,
         timeout_duration: Duration,
     ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + '_ {
-        parrot_api::trace::capture(async move {
-            self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), timeout_duration)
-                .await
-        })
+        self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), timeout_duration)
     }
 }
 
@@ -423,6 +437,17 @@ where
         + Sync
         + 'static,
 {
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        match &self.retirement {
+            Some(receipt) => match receipt.borrow().clone() {
+                Some(result) => parrot_api::address::RetirementStatus::Retired(
+                    result.map_err(crate::error_receipt::ActorReceipt::into_error),
+                ),
+                None => parrot_api::address::RetirementStatus::Pending,
+            },
+            None => parrot_api::address::RetirementStatus::Unsupported,
+        }
+    }
     fn death_watch(&self) -> Option<parrot_api::death_watch::DeathWatch> {
         self.death_watch.clone()
     }
@@ -432,9 +457,7 @@ where
         // ask. No implicit engine default timeout — callers who need a
         // bound use send_with_timeout(Some(d)); fire-and-forget uses
         // `deliver`.
-        Box::pin(parrot_api::trace::capture(async move {
-            self.ask_unbounded(msg, self.default_strategy.clone()).await
-        }))
+        Box::pin(self.ask_unbounded(msg, self.default_strategy.clone()))
     }
 
     fn send_with_timeout<'a>(
@@ -442,18 +465,17 @@ where
         msg: BoxedMessage,
         timeout_duration: Option<Duration>,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(parrot_api::trace::capture(async move {
-            match timeout_duration {
-                Some(duration) => {
-                    self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), duration)
-                        .await
-                }
-                None => {
-                    // Aligned with `send`: unbounded ask.
-                    self.ask_unbounded(msg, self.default_strategy.clone()).await
-                }
+        match timeout_duration {
+            Some(duration) => Box::pin(self.ask_with_strategy_and_timeout(
+                msg,
+                self.default_strategy.clone(),
+                duration,
+            )),
+            None => {
+                // Aligned with `send`: unbounded ask.
+                Box::pin(self.ask_unbounded(msg, self.default_strategy.clone()))
             }
-        }))
+        }
     }
 
     fn send_with_options<'a>(
@@ -461,16 +483,11 @@ where
         msg: BoxedMessage,
         options: MessageOptions,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(parrot_api::trace::capture(async move {
-            self.ask_with_options(msg, options).await
-        }))
+        Box::pin(self.ask_with_options(msg, options))
     }
 
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(parrot_api::trace::capture(async move {
-            self.send_with_strategy(msg, self.default_strategy.clone())
-                .await
-        }))
+        Box::pin(self.send_with_strategy(msg, self.default_strategy.clone()))
     }
 
     fn deliver_with_options<'a>(
@@ -478,13 +495,14 @@ where
         msg: BoxedMessage,
         options: MessageOptions,
     ) -> BoxedFuture<'a, ActorResult<()>> {
+        let msg = self.own_input(msg);
         Box::pin(parrot_api::trace::capture(async move {
-            let msg = crate::thread::envelope::TraceEnvelope::capture(msg);
             options.validate_single_attempt()?;
             let mailbox = self.mailbox()?;
             if !mailbox.supports_high_priority() {
                 options.validate_fifo()?;
             }
+            let msg = crate::thread::envelope::TraceEnvelope::capture(msg.take());
             let delivery = async {
                 mailbox
                     .push_with_priority(
@@ -506,7 +524,7 @@ where
     }
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             if self.registered {
                 // Registry-owned stop reservation publishes the receipt while
                 // it still owns the registration. A reference must not reserve
@@ -536,7 +554,7 @@ where
             // operation to join; retain their mailbox-only close behavior.
             self.mailbox()?.close().await;
             Ok(())
-        })
+        }))
     }
 
     fn path(&self) -> String {
@@ -576,6 +594,7 @@ where
             death_watch: self.death_watch.clone(),
             registered: self.registered,
             stop_request: self.stop_request.clone(),
+            retirement: self.retirement.clone(),
             default_strategy: self.default_strategy.clone(),
             default_timeout: self.default_timeout,
             scheduler: self.scheduler.clone(),

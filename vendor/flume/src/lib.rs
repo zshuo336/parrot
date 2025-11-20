@@ -398,7 +398,7 @@ impl<T> Hook<T, SyncSignal> {
 
 #[cfg(feature = "spin")]
 #[inline]
-fn wait_lock<T>(lock: &Spinlock<T>) -> SpinlockGuard<T> {
+fn wait_lock<T>(lock: &Spinlock<T>) -> SpinlockGuard<'_, T> {
     // Some targets don't support `thread::sleep` (e.g. the `wasm32-unknown-unknown` target when
     // running in the main thread of a web browser) so we only use it on targets where we know it
     // will work
@@ -677,19 +677,26 @@ impl<T> Shared<T> {
     /// Disconnect anything listening on this channel (this will not prevent receivers receiving
     /// msgs that have already been sent)
     fn disconnect_all(&self) {
-        self.disconnected.store(true, Ordering::Relaxed);
+        drop(self.disconnect_deferred());
+    }
 
+    fn disconnect_deferred(&self) -> DeferredSendWakes<T> {
         let mut wakes = DeferredSendWakes::new();
         let mut chan = wait_lock(&self.chan);
-        chan.pull_pending(false, &mut wakes);
-        if let Some((_, sending)) = chan.sending.as_ref() {
-            for hook in sending {
-                wakes.push(hook.clone());
+        if !self.disconnected.swap(true, Ordering::SeqCst) {
+            // Pending sends retain their values in their own hooks. Moving any
+            // into the queue here can refill a queue its owner already drained.
+            if let Some((_, sending)) = chan.sending.as_mut() {
+                for hook in sending.drain(..) {
+                    wakes.push(hook);
+                }
+            }
+            for hook in chan.waiting.drain(..) {
+                wakes.push(hook);
             }
         }
-        for hook in &chan.waiting {
-            wakes.push(hook.clone());
-        }
+        drop(chan);
+        wakes
     }
 
     fn is_disconnected(&self) -> bool {

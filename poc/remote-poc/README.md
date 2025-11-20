@@ -49,7 +49,7 @@ Rust `FrameSender::send` 在等待队列容量前校验帧类型与完整 body �
 不提供网关 actor 生命周期协议。反向请求表最多 128 项，JVM/Ray 未完成项随连接退出清理，
 Erlang 另有 5 秒期限。这些边界不等于生产就绪，也不能作为 WAN、鉴权或性能验收。
 
-第225批的集群 POC 使用实际收发循环和关联 ACK：直接链路分区时经 helper 探测，helper
+第225批引入的集群 POC 使用实际收发循环和关联 ACK：直接链路分区时经 helper 探测，helper
 必须收到目标回复才能报告成功。bus 每节点队列最多64帧，单节点最多128个未完成探测、
 32个 helper 任务；超时预算由请求方传递。runtime 的 Drop 请求清理，shutdown 等待
 接收循环和 helper 任务结束。成员按 incarnation 和状态等级单调合并，自身反驳超过
@@ -58,9 +58,17 @@ Erlang 另有 5 秒期限。这些边界不等于生产就绪，也不能作为 
 Receptionist 返回带 revision 的当前快照：初次 recv 包括现有服务；慢消费者合并中间
 版本并保留最新状态，不提供每次历史变更的日志。register/unregister 返回是否实际改变；
 remove_node 撤销该节点所有服务；重复注册不增版本。订阅 Drop 回收观察者及空 key。
-示例 `poc/Mx-poc/examples/cluster.rs` 实际执行直接失败、间接成功、完整分区失败和服务撤销。
-这是进程内协议实验，调用方显式安排 probe/gossip 和 Suspect/Dead 决策；没有周期探测、
-自动 suspicion 定时器或真实 WAN/鉴权认证，不能当作生产集群认证。
+当前 `SwimNode::start` / `start_with` 已运行拥有式周期探测、间接探测、全量 gossip 和
+Suspect 到期；只有 `start_manual` 保留调用方显式驱动模式。默认 probe 间隔/期限均为
+500 ms，Suspect 期限3秒，gossip 间隔200 ms、fanout 3；这些是本地实验配置，不是 WAN SLO。
+探测和 gossip 使用轮转游标；重复怀疑不能延长期限，旧 incarnation 的超时不能指控新代。
+Dead 墓碑仍参与 gossip，分区愈合后由更高 incarnation 反驳恢复 Alive。
+可选 `ClusterBindings` 将本观察者的 Dead 传播到 Receptionist/PrefixRouter，撤销旧服务/
+路由和相应中继请求；Suspect 保留路由。恢复仅解除拒绝注册，不复活旧服务公告，须重新注册。
+示例 `poc/Mx-poc/examples/cluster.rs` 实际执行自动视图收敛、直接失败但间接成功、分区后的
+自动服务撤销、愈合后的反驳和重新注册，最后等待全部 runtime 退出。
+这是最多1024成员、每节点64帧队列的进程内协议实验；没有真实 WAN、鉴权、生产自动接管
+或性能认证。它也不接通 `crates/parrot-remote` 的实际网络成员协议。
 
 第226批已修复 core-lab 的 beam-sched：真实预算轮转、消息内可恢复处理、高优插入及低优
 防饥饿、每actor串行、回调不持全局锁、死亡释放heap与队列，以及shutdown唤醒并join worker。
@@ -90,9 +98,15 @@ remove_node 撤销该节点所有服务；重复注册不增版本。订阅 Drop
 两个真实后端。运行 `cargo run --locked --manifest-path poc/Mx-poc/core-lab/Cargo.toml -p derive-decouple --example neutral`。
 注册token退出撤销具名工厂；注册不是全局runtime目录。当前独立workspace为7个crate。
 
-待继续修复和验证：core-lab的生产接线、异步/local接口、远程与性能边界，以及
-`bench/actix-bench` 的业务正确性和测量窗口。
+core-lab 的7个crate是独立实验，不是生产 crate 的替代实现。生产已有 typed、factory、
+监督与引擎中立入口，不能把实验“未接入”误读为生产完全没有相应能力；通用迁移仍须
+分别核对所有权、生命周期、异步/local接口、远程和性能合同。
+`bench/actix-bench` 已有实际回复/校验和、队列 barrier、固定工作量和退休检查，不能继续
+列为完全没有业务正确性验证；当前公平性能比较与 M4 原门槛仍归 K22，历史测量不认证新源码。
 旧 2026-10-03 “全绿”陈述不能证明这些能力。
+
+上述 POC、进程回收和生产运行时分别验收。K11/K12/K13/K16/K19/K21/K22/K26 的完整
+生命周期、真实网络故障、安全、跨语言、覆盖、性能和平台矩阵不由本文或单项 POC 关闭。
 
 本轮证据和范围见 `docs/review/independent-2026-10-08/standalone-poc-224/VERIFICATION.md`。
 集群修复证据见 `docs/review/independent-2026-10-08/poc-cluster-225/VERIFICATION.md`。

@@ -64,15 +64,21 @@ pub(super) fn validate_journal(
     }
     Ok(())
 }
-fn desired_key(manifest: &AppManifest) -> Result<String, String> {
+fn desired_key(manifest: &AppManifest, limits: &ApplicationLimits) -> Result<String, String> {
     Ok(format!(
         "{:x}",
-        Sha256::digest(manifest.to_toml().map_err(|e| e.to_string())?.as_bytes())
+        Sha256::digest(
+            manifest
+                .to_toml_with_limits(limits)
+                .map_err(|e| e.to_string())?
+                .as_bytes()
+        )
     ))
 }
 fn project(
     manifest: &AppManifest,
     observed: &ObservedState,
+    limits: &ApplicationLimits,
 ) -> Result<BTreeMap<String, Vec<MirrorPolicySpec>>, String> {
     let mut nodes = BTreeMap::<String, Vec<MirrorPolicySpec>>::new();
     for mirror in &manifest.mirrors {
@@ -99,8 +105,12 @@ fn project(
             .component_nodes
             .get(&shadow.name)
             .ok_or("missing shadow node")?;
-        let sources = source.instance_paths().map_err(|e| e.to_string())?;
-        let shadows = shadow.instance_paths().map_err(|e| e.to_string())?;
+        let sources = source
+            .instance_paths_with_limits(limits)
+            .map_err(|e| e.to_string())?;
+        let shadows = shadow
+            .instance_paths_with_limits(limits)
+            .map_err(|e| e.to_string())?;
         for (index, source_prefix) in sources.into_iter().enumerate() {
             let spec = MirrorPolicySpec {
                 source_prefix,
@@ -202,16 +212,35 @@ impl MirrorSupervisor {
     ) -> Result<ReconcileReport, String> {
         self.inner.require_current()?;
         let components = self.inner.reconcile_components(observed);
-        let desired = desired_key(self.desired())?;
+        let desired = desired_key(self.desired(), &self.inner.limits)?;
         let projection = if components.converged {
-            project(self.desired(), observed)
+            project(self.desired(), observed, &self.inner.limits)
         } else {
             Ok(BTreeMap::new())
         };
+        // A transient component/link observation is not an empty mirror
+        // configuration. Preserve an already-applied responsibility for the
+        // same desired revision until a complete, authenticated projection is
+        // available. A changed desired hash still retires the old session.
+        let projection_ready = components.converged && projection.is_ok();
+        let transient_observation =
+            !projection_ready && (!observed.links_known || !observed.live_nodes.is_empty());
         let wanted = projection.as_ref().cloned().unwrap_or_default();
         let mut ready = true;
         let existing: Vec<_> = self.inner.state.mirrors.keys().cloned().collect();
         for node in existing {
+            let existing_desired = self.inner.state.mirrors[&node].desired.clone();
+            if transient_observation
+                && existing_desired == desired
+                && self.inner.state.mirrors[&node].phase != MirrorIntentPhase::Closing
+            {
+                // Keep the durable ownership and the remote policy. The
+                // component supervisor will report the transient condition;
+                // mirror retirement would turn that observation gap into a
+                // real business outage. A persisted Closing decision must
+                // continue independently of placement/health observations.
+                continue;
+            }
             ready &= self
                 .progress(&node, wanted.get(&node), &desired, remote)
                 .await?;
@@ -429,6 +458,34 @@ mod tests {
     fn manifest() -> AppManifest {
         AppManifest::from_toml("name='receipt-test'\nversion='1.0.0'\n[[components]]\nname='source'\nengine='parrot'\nartifact={Props={factory='test'}}\n[[components]]\nname='shadow'\nengine='parrot'\nartifact={Props={factory='test'}}\n[[mirrors]]\nsource='source'\nshadow='shadow'\n").unwrap()
     }
+    #[test]
+    fn desired_identity_keeps_legacy_canonical_bytes() {
+        let mut manifest = manifest();
+        manifest.components[0].config = Some(
+            toml::from_str(
+                "value=nan\nwhen=2026-11-13T00:00:00Z\nempty={}\n[\"dot.key\"]\ntext='中文'",
+            )
+            .unwrap(),
+        );
+        let legacy = toml::to_string(&manifest).unwrap();
+        let limits = ApplicationLimits {
+            max_source_bytes: legacy.len() as u64,
+            ..Default::default()
+        };
+        assert_eq!(
+            desired_key(&manifest, &limits).unwrap(),
+            format!("{:x}", Sha256::digest(legacy.as_bytes()))
+        );
+        assert!(desired_key(
+            &manifest,
+            &ApplicationLimits {
+                max_source_bytes: limits.max_source_bytes - 1,
+                ..limits
+            }
+        )
+        .unwrap_err()
+        .contains("source bytes budget exceeded"));
+    }
     fn controller(store: Arc<FaultStore>) -> MirrorSupervisor {
         MirrorSupervisor {
             inner: AppSupervisor::with_executor(
@@ -465,7 +522,7 @@ mod tests {
             fail: AtomicBool::new(false),
         });
         let mut c = controller(store.clone());
-        let key = desired_key(c.desired()).unwrap();
+        let key = desired_key(c.desired(), &c.inner.limits).unwrap();
         let session = client
             .control_mirror(&node.config.node_id, MirrorControl::Candidate)
             .await

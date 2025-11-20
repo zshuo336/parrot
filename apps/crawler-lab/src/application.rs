@@ -19,7 +19,7 @@ use parrot_app::{
         ThreadPropsSpawner,
     },
     manifest::{wire_endpoint, AppManifest, ArtifactRef, EngineKind, InstancePolicy},
-    planner::{plan, LocalTopology},
+    planner::{plan, LocalNodeTopology},
 };
 use std::{
     path::Path,
@@ -250,7 +250,9 @@ fn prepare(
             return Err(format!("missing business wire {source}").into());
         }
     }
-    plan(&manifest, &LocalTopology)?;
+    // Runtime identity/role are resolved in execute; prepare only validates the
+    // manifest's structure, independent of the eventual host configuration.
+    parrot_app::manifest::validate(&manifest).map_err(|errors| format!("{errors:?}"))?;
     Ok((manifest, name, workload))
 }
 
@@ -301,12 +303,13 @@ async fn execute(
             return Err("query coordination paths must not already exist".into());
         }
     }
-    let plan = plan(&manifest, &LocalTopology)?;
     let mut base = parrot_config::ParrotConfig::builder()
         .remote_node_id("crawler-lab")
         .remote_bind(bind.to_string());
     base.remote.security.mode = Some("insecure-development".into());
     let resolved = effective_config(&manifest, &base)?;
+    let topology = LocalNodeTopology::from_resolved(&resolved);
+    let plan = plan(&manifest, &topology)?;
     let remote_config =
         parrot_remote::RemoteConfig::from_resolved_async(&resolved, Duration::from_secs(5)).await?;
     #[cfg(unix)]
@@ -345,7 +348,7 @@ async fn execute(
         spawner = unsafe { spawner.with_trusted_dylib(digest) }?;
     }
     let deployer = LocalDeployer {
-        topology: &LocalTopology,
+        topology: &topology,
         gateway_factory: &gateway,
         parrot_spawner: &spawner,
     };

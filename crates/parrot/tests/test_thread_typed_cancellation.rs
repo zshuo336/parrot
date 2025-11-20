@@ -126,8 +126,21 @@ fn isolated(name: &str, live: bool, panics: bool) {
         println!("HOST_CANCEL_READY {name}");
         runtime.shutdown_timeout(Duration::from_secs(3));
         let deadline = Instant::now() + Duration::from_secs(2);
-        while actor_drops.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+        let retirement = loop {
+            match reference.retirement_status() {
+                parrot_api::address::RetirementStatus::Retired(result) => break result,
+                parrot_api::address::RetirementStatus::Pending if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                status => panic!("actual retirement did not complete: {status:?}"),
+            }
+        };
+        assert_eq!(retirement.is_err(), panics, "{retirement:?}");
+        if let Err(error) = retirement {
+            assert!(
+                error.to_string().contains("cancelled destructor panic"),
+                "{error}"
+            );
         }
         assert_eq!(actor_drops.load(Ordering::SeqCst), 1, "actor must retire");
         assert_eq!(

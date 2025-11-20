@@ -1,17 +1,19 @@
 //! S4 · federation-lab composegen（DEV_06 §5.1）。
 //!
-//! 生成 50 集群 × 200 节点 docker compose 拓扑：
-//! - 每容器跑 1 个 supervisor 进程 × N 逻辑节点（容器复用进程模拟——
-//!   默认折叠 4:1，即每容器 4 逻辑节点，50×50 容器 = 10k 容器承载
-//!   50×200 逻辑节点）；
-//! - 拓扑：hub-spoke（每 realm 一个 hub border）+ realm 间 full-mesh
-//!   route-reflector 会话（RouteReflector——F6）；
-//! - CI 缩减模式：`--clusters 10`（07 §14.4 建议 CI 用 10 集群版）。
+//! 50×200 个逻辑节点按4:1规划为2500个容器。输出为JSON（YAML 1.2子集），
+//! 包含容器和折叠数量；这不是已接通supervisor、节点发现及RR会话的部署证明。
+//! 完整折叠运行与网络规模验收仍属于DEV_06交付目标。
 //!
 //! 用法：cargo run --manifest-path tools/federation-lab/Cargo.toml -- composegen
 //!      [--clusters N] [--nodes-per-cluster N] [--fold K] [--out FILE]
 
-use std::fmt::Write as _;
+use serde_json::json;
+use std::{io, path::PathBuf};
+
+pub const MAX_COMPOSE_CONTAINERS: usize = 10_000;
+pub const MAX_COMPOSE_LOGICAL_NODES: usize = 1_000_000;
+pub const MAX_FOLD: usize = 4;
+const FIRST_HUB_PORT: usize = 7000;
 
 /// 生成参数。
 #[derive(Debug, Clone)]
@@ -32,7 +34,7 @@ pub enum Output {
     /// 返回 YAML 字符串（测试/孪生复用——不落盘）。
     Buffer,
     /// 落盘路径（CLI 用）。
-    File(String),
+    File(PathBuf),
 }
 
 /// 生成结果统计。
@@ -85,28 +87,30 @@ impl ComposeGenConfig {
     }
 
     /// 容器总数（每集群 nodes_per_cluster/fold 容器，向上取整）。
-    pub fn containers_per_cluster(&self) -> usize {
-        self.nodes_per_cluster.div_ceil(self.fold)
+    pub fn containers_per_cluster(&self) -> io::Result<usize> {
+        self.stats()?;
+        Ok(self.nodes_per_cluster.div_ceil(self.fold))
     }
 
-    pub fn total_containers(&self) -> usize {
-        self.containers_per_cluster() * self.clusters
+    pub fn total_containers(&self) -> io::Result<usize> {
+        Ok(self.stats()?.containers)
     }
 
-    pub fn total_logical_nodes(&self) -> usize {
-        self.nodes_per_cluster * self.clusters
+    pub fn total_logical_nodes(&self) -> io::Result<usize> {
+        Ok(self.stats()?.logical_nodes)
     }
 
     /// RR full-mesh 会话数。
-    pub fn rr_sessions(&self) -> usize {
-        self.clusters * (self.clusters - 1) / 2
+    pub fn rr_sessions(&self) -> io::Result<usize> {
+        Ok(self.stats()?.rr_sessions)
     }
 
     /// 展开全部容器（fold 模式：每容器 fold 个逻辑节点）。
-    pub fn containers(&self) -> Vec<ContainerSpec> {
-        let mut out = Vec::new();
+    pub fn containers(&self) -> io::Result<Vec<ContainerSpec>> {
+        let stats = self.stats()?;
+        let per = self.nodes_per_cluster.div_ceil(self.fold);
+        let mut out = Vec::with_capacity(stats.containers);
         for c in 0..self.clusters {
-            let per = self.containers_per_cluster();
             for i in 0..per {
                 let is_hub = i == 0;
                 // 折叠：最后一容器可能少折（200 % 4 == 0 常态整除）
@@ -120,7 +124,7 @@ impl ComposeGenConfig {
                     cluster: c,
                     logical_nodes: logical,
                     is_hub,
-                    port: is_hub.then_some(7000 + c as u16),
+                    port: is_hub.then_some((FIRST_HUB_PORT + c) as u16),
                     depends_on: if is_hub {
                         vec![]
                     } else {
@@ -129,60 +133,108 @@ impl ComposeGenConfig {
                 });
             }
         }
-        out
+        Ok(out)
     }
 
     /// 生成 compose YAML（不落盘——测试断言拓扑结构）。
-    pub fn render_yaml(&self) -> String {
-        let mut y = String::new();
-        let _ = writeln!(y, "# parrot federation-lab composegen (auto-generated)");
-        let _ = writeln!(
-            y,
-            "# {} clusters × {} nodes (fold {}:{}), realm '{}'",
-            self.clusters, self.nodes_per_cluster, 1, self.fold, self.realm
-        );
-        let _ = writeln!(y, "services:");
-        for ct in self.containers() {
-            let _ = writeln!(y, "  {}:", ct.name);
-            let _ = writeln!(y, "    image: parrot-node:latest");
-            let _ = write!(y, "    environment:");
-            let _ = write!(y, " PARROT_CLUSTER=c{}", ct.cluster);
-            let _ = write!(y, " PARROT_NODES={}", ct.logical_nodes);
-            let _ = writeln!(y, " PARROT_REALM={}", self.realm);
+    pub fn render_yaml(&self) -> io::Result<String> {
+        let mut services = serde_json::Map::new();
+        for ct in self.containers()? {
+            let mut service = json!({
+                "image": "parrot-node:latest",
+                "environment": {
+                    "PARROT_CLUSTER": format!("c{}", ct.cluster),
+                    "PARROT_NODES": ct.logical_nodes.to_string(),
+                    "PARROT_REALM": self.realm,
+                },
+            });
             if ct.is_hub {
-                let _ = writeln!(y, "    ports:");
-                let _ = writeln!(y, "      - \"{}:{}\"", ct.port.unwrap(), ct.port.unwrap());
-                let _ = writeln!(y, "    command: [\"parrot-node\", \"--role\", \"hub\"]");
+                let port = ct.port.ok_or_else(|| io::Error::other("hub has no port"))?;
+                service["ports"] = json!([format!("{port}:{port}")]);
+                service["command"] = json!(["parrot-node", "--role", "hub"]);
             } else {
-                let _ = writeln!(y, "    command: [\"parrot-node\", \"--role\", \"worker\"]");
-                let _ = writeln!(y, "    depends_on:");
-                for d in &ct.depends_on {
-                    let _ = writeln!(y, "      - {}", d);
-                }
+                service["command"] = json!(["parrot-node", "--role", "worker"]);
+                service["depends_on"] = json!(ct.depends_on);
             }
+            services.insert(ct.name, service);
         }
-        y
+        let document = json!({
+            "x-parrot-model": {
+                "scope": "topology-plan-only",
+                "clusters": self.clusters,
+                "nodes_per_cluster": self.nodes_per_cluster,
+                "fold": self.fold,
+                "realm": self.realm,
+            },
+            "services": services,
+        });
+        serde_json::to_string_pretty(&document)
+            .map(|text| text + "\n")
+            .map_err(io::Error::other)
     }
 
     /// 拓扑统计（G5 门禁记录用——不依赖 Docker 存在）。
-    pub fn stats(&self) -> TopologyStats {
-        TopologyStats {
-            clusters: self.clusters,
-            containers: self.total_containers(),
-            logical_nodes: self.total_logical_nodes(),
-            hubs: self.clusters,
-            rr_sessions: self.rr_sessions(),
+    pub fn stats(&self) -> io::Result<TopologyStats> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        if self.clusters == 0 || self.nodes_per_cluster == 0 {
+            return Err(invalid("clusters and nodes_per_cluster must be positive"));
         }
+        if !(1..=MAX_FOLD).contains(&self.fold) {
+            return Err(invalid("fold must be in 1..=4"));
+        }
+        if self.clusters > usize::from(u16::MAX) - FIRST_HUB_PORT + 1 {
+            return Err(invalid("hub ports exceed 65535"));
+        }
+        if self.realm.is_empty()
+            || self.realm.len() > 32
+            || !self
+                .realm
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || self.realm.starts_with('-')
+            || self.realm.ends_with('-')
+        {
+            return Err(invalid(
+                "realm must contain 1..=32 lowercase ASCII letters, digits or inner hyphens",
+            ));
+        }
+        if matches!(&self.output, Output::File(path) if path.as_os_str().is_empty()) {
+            return Err(invalid("output path must not be empty"));
+        }
+        let containers = self
+            .nodes_per_cluster
+            .div_ceil(self.fold)
+            .checked_mul(self.clusters)
+            .filter(|&count| count <= MAX_COMPOSE_CONTAINERS)
+            .ok_or_else(|| invalid("container count exceeds 10000"))?;
+        let logical_nodes = self
+            .nodes_per_cluster
+            .checked_mul(self.clusters)
+            .filter(|&count| count <= MAX_COMPOSE_LOGICAL_NODES)
+            .ok_or_else(|| invalid("logical node count exceeds 1000000"))?;
+        let rr_sessions = self
+            .clusters
+            .checked_mul(self.clusters - 1)
+            .ok_or_else(|| invalid("RR session count overflow"))?
+            / 2;
+        Ok(TopologyStats {
+            clusters: self.clusters,
+            containers,
+            logical_nodes,
+            hubs: self.clusters,
+            rr_sessions,
+        })
     }
 
     /// 落盘（CLI 模式）。
     pub fn write_out(&self) -> std::io::Result<(TopologyStats, usize)> {
+        let stats = self.stats()?;
         match &self.output {
-            Output::Buffer => Ok((self.stats(), 0)),
+            Output::Buffer => Ok((stats, 0)),
             Output::File(path) => {
-                let y = self.render_yaml();
+                let y = self.render_yaml()?;
                 std::fs::write(path, &y)?;
-                Ok((self.stats(), y.len()))
+                Ok((stats, y.len()))
             }
         }
     }
@@ -196,7 +248,7 @@ mod tests {
     #[test]
     fn s4_topology_scale() {
         let cfg = ComposeGenConfig::fifty_clusters();
-        let s = cfg.stats();
+        let s = cfg.stats().unwrap();
         assert_eq!(s.clusters, 50);
         assert_eq!(s.logical_nodes, 10_000);
         assert_eq!(s.containers, 2500);
@@ -209,8 +261,8 @@ mod tests {
     #[test]
     fn s4_fold_semantics() {
         let cfg = ComposeGenConfig::fifty_clusters();
-        assert_eq!(cfg.containers_per_cluster(), 50);
-        let containers = cfg.containers();
+        assert_eq!(cfg.containers_per_cluster().unwrap(), 50);
+        let containers = cfg.containers().unwrap();
         assert_eq!(containers.len(), 2_500);
         // 每集群首容器是 hub
         let hubs: Vec<_> = containers.iter().filter(|c| c.is_hub).collect();
@@ -229,7 +281,7 @@ mod tests {
             nodes_per_cluster: 199,
             ..ComposeGenConfig::fifty_clusters()
         };
-        let containers = cfg.containers();
+        let containers = cfg.containers().unwrap();
         // 每集群 50 容器（div_ceil(199,4)=50）
         assert_eq!(containers.len(), 50 * 50);
         let total: usize = containers.iter().map(|c| c.logical_nodes).sum();
@@ -238,27 +290,27 @@ mod tests {
         assert_eq!(containers[49].logical_nodes, 3);
     }
 
-    /// S4-d：YAML 结构合法（services 段 + hub 端口 + depends_on）
+    /// S4-d：解析完整结构，不以子串证明Compose字段类型正确。
     #[test]
     fn s4_yaml_structure() {
-        let y = ComposeGenConfig::ci_small().render_yaml();
-        assert!(y.contains("services:"));
-        assert!(y.contains("fed-c0-n0:"));
-        // hub 有端口映射 + role hub
-        assert!(y.contains("\"7000:7000\""));
-        assert!(y.contains("\"--role\", \"hub\""));
-        // worker 有 depends_on
-        assert!(y.contains("depends_on:"));
-        // 环境变量注入（集群/节点数/realm）
-        assert!(y.contains("PARROT_CLUSTER=c0"));
-        assert!(y.contains("PARROT_NODES=4"));
-        assert!(y.contains("PARROT_REALM=fed"));
+        let y = ComposeGenConfig::ci_small().render_yaml().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&y).unwrap();
+        let services = value["services"].as_object().unwrap();
+        assert_eq!(services.len(), 500);
+        assert_eq!(services["fed-c0-n0"]["ports"], json!(["7000:7000"]));
+        assert_eq!(services["fed-c0-n1"]["depends_on"], json!(["fed-c0-n0"]));
+        assert_eq!(
+            services["fed-c0-n0"]["environment"],
+            json!({
+                "PARROT_CLUSTER": "c0", "PARROT_NODES": "4", "PARROT_REALM": "fed"
+            })
+        );
     }
 
     /// S4-e：CI 缩减版（10 集群——CI 资源限制）
     #[test]
     fn s4_ci_small() {
-        let s = ComposeGenConfig::ci_small().stats();
+        let s = ComposeGenConfig::ci_small().stats().unwrap();
         assert_eq!(s.clusters, 10);
         assert_eq!(s.containers, 500);
         assert_eq!(s.logical_nodes, 2_000);

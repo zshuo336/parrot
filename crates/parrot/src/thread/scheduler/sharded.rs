@@ -31,14 +31,24 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
-use flume::{Receiver, Sender, unbounded};
+use flume::{Receiver, Sender, bounded, unbounded};
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::runtime::Builder;
 
-use super::StopHookRequest;
+use super::{ControlEnqueueError, StopHookRequest};
+use crate::thread::error::SystemError;
 use crate::thread::mailbox::Mailbox;
+use crate::thread::native_budget::{NativeWorkerBudget, NativeWorkerReservation};
+
+#[cfg(test)]
+#[path = "sharded_configuration_contracts.rs"]
+mod configuration_contracts;
+
+#[cfg(test)]
+#[path = "sharded_registration_contracts.rs"]
+mod registration_contracts;
 
 /// A scheduled item: a mailbox that became ready (has messages to process).
 struct ShardItem {
@@ -73,6 +83,7 @@ impl JoinReport {
 struct JoinJob {
     handle: Option<std::thread::JoinHandle<ShardExit>>,
     report: Arc<JoinReport>,
+    reservation: Option<NativeWorkerReservation>,
 }
 impl Drop for JoinJob {
     fn drop(&mut self) {
@@ -86,12 +97,27 @@ impl Drop for JoinJob {
             .map_err(crate::owned_payload::panic_message)
             .and_then(|result| result.map_err(crate::owned_payload::panic_message))
             .and_then(|result| result);
+        if let Some(reservation) = self.reservation.take() {
+            reservation.release_after_join();
+        }
         *self.report.result.lock().unwrap() = Some(result);
         self.report.changed.notify_all();
     }
 }
+
+struct OwnedShardHandle {
+    handle: std::thread::JoinHandle<ShardExit>,
+    reservation: NativeWorkerReservation,
+}
+impl std::ops::Deref for OwnedShardHandle {
+    type Target = std::thread::JoinHandle<ShardExit>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
 enum ShardThread {
-    Running(std::thread::JoinHandle<ShardExit>),
+    Running(OwnedShardHandle),
     Joining {
         id: std::thread::ThreadId,
         report: Arc<JoinReport>,
@@ -135,8 +161,9 @@ impl ShardThreads {
                 unreachable!()
             };
             jobs.push(JoinJob {
-                handle: Some(handle),
+                handle: Some(handle.handle),
                 report,
+                reservation: Some(handle.reservation),
             });
         }
         jobs
@@ -206,19 +233,23 @@ mod join_owner_contracts {
                 Err("late thread failure".into())
             });
             let report = Arc::new(JoinReport::default());
+            let budget = Arc::new(NativeWorkerBudget::with_capacity(1));
             let job = JoinJob {
                 handle: Some(handle),
                 report: report.clone(),
+                reservation: Some(budget.try_reserve().unwrap()),
             };
             let queued = tokio::task::spawn_blocking(move || drop(job));
             queued.abort();
             drop(pool_release);
             assert!(report.result().is_none());
             assert!(!exited.load(Ordering::Acquire));
+            assert!(budget.try_reserve().is_err());
             drop(actor_release);
             assert!(queued.await.unwrap_err().is_cancelled());
             blocker.await.unwrap();
             assert!(exited.load(Ordering::Acquire));
+            assert!(budget.try_reserve().is_ok());
             assert_eq!(report.result(), Some(Err("late thread failure".into())));
         });
     }
@@ -240,6 +271,7 @@ mod join_owner_contracts {
         drop(JoinJob {
             handle: Some(handle),
             report: report.clone(),
+            reservation: None,
         });
         let error = report.result().unwrap().unwrap_err();
         assert!(error.contains("panic payload destructor panicked"));
@@ -254,6 +286,29 @@ struct Shard {
     stop_tx: Sender<StopHookRequest>,
 }
 
+#[derive(Clone)]
+struct ShardRegistration {
+    active: Arc<AtomicBool>,
+    mailbox: Weak<dyn Mailbox>,
+    shard: Arc<Shard>,
+}
+impl ShardRegistration {
+    fn enqueue(&self) -> bool {
+        if !self.active.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(mailbox) = self.mailbox.upgrade()
+            && mailbox.schedule_state().try_enqueue()
+        {
+            let _ = self.shard.tx.send(ShardItem {
+                mailbox,
+                active: self.active.clone(),
+            });
+        }
+        true
+    }
+}
+
 /// Fixed-size pool of affinity shards.
 ///
 /// `shards` must be created via [`ShardedScheduler::start`].
@@ -263,7 +318,7 @@ pub struct ShardedScheduler {
     shutdown_notify: Arc<tokio::sync::Notify>,
     threads: Mutex<ShardThreads>,
     /// Registration tokens also invalidate already queued work on deschedule.
-    assigned: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    assigned: Arc<Mutex<HashMap<String, ShardRegistration>>>,
     /// Batch size per wake (mirrors shared-pool worker config).
     batch_size: usize,
 }
@@ -277,28 +332,164 @@ impl fmt::Debug for ShardedScheduler {
     }
 }
 
+struct ShardStartup {
+    shutdown: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
+    threads: Vec<OwnedShardHandle>,
+    armed: bool,
+}
+impl ShardStartup {
+    fn rollback(&mut self) -> Option<String> {
+        if !self.armed {
+            return None;
+        }
+        self.armed = false;
+        self.shutdown.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+        let mut failure = None;
+        for owned in self.threads.drain(..) {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owned.handle.join()))
+                    .map_err(crate::owned_payload::panic_message)
+                    .and_then(|result| result.map_err(crate::owned_payload::panic_message))
+                    .and_then(|result| result);
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
+            owned.reservation.release_after_join();
+        }
+        failure
+    }
+}
+
+impl Drop for ShardStartup {
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
 impl ShardedScheduler {
     /// Start `n` shard threads.
     pub fn start(n: usize, batch_size: usize) -> Arc<Self> {
-        Self::start_with_startup(n, batch_size, || {})
+        Self::try_start(n, batch_size).expect("failed to start shard scheduler")
+    }
+
+    /// Validate before allocating or creating threads. A failed partial start
+    /// stops and joins every thread already created before returning its error.
+    pub fn try_start(n: usize, batch_size: usize) -> Result<Arc<Self>, SystemError> {
+        Self::try_start_with_hooks_and_budget(
+            n,
+            batch_size,
+            || {},
+            |_| Ok(()),
+            |_| Builder::new_current_thread().enable_all().build(),
+            NativeWorkerBudget::global(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_start_with_budget_and_startup<F>(
+        n: usize,
+        batch_size: usize,
+        startup: F,
+        native_budget: Arc<NativeWorkerBudget>,
+    ) -> Result<Arc<Self>, SystemError>
+    where
+        F: Fn() + Clone + Send + 'static,
+    {
+        Self::try_start_with_hooks_and_budget(
+            n,
+            batch_size,
+            startup,
+            |_| Ok(()),
+            |_| Builder::new_current_thread().enable_all().build(),
+            native_budget,
+        )
+    }
+
+    pub fn validate(n: usize, batch_size: usize) -> Result<(), SystemError> {
+        super::configuration::count(
+            "scheduler.sharded.shards",
+            n,
+            1,
+            parrot_config::ThreadResolved::MAX_WORKERS,
+        )?;
+        super::configuration::count(
+            "scheduler.sharded.batch_size",
+            batch_size,
+            1,
+            super::MAX_MESSAGES_PER_BATCH,
+        )
     }
 
     // The empty production startup is a zero-sized closure. Contract tests
     // inject OS startup faults through this exact spawn/entry/join pipeline,
     // independently of isolated actor callbacks.
+    #[cfg(test)]
     fn start_with_startup<F>(n: usize, batch_size: usize, startup: F) -> Arc<Self>
     where
         F: Fn() + Clone + Send + 'static,
     {
-        let n = n.max(1);
+        Self::try_start_with_hooks(
+            n,
+            batch_size,
+            startup,
+            |_| Ok(()),
+            |_| Builder::new_current_thread().enable_all().build(),
+        )
+        .expect("failed to start shard scheduler")
+    }
+
+    #[cfg(test)]
+    fn try_start_with_hooks<F, S, R>(
+        n: usize,
+        batch_size: usize,
+        startup: F,
+        before_spawn: S,
+        runtime: R,
+    ) -> Result<Arc<Self>, SystemError>
+    where
+        F: Fn() + Clone + Send + 'static,
+        S: FnMut(usize) -> std::io::Result<()>,
+        R: Fn(usize) -> std::io::Result<tokio::runtime::Runtime> + Clone + Send + 'static,
+    {
+        Self::try_start_with_hooks_and_budget(
+            n,
+            batch_size,
+            startup,
+            before_spawn,
+            runtime,
+            NativeWorkerBudget::global(),
+        )
+    }
+
+    fn try_start_with_hooks_and_budget<F, S, R>(
+        n: usize,
+        batch_size: usize,
+        startup: F,
+        mut before_spawn: S,
+        runtime: R,
+        native_budget: Arc<NativeWorkerBudget>,
+    ) -> Result<Arc<Self>, SystemError>
+    where
+        F: Fn() + Clone + Send + 'static,
+        S: FnMut(usize) -> std::io::Result<()>,
+        R: Fn(usize) -> std::io::Result<tokio::runtime::Runtime> + Clone + Send + 'static,
+    {
+        Self::validate(n, batch_size)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
         let mut shards = Vec::with_capacity(n);
-        let mut threads = Vec::with_capacity(n);
+        let mut construction = ShardStartup {
+            shutdown: shutdown.clone(),
+            changed: shutdown_notify.clone(),
+            threads: Vec::with_capacity(n),
+            armed: true,
+        };
 
         for i in 0..n {
             let (tx, rx) = unbounded::<ShardItem>();
-            let (stop_tx, stop_rx) = unbounded::<StopHookRequest>();
+            let (stop_tx, stop_rx) = bounded::<StopHookRequest>(super::MAX_CONTROL_QUEUE);
             let tx2 = tx.clone();
             let shard = Arc::new(Shard { tx, stop_tx });
             shards.push(shard);
@@ -306,7 +497,21 @@ impl ShardedScheduler {
             let shutdown = shutdown.clone();
             let shutdown_notify = shutdown_notify.clone();
             let startup = startup.clone();
-            threads.push(
+            let runtime = runtime.clone();
+            let (ready, readiness) = std::sync::mpsc::sync_channel(1);
+            let reservation = match native_budget.try_reserve() {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    let cleanup = construction
+                        .rollback()
+                        .map(|failure| format!("; startup cleanup failed: {failure}"))
+                        .unwrap_or_default();
+                    return Err(SystemError::ThreadSetupError(format!(
+                        "failed to admit shard {i}: {error}{cleanup}"
+                    )));
+                }
+            };
+            let handle = before_spawn(i).and_then(|()| {
                 std::thread::Builder::new()
                     .name(format!("parrot-shard-{}", i))
                     .spawn(move || {
@@ -314,15 +519,58 @@ impl ShardedScheduler {
                         // considered finished. Detached handles then own only a
                         // framework String, never an arbitrary user destructor.
                         shard_thread_exit(|| {
+                            let runtime = match runtime(i) {
+                                Ok(runtime) => runtime,
+                                Err(error) => {
+                                    let _ = ready.send(Err(error.to_string()));
+                                    return;
+                                }
+                            };
+                            if ready.send(Ok(())).is_err() {
+                                return;
+                            }
                             startup();
-                            shard_loop(i, rx, tx2, stop_rx, shutdown, shutdown_notify, batch_size);
+                            runtime.block_on(shard_loop(
+                                i,
+                                rx,
+                                tx2,
+                                stop_rx,
+                                shutdown,
+                                shutdown_notify,
+                                batch_size,
+                            ));
                         })
                     })
-                    .expect("spawn shard thread"),
-            );
+            });
+            let initialized = match handle {
+                Ok(handle) => {
+                    construction.threads.push(OwnedShardHandle {
+                        handle,
+                        reservation,
+                    });
+                    readiness
+                        .recv()
+                        .unwrap_or_else(|error| Err(format!("runtime readiness lost: {error}")))
+                }
+                Err(error) => {
+                    reservation.release_after_join();
+                    Err(error.to_string())
+                }
+            };
+            if let Err(error) = initialized {
+                let cleanup = construction
+                    .rollback()
+                    .map(|failure| format!("; startup cleanup failed: {failure}"))
+                    .unwrap_or_default();
+                return Err(SystemError::ThreadSetupError(format!(
+                    "failed to start shard {i}: {error}{cleanup}"
+                )));
+            }
         }
 
-        Arc::new(Self {
+        construction.armed = false;
+        let threads = std::mem::take(&mut construction.threads);
+        Ok(Arc::new(Self {
             shards,
             shutdown,
             shutdown_notify,
@@ -330,9 +578,9 @@ impl ShardedScheduler {
                 slots: threads.into_iter().map(ShardThread::Running).collect(),
                 failure: None,
             }),
-            assigned: Mutex::new(HashMap::new()),
+            assigned: Arc::new(Mutex::new(HashMap::new())),
             batch_size,
-        })
+        }))
     }
 
     /// Route key → shard index (uses high-quality fxhash-style mixing so
@@ -358,7 +606,9 @@ impl ShardedScheduler {
     /// Schedule an actor onto the shard chosen by its affinity key.
     ///
     /// The mailbox's wake hook is re-armed to route every subsequent message
-    /// arrival into the same shard — the actor never migrates.
+    /// arrival into the same shard while this registration remains active.
+    /// Re-registering a descheduled mailbox can select another shard; its old
+    /// queued or running work releases the slot before waking the new owner.
     pub fn schedule_affinity(
         &self,
         path: &str,
@@ -374,32 +624,43 @@ impl ShardedScheduler {
 
         let idx = self.shard_for(Self::hash_key(affinity_key));
         let active = Arc::new(AtomicBool::new(true));
+        let registration = ShardRegistration {
+            active: active.clone(),
+            mailbox: Arc::downgrade(&mailbox),
+            shard: self.shards[idx].clone(),
+        };
         {
             let mut assigned = self.assigned.lock().unwrap();
             if assigned.contains_key(path) {
                 return Err(format!("actor {path} is already scheduled"));
             }
-            assigned.insert(path.to_string(), active.clone());
+            assigned.insert(path.to_string(), registration.clone());
         }
 
         // Re-arm the wake hook: every message arrival pushes this mailbox
         // into its home shard (subject to the schedule-slot single-entry
         // invariant).
-        let shard = self.shards[idx].clone();
-        let weak = Arc::downgrade(&mailbox);
         let shutting = self.shutdown.clone();
-        let wake_active = active.clone();
+        let assigned = Arc::downgrade(&self.assigned);
+        let path = path.to_owned();
         mailbox.set_wake_hook(Arc::new(move || {
-            if shutting.load(Ordering::Relaxed) || !wake_active.load(Ordering::Acquire) {
+            if shutting.load(Ordering::Acquire) {
                 return;
             }
-            if let Some(strong) = weak.upgrade()
-                && strong.schedule_state().try_enqueue()
+            if !registration.enqueue()
+                && let Some(assigned) = assigned.upgrade()
             {
-                let _ = shard.tx.send(ShardItem {
-                    mailbox: strong,
-                    active: wake_active.clone(),
-                });
+                // A slow old set_wake_hook can complete after a replacement.
+                // Follow only that same mailbox, never a reused path's actor.
+                let current = assigned
+                    .lock()
+                    .unwrap()
+                    .get(&path)
+                    .filter(|current| Weak::ptr_eq(&current.mailbox, &registration.mailbox))
+                    .cloned();
+                if let Some(current) = current {
+                    current.enqueue();
+                }
             }
         }));
 
@@ -414,26 +675,77 @@ impl ShardedScheduler {
         Ok(())
     }
 
-    /// Deschedule an actor (stop routing its wake-ups).
+    /// Stop routing this registration's wake-ups. Already running work is not
+    /// cancelled or joined, and buffered messages remain in the mailbox.
     pub fn deschedule(&self, path: &str) -> Result<(), String> {
-        if let Some(active) = self.assigned.lock().unwrap().remove(path) {
-            active.store(false, Ordering::Release);
+        if let Some(registration) = self.assigned.lock().unwrap().remove(path) {
+            registration.active.store(false, Ordering::Release);
         }
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue_stop_hook(
         &self,
         affinity_key: &str,
         request: StopHookRequest,
     ) -> Result<(), crate::thread::error::SystemError> {
+        match self.try_enqueue_stop_hook(affinity_key, request) {
+            Ok(()) => Ok(()),
+            Err(ControlEnqueueError::Full(_)) => {
+                Err(crate::thread::error::SystemError::ShutdownError(format!(
+                    "shard control queue is full (capacity {})",
+                    super::MAX_CONTROL_QUEUE
+                )))
+            }
+            Err(ControlEnqueueError::Disconnected) => {
+                Err(crate::thread::error::SystemError::ShutdownError(
+                    "shard control channel closed".into(),
+                ))
+            }
+            Err(ControlEnqueueError::Rejected(error)) => Err(error),
+        }
+    }
+
+    fn try_enqueue_stop_hook(
+        &self,
+        affinity_key: &str,
+        request: StopHookRequest,
+    ) -> Result<(), ControlEnqueueError> {
         if self.shutdown.load(Ordering::Acquire) {
-            return Err(crate::thread::error::SystemError::ShuttingDown);
+            return Err(ControlEnqueueError::Rejected(
+                crate::thread::error::SystemError::ShuttingDown,
+            ));
         }
         let index = self.shard_for(Self::hash_key(affinity_key));
-        self.shards[index].stop_tx.send(request).map_err(|_| {
-            crate::thread::error::SystemError::ShutdownError("shard control channel closed".into())
-        })
+        match self.shards[index].stop_tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(flume::TrySendError::Full(request)) => Err(ControlEnqueueError::Full(request)),
+            Err(flume::TrySendError::Disconnected(_)) => Err(ControlEnqueueError::Disconnected),
+        }
+    }
+
+    pub(crate) async fn enqueue_stop_hook_until(
+        &self,
+        affinity_key: &str,
+        request: StopHookRequest,
+    ) -> Result<(), crate::thread::error::SystemError> {
+        let mut request = request;
+        loop {
+            match self.try_enqueue_stop_hook(affinity_key, request) {
+                Ok(()) => return Ok(()),
+                Err(ControlEnqueueError::Full(next)) => {
+                    request = next;
+                    tokio::task::yield_now().await;
+                }
+                Err(ControlEnqueueError::Disconnected) => {
+                    return Err(crate::thread::error::SystemError::ShutdownError(
+                        "shard control channel closed".into(),
+                    ));
+                }
+                Err(ControlEnqueueError::Rejected(error)) => return Err(error),
+            }
+        }
     }
 
     /// Shard lengths (for metrics).
@@ -541,7 +853,7 @@ impl ShardedScheduler {
 
 /// The per-shard event loop: pop mailboxes, run a batch, re-enqueue while
 /// more messages remain.
-fn shard_loop(
+async fn shard_loop(
     shard_id: usize,
     rx: Receiver<ShardItem>,
     tx: Sender<ShardItem>,
@@ -550,58 +862,57 @@ fn shard_loop(
     shutdown_notify: Arc<tokio::sync::Notify>,
     batch_size: usize,
 ) {
-    // Current-thread runtime: actor futures on THIS thread only.
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("shard runtime");
-    rt.block_on(async move {
-        let mut running = FuturesUnordered::new();
-        let mut stopping = FuturesUnordered::new();
-        let mut check_shutdown = tokio::time::interval(std::time::Duration::from_millis(50));
-        while !shutdown.load(Ordering::Acquire) {
-            let notified = shutdown_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if shutdown.load(Ordering::Acquire) {
-                break;
-            }
-            tokio::select! {
-                _ = &mut notified => {}
-                item = rx.recv_async() => {
-                    let Ok(item) = item else { break };
-                    running.push(process_item(shard_id, item, tx.clone(), batch_size));
-                }
-                request = stop_rx.recv_async() => {
-                    let Ok(request) = request else { break };
-                    stopping.push(request.run());
-                }
-                _ = running.next(), if !running.is_empty() => {}
-                _ = stopping.next(), if !stopping.is_empty() => {}
-                _ = check_shutdown.tick() => {}
-            }
+    let mut running = FuturesUnordered::new();
+    let mut stopping = FuturesUnordered::new();
+    let mut check_shutdown = tokio::time::interval(std::time::Duration::from_millis(50));
+    while !shutdown.load(Ordering::Acquire) {
+        let notified = shutdown_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if shutdown.load(Ordering::Acquire) {
+            break;
         }
-        // Dropping the futures cancels suspended actor work on this same thread.
-    });
+        tokio::select! {
+            _ = &mut notified => {}
+            item = rx.recv_async() => {
+                let Ok(item) = item else { break };
+                running.push(process_item(shard_id, item, tx.clone(), batch_size));
+            }
+            request = stop_rx.recv_async() => {
+                let Ok(request) = request else { break };
+                stopping.push(request.run());
+            }
+            _ = running.next(), if !running.is_empty() => {}
+            _ = stopping.next(), if !stopping.is_empty() => {}
+            _ = check_shutdown.tick() => {}
+        }
+    }
+    // Dropping the futures cancels suspended actor work on this same thread.
 }
 
 // Each acquired schedule slot has one release authority. A failure callback may
 // immediately re-enqueue the mailbox, so outer cancellation cannot release twice.
-struct ScheduleLease {
+struct ScheduleLease<'a> {
     mailbox: Arc<dyn Mailbox>,
+    active: &'a AtomicBool,
     owned: AtomicBool,
 }
-impl ScheduleLease {
+impl ScheduleLease<'_> {
     fn release(&self) {
         if self.owned.swap(false, Ordering::AcqRel) {
             self.mailbox.schedule_state().force_release();
+            // A replacement may have recorded its initial wake against this
+            // registration's slot. Route it only after the old work retires.
+            if !self.active.load(Ordering::Acquire) {
+                self.mailbox.fire_wake_hook();
+            }
         }
     }
     fn hand_off(&self) {
         self.owned.store(false, Ordering::Release);
     }
 }
-impl Drop for ScheduleLease {
+impl Drop for ScheduleLease<'_> {
     fn drop(&mut self) {
         self.release();
     }
@@ -614,12 +925,12 @@ struct ShardStage<'a, T: Copy> {
     future: Option<
         parrot_api::types::BoxedFuture<'static, Result<T, crate::thread::error::SystemError>>,
     >,
-    lease: &'a ScheduleLease,
+    lease: &'a ScheduleLease<'a>,
     processor: Arc<dyn crate::thread::processor::ProcessorInterface>,
 }
 impl<'a, T: Copy> ShardStage<'a, T> {
     fn new(
-        lease: &'a ScheduleLease,
+        lease: &'a ScheduleLease<'a>,
         processor: Arc<dyn crate::thread::processor::ProcessorInterface>,
         construct: impl FnOnce() -> parrot_api::types::BoxedFuture<
             'static,
@@ -703,23 +1014,24 @@ fn notify_failure(processor: &dyn crate::thread::processor::ProcessorInterface, 
         processor.notify_system_panic(message);
     })) {
         let message = crate::owned_payload::panic_message(payload);
-        tracing::error!(%message, "shard failure notification panicked");
+        super::failure_diagnostic(|| {
+            tracing::error!(%message, "shard failure notification panicked");
+        });
     }
 }
 
 async fn process_item(shard_id: usize, item: ShardItem, tx: Sender<ShardItem>, batch_size: usize) {
     let mailbox = &item.mailbox;
+    let lease = ScheduleLease {
+        mailbox: mailbox.clone(),
+        active: &item.active,
+        owned: AtomicBool::new(true),
+    };
     if !item.active.load(Ordering::Acquire) {
-        mailbox.schedule_state().force_release();
         return;
     }
     let Some(processor) = mailbox.get_processor() else {
-        mailbox.schedule_state().force_release();
         return;
-    };
-    let lease = ScheduleLease {
-        mailbox: mailbox.clone(),
-        owned: AtomicBool::new(true),
     };
     // Catch both future construction and polling panics, including actor init.
     let work = std::panic::AssertUnwindSafe(async {
@@ -770,7 +1082,9 @@ async fn process_item(shard_id: usize, item: ShardItem, tx: Sender<ShardItem>, b
     if let Err(error) = cancellation.finish(result) {
         let receipt = crate::error_receipt::SystemReceipt::new(error);
         let error = crate::error_receipt::system_summary(receipt.error());
-        tracing::error!(shard_id, path = %mailbox.path().path, %error, "shard actor failed");
+        super::failure_diagnostic(|| {
+            tracing::error!(shard_id, path = %mailbox.path().path, %error, "shard actor failed");
+        });
         lease.release();
         notify_failure(&*processor, error);
         return;
@@ -781,6 +1095,7 @@ async fn process_item(shard_id: usize, item: ShardItem, tx: Sender<ShardItem>, b
     }
     let has_more = mailbox.has_more_messages().await;
     lease.hand_off();
+    drop(lease);
     if mailbox.schedule_state().release(has_more) {
         let _ = tx.send(item);
     }
@@ -789,8 +1104,13 @@ async fn process_item(shard_id: usize, item: ShardItem, tx: Sender<ShardItem>, b
 impl Drop for ShardedScheduler {
     fn drop(&mut self) {
         // Do not leak idle OS threads when the owner is dropped without shutdown.
-        // Joining here could deadlock if the last owner drops on a shard thread.
         self.request_shutdown();
+        let slots = std::mem::take(&mut self.threads.get_mut().unwrap().slots);
+        for slot in slots {
+            if let ShardThread::Running(owned) = slot {
+                crate::thread::native_budget::retire_join(owned.handle, Some(owned.reservation));
+            }
+        }
     }
 }
 
@@ -812,6 +1132,53 @@ mod panic_contracts {
         task::{Context, Poll},
         time::Duration,
     };
+
+    #[test]
+    fn shard_control_queue_is_bounded() {
+        let scheduler = ShardedScheduler::start(1, 1);
+        assert_eq!(
+            scheduler.shards[0].stop_tx.capacity(),
+            Some(super::super::MAX_CONTROL_QUEUE)
+        );
+        scheduler.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shard_control_queue_retries_original_request_after_slot_release() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let startup_release = release_rx.clone();
+        let scheduler = ShardedScheduler::start_with_startup(1, 1, move || {
+            started_tx.send(()).unwrap();
+            startup_release.lock().unwrap().recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let processor = Processor::new(Mode::Creation);
+        for _ in 0..super::super::MAX_CONTROL_QUEUE {
+            let (request, _result) = control_request(&processor, true);
+            scheduler.shards[0].stop_tx.try_send(request).unwrap();
+        }
+        assert_eq!(
+            scheduler.shards[0].stop_tx.len(),
+            super::super::MAX_CONTROL_QUEUE
+        );
+
+        let (request, _result) = control_request(&processor, true);
+        let mut enqueue = Box::pin(scheduler.enqueue_stop_hook_until("one", request));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut enqueue)
+                .await
+                .is_err(),
+            "a full shard control queue must retain the request while no slot is available"
+        );
+
+        release_tx.send(()).unwrap();
+        enqueue.await.unwrap();
+        scheduler.shutdown();
+    }
+
     struct Secondary;
     impl Drop for Secondary {
         fn drop(&mut self) {
@@ -901,6 +1268,27 @@ mod panic_contracts {
                 requeue_acquired: AtomicBool::new(false),
             })
         }
+    }
+
+    fn control_request(
+        processor: &Arc<Processor>,
+        retire_only: bool,
+    ) -> (
+        StopHookRequest,
+        tokio::sync::oneshot::Receiver<Result<(), SystemError>>,
+    ) {
+        let (completion, result) = tokio::sync::oneshot::channel();
+        (
+            StopHookRequest {
+                trace_context: None,
+                path: "/control-contract".into(),
+                processor: processor.clone(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+                completion,
+                retire_only,
+            },
+            result,
+        )
     }
     impl ProcessorStatsTrait for Processor {
         fn get_statistics(&self) -> Option<Arc<ProcessorStats>> {
@@ -1976,6 +2364,28 @@ mod cancellation_contracts {
     #[tokio::test]
     async fn shutdown_disposes_pending_observer_without_thread_failure() {
         run(Mode::PendingDrop, false, false, false, true).await;
+    }
+    #[tokio::test]
+    async fn shard_notification_logging_failure_is_contained() {
+        crate::thread::scheduler::notification_contracts::isolated(
+            "shard_notification_logging_failure_is_contained",
+            || {
+                let p = Processor::new(Mode::Healthy, true, false, true);
+                notify_failure(&*p, "original shard failure".into());
+                assert_eq!(&*p.notices.lock().unwrap(), &["original shard failure"]);
+                assert_eq!(p.payloads.load(Ordering::SeqCst), 1);
+            },
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn shard_stage_notification_logging_failure_preserves_progress() {
+        crate::thread::scheduler::notification_contracts::isolated_async(
+            "shard_stage_notification_logging_failure_preserves_progress",
+            run(Mode::Plain, false, false, true, false),
+            2,
+        )
+        .await;
     }
     #[tokio::test]
     async fn observer_failure_notification_cannot_kill_shard() {

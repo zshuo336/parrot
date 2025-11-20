@@ -8,7 +8,7 @@
 //!
 //! 与 POC 的差异：
 //! - header 内联存储 **oneshot::Sender 句柄**；channel 状态另有一次分配，
-//!   `new_ask` 共两次，不含消息内部资源。drop 顺序：**payload → oneshot → dealloc**（payload
+//!   `new_ask` 共两次，不含消息内部资源，返回 `ReplyReceiver` 以保护接收侧取消。drop 顺序：**payload → oneshot → dealloc**（payload
 //!   drop 可能引用 oneshot 之外的资源，必须先于内存释放；oneshot drop
 //!   唤醒等待者，必须在 dealloc 之前完成发送语义）。
 //! - POC `downcast` 后 `mem::forget(self)` 的双释放坑已随迁修正：本实现
@@ -35,6 +35,8 @@ use std::ptr::NonNull;
 
 use parrot_api::types::BoxedMessage;
 use tokio::sync::oneshot;
+
+use super::reply::ReplyReceiver;
 
 /// 擦除头（布局在块首；`repr(C)` 保证字段顺序稳定）。
 #[repr(C)]
@@ -81,15 +83,10 @@ impl SingleAllocEnvelope {
 
     /// 单块构造（ask 语义），块内存储回复句柄，channel 状态另行分配。
     ///
-    /// 返回 (envelope, reply_receiver)：asker 持 receiver 等回复。
-    pub fn new_ask<M: Any + Send>(
-        msg: M,
-    ) -> (
-        Self,
-        oneshot::Receiver<parrot_api::types::ActorResult<BoxedMessage>>,
-    ) {
+    /// 返回 (envelope, reply_receiver)：asker 持 `ReplyReceiver` 等回复。
+    pub fn new_ask<M: Any + Send>(msg: M) -> (Self, ReplyReceiver) {
         let (tx, rx) = oneshot::channel();
-        (Self::alloc_with(msg, Some(tx)), rx)
+        (Self::alloc_with(msg, Some(tx)), ReplyReceiver::new(rx))
     }
 
     fn alloc_with<M: Any + Send>(

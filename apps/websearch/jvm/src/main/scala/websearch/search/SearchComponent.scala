@@ -59,7 +59,7 @@ object SearchBehavior {
     math.min(java.lang.Integer.toUnsignedLong(raw), lastStart).toInt
   }
 
-  /** jieba 查询切词（与索引侧同停用词表）。 */
+  /** jieba 查询切词；库会将 ASCII 大写转小写，中文切词可能与 Python 不同。 */
   def tokenize(text: String): Vector[String] = seg.synchronized {
     val words = scala.collection.mutable.ArrayBuffer.empty[String]
     seg.process(text, JiebaSegmenter.SegMode.SEARCH).forEach { w =>

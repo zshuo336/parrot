@@ -162,8 +162,10 @@ async fn scenario(asynchronous: bool, tell: bool, panic: bool, traced: bool, pol
             assert_eq!(matches.len(), 1, "each restart phase executes once: {generation}/{name}");
             matches[0].2.clone()
         };
+        let initial_hook = phase(0, "init-call");
+        lifecycle_identity::assert_child(initial_hook.as_ref(), Some(&creation));
         for name in ["constructor", "init-call", "init-poll", "init-resumed"] {
-            assert_eq!(phase(0, name), Some(creation.clone()), "initial creation ancestry");
+            assert_eq!(phase(0, name), if name == "constructor" { Some(creation.clone()) } else { initial_hook.clone() }, "initial creation ancestry");
         }
         let failure = phase(0, "failure-handler");
         match (&cause, &failure) {
@@ -176,7 +178,9 @@ async fn scenario(asynchronous: bool, tell: bool, panic: bool, traced: bool, pol
         }
         let actual: Vec<_> = [(0, "policy"), (1, "constructor"), (1, "init-call"), (1, "init-poll"), (1, "init-resumed")]
             .into_iter().map(|(generation, name)| (name, phase(generation, name))).collect();
-        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, failure.clone())).collect();
+        let replacement = phase(1, "init-call");
+        lifecycle_identity::assert_child(replacement.as_ref(), failure.as_ref());
+        let expected: Vec<_> = actual.iter().map(|(name, _)| (*name, if name.starts_with("init-") { replacement.clone() } else { failure.clone() })).collect();
         assert_eq!(actual, expected, "Actix restart must preserve the failing handler identity");
         println!("PARROT_ACTIX_RESTART_CAUSAL_CASE_OK async={asynchronous} tell={tell} panic={panic} traced={traced} poll_traced={poll_traced}");
     }).await.expect("Actix restart independent liveness bound");
@@ -204,3 +208,5 @@ case!(async_ask_error, true, false, false);
 case!(async_ask_panic, true, false, true);
 case!(async_tell_error, true, true, false);
 case!(async_tell_panic, true, true, true);
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;

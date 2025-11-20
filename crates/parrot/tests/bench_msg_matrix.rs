@@ -526,6 +526,16 @@ fn run_c(n: u64, warmup: u64) {
         );
     });
 }
+async fn join_measurement_jobs(
+    jobs: Vec<tokio::task::JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    let results = futures::future::join_all(jobs).await;
+    results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map(|_| ())
+}
+
 fn run_d(per: u64, warmup: u64) {
     with_system(|ts| async move {
         let r = Arc::new(
@@ -543,9 +553,7 @@ fn run_d(per: u64, warmup: u64) {
                 inline_asks(&r, per, c).await;
             }));
         }
-        for job in jobs {
-            job.await.unwrap();
-        }
+        join_measurement_jobs(jobs).await.unwrap();
         let elapsed = start.elapsed();
         dynamic_snapshot(r.as_ref()).await.verify_delta(
             before,
@@ -553,6 +561,7 @@ fn run_d(per: u64, warmup: u64) {
             8 * (per * (per - 1) / 2) + 28 * per,
         );
         row("D1 dyn-ask-inline-c8", per * 8, elapsed, "concurrency=8");
+        let before = dynamic_snapshot(r.as_ref()).await;
         let start = Instant::now();
         let mut jobs = Vec::new();
         for _ in 0..8 {
@@ -561,13 +570,15 @@ fn run_d(per: u64, warmup: u64) {
                 dynamic_asks(&r, per, |_| (Box::new(Msg1K([7; 1024])), 7)).await;
             }));
         }
-        for job in jobs {
-            job.await.unwrap();
-        }
+        join_measurement_jobs(jobs).await.unwrap();
+        let elapsed = start.elapsed();
+        dynamic_snapshot(r.as_ref())
+            .await
+            .verify_delta(before, per * 8, per * 8 * 7);
         row(
             "D2 dyn-ask-boxed-1KB-c8",
             per * 8,
-            start.elapsed(),
+            elapsed,
             "concurrency=8 payload=1KB",
         );
         let rl = Arc::new(
@@ -576,6 +587,7 @@ fn run_d(per: u64, warmup: u64) {
                 .unwrap(),
         );
         typed_asks(&rl, warmup, |_| (PingL([7; 1024]), 7)).await;
+        let before = typed_snapshot(rl.as_ref()).await;
         let start = Instant::now();
         let mut jobs = Vec::new();
         for _ in 0..8 {
@@ -584,13 +596,15 @@ fn run_d(per: u64, warmup: u64) {
                 typed_asks(&r, per, |_| (PingL([7; 1024]), 7)).await;
             }));
         }
-        for job in jobs {
-            job.await.unwrap();
-        }
+        join_measurement_jobs(jobs).await.unwrap();
+        let elapsed = start.elapsed();
+        typed_snapshot(rl.as_ref())
+            .await
+            .verify_delta(before, per * 8, per * 8 * 7);
         row(
             "D3 static-ask-1KB-c8",
             per * 8,
-            start.elapsed(),
+            elapsed,
             &typed_layout::<EchoL>(),
         );
     });
@@ -761,6 +775,37 @@ smoke!(matrix_c_semantics, run_c(8, 2));
 smoke!(matrix_d_semantics, run_d(4, 2));
 smoke!(matrix_e_semantics, run_e(8, 2));
 smoke!(matrix_f_semantics, run_f(8, 2, 40));
+
+#[tokio::test]
+async fn failed_measurement_waits_for_other_participants() {
+    let gate = Arc::new(Semaphore::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let slow = {
+        let gate = gate.clone();
+        let finished = finished.clone();
+        tokio::spawn(async move {
+            drop(gate.acquire().await.unwrap());
+            finished.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let failed = tokio::spawn(async { panic!("injected measurement failure") });
+    while !failed.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let joining = join_measurement_jobs(vec![failed, slow]);
+    tokio::pin!(joining);
+    assert!(
+        std::future::poll_fn(|cx| match joining.as_mut().poll(cx) {
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+            std::task::Poll::Pending => std::task::Poll::Ready(true),
+        })
+        .await,
+        "failed workload must still wait for the blocked participant"
+    );
+    gate.add_permits(1);
+    assert!(joining.await.unwrap_err().is_panic());
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+}
 
 #[test]
 fn timing_rejects_zero_duration() {

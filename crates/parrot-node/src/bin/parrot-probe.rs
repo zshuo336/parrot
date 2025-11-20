@@ -51,7 +51,9 @@ impl Options {
             match arg.as_str() {
                 "--insecure-development" => insecure = true,
                 value if value.starts_with("--config=") => {
-                    let path = value.trim_start_matches("--config=");
+                    let path = value
+                        .strip_prefix("--config=")
+                        .expect("matched config flag");
                     if path.is_empty() || config.replace(path.to_owned()).is_some() {
                         return Err("--config requires one nonempty path".into());
                     }

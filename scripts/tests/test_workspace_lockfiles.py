@@ -35,8 +35,8 @@ class WorkspaceLockfiles(unittest.TestCase):
                          str(path / 'Cargo.toml'))
         return path
 
-    def gate(self):
-        return subprocess.run(['python3', str(GATE), '--root', str(self.root)],
+    def gate(self, *arguments):
+        return subprocess.run(['python3', str(GATE), '--root', str(self.root), *arguments],
                               env=self.env, text=True, capture_output=True, timeout=30)
 
     def test_discovers_new_workspace_without_allowlist(self):
@@ -87,6 +87,45 @@ class WorkspaceLockfiles(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ['Cargo.lock'])
 
+    def stale_dependency(self, directory):
+        self.package('dependency', 'dependency_fixture')
+        root_manifest = self.root / 'Cargo.toml'
+        root_manifest.write_text(root_manifest.read_text().replace(
+            '[workspace]', '[workspace]\nexclude=["dependency"]'))
+        manifest = self.root / directory / 'Cargo.toml'
+        dependency = '../dependency' if directory != '.' else 'dependency'
+        manifest.write_text(manifest.read_text() +
+                            '\n[dependencies]\ndependency_fixture = { path = "' +
+                            dependency + '" }\n')
+        lock = manifest.with_name('Cargo.lock')
+        return lock, lock.read_bytes()
+
+    def test_resolution_rejects_stale_root_lock_without_rewriting_it(self):
+        lock, before = self.stale_dependency('.')
+        inventory = self.gate()
+        self.assertEqual(inventory.returncode, 0, inventory.stderr)
+        result = self.gate('--check-resolution')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('workspace lockfile resolution failed: Cargo.lock', result.stderr)
+        self.assertIn('--locked', result.stderr)
+        self.assertEqual(lock.read_bytes(), before)
+        self.run_command('cargo', 'generate-lockfile', '--offline')
+        repaired = self.gate('--check-resolution')
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        self.assertEqual(repaired.stdout.splitlines(), ['Cargo.lock', 'dependency/Cargo.lock'])
+
+    def test_resolution_checks_standalone_workspaces_not_only_root(self):
+        self.package('new-tool', 'tool_fixture')
+        lock, before = self.stale_dependency('new-tool')
+        result = self.gate('--check-resolution')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('workspace lockfile resolution failed: new-tool/Cargo.lock', result.stderr)
+        self.assertIn('--locked', result.stderr)
+        self.assertNotIn('workspace lockfile resolution failed: Cargo.lock\n', result.stderr)
+        self.assertEqual(lock.read_bytes(), before)
+
     def audit_fixture(self):
         scripts = self.root / 'scripts'
         scripts.mkdir()
@@ -135,6 +174,15 @@ class WorkspaceLockfiles(unittest.TestCase):
         result = self.audit()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('missing workspace lockfile', result.stderr)
+        self.assertFalse((self.root / 'audit-events.jsonl').exists())
+
+    def test_stale_lock_prevents_every_audit(self):
+        self.stale_dependency('.')
+        self.audit_fixture()
+        result = self.audit()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('workspace lockfile resolution failed: Cargo.lock', result.stderr)
+        self.assertIn('--locked', result.stderr)
         self.assertFalse((self.root / 'audit-events.jsonl').exists())
 
 

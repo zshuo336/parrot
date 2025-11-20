@@ -42,7 +42,11 @@ where
 }
 impl<A: Send + 'static> FactoryDisposal for Factory<A> {
     fn dispose(&self) -> BoxedFuture<'_, Result<(), SystemError>> {
-        Box::pin(async move { self.retire().await.map_err(SystemError::ShutdownError) })
+        Box::pin(async move {
+            self.retire_in_lifecycle()
+                .await
+                .map_err(SystemError::ShutdownError)
+        })
     }
 }
 
@@ -55,8 +59,8 @@ pub(crate) struct PendingFactory {
     pub lifetime: Arc<crate::children::ChildLifetime>,
 }
 pub(crate) enum Replacement<'a> {
-    Generation(&'a Arc<dyn Mailbox>),
-    Pending(&'a Arc<PendingFactory>),
+    Generation(&'a Arc<dyn Mailbox>, Option<tokio::time::Instant>),
+    Pending(&'a Arc<PendingFactory>, Option<tokio::time::Instant>),
     Instance(&'a Arc<super::instance::PendingInstance>),
 }
 /// Dropping a spawn waiter cancels admission/publication but never the owner.
@@ -87,17 +91,48 @@ impl ThreadActorSystem {
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
         F: Fn() -> A + Send + Sync + 'static,
     {
+        self.spawn_owned_factory_in_scope(factory, path, config, None)
+    }
+
+    /// Admit a root factory into an explicit group, retaining its original ref.
+    /// The cohort policy governs failures; engine configuration governs scheduling.
+    pub fn spawn_supervised_in_cohort<'a, A, F>(
+        self: &'a Arc<Self>,
+        factory: F,
+        path: &'a str,
+        config: ThreadActorConfig,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> impl std::future::Future<Output = Result<ThreadActorRef<A>, SpawnError>> + Send + 'a
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.spawn_owned_factory_in_scope(factory, path, config, Some(cohort))
+    }
+
+    fn spawn_owned_factory_in_scope<'a, A, F>(
+        self: &'a Arc<Self>,
+        factory: F,
+        path: &'a str,
+        config: ThreadActorConfig,
+        cohort: Option<&'a crate::root_cohort::RootCohort>,
+    ) -> impl std::future::Future<Output = Result<ThreadActorRef<A>, SpawnError>> + Send + 'a
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
         let factory = crate::owned_payload::OwnedPayload::new(
             factory,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         let config = crate::owned_payload::OwnedPayload::new(
             config,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         parrot_api::trace::capture(async move {
+            let cohort = cohort.or_else(|| self.root_cohorts.guardian());
             let factory = Factory::new(
                 factory.take(),
                 self.factory_slots.clone(),
@@ -105,14 +140,56 @@ impl ThreadActorSystem {
             );
             // Keep one protected copy until synchronous admission has returned.
             // Rejected temporary config clones cannot run the final user Drop.
-            let lifetime = crate::children::ChildLifetime::new(Weak::new());
-            let result = self.start_owned_factory(
-                factory.clone(),
-                path,
-                config.value().clone(),
-                None,
-                lifetime.clone(),
-            );
+            let mut lifetime = crate::children::ChildLifetime::new(Weak::new());
+            let independent_lifetime = lifetime.clone();
+            let mut start = |member| {
+                lifetime = member;
+                self.start_owned_factory(
+                    factory.clone(),
+                    path,
+                    config.value().clone(),
+                    None,
+                    lifetime.clone(),
+                )
+            };
+            let result = if let Some(cohort) = cohort {
+                let mut ticket = None;
+                let mut spawn_error = None;
+                cohort
+                    .validate(&self.root_cohorts)
+                    .and_then(|()| {
+                        cohort.scope.spawn(|member| {
+                            let pending = start(member.clone()).map_err(|error| {
+                                spawn_error = Some(error);
+                                parrot_api::errors::ActorError::Stopped
+                            })?;
+                            let reference = pending.reference.clone_boxed();
+                            let address = pending.reference.mailbox_cell();
+                            let system = Arc::downgrade(self);
+                            let path = path.to_owned();
+                            ticket = Some(pending);
+                            Ok((
+                                reference,
+                                Arc::new(move || {
+                                    if let Some(system) = system.upgrade() {
+                                        let _ = system.request_stop_ref(&path, &address);
+                                    }
+                                    let member = member.clone();
+                                    Box::pin(async move { member.wait().await })
+                                }),
+                            ))
+                        })
+                    })
+                    .map(|()| ticket.expect("admitted root factory"))
+                    .map_err(|error| {
+                        spawn_error.unwrap_or_else(|| match error {
+                            parrot_api::errors::ActorError::Stopped => SpawnError::Cancelled,
+                            error => SpawnError::InvalidConfig(error.to_string()),
+                        })
+                    })
+            } else {
+                start(independent_lifetime)
+            };
             match result {
                 Ok(ticket) => {
                     // The unactivated ticket retains PendingFactory ->
@@ -128,7 +205,7 @@ impl ThreadActorSystem {
                     let config = config.retire();
                     let (factory, config, policy) =
                         tokio::join!(factory, config, lifetime.dispose_policy());
-                    factory.map_err(SpawnError::InitializationFailed)?;
+                    factory.map_err(SpawnError::DisposalFailed)?;
                     config.map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
                     policy.map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
                     Err(error)
@@ -148,7 +225,7 @@ impl ThreadActorSystem {
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
-        lifetime.bind_admission(&mut config, &self.runtime_handle, &self.cleanup_slots);
+        lifetime.bind_admission(&mut config, self.retirement_runtime(), &self.cleanup_slots);
         let restart_lifetime = lifetime.clone();
         let restart_parent = parent.as_ref().map(|parent| parent.clone_boxed());
         let restart_factory = factory.clone();
@@ -177,6 +254,7 @@ impl ThreadActorSystem {
                         .map(|_| ())
                         .map_err(respawn_error);
                 }
+                let initialization_deadline = control.deadline();
                 factory
                     .construct(control, move |actor| {
                         system
@@ -186,7 +264,10 @@ impl ThreadActorSystem {
                                 parent,
                                 config,
                                 Some(entry),
-                                Some(Replacement::Generation(&old_mailbox)),
+                                Some(Replacement::Generation(
+                                    &old_mailbox,
+                                    initialization_deadline,
+                                )),
                                 lifetime,
                                 None,
                             )
@@ -226,9 +307,10 @@ impl ThreadActorSystem {
         .with_system(Arc::downgrade(self))
         .with_mailbox_cell(address)
         .with_stop_request(supervision.stop_request.clone())
-        .with_death_watch(watches.common.clone());
+        .with_death_watch(watches.common.clone())
+        .with_retirement(&lifetime);
         let timeout = self.config().shutdown_timeout;
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now() + self.creation_timeout();
         let pending = Arc::new(PendingFactory {
             reference: Arc::from(reference.clone_boxed()),
             supervision: supervision.clone(),
@@ -241,13 +323,8 @@ impl ThreadActorSystem {
             let mut registry = self.registry.write().unwrap();
             if self.is_shutting_down() {
                 Err(SpawnError::SystemShutdown)
-            } else if config
-                .message_batch_size
-                .is_some_and(|n| !(1..=256).contains(&n))
-            {
-                Err(SpawnError::InvalidConfig(
-                    "message_batch_size must be in 1..=256".into(),
-                ))
+            } else if let Err(error) = config.validate() {
+                Err(SpawnError::InvalidConfig(error.to_string()))
             } else if registry.contains_key(path) {
                 Err(SpawnError::ActorPathAlreadyExists(path.into()))
             } else if self.self_weak().is_none() {
@@ -284,7 +361,7 @@ impl ThreadActorSystem {
         let cancel_system = weak.clone();
         let (send, receive) = tokio::sync::oneshot::channel();
         let (activate, activation) = tokio::sync::oneshot::channel();
-        self.runtime_handle.spawn(parrot_api::trace::capture(async move {
+        self.retirement_runtime().spawn(parrot_api::trace::capture(async move {
             // Parent ownership is installed before any constructor can run.
             if activation.await.is_err() { pending.control.cancel(); }
             let mut send = Some(send);
@@ -297,7 +374,7 @@ impl ThreadActorSystem {
                 let publish_system = weak.clone();
                 let mut result = factory.construct(pending.control.clone(), move |actor| {
                     let system = publish_system.upgrade().ok_or(SpawnError::SystemShutdown)?;
-                    system.spawn_at_internal(actor, &publish_path, next_parent, next_config, Some(next_supervision), Some(Replacement::Pending(&publish_pending)), publish_pending.lifetime.clone(), None)
+                    system.spawn_at_internal(actor, &publish_path, next_parent, next_config, Some(next_supervision), Some(Replacement::Pending(&publish_pending, publish_pending.control.deadline())), publish_pending.lifetime.clone(), None)
                 }).await.map_err(SpawnError::from);
                 if matches!(result, Err(SpawnError::Cancelled)) && let Some(group) = pending.lifetime.recovery() {
                     result = match weak.upgrade() {
@@ -465,18 +542,19 @@ where
                 // Even rejection before scope admission may own arbitrary
                 // factory and decider captures. Dispose outside the topology
                 // lock and retain that work if the caller stops waiting.
-                let policy = crate::supervision_policy::PolicyStore::new(
+                let policy = crate::owned_payload::OwnedPayload::new(
                     strategy.flatten(),
-                    system.cleanup_slots.clone(),
+                    system.retirement_runtime(),
+                    &system.cleanup_slots,
                 );
                 system
-                    .runtime_handle
+                    .retirement_runtime()
                     .spawn(async move {
                         let lifetime = match admitted_lifetime {
                             Some(lifetime) => lifetime.dispose_policy().await,
                             None => Ok(()),
                         };
-                        let policy = policy.dispose().await;
+                        let policy = policy.retire().await;
                         let factory = factory
                             .dispose()
                             .await
@@ -573,7 +651,7 @@ impl ThreadActorSystem {
         };
         let system = self.clone();
         let path = path.to_owned();
-        self.runtime_handle.spawn(async move {
+        self.retirement_runtime().spawn(async move {
             system
                 .retire_generation(
                     &path,
@@ -609,23 +687,39 @@ impl ThreadActorSystem {
                 SpawnError::InitializationFailed(message)
             }
         };
-        let work = async {
+        let retirement = async {
             lifetime
                 .settle_live_decision()
                 .await
                 .map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
-            group
-                .arrive(lifetime.id, Step::Retired)
-                .await
-                .map_err(fail)?;
+            group.arrive(lifetime.id, Step::Retired).await.map_err(fail)
+        };
+        tokio::pin!(retirement);
+        let retired = tokio::select! {
+            biased;
+            result = &mut retirement => result,
+            _ = tokio::time::sleep_until(group.deadline) => {
+                group.abort("Thread cohort retirement deadline elapsed");
+                retirement.await
+            },
+        };
+        if let Err(error) = retired {
+            group.abort(error.to_string());
+            return Err(error);
+        }
+        let deadline = self.reconstruction_deadline(group.deadline);
+        let construction = group
+            .creation_control(lifetime.id, deadline)
+            .map_err(fail)?;
+        let work = async {
             let prepared = parrot_api::trace::in_scope(group.failure_context.clone(), || {
-                factory.prepare::<SpawnError>(group.control.clone())
+                factory.prepare::<SpawnError>(construction.clone())
             })
             .await
             .map_err(SpawnError::from)?;
             if let Err(error) = group.arrive(lifetime.id, Step::Prepared).await {
                 prepared
-                    .discard()
+                    .discard_in_lifecycle()
                     .await
                     .map_err(SpawnError::DisposalFailed)?;
                 return Err(fail(error));
@@ -646,8 +740,12 @@ impl ThreadActorSystem {
             let reference = prepared
                 .publish(move |actor| {
                     let replacing = match &publish_previous {
-                        GroupPrevious::Generation(mailbox) => Replacement::Generation(mailbox),
-                        GroupPrevious::Pending(pending) => Replacement::Pending(pending),
+                        GroupPrevious::Generation(mailbox) => {
+                            Replacement::Generation(mailbox, Some(deadline))
+                        }
+                        GroupPrevious::Pending(pending) => {
+                            Replacement::Pending(pending, Some(deadline))
+                        }
                     };
                     publish_system.spawn_at_internal(
                         actor,
@@ -750,8 +848,8 @@ impl ThreadActorSystem {
         let result = tokio::select! {
             biased;
             result = &mut work => result,
-            _ = tokio::time::sleep_until(group.deadline) => {
-                group.abort("Thread cohort recovery deadline elapsed");
+            _ = tokio::time::sleep_until(deadline) => {
+                group.abort("Thread cohort creation deadline elapsed");
                 work.await
             },
         };
@@ -771,7 +869,7 @@ impl parrot_api::engine::AsyncFactoryRuntime for ThreadActorSystem {
         use parrot_api::system::SystemError;
         let factory = crate::owned_payload::OwnedPayload::new(
             factory,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         Box::pin(parrot_api::trace::capture(async move {

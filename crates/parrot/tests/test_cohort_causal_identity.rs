@@ -270,11 +270,20 @@ fn verify(state: &State, causes: &[Option<TraceContext>]) {
     let mut expected = Vec::new();
     let mut actual = Vec::new();
     for member in 0..2 {
+        let initialization = phase(member, 0, "init-call");
+        lifecycle_identity::assert_child(
+            initialization.as_ref(),
+            phase(member, 0, "creation-handler").as_ref(),
+        );
         for name in ["constructor", "init-call", "init-poll", "init-resumed"] {
             assert!(phase(member, 0, "creation-handler").is_some());
             assert_eq!(
                 phase(member, 0, name),
-                phase(member, 0, "creation-handler"),
+                if name == "constructor" {
+                    phase(member, 0, "creation-handler")
+                } else {
+                    initialization.clone()
+                },
                 "initial child creation ancestry"
             );
         }
@@ -296,6 +305,8 @@ fn verify(state: &State, causes: &[Option<TraceContext>]) {
             "group decision sees its actual cause"
         );
         for member in 0..2 {
+            let initialization = phase(member, epoch + 1, "init-call");
+            lifecycle_identity::assert_child(initialization.as_ref(), failure.as_ref());
             for name in ["constructor", "init-call", "init-poll", "init-resumed"] {
                 let observed = phase(member, epoch + 1, name);
                 if cause.is_none() {
@@ -305,7 +316,16 @@ fn verify(state: &State, causes: &[Option<TraceContext>]) {
                     );
                 }
                 actual.push((epoch, member, name, observed));
-                expected.push((epoch, member, name, failure.clone()));
+                expected.push((
+                    epoch,
+                    member,
+                    name,
+                    if name == "constructor" {
+                        failure.clone()
+                    } else {
+                        initialization.clone()
+                    },
+                ));
             }
         }
         if cause.is_none() {
@@ -367,3 +387,5 @@ case!(actix_ask_error, true, false, false);
 case!(actix_ask_panic, true, false, true);
 case!(actix_tell_error, true, true, false);
 case!(actix_tell_panic, true, true, true);
+#[path = "support/lifecycle_identity.rs"]
+mod lifecycle_identity;

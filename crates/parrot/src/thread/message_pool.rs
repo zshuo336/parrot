@@ -8,7 +8,7 @@
 //! ## Design constraints that shaped this
 //!
 //! - `BoxedMessage = Box<dyn Any + Send>` erases the concrete type, so pools
-//!   are keyed by `TypeId` and recycle through one `downcast` on release.
+//!   are keyed by `TypeId` and recycle through one `downcast` on acquisition.
 //! - The consumer side (`receive_message(payload)`) takes ownership and drops
 //!   the box inside user code — the engine cannot intercept. Therefore
 //!   recycling is opt-in via [`Pooled<T>`], whose `Drop` returns the box to
@@ -19,9 +19,9 @@
 //! ## Bound policy
 //!
 //! Per-type bucket cap (default 128) + total bucket cap (default 256 types)
-//! prevent unbounded retention. Small types benefit most; large payloads
-//! should usually *not* be pooled (they'd pin pages) — gated by a size hint
-//! at acquisition time (caller's responsibility via `T` size).
+//! prevent unbounded entry counts. There is no automatic byte-size gate:
+//! callers must choose whether a type is suitable for pooling. Large payloads
+//! can pin pages when retained, so they should usually bypass this API.
 //!
 //! ## Expected benefit profile
 //!
@@ -53,12 +53,7 @@ struct Pool {
     buckets: HashMap<TypeId, TypeBucket>,
     bucket_cap: usize,
     type_cap: usize,
-    /// Lifetime allocation/deallocation counters (metrics).
-    acquired_fresh: u64,
-    acquired_reused: u64,
-    released: u64,
-    #[allow(dead_code)] // 统计面板字段（stats() 聚合展示）
-    dropped_overflow: u64,
+    counters: PoolStats,
 }
 
 impl Pool {
@@ -67,15 +62,18 @@ impl Pool {
             buckets: HashMap::new(),
             bucket_cap: DEFAULT_BUCKET_CAP,
             type_cap: DEFAULT_TYPE_CAP,
-            acquired_fresh: 0,
-            acquired_reused: 0,
-            released: 0,
-            dropped_overflow: 0,
+            counters: PoolStats::default(),
         }
     }
 }
+impl Drop for Pool {
+    fn drop(&mut self) {
+        retire_buckets(std::mem::take(&mut self.buckets), false);
+    }
+}
 
-/// Counters for the calling thread only; no cross-thread aggregation.
+/// Successful acquisitions and returns for this thread; counters saturate at
+/// `u64::MAX`. `released` counts cached returns, `dropped_overflow` rejected ones.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PoolStats {
     pub acquired_fresh: u64,
@@ -84,70 +82,80 @@ pub struct PoolStats {
     pub dropped_overflow: u64,
 }
 
-thread_local! {
-    static COUNTERS: RefCell<(u64, u64, u64, u64)> = const { RefCell::new((0, 0, 0, 0)) };
-}
-
-#[inline]
-fn bump_counters(fresh: u64, reuse: u64, rel: u64, over: u64) {
-    // Thread-local bump: zero cross-thread contention (P2 lesson: global
-    // atomics made the pool 3.4x SLOWER than malloc under concurrency).
-    COUNTERS.with(|c| {
-        let mut c = c.borrow_mut();
-        c.0 += fresh;
-        c.1 += reuse;
-        c.2 += rel;
-        c.3 += over;
-    });
-}
-
 /// Acquire a `Box<T>` from the current thread's pool for type `T`.
 ///
 /// Returns a pooled wrapper; if the bucket is empty a fresh box is allocated.
 /// The contents are **stale** — callers must overwrite every field they care
 /// about (same contract as Disruptor slot reuse).
 pub fn acquire<T: Default + Send + 'static>() -> Pooled<T> {
-    let reused = POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        let tid = TypeId::of::<T>();
-        let reused = p
-            .buckets
-            .get_mut(&tid)
-            .and_then(|b| b.free.pop())
-            .map(|any| {
-                // Recycle through downcast: exactly one TypeId compare.
-                match any.downcast::<T>() {
-                    Ok(boxed) => boxed,
-                    Err(_) => unreachable!("type bucket invariant violated"),
-                }
-            });
-        match &reused {
-            Some(_) => p.acquired_reused += 1,
-            None => p.acquired_fresh += 1,
-        }
-        reused
-    });
-    match reused {
-        Some(boxed) => {
-            bump_counters(0, 1, 0, 0);
-            Pooled {
-                inner: std::mem::ManuallyDrop::new(boxed),
+    let reused = POOL
+        .try_with(|p| {
+            let mut p = p.borrow_mut();
+            let reused = p
+                .buckets
+                .get_mut(&TypeId::of::<T>())
+                .and_then(|b| b.free.pop());
+            if reused.is_some() {
+                p.counters.acquired_reused = p.counters.acquired_reused.saturating_add(1);
             }
-        }
+            reused
+        })
+        .ok()
+        .flatten();
+    let boxed = match reused {
+        Some(any) => match any.downcast::<T>() {
+            Ok(boxed) => boxed,
+            Err(_) => unreachable!("type bucket invariant violated"),
+        },
         None => {
-            bump_counters(1, 0, 0, 0);
-            Pooled {
-                inner: std::mem::ManuallyDrop::new(Box::new(T::default())),
+            // Default may reenter or panic. Count only a completed acquisition,
+            // and never hold a pool borrow while running user code.
+            let boxed = Box::new(T::default());
+            let _ = POOL.try_with(|p| {
+                let mut p = p.borrow_mut();
+                p.counters.acquired_fresh = p.counters.acquired_fresh.saturating_add(1);
+            });
+            boxed
+        }
+    };
+    Pooled {
+        inner: std::mem::ManuallyDrop::new(boxed),
+    }
+}
+
+fn report_disposal_failure(payload: Box<dyn Any + Send>) {
+    let message = crate::owned_payload::panic_message(payload);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::error!(operation = "message_pool_disposal", %message, "message pool disposal failed");
+    }));
+    drop(crate::owned_payload::PublicationInput::new(result));
+}
+
+fn retire_buckets(buckets: HashMap<TypeId, TypeBucket>, propagate: bool) {
+    let mut first = crate::owned_payload::PublicationInput::new(None);
+    for (_, bucket) in buckets {
+        for value in bucket.free {
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
+            {
+                if propagate && first.value().is_none() {
+                    *first.value_mut() = Some(payload);
+                } else {
+                    report_disposal_failure(payload);
+                }
             }
         }
+    }
+    if let Some(payload) = first.take() {
+        std::panic::resume_unwind(payload);
     }
 }
 
 /// Return a `Box<T>` to the current thread's pool (called by `Pooled::drop`).
 fn release<T: Send + 'static>(boxed: Box<T>) {
-    let accepted = POOL.with(|p| {
+    let mut boxed = Some(boxed);
+    let _ = POOL.try_with(|p| {
         let mut p = p.borrow_mut();
-        p.released += 1;
         let tid = TypeId::of::<T>();
         let cap = p.bucket_cap;
         let type_cap = p.type_cap;
@@ -155,22 +163,28 @@ fn release<T: Send + 'static>(boxed: Box<T>) {
             Some(b) => b,
             None => {
                 if p.buckets.len() >= type_cap {
-                    return false; // too many types; don't retain
+                    p.counters.dropped_overflow = p.counters.dropped_overflow.saturating_add(1);
+                    return;
                 }
                 p.buckets.insert(tid, TypeBucket { free: Vec::new() });
                 p.buckets.get_mut(&tid).unwrap()
             }
         };
         if bucket.free.len() >= cap {
-            return false; // bucket full; drop to allocator
+            p.counters.dropped_overflow = p.counters.dropped_overflow.saturating_add(1);
+            return;
         }
-        bucket.free.push(boxed as Box<dyn Any + Send>);
-        true
+        bucket
+            .free
+            .push(boxed.take().expect("unreturned box") as Box<dyn Any + Send>);
+        p.counters.released = p.counters.released.saturating_add(1);
     });
-    if accepted {
-        bump_counters(0, 0, 1, 0);
-    } else {
-        bump_counters(0, 0, 0, 1);
+    // An unavailable TLS slot or a full cache leaves ownership here. Dispose
+    // only after the borrow ends, including nested Pooled fields at thread exit.
+    if let Some(boxed) = boxed
+        && let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(boxed)))
+    {
+        report_disposal_failure(payload);
     }
 }
 
@@ -211,25 +225,20 @@ impl<T: Send + 'static> Drop for Pooled<T> {
 
 /// Snapshot this thread's pool counters (pool itself is thread-local, so
 /// per-thread stats are the natural granularity).
+/// Returns zeroes if called by a TLS destructor after the pool was destroyed.
 pub fn stats() -> PoolStats {
-    POOL.with(|p| {
-        let p = p.borrow();
-        let c = COUNTERS.with(|c| *c.borrow());
-        let _ = p;
-        PoolStats {
-            acquired_fresh: c.0,
-            acquired_reused: c.1,
-            released: c.2,
-            dropped_overflow: c.3,
-        }
-    })
+    POOL.try_with(|p| p.borrow().counters).unwrap_or_default()
 }
 
-/// Reset pool buckets on the current thread (keeps counters).
+/// Retire the current cache snapshot, keeping counters and any reentrant returns.
+/// Every entry is disposed outside the pool borrow. The first original panic is
+/// rethrown after all entries retire, unless the caller is already unwinding.
+/// Once TLS teardown destroyed the pool, this is a no-op.
 pub fn clear_local() {
-    POOL.with(|p| {
-        p.borrow_mut().buckets.clear();
-    });
+    let buckets = POOL
+        .try_with(|p| std::mem::take(&mut p.borrow_mut().buckets))
+        .unwrap_or_default();
+    retire_buckets(buckets, !std::thread::panicking());
 }
 
 #[cfg(test)]

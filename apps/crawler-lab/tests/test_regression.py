@@ -42,6 +42,16 @@ class GoldenContracts(unittest.TestCase):
             with self.assertRaises(RunFailure):
                 compare(self.golden, changed)
 
+    def test_duplicate_json_fields_cannot_hide_changed_business_results(self):
+        for original, duplicate in [
+            ('"terms":33', '"terms":34,"terms":33'),
+            ('"queries":4', '"queries":5,"queries":4'),
+            ('"doc":9,"score":7', '"doc":10,"doc":9,"score":7'),
+            ('"doc":9,"score":7', '"doc":9,"score":8,"score":7'),
+        ]:
+            with self.subTest(duplicate=duplicate), self.assertRaises(RunFailure):
+                compare(self.golden, self.golden.replace(original, duplicate))
+
     def test_invalid_cli_is_rejected_before_build_or_run(self):
         result = subprocess.run([sys.executable, str(ROOT / 'apps/crawler-lab/deploy/regression.py'), '--typo'],
                                 text=True, capture_output=True, timeout=5)

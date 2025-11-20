@@ -1,4 +1,4 @@
-//! Real actor contexts -> TCP discovery -> facade resolution -> codec/ASK/reply.
+//! Real actor contexts -> TCP discovery -> context resolution -> codec/ASK/reply.
 use parrot::{
     actix::{ActixActor, ActixActorSystem, ActixContext},
     system::{ParrotActorSystem, RemoteGateway},
@@ -26,6 +26,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[path = "support/network.rs"]
+mod network_support;
 
 const LIMIT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -66,6 +69,8 @@ enum Command {
     Register,
     Deregister,
     Subscribe,
+    ResolveAndAsk { path: String, sequence: u64 },
+    ResolvePath(String),
 }
 fn key() -> ReceptionistKey {
     ReceptionistKey::new("edge/real-actor").unwrap()
@@ -90,6 +95,13 @@ async fn handle<C: ActorContext>(
             Command::Register => Box::new(ctx.receptionist_register(key()).await),
             Command::Deregister => Box::new(ctx.receptionist_deregister(&key()).await),
             Command::Subscribe => Box::new(ctx.receptionist_subscribe(key()).await),
+            Command::ResolveAndAsk { path, sequence } => {
+                let target = ctx
+                    .resolve_actor(&path)
+                    .expect("managed context must resolve the discovered remote path");
+                ctx.ask(target, Box::new(Ping(sequence))).await?
+            }
+            Command::ResolvePath(path) => Box::new(ctx.resolve_actor(&path)),
         },
     };
     Ok(value)
@@ -183,6 +195,10 @@ async fn node(id: &str, engine: usize, neutral: bool, gateway_first: bool) -> No
             .register_receptionist_gateway(gateway.clone())
             .await
             .unwrap();
+        facade
+            .register_remote_gateway(Arc::new(Gateway(remote.gateway())))
+            .await
+            .unwrap();
     }
     let counts = Arc::new(Counts::default());
     let actor = if engine == 3 {
@@ -245,11 +261,11 @@ async fn node(id: &str, engine: usize, neutral: bool, gateway_first: bool) -> No
     };
     if !gateway_first {
         facade.register_receptionist_gateway(gateway).await.unwrap();
+        facade
+            .register_remote_gateway(Arc::new(Gateway(remote.gateway())))
+            .await
+            .unwrap();
     }
-    facade
-        .register_remote_gateway(Arc::new(Gateway(remote.gateway())))
-        .await
-        .unwrap();
     ask::<()>(&actor, Command::Ready).await;
     assert_eq!(counts.initialized.load(Ordering::SeqCst), 1);
     Node {
@@ -317,15 +333,16 @@ async fn event(stream: &mut ReceptionistStream, node: &Node, registered: bool) -
     path
 }
 async fn roundtrip(from: &Node, to: &Node, received_path: &str, sequence: u64, count: usize) {
-    let actor = from
-        .facade
-        .get_actor(&ActorPath::placeholder(received_path))
-        .await
-        .expect("received discovery path must resolve through the facade remote gateway");
-    let response = tokio::time::timeout(LIMIT, actor.send(Box::new(Ping(sequence))))
-        .await
-        .unwrap()
-        .unwrap();
+    let response = tokio::time::timeout(
+        LIMIT,
+        from.actor.send(Box::new(Command::ResolveAndAsk {
+            path: received_path.to_owned(),
+            sequence,
+        })),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         *response.downcast::<Pong>().unwrap(),
         Pong {
@@ -501,6 +518,9 @@ impl Drop for Child {
     }
 }
 fn isolated(name: &str, future: impl std::future::Future<Output = ()>) {
+    if network_support::skip_tcp(name) {
+        return;
+    }
     if std::env::var("PARROT_NETWORK_ACTOR_CASE").ok().as_deref() == Some(name) {
         actix::System::new().block_on(future);
         return;
@@ -543,6 +563,142 @@ fn sharded_to_all_real_engines() {
 #[test]
 fn actix_to_all_real_engines() {
     isolated("actix_to_all_real_engines", matrix(3));
+}
+
+struct Redirect(BoxedActorRef);
+impl RemoteGateway for Redirect {
+    fn lookup(&self, path: &str) -> Option<BoxedActorRef> {
+        (path == "parrot://alias/user/route").then(|| self.0.clone_boxed())
+    }
+}
+
+struct StrongEngineLookup(Arc<ThreadActorSystem>);
+#[async_trait::async_trait]
+impl LocalLookup for StrongEngineLookup {
+    async fn lookup(&self, path: &str) -> Option<BoxedActorRef> {
+        self.0.get_actor_ref(path).map(|actor| actor.clone_boxed())
+    }
+}
+
+#[test]
+fn facade_remote_propagation_does_not_form_an_engine_cycle() {
+    isolated(
+        "facade_remote_propagation_does_not_form_an_engine_cycle",
+        async {
+            let f = Arc::new(ParrotActorSystem::new(Default::default()).await.unwrap());
+            let engine = ThreadActorSystem::shared(Default::default());
+            let remote = RemoteActorSystem::new(
+                RemoteConfig::tcp("owned-engine", Some("127.0.0.1:0".parse().unwrap())),
+                Arc::new(StrongEngineLookup(engine.clone())),
+            )
+            .unwrap();
+            f.register_thread_system("thread".into(), engine.clone(), false)
+                .await
+                .unwrap();
+            f.register_remote_gateway(Arc::new(Gateway(remote.gateway())))
+                .await
+                .unwrap();
+            let remote_weak = Arc::downgrade(&remote);
+            let engine_weak = Arc::downgrade(&engine);
+            remote.shutdown().await.unwrap();
+            f.shutdown_runtime().await.unwrap();
+            drop(remote);
+            assert!(
+                remote_weak.upgrade().is_some(),
+                "facade owns its message gateway until it is dropped"
+            );
+            drop(f);
+            assert!(
+                remote_weak.upgrade().is_none(),
+                "facade-owned gateway must not keep a remote/engine cycle after facade drop"
+            );
+            drop(engine);
+            assert!(
+                engine_weak.upgrade().is_none(),
+                "remote forwarding must release the retained engine"
+            );
+        },
+    );
+}
+
+#[test]
+fn contexts_preserve_local_identity_observe_gateway_replacement_and_close() {
+    isolated(
+        "contexts_preserve_local_identity_observe_gateway_replacement_and_close",
+        async {
+            let target = node("matrix-b", 0, false, true).await;
+            for engine in 0..ENGINES.len() {
+                for neutral in [false, true] {
+                    let n = node("matrix-a", engine, neutral, neutral).await;
+                    let local_path = n.actor.path();
+                    let local = ask::<Option<BoxedActorRef>>(
+                        &n.actor,
+                        Command::ResolvePath(local_path.clone()),
+                    )
+                    .await
+                    .expect("managed context must resolve its exact local registry identity");
+                    assert_eq!(local.path(), local_path);
+                    let pong = local.send(Box::new(Ping(17))).await.unwrap();
+                    assert_eq!(pong.downcast::<Pong>().unwrap().receiver, local_path);
+                    assert!(
+                        ask::<Option<BoxedActorRef>>(
+                            &n.actor,
+                            Command::ResolvePath("/user/missing".into())
+                        )
+                        .await
+                        .is_none()
+                    );
+                    assert!(
+                        ask::<Option<BoxedActorRef>>(
+                            &n.actor,
+                            Command::ResolvePath("parrot://alias/user/route".into())
+                        )
+                        .await
+                        .is_none()
+                    );
+                    n.facade
+                        .register_remote_gateway(Arc::new(Redirect(target.actor.clone_boxed())))
+                        .await
+                        .unwrap();
+                    let redirected = ask::<Option<BoxedActorRef>>(
+                        &n.actor,
+                        Command::ResolvePath("parrot://alias/user/route".into()),
+                    )
+                    .await
+                    .expect("all registered engines must observe a replaced remote gateway");
+                    assert_eq!(redirected.path(), target.actor.path());
+                    let pong = redirected.send(Box::new(Ping(91))).await.unwrap();
+                    let pong = pong.downcast::<Pong>().unwrap();
+                    assert_eq!(pong.sequence, 91);
+                    assert_eq!(pong.receiver, target.actor.path());
+                    n.facade.shutdown_runtime().await.unwrap();
+                    let runtime = n.facade.runtime("engine").unwrap();
+                    assert!(runtime.get_actor(&local_path).await.is_none());
+                    assert!(
+                        runtime
+                            .get_actor("parrot://alias/user/route")
+                            .await
+                            .is_none()
+                    );
+                    let denied: Arc<dyn RemoteGateway> =
+                        Arc::new(Redirect(target.actor.clone_boxed()));
+                    let weak = Arc::downgrade(&denied);
+                    assert!(
+                        matches!(
+                            n.facade.register_remote_gateway(denied).await,
+                            Err(parrot_api::system::SystemError::ShuttingDown)
+                        ),
+                        "closed facade must reject and release a late remote gateway"
+                    );
+                    assert!(weak.upgrade().is_none());
+                    drop(runtime);
+                    stop(n).await;
+                }
+            }
+            assert_eq!(*target.counts.received.lock().unwrap(), vec![91; 8]);
+            stop(target).await;
+        },
+    );
 }
 
 #[test]
@@ -590,7 +746,22 @@ fn actor_stop_with_live_nodes_withdraws_tcp_discovery() {
                 write(&a, true).await;
                 event(&mut remote, &a, true).await;
                 let discovered = event(&mut local, &a, true).await;
-                roundtrip(&b, &a, &discovered, 902, 1).await;
+                // The service actor on b has retired. The still-live host,
+                // rather than that stopped actor's context, makes this probe.
+                let target = b
+                    .facade
+                    .get_actor(&ActorPath::placeholder(discovered))
+                    .await
+                    .unwrap();
+                let reply = target.send(Box::new(Ping(902))).await.unwrap();
+                assert_eq!(
+                    *reply.downcast::<Pong>().unwrap(),
+                    Pong {
+                        sequence: 902,
+                        receiver: a.actor.path(),
+                        received: 1,
+                    }
+                );
                 assert_eq!(*a.counts.received.lock().unwrap(), [902]);
                 assert_eq!(*b.counts.received.lock().unwrap(), [901]);
                 write(&a, false).await;

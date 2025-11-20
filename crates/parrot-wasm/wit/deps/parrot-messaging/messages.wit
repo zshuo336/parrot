@@ -1,0 +1,24 @@
+package parrot:messaging@0.1.0;
+
+interface messages {
+    record msg {
+        type-key: string,
+        payload: list<u8>,
+    }
+    enum messaging-error {
+        disabled,
+        denied,
+        invalid-request,
+        limit,
+        timeout,
+        unknown-target,
+        unknown-type,
+        codec,
+        failed,
+        unexpected-reply,
+    }
+    /// Timeout covers mailbox admission and the actual handler response.
+    ask: func(destination: string, message: msg, timeout-ms: u32) -> result<msg, messaging-error>;
+    /// Success acknowledges mailbox admission only. Cancellation is not rollback.
+    tell: func(destination: string, message: msg, timeout-ms: u32) -> result<_, messaging-error>;
+}

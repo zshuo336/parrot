@@ -4,6 +4,9 @@ use futures::{stream, StreamExt};
 use parrot_config::endpoint::SeedEndpoint;
 use std::{collections::BTreeMap, future::Future, io, net::SocketAddr, sync::Weak, time::Duration};
 
+#[cfg(test)]
+mod diagnostic_contracts;
+
 #[derive(Default)]
 pub(super) struct SeedGroup {
     identity: String,
@@ -81,7 +84,9 @@ impl SeedGroup {
                         }
                     }
                     Err(error) => {
-                        tracing::debug!(node = %self.identity, %error, "seed DNS refresh failed")
+                        super::diagnostic(
+                            || tracing::debug!(node = %self.identity, %error, "seed DNS refresh failed"),
+                        );
                     }
                 }
             }
@@ -117,9 +122,13 @@ impl SeedGroup {
             {
                 Ok(Ok(identity)) => return Some(identity),
                 Ok(Err(error)) => {
-                    tracing::debug!(node = %address.node_id, %error, "seed connection retry")
+                    super::diagnostic(
+                        || tracing::debug!(node = %address.node_id, %error, "seed connection retry"),
+                    );
                 }
-                Err(_) => tracing::debug!(node = %address.node_id, "seed candidate timed out"),
+                Err(_) => super::diagnostic(
+                    || tracing::debug!(node = %address.node_id, "seed candidate timed out"),
+                ),
             }
         }
         None

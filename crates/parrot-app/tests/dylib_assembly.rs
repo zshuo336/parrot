@@ -52,6 +52,31 @@ async fn native_runtime_is_explicitly_feature_gated() {
 
 #[cfg(feature = "dylib")]
 mod enabled {
+    // Each contract owns a loader namespace. Independent tests must not spend
+    // one another's lifecycle deadlines waiting for dyld/glibc loader locks.
+    macro_rules! native_test {
+        ($name:ident, $body:ident) => {
+            native_test!($name, $body, tokio::runtime::Builder::new_current_thread());
+        };
+        ($name:ident, $body:ident, $runtime:expr) => {
+            #[test]
+            fn $name() {
+                let qualified = concat!(module_path!(), "::", stringify!($name));
+                let (_, test) = qualified.split_once("::").unwrap();
+                isolated_native(test, || {
+                    $runtime.enable_all().build().unwrap().block_on($body());
+                });
+            }
+        };
+    }
+
+    mod lifecycle {
+        include!("dylib_assembly/lifecycle.rs");
+    }
+    mod guest_lifecycle {
+        include!("dylib_assembly/guest_lifecycle.rs");
+    }
+
     use parrot::thread::system::ThreadActorSystem;
     use parrot_api::{address::ActorRefExt, types::BoxedActorRef};
     use parrot_app::{
@@ -185,6 +210,42 @@ mod enabled {
             .0
     }
     struct NoGateway;
+
+    native_test!(
+        native_constructor_exact_output_preserves_legacy_bytes_and_special_values,
+        constructor_output_contract
+    );
+    async fn constructor_output_contract() {
+        use parrot_api::address::stop_for_cleanup;
+        use parrot_app::host::dylib::MAX_CONFIG_BYTES;
+        let mut setup = Setup::new();
+        setup.config.extend(toml::from_str::<toml::Table>("nan=nan\npositive=inf\nnegative=-inf\nzero=-0.0\nwhen=2026-11-13T00:00:00Z\nempty={}\npadding=''\n[\"dot.key\"]\nx=1").unwrap());
+        let path = "/user/exact-native";
+        let envelope = |config: &toml::Table| {
+            toml::Table::from_iter([
+                ("self_path".into(), path.into()),
+                ("config".into(), toml::Value::Table(config.clone())),
+            ])
+        };
+        let base = toml::to_string(&envelope(&setup.config)).unwrap().len();
+        let padding_bytes = MAX_CONFIG_BYTES - base;
+        let padding = "中".repeat(padding_bytes / 3) + &"x".repeat(padding_bytes % 3);
+        setup
+            .config
+            .insert("padding".into(), padding.clone().into());
+        let expected = toml::to_string(&envelope(&setup.config)).unwrap();
+        assert_eq!(expected.len(), MAX_CONFIG_BYTES);
+        let actors = setup.spawn(&[path]).await.unwrap();
+        assert_eq!(ask(&actors[0], "config", &[]).await, expected.as_bytes());
+        stop_for_cleanup(&*actors[0]).await.unwrap();
+        setup
+            .config
+            .insert("padding".into(), (padding + "x").into());
+        let result = setup.spawn(&[path]).await;
+        assert!(matches!(result, Err(DeployError::Config(_))));
+        assert!(setup.engine.get_actor_ref(path).is_none());
+        setup.engine.shutdown_internal().await.unwrap();
+    }
     #[async_trait::async_trait]
     impl GatewayFactory for NoGateway {
         async fn configure(&self, _: &parrot_config::Resolved) -> Result<(), DeployError> {
@@ -203,8 +264,11 @@ mod enabled {
         }
     }
 
-    #[tokio::test]
-    async fn native_guest_receives_exact_handler_parent_and_isolates_untraced_calls() {
+    native_test!(
+        native_guest_receives_exact_handler_parent_and_isolates_untraced_calls,
+        guest_parent_contract
+    );
+    async fn guest_parent_contract() {
         tokio::time::timeout(Duration::from_secs(30), async {
             use parrot_api::trace::{self, SpanKind, SpanStatus, TraceRecorder};
             let setup = Setup::new();
@@ -253,8 +317,11 @@ mod enabled {
         .expect("native ASK causality exceeded its liveness deadline");
     }
 
-    #[tokio::test]
-    async fn native_tells_deliver_independent_parents_to_real_sibling_instances() {
+    native_test!(
+        native_tells_deliver_independent_parents_to_real_sibling_instances,
+        tell_parent_contract
+    );
+    async fn tell_parent_contract() {
         tokio::time::timeout(Duration::from_secs(30), async {
             use parrot_api::trace::{SpanStatus, TraceRecorder};
             let setup = Setup::new();
@@ -308,8 +375,12 @@ mod enabled {
         .expect("native TELL causality exceeded its liveness deadline");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_native_ask_keeps_owned_parent_until_return_without_leaking_to_next_call() {
+    native_test!(
+        cancelled_native_ask_keeps_owned_parent_until_return_without_leaking_to_next_call,
+        cancelled_ask_parent_contract,
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2)
+    );
+    async fn cancelled_ask_parent_contract() {
         tokio::time::timeout(Duration::from_secs(30), async {
             use parrot_api::trace::{SpanStatus, TraceRecorder};
             let mut setup = Setup::new();
@@ -362,8 +433,11 @@ mod enabled {
         .expect("native cancelled ASK causality exceeded its liveness deadline");
     }
 
-    #[tokio::test]
-    async fn manifest_pool_uses_real_native_state_config_hooks_and_teardown() {
+    native_test!(
+        manifest_pool_uses_real_native_state_config_hooks_and_teardown,
+        manifest_pool_contract
+    );
+    async fn manifest_pool_contract() {
         let setup = Setup::new();
         let manifest = app_manifest(&setup);
         let deployer = LocalDeployer {
@@ -442,8 +516,11 @@ mod enabled {
         setup.engine.shutdown_internal().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn trust_metadata_and_byte_validation_precede_native_execution() {
+    native_test!(
+        trust_metadata_and_byte_validation_precede_native_execution,
+        trust_metadata_contract
+    );
+    async fn trust_metadata_contract() {
         let setup = Setup::new();
         let untrusted = ThreadPropsSpawner::new(setup.engine.clone());
         let error = untrusted
@@ -500,8 +577,11 @@ mod enabled {
         setup.engine.shutdown_internal().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn pool_failure_retires_prior_instances_in_reverse_order() {
+    native_test!(
+        pool_failure_retires_prior_instances_in_reverse_order,
+        pool_failure_contract
+    );
+    async fn pool_failure_contract() {
         let mut setup = Setup::new();
         setup.config.insert(
             "fail_path".into(),
@@ -525,8 +605,11 @@ mod enabled {
         setup.engine.shutdown_internal().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn occupied_path_preserves_owner_and_destroys_unregistered_instance() {
+    native_test!(
+        occupied_path_preserves_owner_without_constructing_a_rejected_instance,
+        occupied_path_contract
+    );
+    async fn occupied_path_contract() {
         let setup = Setup::new();
         let original = setup.spawn(&["/user/same"]).await.unwrap().pop().unwrap();
         assert!(setup.spawn(&["/user/first", "/user/same"]).await.is_err());
@@ -538,6 +621,14 @@ mod enabled {
                 .lines()
                 .filter(|l| *l == "destroy:/user/same")
                 .count(),
+            0
+        );
+        assert_eq!(
+            setup
+                .events()
+                .lines()
+                .filter(|l| *l == "construct:/user/same")
+                .count(),
             1
         );
         original.stop().await.unwrap();
@@ -547,9 +638,237 @@ mod enabled {
                 .lines()
                 .filter(|l| *l == "destroy:/user/same")
                 .count(),
-            2
+            1
         );
         setup.engine.shutdown_internal().await.unwrap();
+    }
+
+    struct ReleaseConstructor(PathBuf);
+    impl Drop for ReleaseConstructor {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+
+    native_test!(
+        native_constructor_runs_inside_admitted_identity_and_deployment_waits_for_it,
+        admitted_constructor_contract
+    );
+    async fn admitted_constructor_contract() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut setup = Setup::new();
+            let gate = setup.gate("construct_gate");
+            let _release = ReleaseConstructor(gate.clone());
+            let spawner = setup.spawner.clone();
+            let artifact = setup.artifact.clone();
+            let config = setup.config.clone();
+            let mut job = tokio::spawn(async move {
+                spawner
+                    .spawn_artifact(&artifact, &["/user/admitted".into()], Some(&config))
+                    .await
+            });
+            setup.wait_for("construct-enter:/user/admitted").await;
+            let admitted = setup.engine.get_actor_ref("/user/admitted").is_some();
+            let early = tokio::time::timeout(Duration::from_millis(100), &mut job).await;
+            let waiting = early.is_err();
+            std::fs::write(&gate, b"release").unwrap();
+            let actors = match early {
+                Ok(result) => result,
+                Err(_) => job.await,
+            }
+            .unwrap()
+            .unwrap();
+            assert_eq!(ask(&actors[0], "echo", b"started").await, b"started");
+            actors[0].stop().await.unwrap();
+            setup.engine.shutdown_internal().await.unwrap();
+            assert!(admitted, "constructor ran before engine path admission");
+            assert!(waiting, "deployment acknowledged an unfinished constructor");
+            for event in ["construct", "drain", "destroy"] {
+                assert_eq!(
+                    setup
+                        .events()
+                        .lines()
+                        .filter(|line| *line == format!("{event}:/user/admitted"))
+                        .count(),
+                    1
+                );
+            }
+        })
+        .await
+        .expect("native admitted constructor deadline");
+    }
+
+    native_test!(
+        concurrent_native_path_contender_never_executes_its_constructor,
+        concurrent_path_contract
+    );
+    async fn concurrent_path_contract() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut setup = Setup::new();
+            let gate = setup.gate("construct_gate");
+            let _release = ReleaseConstructor(gate.clone());
+            let launch = || {
+                let spawner = setup.spawner.clone();
+                let artifact = setup.artifact.clone();
+                let config = setup.config.clone();
+                tokio::spawn(async move {
+                    spawner
+                        .spawn_artifact(&artifact, &["/user/contended".into()], Some(&config))
+                        .await
+                })
+            };
+            let first = launch();
+            setup.wait_for("construct-enter:/user/contended").await;
+            let second = launch();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !second.is_finished()
+                    && setup
+                        .events()
+                        .lines()
+                        .filter(|line| *line == "construct-enter:/user/contended")
+                        .count()
+                        < 2
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let rejected_before_release = second.is_finished();
+            std::fs::write(&gate, b"release").unwrap();
+            let winner = first.await.unwrap().unwrap();
+            let loser = second.await.unwrap();
+            assert_eq!(ask(&winner[0], "echo", b"owner").await, b"owner");
+            winner[0].stop().await.unwrap();
+            setup.engine.shutdown_internal().await.unwrap();
+            assert!(loser.is_err());
+            assert!(
+                rejected_before_release,
+                "path contender waited inside a rejected constructor"
+            );
+            for event in ["construct-enter", "construct", "drain", "destroy"] {
+                assert_eq!(
+                    setup
+                        .events()
+                        .lines()
+                        .filter(|line| *line == format!("{event}:/user/contended"))
+                        .count(),
+                    1
+                );
+            }
+        })
+        .await
+        .expect("native path contention deadline");
+    }
+
+    native_test!(
+        failed_native_initialization_reports_artifact_error_and_allows_same_path_retry,
+        failed_initialization_contract
+    );
+    async fn failed_initialization_contract() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut setup = Setup::new();
+            setup.config.insert(
+                "fail_path".into(),
+                toml::Value::String("/user/retry-init".into()),
+            );
+            let error = setup.spawn(&["/user/retry-init"]).await.unwrap_err();
+            assert!(
+                matches!(error.primary_error(), DeployError::Artifact(_)),
+                "{error}"
+            );
+            assert!(setup.engine.get_actor_ref("/user/retry-init").is_none());
+            assert!(!setup
+                .events()
+                .lines()
+                .any(|line| line == "construct:/user/retry-init"));
+            setup.config.remove("fail_path");
+            let actors = setup.spawn(&["/user/retry-init"]).await.unwrap();
+            assert_eq!(ask(&actors[0], "echo", b"retry").await, b"retry");
+            actors[0].stop().await.unwrap();
+            setup.engine.shutdown_internal().await.unwrap();
+            assert_eq!(
+                setup
+                    .events()
+                    .lines()
+                    .filter(|line| *line == "construct-enter:/user/retry-init")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                setup
+                    .events()
+                    .lines()
+                    .filter(|line| *line == "destroy:/user/retry-init")
+                    .count(),
+                1
+            );
+            assert!(setup.spawner.pending_cleanup().is_empty());
+        })
+        .await
+        .expect("native initialization retry deadline");
+    }
+
+    native_test!(
+        closed_engine_does_not_execute_native_constructor,
+        closed_engine_contract
+    );
+    async fn closed_engine_contract() {
+        let setup = Setup::new();
+        setup.engine.shutdown_internal().await.unwrap();
+        let error = setup.spawn(&["/user/closed-init"]).await.unwrap_err();
+        assert!(
+            matches!(error.primary_error(), DeployError::Engine(_)),
+            "{error}"
+        );
+        assert_eq!(setup.events(), "", "closed engine executed native hooks");
+    }
+
+    #[test]
+    fn failed_native_initialization_returns_entire_worker_capacity_before_retry() {
+        isolated_native(
+            "enabled::failed_native_initialization_returns_entire_worker_capacity_before_retry",
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(failed_native_initialization_capacity_contract());
+            },
+        );
+    }
+
+    async fn failed_native_initialization_capacity_contract() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut setup = Setup::new();
+            setup.config.insert(
+                "fail_path".into(),
+                toml::Value::String("/user/capacity-fail".into()),
+            );
+            assert!(setup.spawn(&["/user/capacity-fail"]).await.is_err());
+            setup.config.remove("fail_path");
+            let paths: Vec<_> = (0..MAX_WORKERS)
+                .map(|n| format!("/user/recovered-{n}"))
+                .collect();
+            let actors = setup
+                .spawner
+                .spawn_artifact(&setup.artifact, &paths, Some(&setup.config))
+                .await
+                .unwrap();
+            assert_eq!(actors.len(), MAX_WORKERS);
+            for actor in &actors {
+                assert_eq!(ask(actor, "echo", b"capacity").await, b"capacity");
+            }
+            assert!(setup.spawn(&["/user/over-capacity"]).await.is_err());
+            assert!(!setup.events().contains("over-capacity"));
+            for actor in actors.iter().rev() {
+                actor.stop().await.unwrap();
+            }
+            setup.engine.shutdown_internal().await.unwrap();
+            assert!(setup.spawner.pending_cleanup().is_empty());
+        })
+        .await
+        .expect("native failed-start capacity deadline");
     }
 
     #[test]
@@ -638,8 +957,11 @@ mod enabled {
         setup.engine.shutdown_internal().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn native_message_and_cleanup_gates_do_not_block_async_runtime() {
+    native_test!(
+        native_message_and_cleanup_gates_do_not_block_async_runtime,
+        runtime_progress_contract
+    );
+    async fn runtime_progress_contract() {
         let mut setup = Setup::new();
         let message_gate = setup.gate("message_gate");
         let drain_gate = setup.gate("drain_gate");
@@ -678,8 +1000,23 @@ mod enabled {
         setup.engine.shutdown_internal().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn native_capacity_is_reserved_for_whole_pool_and_shared_by_clones() {
+    // Full pools compete on the process-wide loader lock with unrelated
+    // lifecycle deadlines. Preserve all 32 workers in a dedicated process.
+    #[test]
+    fn native_capacity_is_reserved_for_whole_pool_and_shared_by_clones() {
+        isolated_native(
+            "enabled::native_capacity_is_reserved_for_whole_pool_and_shared_by_clones",
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(native_capacity_contract());
+            },
+        );
+    }
+
+    async fn native_capacity_contract() {
         let setup = Setup::new();
         let paths: Vec<_> = (0..MAX_WORKERS + 1)
             .map(|i| format!("/user/p-{i}"))
@@ -715,8 +1052,11 @@ mod enabled {
         setup.engine.shutdown_internal().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn message_bounds_reject_without_invoking_native_code_or_retiring_actor() {
+    native_test!(
+        message_bounds_reject_without_invoking_native_code_or_retiring_actor,
+        message_bounds_contract
+    );
+    async fn message_bounds_contract() {
         let setup = Setup::new();
         let actor = setup
             .spawn(&["/user/bounded"])
@@ -772,8 +1112,11 @@ mod enabled {
         });
     }
 
-    #[tokio::test]
-    async fn a_pool_keeps_one_verified_snapshot_when_the_source_changes_during_construction() {
+    native_test!(
+        a_pool_keeps_one_verified_snapshot_when_the_source_changes_during_construction,
+        verified_snapshot_contract
+    );
+    async fn verified_snapshot_contract() {
         let mut setup = Setup::new();
         let gate = setup.gate("construct_gate");
         let spawner = setup.spawner.clone();
@@ -809,8 +1152,11 @@ mod enabled {
         setup.engine.shutdown_internal().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn cli_requires_operator_authorization_and_rejects_digest_mismatch() {
+    native_test!(
+        cli_requires_operator_authorization_and_rejects_digest_mismatch,
+        cli_authorization_contract
+    );
+    async fn cli_authorization_contract() {
         let setup = Setup::new();
         let path = setup.temp.path().join("app.toml");
         std::fs::write(&path, toml::to_string(&app_manifest(&setup)).unwrap()).unwrap();
@@ -965,13 +1311,19 @@ mod enabled {
         }
     }
 
-    #[tokio::test]
-    async fn native_failure_retirement_is_joined_before_drain_success() {
+    native_test!(
+        native_failure_retirement_is_joined_before_drain_success,
+        failure_retirement_success_contract
+    );
+    async fn failure_retirement_success_contract() {
         failure_retirement_before_drain(false).await;
     }
 
-    #[tokio::test]
-    async fn native_failure_retirement_error_is_not_a_successful_drain() {
+    native_test!(
+        native_failure_retirement_error_is_not_a_successful_drain,
+        failure_retirement_error_contract
+    );
+    async fn failure_retirement_error_contract() {
         failure_retirement_before_drain(true).await;
     }
 
@@ -1117,14 +1469,20 @@ mod enabled {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn cli_serves_real_native_messages_over_tcp_and_sigterm_waits_for_destroy() {
+    native_test!(
+        cli_serves_real_native_messages_over_tcp_and_sigterm_waits_for_destroy,
+        cli_messages_contract
+    );
+    async fn cli_messages_contract() {
         cli_native_shutdown(false).await;
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn cli_native_business_failure_over_tcp_retires_before_successful_sigterm() {
+    native_test!(
+        cli_native_business_failure_over_tcp_retires_before_successful_sigterm,
+        cli_business_failure_contract
+    );
+    async fn cli_business_failure_contract() {
         cli_native_shutdown(true).await;
     }
 
@@ -1135,6 +1493,10 @@ mod enabled {
             body();
             return;
         }
+        // Bound independent fixture processes; each contract still exercises
+        // its own concurrent workers, loading, cancellation and retirement.
+        static CONTRACT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _contract = CONTRACT.lock().unwrap_or_else(|error| error.into_inner());
         fixture();
         let log = tempfile::NamedTempFile::new().unwrap();
         struct Child(std::process::Child);
@@ -1245,7 +1607,7 @@ mod enabled {
             .await
             .unwrap_or_else(|_| panic!("native probe slot {slot} did not advance"));
         }
-        async fn retired(&self, setup: &Setup) {
+        async fn physically_retired(&self, setup: &Setup) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while setup.engine.get_actor_ref("/user/unload").is_some() {
                     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1265,6 +1627,9 @@ mod enabled {
                 0,
                 "fixture watchdog must not be needed to release the worker"
             );
+        }
+        async fn retired(&self, setup: &Setup) {
+            self.physically_retired(setup).await;
             assert!(setup.spawner.pending_cleanup().is_empty());
         }
     }
@@ -1279,6 +1644,78 @@ mod enabled {
                 std::mem::forget(self.0.clone());
             }
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn stopping_native_initialization_keeps_path_and_worker_until_actual_unload() {
+        isolated_native(
+            "enabled::stopping_native_initialization_keeps_path_and_worker_until_actual_unload",
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut setup = Setup::with_timeout(Duration::from_millis(150));
+                        let probe = UnloadProbe::new(&mut setup, true);
+                        let spawner = setup.spawner.clone();
+                        let artifact = setup.artifact.clone();
+                        let config = setup.config.clone();
+                        let job = tokio::spawn(async move {
+                            spawner
+                                .spawn_artifact(&artifact, &["/user/unload".into()], Some(&config))
+                                .await
+                        });
+                        probe.wait_for(0).await;
+                        let actor = setup
+                            .engine
+                            .get_actor_ref("/user/unload")
+                            .expect("constructor must own an admitted actor");
+                        let stopped = tokio::time::timeout(Duration::from_secs(5), actor.stop())
+                            .await
+                            .unwrap();
+                        assert!(
+                            matches!(
+                                stopped,
+                                Err(parrot_api::errors::ActorError::TimeoutDetail(_))
+                            ),
+                            "{stopped:?}"
+                        );
+                        assert!(setup.engine.get_actor_ref("/user/unload").is_some());
+                        assert_eq!(probe.value(2), 0);
+                        assert_eq!(probe.value(7), 0);
+                        probe.release(1);
+                        probe.wait_for(5).await;
+                        assert!(setup.engine.get_actor_ref("/user/unload").is_some());
+                        assert_eq!(probe.value(4), 1);
+                        assert_eq!(probe.value(7), 0);
+                        probe.release(6);
+                        probe.physically_retired(&setup).await;
+                        assert!(job.await.unwrap().is_err());
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while matches!(
+                                actor.retirement_status(),
+                                parrot_api::address::RetirementStatus::Pending
+                            ) {
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        setup.spawner.retry_pending_cleanup().await.unwrap();
+                        assert!(setup.spawner.pending_cleanup().is_empty());
+                        assert!(
+                            matches!(
+                                actor.stop().await,
+                                Err(parrot_api::errors::ActorError::TimeoutDetail(_))
+                            ),
+                            "the published stop timeout must remain stable after actual retirement"
+                        );
+                        setup.engine.shutdown_internal().await.unwrap();
+                    });
+            },
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

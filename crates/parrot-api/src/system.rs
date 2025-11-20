@@ -101,19 +101,24 @@ pub struct ActorSystemConfig {
     pub timeouts: SystemTimeouts,
 }
 
-/// Configuration for the system's root guardian actor.
-///
-/// The guardian is a special system actor that supervises
-/// all top-level user actors.
+/// Configuration for automatic supervision of ordinary top-level actors.
+/// Built-in engines install this through their `with_guardian` constructors;
+/// Thread also installs it through `ActorSystem::start`. Roots retain their
+/// parentless identity. Explicit root cohorts have their own policy.
+/// Merely storing this configuration in a facade does not reconfigure an
+/// externally registered runtime.
 #[derive(Debug, Clone, Default)]
 pub struct GuardianConfig {
-    /// Maximum number of restarts allowed for supervised actors
+    /// Authoritative restart limit, overriding the strategy's duplicate field.
+    /// OneForOne counts per member; OneForAll shares one budget across roots.
+    /// Zero disables restarts, including Default(RestartOnFailure).
     pub max_restarts: u32,
 
-    /// Time window for counting restarts
+    /// Sliding restart window, overriding the strategy's duplicate field.
+    /// Restart-capable strategies require a positive window for a nonzero limit.
     pub restart_window: Duration,
 
-    /// Strategy for handling supervised actor failures
+    /// Failure decision and grouping. Stop and Resume do not charge a restart.
     pub supervision_strategy: SupervisorStrategyType,
 }
 
@@ -123,13 +128,18 @@ pub struct GuardianConfig {
 /// system operations to prevent resource leaks.
 #[derive(Debug, Clone, Default)]
 pub struct SystemTimeouts {
-    /// Maximum time allowed for actor creation
+    /// Creation/initialization budget for engines started from this config.
+    /// Zero adds no deadline beyond native constructor/recovery limits.
+    /// Synchronous user code cannot be preempted; late output is retired.
     pub actor_creation: Duration,
 
-    /// Maximum time allowed for message processing
+    /// Execution budget for a handler, independent of mailbox and ask waiting.
+    /// Zero disables this deadline. Expiration cancels the actual handler
+    /// future and follows supervision; a synchronous poll is checked on return.
     pub message_handling: Duration,
 
-    /// Maximum time allowed for system shutdown
+    /// Shutdown receipt budget. Zero preserves native engine settings.
+    /// A timed-out receipt does not release unfinished cleanup ownership.
     pub system_shutdown: Duration,
 }
 

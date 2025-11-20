@@ -217,6 +217,914 @@ fn spans(body: &[u8]) -> Vec<serde_json::Value> {
         .clone()
 }
 
+#[cfg(feature = "wasm")]
+fn wasm_recording_artifact() -> parrot_app::manifest::ArtifactRef {
+    use sha2::{Digest, Sha256};
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../parrot-wasm/tests/fixtures/recording-component.wasm")
+        .canonicalize()
+        .unwrap();
+    parrot_app::manifest::ArtifactRef::Wasm {
+        digest: format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap())),
+        uri: url::Url::from_file_path(path).unwrap().to_string(),
+    }
+}
+
+#[cfg(feature = "wasm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_wasm_lifecycle_exports_real_start_and_one_drain_with_guest_children() {
+    wasm_lifecycle_export(false).await;
+}
+
+#[cfg(feature = "wasm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_wasm_real_stop_exports_drain_and_guest_with_stop_identity() {
+    wasm_lifecycle_export(true).await;
+}
+
+#[cfg(feature = "wasm")]
+async fn wasm_lifecycle_export(drain_by_stop: bool) {
+    use parrot_api::address::ActorRefExt;
+    use parrot_app::{
+        assemble::{ParrotAppHook, ParrotSpawner},
+        hook_phase,
+        host::{wasm::WasmAsk, ThreadPropsSpawner},
+    };
+    let mut server = Server::new().await;
+    let mut exporter = TraceExporter::start(server.config()).unwrap();
+    let engine = parrot::thread::ThreadActorSystem::shared(Default::default());
+    let spawner = ThreadPropsSpawner::new(engine.clone()).with_wasm_limits(
+        parrot_wasm::WasmConfig {
+            fuel_per_message: 2_000_000,
+            epoch_deadline: 1000,
+            ..Default::default()
+        },
+        Default::default(),
+    );
+    let start_root = exporter.root();
+    let actors = start_root
+        .scope(spawner.spawn_artifact(
+            &wasm_recording_artifact(),
+            &["/user/lifecycle-export".into()],
+            None,
+        ))
+        .await
+        .unwrap();
+    let actor = &actors[0];
+    let identity = actor
+        .ask(WasmAsk {
+            type_key: "start-identity".into(),
+            payload: vec![],
+        })
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(&identity[..16], &start_root.trace_id());
+    actor
+        .send(Box::new(ParrotAppHook(hook_phase::START)))
+        .await
+        .unwrap();
+    let drain_root = exporter.root();
+    if drain_by_stop {
+        let stop = drain_root.in_scope(|| actor.stop());
+        parrot_api::trace::TraceContext::root()
+            .scope(stop)
+            .await
+            .unwrap();
+    } else {
+        drain_root
+            .scope(async { actor.send(Box::new(ParrotAppHook(hook_phase::DRAIN))).await })
+            .await
+            .unwrap();
+        for phase in [hook_phase::DRAIN, hook_phase::STOP] {
+            actor.send(Box::new(ParrotAppHook(phase))).await.unwrap();
+        }
+    }
+    actor.stop().await.unwrap();
+    assert!(engine.get_actor_ref("/user/lifecycle-export").is_none());
+    engine.shutdown_internal().await.unwrap();
+
+    let mut received = Vec::new();
+    let expected = 6;
+    while received.len() < expected {
+        let request = server.next().await;
+        received.extend(spans(&request.body));
+        request.reply.send(Reply::ok()).ok().unwrap();
+    }
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let by_kind = |kind: &str| {
+        let matches: Vec<_> =
+            received
+                .iter()
+                .filter(|span| {
+                    span["attributes"].as_array().unwrap().iter().any(|a| {
+                        a["key"] == "parrot.span.kind" && a["value"]["stringValue"] == kind
+                    })
+                })
+                .collect();
+        assert_eq!(matches.len(), 1, "missing or repeated actual {kind}");
+        matches[0]
+    };
+    for (phase, root) in [("on-start", &start_root), ("on-drain", &drain_root)] {
+        let host = received
+            .iter()
+            .find(|s| s["name"] == format!("wasm/{phase}:/user/lifecycle-export"))
+            .unwrap();
+        let guest = received
+            .iter()
+            .find(|s| s["name"] == format!("guest/{phase}"))
+            .unwrap();
+        assert_eq!(host["traceId"], hex(&root.trace_id()));
+        assert_eq!(guest["traceId"], host["traceId"]);
+        assert_eq!(guest["parentSpanId"], host["spanId"]);
+        assert_ne!(guest["spanId"], host["spanId"]);
+        assert!(host["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |a| a["key"] == "parrot.span.kind" && a["value"]["stringValue"] == "wasm_lifecycle"
+            ));
+        if phase == "on-start" {
+            let hook = by_kind("actor_init");
+            assert_eq!(hook["name"], "/user/lifecycle-export");
+            assert_eq!(hook["traceId"], host["traceId"]);
+            assert_eq!(hook["parentSpanId"], hex(&root.span_id()));
+            assert_eq!(host["parentSpanId"], hook["spanId"]);
+            assert_eq!(host["spanId"], hex(&identity[16..24]));
+            assert_eq!(guest["spanId"], hex(&identity[24..32]));
+        } else if drain_by_stop {
+            let hook = by_kind("actor_before_stop");
+            assert_eq!(hook["name"], "/user/lifecycle-export");
+            assert_eq!(hook["traceId"], host["traceId"]);
+            assert_eq!(hook["parentSpanId"], hex(&root.span_id()));
+            assert_eq!(host["parentSpanId"], hook["spanId"]);
+        } else {
+            let handler = by_kind("dynamic_handler");
+            assert_eq!(handler["name"], "/user/lifecycle-export");
+            assert_eq!(handler["traceId"], host["traceId"]);
+            assert_eq!(host["parentSpanId"], handler["spanId"]);
+            assert_eq!(handler["parentSpanId"], hex(&root.span_id()));
+        }
+    }
+    assert!(received.iter().all(|s| s["status"]["code"] == 1));
+    let report = exporter.shutdown(Duration::from_secs(2)).await.unwrap();
+    assert_eq!(report.end, TraceExportEnd::Complete);
+    assert_eq!(received.len(), expected);
+    assert_eq!(report.status.accepted_spans, expected as u64);
+    assert!(report.remaining.terminal);
+    assert_eq!(report.remaining.counts.overwritten, 0);
+}
+
+#[cfg(feature = "wasm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_manifest_wasm_start_exports_errors_without_publishing_an_actor() {
+    use parrot_app::{assemble::ParrotSpawner, host::ThreadPropsSpawner};
+    let mut server = Server::new().await;
+    let mut exporter = TraceExporter::start(server.config()).unwrap();
+    let engine = parrot::thread::ThreadActorSystem::shared(Default::default());
+    let spawner = ThreadPropsSpawner::new(engine.clone()).with_wasm_limits(
+        parrot_wasm::WasmConfig {
+            fuel_per_message: 2_000_000,
+            epoch_deadline: 1000,
+            ..Default::default()
+        },
+        Default::default(),
+    );
+    let config = toml::from_str::<toml::Table>("recording-on-start-mode = 'trap'").unwrap();
+    let root = exporter.root();
+    let result = root
+        .scope(spawner.spawn_artifact(
+            &wasm_recording_artifact(),
+            &["/user/failed-lifecycle".into()],
+            Some(&config),
+        ))
+        .await;
+    assert!(matches!(result, Err(parrot_app::DeployError::Engine(_))));
+    assert!(engine.get_actor_ref("/user/failed-lifecycle").is_none());
+    assert!(spawner.pending_cleanup().is_empty());
+    engine.shutdown_internal().await.unwrap();
+    let mut received = Vec::new();
+    while received.len() < 3 {
+        let request = server.next().await;
+        received.extend(spans(&request.body));
+        request.reply.send(Reply::ok()).ok().unwrap();
+    }
+    assert_eq!(received.len(), 3);
+    let guest = received
+        .iter()
+        .find(|s| s["name"] == "guest/on-start")
+        .unwrap();
+    let host = received
+        .iter()
+        .find(|s| s["name"] == "wasm/on-start:/user/failed-lifecycle")
+        .unwrap();
+    let hook = received
+        .iter()
+        .find(|s| s["name"] == "/user/failed-lifecycle")
+        .unwrap();
+    assert!(hook["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| { a["key"] == "parrot.span.kind" && a["value"]["stringValue"] == "actor_init" }));
+    assert_eq!(host["parentSpanId"], hook["spanId"]);
+    assert_eq!(host["traceId"], hook["traceId"]);
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    assert_eq!(hook["traceId"], hex(&root.trace_id()));
+    assert_eq!(hook["parentSpanId"], hex(&root.span_id()));
+    assert_eq!(guest["parentSpanId"], host["spanId"]);
+    assert_eq!(guest["traceId"], host["traceId"]);
+    assert!(received.iter().all(|s| s["status"]["code"] == 2));
+    let report = exporter.shutdown(Duration::from_secs(2)).await.unwrap();
+    assert_eq!(report.end, TraceExportEnd::Complete);
+    assert_eq!(report.status.accepted_spans, 3);
+    assert!(report.remaining.terminal);
+    assert_eq!(report.remaining.counts.overwritten, 0);
+}
+
+#[cfg(feature = "wasm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_wasm_actor_exports_guest_children_over_http_for_ask_and_tell() {
+    use parrot::thread::ThreadActorSystem;
+    use parrot_api::address::ActorRefExt;
+    use parrot_app::host::wasm::{WasmActor, WasmAsk, WasmTell};
+    use parrot_wasm::{runtime::WasmRuntime, HostCtx, WasmConfig};
+    let mut server = Server::new().await;
+    let mut exporter = TraceExporter::start(server.config()).unwrap();
+    let runtime = WasmRuntime::new_with_manual_epoch(WasmConfig {
+        fuel_per_message: 2_000_000,
+        epoch_deadline: 1000,
+        ..Default::default()
+    })
+    .unwrap();
+    let component = runtime
+        .instantiate_bytes(
+            include_bytes!("../../parrot-wasm/tests/fixtures/recording-component.wasm"),
+            HostCtx::default(),
+        )
+        .unwrap();
+    let engine = ThreadActorSystem::shared(Default::default());
+    let actor: parrot_api::types::BoxedActorRef = Box::new(
+        engine
+            .spawn_at(
+                WasmActor::new(component).unwrap(),
+                "/user/recording-guest",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap(),
+    );
+    for tell in [false, true] {
+        let root = exporter.root();
+        let reply = root
+            .scope(async {
+                if tell {
+                    actor
+                        .ask(WasmTell {
+                            type_key: "nested".into(),
+                            payload: vec![],
+                        })
+                        .await
+                        .unwrap()
+                        .0
+                } else {
+                    actor
+                        .ask(WasmAsk {
+                            type_key: "nested".into(),
+                            payload: vec![],
+                        })
+                        .await
+                        .unwrap()
+                        .0
+                }
+            })
+            .await;
+        if !tell {
+            assert_eq!(&reply[..16], &root.trace_id());
+        }
+        // The worker may export the inner completion before the outer handler
+        // retires. Collect across requests instead of assuming one batch.
+        let mut received = Vec::new();
+        while received.len() < 3 {
+            let request = server.next().await;
+            received.extend(spans(&request.body));
+            request.reply.send(Reply::ok()).ok().unwrap();
+        }
+        assert_eq!(received.len(), 3);
+        let named = |name: &str| received.iter().find(|s| s["name"] == name).unwrap();
+        let outer = named("guest/outer");
+        let inner = named("guest/inner");
+        let handler = named("/user/recording-guest");
+        assert_eq!(inner["traceId"], outer["traceId"]);
+        assert_eq!(outer["traceId"], handler["traceId"]);
+        assert_eq!(inner["parentSpanId"], outer["spanId"]);
+        assert_eq!(outer["parentSpanId"], handler["spanId"]);
+        assert_ne!(inner["spanId"], outer["spanId"]);
+        for span in [inner, outer] {
+            assert_eq!(span["status"]["code"], 1);
+            assert!(span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |a| a["key"] == "parrot.span.kind" && a["value"]["stringValue"] == "wasm_guest"
+                ));
+        }
+    }
+    // Clearing ambient context must not retain the previous recording session.
+    actor
+        .ask(WasmAsk {
+            type_key: "disabled".into(),
+            payload: vec![],
+        })
+        .await
+        .unwrap();
+    engine.shutdown_internal().await.unwrap();
+    let report = exporter.shutdown(Duration::from_secs(2)).await.unwrap();
+    assert_eq!(report.end, TraceExportEnd::Complete);
+    assert_eq!(report.status.accepted_spans, 6);
+    assert!(report.pending.is_none());
+    assert!(report.remaining.terminal);
+    assert_eq!(report.remaining.counts.in_flight, 0);
+    assert_eq!(report.remaining.counts.overwritten, 0);
+}
+
+#[cfg(feature = "wasm")]
+#[tokio::test]
+async fn actual_wasm_recovery_exports_independent_lifecycle_for_ask_and_tell() {
+    use parrot::thread::{SupervisorStrategy, ThreadActorSystem, ThreadActorSystemConfig};
+    use parrot_api::address::ActorRefExt;
+    use parrot_app::host::wasm::{WasmActor, WasmAsk, WasmTell};
+    use parrot_wasm::{runtime::WasmRuntime, HostCtx, WasmConfig};
+    let mut server = Server::new().await;
+    let mut exporter = TraceExporter::start(server.config()).unwrap();
+    let runtime = WasmRuntime::new_with_manual_epoch(WasmConfig {
+        fuel_per_message: 2_000_000,
+        epoch_deadline: 1000,
+        ..Default::default()
+    })
+    .unwrap();
+    let component = runtime
+        .instantiate_bytes(
+            include_bytes!("../../parrot-wasm/tests/fixtures/recording-component.wasm"),
+            HostCtx {
+                self_path: "/user/recovery-export".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let engine = ThreadActorSystem::shared(ThreadActorSystemConfig {
+        default_supervisor_strategy: SupervisorStrategy::Resume,
+        ..Default::default()
+    });
+    let actor: parrot_api::types::BoxedActorRef = Box::new(
+        engine
+            .spawn_at(
+                WasmActor::new(component).unwrap(),
+                "/user/recovery-export",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap(),
+    );
+    for tell in [false, true] {
+        let failed = exporter.root();
+        assert!(failed
+            .scope(async {
+                actor
+                    .ask(WasmAsk {
+                        type_key: "trap".into(),
+                        payload: vec![],
+                    })
+                    .await
+            })
+            .await
+            .is_err());
+        let next = exporter.root();
+        if tell {
+            next.scope(async {
+                actor
+                    .ask(WasmTell {
+                        type_key: "nested".into(),
+                        payload: vec![],
+                    })
+                    .await
+            })
+            .await
+            .unwrap();
+        } else {
+            next.scope(async {
+                actor
+                    .ask(WasmAsk {
+                        type_key: "nested".into(),
+                        payload: vec![],
+                    })
+                    .await
+            })
+            .await
+            .unwrap();
+        }
+        let identity = actor
+            .ask(WasmAsk {
+                type_key: "start-identity".into(),
+                payload: vec![],
+            })
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            identity.len(),
+            40,
+            "recovery must actually supply a guest recording capability"
+        );
+        let mut received = Vec::new();
+        while received.len() < 7 {
+            let request = server.next().await;
+            received.extend(spans(&request.body));
+            request.reply.send(Reply::ok()).ok().unwrap();
+        }
+        assert_eq!(received.len(), 7);
+        let named = |name: &str| {
+            received
+                .iter()
+                .find(|span| span["name"] == name && span["status"]["code"] == 1)
+                .unwrap()
+        };
+        let recovery = named("wasm/recovery-start:/user/recovery-export");
+        let startup = named("guest/on-start");
+        let handler = named("/user/recovery-export");
+        let outer = named("guest/outer");
+        let inner = named("guest/inner");
+        assert_eq!(recovery["parentSpanId"], handler["spanId"]);
+        assert_eq!(startup["parentSpanId"], recovery["spanId"]);
+        assert_eq!(outer["parentSpanId"], handler["spanId"]);
+        assert_eq!(inner["parentSpanId"], outer["spanId"]);
+        assert_ne!(recovery["spanId"], handler["spanId"]);
+        for span in [recovery, startup, handler, outer, inner] {
+            assert_eq!(span["traceId"], handler["traceId"]);
+        }
+        assert!(recovery["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attribute| {
+                attribute["key"] == "parrot.span.kind"
+                    && attribute["value"]["stringValue"] == "wasm_lifecycle"
+            }));
+        assert_eq!(
+            received
+                .iter()
+                .filter(|span| span["status"]["code"] == 2)
+                .count(),
+            2
+        );
+    }
+    engine.shutdown_internal().await.unwrap();
+    let report = exporter.shutdown(Duration::from_secs(2)).await.unwrap();
+    assert_eq!(report.end, TraceExportEnd::Complete);
+    assert_eq!(report.status.accepted_spans, 14);
+    assert!(report.pending.is_none());
+    assert!(report.remaining.terminal);
+    assert_eq!(report.remaining.counts.overwritten, 0);
+}
+
+#[cfg(feature = "dylib")]
+mod native_recording {
+    use super::*;
+    use parrot::thread::ThreadActorSystem;
+    use parrot_api::{address::ActorRefExt, trace::TraceRecorder, types::BoxedActorRef};
+    use parrot_app::{
+        assemble::ParrotSpawner,
+        host::{
+            dylib::{DylibAsk, DylibTell},
+            ThreadPropsSpawner,
+        },
+        manifest::ArtifactRef,
+    };
+    use sha2::{Digest, Sha256};
+    use std::{path::PathBuf, sync::OnceLock};
+
+    fn fixture() -> &'static PathBuf {
+        static PATH: OnceLock<PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let root =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../parrot-abi/tests/fixtures");
+            let output = std::process::Command::new("cargo")
+                .args(["build", "--release", "--locked", "--target-dir"])
+                .arg(root.join("target"))
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            root.join("target/release")
+                .join(format!(
+                    "libparrot_abi_recordingcomp.{}",
+                    std::env::consts::DLL_EXTENSION
+                ))
+                .canonicalize()
+                .unwrap()
+        })
+    }
+
+    async fn spawn(
+        engine: &Arc<ThreadActorSystem>,
+        path: &str,
+        config: Option<&toml::Table>,
+    ) -> BoxedActorRef {
+        let file = fixture();
+        let digest = format!("sha256:{:x}", Sha256::digest(std::fs::read(file).unwrap()));
+        // SAFETY: these tests build and own the trusted non-unwinding fixture.
+        let spawner =
+            unsafe { ThreadPropsSpawner::new(engine.clone()).with_trusted_dylib(&digest) }.unwrap();
+        let artifact = ArtifactRef::Dylib {
+            digest,
+            uri: url::Url::from_file_path(file).unwrap().into(),
+            abi: 1,
+        };
+        spawner
+            .spawn_artifact(&artifact, &[path.into()], config)
+            .await
+            .unwrap()
+            .remove(0)
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_native_guest_lifecycle_exports_nested_spans_and_unfinished_status_over_http() {
+        use parrot_app::{assemble::ParrotAppHook, hook_phase};
+        for explicit_drain in [false, true] {
+            let mut server = Server::new().await;
+            let mut exporter = TraceExporter::start(server.config()).unwrap();
+            let engine = ThreadActorSystem::shared(Default::default());
+            let config = toml::Table::from_iter([("lifecycle".into(), true.into())]);
+            let creation = exporter.root();
+            let actor = creation
+                .scope(spawn(&engine, "/user/guest-http", Some(&config)))
+                .await;
+            let drain_root = exporter.root();
+            if explicit_drain {
+                drain_root
+                    .scope(async { actor.send(Box::new(ParrotAppHook(hook_phase::DRAIN))).await })
+                    .await
+                    .unwrap();
+            }
+            let stop_root = exporter.root();
+            stop_root.in_scope(|| actor.stop()).await.unwrap();
+            engine.shutdown_internal().await.unwrap();
+            let expected = if explicit_drain { 16 } else { 15 };
+            let mut received = Vec::new();
+            while received.len() < expected {
+                let request = server.next().await;
+                received.extend(spans(&request.body));
+                request.reply.send(Reply::ok()).ok().unwrap();
+            }
+            assert_eq!(received.len(), expected);
+            let named = |target: &str| {
+                let matches: Vec<_> = received
+                    .iter()
+                    .filter(|span| span["name"] == target)
+                    .collect();
+                assert_eq!(matches.len(), 1, "one actual {target}");
+                matches[0]
+            };
+            let attribute = |span: &serde_json::Value, key: &str| {
+                span["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|attribute| attribute["key"] == key)
+                    .unwrap()["value"]["stringValue"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            for (phase, host_phase, trace) in [
+                ("construct", "construct", creation.trace_id()),
+                (
+                    "drain",
+                    "drain",
+                    if explicit_drain {
+                        drain_root.trace_id()
+                    } else {
+                        stop_root.trace_id()
+                    },
+                ),
+                ("destroy", "retire", stop_root.trace_id()),
+            ] {
+                let host = named(&format!("native/{host_phase}:/user/guest-http"));
+                let guest = named(&format!("guest/{phase}"));
+                let nested = named(&format!("guest/{phase}/nested"));
+                let unfinished = named(&format!("guest/{phase}/unfinished"));
+                assert_eq!(host["traceId"], hex(&trace));
+                assert_eq!(guest["traceId"], host["traceId"]);
+                assert_eq!(guest["parentSpanId"], host["spanId"]);
+                assert_eq!(nested["parentSpanId"], guest["spanId"]);
+                assert_eq!(unfinished["parentSpanId"], host["spanId"]);
+                for span in [guest, nested, unfinished] {
+                    assert_eq!(span["traceId"], host["traceId"]);
+                    assert_eq!(attribute(span, "parrot.span.kind"), "native_guest");
+                }
+                assert_eq!(guest["status"]["code"], 1);
+                assert_eq!(nested["status"]["code"], 1);
+                assert_eq!(unfinished["status"]["code"], 2);
+                assert_eq!(attribute(unfinished, "parrot.span.status"), "cancelled");
+                assert_eq!(
+                    host["status"]["code"], 1,
+                    "unfinished guest spans do not turn a successful hook into an error"
+                );
+            }
+            let report = exporter.shutdown(Duration::from_secs(2)).await.unwrap();
+            assert_eq!(report.end, TraceExportEnd::Complete);
+            assert_eq!(report.status.accepted_spans as usize, expected);
+            assert!(report.remaining.terminal);
+            assert_eq!(report.remaining.counts.overwritten, 0);
+            assert!(report.pending.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_native_lifecycle_exports_start_drain_and_unload_with_exact_parents() {
+        use parrot_app::{assemble::ParrotAppHook, hook_phase};
+        for explicit_drain in [false, true] {
+            let mut server = Server::new().await;
+            let mut exporter = TraceExporter::start(server.config()).unwrap();
+            let engine = ThreadActorSystem::shared(Default::default());
+            let creation = exporter.root();
+            let actor = creation
+                .scope(spawn(&engine, "/user/native-lifecycle-http", None))
+                .await;
+            actor
+                .ask(DylibAsk {
+                    type_key: "disabled".into(),
+                    payload: vec![],
+                })
+                .await
+                .unwrap();
+            let drain_root = exporter.root();
+            if explicit_drain {
+                drain_root
+                    .scope(async { actor.send(Box::new(ParrotAppHook(hook_phase::DRAIN))).await })
+                    .await
+                    .unwrap();
+                for phase in [hook_phase::DRAIN, hook_phase::STOP] {
+                    actor.send(Box::new(ParrotAppHook(phase))).await.unwrap();
+                }
+            }
+            let stop_root = exporter.root();
+            let stop = stop_root.in_scope(|| actor.stop());
+            parrot_api::trace::TraceContext::root()
+                .scope(stop)
+                .await
+                .unwrap();
+            engine.shutdown_internal().await.unwrap();
+            let expected = if explicit_drain { 7 } else { 6 };
+            let mut received = Vec::new();
+            while received.len() < expected {
+                let request = server.next().await;
+                received.extend(spans(&request.body));
+                request.reply.send(Reply::ok()).ok().unwrap();
+            }
+            assert_eq!(received.len(), expected);
+            let native = |phase: &str| {
+                let matches: Vec<_> = received
+                    .iter()
+                    .filter(|span| {
+                        span["name"] == format!("native/{phase}:/user/native-lifecycle-http")
+                    })
+                    .collect();
+                assert_eq!(matches.len(), 1, "one actual native {phase}");
+                matches[0]
+            };
+            let by_kind = |kind: &str| {
+                let matches: Vec<_> = received
+                    .iter()
+                    .filter(|span| {
+                        span["attributes"].as_array().unwrap().iter().any(|a| {
+                            a["key"] == "parrot.span.kind" && a["value"]["stringValue"] == kind
+                        })
+                    })
+                    .collect();
+                assert_eq!(matches.len(), 1, "one actual {kind}");
+                matches[0]
+            };
+            let init = by_kind("actor_init");
+            let before_stop = by_kind("actor_before_stop");
+            for phase in ["load", "construct", "drain", "retire"] {
+                let span = native(phase);
+                assert_eq!(span["status"]["code"], 1);
+                assert!(span["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["key"] == "parrot.span.kind"
+                        && a["value"]["stringValue"] == "native_lifecycle"));
+            }
+            for phase in ["load", "construct"] {
+                assert_eq!(native(phase)["traceId"], hex(&creation.trace_id()));
+                assert_eq!(native(phase)["parentSpanId"], init["spanId"]);
+            }
+            assert_ne!(native("load")["spanId"], native("construct")["spanId"]);
+            assert_eq!(before_stop["parentSpanId"], hex(&stop_root.span_id()));
+            assert_eq!(native("retire")["traceId"], hex(&stop_root.trace_id()));
+            assert_eq!(native("retire")["parentSpanId"], before_stop["spanId"]);
+            if explicit_drain {
+                assert_eq!(native("drain")["traceId"], hex(&drain_root.trace_id()));
+                assert_eq!(
+                    native("drain")["parentSpanId"],
+                    by_kind("dynamic_handler")["spanId"]
+                );
+            } else {
+                assert_eq!(native("drain")["traceId"], hex(&stop_root.trace_id()));
+                assert_eq!(native("drain")["parentSpanId"], native("retire")["spanId"]);
+            }
+            let report = exporter.shutdown(Duration::from_secs(2)).await.unwrap();
+            assert_eq!(report.end, TraceExportEnd::Complete);
+            assert_eq!(report.status.accepted_spans as usize, expected);
+            assert!(report.remaining.terminal);
+            assert_eq!(report.remaining.counts.overwritten, 0);
+            assert!(report.pending.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_native_actor_exports_guest_children_over_http_for_ask_and_tell() {
+        let mut server = Server::new().await;
+        let mut exporter = TraceExporter::start(server.config()).unwrap();
+        let engine = ThreadActorSystem::shared(Default::default());
+        let actor = spawn(&engine, "/user/native-recording", None).await;
+        for tell in [false, true] {
+            let root = exporter.root();
+            let reply = if tell {
+                root.in_scope(|| {
+                    actor.ask(DylibTell {
+                        type_key: "nested".into(),
+                        payload: vec![],
+                    })
+                })
+                .await
+                .unwrap()
+                .0
+            } else {
+                root.in_scope(|| {
+                    actor.ask(DylibAsk {
+                        type_key: "nested".into(),
+                        payload: vec![],
+                    })
+                })
+                .await
+                .unwrap()
+                .0
+            };
+            let mut received = Vec::new();
+            while received.len() < 3 {
+                let request = server.next().await;
+                received.extend(spans(&request.body));
+                request.reply.send(Reply::ok()).ok().unwrap();
+            }
+            assert_eq!(received.len(), 3);
+            let named = |name: &str| received.iter().find(|s| s["name"] == name).unwrap();
+            let outer = named("native/outer");
+            let inner = named("native/inner");
+            let handler = named("/user/native-recording");
+            assert_eq!(handler["traceId"], hex(&root.trace_id()));
+            assert_eq!(handler["parentSpanId"], hex(&root.span_id()));
+            assert_eq!(inner["traceId"], outer["traceId"]);
+            assert_eq!(outer["traceId"], handler["traceId"]);
+            assert_eq!(inner["parentSpanId"], outer["spanId"]);
+            assert_eq!(outer["parentSpanId"], handler["spanId"]);
+            assert_ne!(inner["spanId"], outer["spanId"]);
+            assert_ne!(outer["spanId"], handler["spanId"]);
+            if tell {
+                assert!(reply.is_empty());
+            } else {
+                assert_eq!(&reply[..16], &root.trace_id());
+                assert_eq!(hex(&reply[16..24]), outer["spanId"].as_str().unwrap());
+                assert_eq!(hex(&reply[24..]), inner["spanId"].as_str().unwrap());
+            }
+            for span in [inner, outer, handler] {
+                assert_eq!(span["status"]["code"], 1);
+            }
+            for span in [inner, outer] {
+                assert!(span["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["key"] == "parrot.span.kind"
+                        && a["value"]["stringValue"] == "native_guest"));
+            }
+        }
+        actor
+            .ask(DylibAsk {
+                type_key: "disabled".into(),
+                payload: vec![],
+            })
+            .await
+            .unwrap();
+        engine.shutdown_internal().await.unwrap();
+        let report = exporter.shutdown(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(report.end, TraceExportEnd::Complete);
+        assert_eq!(report.status.accepted_spans, 6);
+        assert!(report.pending.is_none());
+        assert!(report.remaining.terminal);
+        assert_eq!(report.remaining.counts.in_flight, 0);
+        assert_eq!(report.remaining.counts.overwritten, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_caller_does_not_retire_active_native_guest_or_leak_to_next_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let entered = temp.path().join("entered");
+        let release = temp.path().join("release");
+        let mut config = toml::Table::new();
+        config.insert("entered".into(), entered.to_str().unwrap().into());
+        config.insert("release".into(), release.to_str().unwrap().into());
+        let engine = ThreadActorSystem::shared(Default::default());
+        let actor = spawn(&engine, "/user/native-cancel", Some(&config)).await;
+        let recorder = TraceRecorder::new(8).unwrap();
+        let root = recorder.root();
+        let copy = actor.clone_boxed();
+        let context = root.clone();
+        let task = tokio::spawn(async move {
+            context
+                .in_scope(|| {
+                    copy.ask(DylibAsk {
+                        type_key: "gate".into(),
+                        payload: vec![],
+                    })
+                })
+                .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        if ready.is_err() {
+            std::fs::write(&release, b"open").unwrap();
+            panic!("native handler did not enter its gate");
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        recorder.close();
+        let pending = recorder.snapshot();
+        // The native command and handler are both still executing, regardless
+        // of whether the original caller continues waiting for their result.
+        assert!(!pending.terminal);
+        assert!(pending.records.is_empty());
+        assert_eq!(pending.counts.started, 2);
+        assert_eq!(pending.counts.in_flight, 2);
+        std::fs::write(&release, b"open").unwrap();
+        actor
+            .ask(DylibAsk {
+                type_key: "disabled".into(),
+                payload: vec![],
+            })
+            .await
+            .unwrap();
+        engine.shutdown_internal().await.unwrap();
+        let snapshot = recorder.snapshot();
+        assert!(snapshot.terminal);
+        assert_eq!(snapshot.counts.started, 2);
+        assert_eq!(snapshot.counts.completed, 2);
+        assert_eq!(snapshot.counts.ok, 2);
+        assert_eq!(snapshot.counts.in_flight, 0);
+        let guest = snapshot
+            .records
+            .iter()
+            .find(|s| s.kind == SpanKind::NativeGuest)
+            .unwrap();
+        let handler = snapshot
+            .records
+            .iter()
+            .find(|s| s.kind == SpanKind::DynamicHandler)
+            .unwrap();
+        assert_eq!(guest.trace_id, root.trace_id());
+        assert_eq!(guest.parent_span_id, Some(handler.span_id));
+        assert_eq!(handler.parent_span_id, Some(root.span_id()));
+    }
+}
+
 #[tokio::test]
 async fn continuously_exports_distinct_operations_before_shutdown() {
     let mut server = Server::new().await;

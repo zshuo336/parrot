@@ -11,7 +11,8 @@ use crate::manifest::AppManifest;
 use crate::planner::{self, TopologyView};
 use parrot_api::types::BoxedActorRef;
 
-/// 装配结果（refs 只读视图 + teardown——消费 ctx 逆序停用）。
+/// 装配结果。显式等待 teardown；失败时保留该对象以重试清理。
+/// Drop 仅释放引用，不代替 actor 或网关的异步停用。
 pub struct Assembled {
     ctx: AssemblingContext,
     deployer: LocalDeployerStorage,

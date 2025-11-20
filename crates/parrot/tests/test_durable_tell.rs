@@ -275,31 +275,71 @@ async fn durable_offline_replay() {
 }
 
 /// Five-minute WAL retention experiment; no network fault or automatic proxy is exercised.
+fn retention_record(seq: u64) -> WalRecord {
+    WalRecord {
+        endpoint: "edge-1".into(),
+        sender: "cloud-proxy".into(),
+        seq,
+        path: "parrot://edge-1/user/sink".into(),
+        type_key: "bin:durable::DTell#v1".into(),
+        payload: parrot_api::message::serde_remote_serialize(&DTell(seq))
+            .unwrap()
+            .into(),
+    }
+}
+
+async fn retain_and_recover_wal(count: u32, spacing: Duration) {
+    assert!(count > 0 && !spacing.is_zero(), "empty retention workload");
+    let directory = tempfile::tempdir().unwrap();
+    let wal = Wal::open(directory.path()).unwrap();
+    let t0 = Instant::now();
+    for seq in 1..=u64::from(count) {
+        wal.append(retention_record(seq)).unwrap();
+        tokio::time::sleep(spacing).await;
+    }
+    let elapsed = t0.elapsed();
+    assert!(elapsed >= spacing * count, "full real retention span");
+    let expected: Vec<_> = (1..=u64::from(count)).map(retention_record).collect();
+    assert_eq!(wal.pending_len().unwrap(), count as usize);
+    assert_eq!(wal.replay("edge-1").unwrap(), expected);
+    wal.sync().unwrap();
+    drop(wal);
+
+    let recovered = Wal::open(directory.path()).unwrap();
+    assert_eq!(
+        recovered.pending_len().unwrap(),
+        count as usize,
+        "recovered pending record count"
+    );
+    assert_eq!(
+        recovered.replay("edge-1").unwrap(),
+        expected,
+        "retained records must survive close/reopen with every field intact"
+    );
+    recovered
+        .ack("edge-1", "cloud-proxy", u64::from(count))
+        .unwrap();
+    assert_eq!(recovered.pending_len().unwrap(), 0);
+    drop(recovered);
+    let empty = Wal::open(directory.path()).unwrap();
+    assert!(empty.replay("edge-1").unwrap().is_empty());
+    drop(empty);
+    directory.close().unwrap();
+    println!(
+        "[WAL-RETENTION] records={count} elapsed_ns={} recovered_fields=true ack_recovered=true directory_removed=true",
+        elapsed.as_nanos()
+    );
+}
+
+#[tokio::test]
+async fn retention_checks_recovered_records_and_acknowledgement() {
+    retain_and_recover_wal(3, Duration::from_millis(1)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "5min WAL retention experiment; NOT the automatic offline/reconnect acceptance gate"]
 async fn durable_offline_5min_real() {
-    let dir = std::env::temp_dir().join("parrot-durable-5min");
-    let _ = std::fs::remove_dir_all(&dir);
-    let wal = Wal::open(&dir).unwrap();
-    // 真实 5min：每 3s 一条 → 100 条
-    let t0 = Instant::now();
-    for seq in 1..=100u64 {
-        wal.append(WalRecord {
-            endpoint: "edge-1".into(),
-            sender: "cloud-proxy".into(),
-            seq,
-            path: String::new(),
-            type_key: "bin:durable::DTell#v1".into(),
-            payload: parrot_api::message::serde_remote_serialize(&DTell(seq))
-                .unwrap()
-                .into(),
-        })
-        .unwrap();
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
-    assert!(t0.elapsed() >= Duration::from_secs(290), "real 5min span");
-    assert_eq!(wal.replay("edge-1").unwrap().len(), 100);
-    let _ = std::fs::remove_dir_all(&dir);
+    retain_and_recover_wal(100, Duration::from_secs(3)).await;
 }
 
 /// Explicit disk latency experiment; no percentile trimming or universal
@@ -307,9 +347,8 @@ async fn durable_offline_5min_real() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "disk latency experiment: run in isolation with --release --ignored --nocapture"]
 async fn wal_ack_latency_report() {
-    let dir = std::env::temp_dir().join(format!("parrot-ack-lat-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let wal = Wal::open(&dir).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let wal = Wal::open(directory.path()).unwrap();
 
     let rec = WalRecord {
         endpoint: "e".into(),
@@ -330,6 +369,7 @@ async fn wal_ack_latency_report() {
         wal.flush().unwrap();
         wal.ack("e", "s", 1 + i).unwrap();
     }
+    assert_eq!(wal.pending_len().unwrap(), 0);
 
     // 无 ACK 基线：append+flush
     let mut base = Vec::new();
@@ -343,6 +383,19 @@ async fn wal_ack_latency_report() {
         wal.flush().unwrap();
         base.push(t0.elapsed().as_nanos() as u64);
     }
+    let expected: Vec<_> = (51..=250)
+        .map(|seq| WalRecord { seq, ..rec.clone() })
+        .collect();
+    assert_eq!(wal.replay("e").unwrap(), expected);
+    drop(wal);
+    let wal = Wal::open(directory.path()).unwrap();
+    assert_eq!(wal.replay("e").unwrap(), expected, "baseline disk recovery");
+    // Start the ACK cohort without the baseline's retained backlog. These are
+    // different disk workloads, so their p99 difference is not an ACK overhead.
+    wal.ack("e", "s", 250).unwrap();
+    drop(wal);
+    let wal = Wal::open(directory.path()).unwrap();
+    assert_eq!(wal.pending_len().unwrap(), 0);
     // 有 ACK 路径：append+flush+ack
     let mut with_ack = Vec::new();
     for i in 0..200u64 {
@@ -362,7 +415,15 @@ async fn wal_ack_latency_report() {
     let a99 = with_ack[(with_ack.len() * 99).div_ceil(100) - 1];
     println!("WAL append+sync p99={b99}ns; append+sync+ack p99={a99}ns (untrimmed)");
     assert_eq!(wal.pending_len().unwrap(), 0);
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(wal);
+    let recovered = Wal::open(directory.path()).unwrap();
+    assert_eq!(recovered.pending_len().unwrap(), 0);
+    assert!(recovered.replay("e").unwrap().is_empty());
+    drop(recovered);
+    directory.close().unwrap();
+    println!(
+        "[WAL-LATENCY] warmup=50 baseline=200 with_ack=200 baseline_recovered=true ack_recovered=true directory_removed=true cohorts=different_disk_workloads"
+    );
 }
 
 /// Exercise the automatic worker through a real Thread engine, without test-side

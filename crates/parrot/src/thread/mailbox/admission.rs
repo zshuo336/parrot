@@ -1,4 +1,6 @@
 //! Admission before queueing, shared by every dynamic Thread delivery path.
+#[cfg(test)]
+mod entry_contracts;
 mod managed;
 use super::*;
 use crate::thread::envelope::{AskEnvelope, AskPayload, ControlMessage};
@@ -43,9 +45,14 @@ impl AdmissionMailbox {
         })
     }
     async fn prepare_item(&self, item: MailboxItem) -> Result<MailboxItem, MailboxError> {
+        let item = super::Input::unbound(item);
         if self.inner.is_closed().await {
+            if let Err(error) = item.retire().await {
+                tracing::error!(error = %error, "closed admission mailbox input disposal failed");
+            }
             return Err(MailboxError::Closed);
         }
+        let item = item.take();
         let item = match item {
             MailboxItem::Plain(message) => {
                 let (message, parent) = crate::thread::envelope::TraceEnvelope::unpack(message);
@@ -225,6 +232,13 @@ mod tests {
             assert!(futures::poll!(&mut blocked).is_pending());
             assert_eq!(held.load(Ordering::SeqCst), 2);
             drop(blocked);
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while held.load(Ordering::SeqCst) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled prepared input must release its charge");
             assert_eq!(held.load(Ordering::SeqCst), 1);
             let popped = m.pop().await.unwrap();
             assert_eq!(
@@ -292,5 +306,42 @@ mod tests {
             m.close().await;
             assert_eq!(held.load(Ordering::SeqCst), 0);
         }
+    }
+
+    struct Hostile(Arc<AtomicUsize>);
+    impl Drop for Hostile {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("closed admission input destructor");
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_wrapper_retires_hostile_inputs_without_changing_rejection() {
+        use futures::FutureExt;
+        let drops = Arc::new(AtomicUsize::new(0));
+        for inner in fixtures() {
+            inner.close().await;
+            let m = AdmissionMailbox::new(inner, Arc::new(Policy(Arc::new(AtomicUsize::new(0)))));
+            for ask in [false, true] {
+                let message: BoxedMessage = Box::new(Hostile(drops.clone()));
+                let pending = if ask {
+                    m.push_ask(
+                        AskEnvelope::with_boxed(message).0,
+                        BackpressureStrategy::Error,
+                    )
+                } else {
+                    m.push(message, BackpressureStrategy::Error)
+                };
+                assert!(
+                    matches!(
+                        std::panic::AssertUnwindSafe(pending).catch_unwind().await,
+                        Ok(Err(MailboxError::Closed))
+                    ),
+                    "closed wrapper must preserve rejection"
+                );
+            }
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 6);
     }
 }

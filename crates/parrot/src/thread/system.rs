@@ -56,6 +56,10 @@ use crate::thread::scheduler::ThreadSchedulerFactory;
 use crate::thread::scheduler::dedicated_thread::TypedThreadSchedulerExt;
 use parrot_api::message::Message;
 
+#[cfg(test)]
+#[path = "system/last_owner_contracts.rs"]
+mod last_owner_contracts;
+
 /// Adapter for the public type-erased actor API.
 ///
 /// `ThreadActor` needs a concrete `ThreadContext<A>`, while the public boxed
@@ -72,6 +76,9 @@ pub(super) struct BoxedThreadActor {
 }
 
 impl parrot_api::engine::AsyncEngineRuntime for ThreadActorSystem {
+    fn cohort_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncCohortRuntime> {
+        Some(self)
+    }
     fn factory_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncFactoryRuntime> {
         Some(self)
     }
@@ -84,15 +91,15 @@ impl parrot_api::engine::AsyncEngineRuntime for ThreadActorSystem {
         // Install ownership before returning the future, including unpolled drop.
         let actor = crate::owned_payload::OwnedPayload::new(
             actor,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         let config = crate::owned_payload::OwnedPayload::new(
             config,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             let admission = options.validate().and_then(|()| {
                 self.self_arc().ok_or_else(|| {
                     parrot_api::system::SystemError::InitializationError(
@@ -123,7 +130,7 @@ impl parrot_api::engine::AsyncEngineRuntime for ThreadActorSystem {
                     error => parrot_api::system::SystemError::ActorCreationError(error.to_string()),
                 })?;
             Ok(Box::new(reference) as BoxedActorRef)
-        })
+        }))
     }
 
     fn get_actor<'a>(&'a self, path: &'a str) -> BoxedFuture<'a, Option<BoxedActorRef>> {
@@ -136,9 +143,9 @@ impl parrot_api::engine::AsyncEngineRuntime for ThreadActorSystem {
 
     fn shutdown(&self) -> BoxedFuture<'_, Result<(), parrot_api::system::SystemError>> {
         Box::pin(async move {
-            self.shutdown_internal().await.map_err(|error| {
-                parrot_api::system::SystemError::Other(anyhow::anyhow!(error.to_string()))
-            })
+            self.shutdown_internal()
+                .await
+                .map_err(crate::error_receipt::public_system_error)
         })
     }
 }
@@ -443,6 +450,8 @@ impl Message for Terminated {
 /// `Weak<ThreadActorSystem>` is distributed to contexts so actors can spawn
 /// children and register watches without creating reference cycles.
 pub struct ThreadActorSystem {
+    pub(crate) operation_timeouts: parrot_api::system::SystemTimeouts,
+    pub(crate) root_cohorts: Arc<crate::root_cohort::RootCohorts>,
     // A per-system scheduling rendezvous for deterministic stop-race tests.
     // Absent from production builds; it never changes a stop result.
     #[cfg(test)]
@@ -459,6 +468,7 @@ pub struct ThreadActorSystem {
     pub(crate) typed_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) cleanup_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) factory_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) instance_admission: Arc<tokio::sync::Semaphore>,
 
     /// Runtime handle for spawning async tasks
     pub(crate) runtime_handle: Handle,
@@ -480,8 +490,9 @@ pub struct ThreadActorSystem {
     self_weak: Mutex<Option<Weak<ThreadActorSystem>>>,
 
     /// K2 receptionist 网关（可选——facade 注册后注入；context 三方法出口）
-    receptionist: RwLock<Option<Arc<dyn crate::system::ReceptionistGateway>>>,
-    remote: RwLock<Option<Arc<dyn crate::system::RemoteGateway>>>,
+    receptionist:
+        crate::system::registrations::Registry<Option<Arc<dyn crate::system::ReceptionistGateway>>>,
+    remote: crate::system::registrations::Registry<Option<Arc<dyn crate::system::RemoteGateway>>>,
 }
 
 impl Drop for ThreadActorSystem {
@@ -490,7 +501,7 @@ impl Drop for ThreadActorSystem {
         if self.shutdown_completion.lock().unwrap().is_none() {
             let work =
                 self.shutdown_resources(tokio::time::Instant::now() + self.config.shutdown_timeout);
-            self.runtime_handle.spawn(async move {
+            self.retirement_runtime().spawn(async move {
                 let _ = work.await;
             });
         }
@@ -512,24 +523,113 @@ impl fmt::Debug for ThreadActorSystem {
 }
 
 impl ThreadActorSystem {
+    pub(crate) fn retirement_runtime(&self) -> &Handle {
+        self.root_cohorts.retirement_runtime()
+    }
+    /// Create a managed system whose ordinary roots inherit one guardian policy.
+    /// Explicit cohorts isolate their roots from this default supervision group.
+    pub fn with_guardian(
+        config: ThreadActorSystemConfig,
+        guardian: parrot_api::system::GuardianConfig,
+    ) -> BoxedFuture<'static, Result<Arc<Self>, parrot_api::system::SystemError>> {
+        Self::with_guardian_and_timeouts(config, guardian, Default::default())
+    }
+
+    pub(crate) fn with_guardian_and_timeouts(
+        mut config: ThreadActorSystemConfig,
+        guardian: parrot_api::system::GuardianConfig,
+        timeouts: parrot_api::system::SystemTimeouts,
+    ) -> BoxedFuture<'static, Result<Arc<Self>, parrot_api::system::SystemError>> {
+        let guardian = crate::owned_payload::OwnedPayload::unbound(guardian);
+        Box::pin(parrot_api::trace::capture(async move {
+            if let Err(error) = crate::system::startup::validate_timeouts(&timeouts) {
+                guardian.retire().await?;
+                return Err(error);
+            }
+            if !timeouts.system_shutdown.is_zero() {
+                config.shutdown_timeout = timeouts.system_shutdown;
+            }
+            let strategy = crate::root_cohort::guardian_strategy(guardian).await?;
+            let strategy = crate::owned_payload::OwnedPayload::unbound(strategy);
+            let system = match Self::try_new(config) {
+                Ok(mut system) => {
+                    system.operation_timeouts = timeouts;
+                    let system = Arc::new(system);
+                    system.set_self_weak(Arc::downgrade(&system));
+                    system
+                }
+                Err(error) => {
+                    strategy.retire().await?;
+                    return Err(parrot_api::system::SystemError::InitializationError(
+                        error.to_string(),
+                    ));
+                }
+            };
+            system
+                .root_cohorts
+                .install_guardian(
+                    strategy.take(),
+                    system.config.shutdown_timeout,
+                    system.cleanup_slots.clone(),
+                )
+                .await?;
+            Ok(system)
+        }))
+    }
+
     /// Create a new thread actor system.
     ///
     /// Prefer [`ThreadActorSystem::shared`], which returns an `Arc` and installs
     /// its weak self reference. When wrapping `new` in an `Arc` manually, call
     /// [`ThreadActorSystem::set_self_weak`] before spawning actors that use context
     /// operations requiring their owning system.
+    ///
+    /// # Panics
+    /// Panics on invalid configuration or a missing ambient Tokio runtime.
+    /// Use [`Self::try_new`] to receive these errors.
     pub fn new(config: ThreadActorSystemConfig) -> Self {
-        Self::with_runtime_handle(config, Handle::current())
+        Self::try_new(config).expect("invalid thread system configuration or missing Tokio runtime")
+    }
+
+    /// Return configuration/runtime errors before allocating or spawning workers.
+    pub fn try_new(config: ThreadActorSystemConfig) -> Result<Self, SystemError> {
+        config
+            .validate()
+            .map_err(|error| SystemError::ConfigError(error.to_string()))?;
+        let runtime = Handle::try_current()
+            .map_err(|error| SystemError::ThreadSetupError(error.to_string()))?;
+        Self::try_with_runtime_handle(config, runtime)
     }
 
     /// Create a new system bound to a specific runtime handle.
+    ///
+    /// # Panics
+    /// Panics on invalid configuration. Use [`Self::try_with_runtime_handle`]
+    /// to receive configuration errors.
     pub fn with_runtime_handle(config: ThreadActorSystemConfig, runtime_handle: Handle) -> Self {
+        Self::try_with_runtime_handle(config, runtime_handle)
+            .expect("invalid thread system configuration")
+    }
+
+    /// Fallible constructor with an explicit caller-owned Tokio runtime.
+    pub fn try_with_runtime_handle(
+        config: ThreadActorSystemConfig,
+        runtime_handle: Handle,
+    ) -> Result<Self, SystemError> {
+        config
+            .validate()
+            .map_err(|error| SystemError::ConfigError(error.to_string()))?;
         let config = Arc::new(config);
+        let root_cohorts = Arc::new(
+            crate::root_cohort::RootCohorts::new()
+                .map_err(|error| SystemError::ThreadSetupError(error.to_string()))?,
+        );
 
         let factory = ThreadSchedulerFactory::new(runtime_handle.clone());
         let pool_config = crate::thread::scheduler::shared::SharedThreadPoolConfig {
             pool_size: config.shared_pool_size,
             max_queue_capacity: config.shared_queue_capacity,
+            work_stealing: config.shared_work_stealing,
             burst_workers_max: config.shared_burst_workers_max,
             burst_backlog_threshold: std::time::Duration::from_millis(
                 config.shared_burst_backlog_threshold_ms,
@@ -543,13 +643,19 @@ impl ThreadActorSystem {
             max_threads: config.max_dedicated_threads,
             ..Default::default()
         };
-        let scheduler_group =
-            Arc::new(factory.create_scheduler_group(Some(pool_config), Some(dedicated_config)));
+        let scheduler_group = Arc::new(
+            factory.try_create_scheduler_group(Some(pool_config), Some(dedicated_config))?,
+        );
 
-        Self {
+        Ok(Self {
+            operation_timeouts: Default::default(),
+            root_cohorts,
             typed_slots: Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1))),
             cleanup_slots: Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1))),
             factory_slots: Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1))),
+            instance_admission: Arc::new(tokio::sync::Semaphore::new(
+                Self::MAX_PENDING_INSTANCE_CREATIONS,
+            )),
             config,
             registry: Arc::new(RwLock::new(HashMap::new())),
             scheduler_group,
@@ -562,9 +668,9 @@ impl ThreadActorSystem {
             self_weak: Mutex::new(None),
             #[cfg(test)]
             reference_stop_probe: Mutex::new(None),
-            receptionist: RwLock::new(None),
-            remote: RwLock::new(None),
-        }
+            receptionist: crate::system::registrations::Registry::new(None),
+            remote: crate::system::registrations::Registry::new(None),
+        })
     }
 
     /// K2：注入 receptionist 网关（facade 注册时下发）。
@@ -587,20 +693,43 @@ impl ThreadActorSystem {
     }
 
     /// Create and initialize a shared (`Arc`) system.
+    ///
+    /// # Panics
+    /// Panics on invalid configuration or a missing ambient Tokio runtime.
+    /// Use [`Self::try_shared`] to receive these errors.
     pub fn shared(config: ThreadActorSystemConfig) -> Arc<Self> {
-        let system = Arc::new(Self::new(config));
+        Self::try_shared(config)
+            .expect("invalid thread system configuration or missing Tokio runtime")
+    }
+
+    /// Fallible shared constructor, installing the system identity on success.
+    pub fn try_shared(config: ThreadActorSystemConfig) -> Result<Arc<Self>, SystemError> {
+        let system = Arc::new(Self::try_new(config)?);
         system.set_self_weak(Arc::downgrade(&system));
-        system
+        Ok(system)
     }
 
     /// Create and initialize a shared system bound to a runtime handle.
+    ///
+    /// # Panics
+    /// Panics on invalid configuration. Use [`Self::try_shared_with_handle`]
+    /// to receive configuration errors.
     pub fn shared_with_handle(
         config: ThreadActorSystemConfig,
         runtime_handle: Handle,
     ) -> Arc<Self> {
-        let system = Arc::new(Self::with_runtime_handle(config, runtime_handle));
+        Self::try_shared_with_handle(config, runtime_handle)
+            .expect("invalid thread system configuration")
+    }
+
+    /// Fallible shared constructor with an explicit caller-owned runtime.
+    pub fn try_shared_with_handle(
+        config: ThreadActorSystemConfig,
+        runtime_handle: Handle,
+    ) -> Result<Arc<Self>, SystemError> {
+        let system = Arc::new(Self::try_with_runtime_handle(config, runtime_handle)?);
         system.set_self_weak(Arc::downgrade(&system));
-        system
+        Ok(system)
     }
 
     /// Install the weak self reference. Call once after wrapping in Arc.
@@ -615,6 +744,40 @@ impl ThreadActorSystem {
     /// Get the system configuration.
     pub fn config(&self) -> &ThreadActorSystemConfig {
         &self.config
+    }
+
+    pub(crate) fn creation_timeout(&self) -> Duration {
+        if self.operation_timeouts.actor_creation.is_zero() {
+            self.config.shutdown_timeout
+        } else {
+            self.operation_timeouts.actor_creation
+        }
+    }
+    pub(crate) fn reconstruction_deadline(
+        &self,
+        recovery: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        if self.operation_timeouts.actor_creation.is_zero() {
+            recovery
+        } else {
+            recovery.min(tokio::time::Instant::now() + self.operation_timeouts.actor_creation)
+        }
+    }
+
+    /// Create an explicit supervision group for roots. OneForAll uses one
+    /// sliding restart budget and retirement/preparation/publication barriers.
+    pub fn root_cohort(
+        &self,
+        strategy: parrot_api::supervisor::SupervisorStrategyType,
+    ) -> parrot_api::types::BoxedFuture<
+        'static,
+        parrot_api::types::ActorResult<crate::root_cohort::RootCohort>,
+    > {
+        self.root_cohorts.create(
+            strategy,
+            self.config.shutdown_timeout,
+            self.cleanup_slots.clone(),
+        )
     }
 
     /// Get the runtime handle.
@@ -644,17 +807,18 @@ impl ThreadActorSystem {
     }
 
     /// M3 supervision plumbing: spawn the supervision decision for a
-    /// panicked actor as a detached task on the system runtime.
+    /// panicked actor as a detached task on the independent lifecycle runtime.
     pub(crate) fn runtime_spawn_supervision(
         self: &Arc<Self>,
         path: String,
         mailbox: WeakMailboxRef,
-        error: Arc<ActorError>,
+        error: impl Into<crate::error_receipt::ActorReceipt>,
     ) {
+        let error = error.into();
         let system = self.clone();
-        self.runtime_handle
+        self.retirement_runtime()
             .spawn(parrot_api::trace::capture(async move {
-                let reason = match error.as_ref() {
+                let reason = match error.error().as_ref() {
                     ActorError::Panic(message) => {
                         parrot_api::supervisor::DeathReason::Panic(message.clone())
                     }
@@ -670,8 +834,9 @@ impl ThreadActorSystem {
         self: &Arc<Self>,
         path: String,
         mailbox: WeakMailboxRef,
-        error: Arc<ActorError>,
+        error: impl Into<crate::error_receipt::ActorReceipt>,
     ) {
+        let error = error.into();
         let Some(expected) = mailbox.upgrade() else {
             return;
         };
@@ -690,7 +855,7 @@ impl ThreadActorSystem {
             let Some(processor) = entry.mailbox.get_processor() else {
                 return;
             };
-            if !processor.begin_escalation(error.clone()) {
+            if !processor.begin_escalation(error.error().clone()) {
                 return;
             }
             let fallback = entry
@@ -702,12 +867,12 @@ impl ThreadActorSystem {
                 error.clone(),
                 tokio::time::Instant::now() + self.config().shutdown_timeout,
                 matches!(fallback, crate::thread::config::SupervisorStrategy::Resume),
-                &self.runtime_handle,
+                self.retirement_runtime(),
             );
             (processor, decision)
         };
         let system = self.clone();
-        self.runtime_handle
+        self.retirement_runtime()
             .spawn(parrot_api::trace::capture(async move {
                 if decision.await {
                     let registry = system.registry.read().unwrap();
@@ -725,7 +890,7 @@ impl ThreadActorSystem {
                     }
                     return;
                 }
-                processor.fail_from_escalation(error.clone());
+                processor.fail_from_escalation(error.error().clone());
                 let reason = parrot_api::supervisor::DeathReason::Escalated(
                     crate::error_receipt::actor_summary(&error),
                 );
@@ -801,6 +966,8 @@ impl ThreadActorSystem {
     }
 
     /// Spawn an instance after owning and retiring its creation configuration.
+    /// Invalid engine overrides return `SpawnError::InvalidConfig` after input
+    /// retirement; a disposal failure takes precedence over configuration errors.
     pub fn spawn_typed_with_config<A>(
         self: &Arc<Self>,
         actor: A,
@@ -857,7 +1024,7 @@ impl ThreadActorSystem {
         let mut engine = PublicationInput::new(thread_config);
         lifetime.bind_admission(
             engine.value_mut(),
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         let thread_config = engine.value();
@@ -867,14 +1034,9 @@ impl ThreadActorSystem {
                 return Err(SpawnError::SchedulerError("System is shutting down".into()));
             }
 
-            if thread_config
-                .message_batch_size
-                .is_some_and(|n| !(1..=256).contains(&n))
-            {
-                return Err(SpawnError::SchedulerError(
-                    "message_batch_size must be in 1..=256".into(),
-                ));
-            }
+            thread_config
+                .validate()
+                .map_err(|error| SpawnError::InvalidConfig(error.to_string()))?;
 
             // Fast existence check; registration and scheduling are committed
             // together below, before a worker can observe an unregistered actor.
@@ -926,7 +1088,11 @@ impl ThreadActorSystem {
                         |instance| instance.watches.clone(),
                     )
                 });
-            let actor_ref = Arc::new(actor_ref.with_death_watch(watches.common.clone()));
+            let actor_ref = Arc::new(
+                actor_ref
+                    .with_death_watch(watches.common.clone())
+                    .with_retirement(&lifetime),
+            );
 
             let actor_path = ActorPath {
                 target: actor_ref.clone() as parrot_api::types::WeakActorTarget,
@@ -980,13 +1146,30 @@ impl ThreadActorSystem {
             context.set_mailbox(Arc::downgrade(&mailbox) as WeakMailboxRef);
 
             let children = context.owned_children.clone();
+            let initialization_deadline = if self.operation_timeouts.actor_creation.is_zero() {
+                None
+            } else {
+                match &replacing {
+                    Some(crate::thread::factory::Replacement::Pending(_, deadline)) => *deadline,
+                    Some(crate::thread::factory::Replacement::Instance(pending)) => {
+                        pending.control.deadline()
+                    }
+                    Some(crate::thread::factory::Replacement::Generation(_, deadline)) => *deadline,
+                    _ => group.as_ref().map(|group| group.deadline),
+                }
+            };
             let processor = Arc::new(
-                ActorProcessor::<A>::new(
-                    ThreadActor::new(actor.take(), actor_path.clone()),
+                ActorProcessor::<A>::try_new(
+                    ThreadActor::new(actor.take(), actor_path.clone())
+                        .with_initialization_deadline(initialization_deadline),
                     context,
                     path.to_string(),
-                    thread_config.clone(),
+                    self.config.merge_with_actor_config(thread_config),
                 )
+                .map_err(|error| match error {
+                    SystemError::Panic(message) => SpawnError::DisposalFailed(message),
+                    error => SpawnError::InvalidConfig(error.to_string()),
+                })?
                 .with_group_activation(group.clone()),
             );
 
@@ -1003,7 +1186,7 @@ impl ThreadActorSystem {
                 }
                 if let Some(expected) = &replacing {
                     let valid = match expected {
-                        crate::thread::factory::Replacement::Generation(expected) => {
+                        crate::thread::factory::Replacement::Generation(expected, _) => {
                             registry
                                 .get(path)
                                 .and_then(ActorRegistryEntry::dynamic)
@@ -1029,7 +1212,7 @@ impl ThreadActorSystem {
                         crate::thread::factory::Replacement::Instance(expected) => {
                             matches!(registry.get(path), Some(ActorRegistryEntry::Instance(entry)) if Arc::ptr_eq(expected, entry) && !entry.control.is_cancelled())
                         }
-                        crate::thread::factory::Replacement::Pending(expected) => {
+                        crate::thread::factory::Replacement::Pending(expected, _) => {
                             matches!(registry.get(path), Some(ActorRegistryEntry::Pending(entry)) if Arc::ptr_eq(expected, entry) && match &group {
                                 Some(group) => !group.control.is_cancelled() && !entry.lifetime.is_stopping() && entry.lifetime.recovery().is_some_and(|assigned| assigned.id == group.id),
                                 None => !entry.control.is_cancelled() && entry.lifetime.recovery().is_none(),
@@ -1104,9 +1287,13 @@ impl ThreadActorSystem {
                             .map_err(|error| SpawnError::SchedulerError(error.to_string())),
                         SchedulingMode::Sharded { affinity_key } => self
                             .scheduler_group
-                            .sharded()
-                            .schedule_affinity(path, mailbox.clone(), affinity_key)
-                            .map_err(SpawnError::SchedulerError),
+                            .try_sharded()
+                            .map_err(|error| SpawnError::SchedulerError(error.to_string()))
+                            .and_then(|scheduler| {
+                                scheduler
+                                    .schedule_affinity(path, mailbox.clone(), affinity_key)
+                                    .map_err(SpawnError::SchedulerError)
+                            }),
                         SchedulingMode::SharedPool { .. } => self
                             .scheduler_group
                             .shared_scheduler
@@ -1180,6 +1367,7 @@ impl ThreadActorSystem {
     /// Initial and restart factories run on bounded workers under the configured
     /// shutdown deadline. Pending creation reserves the path; timeout/caller
     /// cancellation does not release it before actual factory/output disposal.
+    /// Invalid engine overrides are rejected before invoking the factory.
     pub fn spawn_supervised_with_config<'a, A, F>(
         self: &'a Arc<Self>,
         factory: F,
@@ -1202,12 +1390,12 @@ impl ThreadActorSystem {
     ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
         let actor = crate::owned_payload::OwnedPayload::new(
             actor,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         let config = crate::owned_payload::OwnedPayload::new(
             config,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         Box::pin(async move {
@@ -1236,8 +1424,15 @@ impl ThreadActorSystem {
     /// Inject the gateway used for explicit `parrot://` paths. Gateways that
     /// refer back to this engine must use weak ownership to avoid a cycle.
     pub fn set_remote_gateway(&self, gateway: Arc<dyn crate::system::RemoteGateway>) {
-        let retired = self.remote.write().unwrap().replace(gateway);
-        drop(retired);
+        drop(self.swap_remote_gateway(gateway));
+    }
+
+    /// Transfer the displaced owner to the facade for disposal outside its locks.
+    pub(crate) fn swap_remote_gateway(
+        &self,
+        gateway: Arc<dyn crate::system::RemoteGateway>,
+    ) -> Option<Arc<dyn crate::system::RemoteGateway>> {
+        self.remote.write().unwrap().replace(gateway)
     }
 
     /// Resolve a local path or an explicit remote path. No engine lock is held
@@ -1248,7 +1443,7 @@ impl ThreadActorSystem {
         }
         if path.starts_with("parrot://") {
             let gateway = self.remote.read().unwrap().clone()?;
-            return gateway.lookup(path);
+            return crate::system::lookup_owned(gateway, |gateway| gateway.lookup(path));
         }
         self.get_actor_ref(path).map(ArcActorRef::boxed)
     }
@@ -1275,8 +1470,11 @@ impl ThreadActorSystem {
     /// Stop an actor with the system's configured deadline. Concurrent callers
     /// await the same operation; cancelling a caller does not abandon cleanup.
     /// A notification error does not undo termination of the actor itself.
-    pub async fn stop_actor(&self, path: &str) -> Result<(), SystemError> {
-        await_stop(self.request_stop(path, None)?).await
+    pub fn stop_actor<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), SystemError>> + Send + 'a {
+        parrot_api::trace::capture(async move { await_stop(self.request_stop(path, None)?).await })
     }
 
     /// Reserve an owned stop synchronously. Context self-stop only requests
@@ -1402,105 +1600,106 @@ impl ThreadActorSystem {
                 let schedulers = self.scheduler_group.clone();
                 let timeout = self.config.shutdown_timeout;
                 let slots = self.cleanup_slots.clone();
-                self.runtime_handle.spawn(async move {
-                    let work = async {
-                        let (children_result, result) = tokio::join!(
-                            children.join(),
-                            stop_actor_resources(
-                                &path,
-                                mailbox.clone(),
-                                mode,
-                                schedulers,
-                                slots,
+                self.retirement_runtime()
+                    .spawn(parrot_api::trace::capture(async move {
+                        let work = async {
+                            let (children_result, result) = tokio::join!(
+                                children.join(),
+                                stop_actor_resources(
+                                    &path,
+                                    mailbox.clone(),
+                                    mode,
+                                    schedulers,
+                                    slots,
+                                    deadline
+                                )
+                            );
+                            let policy_disposal = lifetime
+                                .dispose_policy()
+                                .await
+                                .map_err(SystemError::policy_disposal);
+                            let factory_disposal = match factory {
+                                Some(factory) => factory.dispose().await,
+                                None => Ok(()),
+                            };
+                            let result = factory_disposal
+                                .and(result)
+                                .and(
+                                    children_result
+                                        .map_err(|e| SystemError::Other(anyhow::Error::new(e))),
+                                )
+                                .and(policy_disposal);
+                            let reason = match &result {
+                                Ok(()) => parrot_api::supervisor::DeathReason::Normal,
+                                Err(SystemError::Timeout(_)) => {
+                                    parrot_api::supervisor::DeathReason::Killed
+                                }
+                                Err(SystemError::Panic(message)) => {
+                                    parrot_api::supervisor::DeathReason::Panic(message.clone())
+                                }
+                                Err(error) => parrot_api::supervisor::DeathReason::Failed(
+                                    crate::error_receipt::system_summary(error),
+                                ),
+                            };
+                            let delivery_deadline = if tokio::time::Instant::now() >= deadline {
+                                tokio::time::Instant::now() + timeout
+                            } else {
                                 deadline
-                            )
-                        );
-                        let policy_disposal = lifetime
-                            .dispose_policy()
-                            .await
-                            .map_err(SystemError::policy_disposal);
-                        let factory_disposal = match factory {
-                            Some(factory) => factory.dispose().await,
-                            None => Ok(()),
-                        };
-                        let result = factory_disposal
-                            .and(result)
-                            .and(
-                                children_result
-                                    .map_err(|e| SystemError::Other(anyhow::Error::new(e))),
-                            )
-                            .and(policy_disposal);
-                        let reason = match &result {
-                            Ok(()) => parrot_api::supervisor::DeathReason::Normal,
-                            Err(SystemError::Timeout(_)) => {
-                                parrot_api::supervisor::DeathReason::Killed
-                            }
-                            Err(SystemError::Panic(message)) => {
-                                parrot_api::supervisor::DeathReason::Panic(message.clone())
-                            }
-                            Err(error) => parrot_api::supervisor::DeathReason::Failed(
-                                crate::error_receipt::system_summary(error),
-                            ),
-                        };
-                        let delivery_deadline = if tokio::time::Instant::now() >= deadline {
-                            tokio::time::Instant::now() + timeout
-                        } else {
-                            deadline
-                        };
-                        let event = parrot_api::context::ActorTerminated {
-                            generation: watches.common.id(),
-                            path: path.clone(),
-                            reason: reason.clone(),
-                        };
-                        let (_, notified) = tokio::join!(
-                            watches.common.terminated(
-                                event,
-                                delivery_deadline
-                                    .saturating_duration_since(tokio::time::Instant::now())
-                            ),
-                            crate::thread::death_watch::notify_legacy(
-                                &watches.legacy,
-                                &path,
-                                reason,
-                                delivery_deadline
-                                    .saturating_duration_since(tokio::time::Instant::now())
-                            )
-                        );
-                        {
-                            let mut registry = registry.write().unwrap();
-                            if registry
-                                .get(&path)
-                                .and_then(ActorRegistryEntry::dynamic)
-                                .is_some_and(|entry| Arc::ptr_eq(&entry.mailbox, &mailbox))
+                            };
+                            let event = parrot_api::context::ActorTerminated {
+                                generation: watches.common.id(),
+                                path: path.clone(),
+                                reason: reason.clone(),
+                            };
+                            let (_, notified) = tokio::join!(
+                                watches.common.terminated(
+                                    event,
+                                    delivery_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now())
+                                ),
+                                crate::thread::death_watch::notify_legacy(
+                                    &watches.legacy,
+                                    &path,
+                                    reason,
+                                    delivery_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now())
+                                )
+                            );
                             {
-                                registry.remove(&path);
+                                let mut registry = registry.write().unwrap();
+                                if registry
+                                    .get(&path)
+                                    .and_then(ActorRegistryEntry::dynamic)
+                                    .is_some_and(|entry| Arc::ptr_eq(&entry.mailbox, &mailbox))
+                                {
+                                    registry.remove(&path);
+                                }
                             }
+                            result.and(notified)
+                        };
+                        let (result, timed_out) =
+                            super::stop_deadline::join_until(work, deadline, || {
+                                sender.send_replace(Some(StopOutcome::TimedOut(format!(
+                                    "actor {path} stop exceeded configured deadline"
+                                ))));
+                            })
+                            .await;
+                        let result = result.map_err(crate::error_receipt::SystemReceipt::new);
+                        let notification = lifetime.finish(
+                            result
+                                .as_ref()
+                                .map(|_| ())
+                                .map_err(|error| error.actor_receipt()),
+                        );
+                        let outcome = StopOutcome::from_result(
+                            result.map_err(crate::error_receipt::SystemReceipt::into_error),
+                        );
+                        if !timed_out {
+                            sender.send_replace(Some(outcome.clone()));
                         }
-                        result.and(notified)
-                    };
-                    let (result, timed_out) =
-                        super::stop_deadline::join_until(work, deadline, || {
-                            sender.send_replace(Some(StopOutcome::TimedOut(format!(
-                                "actor {path} stop exceeded configured deadline"
-                            ))));
-                        })
-                        .await;
-                    let result = result.map_err(crate::error_receipt::SystemReceipt::new);
-                    let notification = lifetime.finish(
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.actor_receipt()),
-                    );
-                    let outcome = StopOutcome::from_result(
-                        result.map_err(crate::error_receipt::SystemReceipt::into_error),
-                    );
-                    if !timed_out {
-                        sender.send_replace(Some(outcome.clone()));
-                    }
-                    retired.send_replace(Some(outcome));
-                    notification.await;
-                });
+                        retired.send_replace(Some(outcome));
+                        notification.await;
+                    }));
                 (receiver, retirement)
             };
             let _ = entry.stop_request.set(completion.0.clone());
@@ -1524,46 +1723,75 @@ impl ThreadActorSystem {
     }
 
     /// Broadcast a message to all registered actors.
-    pub async fn broadcast_message(&self, msg: BoxedMessage) -> Result<(), SystemError> {
-        self.broadcast_cloning(move || msg_clone(&msg)).await
+    pub fn broadcast_message(
+        &self,
+        msg: BoxedMessage,
+    ) -> impl std::future::Future<Output = Result<(), SystemError>> + Send + '_ {
+        let source = crate::broadcast::Input::new(
+            crate::owned_payload::OwnedPayload::new(msg, &self.runtime_handle, &self.cleanup_slots),
+            self.factory_slots.clone(),
+        );
+        parrot_api::trace::capture(self.broadcast_cloning(source, |msg| {
+            msg_clone(msg).map_err(|_| {
+                ActorError::InternalError("Broadcast requires a cloneable message payload".into())
+            })
+        }))
     }
 
-    async fn broadcast_cloning<F>(&self, mut copy: F) -> Result<(), SystemError>
+    async fn broadcast_cloning<T, F>(
+        &self,
+        mut source: crate::broadcast::Input<T>,
+        copy: F,
+    ) -> Result<(), SystemError>
     where
-        F: FnMut() -> Result<BoxedMessage, SystemError> + Send,
+        T: Send + 'static,
+        F: Fn(&T) -> ActorResult<BoxedMessage> + Copy + Send + 'static,
     {
-        if self.is_shutting_down() {
-            return Err(SystemError::ShuttingDown);
-        }
+        let result = async {
+            if self.is_shutting_down() {
+                return Err(SystemError::ShuttingDown);
+            }
 
-        let targets = {
-            let registry = self.registry.read().unwrap();
-            registry
-                .values()
-                .map(|entry| {
-                    (
-                        entry.actor_ref(),
-                        entry.dynamic().map(|entry| entry.mailbox.clone()),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        for (actor, mailbox) in targets {
-            let message = copy()?;
-            match mailbox {
-                Some(mailbox) => mailbox
-                    .push(message, BackpressureStrategy::DropNewest)
+            let targets = {
+                let registry = self.registry.read().unwrap();
+                registry
+                    .values()
+                    .map(|entry| {
+                        (
+                            entry.actor_ref(),
+                            entry.dynamic().map(|entry| entry.mailbox.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (actor, mailbox) in targets {
+                let message = source
+                    .copy_with(copy)
                     .await
-                    .map_err(|error| SystemError::ShutdownError(error.to_string()))?,
-                None => tokio::time::timeout(self.config.shutdown_timeout, actor.deliver(message))
+                    .map_err(|error| SystemError::Other(anyhow::Error::new(error)))?;
+                match mailbox {
+                    Some(mailbox) => mailbox
+                        .push(
+                            super::envelope::TraceEnvelope::capture(message.take()),
+                            BackpressureStrategy::DropNewest,
+                        )
+                        .await
+                        .map_err(|error| SystemError::ShutdownError(error.to_string()))?,
+                    None => tokio::time::timeout(
+                        self.config.shutdown_timeout,
+                        actor.deliver(message.take()),
+                    )
                     .await
                     .map_err(|_| {
                         SystemError::Timeout(format!("broadcast to {} timed out", actor.path()))
                     })?
                     .map_err(|error| SystemError::ShutdownError(error.to_string()))?,
+                }
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        crate::broadcast::finish(source, result, crate::error_receipt::system_summary).await
     }
 
     /// Internal shutdown: stop all actors, deschedule, close mailboxes.
@@ -1588,7 +1816,7 @@ impl ThreadActorSystem {
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 let deadline = tokio::time::Instant::now() + self.config.shutdown_timeout;
                 let work = self.shutdown_resources(deadline);
-                self.runtime_handle.spawn(async move {
+                self.retirement_runtime().spawn(async move {
                     let (result, timed_out) =
                         super::stop_deadline::join_until(work, deadline, || {
                             sender.send_replace(Some(StopOutcome::TimedOut(
@@ -1611,6 +1839,8 @@ impl ThreadActorSystem {
         &self,
         deadline: tokio::time::Instant,
     ) -> parrot_api::types::BoxedFuture<'static, Result<(), SystemError>> {
+        self.root_cohorts.close();
+        let root_cohorts = self.root_cohorts.clone();
         // Reserve all stops while the registry still retains every generation.
         // Existing stop/supervision operations own separate true retirement receipts.
         let completions: Vec<_> = self
@@ -1626,15 +1856,18 @@ impl ThreadActorSystem {
         let shutdown_signal = self.shutdown_signal.clone();
         let stopped = self.stopped.clone();
         let timeout = self.config.shutdown_timeout;
+        let retirement_runtime = self.retirement_runtime().clone();
         Box::pin(async move {
             let results = futures::future::join_all(completions.into_iter().map(await_stop)).await;
+            let cohorts = root_cohorts.join().await;
             // Affinity schedulers remain alive until every actor was disposed.
             let cleanup_deadline = deadline.max(tokio::time::Instant::now() + timeout);
             let sharded = scheduler_group.sharded_scheduler.lock().unwrap().clone();
             let (shared, dedicated, shards) = tokio::join!(
-                scheduler_group
-                    .shared_scheduler
-                    .shutdown(timeout.as_millis().min(u64::MAX as u128) as u64),
+                scheduler_group.shared_scheduler.shutdown_on(
+                    timeout.as_millis().min(u64::MAX as u128) as u64,
+                    &retirement_runtime
+                ),
                 async {
                     let scheduler = &scheduler_group.dedicated_scheduler;
                     let result = scheduler.shutdown_until(cleanup_deadline).await;
@@ -1668,10 +1901,39 @@ impl ThreadActorSystem {
             // Preserve that error without misreporting an already joined system.
             stopped.store(true, Ordering::Release);
             shutdown_signal.notify_waiters();
-            shared?;
-            dedicated?;
-            shards?;
-            results.into_iter().collect()
+            let mut first = None;
+            let mut additional = Vec::new();
+            let mut failures = 0usize;
+            for result in [
+                shared,
+                dedicated,
+                shards,
+                cohorts.map_err(|error| {
+                    SystemError::ShutdownError(crate::error_receipt::actor_summary(&error))
+                }),
+            ]
+            .into_iter()
+            .chain(results)
+            {
+                if let Err(error) = result {
+                    failures += 1;
+                    let error = crate::error_receipt::SystemReceipt::new(error);
+                    if first.is_none() {
+                        first = Some(error);
+                    } else if additional.len() < 7 {
+                        additional.push(crate::error_receipt::system_summary(error.error()));
+                    }
+                }
+            }
+            match first {
+                None => Ok(()),
+                Some(error) if failures == 1 => Err(error.into_error()),
+                Some(error) => Err(SystemError::ShutdownError(format!(
+                    "{failures} shutdown failures: {}; {}",
+                    crate::error_receipt::system_summary(error.error()),
+                    additional.join("; ")
+                ))),
+            }
         })
     }
 }
@@ -1819,12 +2081,12 @@ pub trait ErasedSpawnable: Send + Sync + 'static {
     {
         let payload = crate::owned_payload::OwnedPayload::new(
             self,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         let engine = crate::owned_payload::OwnedPayload::new(
             thread_config,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         Box::pin(async move {
@@ -1891,12 +2153,12 @@ impl ErasedSpawnBox {
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
         let payload = crate::owned_payload::OwnedPayload::new(
             self,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         let engine = crate::owned_payload::OwnedPayload::new(
             thread_config,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         Box::pin(async move {
@@ -1966,17 +2228,17 @@ where
     {
         let payload = crate::owned_payload::OwnedPayload::new(
             self,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         let config = crate::owned_payload::OwnedPayload::new(
             config,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         let engine = crate::owned_payload::OwnedPayload::new(
             thread_config,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         Box::pin(async move {
@@ -2015,12 +2277,12 @@ where
     {
         let payload = crate::owned_payload::OwnedPayload::new(
             self,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         let engine = crate::owned_payload::OwnedPayload::new(
             thread_config,
-            &system.runtime_handle,
+            system.retirement_runtime(),
             &system.cleanup_slots,
         );
         Box::pin(async move {
@@ -2060,6 +2322,9 @@ impl ArcActorRef {
 
 #[async_trait]
 impl ActorRef for ArcActorRef {
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.0.retirement_status()
+    }
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         self.0.send(msg)
     }
@@ -2119,24 +2384,77 @@ impl ActorRef for ArcActorRef {
 
 #[async_trait]
 impl ActorSystem for ThreadActorSystem {
-    async fn start(config: ActorSystemConfig) -> Result<Self, parrot_api::system::SystemError> {
-        let runtime_handle = Handle::try_current().map_err(|_| {
-            parrot_api::system::SystemError::InitializationError(
-                "ThreadActorSystem::start must be called within a Tokio runtime".to_string(),
-            )
-        })?;
-
-        let thread_config = ThreadActorSystemConfig {
-            name: if config.name.is_empty() {
-                "parrot-thread-system".to_string()
+    fn start<'async_trait>(
+        config: ActorSystemConfig,
+    ) -> parrot_api::types::BoxedFuture<'async_trait, Result<Self, parrot_api::system::SystemError>>
+    where
+        Self: 'async_trait,
+    {
+        let config = crate::owned_payload::OwnedPayload::unbound(config);
+        Box::pin(parrot_api::trace::capture(async move {
+            let mut timeouts = config.value().timeouts.clone();
+            let mut thread_config = ThreadActorSystemConfig {
+                shutdown_timeout: if timeouts.system_shutdown.is_zero() {
+                    ThreadActorSystemConfig::default().shutdown_timeout
+                } else {
+                    timeouts.system_shutdown
+                },
+                name: if config.value().name.is_empty() {
+                    "parrot-thread-system".to_string()
+                } else {
+                    config.value().name.clone()
+                },
+                ..Default::default()
+            };
+            if let Err(error) = crate::system::startup::apply_thread_runtime_config(
+                &mut thread_config,
+                &mut timeouts,
+                &config.value().runtime_config,
+            ) {
+                config.retire().await?;
+                return Err(error);
+            }
+            let runtime_handle = match Handle::try_current() {
+                Ok(handle) => handle,
+                Err(_) => {
+                    config.retire().await?;
+                    return Err(parrot_api::system::SystemError::InitializationError(
+                        "ThreadActorSystem::start must be called within a Tokio runtime".into(),
+                    ));
+                }
+            };
+            let guardian =
+                crate::owned_payload::OwnedPayload::unbound(config.take().guardian_config);
+            let strategy = crate::root_cohort::guardian_strategy(guardian).await?;
+            let strategy = crate::owned_payload::OwnedPayload::unbound(strategy);
+            thread_config.shutdown_timeout = if timeouts.system_shutdown.is_zero() {
+                ThreadActorSystemConfig::default().shutdown_timeout
             } else {
-                config.name
-            },
-            ..Default::default()
-        };
+                timeouts.system_shutdown
+            };
 
-        let system = Self::with_runtime_handle(thread_config, runtime_handle);
-        Ok(system)
+            let system = match Self::try_with_runtime_handle(thread_config, runtime_handle) {
+                Ok(mut system) => {
+                    system.operation_timeouts = timeouts;
+                    system
+                }
+                Err(error) => {
+                    strategy.retire().await?;
+                    return Err(parrot_api::system::SystemError::InitializationError(
+                        error.to_string(),
+                    ));
+                }
+            };
+            system
+                .root_cohorts
+                .install_guardian(
+                    strategy.take(),
+                    system.config.shutdown_timeout,
+                    system.cleanup_slots.clone(),
+                )
+                .await?;
+            Ok(system)
+        }))
     }
 
     fn spawn_root_typed<'life0, 'async_trait, A>(
@@ -2154,12 +2472,12 @@ impl ActorSystem for ThreadActorSystem {
     {
         let actor = crate::owned_payload::OwnedPayload::new(
             actor,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         let config = crate::owned_payload::OwnedPayload::new(
             config,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         Box::pin(async move {
@@ -2187,12 +2505,12 @@ impl ActorSystem for ThreadActorSystem {
     {
         let actor = crate::owned_payload::OwnedPayload::new(
             actor,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         let config = crate::owned_payload::OwnedPayload::new(
             config,
-            &self.runtime_handle,
+            self.retirement_runtime(),
             &self.cleanup_slots,
         );
         Box::pin(async move {
@@ -2220,13 +2538,24 @@ impl ActorSystem for ThreadActorSystem {
         self.resolve_actor(&path.path)
     }
 
-    async fn broadcast<M: Message + Clone>(
-        &self,
+    fn broadcast<'life0, 'async_trait, M>(
+        &'life0 self,
         msg: M,
-    ) -> Result<(), parrot_api::system::SystemError> {
-        self.broadcast_cloning(move || Ok(Box::new(msg.clone()) as BoxedMessage))
-            .await
-            .map_err(|e| parrot_api::system::SystemError::Other(anyhow::anyhow!(e.to_string())))
+    ) -> parrot_api::types::BoxedFuture<'async_trait, Result<(), parrot_api::system::SystemError>>
+    where
+        'life0: 'async_trait,
+        M: Message + Clone + 'async_trait,
+        Self: 'async_trait,
+    {
+        let source = crate::broadcast::Input::new(
+            crate::owned_payload::OwnedPayload::new(msg, &self.runtime_handle, &self.cleanup_slots),
+            self.factory_slots.clone(),
+        );
+        Box::pin(parrot_api::trace::capture(async move {
+            self.broadcast_cloning(source, |msg| Ok(Box::new(msg.clone()) as BoxedMessage))
+                .await
+                .map_err(crate::error_receipt::public_system_error)
+        }))
     }
 
     fn status(&self) -> SystemStatus {
@@ -2265,7 +2594,7 @@ impl ActorSystem for ThreadActorSystem {
     async fn shutdown(self) -> Result<(), parrot_api::system::SystemError> {
         self.shutdown_internal()
             .await
-            .map_err(|e| parrot_api::system::SystemError::Other(anyhow::anyhow!(e.to_string())))
+            .map_err(crate::error_receipt::public_system_error)
     }
 }
 
@@ -2316,6 +2645,9 @@ mod tests {
                 if let Some(v) = msg.downcast_ref::<u64>() {
                     self.received.lock().unwrap().push(*v);
                     return Ok(Box::new(*v) as BoxedMessage);
+                }
+                if msg.is::<()>() {
+                    return Ok(Box::new(self.received.lock().unwrap().clone()) as BoxedMessage);
                 }
                 Ok(msg)
             })
@@ -2556,40 +2888,37 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_broadcast_delivers_to_all_mailboxes() {
         let sys = shared_system();
-
+        let mut actors = Vec::new();
         for name in ["/user/bcast-1", "/user/bcast-2"] {
-            sys.spawn_at::<RecvRecorder>(
-                RecvRecorder::default(),
-                name,
-                None,
-                ThreadActorConfig::default(),
-            )
-            .await
-            .unwrap();
+            actors.push(
+                sys.spawn_at::<RecvRecorder>(
+                    RecvRecorder::default(),
+                    name,
+                    None,
+                    ThreadActorConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
         }
 
         sys.broadcast_message(Box::new(42u64) as BoxedMessage)
             .await
             .unwrap();
 
-        // Wait until both mailboxes have drained the broadcast.
-        for _ in 0..200 {
-            let empty1 = sys.get_mailbox("/user/bcast-1").unwrap().is_empty().await;
-            let empty2 = sys.get_mailbox("/user/bcast-2").unwrap().is_empty().await;
-            if empty1 && empty2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        for actor in actors {
+            let received = actor
+                .send(Box::new(()))
+                .await
+                .unwrap()
+                .downcast::<Vec<u64>>()
+                .expect("query must return recorded business values");
+            assert_eq!(
+                *received,
+                vec![42],
+                "broadcast must reach each actor exactly once"
+            );
         }
-
-        assert!(
-            sys.get_mailbox("/user/bcast-1").unwrap().is_empty().await,
-            "broadcast should be drained by the shared pool"
-        );
-        assert!(
-            sys.get_mailbox("/user/bcast-2").unwrap().is_empty().await,
-            "broadcast should be drained by the shared pool"
-        );
 
         sys.shutdown_internal().await.unwrap();
     }
@@ -2852,5 +3181,83 @@ mod reservation_race {
         dedicated_failure:SchedulingMode::DedicatedThread,true;
         sharded_success:SchedulingMode::Sharded{affinity_key:"race".into()},false;
         sharded_failure:SchedulingMode::Sharded{affinity_key:"race".into()},true;
+    }
+}
+
+#[cfg(test)]
+mod actor_input_contracts {
+    use super::*;
+    use parrot_api::actor::{ActorState, EmptyConfig};
+    use std::sync::atomic::AtomicUsize;
+
+    struct Probe(Arc<AtomicUsize>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Actor for Probe {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+        fn receive_message<'a>(
+            &'a mut self,
+            message: BoxedMessage,
+            _: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async { Ok(message) })
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_rechecks_actor_configuration_before_allocating_mailbox() {
+        let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
+            shared_pool_size: 1,
+            shared_burst_workers_max: 0,
+            max_dedicated_threads: 1,
+            ..Default::default()
+        });
+        for mode in [
+            SchedulingMode::SharedPool {
+                max_messages_per_run: 1,
+            },
+            SchedulingMode::DedicatedThread,
+            SchedulingMode::Sharded {
+                affinity_key: "publication-input".into(),
+            },
+        ] {
+            let disposed = Arc::new(AtomicUsize::new(0));
+            let lifetime = crate::children::ChildLifetime::new(Weak::new());
+            // Bypass both public admission paths to exercise the common boundary
+            // used by child publication and reconstruction, without huge allocations.
+            let result = system.spawn_at_internal(
+                Probe(disposed.clone()),
+                "/invalid-publication",
+                None,
+                ThreadActorConfig {
+                    mailbox_capacity: Some(0),
+                    scheduling_mode: Some(mode),
+                    ..Default::default()
+                },
+                None,
+                None,
+                lifetime.clone(),
+                None,
+            );
+            let retired_at_return = disposed.load(Ordering::SeqCst);
+            if let Ok(reference) = &result {
+                reference.stop().await.unwrap();
+            }
+            lifetime.dispose_policy().await.unwrap();
+            assert!(
+                matches!(result, Err(SpawnError::InvalidConfig(ref message)) if message.contains("actor.mailbox_capacity")),
+                "{result:?}"
+            );
+            assert_eq!(retired_at_return, 1);
+            assert_eq!(system.actor_count(), 0);
+        }
+        system.shutdown_internal().await.unwrap();
     }
 }

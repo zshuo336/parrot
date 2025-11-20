@@ -21,6 +21,7 @@ struct Counts {
     dropped: AtomicUsize,
     captures: AtomicUsize,
     watched: AtomicUsize,
+    probes: AtomicUsize,
 }
 struct Root {
     counts: Arc<Counts>,
@@ -68,6 +69,9 @@ impl Actor for Root {
             if msg.is::<Native>() {
                 return Ok(Box::new(ctx.get_self_ref()) as BoxedMessage);
             }
+            if msg.is::<Probe>() {
+                self.counts.probes.fetch_add(1, Ordering::SeqCst);
+            }
             self.messages.set(self.messages.get() + 1);
             Ok(Box::new((self.generation, self.messages.get())) as BoxedMessage)
         })
@@ -75,6 +79,14 @@ impl Actor for Root {
 }
 struct Crash;
 struct Native;
+struct Probe {
+    dropped: Arc<AtomicUsize>,
+}
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
 fn factory(counts: &Arc<Counts>, fail_init: bool) -> impl Fn() -> Root + Send + Sync + 'static {
     let counts = counts.clone();
     move || Root {
@@ -204,6 +216,65 @@ async fn root_initialization_failure_runs_custom_decider_and_respects_zero_budge
     assert_eq!(decided.load(Ordering::SeqCst), 1);
     assert_eq!(counts.made.load(Ordering::SeqCst), 1);
     assert_eq!(counts.dropped.load(Ordering::SeqCst), 1);
+    sys.shutdown().await.unwrap();
+}
+
+#[actix::test]
+async fn root_recovery_window_rejects_and_retires_input_before_new_generation() {
+    let sys = system(Duration::from_secs(2)).await;
+    let counts = Arc::new(Counts::default());
+    let gate = Arc::new(Gate::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let next = {
+        let counts = counts.clone();
+        let gate = gate.clone();
+        let calls = calls.clone();
+        move || {
+            let generation = calls.fetch_add(1, Ordering::SeqCst);
+            if generation == 1 {
+                gate.block();
+            }
+            Root {
+                generation: counts.made.fetch_add(1, Ordering::SeqCst),
+                counts: counts.clone(),
+                messages: Cell::new(0),
+                fail_init: false,
+            }
+        }
+    };
+    let root = sys
+        .spawn_root_factory_with_strategy(
+            next,
+            DefaultSupervisorStrategyFactory::one_for_one(1, Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+    generation(&root, 0).await;
+    let _ = root.send(Box::new(Crash)).await;
+    gate.entered().await;
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let result = root
+        .send(Box::new(Probe {
+            dropped: dropped.clone(),
+        }))
+        .await;
+    assert!(matches!(result, Err(ActorError::Stopped)));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while dropped.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.probes.load(Ordering::SeqCst), 0);
+
+    gate.release();
+    generation(&root, 1).await;
+    let reply = root.send(Box::new(())).await.unwrap();
+    assert_eq!(*reply.downcast::<(usize, usize)>().unwrap(), (1, 2));
+    root.stop().await.unwrap();
     sys.shutdown().await.unwrap();
 }
 #[derive(Default)]
@@ -374,6 +445,16 @@ async fn shutdown_during_root_decider_keeps_policy_owned_and_prevents_late_resta
         parrot_api::system::SystemState::ShuttingDown
     );
     assert!(sys.get_actor(&root.path()).await.is_some());
+    assert!(
+        sys.resolve_actor(&root.path()).is_none(),
+        "context resolution must reject a shutting-down engine even while cleanup remains registered"
+    );
+    assert!(
+        parrot_api::engine::AsyncEngineRuntime::get_actor(&sys, &root.path())
+            .await
+            .is_none(),
+        "neutral resolution must reject a shutting-down engine without hiding legacy cleanup ownership"
+    );
     assert_eq!(counts.captures.load(Ordering::SeqCst), 0);
     gate.release();
     tokio::time::timeout(Duration::from_secs(2), async {

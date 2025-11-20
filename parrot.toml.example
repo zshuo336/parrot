@@ -34,6 +34,8 @@
 # 高/普通优先级共用的就绪队列容量；满时合并到已有 actor 注册状态等待调度。
 # 不限制 actor 数量；每个邮箱仍按自己的容量对生产者施加背压。
 #shared_queue_capacity = 10000
+# Worker-local FIFO queues and work stealing share the same ready-queue budget.
+#shared_work_stealing = false
 # 专用线程上限（默认 32）
 #max_dedicated_threads = 32
 # actor 默认邮箱容量（默认 1024）
@@ -50,6 +52,8 @@
 # [remote.node] —— 节点身份与拓扑（部署强相关——最应外置的部分）
 # ---------------------------------------------------------------------------
 [remote.node]
+# Transport: tcp, quic or mem. QUIC requires mTLS or explicit development mode.
+#scheme = "tcp"
 # 节点唯一 id（多节点拓扑必填）
 #node_id = "spoke-a"
 # 监听地址 host:port
@@ -74,19 +78,45 @@
 #roles = { spoke-a = ["edge/public"], spoke-b = ["edge/public"] }
 # Higher-priority maps replace the complete inherited map; roles = {} clears it.
 # default_deny inherits separately; clearing roles does not override false.
+# Foreign services also require a grant to their immediate relay AND to their owner.
+#relays = { hub-a = ["edge/public"] }
+# relays defaults to empty/deny even if default_deny = false; relays = {} clears it.
 # Network service sync still requires verified mTLS or explicit development mode.
 # These grants alone do not inject actor/message gateways into an application.
+# Retained receiver count and reserved queue bytes; zero disables new streams.
+#max_subscriptions = 1024
+#max_subscription_bytes = 268435456
+# Distinct local/remote service entries and declared retained table bytes.
+# Zero disables additional entries; these are not process RSS limits.
+#max_registrations = 65536
+#max_registration_bytes = 268435456
+
+# Security defaults to local: loopback-only TCP or memory transport, with no
+# network administrative commands. Enable mTLS explicitly for network peers.
+# [remote.security]
+# mode = "mtls"
+# cert_path = "/private/parrot/node-cert.pem"
+# key_path = "/private/parrot/node-key.pem"
+# ca_path = "/private/parrot/ca.pem"
+# Certificate identity must match node_id; mTLS seeds require node-id@host:port.
+# Authenticated administrators are separate from receptionist service grants.
+# admin_nodes = []
 
 # ---------------------------------------------------------------------------
 # [remote.transport] —— 连接层（原写死常量参数化）
 # ---------------------------------------------------------------------------
 [remote.transport]
+# Physical connections including handshakes, shared by all built-in system entry points.
+#connection_capacity = 1024
+# Concurrent dials/handshakes; both admission limits must be positive.
+#handshake_capacity = 64
 # 心跳间隔，毫秒（默认 2000；半开检测延迟 ≈ interval × max_loss）
 #heartbeat_interval_ms = 2000
 # 连续丢失多少个间隔判半开断开（默认 5）
 #heartbeat_max_loss = 5
 # 出站帧队列容量（默认 1024——满则反压）
 #outbound_queue = 1024
+# Queue size must fit channel permits; interval * max_loss must fit the clock.
 # 系统级未完成入站 ASK 上限（含等待 lookup / actor / 回复队列）
 #inbound_ask_capacity = 1024
 # 上述 ASK 的 path + type_key + payload 编码长度总预算；不是节点 RSS 上限
@@ -126,3 +156,16 @@
 # election_ms = 2000
 # heartbeat_ms = 150
 # rpc_timeout_ms = 5000
+
+# Application runner tracing. The same fields work under manifest.config_overlay.tracing.
+# Priority: manifest overlay > explicit code/CLI > this file > defaults.
+# Loading this data alone does not start an exporter; replay does not activate it.
+# [tracing]
+# enabled = true
+# otlp_endpoint = "https://collector.example/v1/traces"
+# allow_insecure_http = false
+# capacity = 4096
+# interval_ms = 1000
+# request_timeout_ms = 5000
+# max_attempts = 8
+# socket = "/private/parrot/trace.sock"

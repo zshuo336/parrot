@@ -17,9 +17,12 @@ use parrot_remote::system::RemoteActorSystem;
 use parrot_remote::LocalLookup;
 
 use crate::assemble::{DeployError, GatewayFactory, ParrotSpawner};
+use crate::limits::ApplicationLimits;
 use crate::manifest::{ArtifactRef, ComponentSpec, EngineKind};
 
 mod cleanup;
+#[cfg(any(feature = "wasm", feature = "dylib"))]
+mod operator_policy;
 mod references;
 use references::OwnedReferences;
 mod gateway_admission;
@@ -74,6 +77,7 @@ pub struct ThreadPropsSpawner {
     engine: Arc<ThreadActorSystem>,
     remote: Option<Arc<RemoteActorSystem>>,
     cleanup: Arc<cleanup::Registry>,
+    limits: ApplicationLimits,
     #[cfg(feature = "wasm")]
     wasm: Arc<wasm::WasmHost>,
     #[cfg(feature = "dylib")]
@@ -96,6 +100,15 @@ impl parrot::system::RemoteGateway for HostRemoteGateway {
 }
 
 impl ThreadPropsSpawner {
+    /// Set input budgets for subsequent spawn requests, before copying inputs,
+    /// reserving cleanup ownership or running factories. Existing clones retain
+    /// their limits; cleanup capacity remains shared. Use the same policy as the
+    /// assembler when customizing application budgets. This is a per-request
+    /// admission policy, not an RSS or aggregate concurrent deployment limit.
+    pub fn with_application_limits(mut self, limits: ApplicationLimits) -> Self {
+        self.limits = limits;
+        self
+    }
     /// Authorize native artifacts with this exact digest for this spawner.
     /// Feature enablement alone never authorizes native execution. Clones made
     /// before this call retain their original policy; all share worker capacity.
@@ -118,6 +131,27 @@ impl ThreadPropsSpawner {
         self.dylib = Arc::new(self.dylib.authorize(digest)?);
         Ok(self)
     }
+    /// Replace native guest message grants for subsequent deployments. Native
+    /// trust authorization is still separately required. Existing clones and
+    /// deployed actors retain their policy; business config cannot grant access.
+    #[cfg(feature = "dylib")]
+    pub fn with_dylib_messaging(
+        mut self,
+        grants: Vec<dylib::NativeMessageGrant>,
+    ) -> Result<Self, DeployError> {
+        self.dylib = Arc::new(self.dylib.with_messaging(grants)?);
+        Ok(self)
+    }
+    /// Replace discovery grants for future native deployments. Execution trust
+    /// and messaging authority are independent; existing clones retain grants.
+    #[cfg(feature = "dylib")]
+    pub fn with_dylib_services(
+        mut self,
+        grants: Vec<dylib::NativeServiceGrant>,
+    ) -> Result<Self, DeployError> {
+        self.dylib = Arc::new(self.dylib.with_services(grants)?);
+        Ok(self)
+    }
     /// Failed original identities retained by this spawner and all its clones.
     pub fn pending_cleanup(&self) -> Vec<crate::cleanup::RetainedActor> {
         self.cleanup.pending()
@@ -136,12 +170,37 @@ impl ThreadPropsSpawner {
         config: parrot_wasm::WasmConfig,
         limits: parrot_wasm::runtime::CompilationLimits,
     ) -> Self {
-        self.wasm = Arc::new(wasm::WasmHost::new(config, limits));
+        self.wasm = Arc::new(self.wasm.with_limits(config, limits));
         self
+    }
+    /// Replace optional guest messaging authority for subsequent deployments.
+    /// Grants bind exact actor path, verified artifact, destination and codec.
+    /// Existing clones keep their policy. CLI/Node hosts require an explicit
+    /// operator policy file to grant messaging; their defaults deny all calls.
+    #[cfg(feature = "wasm")]
+    pub fn with_wasm_messaging(
+        mut self,
+        grants: Vec<wasm::WasmMessageGrant>,
+    ) -> Result<Self, DeployError> {
+        self.wasm = Arc::new(self.wasm.with_messaging(grants)?);
+        Ok(self)
+    }
+    /// Replace optional discovery authority for subsequent Wasm deployments.
+    /// Registration is bound to the actual actor generation and its own path.
+    /// Existing clones retain their authority; limits and messaging changes
+    /// preserve it. No business configuration can grant service access.
+    #[cfg(feature = "wasm")]
+    pub fn with_wasm_services(
+        mut self,
+        grants: Vec<wasm::WasmServiceGrant>,
+    ) -> Result<Self, DeployError> {
+        self.wasm = Arc::new(self.wasm.with_services(grants)?);
+        Ok(self)
     }
     pub fn new(engine: Arc<ThreadActorSystem>) -> Self {
         Self {
             cleanup: cleanup::Registry::new(engine.runtime_handle().clone()),
+            limits: ApplicationLimits::default(),
             engine,
             remote: None,
             #[cfg(feature = "wasm")]
@@ -161,6 +220,7 @@ impl ThreadPropsSpawner {
         }));
         Self {
             cleanup: cleanup::Registry::new(engine.runtime_handle().clone()),
+            limits: ApplicationLimits::default(),
             engine,
             remote: Some(remote),
             #[cfg(feature = "wasm")]
@@ -211,6 +271,9 @@ impl ParrotSpawner for ThreadPropsSpawner {
         paths: &[String],
         config: Option<&toml::Table>,
     ) -> Result<Vec<BoxedActorRef>, DeployError> {
+        self.limits
+            .check_host_props(factory, paths, config)
+            .map_err(|error| DeployError::Config(error.to_string()))?;
         self.spawn_artifact(
             &ArtifactRef::Props {
                 factory: factory.into(),
@@ -241,6 +304,9 @@ impl ParrotSpawner for ThreadPropsSpawner {
         paths: &[String],
         config: Option<&toml::Table>,
     ) -> Result<Vec<BoxedActorRef>, DeployError> {
+        self.limits
+            .check_host_request(artifact, paths, config)
+            .map_err(|error| DeployError::Config(error.to_string()))?;
         self.validate_artifact(artifact)?;
         let cleanup = self.cleanup.reserve(paths)?;
         let runtime = self.engine.runtime_handle().clone();
@@ -249,10 +315,11 @@ impl ParrotSpawner for ThreadPropsSpawner {
         let config = config.cloned();
         let (reply, result) = tokio::sync::oneshot::channel();
         let (claimed, claim) = tokio::sync::oneshot::channel();
+        let creation_context = parrot_api::trace::TraceContext::current();
         // Keep the running factory and partial pool owned if the caller goes away.
         // The extra acknowledgement also covers cancellation after send succeeds
         // but before the result is polled: a buffered result is not a transfer.
-        runtime.spawn(async move {
+        runtime.spawn(parrot_api::trace::scope(creation_context, async move {
             match owner
                 .spawn_owned_artifact(&reply, &artifact, &cleanup, config.as_ref())
                 .await
@@ -291,7 +358,7 @@ impl ParrotSpawner for ThreadPropsSpawner {
                     }
                 }
             }
-        });
+        }));
         let references = result.await.map_err(|_| {
             DeployError::Engine("artifact owner exited before delivering its result".into())
         })??;
@@ -402,8 +469,12 @@ impl ThreadPropsSpawner {
             match result {
                 Ok(actor) => owned.push(actor),
                 Err(error) => {
+                    let detail = crate::disposal::actor_error_detail(error);
                     return Err(cleanup
-                        .rollback(owned, DeployError::Engine(format!("spawn {path}: {error}")))
+                        .rollback(
+                            owned,
+                            DeployError::Engine(format!("spawn {path}: {detail}")),
+                        )
                         .await);
                 }
             }
@@ -469,6 +540,9 @@ struct ArcActorRef(Arc<dyn parrot_api::address::ActorRef>);
 
 #[async_trait::async_trait]
 impl parrot_api::address::ActorRef for ArcActorRef {
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.0.retirement_status()
+    }
     fn send<'a>(
         &'a self,
         msg: parrot_api::types::BoxedMessage,
@@ -619,6 +693,7 @@ pub struct ProcessGatewayFactory {
     startup_timeout: std::time::Duration,
     jvm_classpath: Option<std::ffi::OsString>,
     beam_sources: std::collections::HashMap<String, PathBuf>,
+    application_limits: ApplicationLimits,
 }
 impl ProcessGatewayFactory {
     pub fn new(repo_root: PathBuf, remote: Arc<RemoteActorSystem>) -> Self {
@@ -651,10 +726,17 @@ impl ProcessGatewayFactory {
             startup_timeout: std::time::Duration::from_secs(90),
             jvm_classpath: std::env::var_os("PARROT_JVM_CLASSPATH"),
             beam_sources: Default::default(),
+            application_limits: ApplicationLimits::default(),
         }
     }
     pub fn with_startup_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.startup_timeout = timeout;
+        self
+    }
+    /// Per-request input policy, copied when the factory is cloned. Process
+    /// ownership slots remain shared through GatewayProcesses.
+    pub fn with_application_limits(mut self, limits: ApplicationLimits) -> Self {
+        self.application_limits = limits;
         self
     }
     pub fn with_jvm_classpath(mut self, classpath: impl Into<std::ffi::OsString>) -> Self {
@@ -932,6 +1014,11 @@ impl GatewayFactory for ProcessGatewayFactory {
             || actual.knobs.unwrap_or_default() != expected.knobs.unwrap_or_default()
             || actual.receptionist_acl.default_deny != expected.receptionist_acl.default_deny
             || actual.receptionist_acl.roles != expected.receptionist_acl.roles
+            || actual.receptionist_relay_acl.default_deny
+                != expected.receptionist_relay_acl.default_deny
+            || actual.receptionist_relay_acl.roles != expected.receptionist_relay_acl.roles
+            || actual.receptionist_subscriptions != expected.receptionist_subscriptions
+            || actual.receptionist_registrations != expected.receptionist_registrations
             || !seeds_match
         {
             return Err(DeployError::Config("remote host differs from effective_config; construct the host before assembly using that configuration".into()));
@@ -945,6 +1032,27 @@ impl GatewayFactory for ProcessGatewayFactory {
         paths: &[String],
         version: &str,
     ) -> Result<Vec<BoxedActorRef>, DeployError> {
+        self.application_limits
+            .check_host_request(&comp.artifact, paths, comp.config.as_ref())
+            .map_err(|error| DeployError::Config(error.to_string()))?;
+        let mut payload = comp
+            .deployment_with_limits(version, &self.application_limits)
+            .map_err(DeployError::Config)?;
+        if paths.len() != comp.instances.instance_count()
+            || paths.iter().enumerate().any(|(index, path)| {
+                let expected = match comp.instances {
+                    crate::InstancePolicy::Singleton | crate::InstancePolicy::Ephemeral => {
+                        format!("/user/{}", comp.name)
+                    }
+                    _ => format!("/user/{}-{index}", comp.name),
+                };
+                *path != expected
+            })
+        {
+            return Err(DeployError::Config(
+                "gateway instance paths differ from component declaration".into(),
+            ));
+        }
         let _operation = self.procs.operation.lock().await;
         if self.procs.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(DeployError::Engine("gateway factory is shut down".into()));
@@ -956,7 +1064,6 @@ impl GatewayFactory for ProcessGatewayFactory {
             )));
         }
         self.procs.wait_component(&comp.name).await?;
-        let mut payload = comp.deployment(version).map_err(DeployError::Config)?;
         if paths
             .iter()
             .any(|path| self.procs.routes.0.read().unwrap().contains_key(path))
@@ -981,6 +1088,11 @@ impl GatewayFactory for ProcessGatewayFactory {
             }
         }
         let result = async {
+            // Compilation can replace the Beam URI after input admission.
+            // Keep this check in the retirement scope of the owned gateway.
+            self.application_limits
+                .check_metadata(&payload)
+                .map_err(|error| DeployError::Config(error.to_string()))?;
             let deployed = self
                 .remote
                 .deploy_component(&node_id, payload)

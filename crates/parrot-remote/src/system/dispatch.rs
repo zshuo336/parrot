@@ -89,8 +89,10 @@ async fn dispatch(ingress: &Arc<Ingress>, frame: Frame, back: &FrameSender, from
         .is_err()
         || cleanup.failed()
     {
-        tracing::warn!(node = %from, "inbound dispatch panicked; closing its connection");
         back.close();
+        super::diagnostic(
+            || tracing::warn!(node = %from, "inbound dispatch panicked; closing its connection"),
+        );
     }
 }
 
@@ -164,8 +166,8 @@ pub(super) async fn run(
                     // Waiting here would recreate global HOL. Closing the exact
                     // offending connection makes refusal visible to pending
                     // callers and cancels its active/queued dispatch work.
-                    tracing::warn!(node = %from, "inbound dispatch budget exhausted; closing its connection");
                     back.close();
+                    super::diagnostic(|| tracing::warn!(node = %from, "inbound dispatch budget exhausted; closing its connection"));
                     continue;
                 }
                 let size = size.expect("checked dispatch size");

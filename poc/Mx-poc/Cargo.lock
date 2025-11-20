@@ -192,6 +192,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "flume"
 version = "0.11.1"
 dependencies = [
@@ -483,6 +489,7 @@ dependencies = [
  "async-trait",
  "crossbeam-queue",
  "downcast-rs",
+ "fastrand",
  "flume",
  "futures",
  "num_cpus",
@@ -506,6 +513,7 @@ dependencies = [
  "flume",
  "futures",
  "parrot-api-derive",
+ "pin-project-lite",
  "thiserror",
  "tokio",
  "tracing",
@@ -526,6 +534,7 @@ dependencies = [
 name = "parrot-config"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "parrot-api",
  "serde",
  "thiserror",

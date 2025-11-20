@@ -120,14 +120,23 @@ async fn wasm_actor_state_across_messages() {
 }
 
 #[tokio::test]
-async fn wasm_actor_trap_reported_not_crash() {
+async fn wasm_actor_guest_business_error_preserves_state_and_progress() {
     let ts = ThreadActorSystem::shared(Default::default());
     let r = spawn_wasm(&ts, "/user/wasm-err", 100_000).await;
-    let e = ask(&r, "err", &[]).await.unwrap_err();
-    assert!(e.to_string().contains("wasm trap"), "got: {e}");
-    // 引擎仍活：后续消息照常
-    let ok = ask(&r, "echo", b"after-trap").await.unwrap();
-    assert_eq!(ok.0, b"after-trap");
+    assert_eq!(ask(&r, "state", &[]).await.unwrap().0, 1u64.to_le_bytes());
+    let error = ask(&r, "err", &[]).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            parrot_api::errors::ActorError::MessageHandlingError(ref detail)
+                if detail == "wasm trap: wasm trap: fixture-err"
+        ),
+        "{error:?}"
+    );
+    // The guest returns Result::Err; no Wasmtime trap or Store reset occurred.
+    assert_eq!(ask(&r, "state", &[]).await.unwrap().0, 2u64.to_le_bytes());
+    let ok = ask(&r, "echo", b"after-business-error").await.unwrap();
+    assert_eq!(ok.0, b"after-business-error");
     ts.stop_actor("/user/wasm-err").await.unwrap();
 }
 

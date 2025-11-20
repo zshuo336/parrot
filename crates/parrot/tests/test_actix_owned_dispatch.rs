@@ -98,11 +98,23 @@ fn async_dispatch_preserves_state_serialization_and_error_recovery() {
         let read = actor.send(message(Command::Read));
         let (added, read) = tokio::join!(add, read);
         assert_eq!(
-            *added.unwrap().unwrap().unwrap().downcast::<u64>().unwrap(),
+            *added
+                .unwrap()
+                .into_inner()
+                .unwrap()
+                .unwrap()
+                .downcast::<u64>()
+                .unwrap(),
             11
         );
         assert_eq!(
-            *read.unwrap().unwrap().unwrap().downcast::<u64>().unwrap(),
+            *read
+                .unwrap()
+                .into_inner()
+                .unwrap()
+                .unwrap()
+                .downcast::<u64>()
+                .unwrap(),
             11
         );
         assert!(
@@ -110,6 +122,7 @@ fn async_dispatch_preserves_state_serialization_and_error_recovery() {
                 .send(message(Command::Fail))
                 .await
                 .unwrap()
+                .into_inner()
                 .unwrap()
                 .is_err()
         );
@@ -117,6 +130,7 @@ fn async_dispatch_preserves_state_serialization_and_error_recovery() {
             .send(message(Command::Read))
             .await
             .unwrap()
+            .into_inner()
             .unwrap()
             .unwrap();
         assert_eq!(

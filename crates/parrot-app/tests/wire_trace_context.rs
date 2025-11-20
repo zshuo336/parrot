@@ -694,7 +694,7 @@ async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<parrot_remote:
     stream.read_exact(&mut bytes[4..]).await.unwrap();
     parrot_remote::frame::Frame::decode(&mut bytes).unwrap()
 }
-async fn raw_connection(server: &Server, causal: bool) -> tokio::net::TcpStream {
+async fn raw_connection(server: &Server, causal: bool, batch: bool) -> tokio::net::TcpStream {
     use parrot_remote::{
         frame::Frame,
         handshake::{caps, HandshakeBody},
@@ -707,6 +707,7 @@ async fn raw_connection(server: &Server, causal: bool) -> tokio::net::TcpStream 
         node_id: "raw-peer".into(),
         capabilities: caps::BIN
             | caps::TELL_COMPLETION
+            | if batch { caps::BATCH_FRAMES } else { 0 }
             | if causal { caps::TRACE_CONTEXT } else { 0 },
         ..Default::default()
     }
@@ -730,7 +731,7 @@ async fn unnegotiated_prefix_and_bad_last_batch_member_cannot_execute_business()
                 true,
                 false,
             );
-            let mut stream = raw_connection(&server, batch).await;
+            let mut stream = raw_connection(&server, batch, batch).await;
             let payload = parrot_api::message::serde_remote_serialize(&Work {
                 value: 2,
                 delay_ms: 0,
@@ -773,7 +774,7 @@ async fn valid_batch_assigns_each_real_handler_its_own_remote_parent() {
     use parrot_remote::frame::Frame;
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut server = Server::start("batch-parents", None, true, false);
-        let mut stream = raw_connection(&server, true).await;
+        let mut stream = raw_connection(&server, true, true).await;
         let roots: Vec<_> = (0..3).map(|_| TraceContext::root()).collect();
         let frames: Vec<_> = roots
             .iter()
@@ -834,7 +835,7 @@ async fn reordered_tells_retain_the_buffered_messages_parent() {
     use parrot_remote::frame::Frame;
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut server = Server::start("reorder-parents", None, true, false);
-        let mut stream = raw_connection(&server, true).await;
+        let mut stream = raw_connection(&server, true, false).await;
         let roots: Vec<_> = (0..3).map(|_| TraceContext::root()).collect();
         for i in [0, 2, 1] {
             let payload = parrot_api::message::serde_remote_serialize(&Work {

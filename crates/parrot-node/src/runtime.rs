@@ -1,8 +1,5 @@
 //! The executable and integration tests use the same node assembly path.
-use crate::{
-    configuration::NodeSettings, FacadeLookup, GatewayAdapter, NodeComponentExecutor, NodeState,
-    NODE,
-};
+use crate::{configuration::NodeSettings, FacadeLookup, NodeComponentExecutor, NodeState, NODE};
 use parrot::{
     system::ParrotActorSystem,
     thread::{config::ThreadActorSystemConfig, system::ThreadActorSystem},
@@ -14,27 +11,49 @@ use parrot_remote::roles::directory::network::{
 use parrot_remote::{LocalLookup, NodeAddr, RemoteActorSystem, RemoteConfig};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, RwLock, Weak},
     time::Duration,
 };
 
 pub type NodeError = Box<dyn std::error::Error + Send + Sync>;
+
+struct NodeGateway {
+    remote: Weak<RemoteActorSystem>,
+    engine: Weak<ThreadActorSystem>,
+    shards: Weak<RwLock<(bool, Vec<crate::sharding::ShardRouter>)>>,
+}
+impl parrot::system::RemoteGateway for NodeGateway {
+    fn lookup(&self, path: &str) -> Option<parrot_api::types::BoxedActorRef> {
+        let remote = self.remote.upgrade()?;
+        if let Some(local) = remote.local_actor_path(path) {
+            return self.engine.upgrade()?.resolve_actor(local).or_else(|| {
+                self.shards
+                    .upgrade()?
+                    .read()
+                    .ok()?
+                    .1
+                    .iter()
+                    .find_map(|router| router.resolve_local(local))
+            });
+        }
+        remote.gateway().lookup(path)
+    }
+}
+
 pub struct RunningNode {
+    pub facade: Arc<ParrotActorSystem>,
     pub thread: Arc<ThreadActorSystem>,
     pub remote: Arc<RemoteActorSystem>,
     directory: Option<tokio::sync::Mutex<NetworkDirectory>>,
     directory_handle: Option<DirectoryHandle>,
+    shards: Arc<RwLock<(bool, Vec<crate::sharding::ShardRouter>)>>,
+    shard_install: tokio::sync::Mutex<()>,
 }
 impl RunningNode {
     /// A process hosts exactly one node (the Props inventory uses NODE).
     /// Call shutdown explicitly to await actor hooks and scheduler teardown.
     pub async fn start(settings: &NodeSettings) -> Result<Self, NodeError> {
-        Self::start_inner(
-            settings,
-            #[cfg(feature = "dylib")]
-            &crate::NativeTrust::default(),
-        )
-        .await
+        Self::start_with_host_options(settings, &crate::HostOptions::default()).await
     }
     /// Start with explicit native execution authority. Ordinary NodeSettings and
     /// remote Admin permissions cannot create or expand this trust grant.
@@ -43,11 +62,25 @@ impl RunningNode {
         settings: &NodeSettings,
         native: &crate::NativeTrust,
     ) -> Result<Self, NodeError> {
-        Self::start_inner(settings, native).await
+        Self::start_with_host_options(
+            settings,
+            &crate::HostOptions {
+                native: native.clone(),
+                native_messaging: Default::default(),
+                native_services: Default::default(),
+                #[cfg(feature = "wasm")]
+                wasm_messaging: Default::default(),
+                #[cfg(feature = "wasm")]
+                wasm_services: Default::default(),
+            },
+        )
+        .await
     }
-    async fn start_inner(
+    /// Start with explicit immutable operator authority. Neither node settings
+    /// nor remote deployment configuration can replace this host policy.
+    pub async fn start_with_host_options(
         settings: &NodeSettings,
-        #[cfg(feature = "dylib")] native: &crate::NativeTrust,
+        options: &crate::HostOptions,
     ) -> Result<Self, NodeError> {
         settings.validate()?;
         // Resolve discovery and fixed voting routes independently, under one
@@ -72,7 +105,7 @@ impl RunningNode {
         .await??;
         cfg.extra_caps |= parrot_remote::handshake::caps::ARTIFACTS;
         #[cfg(feature = "dylib")]
-        if !native.is_empty() {
+        if !options.native.is_empty() {
             cfg.extra_caps |= parrot_remote::handshake::caps::DYLIB;
         }
         #[cfg(feature = "wasm")]
@@ -103,17 +136,24 @@ impl RunningNode {
             None => RemoteActorSystem::new(cfg, Arc::new(FacadeLookup))?,
         };
         let facade = Arc::new(ParrotActorSystem::new(ActorSystemConfig::default()).await?);
-        let thread =
-            ThreadActorSystem::shared(ThreadActorSystemConfig::from_resolved(&settings.resolved));
+        let thread = ThreadActorSystem::try_shared(ThreadActorSystemConfig::from_resolved(
+            &settings.resolved,
+        ))?;
         let node = Self {
+            facade: facade.clone(),
             thread,
             remote,
             directory_handle: directory.as_ref().map(NetworkDirectory::handle),
             directory: directory.map(tokio::sync::Mutex::new),
+            shards: Arc::new(RwLock::new((false, Vec::new()))),
+            shard_install: tokio::sync::Mutex::new(()),
         };
         let result: Result<(), NodeError> = async {
             facade
                 .register_thread_system("eng".into(), node.thread.clone(), true)
+                .await?;
+            facade
+                .register_receptionist_gateway(Arc::new(node.remote.receptionist_gateway()))
                 .await?;
             NODE.set(NodeState {
                 facade: facade.clone(),
@@ -123,8 +163,7 @@ impl RunningNode {
             let executor = NodeComponentExecutor::for_running_node(
                 node.thread.clone(),
                 settings.wasm_epoch_ticks,
-                #[cfg(feature = "dylib")]
-                native,
+                options,
             )?;
             for name in &settings.actors {
                 crate::spawn_builtin(&node.thread, name).await?;
@@ -134,7 +173,11 @@ impl RunningNode {
             }
             node.remote.set_component_executor(Some(Arc::new(executor)));
             facade
-                .register_remote_gateway(Arc::new(GatewayAdapter(node.remote.gateway())))
+                .register_remote_gateway(Arc::new(NodeGateway {
+                    remote: Arc::downgrade(&node.remote),
+                    engine: Arc::downgrade(&node.thread),
+                    shards: Arc::downgrade(&node.shards),
+                }))
                 .await?;
             if let Some(directory) = &node.directory {
                 directory.lock().await.start_transport().await?;
@@ -156,6 +199,49 @@ impl RunningNode {
     pub fn directory(&self) -> Option<DirectoryHandle> {
         self.directory_handle.clone()
     }
+    /// Install an application-owned shard family. Node retains the host before
+    /// publishing either prefix and closes every retained host before transport.
+    /// A failed publication keeps a closed host for shutdown/cleanup retry.
+    pub fn install_shards(
+        &self,
+        config: crate::sharding::ShardConfig,
+        factory: crate::sharding::ShardFactory,
+    ) -> parrot_api::types::BoxedFuture<'_, Result<crate::sharding::ShardRouter, NodeError>> {
+        let factory = crate::sharding::owned::Owned::new(factory);
+        Box::pin(parrot_api::trace::capture(async move {
+            let _install = self.shard_install.lock().await;
+            if self.shards.read().unwrap_or_else(|e| e.into_inner()).0 {
+                return Err("node shard admission is closed".into());
+            }
+            if self
+                .shards
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .1
+                .iter()
+                .any(|host| host.name() == config.name)
+            {
+                return Err("shard family is already installed".into());
+            }
+            let host = crate::sharding::ShardRouter::start(
+                &self.thread,
+                self.remote.clone(),
+                config,
+                factory,
+            )
+            .await?;
+            self.shards
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .1
+                .push(host.clone());
+            if let Err(error) = host.publish(&self.facade) {
+                host.reject();
+                return Err(Box::new(error) as NodeError);
+            }
+            Ok(host)
+        }))
+    }
     /// Standard processes must stop advertising readiness after a disk owner fails.
     pub async fn wait_directory_failure(&self) -> NodeError {
         if let Some(handle) = &self.directory_handle {
@@ -175,7 +261,28 @@ impl RunningNode {
             .ok_or_else(|| "node has no listening address".into())
     }
     pub async fn shutdown(&self) -> Result<(), NodeError> {
-        // Stop network admission before stopping actors; always attempt both.
+        // Shard authority must remain reachable until accepted work is drained
+        // and actual child retirement is confirmed. Always attempt all owners.
+        let hosts = {
+            let _install = self.shard_install.lock().await;
+            let mut hosts = self.shards.write().unwrap_or_else(|e| e.into_inner());
+            hosts.0 = true;
+            for host in &hosts.1 {
+                host.reject();
+            }
+            hosts.1.clone()
+        };
+        let mut shard_errors = Vec::new();
+        let shard_deadline = tokio::time::Instant::now() + self.thread.config().shutdown_timeout;
+        for host in hosts {
+            match tokio::time::timeout_at(shard_deadline, host.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => shard_errors.push(error.to_string()),
+                Err(_) => {
+                    shard_errors.push(format!("shard {} drain deadline elapsed", host.name()))
+                }
+            }
+        }
         let remote: Result<(), NodeError> = if let Some(directory) = &self.directory {
             directory
                 .lock()
@@ -191,10 +298,11 @@ impl RunningNode {
         };
         let local = self.thread.shutdown_internal().await;
         match (remote, local) {
-            (Ok(()), Ok(())) => Ok(()),
-            (remote, local) => {
-                Err(format!("node shutdown: remote={remote:?}, thread={local:?}").into())
-            }
+            (Ok(()), Ok(())) if shard_errors.is_empty() => Ok(()),
+            (remote, local) => Err(format!(
+                "node shutdown: shards={shard_errors:?}, remote={remote:?}, thread={local:?}"
+            )
+            .into()),
         }
     }
 }

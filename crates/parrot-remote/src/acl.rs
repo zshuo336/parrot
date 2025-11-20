@@ -5,9 +5,10 @@
 //! authenticate standalone principals. System-owned receptionist gateways check
 //! the local node, and network snapshots check the authorized physical peer.
 //! Both use RemoteConfig::receptionist_acl, which denies all keys by default.
-//! RouteAcl is not yet
-//! wired into the default remote ingress, and these helpers do not establish
-//! TLS identity, wire error mapping, or control-plane authorization.
+//! `RouteAcl` can be installed on a `RemoteActorSystem` before it is started.
+//! It is an application route policy layered on top of the authenticated
+//! transport; it does not establish TLS identity or grant control-plane
+//! authorization by itself.
 
 use std::collections::HashMap;
 
@@ -157,6 +158,15 @@ impl RouteAcl {
             }
         }
         Ok(())
+    }
+
+    /// Validate a realm/cluster principal used as the source of a route.
+    /// Keeping this check here prevents callers from accidentally configuring
+    /// a policy that can never make a deterministic authorization decision.
+    pub fn validate_principal(principal: &str) -> Result<(), String> {
+        valid_segments(principal)
+            .then_some(())
+            .ok_or_else(|| format!("invalid route ACL principal: {principal:?}"))
     }
 
     /// 转发判定：`src_realm`（发送方 realm/cluster）→ `target_prefix`

@@ -608,11 +608,16 @@ async fn assembly_rejects_service_grants_that_differ_from_the_running_remote_hos
         "[remote.receptionist.roles]\nhost = ['edge/host-service']",
         "[remote.receptionist]\ndefault_deny = false\n[remote.receptionist.roles]\nhost = ['edge']",
         "[remote.receptionist]\nroles = {}",
+        "[remote.receptionist]\nmax_subscriptions = 1\n[remote.receptionist.roles]\nhost = ['edge']",
+        "[remote.receptionist]\nmax_subscription_bytes = 0\n[remote.receptionist.roles]\nhost = ['edge']",
+        "[remote.receptionist]\nmax_registrations = 1\n[remote.receptionist.roles]\nhost = ['edge']",
+        "[remote.receptionist]\nmax_registration_bytes = 0\n[remote.receptionist.roles]\nhost = ['edge']",
+        "[remote.receptionist.roles]\nhost = ['edge']\n[remote.receptionist.relays]\nrelay = ['edge']",
     ] {
         let resolved = config(grants).build().unwrap();
         assert!(
             gateway.configure(&resolved).await.is_err(),
-            "assembly must reject an ACL that differs from the running host"
+            "assembly must reject service policy or budgets that differ from the running host"
         );
     }
     gateway.configure(&actual).await.unwrap();

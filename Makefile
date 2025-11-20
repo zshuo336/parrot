@@ -22,6 +22,7 @@
 #    make matrix               # Rust↔JVM 一致性矩阵（需先 make build-jvm）
 #    make check-a5-perf        # A5 近期 >50000/s 门槛
 #    make check-a5-stretch     # A5 原 >300000/s 长期目标（失败仍返回非零）
+#    make check-mailbox-thread-exhaustion # Linux Docker 真实线程额度耗尽回归
 #    make ts / py / jvm / erl / cpp    # 单语言测试快捷方式
 #    make clean                # 清理 cargo target/ + TS dist/ + C++ bin/
 #
@@ -59,6 +60,10 @@ JVM_DIR  := interop/jvm
 CPP_DIR  := interop/cpp-lite
 CPP_BUILD_DIR := $(abspath target/cpp-lite)
 ERL_DIR  := interop/erlang
+
+.PHONY: check-mailbox-thread-exhaustion
+check-mailbox-thread-exhaustion:
+	python3 scripts/check_mailbox_thread_exhaustion.py $(if $(filter 1,$(RELEASE)),--release,)
 
 # GNU Make 3.81 (the macOS system make) ignores .SHELLFLAGS. Put the
 # required failure policy in SHELL so compound recipes and pipelines cannot
@@ -243,7 +248,12 @@ test-full: test-fast lint
 	@$(MAKE) --no-print-directory check-thread-perf
 	@echo ""
 	@echo "==> release 压测（包含 ignored 用例，A5 stretch 另行执行）"
-	$(CARGO) test --release $(CARGO_SCOPE) $(CARGO_FEAT) --lib --bins --tests -- --include-ignored $(CURRENT_PERF_TEST_ARGS) $(PERF_TEST_THREADS)
+	$(CARGO) test --release $(CARGO_SCOPE) $(CARGO_FEAT) --lib --bins --tests -- --include-ignored --skip thread_exhaustion_ $(CURRENT_PERF_TEST_ARGS) $(PERF_TEST_THREADS)
+ifeq ($(shell uname -s),Linux)
+ifeq ($(strip $(filter-out parrot,$(CRATE))),)
+	@$(MAKE) --no-print-directory check-mailbox-thread-exhaustion RELEASE=1
+endif
+endif
 	@echo "✓ 全模式完成（debug 全量 + release 当前阈值 + 压测 + lint；A5 stretch 另行执行；doc-tests 的 ignore 示例不参与压测——与 test-stress 同语义）"
 
 # ---- 压测模式：release 常规用例与压力/阈值实验，A5 stretch 独立--------------------------
@@ -251,7 +261,12 @@ test-stress:
 ifneq ($(CRAWLER_PREPARE),)
 	@$(MAKE) --no-print-directory build-crawler-business
 endif
-	$(CARGO) test --release $(CARGO_SCOPE) $(CARGO_FEAT) --lib --bins --tests -- --include-ignored $(CURRENT_PERF_TEST_ARGS) $(PERF_TEST_THREADS) $(EXTRA)
+	$(CARGO) test --release $(CARGO_SCOPE) $(CARGO_FEAT) --lib --bins --tests -- --include-ignored --skip thread_exhaustion_ $(CURRENT_PERF_TEST_ARGS) $(PERF_TEST_THREADS) $(EXTRA)
+ifeq ($(shell uname -s),Linux)
+ifeq ($(strip $(filter-out parrot,$(CRATE))),)
+	@$(MAKE) --no-print-directory check-mailbox-thread-exhaustion RELEASE=1
+endif
+endif
 	@echo "✓ 压测模式完成（release --include-ignored，A5 stretch 另行执行；doc-tests 由 fast/full 覆盖——ignore 示例不参与压测语义）"
 
 # ---- 多语言模式：TS + Python + JVM + Erlang + C++（缺工具链失败）----------
@@ -414,7 +429,13 @@ check-make: ## 验证真实 recipe／递归 make 的失败传播（无需外部�
 	python3 scripts/tests/test_make_contracts.py -v
 	python3 scripts/tests/test_cpp_make_contracts.py -v
 
-lint: check-make check-business-artifacts fmt clippy ## recipe failure propagation + fmt + strict clippy
+.PHONY: check-implementation-contracts
+check-implementation-contracts: ## Check DEV task accounting; this does not certify implementation acceptance
+	python3 -B -m unittest discover -s scripts/tests -p test_implementation_contracts.py -v
+	python3 -B -O -m unittest discover -s scripts/tests -p test_implementation_contracts.py -v
+	python3 -B scripts/check_implementation_contracts.py
+
+lint: check-make check-business-artifacts check-implementation-contracts fmt clippy ## recipe failure propagation + contract accounting + fmt + strict clippy
 
 fmt:
 	$(CARGO) fmt --all --check

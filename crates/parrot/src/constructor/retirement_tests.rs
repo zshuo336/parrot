@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct BadPayload;
 impl Drop for BadPayload {
@@ -11,6 +11,13 @@ impl Drop for BadPayload {
 struct Capture {
     drops: Arc<AtomicUsize>,
     recursive: bool,
+}
+
+struct CountCapture(Arc<AtomicUsize>);
+impl Drop for CountCapture {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 impl Drop for Capture {
     fn drop(&mut self) {
@@ -41,30 +48,24 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 fn isolated(name: &str, body: impl FnOnce()) {
-    const FLAG: &str = "PARROT_FACTORY_RETIREMENT_CASE";
-    let full = format!("constructor::retirement_tests::{name}");
-    if std::env::var(FLAG).as_deref() == Ok(name) {
-        body();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &full, "--nocapture"])
-        .env(FLAG, name)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "{name}: {status}");
-            break;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("{name}: deadline");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    crate::test_support::isolated_with_timeout(
+        &format!("constructor::retirement_tests::{name}"),
+        Duration::from_secs(15),
+        body,
+    );
+}
+#[test]
+fn retirement_helper_rejects_empty_exact_child_selection() {
+    let failure = std::panic::catch_unwind(|| {
+        isolated("__missing_retirement_case__", || {
+            panic!("missing child selection must never execute this body");
+        });
+    })
+    .expect_err("retirement helper accepted an empty exact child selection");
+    assert!(
+        crate::owned_payload::panic_message(failure)
+            .contains("child did not execute its body exactly once")
+    );
 }
 #[test]
 fn unpolled_retirement_survives_executor_shutdown() {
@@ -481,5 +482,54 @@ async fn admitted_thread_constructor_does_not_wait_for_unrelated_cleanup_capacit
     assert!(
         matches!(progress, Ok(Ok(()))),
         "admitted constructor was blocked by unused configuration cleanup"
+    );
+}
+
+#[test]
+fn cleanup_owner_saturation_applies_backpressure_without_unbounded_waiters() {
+    isolated(
+        "cleanup_owner_saturation_applies_backpressure_without_unbounded_waiters",
+        || {
+            let runtime = runtime();
+            let cleanup = Arc::new(Semaphore::new(1));
+            let held = cleanup.clone().try_acquire_owned().unwrap();
+            let drops = Arc::new(AtomicUsize::new(0));
+            for _ in 0..=crate::owned_payload::MAX_PENDING_CLEANUPS_PER_SLOT {
+                let capture = CountCapture(drops.clone());
+                let factory = Factory::new(
+                    move || {
+                        let _ = &capture;
+                    },
+                    Arc::new(Semaphore::new(1)),
+                    cleanup.clone(),
+                );
+                let receipt = {
+                    let _entered = runtime.enter();
+                    factory.retire()
+                };
+                drop(receipt);
+                drop(factory);
+            }
+            // The first 1024 owners are retained by the bounded pending
+            // budget. The overflow owner is retired synchronously while the
+            // cleanup worker is deliberately held.
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(held);
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while drops.load(Ordering::SeqCst)
+                        <= crate::owned_payload::MAX_PENDING_CLEANUPS_PER_SLOT
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("bounded cleanup owners did not retire");
+            });
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                crate::owned_payload::MAX_PENDING_CLEANUPS_PER_SLOT + 1
+            );
+        },
     );
 }

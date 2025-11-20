@@ -14,6 +14,10 @@ use parrot_api::errors::ActorError;
 use parrot_api::message::Message;
 use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
 use std::fmt::Debug;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// Simple message with string payload
 #[derive(Debug, Clone)]
@@ -36,13 +40,21 @@ impl Message for Greeting {
 /// A minimal actor implementation
 struct GreeterActor {
     state: ActorState,
+    retired: Arc<AtomicUsize>,
 }
 
 impl Default for GreeterActor {
     fn default() -> Self {
         Self {
             state: ActorState::Starting,
+            retired: Arc::default(),
         }
+    }
+}
+
+impl Drop for GreeterActor {
+    fn drop(&mut self) {
+        self.retired.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -99,14 +111,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Create and spawn our actor
         let actor = GreeterActor::default();
+        let retired = actor.retired.clone();
         let actor_ref = system.spawn_root_typed(actor, EmptyConfig).await?;
 
         // Send a message and get response
         let response = actor_ref.ask(Greeting("Actix World".to_string())).await?;
-
+        assert_eq!(response, "Hello, Actix World!");
         println!("Response: {}", response);
 
         // Cleanup
+        actor_ref.stop().await?;
+        assert!(!actor_ref.is_alive().await);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+        assert_eq!(system.status().active_actors, 0);
         system.shutdown().await?;
         actix::System::current().stop();
 

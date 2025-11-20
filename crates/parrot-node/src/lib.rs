@@ -15,6 +15,8 @@
 //!   all. Unknown names and empty interior entries are errors.
 //! - PARROT_READY_FILE: optional path for the complete actual endpoint record.
 //! - PARROT_WASM_EPOCH_TICKS: positive u32 host budget; requires wasm feature.
+//! - PARROT_WASM_MESSAGING_POLICY: explicit operator TOML file of exact guest
+//!   grants; requires wasm feature. Business config and Admin cannot select it.
 //! - PARROT_TRUST_NATIVE_SHA256: executable-only, comma-separated trusted native
 //!   SHA-256 digests; requires dylib feature. This is operator authorization of
 //!   the complete unsafe ABI/dependency contract, not artifact authentication.
@@ -51,9 +53,12 @@ use parrot_remote::LocalLookup;
 
 pub mod configuration;
 pub mod directory;
+mod host_options;
+pub use host_options::HostOptions;
 #[cfg(feature = "dylib")]
 pub mod native;
 pub mod runtime;
+pub mod sharding;
 #[cfg(feature = "dylib")]
 pub use native::NativeTrust;
 #[cfg(feature = "dylib")]
@@ -113,6 +118,8 @@ impl Actor for EchoActor {
 }
 
 /// 计数器：NInc(v) 累加 / NGetTotal → NTotal。
+/// Overflow is rejected without changing the total.
+/// Direct embedders choose supervision; Node's builtin/factory paths use Resume.
 #[derive(Default)]
 pub struct CounterActor {
     total: u64,
@@ -128,7 +135,11 @@ impl Actor for CounterActor {
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(i) = msg.downcast_ref::<NInc>() {
-                self.total += i.0;
+                self.total = self.total.checked_add(i.0).ok_or_else(|| {
+                    parrot_api::errors::ActorError::MessageHandlingError(
+                        "counter total overflow".into(),
+                    )
+                })?;
                 return Ok(Box::new(NTotal(self.total)) as BoxedMessage);
             }
             if msg.downcast_ref::<NGetTotal>().is_some() {
@@ -270,19 +281,30 @@ pub(crate) fn node() -> &'static NodeState {
 
 /// 远程 spawn echo：fn 指针形态（PropsFactory 契约）。
 fn spawn_remote_echo(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-    spawn_on_engine(path, EchoActor)
+    spawn_on_engine(path, EchoActor, ThreadActorConfig::default())
 }
 fn spawn_remote_counter(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-    spawn_on_engine(path, CounterActor::default())
+    spawn_on_engine(path, CounterActor::default(), counter_config())
 }
 fn spawn_remote_kv(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-    spawn_on_engine(path, KvActor::default())
+    spawn_on_engine(path, KvActor::default(), ThreadActorConfig::default())
 }
 fn spawn_remote_slow(path: &str) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-    spawn_on_engine(path, SlowActor)
+    spawn_on_engine(path, SlowActor, ThreadActorConfig::default())
 }
 
-fn spawn_on_engine<A>(path: &str, actor: A) -> BoxedFuture<'static, ActorResult<BoxedActorRef>>
+fn counter_config() -> ThreadActorConfig {
+    ThreadActorConfig {
+        supervisor_strategy: Some(parrot::thread::SupervisorStrategy::Resume),
+        ..Default::default()
+    }
+}
+
+fn spawn_on_engine<A>(
+    path: &str,
+    actor: A,
+    config: ThreadActorConfig,
+) -> BoxedFuture<'static, ActorResult<BoxedActorRef>>
 where
     A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
@@ -290,7 +312,7 @@ where
     Box::pin(async move {
         let r = node()
             .ts
-            .spawn_at(actor, &path, None, ThreadActorConfig::default())
+            .spawn_at(actor, &path, None, config)
             .await
             .map_err(|e| parrot_api::errors::ActorError::InternalError(format!("spawn: {e}")))?;
         Ok(Box::new(r) as BoxedActorRef)
@@ -332,6 +354,11 @@ pub struct FacadeLookup;
 #[async_trait::async_trait]
 impl LocalLookup for FacadeLookup {
     async fn lookup(&self, path: &str) -> Option<Box<dyn ActorRef>> {
+        // Remote work must enter the shard admission/ownership boundary; real
+        // parent/child engine paths are private implementation identities.
+        if path.starts_with("/_shard_hosts/") {
+            return None;
+        }
         node()
             .facade
             .get_actor(&parrot_api::address::ActorPath::placeholder(path))
@@ -420,12 +447,7 @@ pub async fn spawn_builtin(
     let path = format!("/user/{which}");
     let r: Result<BRef, _> = match which {
         "counter" => ts
-            .spawn_at(
-                CounterActor::default(),
-                &path,
-                None,
-                ThreadActorConfig::default(),
-            )
+            .spawn_at(CounterActor::default(), &path, None, counter_config())
             .await
             .map(boxed),
         "kv" => ts

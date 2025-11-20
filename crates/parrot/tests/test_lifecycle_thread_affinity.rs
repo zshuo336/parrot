@@ -200,6 +200,10 @@ async fn check_hook_deadline(mode: SchedulingMode, synchronous: bool) {
         shutdown_timeout: Duration::from_millis(40),
         ..Default::default()
     });
+    // This test measures hook cancellation, not lazy shard startup in 40 ms.
+    if matches!(&mode, SchedulingMode::Sharded { .. }) {
+        system.scheduler_group().try_sharded().unwrap();
+    }
     let actor = system
         .spawn_at(
             StopTimingActor {

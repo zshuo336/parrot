@@ -234,6 +234,14 @@ async fn retirement(mode: u8, traced: bool, closed: bool) {
         trace::in_scope(Some(unrelated.root()), || drop(call));
         actor.stop().await.unwrap();
     }
+    // Rejected and unpolled inputs retire on the independent cleanup executor.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while seen.retired.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     system.shutdown().await.unwrap();
     assert_eq!(seen.made.load(Ordering::SeqCst), 1);
     assert_eq!(seen.dropped.load(Ordering::SeqCst), 1);

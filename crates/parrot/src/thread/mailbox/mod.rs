@@ -2,6 +2,7 @@
 
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
@@ -18,6 +19,167 @@ pub mod admission;
 pub mod mpsc;
 pub mod spsc;
 pub mod spsc_ringbuf;
+
+mod drain;
+
+#[cfg(test)]
+mod drain_budget_contracts;
+
+type Input<T> = crate::owned_payload::OwnedPayload<T>;
+
+// Final-owner Drop has no async disposal receipt or guaranteed live executor.
+// Each detached value therefore needs its own synchronous unwind boundary.
+fn retire_on_drop<T>(value: T, stage: &'static str) {
+    if let Err(error) = crate::owned_payload::PublicationInput::new(value).retire() {
+        tracing::error!(stage, error = %error, "final mailbox owner disposal failed");
+    }
+}
+
+// Call only after releasing queue locks and signalling committed work. Rejection
+// keeps its original category; successful replacement must report cleanup failure.
+async fn finish_push<T: Send + 'static>(
+    result: Result<(), MailboxError>,
+    rejected: Option<Input<T>>,
+    evicted: Option<Input<T>>,
+) -> Result<(), MailboxError> {
+    if let Some(rejected) = rejected
+        && let Err(error) = rejected.retire().await
+    {
+        tracing::error!(error = %error, rejection = ?result, "rejected mailbox input disposal failed");
+    }
+    if let Some(evicted) = evicted
+        && let Err(error) = evicted.retire().await
+    {
+        if result.is_ok() {
+            return Err(MailboxError::PushError(format!(
+                "replacement admitted; evicted mailbox input disposal failed: {}",
+                crate::error_receipt::actor_summary(&error)
+            )));
+        }
+        tracing::error!(error = %error, rejection = ?result, "evicted mailbox input disposal failed after rejection");
+    }
+    result
+}
+
+fn retire_detached_sync<T: Send + 'static>(values: impl IntoIterator<Item = T>) -> Option<String> {
+    let mut errors = Vec::new();
+    for value in values {
+        if let Err(error) = crate::owned_payload::retire_synchronously(value) {
+            errors.push(crate::error_receipt::actor_summary(&error));
+        }
+    }
+    (!errors.is_empty()).then(|| errors.join("; "))
+}
+
+#[derive(Default)]
+struct CloseStatus {
+    claimed: bool,
+    complete: bool,
+    error: Option<String>,
+}
+
+enum CloseAttempt<T> {
+    Reservation,
+    Owned(T),
+    Observing,
+}
+
+/// Shares the physical close completion across concurrent callers.
+///
+/// Sealing and queue extraction are synchronous with respect to the mailbox's
+/// own bookkeeping locks, while user destructors run in an owned task. A
+/// cancelled waiter therefore cannot abandon cleanup, and a later close cannot
+/// report completion before the first drain has finished.
+/// Admission waits happen before claiming or detaching the queue.
+pub(crate) struct CloseState {
+    status: Mutex<CloseStatus>,
+    complete: tokio::sync::Notify,
+}
+
+impl CloseState {
+    pub(crate) fn new() -> Self {
+        Self {
+            status: Mutex::new(CloseStatus::default()),
+            complete: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn claim(&self, has_values: bool, reserved: bool) -> CloseAttempt<()> {
+        let mut status = self.status.lock().unwrap();
+        if status.claimed {
+            CloseAttempt::Observing
+        } else if has_values && !reserved {
+            CloseAttempt::Reservation
+        } else {
+            status.claimed = true;
+            CloseAttempt::Owned(())
+        }
+    }
+
+    async fn reserve(&self) -> Option<drain::Reservation> {
+        if self.status.lock().unwrap().claimed {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.wait() => None,
+            reservation = drain::Reservation::acquire() => Some(reservation),
+        }
+    }
+
+    fn start_drain<T: Send + 'static>(
+        self: &Arc<Self>,
+        values: Vec<T>,
+        reservation: Option<drain::Reservation>,
+    ) {
+        if values.is_empty() {
+            self.finish(None);
+            return;
+        }
+        let owner = self.clone();
+        // Only raw external channel permits can publish after an empty-queue
+        // claim. Such inputs inherit synchronous disposal, without a new thread.
+        reservation
+            .unwrap_or(drain::Reservation::Inline)
+            .run(move || owner.finish_drain(values));
+    }
+
+    fn finish_drain<T: Send + 'static>(&self, values: Vec<T>) {
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            retire_detached_sync(values)
+        }))
+        .unwrap_or_else(|payload| Some(crate::owned_payload::panic_message(payload)));
+        self.finish(error);
+    }
+
+    fn finish(&self, error: Option<String>) {
+        {
+            let mut status = self.status.lock().unwrap();
+            status.error = error;
+            status.complete = true;
+        }
+        self.complete.notify_waiters();
+    }
+
+    pub(crate) async fn wait(&self) {
+        loop {
+            let notified = self.complete.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let completion = {
+                let status = self.status.lock().unwrap();
+                (status.complete, status.error.clone())
+            };
+            if completion.0 {
+                if let Some(error) = completion.1 {
+                    panic!("mailbox drain disposal failed: {error}");
+                }
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// M5: mailbox 内部条目——ask 信封按值流动（零信封装箱）。
 ///
@@ -55,6 +217,29 @@ pub type WeakMailboxRef = std::sync::Weak<dyn Mailbox + Send + Sync>;
 /// not to re-queue it (it looked empty), and a subsequent push only fires a
 /// bare `Notify` that no worker associates with this mailbox.
 pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
+
+fn invoke_wake_hook(hook: Option<WakeHook>) {
+    let Some(hook) = hook else {
+        return;
+    };
+    // A self-replacing hook can leave this snapshot as its last owner. Dispose
+    // it after catching the callback, so two user panics cannot abort unwinding.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
+    let disposal = crate::owned_payload::PublicationInput::new(hook).retire();
+    match (result, disposal) {
+        (Ok(()), Ok(())) => {}
+        (Err(payload), Ok(())) => std::panic::resume_unwind(payload),
+        (Ok(()), Err(error)) => panic!(
+            "mailbox wake hook disposal failed: {}",
+            crate::error_receipt::actor_summary(&error)
+        ),
+        (Err(payload), Err(error)) => panic!(
+            "mailbox wake hook failed: {}; disposal failed: {}",
+            crate::owned_payload::panic_message(payload),
+            crate::error_receipt::actor_summary(&error)
+        ),
+    }
+}
 
 /// Scheduling-slot state ensuring at most one queue entry (and at most one
 /// owning worker) per mailbox.
@@ -240,6 +425,14 @@ pub trait Mailbox: Debug + Send + Sync + 'static {
 
     /// Seal and drain the mailbox. Dropping user messages can execute user code;
     /// lifecycle callers isolate this operation from their deadline timers.
+    /// Built-in mailboxes share 32 native drain leases per process, held through
+    /// OS join (including TLS disposal). Saturation waits before queue extraction;
+    /// cancellation then leaves values in the sealed mailbox for retry or final
+    /// owner disposal. After extraction, cleanup survives waiter cancellation and
+    /// the original runtime's exit. Empty queues need no lease. Reentrant disposal
+    /// and OS thread startup failure use synchronous cleanup outside queue locks.
+    /// The close receipt covers message disposal; the helper's native join can
+    /// finish later while still retaining its lease.
     async fn close(&self);
 
     /// Whether the mailbox is closed.
@@ -247,7 +440,9 @@ pub trait Mailbox: Debug + Send + Sync + 'static {
         false
     }
 
-    /// Associate a processor with this mailbox (interior mutability).
+    /// Publish a processor, then release the old handle outside the slot lock.
+    /// Reentrant replacements survive; this does not stop or retire processors.
+    /// An old handle's destructor panic propagates after the new value is set.
     fn set_processor(&self, processor: Arc<dyn ProcessorInterface>);
 
     /// Get the associated processor, if any.
@@ -259,10 +454,15 @@ pub trait Mailbox: Debug + Send + Sync + 'static {
     /// Install the wake hook fired after each successful push.
     ///
     /// Schedulers use this to re-enqueue the mailbox when new messages arrive
-    /// while no worker currently owns it.
+    /// while no worker currently owns it. Publication precedes releasing the
+    /// old hook outside the lock, including when its capture destructor panics.
     fn set_wake_hook(&self, hook: WakeHook);
 
-    /// Fire the installed wake hook (no-op when none is installed).
+    /// Invoke an owned hook snapshot outside the slot lock (no-op if absent).
+    /// Reentrant/concurrent replacement does not cancel an in-flight callback.
+    /// Independent calls may overlap; hooks must provide their own serialization
+    /// if needed. Callback panics propagate without poisoning the slot. If both
+    /// callback and snapshot disposal panic, their diagnostics are combined.
     fn fire_wake_hook(&self);
 
     /// The scheduling slot state guarding single-owner processing.

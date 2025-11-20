@@ -176,10 +176,13 @@ async fn old_connection_without_capability_fails_before_registering_or_sending()
     .unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let sender = FrameSender::new(tx, "old-peer");
-    sys.links
-        .write()
-        .unwrap()
-        .push(("old-peer".into(), sender, Arc::new(NodeStatus::default())));
+    sys.links.write().unwrap().push(Link {
+        address: NodeAddr::mem("old-peer"),
+        sender,
+        status: Arc::new(NodeStatus::default()),
+        role: crate::handshake::TopologyRole::Normal,
+        dial_addr: None,
+    });
     let error = sys.measured_metrics("old-peer").await.unwrap_err();
     assert!(error
         .to_string()

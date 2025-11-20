@@ -15,6 +15,7 @@ use parrot_app::host::ThreadPropsSpawner;
 use parrot_app::manifest::{AppManifest, ArtifactRef, ComponentSpec, EngineKind, InstancePolicy};
 use parrot_app::planner::LocalTopology;
 use parrot_app::test_support::test_assemble_default_cfg;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // ── 测试组件（PropsFactory——app.m5 命名空间）──
@@ -59,6 +60,49 @@ parrot_api::message::inventory::submit! {
     parrot_app::host::ThreadPropsFactory {
         name: "app.m5.echo",
         spawn: spawn_m5_echo,
+    }
+}
+
+static ROLLBACK_STARTED: AtomicUsize = AtomicUsize::new(0);
+static ROLLBACK_RETIRED: AtomicUsize = AtomicUsize::new(0);
+
+struct RollbackProbe;
+impl Drop for RollbackProbe {
+    fn drop(&mut self) {
+        ROLLBACK_RETIRED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl Actor for RollbackProbe {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+    fn receive_message<'a>(
+        &'a mut self,
+        message: parrot_api::types::BoxedMessage,
+        _: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<parrot_api::types::BoxedMessage>> {
+        Box::pin(async move { Ok(message) })
+    }
+}
+fn spawn_rollback_probe(
+    engine: Arc<ThreadActorSystem>,
+    path: String,
+    _: Option<toml::Table>,
+) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
+    Box::pin(async move {
+        let actor = engine
+            .spawn_at(RollbackProbe, &path, None, ThreadActorConfig::default())
+            .await?;
+        ROLLBACK_STARTED.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(actor) as BoxedActorRef)
+    })
+}
+parrot_api::message::inventory::submit! {
+    parrot_app::host::ThreadPropsFactory {
+        name: "app.m5.rollback-probe",
+        spawn: spawn_rollback_probe,
     }
 }
 
@@ -169,22 +213,43 @@ async fn paths_default_singleton() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn missing_factory_rolls_back_atomic() {
-    // 未注册工厂 → 装配失败（fine 先成功——ctx 内部回卷后返回 Err）
+async fn missing_factory_retires_started_dependencies_and_never_starts_dependents() {
+    let engine = thread_system();
+    let started = ROLLBACK_STARTED.load(Ordering::SeqCst);
+    let retired = ROLLBACK_RETIRED.load(Ordering::SeqCst);
+    let mut fine = spec("fine");
+    fine.artifact = ArtifactRef::Props {
+        factory: "app.m5.rollback-probe".into(),
+    };
     let mut bad = spec("bad");
+    bad.deps = vec!["fine".into()];
     bad.artifact = ArtifactRef::Props {
         factory: "app.m5.noexist".into(),
     };
-    let mut never = spec("never");
+    let mut never = fine.clone();
+    never.name = "never".into();
     never.deps = vec!["bad".into()];
     let r = test_assemble_default_cfg(
-        &manifest(vec![spec("fine"), bad, never]),
+        &manifest(vec![never, bad, fine]),
         Box::new(LocalTopology),
         Box::new(NoGateway),
-        Box::new(ThreadPropsSpawner::new(thread_system())),
+        Box::new(ThreadPropsSpawner::new(engine.clone())),
     )
     .await;
-    assert!(r.is_err(), "未注册工厂必须失败");
+    let error = match r {
+        Err(error) => error,
+        Ok(_) => panic!("missing factory was accepted"),
+    };
+    assert!(error.to_string().contains("app.m5.noexist"), "{error}");
+    assert_eq!(ROLLBACK_STARTED.load(Ordering::SeqCst), started + 1);
+    assert_eq!(ROLLBACK_RETIRED.load(Ordering::SeqCst), retired + 1);
+    for path in ["/user/fine", "/user/bad", "/user/never"] {
+        assert!(
+            engine.get_actor_ref(path).is_none(),
+            "still registered: {path}"
+        );
+    }
+    engine.shutdown_internal().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -216,10 +281,10 @@ async fn pool_instance_paths() {
     let mut pool = spec("pool");
     pool.instances = InstancePolicy::Pool(3);
     let mut a = assemble(vec![pool]).await;
-    let paths = a.paths("pool").expect("paths");
-    assert_eq!(paths.len(), 3);
-    assert!(paths.contains(&"/user/pool-0".to_string()));
-    assert!(paths.contains(&"/user/pool-2".to_string()));
+    assert_eq!(
+        a.paths("pool").expect("paths"),
+        ["/user/pool-0", "/user/pool-1", "/user/pool-2"]
+    );
     a.teardown().await.unwrap();
 }
 

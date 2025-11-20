@@ -100,7 +100,7 @@ async fn run_actor<A: ParrotTypedDispatch>(
         }
         use crate::typed_supervision::Step;
         match control
-            .wait_typed_stage(parrot_api::trace::scope(inputs.creation_context.take(), crate::typed_supervision::lifecycle_stage(|| actor.init_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed))), &runtime)
+            .wait_typed_stage(parrot_api::trace::scope(inputs.creation_context.take(), crate::typed_supervision::recorded_lifecycle_stage(parrot_api::trace::SpanKind::ActorInit, context.path(), || actor.init_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed).with_deadline(control.initialization_deadline()))), &runtime)
             .await
         {
             Step::Stopped => return Ok(()),
@@ -114,12 +114,13 @@ async fn run_actor<A: ParrotTypedDispatch>(
                     "non-repeatable parent cannot recover".into(),
                 ));
             }
-            Step::Ready(result) => result.unwrap_or_else(|message| Err(ActorError::Panic(message))).inspect_err(|_| {
+            Step::Ready(result) => result.result.unwrap_or_else(|message| Err(ActorError::Panic(message))).inspect_err(|_| {
                 control
                     .supervision_failed
                     .store(true, std::sync::atomic::Ordering::Release);
             })?,
         }
+        control.finish_initialization();
         let mut budget = ready_budget::ReadyBudget::default();
         loop {
             let envelope = match budget
@@ -153,7 +154,7 @@ async fn run_actor<A: ParrotTypedDispatch>(
                         crate::typed_supervision::DispatchCleanup::new(
                             &mut inputs.cleanup_error,
                             &mut inputs.dispatch_cancel_failed,
-                        ),
+                        ).with_timeout(control.message_timeout),
                     ),
                     &runtime,
                 ))
@@ -201,7 +202,7 @@ async fn run_actor<A: ParrotTypedDispatch>(
         tokio::select! {
             biased;
             _ = control.expired() => Err(control.enforce_deadline()),
-            result = crate::typed_supervision::lifecycle_stage(|| actor.before_stop_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed)) => result.unwrap_or_else(|message| Err(ActorError::Panic(message))),
+            result = parrot_api::trace::scope(control.take_stop_context(), crate::typed_supervision::recorded_lifecycle_stage(parrot_api::trace::SpanKind::ActorBeforeStop, context.path(), || actor.before_stop_with_context(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed))) => result.result.unwrap_or_else(|message| Err(ActorError::Panic(message))),
         }
     })
     .catch_unwind()
@@ -279,6 +280,62 @@ impl ActixActorSystem {
         self.spawn_typed_source(Some(actor), None, path, strategy)
     }
 
+    /// Admit a static instance into an explicit root group. A group restart
+    /// stops coherently when any selected member lacks a repeatable factory.
+    pub fn spawn_typed_in_cohort<'a, A, M>(
+        self: &'a Arc<Self>,
+        actor: A,
+        path: &'a str,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> impl std::future::Future<Output = ActorResult<TypedActorRef<A, M>>> + Send + 'a
+    where
+        A: ParrotTypedDispatch,
+        M: ParrotMsgVariant<A>,
+    {
+        let payload =
+            crate::owned_payload::OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots);
+        let policy =
+            crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots);
+        parrot_api::trace::capture(self.spawn_typed_owned_source(
+            Some(payload),
+            None,
+            path,
+            policy,
+            None,
+            Some(cohort),
+        ))
+    }
+
+    /// Admit a repeatable static root into the group's shared recovery barriers.
+    pub fn spawn_typed_factory_in_cohort<'a, A, M, F>(
+        self: &'a Arc<Self>,
+        factory: F,
+        path: &'a str,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> impl std::future::Future<Output = ActorResult<TypedActorRef<A, M>>> + Send + 'a
+    where
+        A: ParrotTypedDispatch,
+        M: ParrotMsgVariant<A>,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        let factory = crate::constructor::owned::OwnedFactory::new(
+            factory,
+            self.constructor_slots.clone(),
+            self.cleanup_slots.clone(),
+            self.runtime.clone(),
+        );
+        let policy =
+            crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots);
+        parrot_api::trace::capture(self.spawn_typed_owned_source(
+            None,
+            Some(factory),
+            path,
+            policy,
+            None,
+            Some(cohort),
+        ))
+    }
+
     fn spawn_typed_source<'a, A, M>(
         self: &'a Arc<Self>,
         actor: Option<A>,
@@ -299,7 +356,7 @@ impl ActixActorSystem {
             &self.cleanup_slots,
         );
         parrot_api::trace::capture(
-            self.spawn_typed_owned_source(payload, factory, path, policy, None),
+            self.spawn_typed_owned_source(payload, factory, path, policy, None, None),
         )
     }
 
@@ -323,7 +380,7 @@ impl ActixActorSystem {
             self.cleanup_slots.clone(),
             self.runtime.clone(),
         );
-        self.spawn_typed_owned_source(None, Some(factory), path, policy, Some(parent))
+        self.spawn_typed_owned_source(None, Some(factory), path, policy, Some(parent), None)
             .await
     }
 
@@ -340,7 +397,7 @@ impl ActixActorSystem {
         A: ParrotTypedDispatch,
         M: ParrotMsgVariant<A>,
     {
-        self.spawn_typed_owned_source(Some(actor), None, path, policy, Some(parent))
+        self.spawn_typed_owned_source(Some(actor), None, path, policy, Some(parent), None)
             .await
     }
 
@@ -353,12 +410,25 @@ impl ActixActorSystem {
             Option<parrot_api::supervisor::SupervisorStrategyType>,
         >,
         parent: Option<&crate::typed_context::ManagedContext>,
+        cohort: Option<&crate::root_cohort::RootCohort>,
     ) -> ActorResult<TypedActorRef<A, M>>
     where
         A: ParrotTypedDispatch,
         M: ParrotMsgVariant<A>,
     {
         let creation_context = parrot_api::trace::TraceContext::current();
+        let cohort = cohort.or_else(|| {
+            parent
+                .is_none()
+                .then(|| self.root_cohorts.guardian())
+                .flatten()
+        });
+        let policy = if cohort.is_some() {
+            policy.retire().await?;
+            crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots)
+        } else {
+            policy
+        };
         let mut factory = factory;
         let mut payload = payload;
         let mut policy = Some(policy);
@@ -388,12 +458,13 @@ impl ActixActorSystem {
                     self.policy_slots.clone(),
                 )
             });
-            let (control, finished) = ActorControl::with_lifetime(
+            let (mut control, finished) = ActorControl::with_lifetime(
                 self.settings.shutdown_timeout,
                 self.settings.max_context_tasks,
                 Some(lifetime),
                 self.policy_slots.clone(),
             );
+            ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
             let own = Arc::new(std::sync::OnceLock::new());
             let weak_stop = Arc::downgrade(&control);
             let weak_escalated = Arc::downgrade(&control);
@@ -413,14 +484,19 @@ impl ActixActorSystem {
                         }
                     }),
                     escalate: Arc::new(move |error| {
+                        let error = crate::error_receipt::ActorReceipt::new(error);
                         if let Some(control) = weak_escalated.upgrade()
                             && !control.channel.is_sealed()
                         {
                             let mut signal = control.escalated.lock().unwrap();
-                            signal.get_or_insert(error);
-                            control
-                                .begin_construction(tokio::time::Instant::now() + control.timeout);
+                            if signal.is_none() {
+                                *signal = Some(error.clone());
+                            }
+                            control.begin_construction_quiet(
+                                tokio::time::Instant::now() + control.timeout,
+                            );
                             drop(signal);
+                            control.construction_changed();
                             control.typed_escalation_changed.notify_waiters();
                         }
                     }),
@@ -441,7 +517,8 @@ impl ActixActorSystem {
                         if control.channel.is_sealed() {
                             group.abort("static factory member is stopping");
                         }
-                        control.begin_construction(group.deadline);
+                        control.begin_construction_quiet(group.deadline);
+                        control.construction_changed();
                         control.typed_escalation_changed.notify_waiters();
                     } else {
                         group.abort("static factory member owner disappeared");
@@ -464,7 +541,7 @@ impl ActixActorSystem {
                 Arc::from(actor_ref.clone().into_dyn());
             own.set(Arc::downgrade(&erased))
                 .unwrap_or_else(|_| unreachable!("one typed identity"));
-            let arbiter = self.arbiter_pool().next_arbiter();
+            let arbiter = self.arbiter_pool().reserve_arbiter();
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
             let (retired_tx, retired_rx) = tokio::sync::oneshot::channel();
             let task_control = control.clone();
@@ -533,7 +610,7 @@ impl ActixActorSystem {
                         )),
                     };
                     let factory = match factory {
-                        Some(factory) => factory.retire().await,
+                        Some(factory) => factory.retire_in_lifecycle().await,
                         None => Ok(()),
                     };
                     unpublished
@@ -546,29 +623,36 @@ impl ActixActorSystem {
             );
             Ok(actor_ref)
         };
-        let admission = if let Some(parent) = parent {
-            let mut reference = None;
-            let result = parent.scope.spawn(|lifetime| {
-                let actor = admit(Some(lifetime.clone()))?;
-                let erased = actor.clone().into_dyn();
-                let stop = erased.clone_boxed();
-                reference = Some(actor);
-                Ok((
-                    erased,
-                    Arc::new(move || {
-                        let stop = stop.clone_boxed();
-                        let lifetime = lifetime.clone();
-                        Box::pin(async move {
-                            let _ = stop.stop().await;
-                            lifetime.wait().await
-                        })
-                    }),
-                ))
+        let admission = cohort
+            .map_or(Ok(()), |cohort| cohort.validate(&self.root_cohorts))
+            .and_then(|()| {
+                if let Some(scope) = parent
+                    .map(|parent| &parent.scope)
+                    .or_else(|| cohort.map(|cohort| &cohort.scope))
+                {
+                    let mut reference = None;
+                    let result = scope.spawn(|lifetime| {
+                        let actor = admit(Some(lifetime.clone()))?;
+                        let erased = actor.clone().into_dyn();
+                        let stop = erased.clone_boxed();
+                        reference = Some(actor);
+                        Ok((
+                            erased,
+                            Arc::new(move || {
+                                let stop = stop.clone_boxed();
+                                let lifetime = lifetime.clone();
+                                Box::pin(async move {
+                                    let _ = stop.stop().await;
+                                    lifetime.wait().await
+                                })
+                            }),
+                        ))
+                    });
+                    result.map(|_| reference.expect("admitted typed child"))
+                } else {
+                    admit(None)
+                }
             });
-            result.map(|_| reference.expect("admitted typed child"))
-        } else {
-            admit(None)
-        };
         match admission {
             Ok(reference) => Ok(reference),
             Err(error) => {
@@ -578,7 +662,7 @@ impl ActixActorSystem {
                 drop(policy);
                 let factory = async {
                     match factory {
-                        Some(factory) => factory.retire().await,
+                        Some(factory) => factory.retire_in_lifecycle().await,
                         None => Ok(()),
                     }
                 };

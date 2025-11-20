@@ -8,8 +8,10 @@
 //! - `scan_violations`：直接解析ELF/Mach-O；扫描错误不得当作无违例
 
 use crate::{
-    AbiComponent, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, AbiTraceParentV1, AbiTraceV1,
-    ABI_META_SYMBOL, ABI_OK, ABI_TRACE_V1_SYMBOL, PARROT_ABI_VERSION,
+    AbiComponent, AbiMessagingHostV1, AbiMessagingV1, AbiMeta, AbiMsg, AbiRecordingHostV1,
+    AbiRecordingV1, AbiReplyBuf, AbiServicesHostV1, AbiServicesV1, AbiStr, AbiTraceParentV1,
+    AbiTraceV1, ABI_MESSAGING_V1_SYMBOL, ABI_META_SYMBOL, ABI_OK, ABI_RECORDING_V1_SYMBOL,
+    ABI_SERVICES_V1_SYMBOL, ABI_TRACE_V1_SYMBOL, PARROT_ABI_VERSION,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod artifact;
+mod lifecycle;
 pub use artifact::NativeArtifact;
+use lifecycle::LifecycleCall;
 
 /// 加载错误（拒载语义——禁止清单 violation 也走这里）。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -176,6 +180,18 @@ pub enum UnloadError {
         codes: Vec<u32>,
         report: UnloadReport,
     },
+    #[error(
+        "native destroy failed with codes {codes:?} (drain codes {drain_codes:?}); all instances destroyed: {report:?}"
+    )]
+    DestroyFailed {
+        codes: Vec<u32>,
+        drain_codes: Vec<u32>,
+        report: UnloadReport,
+    },
+    #[error("invalid trace parent; legacy cleanup completed")]
+    InvalidTraceParent,
+    #[error("native recording callback panicked; cleanup result: {cleanup}")]
+    RecordingCallbackPanicked { cleanup: String },
     #[error("native cleanup deadline elapsed; owned cleanup continues in the background")]
     TimedOut,
     #[error("native cleanup timeout exceeds the monotonic clock range; cleanup continues")]
@@ -205,6 +221,10 @@ pub struct DylibHandle {
     staged: Option<Arc<artifact::StagedFile>>,
     meta: *const AbiMeta,
     trace_v1: Option<AbiTraceV1>,
+    recording_v1: Option<AbiRecordingV1>,
+    messaging_v1: Option<AbiMessagingV1>,
+    services_v1: Option<AbiServicesV1>,
+    lifecycle_v1: Option<crate::AbiLifecycleV1>,
     registry: Arc<InstanceRegistry>,
     /// Quarantine 后为 true（新消息拒绝进入）。
     quarantined: std::sync::atomic::AtomicBool,
@@ -235,6 +255,18 @@ impl DylibHandle {
     pub fn supports_trace_v1(&self) -> bool {
         self.trace_v1.is_some()
     }
+    pub fn supports_recording_v1(&self) -> bool {
+        self.recording_v1.is_some()
+    }
+    pub fn supports_messaging_v1(&self) -> bool {
+        self.messaging_v1.is_some()
+    }
+    pub fn supports_services_v1(&self) -> bool {
+        self.services_v1.is_some()
+    }
+    pub fn supports_lifecycle_v1(&self) -> bool {
+        self.lifecycle_v1.is_some()
+    }
     /// 测试钩子：直接置/清 quarantine（状态机断言用）。
     #[doc(hidden)]
     pub fn set_quarantined(&self, v: bool) {
@@ -245,6 +277,14 @@ impl DylibHandle {
 impl DylibHandle {
     /// Synchronous fallback shared by Drop and the owned unload worker.
     fn cleanup(&mut self) -> Result<UnloadReport, UnloadError> {
+        // No borrowed capabilities are inferred by legacy cleanup or Drop.
+        unsafe { self.cleanup_with_lifecycle(None) }
+    }
+
+    unsafe fn cleanup_with_lifecycle(
+        &mut self,
+        call: Option<LifecycleCall<'_>>,
+    ) -> Result<UnloadReport, UnloadError> {
         self.quarantined.store(true, Ordering::Release);
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(UnloadReport::default());
@@ -280,6 +320,7 @@ impl DylibHandle {
         );
         let mut report = UnloadReport::default();
         let mut codes = Vec::new();
+        let mut destroy_codes = Vec::new();
         // SAFETY: load's trust contract guarantees valid unique instances,
         // non-unwinding hooks, and destroy validity even after a drain error.
         unsafe {
@@ -288,7 +329,7 @@ impl DylibHandle {
                 let code = drained
                     .get(&addr)
                     .copied()
-                    .unwrap_or_else(|| ((*(*comp).vt).on_drain)((*comp).self_));
+                    .unwrap_or_else(|| self.invoke_drain(comp, call));
                 if code == ABI_OK {
                     report.drained += 1;
                 } else {
@@ -298,7 +339,10 @@ impl DylibHandle {
             // Complete the drain phase before destroying any instance: another
             // instance's drain hook may still need shared library-owned state.
             for addr in instances {
-                ((*self.meta).hooks.destroy)(addr as *mut AbiComponent);
+                let code = self.invoke_destroy(addr as *mut AbiComponent, call);
+                if code != ABI_OK {
+                    destroy_codes.push(code);
+                }
             }
         }
         // Release this handle after destroying its instances. Finalizers invoked
@@ -306,7 +350,13 @@ impl DylibHandle {
         // image for other handles or runtime state. This is not proof of unmapping.
         drop(self.lib.take());
         drop(self.staged.take());
-        if codes.is_empty() {
+        if !destroy_codes.is_empty() {
+            Err(UnloadError::DestroyFailed {
+                codes: destroy_codes,
+                drain_codes: codes,
+                report,
+            })
+        } else if codes.is_empty() {
             Ok(report)
         } else {
             Err(UnloadError::DrainFailed { codes, report })
@@ -369,6 +419,10 @@ impl DylibLoader {
     /// the loading thread or a Tokio runtime. If exported, `PARROT_ABI_TRACE_V1`
     /// must be immutable valid `AbiTraceV1` data for the library lifetime, and
     /// its message hook has all the same obligations as the original vtable.
+    /// The optional recording, messaging, services and lifecycle descriptors
+    /// have the same immutable, library-lifetime storage obligations. Lifecycle
+    /// constructors must clean up on failure; lifecycle destroy must release the
+    /// instance on every return code and remain valid after any drain result.
     /// Static scanning is
     /// not a sandbox and a matching digest does not establish these guarantees.
     ///
@@ -431,9 +485,34 @@ impl DylibLoader {
                     host: PARROT_ABI_VERSION,
                 });
             }
-            let name = (*meta).name_str().to_string();
+            let name = (*meta)
+                .try_name_str()
+                .ok_or_else(|| {
+                    LoadError::Symbol("PARROT_ABI_META contains invalid UTF-8 metadata name".into())
+                })?
+                .to_string();
             let trace_v1 = lib
                 .get::<*const AbiTraceV1>(ABI_TRACE_V1_SYMBOL.as_bytes())
+                .ok()
+                .filter(|extension| same_symbol_image(meta.cast(), (**extension).cast()))
+                .map(|extension| **extension);
+            let recording_v1 = lib
+                .get::<*const AbiRecordingV1>(ABI_RECORDING_V1_SYMBOL.as_bytes())
+                .ok()
+                .filter(|extension| same_symbol_image(meta.cast(), (**extension).cast()))
+                .map(|extension| **extension);
+            let messaging_v1 = lib
+                .get::<*const AbiMessagingV1>(ABI_MESSAGING_V1_SYMBOL.as_bytes())
+                .ok()
+                .filter(|extension| same_symbol_image(meta.cast(), (**extension).cast()))
+                .map(|extension| **extension);
+            let services_v1 = lib
+                .get::<*const AbiServicesV1>(ABI_SERVICES_V1_SYMBOL.as_bytes())
+                .ok()
+                .filter(|extension| same_symbol_image(meta.cast(), (**extension).cast()))
+                .map(|extension| **extension);
+            let lifecycle_v1 = lib
+                .get::<*const crate::AbiLifecycleV1>(crate::ABI_LIFECYCLE_V1_SYMBOL.as_bytes())
                 .ok()
                 .filter(|extension| same_symbol_image(meta.cast(), (**extension).cast()))
                 .map(|extension| **extension);
@@ -444,6 +523,10 @@ impl DylibLoader {
                 staged,
                 meta,
                 trace_v1,
+                recording_v1,
+                messaging_v1,
+                services_v1,
+                lifecycle_v1,
                 registry: Arc::new(InstanceRegistry::default()),
                 quarantined: std::sync::atomic::AtomicBool::new(false),
                 closed: std::sync::atomic::AtomicBool::new(false),
@@ -463,6 +546,15 @@ impl DylibLoader {
     /// }
     /// ```
     pub fn construct(&self, h: &DylibHandle, cfg: &str) -> Result<*mut AbiComponent, LoadError> {
+        unsafe { self.construct_with_lifecycle(h, cfg, None) }
+    }
+
+    unsafe fn construct_with_lifecycle(
+        &self,
+        h: &DylibHandle,
+        cfg: &str,
+        call: Option<LifecycleCall<'_>>,
+    ) -> Result<*mut AbiComponent, LoadError> {
         if h.quarantined.load(Ordering::Acquire) {
             return Err(LoadError::Construct {
                 code: crate::ABI_ERR_STATE,
@@ -483,7 +575,11 @@ impl DylibLoader {
             let mut out = out;
             let construct_fn = (*h.meta).hooks.construct;
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                construct_fn(cfg, &mut out as *mut *mut AbiComponent)
+                if let (Some(extension), Some(call)) = (h.lifecycle_v1, call) {
+                    (extension.construct)(cfg, &mut out, call.parent_ptr(), call.recording_ptr())
+                } else {
+                    construct_fn(cfg, &mut out)
+                }
             }))
             .unwrap_or(99); // 宿主侧 panic 码（ABI_ERR_* 之外——诊断可辨）
                             // 注：99 = 宿主侧 panic 码（ABI_ERR_* 之外——诊断可辨）
@@ -538,6 +634,101 @@ impl DylibLoader {
         out: &mut AbiReplyBuf,
         parent: Option<&AbiTraceParentV1>,
     ) -> Result<(), (u32, String)> {
+        self.handle_message(h, comp, msg, out, parent, None, None, None)
+    }
+
+    /// Invoke the component-owned recording extension, falling back to trace v1
+    /// or the original vtable. No recording is inferred from causal IDs.
+    /// # Safety
+    /// All requirements of handle_msg_with_trace apply. The host descriptor,
+    /// context and callback state must remain valid for this call, permit only
+    /// synchronous same-thread access, and callbacks must never unwind across C.
+    /// An exported recording descriptor has the same trust/storage obligations
+    /// as the trace descriptor. A null capability explicitly disables recording.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn handle_msg_with_recording(
+        &self,
+        h: &DylibHandle,
+        comp: *mut AbiComponent,
+        msg: AbiMsg,
+        out: &mut AbiReplyBuf,
+        parent: Option<&AbiTraceParentV1>,
+        recording: Option<&AbiRecordingHostV1>,
+    ) -> Result<(), (u32, String)> {
+        self.handle_message(h, comp, msg, out, parent, Some(recording), None, None)
+    }
+
+    /// Invoke optional messaging v1 with explicit borrowed capabilities,
+    /// falling back to recording, trace and the original vtable in that order.
+    /// # Safety
+    /// All requirements of handle_msg_with_recording apply to both host
+    /// descriptors. Messaging callbacks are synchronous, same-thread and must
+    /// not unwind. Native code remains trusted, including all dependencies.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn handle_msg_with_capabilities(
+        &self,
+        h: &DylibHandle,
+        comp: *mut AbiComponent,
+        msg: AbiMsg,
+        out: &mut AbiReplyBuf,
+        parent: Option<&AbiTraceParentV1>,
+        recording: Option<&AbiRecordingHostV1>,
+        messaging: Option<&AbiMessagingHostV1>,
+    ) -> Result<(), (u32, String)> {
+        self.handle_message(
+            h,
+            comp,
+            msg,
+            out,
+            parent,
+            Some(recording),
+            Some(messaging),
+            None,
+        )
+    }
+
+    /// Invoke discovery v1, falling back to messaging, recording, trace and the
+    /// original hook. Earlier public entries never select the discovery hook.
+    /// # Safety
+    /// All requirements of handle_msg_with_capabilities apply to every host
+    /// descriptor. Discovery callbacks and pointers are synchronous, borrowed,
+    /// same-thread and must not unwind or outlive this call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn handle_msg_with_services(
+        &self,
+        h: &DylibHandle,
+        comp: *mut AbiComponent,
+        msg: AbiMsg,
+        out: &mut AbiReplyBuf,
+        parent: Option<&AbiTraceParentV1>,
+        recording: Option<&AbiRecordingHostV1>,
+        messaging: Option<&AbiMessagingHostV1>,
+        services: Option<&AbiServicesHostV1>,
+    ) -> Result<(), (u32, String)> {
+        self.handle_message(
+            h,
+            comp,
+            msg,
+            out,
+            parent,
+            Some(recording),
+            Some(messaging),
+            Some(services),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn handle_message(
+        &self,
+        h: &DylibHandle,
+        comp: *mut AbiComponent,
+        msg: AbiMsg,
+        out: &mut AbiReplyBuf,
+        parent: Option<&AbiTraceParentV1>,
+        recording: Option<Option<&AbiRecordingHostV1>>,
+        messaging: Option<Option<&AbiMessagingHostV1>>,
+        services: Option<Option<&AbiServicesHostV1>>,
+    ) -> Result<(), (u32, String)> {
         if parent.is_some_and(|parent| !parent.is_valid()) {
             return Err((crate::ABI_ERR_STATE, "invalid trace parent".into()));
         }
@@ -563,7 +754,40 @@ impl DylibLoader {
         let f = (*vt).handle_msg;
         let self_ = (*comp).self_;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(extension) = h.trace_v1 {
+            if let (Some(extension), Some(services)) = (h.services_v1, services) {
+                (extension.handle_msg)(
+                    self_,
+                    msg,
+                    out,
+                    parent.map_or(std::ptr::null(), std::ptr::from_ref),
+                    recording
+                        .flatten()
+                        .map_or(std::ptr::null(), std::ptr::from_ref),
+                    messaging
+                        .flatten()
+                        .map_or(std::ptr::null(), std::ptr::from_ref),
+                    services.map_or(std::ptr::null(), std::ptr::from_ref),
+                )
+            } else if let (Some(extension), Some(messaging)) = (h.messaging_v1, messaging) {
+                (extension.handle_msg)(
+                    self_,
+                    msg,
+                    out,
+                    parent.map_or(std::ptr::null(), std::ptr::from_ref),
+                    recording
+                        .flatten()
+                        .map_or(std::ptr::null(), std::ptr::from_ref),
+                    messaging.map_or(std::ptr::null(), std::ptr::from_ref),
+                )
+            } else if let (Some(extension), Some(recording)) = (h.recording_v1, recording) {
+                (extension.handle_msg)(
+                    self_,
+                    msg,
+                    out,
+                    parent.map_or(std::ptr::null(), std::ptr::from_ref),
+                    recording.map_or(std::ptr::null(), std::ptr::from_ref),
+                )
+            } else if let Some(extension) = h.trace_v1 {
                 (extension.handle_msg)(
                     self_,
                     msg,
@@ -594,6 +818,15 @@ impl DylibLoader {
         h: &DylibHandle,
         comp: *mut AbiComponent,
     ) -> Result<(), (u32, String)> {
+        self.drain_with_lifecycle(h, comp, None)
+    }
+
+    unsafe fn drain_with_lifecycle(
+        &self,
+        h: &DylibHandle,
+        comp: *mut AbiComponent,
+        call: Option<LifecycleCall<'_>>,
+    ) -> Result<(), (u32, String)> {
         let addr = comp as usize;
         let _guard = acquire_inflight(&h.registry, addr)
             .ok_or((crate::ABI_ERR_STATE, "component not registered".into()))?;
@@ -601,7 +834,7 @@ impl DylibLoader {
         let code = match cached {
             Some(code) => code,
             None => {
-                let code = unsafe { ((*(*comp).vt).on_drain)((*comp).self_) };
+                let code = h.invoke_drain(comp, call);
                 h.registry.drained.lock().unwrap().insert(addr, code);
                 code
             }

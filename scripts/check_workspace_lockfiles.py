@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """List source workspace lockfiles, rejecting absent or git-ignored inputs.
 
-Cargo locates workspace roots without building or resolving dependencies. Git's
+By default Cargo locates workspace roots without resolving dependencies. Git's
 source selection excludes generated trees; review snapshots and vendored code
 are not independent product workspaces. --no-index also catches ignore rules
 masked by an already tracked lockfile in a developer checkout.
+--check-resolution additionally checks every workspace with cargo metadata
+--locked before returning any audit input. CARGO_NET_OFFLINE is honored.
 """
 import argparse
 from pathlib import Path
@@ -12,7 +14,7 @@ import subprocess
 import sys
 
 
-def workspace_lockfiles(root):
+def workspace_lockfiles(root, check_resolution=False):
     root = Path(root).resolve()
     selected = subprocess.run(
         ['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
@@ -47,16 +49,30 @@ def workspace_lockfiles(root):
                                                 ignored.stdout, ignored.stderr)
     if errors:
         raise ValueError('\n'.join(errors))
+    if check_resolution:
+        for lock in sorted(locks):
+            resolved = subprocess.run(
+                ['cargo', 'metadata', '--locked', '--format-version', '1',
+                 '--manifest-path', str(root / Path(lock).with_name('Cargo.toml'))],
+                cwd=root, capture_output=True, text=True, timeout=120,
+            )
+            if resolved.returncode:
+                errors.append('workspace lockfile resolution failed: ' + lock + '\n'
+                              + resolved.stderr.strip())
+        if errors:
+            raise ValueError('\n'.join(errors))
     return sorted(locks)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--check-resolution', action='store_true',
+                        help='require cargo metadata --locked to resolve every workspace')
     args = parser.parse_args()
     try:
-        print('\n'.join(workspace_lockfiles(args.root)))
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print('\n'.join(workspace_lockfiles(args.root, args.check_resolution)))
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
         print(error, file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError) and error.stderr:
             print(error.stderr, file=sys.stderr, end='')

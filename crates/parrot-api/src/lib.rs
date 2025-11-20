@@ -74,6 +74,8 @@
 
 pub mod actor;
 pub mod address;
+#[doc(hidden)]
+pub mod batch_dispatch;
 pub mod context;
 pub mod death_watch;
 pub mod engine;

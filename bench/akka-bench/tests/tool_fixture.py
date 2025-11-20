@@ -9,6 +9,11 @@ name = Path(sys.argv[0]).name
 stage = ('contracts' if 'BenchContracts' in sys.argv else 'keys' if 'keys' in sys.argv else 'runtime') if name == 'java' else name
 with open(os.environ['BENCH_EVENTS'], 'a') as out:
     out.write(json.dumps(dict(stage=stage, args=sys.argv[1:])) + '\n')
+if os.environ.get('BENCH_LEAVE_CHILD') == stage:
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    Path(os.environ['BENCH_PIDS']).write_text(json.dumps([child.pid]))
 if os.environ.get('BENCH_FAIL') == stage:
     sys.exit(17)
 if os.environ.get('BENCH_BLOCK') == stage:

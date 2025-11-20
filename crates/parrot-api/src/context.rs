@@ -53,13 +53,17 @@ pub trait ActorSpawner: Send + Sync {
     /// The constructor owns its configuration; it is not called before admission.
     fn spawn_factory_erased<'a>(
         &'a self,
-        _factory: BoxedMessage,
-        _strategy: Option<SupervisorStrategyType>,
+        factory: BoxedMessage,
+        strategy: Option<SupervisorStrategyType>,
     ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
-        Box::pin(async {
-            Err(crate::errors::ActorError::InitializationError(
-                "this spawner has no repeatable factory bridge".into(),
-            ))
+        let factory = crate::owned_input::Input::new(factory);
+        let strategy = crate::owned_input::Input::new(strategy);
+        Box::pin(async move {
+            strategy.finish(
+                factory.finish(Err(crate::errors::ActorError::InitializationError(
+                    "this spawner has no repeatable factory bridge".into(),
+                ))),
+            )
         })
     }
     /// Creates new actor instance
@@ -493,6 +497,8 @@ pub trait ActorContext: Send + Sync {
 /// and handling responses.
 pub trait ActorContextMessage: ActorContext {
     /// Sends a message to self without waiting for response.
+    /// The background task waits only for mailbox admission. Its successful
+    /// submission does not acknowledge admission or completed processing.
     ///
     /// # Type Parameters
     /// * `M` - Message type
@@ -511,7 +517,7 @@ pub trait ActorContextMessage: ActorContext {
             )
         })?;
         handle.spawn(async move {
-            if let Err(error) = self_ref.send(Box::new(msg) as BoxedMessage).await {
+            if let Err(error) = self_ref.deliver(Box::new(msg) as BoxedMessage).await {
                 tracing::debug!(%error, "send_self delivery failed after task admission");
             }
         });

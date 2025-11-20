@@ -78,6 +78,10 @@ pub struct MemoryTransport {
 }
 
 impl MemoryTransport {
+    pub(crate) fn with_admission(mut self, admission: super::ConnectionAdmission) -> Self {
+        self.tasks.admission = admission;
+        self
+    }
     pub(crate) fn with_metrics(mut self, metrics: Arc<crate::metrics::TransportMetrics>) -> Self {
         self.tasks.metrics = metrics;
         self
@@ -118,7 +122,7 @@ impl MemoryTransport {
             }
         }
         Ok(Self {
-            tasks: ConnectionTasks::default(),
+            tasks: ConnectionTasks::with_knobs(knobs),
             capture: None,
             handshake,
             inbound,
@@ -146,7 +150,8 @@ impl MemoryTransport {
                 }
             }
         }
-        self.accept_rx.lock().unwrap().take();
+        let receiver = self.accept_rx.lock().unwrap().take();
+        crate::ingress::unwind::Cleanup::default().dispose(receiver);
     }
 }
 
@@ -157,11 +162,19 @@ impl Drop for MemoryTransport {
     }
 }
 
+impl super::OwnedTransport for MemoryTransport {
+    fn close_admission(&self) {
+        self.tasks.close_admission();
+        *self.accept_tx.closed.lock().unwrap() = true;
+    }
+}
+
 #[async_trait::async_trait]
 impl Transport for MemoryTransport {
     async fn connect(&self, addr: &NodeAddr) -> Result<ConnectionHandle, RemoteError> {
         self.tasks
             .run(async {
+                let (connection, _handshake) = self.tasks.admit()?;
                 let target = {
                     let g = hub().lock().unwrap();
                     g.get(&addr.node_id).cloned().ok_or_else(|| {
@@ -173,7 +186,7 @@ impl Transport for MemoryTransport {
                     RemoteError::Transport(format!("mem peer {} not accepting", addr.node_id))
                 })?;
                 run_connection_captured(
-                    client,
+                    super::AdmittedIo::new(client, connection),
                     ConnParams {
                         side: ConnSide::Connect,
                         local_addr: None,
@@ -220,8 +233,9 @@ impl Transport for MemoryTransport {
                         }
                     }
                 };
+                let (connection, _handshake) = self.tasks.admit()?;
                 run_connection_captured(
-                    server,
+                    super::AdmittedIo::new(server, connection),
                     ConnParams {
                         side: ConnSide::Accept,
                         local_addr: None,
@@ -243,8 +257,9 @@ impl Transport for MemoryTransport {
     }
 
     fn close(&self) {
-        self.tasks.close();
+        super::OwnedTransport::close_admission(self);
         self.close_endpoint();
+        self.tasks.close();
     }
 
     async fn shutdown(&self) {

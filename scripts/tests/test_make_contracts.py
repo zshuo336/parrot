@@ -66,7 +66,8 @@ class MakeContracts(unittest.TestCase):
         result = subprocess.run(
             [MAKE, "--no-print-directory", "-f", "Makefile", "-f", "probes.mk",
              target, "CARGO=" + str(self.bin / "cargo"), "LAB_SCRIPT=launcher", *args],
-            cwd=self.directory, env=environment, text=True, capture_output=True, timeout=15,
+            # This is a hang watchdog, not a recipe performance threshold.
+            cwd=self.directory, env=environment, text=True, capture_output=True, timeout=60,
         )
         events = self.events.read_text().splitlines() if self.events.exists() else []
         return result, events
@@ -151,7 +152,11 @@ class MakeContracts(unittest.TestCase):
                 self.failed(result)
                 self.assertTrue(any(line.startswith("erlc:-Werror") for line in events), events)
                 self.assertFalse(any(line.startswith(("erl:", "python3:")) for line in events), events)
-                self.assertEqual(list(temporary_beams.iterdir()), [])
+                # macOS developer-tool shims may materialize their own
+                # xcrun_db cache beside the command's temporary output.
+                remaining = [path for path in temporary_beams.iterdir()
+                             if not (sys.platform == 'darwin' and path.name == 'xcrun_db')]
+                self.assertEqual(remaining, [])
 
     def test_component_preparation_failure_prevents_cargo_tests(self):
         for target in ['test-fast', 'test-stress']:
@@ -282,7 +287,10 @@ sys.exit(23 if os.environ['PARROT_PERF_FAILURE'] in names else 0)
             args = shlex.split(line[len('cargo:'):])
             self.assertIn('--include-ignored', args)
             skips = [args[i + 1] for i, a in enumerate(args[:-1]) if a == '--skip']
-            self.assertEqual(skips, ['a5_herd_spawn_throughput_thread_stretch'], line)
+            expected = ['a5_herd_spawn_throughput_thread_stretch']
+            if '--lib' in args and '--tests' in args:
+                expected.insert(0, 'thread_exhaustion_')
+            self.assertEqual(skips, expected, line)
             self.assertEqual([a for a in args if a.startswith('--test-threads=')], ['--test-threads=1'])
 
     def test_full_acceptance_excludes_only_a5_stretch(self):
@@ -296,6 +304,31 @@ sys.exit(23 if os.environ['PARROT_PERF_FAILURE'] in names else 0)
         result, events = self.run_make('test-stress')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_current_performance_selection(events)
+
+    def test_linux_full_and_stress_require_the_isolated_thread_exhaustion_gate(self):
+        (self.bin / 'uname').write_text('#!/bin/sh\nprintf "Linux\\n"\n')
+        (self.bin / 'uname').chmod(0o755)
+        self.performance_failure('no-performance-failure')
+        for target in ['test-full', 'test-stress']:
+            with self.subTest(target=target):
+                self.events.unlink(missing_ok=True)
+                result, events = self.run_make(
+                    target, 'CRATE=parrot', fail_tool='python3',
+                    fail_arg='scripts/check_mailbox_thread_exhaustion.py',
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn('✓ 压测模式完成', result.stdout)
+                self.assertEqual(events.count(
+                    'python3:scripts/check_mailbox_thread_exhaustion.py --release'), 1, events)
+                self.assertNotIn('✓ 全模式完成', result.stdout)
+
+    def test_linux_unrelated_crate_scope_does_not_run_the_parrot_exhaustion_gate(self):
+        (self.bin / 'uname').write_text('#!/bin/sh\nprintf "Linux\\n"\n')
+        (self.bin / 'uname').chmod(0o755)
+        self.performance_failure('no-performance-failure')
+        result, events = self.run_make('test-stress', 'CRATE=parrot-api')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any('check_mailbox_thread_exhaustion.py' in event for event in events))
 
     def test_ci_release_acceptance_excludes_only_a5_stretch(self):
         workflow = Path(os.environ.get('PARROT_CI_WORKFLOW', ROOT / '.github/workflows/ci.yml'))

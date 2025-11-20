@@ -91,6 +91,305 @@ fn expanded_paths_charge_utf8_and_decimal_digit_boundaries() {
     exceeded(component.instance_paths().unwrap_err(), "expanded bytes");
 }
 
+// Materialize small expected cache keys independently of the admission formula.
+fn hook_cache_charge(name: &str, roots: &[String], suffixes: &[&str]) -> u64 {
+    let header = std::mem::size_of::<String>();
+    let root_bytes: usize = roots.iter().map(|root| root.len() + header).sum();
+    let cache_bytes: usize = roots
+        .iter()
+        .flat_map(|root| {
+            suffixes.iter().map(move |suffix| {
+                let path = if suffix.is_empty() {
+                    root.clone()
+                } else {
+                    format!("{root}/{suffix}")
+                };
+                name.len() + header + path.len() + header
+            })
+        })
+        .sum();
+    (root_bytes + cache_bytes) as u64
+}
+
+#[test]
+fn hook_expansion_budget_counts_utf8_cache_keys_and_decimal_boundaries() {
+    for count in [1, 9, 10, 11, 99, 100, 101] {
+        for policy in [InstancePolicy::Pool(count), InstancePolicy::Sharded(count)] {
+            let mut component = spec("节点", count);
+            component.instances = policy;
+            component.hooks.on_start = Some(".".into());
+            component.hooks.on_drain = Some("子/启动".into());
+            component.hooks.on_stop = Some("/user/节点/结束".into());
+            let roots: Vec<_> = (0..count)
+                .map(|index| format!("/user/节点-{index}"))
+                .collect();
+            let exact = hook_cache_charge("节点", &roots, &["", "子/启动", "结束"]);
+            let limits = ApplicationLimits {
+                max_expanded_bytes: exact,
+                ..Default::default()
+            };
+            let model = manifest(vec![component.clone()]);
+            validate_with_limits(&model, &limits).unwrap();
+            component.deployment_with_limits("1.0.0", &limits).unwrap();
+            let below = ApplicationLimits {
+                max_expanded_bytes: exact - 1,
+                ..limits
+            };
+            exceeded(below.check_manifest(&model).unwrap_err(), "expanded bytes");
+            assert!(component
+                .deployment_with_limits("1.0.0", &below)
+                .unwrap_err()
+                .contains("expanded bytes"));
+        }
+    }
+}
+
+#[test]
+fn hook_expansion_budget_deduplicates_equivalent_phase_paths() {
+    for (hooks, suffix) in [
+        ([".", "/user/a", "."], ""),
+        (["child", "/user/a/child", "child"], "child"),
+    ] {
+        for policy in [
+            InstancePolicy::Singleton,
+            InstancePolicy::Ephemeral,
+            InstancePolicy::Pool(2),
+        ] {
+            let mut component = spec("a", 2);
+            component.instances = policy;
+            component.hooks.on_start = Some(hooks[0].into());
+            component.hooks.on_drain = Some(hooks[1].into());
+            component.hooks.on_stop = Some(hooks[2].into());
+            let roots = if component.instances.instance_count() == 1 {
+                vec!["/user/a".into()]
+            } else {
+                vec!["/user/a-0".into(), "/user/a-1".into()]
+            };
+            let exact = hook_cache_charge("a", &roots, &[suffix]);
+            let model = manifest(vec![component]);
+            let limits = ApplicationLimits {
+                max_expanded_bytes: exact,
+                ..Default::default()
+            };
+            validate_with_limits(&model, &limits).unwrap();
+            exceeded(
+                ApplicationLimits {
+                    max_expanded_bytes: exact - 1,
+                    ..limits
+                }
+                .check_manifest(&model)
+                .unwrap_err(),
+                "expanded bytes",
+            );
+        }
+    }
+}
+
+#[test]
+fn hook_expansion_budget_accumulates_across_components_and_public_plans() {
+    let mut a = spec("a", 2);
+    a.hooks.on_start = Some("child".into());
+    let mut b = spec("b", 1);
+    b.hooks.on_stop = Some(".".into());
+    let exact = hook_cache_charge("a", &["/user/a-0".into(), "/user/a-1".into()], &["child"])
+        + hook_cache_charge("b", &["/user/b-0".into()], &[""]);
+    let model = manifest(vec![a.clone(), b.clone()]);
+    let plan = parrot_app::planner::Plan {
+        order: vec![a.clone(), b.clone()]
+            .into_iter()
+            .map(|spec| parrot_app::planner::PlannedComponent {
+                spec,
+                shard_plan: None,
+                nodes: vec![],
+            })
+            .collect(),
+        warnings: vec![],
+    };
+    let limits = ApplicationLimits {
+        max_expanded_bytes: exact,
+        ..Default::default()
+    };
+    limits.check_manifest(&model).unwrap();
+    limits.check_plan(&plan).unwrap();
+    let below = ApplicationLimits {
+        max_expanded_bytes: exact - 1,
+        ..limits
+    };
+    below.check_manifest(&manifest(vec![a])).unwrap();
+    below.check_manifest(&manifest(vec![b])).unwrap();
+    exceeded(below.check_manifest(&model).unwrap_err(), "expanded bytes");
+    exceeded(below.check_plan(&plan).unwrap_err(), "expanded bytes");
+}
+
+#[test]
+fn hook_expansion_budget_and_selected_node_names_share_one_limit() {
+    let mut component = spec("a", 2);
+    component.hooks.on_start = Some("child".into());
+    let root_and_hooks =
+        hook_cache_charge("a", &["/user/a-0".into(), "/user/a-1".into()], &["child"]);
+    let exact = root_and_hooks + "local".len() as u64 + std::mem::size_of::<String>() as u64;
+    let model = manifest(vec![component]);
+    let limits = ApplicationLimits {
+        max_expanded_bytes: exact,
+        ..Default::default()
+    };
+    let plan = plan_with_limits(&model, &LocalTopology, &limits).unwrap();
+    let below = ApplicationLimits {
+        max_expanded_bytes: exact - 1,
+        ..limits
+    };
+    below.check_manifest(&model).unwrap();
+    assert!(plan_with_limits(&model, &LocalTopology, &below)
+        .unwrap_err()
+        .to_string()
+        .contains("expanded bytes"));
+    exceeded(below.check_plan(&plan).unwrap_err(), "expanded bytes");
+}
+
+#[test]
+fn hook_expansion_budget_preserves_caller_path_charges_in_mutable_plans() {
+    let mut component = spec("a", 2);
+    component.hooks.on_start = Some("child".into());
+    let generated = ["/user/a-0".into(), "/user/a-1".into()];
+    let generated_bytes: u64 = generated
+        .iter()
+        .map(|s: &String| s.len() as u64 + std::mem::size_of::<String>() as u64)
+        .sum();
+    let supplied = vec![
+        "/user/a-0/longer-path".to_string(),
+        "/user/a-1/longer-path".to_string(),
+    ];
+    let supplied_bytes: u64 = supplied
+        .iter()
+        .map(|s| s.len() as u64 + std::mem::size_of::<String>() as u64)
+        .sum();
+    let exact = supplied_bytes + hook_cache_charge("a", &generated, &["child"]) - generated_bytes;
+    let plan = parrot_app::planner::Plan {
+        order: vec![parrot_app::planner::PlannedComponent {
+            spec: component,
+            shard_plan: Some(supplied),
+            nodes: vec![],
+        }],
+        warnings: vec![],
+    };
+    let limits = ApplicationLimits {
+        max_expanded_bytes: exact,
+        ..Default::default()
+    };
+    limits.check_plan(&plan).unwrap();
+    exceeded(
+        ApplicationLimits {
+            max_expanded_bytes: exact - 1,
+            ..limits
+        }
+        .check_plan(&plan)
+        .unwrap_err(),
+        "expanded bytes",
+    );
+}
+
+#[test]
+fn hook_expansion_budget_rejects_before_topology_queries() {
+    struct NoTopology;
+    impl TopologyView for NoTopology {
+        fn candidates(&self, _: &PlacementConstraint) -> Vec<CandidateNode> {
+            panic!("topology called before hook expansion admission")
+        }
+        fn self_is(&self, _: Option<&str>) -> bool {
+            true
+        }
+    }
+    let mut component = spec("a", 128);
+    component.hooks.on_start = Some("x".repeat(128));
+    let model = manifest(vec![component]);
+    let limits = ApplicationLimits {
+        max_expanded_bytes: 16 * 1024,
+        ..Default::default()
+    };
+    assert!(plan_with_limits(&model, &NoTopology, &limits)
+        .unwrap_err()
+        .to_string()
+        .contains("expanded bytes"));
+}
+
+#[tokio::test]
+async fn hook_expansion_budget_rejects_before_host_configuration() {
+    let mut component = spec("a", 128);
+    component.hooks.on_start = Some("x".repeat(128));
+    let model = manifest(vec![component]);
+    let plan = plan_with_limits(&model, &LocalTopology, &Default::default()).unwrap();
+    let host = NoSideEffects;
+    let deployer = LocalDeployer {
+        topology: &LocalTopology,
+        parrot_spawner: &host,
+        gateway_factory: &host,
+    };
+    let limits = ApplicationLimits {
+        max_expanded_bytes: 16 * 1024,
+        ..Default::default()
+    };
+    let mut context = AssemblingContext::new_with_limits(limits);
+    let error = context
+        .assemble(&plan, &deployer, &model, &Default::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, DeployError::Config(ref detail) if detail.contains("expanded bytes")),
+        "{error:?}"
+    );
+    assert!(context.started().is_empty());
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn hook_expansion_budget_checks_products_without_expanding_instances() {
+    let mut component = spec("a", usize::MAX / 512);
+    component.hooks.on_start = Some("x".repeat(2048));
+    let limits = ApplicationLimits {
+        max_instances: u64::MAX,
+        max_expanded_bytes: u64::MAX,
+        ..Default::default()
+    };
+    assert!(matches!(
+        limits.check_manifest(&manifest(vec![component])),
+        Err(AdmissionError::Overflow("expanded bytes"))
+    ));
+}
+
+#[test]
+fn hook_path_resolution_preserves_boundaries_and_invalid_path_diagnostics() {
+    let mut component = spec("a", 2);
+    for (hook, expected) in [
+        (".", "/user/a-7"),
+        ("/user/a", "/user/a-7"),
+        ("child/节点", "/user/a-7/child/节点"),
+        ("/user/a/child/节点", "/user/a-7/child/节点"),
+    ] {
+        assert_eq!(component.hook_path(hook, "/user/a-7").unwrap(), expected);
+    }
+    for (hook, detail) in [
+        ("/user/ab/child", "outside component"),
+        ("/user/a-7/child", "outside component"),
+        ("/user/a/", "empty hook path/segment"),
+        ("", "empty hook path/segment"),
+        ("child/", "invalid hook path"),
+        ("child//x", "invalid hook path"),
+        ("../x", "invalid hook path"),
+        ("/user/a/./x", "invalid hook path"),
+    ] {
+        component.hooks.on_start = Some(hook.into());
+        let model = manifest(vec![component.clone()]);
+        ApplicationLimits::default().check_manifest(&model).unwrap();
+        let errors = validate_with_limits(&model, &Default::default()).unwrap_err();
+        assert!(
+            errors.iter().any(|error| {
+                matches!(error, ManifestError::BadHook(message) if message.contains(detail))
+            }),
+            "hook {hook:?}: {errors:?}"
+        );
+    }
+}
+
 #[test]
 fn components_dependencies_and_wires_have_independent_cumulative_limits() {
     let mut a = spec("a", 1);
@@ -342,7 +641,7 @@ fn node(name: &str, load: f32) -> CandidateNode {
 
 #[test]
 fn topology_limits_apply_before_sorting_and_selected_node_cloning() {
-    let mut c = spec("a", 3);
+    let mut c = spec("a", 2);
     c.placement.anti_affinity = true;
     let m = manifest(vec![c]);
     let candidates = Candidates(vec![node("one", 0.4), node("two", 0.2)]);
@@ -351,7 +650,7 @@ fn topology_limits_apply_before_sorting_and_selected_node_cloning() {
         ..Default::default()
     };
     let p = plan_with_limits(&m, &candidates, &limits).unwrap();
-    assert_eq!(p.order[0].nodes, ["two", "one", "two"]);
+    assert_eq!(p.order[0].nodes, ["two", "one"]);
     assert!(plan_with_limits(
         &m,
         &candidates,

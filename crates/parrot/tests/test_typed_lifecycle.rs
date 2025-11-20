@@ -519,6 +519,18 @@ async fn typed_watcher_receives_actual_typed_panic_reason() {
     assert!(
         matches!(death.reason, parrot_api::supervisor::DeathReason::Panic(ref reason) if reason.contains("typed crash detail"))
     );
+    // Legacy notification delivery precedes registry retirement. Join the
+    // failed actor before checking shutdown of the remaining healthy watcher.
+    assert!(matches!(
+        actor.stop().await,
+        Err(parrot_api::errors::ActorError::Panic(ref reason)) if reason == "typed crash detail"
+    ));
+    assert!(matches!(
+        actor.retirement_status(),
+        parrot_api::address::RetirementStatus::Retired(Ok(()))
+    ));
+    assert!(system.get_actor_ref("/managed").is_none());
+    assert!(_watcher.is_alive());
     system.shutdown_internal().await.unwrap();
 }
 

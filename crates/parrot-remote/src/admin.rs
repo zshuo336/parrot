@@ -1,7 +1,9 @@
 //! 职责：远程 spawn/stop 管理协议——SYSTEM_EVENT 管理载荷 + 目标节点 AdminService（DEV_02 §0）。
 //!
-//! 权限域：运维面（证书 role=admin 校验——K4 mTLS 后启用；P2 前期 mem/tcp
-//! 信任连接边界），与 receptionist ACL（数据面）不同轨。
+//! Administrative commands require the configured ControlPolicy: in-process
+//! memory access, or verified mTLS identity plus the explicit admin-node list.
+//! Unauthenticated network control requires an explicit insecure development
+//! opt-in. This policy is separate from receptionist key and route ACLs.
 //!
 //! PropsRef 原则（DEV_02 §0.2）：actor 本体（闭包/结构体）不可序列化，
 //! 跨线传"构造器注册名"——inventory 自注册，与 RemoteMessage 宏同族机制。
@@ -31,6 +33,9 @@ pub mod sys_event_tag {
     pub const MEMBERSHIP_PONG: u8 = 0x13;
     pub const MEMBERSHIP_PING_REQ_ACK: u8 = 0x14;
     pub const RECEPTIONIST_SYNC: u8 = 0x20;
+    pub const RECEPTIONIST_SEGMENT: u8 = 0x21;
+    pub const RECEPTIONIST_ROUTES: u8 = 0x22;
+    pub const RECEPTIONIST_ROUTES_SEGMENT: u8 = 0x23;
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -120,6 +125,15 @@ pub fn decode_sys_event(payload: &[u8]) -> Result<SysEvent, RemoteError> {
             crate::swim::ProbeEvent::decode(tag, body)?,
         )),
         sys_event_tag::RECEPTIONIST_SYNC => Ok(SysEvent::ReceptionistSync(body.to_vec().into())),
+        sys_event_tag::RECEPTIONIST_SEGMENT => {
+            Ok(SysEvent::ReceptionistSegment(body.to_vec().into()))
+        }
+        sys_event_tag::RECEPTIONIST_ROUTES => {
+            Ok(SysEvent::ReceptionistRoutes(body.to_vec().into()))
+        }
+        sys_event_tag::RECEPTIONIST_ROUTES_SEGMENT => {
+            Ok(SysEvent::ReceptionistRoutesSegment(body.to_vec().into()))
+        }
         sys_event_tag::ADMIN_CMD_V2 => Ok(SysEvent::AdminCommandV2(
             parrot_api::message::serde_remote_deserialize(body)
                 .map_err(|e| RemoteError::Codec(format!("admin cmd v2 decode: {e}")))?,
@@ -145,6 +159,9 @@ pub enum SysEvent {
     MembershipGossip(bytes::Bytes),
     MembershipProbe(crate::swim::ProbeEvent),
     ReceptionistSync(bytes::Bytes),
+    ReceptionistSegment(bytes::Bytes),
+    ReceptionistRoutes(bytes::Bytes),
+    ReceptionistRoutesSegment(bytes::Bytes),
 }
 
 /// 本地可远程 spawn 的工厂（inventory 自注册——DEV_02 §0.2）。

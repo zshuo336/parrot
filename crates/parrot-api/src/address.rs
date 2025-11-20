@@ -24,6 +24,9 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod retirement;
+pub use retirement::{stop_for_cleanup, stop_for_owned_cleanup, RetirementStatus};
+
 /// # Actor Path
 ///
 /// ## Overview
@@ -72,7 +75,10 @@ impl ActorPath {
 
     /// Creates a path with an inert target that rejects message delivery.
     ///
-    /// Useful for tests and bootstrap metadata. The target is a shared
+    /// Useful for tests and bootstrap metadata. Rejected messages remain owned
+    /// by the returned future until polling or cancellation; their destructor
+    /// panics are isolated and cannot replace the ActorNotFound rejection.
+    /// The target is a shared
     /// `DeadTargetRef`, not a weak pointer; it has no `upgrade` operation and
     /// does not resolve automatically when an actor with this path is created.
     pub fn placeholder(path: impl Into<String>) -> Self {
@@ -251,6 +257,15 @@ pub trait ActorRef: Send + Sync + Debug {
     /// 3. Cleans up resources
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>>;
 
+    /// Observe this reference's actual owned retirement, independently of a
+    /// previously published stop deadline. This never initiates or waits for
+    /// cleanup. Managed logical references follow their supervised generations,
+    /// but cannot observe an unrelated actor later created at the same path.
+    /// Adapters must forward the capability of their original identity.
+    fn retirement_status(&self) -> RetirementStatus {
+        RetirementStatus::Unsupported
+    }
+
     /// Returns actor's path
     ///
     /// ## Returns
@@ -261,8 +276,9 @@ pub trait ActorRef: Send + Sync + Debug {
     ///
     /// This observation can change before the next operation. In managed local
     /// engines, `false` may mean the mailbox is closed while owned cleanup is
-    /// still running. It is not a retirement receipt. Await `stop()` to join
-    /// cleanup and inspect its result; remote reachability is not termination.
+    /// still running. It is not a retirement receipt. `stop()` may retain a
+    /// historical timeout; use `retirement_status` or `stop_for_cleanup` for
+    /// supported actual outcomes. Remote reachability is not termination.
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool>;
 
     /// Creates boxed clone of reference
@@ -521,31 +537,29 @@ pub(crate) struct DeadTargetRef;
 
 #[async_trait]
 impl ActorRef for DeadTargetRef {
-    fn send<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        let msg = crate::owned_input::Input::new(msg);
         Box::pin(async move {
-            Err(crate::errors::ActorError::ActorNotFound(
+            msg.finish(Err(crate::errors::ActorError::ActorNotFound(
                 "dead://placeholder".to_string(),
-            ))
+            )))
         })
     }
 
     fn send_with_timeout<'a>(
         &'a self,
-        _msg: BoxedMessage,
+        msg: BoxedMessage,
         _timeout_duration: Option<std::time::Duration>,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async move {
-            Err(crate::errors::ActorError::ActorNotFound(
-                "dead://placeholder".to_string(),
-            ))
-        })
+        self.send(msg)
     }
 
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+    fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        let msg = crate::owned_input::Input::new(msg);
         Box::pin(async move {
-            Err(crate::errors::ActorError::ActorNotFound(
+            msg.finish(Err(crate::errors::ActorError::ActorNotFound(
                 "dead://placeholder".to_string(),
-            ))
+            )))
         })
     }
 

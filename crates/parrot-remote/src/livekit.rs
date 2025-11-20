@@ -1,31 +1,23 @@
-//! F9 · ParrotLiveKitBridge（DEV_05 §8 / 07 §8.3 双平面桥）。
+//! LiveKit room metadata, subscription policy and an injected signal event pump.
 //!
-//! 结构（07 §8.3）：
-//! ```text
-//! ParrotLiveKitBridge（topology_role=Border）：
-//!   RoomSupervisor（thread）——房间监督树生命周期
-//!     ├── Participant actor——信令 IO 编排
-//!     ├── Track actor——轨道元数据 + Receptionist 注册 media/track/{room}/{track}
-//!     └── Policy actor——订阅权限（F8 ACL 联动）
-//!   信令路径：Parrot Wire（ASK/TELL）⇄ LiveKit WebSocket/JSON-RPC
-//!   媒体路径：WebRTC 端口直通——绝不进邮箱（07 §8.3.1 三重否决）
-//! ```
-//!
-//! 本模块：房间/参与者/轨道的领域模型 + 监督树生命周期状态机 +
-//! 信令事件泵（`LiveKitSignal` 可注入——真实 livekit-server 经
-//! livekit-api 接入，测试用内存桩）。
+//! This module creates no engine actors, receptionist registrations, Wire or
+//! LiveKit network connections. Hosts supply a trusted LiveKitSignal adapter;
+//! InMemSignal is only a local fixture. The actor supervision tree, real server
+//! adapter and media-plane integration described in DEV_05 / 07 remain separate
+//! implementation work. Track keys and downsample FPS are metadata, not evidence
+//! of actual registration or video processing.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 // ── 领域模型 ─────────────────────────────────────────────
 
-/// 房间生命周期（监督树映射：Open=树起、Closed=树停）。
+/// Last processed room-model state, not an engine supervision receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomState {
-    /// 监督树已起（Participant/Track/Policy actor 存活）。
+    /// The model accepts joins and publications.
     Open,
-    /// 优雅关闭中（drain 参与者 → 停轨道 → 停策略）。
+    /// Transient state while synchronous close clears metadata.
     Closing,
     Closed,
 }
@@ -64,7 +56,7 @@ impl Track {
 
 // ── 房间监督树 ───────────────────────────────────────────
 
-/// RoomSupervisor 状态机（每房间一份——thread 引擎 actor 的内核态）。
+/// One room's metadata state machine; it owns no engine actors or media tasks.
 pub struct RoomSupervisor {
     pub room: String,
     pub state: RoomState,
@@ -84,7 +76,7 @@ impl RoomSupervisor {
         }
     }
 
-    /// 参与者加入（spawn Participant actor 的领域效果）。
+    /// Insert or replace participant metadata from a trusted signal adapter.
     pub fn join(
         &mut self,
         identity: &str,
@@ -110,17 +102,16 @@ impl RoomSupervisor {
         Ok(())
     }
 
-    /// 参与者离开（stop Participant actor）。
+    /// Remove the participant and its track metadata.
     pub fn leave(&mut self, identity: &str) -> Result<(), BridgeError> {
         self.participants
             .remove(identity)
             .ok_or_else(|| BridgeError::NotFound(identity.into()))?;
-        // 其发布的轨道一并撤（Track actor 停 + Receptionist 反注册）
         self.tracks.retain(|_, t| t.publisher != identity);
         Ok(())
     }
 
-    /// 发布轨道（spawn Track actor + 注册 media/track/{room}/{sid}）。
+    /// Store track metadata and return its suggested receptionist key.
     pub fn publish_track(
         &mut self,
         publisher: &str,
@@ -167,7 +158,7 @@ impl RoomSupervisor {
         Ok(())
     }
 
-    /// 关闭（监督树停：drain 参与者 → 停轨道 → Closed）。
+    /// Clear metadata synchronously; host actors and network work are not drained.
     pub fn close(&mut self) {
         self.state = RoomState::Closing;
         self.participants.clear();
@@ -229,11 +220,11 @@ pub enum SignalEvent {
     },
 }
 
-/// 信令泵注入面（测试桩实现；生产 livekit-api 适配）。
+/// Trusted host injection interface. No real server adapter is supplied here.
 pub trait LiveKitSignal: Send + Sync {
     /// 拉取一批信令事件（非阻塞——空 Vec=无）。
     fn poll_events(&self, room: &str) -> Vec<SignalEvent>;
-    /// 推送下行（订阅确认/状态推送——Participant actor 的发送面）。
+    /// Publish a model acknowledgement through the host adapter.
     fn send_downlink(&self, room: &str, to: &str, payload: &[u8]);
 }
 
@@ -287,7 +278,7 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
         }
     }
 
-    /// 开房（监督树起）。
+    /// Create or replace a room model, discarding its previous metadata.
     pub fn open_room(&self, room: &str) {
         self.rooms
             .write()
@@ -303,8 +294,8 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
 
     /// 事件泵一步（信令 → 领域动作 → 下行确认）。
     ///
-    /// 返回本步处理的事件数（宿主周期调用——Participant actor 的
-    /// mailbox drain 等价物）。
+    /// Return the number of polled events, including rejected/discarded events.
+    /// The host drives this method; it is not an actor mailbox drain barrier.
     pub fn pump(&self, room: &str) -> usize {
         let events = self.signal.poll_events(room);
         let n = events.len();
@@ -335,7 +326,7 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
                     kind,
                 } => {
                     if let Ok(key) = sup.publish_track(&publisher, &sid, kind) {
-                        // Track actor 注册回执（Receptionist key 下发）
+                        // Return a suggested key; no receptionist operation occurs here.
                         downlinks.push((publisher, key.into_bytes()));
                     }
                 }
@@ -372,9 +363,8 @@ impl<S: LiveKitSignal> ParrotLiveKitBridge<S> {
 mod tests {
     use super::*;
 
-    // F9：房间开关 = 监督树起停（生命周期）
     #[test]
-    fn livekit_room_actor_lifecycle() {
+    fn livekit_room_model_open_close_and_join_acknowledgement() {
         let bridge = ParrotLiveKitBridge::new(std::sync::Arc::new(InMemSignal::default()));
         bridge.open_room("r1");
         assert_eq!(bridge.room_state("r1"), Some(RoomState::Open));
@@ -419,12 +409,11 @@ mod tests {
             "join downlink"
         );
 
-        // 关房 = 监督树停
         bridge.close_room("r1");
         assert_eq!(bridge.room_state("r1"), Some(RoomState::Closed));
     }
 
-    // F9：轨道发布 + Receptionist key + 订阅权限（Policy）
+    // Model track metadata, suggested key and subscription policy.
     #[test]
     fn track_publish_and_subscribe_policy() {
         let sig = InMemSignal::default();
@@ -455,7 +444,7 @@ mod tests {
             },
         );
         bridge.pump("r1");
-        // 发布回执 = receptionist key
+        // The model returns a suggested key, not a registration receipt.
         let dl = sig.downlinks();
         assert!(dl
             .iter()

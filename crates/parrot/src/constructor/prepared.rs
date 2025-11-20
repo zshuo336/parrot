@@ -4,6 +4,15 @@ use parrot_api::types::BoxedFuture;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, watch};
 
+const MAX_LIFECYCLE_DISCARD_WAITERS: usize = 1024;
+
+fn lifecycle_discard_waiters() -> Arc<Semaphore> {
+    static WAITERS: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    WAITERS
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_LIFECYCLE_DISCARD_WAITERS)))
+        .clone()
+}
+
 // Protect cancellation before the cleanup/publication worker is ever polled,
 // including submission to a runtime that has already shut down. The output and
 // its final factory capture must never unwind through each other's destructors.
@@ -29,15 +38,11 @@ impl<A> OutputLease<A> {
     }
     fn record_failure(&self, error: &str) {
         if let Some(invocation) = &self.invocation {
-            invocation
-                .state
-                .lock()
-                .unwrap()
-                .retirement_failure
-                .get_or_insert_with(|| error.to_owned());
+            invocation.record_failure(error);
         }
     }
     fn retire(&mut self) -> Result<(), String> {
+        let _scope = crate::owned_payload::DisposalScope::enter();
         parrot_api::trace::in_scope(self.context.clone(), || {
             let output = self.actor.take().map_or(Ok(()), |actor| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(actor))).map_err(
@@ -69,6 +74,7 @@ impl<A> Drop for OutputLease<A> {
 struct Discard<A> {
     output: OutputLease<A>,
     finished: watch::Sender<Option<Result<(), String>>>,
+    _pending: Option<crate::owned_payload::PendingCleanupPermit>,
 }
 impl<A> Drop for Discard<A> {
     fn drop(&mut self) {
@@ -99,32 +105,90 @@ impl<A: Send + 'static> Prepared<A> {
             return Box::pin(async { Ok(()) });
         };
         let cleanup = self.cleanup.clone();
-        let (finished, mut receipt) = watch::channel(None);
-        let owner = Discard {
+        let (finished, receipt) = watch::channel(None);
+        let mut owner = Discard {
             output: OutputLease::new(actor, invocation, self.context.clone()),
             finished,
+            _pending: None,
         };
-        self.runtime.spawn(async move {
-            // Normal retirement remains bounded. If the host cancels this task,
-            // the same owner isolates destructors and reports actual disposal.
+        if crate::owned_payload::DisposalScope::active() {
+            drop(owner);
+        } else if let Some(pending) =
+            crate::owned_payload::try_pending_cleanup_permit(&self.cleanup)
+        {
+            owner._pending = Some(pending);
+            self.runtime.spawn(async move {
+                // Normal retirement remains bounded. If the host cancels this task,
+                // the same owner isolates destructors and reports actual disposal.
+                let permit = cleanup.acquire_owned().await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    drop(owner);
+                })
+                .await;
+            });
+        } else {
+            // Saturation applies backpressure at the owner boundary. The
+            // synchronous owner still publishes the actual disposal receipt.
+            drop(owner);
+        }
+        wait_receipt(receipt)
+    }
+
+    /// Retire an already-prepared output from a retained lifecycle owner.
+    ///
+    /// Raw `discard` preserves synchronous backpressure for callers that own
+    /// the final value. Cohort recovery is different: its driver must remain
+    /// schedulable while pending cleanup capacity is exhausted. Keep the
+    /// output in one bounded waiter task until admission, then hand it to the
+    /// normal blocking cleanup owner. Dropping the returned receipt cannot
+    /// cancel that owner or lose its actual disposal result.
+    pub(crate) fn discard_in_lifecycle(mut self) -> BoxedFuture<'static, Result<(), String>> {
+        let Some((actor, invocation)) = self.parts.take() else {
+            return Box::pin(async { Ok(()) });
+        };
+        let cleanup = self.cleanup.clone();
+        let runtime = self.runtime.clone();
+        let (finished, receipt) = watch::channel(None);
+        let mut owner = Discard {
+            output: OutputLease::new(actor, invocation, self.context.clone()),
+            finished,
+            _pending: None,
+        };
+        if crate::owned_payload::DisposalScope::active() {
+            drop(owner);
+            return wait_receipt(receipt);
+        }
+        if let Some(pending) = crate::owned_payload::try_pending_cleanup_permit(&cleanup) {
+            owner._pending = Some(pending);
+            runtime.spawn(async move {
+                let permit = cleanup.acquire_owned().await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    drop(owner);
+                })
+                .await;
+            });
+            return wait_receipt(receipt);
+        }
+        let Ok(waiter) = lifecycle_discard_waiters().try_acquire_owned() else {
+            // The bounded lifecycle waiter pool is itself saturated. Preserve
+            // the final-owner rule instead of creating an unbounded task list.
+            drop(owner);
+            return wait_receipt(receipt);
+        };
+        runtime.spawn(async move {
+            let pending = crate::owned_payload::pending_cleanup_permit(&cleanup).await;
+            owner._pending = Some(pending);
             let permit = cleanup.acquire_owned().await;
             let _ = tokio::task::spawn_blocking(move || {
+                let _waiter = waiter;
                 let _permit = permit;
                 drop(owner);
             })
             .await;
         });
-        Box::pin(async move {
-            loop {
-                if let Some(result) = receipt.borrow_and_update().clone() {
-                    return result;
-                }
-                receipt
-                    .changed()
-                    .await
-                    .map_err(|_| "prepared cleanup owner ended without a receipt".to_owned())?;
-            }
-        })
+        wait_receipt(receipt)
     }
     pub(crate) fn discard(mut self) -> BoxedFuture<'static, Result<(), String>> {
         self.start_discard()
@@ -158,6 +222,7 @@ impl<A: Send + 'static> Prepared<A> {
                 let _permit = permit;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if control.is_cancelled() {
+                        let _scope = crate::owned_payload::DisposalScope::enter();
                         drop(output.take_actor());
                         Err(ConstructionError::Cancelled)
                     } else {
@@ -188,6 +253,22 @@ impl<A: Send + 'static> Prepared<A> {
         })
     }
 }
+
+fn wait_receipt(
+    mut receipt: watch::Receiver<Option<Result<(), String>>>,
+) -> BoxedFuture<'static, Result<(), String>> {
+    Box::pin(async move {
+        loop {
+            if let Some(result) = receipt.borrow_and_update().clone() {
+                return result;
+            }
+            receipt
+                .changed()
+                .await
+                .map_err(|_| "prepared cleanup owner ended without a receipt".to_owned())?;
+        }
+    })
+}
 impl<A: Send + 'static> Drop for Prepared<A> {
     fn drop(&mut self) {
         // The invocation remains in the owned cleanup task. Factory::retire
@@ -202,6 +283,20 @@ impl<A: Send + 'static> Factory<A> {
     ) -> impl std::future::Future<Output = Result<Prepared<A>, ConstructionError<E>>> + Send + '_
     {
         parrot_api::trace::capture(async move {
+            let cleanup_reservation = if crate::owned_payload::DisposalScope::active() {
+                self.admission.clone().try_acquire_owned().map_err(|_| {
+                    ConstructionError::WorkerFailed(
+                        "cleanup capacity unavailable during reentrant preparation".into(),
+                    )
+                })?
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = control.cancelled() => return Err(ConstructionError::Cancelled),
+                    permit = self.admission.clone().acquire_owned() => permit
+                        .map_err(|error| ConstructionError::WorkerFailed(error.to_string()))?,
+                }
+            };
             let invocation = {
                 let mut state = self.state.lock().unwrap();
                 if state.disposal.is_some() {
@@ -213,6 +308,7 @@ impl<A: Send + 'static> Factory<A> {
                     function: Some(function),
                     state: self.state.clone(),
                     changed: self.changed.clone(),
+                    cleanup: Some(cleanup_reservation),
                 }
             };
             let permit = tokio::select! {
@@ -353,6 +449,72 @@ mod tests {
             Arc::new(Semaphore::new(1)),
         )
     }
+
+    #[tokio::test]
+    async fn saturated_discard_preserves_output_and_final_capture_receipts() {
+        struct FinalCapture {
+            drops: Arc<AtomicUsize>,
+            panic: bool,
+        }
+        impl Drop for FinalCapture {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                assert!(!self.panic, "final prepared capture failure");
+            }
+        }
+
+        for (output_panics, capture_panics) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let captures = Arc::new(AtomicUsize::new(0));
+            let cleanup = Arc::new(Semaphore::new(1));
+            let capture = FinalCapture {
+                drops: captures.clone(),
+                panic: capture_panics,
+            };
+            let observed = drops.clone();
+            let factory = Factory::new(
+                move || {
+                    let _ = &capture;
+                    Output {
+                        dropped: observed.clone(),
+                        gate: None,
+                        panic: output_panics,
+                    }
+                },
+                Arc::new(Semaphore::new(1)),
+                cleanup.clone(),
+            );
+            let prepared = factory.prepare::<()>(Arc::default()).await.unwrap();
+            drop(factory);
+            let pending: Vec<_> = (0..crate::owned_payload::MAX_PENDING_CLEANUPS_PER_SLOT)
+                .map(|_| crate::owned_payload::try_pending_cleanup_permit(&cleanup).unwrap())
+                .collect();
+            assert!(crate::owned_payload::try_pending_cleanup_permit(&cleanup).is_none());
+
+            // Discard starts before its observer is polled, including overflow.
+            let receipt = prepared.discard();
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(captures.load(Ordering::SeqCst), 1);
+            drop(pending);
+            let result = receipt.await;
+            match (output_panics, capture_panics) {
+                (false, false) => result.unwrap(),
+                (true, _) => assert!(
+                    result
+                        .unwrap_err()
+                        .contains("prepared output disposal panicked")
+                ),
+                (false, true) => assert!(
+                    result
+                        .unwrap_err()
+                        .contains("final prepared capture failure")
+                ),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn prepared_cohort_releases_worker_capacity_but_retains_factory_captures() {
         let drops = Arc::new(AtomicUsize::new(0));
@@ -485,6 +647,43 @@ mod tests {
         retiring.await.unwrap();
         assert_eq!(captures.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn admission_bounds_staged_outputs_and_cancellation_keeps_state_unpublished() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let factory = Factory::new(
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+            Arc::new(Semaphore::new(1)),
+            Arc::new(Semaphore::new(1)),
+        );
+
+        let first = factory.prepare::<()>(Arc::default()).await.unwrap();
+        let second = factory.prepare::<()>(Arc::default()).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(factory.admission.available_permits(), 0);
+        assert_eq!(factory.state.lock().unwrap().active, 2);
+
+        let control = Arc::new(ConstructionControl::default());
+        let mut third = Box::pin(factory.prepare::<()>(control.clone()));
+        assert!(futures::poll!(&mut third).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(factory.state.lock().unwrap().active, 2);
+
+        control.cancel();
+        assert!(matches!(third.await, Err(ConstructionError::Cancelled)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(factory.state.lock().unwrap().active, 2);
+
+        first.discard().await.unwrap();
+        assert_eq!(factory.admission.available_permits(), 1);
+        second.discard().await.unwrap();
+        assert_eq!(factory.admission.available_permits(), 2);
+        assert_eq!(factory.state.lock().unwrap().active, 0);
+        factory.retire().await.unwrap();
     }
 }
 

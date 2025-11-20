@@ -87,6 +87,16 @@ class WebsearchContracts(Contracts, unittest.TestCase):
     key = 'bin:ws/Tokenize'
     stats_key = 'bin:ws/IndexStats'
 
+    def test_ascii_case_variants_share_terms_and_stop_words(self):
+        key, reply = self.dispatcher.dispatch(
+            self.key, payload([(17, b'BM25 bm25 Bm25 ALPHA alpha THE the')]))
+        expected = struct.pack('<I', 2)
+        for term, frequency in [(b'bm25', 3), (b'alpha', 2)]:
+            expected += struct.pack('<I', len(term)) + term + struct.pack('<QI', 17, frequency)
+        self.assertEqual(key, 'bin:ws/Terms')
+        self.assertEqual(reply, expected)
+        self.assertEqual(self.stats(), (2, 2))
+
     def test_retokenization_replaces_obsolete_and_empty_document_terms(self):
         self.dispatcher.dispatch(self.key, payload([(17, b'alpha beta'), (29, b'beta')]))
         self.assertEqual(self.stats(), (2, 3))

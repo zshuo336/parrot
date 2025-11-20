@@ -328,12 +328,12 @@ node!(
 
 enum System {
     Thread(Arc<parrot::thread::ThreadActorSystem>),
-    Actix(parrot::actix::ActixActorSystem),
+    Actix(Box<parrot::actix::ActixActorSystem>),
 }
 impl System {
     async fn new(actix: bool, timeout: Duration) -> Self {
         if actix {
-            Self::Actix(
+            Self::Actix(Box::new(
                 parrot::actix::ActixActorSystem::with_settings(
                     parrot::actix::ActixSystemSettings {
                         arbiter_count: 2,
@@ -343,7 +343,7 @@ impl System {
                 )
                 .await
                 .unwrap(),
-            )
+            ))
         } else {
             Self::Thread(parrot::thread::ThreadActorSystem::shared(
                 parrot::thread::config::ThreadActorSystemConfig {

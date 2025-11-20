@@ -16,11 +16,13 @@ fn system(name: &str) -> Arc<RemoteActorSystem> {
 fn link(sys: &RemoteActorSystem) -> (FrameSender, mpsc::Receiver<Frame>) {
     let (tx, rx) = mpsc::channel(1);
     let sender = FrameSender::new(tx, "peer");
-    sys.links.write().unwrap().push((
-        "peer".into(),
-        sender.clone(),
-        Arc::new(NodeStatus::default()),
-    ));
+    sys.links.write().unwrap().push(Link {
+        address: NodeAddr::mem("peer"),
+        sender: sender.clone(),
+        status: Arc::new(NodeStatus::default()),
+        role: crate::handshake::TopologyRole::Normal,
+        dial_addr: None,
+    });
     (sender, rx)
 }
 fn pending(sys: &RemoteActorSystem, v2: bool) -> usize {
@@ -85,6 +87,54 @@ fn reply(v2: bool, id: u64) -> Frame {
     };
     frame
 }
+
+#[tokio::test]
+async fn drain_duration_preserves_wire_budget_without_wrapping() {
+    let sys = system("admin-drain-duration");
+    let (sender, mut rx) = link(&sys);
+    let cases = [
+        (Duration::ZERO, 0),
+        (Duration::from_nanos(999_999), 0),
+        (Duration::from_micros(1_999), 1),
+        (Duration::from_secs(5), 5_000),
+        (Duration::from_millis(u64::MAX), u64::MAX),
+        (Duration::new(18_446_744_073_709_551, 616_000_000), u64::MAX),
+        (Duration::MAX, u64::MAX),
+    ];
+    let mut observed = Vec::new();
+    for (duration, expected) in cases {
+        let caller = sys.clone();
+        let task =
+            tokio::spawn(async move { caller.drain_component("peer", "/test", duration).await });
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame.payload[0], crate::admin::sys_event_tag::ADMIN_CMD_V2);
+        let command = parrot_api::message::serde_remote_deserialize(&frame.payload[1..]).unwrap();
+        let crate::admin_v2::AdminCommandV2::DrainComponent {
+            req_id,
+            path_prefix,
+            timeout_ms,
+        } = command
+        else {
+            panic!("expected drain command");
+        };
+        assert_eq!(req_id, frame.header.correlation_id);
+        assert_eq!(path_prefix, "/test");
+        let mut response = reply(true, req_id);
+        response.payload = crate::admin_v2::encode_admin_reply_v2(&AdminReplyV2::Drained {
+            req_id,
+            drained: 2,
+            aborted: 1,
+        });
+        sys.ingress.dispatch(response, &sender, "peer").await;
+        assert_eq!(task.await.unwrap().unwrap(), (2, 1));
+        observed.push((duration, timeout_ms, expected));
+    }
+    sys.shutdown().await.unwrap();
+    for (duration, actual, expected) in observed {
+        assert_eq!(actual, expected, "wire budget for {duration:?}");
+    }
+}
+
 #[tokio::test]
 async fn unknown_peer_does_not_leak_admin_pending() {
     for v2 in [false, true] {
@@ -521,6 +571,113 @@ async fn incorrect_executor_reply_id_returns_protocol_failure_for_original_reque
         }
         other => panic!("wrong reply: {other:?}"),
     }
+}
+
+async fn assert_admin_first_poll_context(traced: bool) {
+    use crate::{
+        handshake::{caps, HandshakeBody},
+        transport::{run_connection, ConnParams, ConnSide, RuntimeKnobs},
+    };
+    use parrot_api::trace::{self, TraceContext};
+    use std::{future::Future, task::Context};
+    let sys = RemoteActorSystem::new(
+        RemoteConfig::tcp("context-caller", None).with_insecure_development(),
+        Arc::new(Empty),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let route = NodeAddr::tcp("peer", listener.local_addr().unwrap());
+    // Keep the discovery source consistent with the periodic reconciler.
+    sys.membership.lock().await.members.insert(
+        "peer".into(),
+        crate::swim::Member {
+            node_id: "peer".into(),
+            addr: (&route).into(),
+            status: crate::swim::MemberStatus::Alive,
+            incarnation: 1,
+            status_until_ms: 0,
+            metadata: bytes::Bytes::new(),
+        },
+    );
+    sys.nodes.reconcile_membership(vec![route.into()]);
+    sys.start().await.unwrap();
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    sys.discovery_gates
+        .lock()
+        .unwrap()
+        .insert("peer".into(), Arc::downgrade(&gate));
+    let hold = gate.lock().await;
+    let constructed = TraceContext::root();
+    let first = traced.then(TraceContext::root);
+    let later = TraceContext::root();
+    let mut request = constructed.in_scope(|| Box::pin(sys.stop_component("peer", "/owned")));
+    let waker = futures::task::noop_waker();
+    assert!(trace::in_scope(first.clone(), || request
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker)))
+    .is_pending());
+    drop(hold);
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let (tx, mut rx) = mpsc::channel(8);
+    let accepting = async {
+        let (io, _) = listener.accept().await.unwrap();
+        let peer = run_connection(
+            io,
+            ConnParams {
+                side: ConnSide::Accept,
+                local_addr: None,
+                peer_addr: None,
+                scheme: "tcp",
+                local_handshake: HandshakeBody {
+                    node_id: "peer".into(),
+                    capabilities: caps::BIN | caps::TRACE_CONTEXT | caps::ADMIN_TRACE_CONTEXT,
+                    ..Default::default()
+                },
+                inbound: tx,
+                on_disconnect: Arc::new(|_| {}),
+                shutdown: shutdown.subscribe(),
+                knobs: Some(RuntimeKnobs {
+                    heartbeat_enabled: false,
+                    ..Default::default()
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let Some((mut frame, back, _)) = rx.recv().await else {
+            return (peer, None);
+        };
+        let parent = frame.take_trace_parent().unwrap();
+        let id = frame.header.correlation_id;
+        back.send(crate::admin_v2::reply_frame_v2(
+            id,
+            "",
+            &AdminReplyV2::Stopped { req_id: id },
+        ))
+        .await
+        .unwrap();
+        (peer, Some(parent))
+    };
+    let (result, (peer, observed)) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(later.scope(request), accepting)
+    })
+    .await
+    .unwrap();
+    sys.shutdown().await.unwrap();
+    shutdown.send_replace(true);
+    peer.closed.await.unwrap();
+    result.unwrap();
+    assert_eq!(observed, Some(first.as_ref().map(TraceContext::as_parent)));
+}
+
+#[tokio::test]
+async fn admin_parent_is_captured_before_awaited_discovery() {
+    assert_admin_first_poll_context(true).await;
+}
+
+#[tokio::test]
+async fn untraced_admin_does_not_inherit_later_discovery_poller() {
+    assert_admin_first_poll_context(false).await;
 }
 
 #[tokio::test]

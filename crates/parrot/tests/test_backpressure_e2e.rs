@@ -1,60 +1,40 @@
-//! E3 · 反压贯通 e2e（DEV_03 §4 / 06 §3.3）。
-//!
-//! 链路：端侧慢消费 → 端侧读循环挂起 → 传输窗口收紧 → 云编排 actor
-//! deliver 挂起/失败 → 其邮箱策略（Block/Error）触发。
-//!
-//! mem 载体等价：端侧 SlowSink（每条 sleep）+ 小邮箱（Error 策略→ 快速
-//! 失败可见；Block 策略 → 唤醒后最终全达）。
+//! Local facade-to-Thread mailbox backpressure contracts.
+//! Network/transport-window backpressure requires separate remote tests.
 
-mod common;
-
-#[allow(unused_imports)]
-use common::*;
+use futures::FutureExt;
 use parrot::system::ParrotActorSystem;
 use parrot::thread::config::{BackpressureStrategy, ThreadActorConfig, ThreadActorSystemConfig};
 use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{Actor, EmptyConfig};
 use parrot_api::address::ActorPath;
+use parrot_api::errors::ActorError;
 use parrot_api::system::{ActorSystem, ActorSystemConfig};
-use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::oneshot;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct BpTell(pub u64);
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct BpGetCount;
-
-macro_rules! remote_msg {
-    ($t:ty, $key:literal) => {
-        parrot_api::message::inventory::submit! {
-            parrot_api::message::CodecRegistration {
-                type_key: $key,
-                type_id: std::any::TypeId::of::<$t>(),
-                encode: |msg: &parrot_api::types::BoxedMessage| {
-                    let m = msg.downcast_ref::<$t>().ok_or(concat!("downcast ", $key))?;
-                    parrot_api::message::serde_remote_serialize(&m)
-                },
-                decode: |b: &[u8]| {
-                    let v: $t = parrot_api::message::serde_remote_deserialize(b)?;
-                    Ok(Box::new(v) as parrot_api::types::BoxedMessage)
-                },
-            }
-        }
-    };
+const DEADLINE: Duration = Duration::from_secs(5);
+struct BpTell(u64);
+struct BpGetValues;
+struct Gate {
+    entered: oneshot::Sender<()>,
+    released: oneshot::Receiver<()>,
 }
-
-remote_msg!(BpTell, "bin:bp::BpTell#v1");
-remote_msg!(BpGetCount, "bin:bp::BpGetCount#v1");
-
-/// 慢消费端：每条 sleep（模拟端侧慢）。
-struct SlowSink {
-    count: u64,
-    delay_ms: u64,
+struct Sink {
+    values: Vec<u64>,
+    destroyed: Arc<AtomicUsize>,
+    handled: Arc<AtomicUsize>,
+    progress: Arc<tokio::sync::Notify>,
 }
-
-impl Actor for SlowSink {
+impl Drop for Sink {
+    fn drop(&mut self) {
+        self.destroyed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl Actor for Sink {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
     fn receive_message<'a>(
@@ -63,105 +43,239 @@ impl Actor for SlowSink {
         _ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
-            if let Some(BpTell(_)) = msg.downcast_ref::<BpTell>() {
-                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-                self.count += 1;
-                return Ok(Box::new(BpTell(self.count)) as BoxedMessage);
+            if msg.is::<Gate>() {
+                let Gate { entered, released } = *msg.downcast::<Gate>().unwrap();
+                let _ = entered.send(());
+                // Dropping the release sender also opens the gate during unwind.
+                let _ = released.await;
+                return Ok(Box::new(()) as BoxedMessage);
             }
-            if msg.downcast_ref::<BpGetCount>().is_some() {
-                return Ok(Box::new(BpTell(self.count)) as BoxedMessage);
+            if let Some(BpTell(value)) = msg.downcast_ref::<BpTell>() {
+                self.values.push(*value);
+                self.handled.fetch_add(1, Ordering::SeqCst);
+                self.progress.notify_one();
+                return Ok(Box::new(*value) as BoxedMessage);
             }
-            Err(parrot_api::errors::ActorError::MessageHandlingError(
-                "unhandled".into(),
-            ))
+            if msg.is::<BpGetValues>() {
+                return Ok(Box::new(self.values.clone()) as BoxedMessage);
+            }
+            Err(ActorError::MessageHandlingError("unhandled".into()))
         })
     }
-
     fn state(&self) -> parrot_api::actor::ActorState {
         parrot_api::actor::ActorState::Running
     }
 }
 
-async fn mk_facade_with_sink(
-    mailbox: usize,
-    strategy: BackpressureStrategy,
-    delay_ms: u64,
-) -> Arc<ParrotActorSystem> {
-    let facade = Arc::new(
-        ParrotActorSystem::new(ActorSystemConfig::default())
-            .await
-            .unwrap(),
-    );
-    let cfg = ThreadActorSystemConfig {
-        default_mailbox_capacity: mailbox,
-        default_backpressure_strategy: strategy.clone(),
-        ..Default::default()
-    };
-    let ts = ThreadActorSystem::shared(cfg);
-    facade
-        .register_thread_system("eng".into(), ts.clone(), true)
-        .await
-        .unwrap();
-    let actor_cfg = ThreadActorConfig {
-        mailbox_capacity: Some(mailbox),
-        backpressure_strategy: Some(strategy),
-        ..Default::default()
-    };
-    ts.spawn_at(
-        SlowSink { count: 0, delay_ms },
-        "/user/slow",
-        None,
-        actor_cfg,
-    )
-    .await
-    .unwrap();
-    facade
+struct Fixture {
+    facade: ParrotActorSystem,
+    sink: BoxedActorRef,
+    destroyed: Arc<AtomicUsize>,
+    handled: Arc<AtomicUsize>,
+    progress: Arc<tokio::sync::Notify>,
+    gates: tokio::task::JoinSet<ActorResult<BoxedMessage>>,
 }
-
-/// Block 策略：端侧唤醒后最终全达。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn backpressure_e2e_block_eventual_delivery() {
-    let facade = mk_facade_with_sink(16, BackpressureStrategy::Block, 1).await;
-    let sink = facade
-        .get_actor(&ActorPath::placeholder("/user/slow"))
-        .await
-        .unwrap();
-
-    // 200 条 tell（每条 1ms 慢消费——邮箱 16 会反复满，Block 挂起等待）
-    let t0 = std::time::Instant::now();
-    for i in 0..200u64 {
-        sink.send(Box::new(BpTell(i)))
+impl Fixture {
+    async fn new(capacity: usize, strategy: BackpressureStrategy) -> Self {
+        let facade = ParrotActorSystem::new(ActorSystemConfig::default())
             .await
-            .expect("Block must not drop");
-    }
-    // 全部投递完成（最后一条 ask 返回时 count 已含全部）
-    let r = sink.send(Box::new(BpGetCount)).await.unwrap();
-    let cnt = r.downcast_ref::<BpTell>().unwrap().0;
-    assert_eq!(cnt, 200, "all 200 tells delivered after wakeup");
-    assert!(
-        t0.elapsed() > Duration::from_millis(150),
-        "slow consumer actually throttled"
-    );
-}
-
-/// Error 策略：邮箱满 → 编排侧 deliver（tell）收到确定性错误（不悬挂、不静默丢）。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn backpressure_e2e_error_fast_fail() {
-    let facade = mk_facade_with_sink(4, BackpressureStrategy::Error, 50).await;
-    let sink = facade
-        .get_actor(&ActorPath::placeholder("/user/slow"))
-        .await
-        .unwrap();
-
-    // deliver（tell 语义——不等待回复）：50ms 慢消费 + 容量 4 → 快速堆满
-    let mut errors = 0;
-    for i in 0..64u64 {
-        if sink.deliver(Box::new(BpTell(i))).await.is_err() {
-            errors += 1;
+            .unwrap();
+        let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
+            default_mailbox_capacity: capacity,
+            default_backpressure_strategy: strategy.clone(),
+            ..Default::default()
+        });
+        facade
+            .register_thread_system("eng".into(), system.clone(), true)
+            .await
+            .unwrap();
+        let destroyed = Arc::new(AtomicUsize::new(0));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::new(tokio::sync::Notify::new());
+        system
+            .spawn_at(
+                Sink {
+                    values: Vec::new(),
+                    destroyed: destroyed.clone(),
+                    handled: handled.clone(),
+                    progress: progress.clone(),
+                },
+                "/user/slow",
+                None,
+                ThreadActorConfig {
+                    mailbox_capacity: Some(capacity),
+                    backpressure_strategy: Some(strategy),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sink = facade
+            .get_actor(&ActorPath::placeholder("/user/slow"))
+            .await
+            .unwrap();
+        Self {
+            facade,
+            sink,
+            destroyed,
+            handled,
+            progress,
+            gates: tokio::task::JoinSet::new(),
         }
     }
-    assert!(
-        errors > 0,
-        "Error strategy must surface backpressure to orchestrator"
-    );
+
+    async fn gate(&mut self) -> oneshot::Sender<()> {
+        let (entered, receipt) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let actor = self.sink.clone_boxed();
+        self.gates.spawn(async move {
+            actor
+                .send_with_timeout(Box::new(Gate { entered, released }), Some(DEADLINE))
+                .await
+        });
+        tokio::time::timeout(DEADLINE, receipt)
+            .await
+            .unwrap()
+            .unwrap();
+        release
+    }
+
+    async fn values(&self, expected: usize) -> Vec<u64> {
+        tokio::time::timeout(DEADLINE, async {
+            while self.handled.load(Ordering::SeqCst) < expected {
+                self.progress.notified().await;
+            }
+        })
+        .await
+        .expect("admitted messages must drain before the read request");
+        let result = self
+            .sink
+            .send_with_timeout(Box::new(BpGetValues), Some(DEADLINE))
+            .await
+            .unwrap();
+        *result.downcast::<Vec<u64>>().unwrap()
+    }
+
+    async fn finish(mut self) {
+        let mut joined = true;
+        while !self.gates.is_empty() {
+            match tokio::time::timeout(DEADLINE, self.gates.join_next()).await {
+                Ok(Some(Ok(Ok(_)))) => {}
+                Ok(_) => joined = false,
+                Err(_) => {
+                    joined = false;
+                    self.gates.abort_all();
+                    while self.gates.join_next().await.is_some() {}
+                }
+            }
+        }
+        let stopped = tokio::time::timeout(DEADLINE, self.sink.stop()).await;
+        let shutdown = tokio::time::timeout(DEADLINE, self.facade.shutdown()).await;
+        assert!(joined, "all admitted gate requests must complete and join");
+        stopped.unwrap().unwrap();
+        shutdown.unwrap().unwrap();
+        assert!(!self.sink.is_alive().await);
+        assert_eq!(
+            self.destroyed.load(Ordering::SeqCst),
+            1,
+            "actual actor destruction"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backpressure_e2e_block_eventual_delivery() {
+    const CAPACITY: u64 = 16;
+    let mut fixture = Fixture::new(CAPACITY as usize, BackpressureStrategy::Block).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let mut next = 0;
+        while next < 200 {
+            let release = fixture.gate().await;
+            let full_at = (next + CAPACITY).min(200);
+            while next < full_at {
+                tokio::time::timeout(DEADLINE, fixture.sink.deliver(Box::new(BpTell(next))))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                next += 1;
+            }
+            if next < 200 {
+                let pending = fixture.sink.deliver(Box::new(BpTell(next)));
+                tokio::pin!(pending);
+                assert!(
+                    futures::poll!(&mut pending).is_pending(),
+                    "full mailbox must block admission"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), &mut pending)
+                        .await
+                        .is_err(),
+                    "admission must remain blocked while no capacity is released"
+                );
+                drop(release);
+                tokio::time::timeout(DEADLINE, pending)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                next += 1;
+            } else {
+                drop(release);
+            }
+            assert_eq!(
+                fixture.values(next as usize).await,
+                (0..next).collect::<Vec<_>>(),
+                "every admitted value must arrive exactly once and in order"
+            );
+        }
+        assert_eq!(next, 200);
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backpressure_e2e_error_fast_fail() {
+    let mut fixture = Fixture::new(4, BackpressureStrategy::Error).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let release = fixture.gate().await;
+        for value in 0..4 {
+            tokio::time::timeout(DEADLINE, fixture.sink.deliver(Box::new(BpTell(value))))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for value in 4..64 {
+            let rejected =
+                tokio::time::timeout(DEADLINE, fixture.sink.deliver(Box::new(BpTell(value))))
+                    .await
+                    .expect("Error strategy must reject while the gate remains closed");
+            assert!(
+                matches!(rejected, Err(ActorError::InternalError(ref detail))
+                            if detail.contains("Full { capacity: 4 }")),
+                "only the configured full-capacity error qualifies: {rejected:?}"
+            );
+        }
+        drop(release);
+        assert_eq!(
+            fixture.values(4).await,
+            vec![0, 1, 2, 3],
+            "rejected inputs must not execute"
+        );
+        fixture.sink.deliver(Box::new(BpTell(99))).await.unwrap();
+        assert_eq!(
+            fixture.values(5).await,
+            vec![0, 1, 2, 3, 99],
+            "admission recovers after drain"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fixture.finish().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }

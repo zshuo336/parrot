@@ -11,14 +11,12 @@ use parrot_api::{
     actor::{ActorState, EmptyConfig},
     address::{ActorPath, ActorRef, ActorRefExt},
     match_message,
-    message::Message,
     system::{ActorSystem, ActorSystemConfig},
     types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage, WeakActorTarget},
 };
 use parrot_api_derive::{Message, ParrotActor};
 
 mod test_helpers;
-use test_helpers::wait_for;
 
 // Create a simple ActorRef implementation for testing
 #[derive(Debug)]
@@ -79,6 +77,10 @@ impl ActorRef for TestActorRef {
 #[message(result = "String")]
 struct BroadcastTestMessage(String);
 
+#[derive(Debug, Message)]
+#[message(result = "Vec<String>")]
+struct BroadcastHistory;
+
 // Define a simple test actor
 #[derive(Debug, Clone, ParrotActor)]
 #[ParrotActor(engine = "actix")]
@@ -111,6 +113,9 @@ impl SystemTestActor {
 
                 // Return confirmation with actor name
                 format!("{} received: {}", actor.name, msg.0)
+            },
+            BroadcastHistory => |actor: &mut Self, _: &BroadcastHistory| {
+                actor.received_broadcasts.clone()
             }
         )
     }
@@ -128,6 +133,9 @@ impl SystemTestActor {
 
                 // Return confirmation with actor name
                 format!("{} received: {}", actor.name, msg.0)
+            },
+            BroadcastHistory => |actor: &mut Self, _: &BroadcastHistory| {
+                actor.received_broadcasts.clone()
             }
         )
     }
@@ -332,10 +340,15 @@ fn test_broadcast_message() -> Result<()> {
         let broadcast_msg = BroadcastTestMessage("This is a broadcast".to_string());
         system.internal_broadcast(broadcast_msg.clone()).await?;
 
-        // Wait for message processing
-        wait_for(100).await;
+        // A FIFO query proves the broadcast's actual effect at each recipient.
+        for actor in [&actor_ref1, &actor_ref2, &actor_ref3] {
+            assert_eq!(
+                actor.ask(BroadcastHistory).await?,
+                vec!["This is a broadcast".to_string()]
+            );
+        }
 
-        // Verify each actor received the broadcast by sending individual messages
+        // Independent requests must still work after broadcasting.
         let response1 = actor_ref1
             .ask(BroadcastTestMessage("Individual1".to_string()))
             .await?;

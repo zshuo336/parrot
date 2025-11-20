@@ -9,10 +9,15 @@ use std::sync::{Arc, Mutex};
 use crate::thread::error::SystemError;
 use crate::thread::processor::ProcessorInterface;
 
+mod shutdown;
+
 /// Manages actor processors by path.
 #[derive(Default)]
 pub struct ActorProcessorManager {
     processors: Mutex<HashMap<String, Arc<dyn ProcessorInterface>>>,
+    // No user state is protected by this gate; unwinding releases its permit.
+    // Preserve the registry's existing UnwindSafe/RefUnwindSafe API traits.
+    shutdown: std::panic::AssertUnwindSafe<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for ActorProcessorManager {
@@ -20,6 +25,14 @@ impl std::fmt::Debug for ActorProcessorManager {
         f.debug_struct("ActorProcessorManager")
             .field("processors", &self.len())
             .finish()
+    }
+}
+
+impl Drop for ActorProcessorManager {
+    fn drop(&mut self) {
+        if let Err(error) = self.try_clear() {
+            tracing::warn!(%error, "processor registry disposal failed");
+        }
     }
 }
 
@@ -68,20 +81,56 @@ impl ActorProcessorManager {
         self.len() == 0
     }
 
-    /// Remove and stop all processors.
+    /// Stop the current snapshot, logging failures. Failed or cancelled stops
+    /// remain registered for explicit retry. Use `try_shutdown_all` for receipts.
+    /// This does not retire actor storage on its execution scheduler.
     pub async fn shutdown_all(&self) {
-        let all: Vec<Arc<dyn ProcessorInterface>> = {
-            let mut map = self.processors.lock().unwrap();
-            map.drain().map(|(_, v)| v).collect()
-        };
-        for processor in all {
-            let _ = processor.stop_erased().await;
+        if let Err(error) = self.try_shutdown_all().await {
+            tracing::warn!(%error, "processor snapshot shutdown failed");
         }
     }
 
-    /// Clear the registry without stopping processors.
+    /// Poll all snapshot stops cooperatively, without spawning detached work.
+    /// Only successful stops with successful future disposal are removed, and
+    /// only if the path still identifies the original processor. Registrations
+    /// after snapshot capture are excluded. Concurrent shutdowns are serialized.
+    /// Cancellation retains unfinished entries; no implicit deadline is added.
+    /// Blocking callbacks/destructors cannot be preempted by this registry.
+    pub async fn try_shutdown_all(&self) -> Result<(), SystemError> {
+        self.shutdown_snapshot().await
+    }
+
+    /// Release this registry snapshot without stopping processors. Panics only
+    /// after all handles have been released if a processor destructor panics.
+    /// Use `try_clear` to receive the disposal failures instead.
     pub fn clear(&self) {
-        self.processors.lock().unwrap().clear();
+        self.try_clear().expect("processor registry clear failed");
+    }
+
+    /// Detach the current snapshot, then release each handle outside the lock.
+    /// Registrations made during disposal belong to the next snapshot. External
+    /// handles can keep processors alive; this is not a storage-retirement API.
+    /// Disposal is synchronous on the caller and isolates unwindable panics.
+    pub fn try_clear(&self) -> Result<(), SystemError> {
+        let all = std::mem::take(&mut *self.processors.lock().unwrap());
+        let mut failures = Vec::new();
+        for (path, processor) in all {
+            let result = crate::owned_payload::PublicationInput::new(processor).retire();
+            if let Err(error) = result {
+                failures.push(format!(
+                    "{path}: {}",
+                    crate::error_receipt::actor_summary(&error)
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(SystemError::Panic(format!(
+                "processor registry disposal failed: {}",
+                failures.join("; ")
+            )))
+        }
     }
 }
 
@@ -142,12 +191,26 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_all_stops_processors_and_drains() {
         let manager = ActorProcessorManager::new();
-        manager.register("a", make_processor()).unwrap();
-        manager.register("b", make_processor()).unwrap();
+        let first = make_processor();
+        let second = make_processor();
+        first.clone().initialize_and_start_erased().await.unwrap();
+        second.clone().initialize_and_start_erased().await.unwrap();
+        manager.register("a", first.clone()).unwrap();
+        manager.register("b", second.clone()).unwrap();
         assert_eq!(manager.len(), 2);
 
         manager.shutdown_all().await;
         assert!(manager.is_empty(), "shutdown_all must drain the registry");
+        for processor in [first, second] {
+            let concrete = processor
+                .as_any_ref()
+                .downcast_ref::<ActorProcessor<DummyActor>>()
+                .unwrap();
+            assert_eq!(
+                concrete.get_status(),
+                crate::thread::processor::ProcessorStatus::Stopped
+            );
+        }
     }
 
     #[tokio::test]

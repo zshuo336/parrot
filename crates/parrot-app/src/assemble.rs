@@ -155,7 +155,10 @@ pub trait ParrotSpawner: Send + Sync {
         self.validate_artifact(artifact)?;
         match artifact {
             crate::manifest::ArtifactRef::Props { factory } => {
-                self.spawn_props(factory, paths, config).await
+                guarded_spawn(&format!("Props factory {factory}"), paths, || {
+                    self.spawn_props(factory, paths, config)
+                })
+                .await
             }
             other => Err(DeployError::Artifact(format!(
                 "{} artifact spawn is not implemented by this spawner",
@@ -214,7 +217,7 @@ impl Default for AssemblingContext {
     }
 }
 
-/// 本地部署器（manifest → 本地执行面；与 ClusterDeployer 同构差异点）。
+/// 本地部署器：每个组件的全部实例交给同一个宿主，不执行 Plan 的跨节点分配。
 pub struct LocalDeployer<'a> {
     pub topology: &'a dyn TopologyView,
     pub gateway_factory: &'a dyn GatewayFactory,
@@ -319,9 +322,10 @@ impl AssemblingContext {
             })?;
             // Valid TOML includes NaN, whose ordinary PartialEq is not reflexive.
             // Compare the lossless serialized spec, also retaining signed zero.
-            let same_spec = toml::to_string(expected)
+            let same_spec = crate::encoding::canonical(expected, self.limits.max_source_bytes)
                 .map_err(|e| DeployError::Config(e.to_string()))?
-                == toml::to_string(&pc.spec).map_err(|e| DeployError::Config(e.to_string()))?;
+                == crate::encoding::canonical(&pc.spec, self.limits.max_source_bytes)
+                    .map_err(|e| DeployError::Config(e.to_string()))?;
             if !same_spec
                 || !planned.insert(pc.spec.name.clone())
                 || pc
@@ -333,6 +337,20 @@ impl AssemblingContext {
                 return Err(DeployError::Config(
                     "plan differs from manifest or dependency order".into(),
                 ));
+            }
+            // This deployer starts the entire cohort on one host. Public Plan
+            // node lists cannot authorize placement the host cannot execute.
+            if pc.spec.placement.anti_affinity && pc.spec.instances.instance_count() > 1 {
+                return Err(DeployError::Config(format!(
+                    "component {:?}: local assembly cannot satisfy multi-instance anti_affinity",
+                    pc.spec.name
+                )));
+            }
+            if !deployer.topology.self_matches(&pc.spec.placement) {
+                return Err(DeployError::Config(format!(
+                    "component {:?}: local topology does not satisfy placement (role={:?}, realm={:?}, label={:?})",
+                    pc.spec.name, pc.spec.placement.role, pc.spec.placement.realm, pc.spec.placement.label
+                )));
             }
             let expected = instance_paths(&pc.spec, &self.limits)?;
             if pc
@@ -360,15 +378,36 @@ impl AssemblingContext {
                 "cleanup timeout is not representable".into(),
             ));
         }
-        deployer.parrot_spawner.configure(&resolved)?;
+        host_call("local host configuration", || {
+            deployer.parrot_spawner.configure(&resolved)
+        })??;
         for component in &manifest.components {
             if component.engine == crate::manifest::EngineKind::Parrot {
-                deployer
-                    .parrot_spawner
-                    .validate_artifact(&component.artifact)?;
+                host_call("host artifact validation", || {
+                    deployer
+                        .parrot_spawner
+                        .validate_artifact(&component.artifact)
+                })??;
             }
         }
-        deployer.gateway_factory.configure(&resolved).await?;
+        match host_future("gateway configuration", || {
+            deployer.gateway_factory.configure(&resolved)
+        })
+        .await
+        {
+            crate::disposal::FutureCompletion::Ready(result) => result?,
+            crate::disposal::FutureCompletion::DisposalFailed(result) => {
+                return Err(host_disposal_error(
+                    "gateway configuration",
+                    result.err().unwrap_or_else(|| {
+                        DeployError::Engine("gateway configuration future disposal panicked".into())
+                    }),
+                ));
+            }
+            crate::disposal::FutureCompletion::Panicked => {
+                return Err(DeployError::Engine("gateway configuration panicked".into()));
+            }
+        }
 
         for pc in &plan.order {
             let comp = &pc.spec;
@@ -384,7 +423,8 @@ impl AssemblingContext {
             ))
             .catch_unwind()
             .await
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|payload| {
+                crate::disposal::drop_catching(payload);
                 Err(DeployError::Engine(format!(
                     "spawn component {} panicked",
                     comp.name
@@ -509,21 +549,24 @@ impl AssemblingContext {
                             .unwrap_or_else(|| format!("{name}[{index}]"));
                         let result = tokio::time::timeout(
                             self.cleanup_timeout,
-                            std::panic::AssertUnwindSafe(async { actor.stop().await })
-                                .catch_unwind(),
+                            std::panic::AssertUnwindSafe(async {
+                                parrot_api::address::stop_for_cleanup(&**actor).await
+                            })
+                            .catch_unwind(),
                         )
                         .await;
                         match result {
-                            Ok(Ok(Ok(())))
-                            | Ok(Ok(Err(parrot_api::errors::ActorError::ActorNotFound(_)))) => {
+                            Ok(Ok(Ok(()))) => {
                                 // No await between confirmation and recording it:
                                 // cancellation of a later stop preserves progress.
                                 self.completed_terminations.insert(key);
                             }
                             Ok(Ok(Err(error))) => {
-                                failures.push(DeployError::Engine(format!("stop {path}: {error}")))
+                                let detail = crate::disposal::actor_error_detail(error);
+                                failures.push(DeployError::Engine(format!("stop {path}: {detail}")))
                             }
-                            Ok(Err(_)) => {
+                            Ok(Err(payload)) => {
+                                crate::disposal::drop_catching(payload);
                                 failures.push(DeployError::Engine(format!("stop {path} panicked")))
                             }
                             Err(_) => failures
@@ -532,21 +575,26 @@ impl AssemblingContext {
                     }
                     aggregate(failures)
                 } else {
-                    tokio::time::timeout(
+                    match tokio::time::timeout(
                         self.cleanup_timeout,
-                        deployer.gateway_factory.stop_gateway(spec),
+                        crate::disposal::catch_future(deployer.gateway_factory.stop_gateway(spec)),
                     )
                     .await
-                    .unwrap_or_else(|_| {
-                        Err(DeployError::Engine(format!(
+                    {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(())) => Err(DeployError::Engine(format!(
+                            "stop component {name} panicked"
+                        ))),
+                        Err(_) => Err(DeployError::Engine(format!(
                             "stop component {name} cleanup deadline"
-                        )))
-                    })
+                        ))),
+                    }
                 }
             })
             .catch_unwind()
             .await
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|payload| {
+                crate::disposal::drop_catching(payload);
                 Err(DeployError::Engine(format!(
                     "stop component {name} panicked"
                 )))
@@ -592,23 +640,35 @@ impl AssemblingContext {
                                 DeployError::Engine(format!("missing instance {instance}"))
                             })
                     } else if spec.engine == crate::manifest::EngineKind::Parrot {
-                        deployer.parrot_spawner.hook_target(&path).await
+                        crate::disposal::catch_future(deployer.parrot_spawner.hook_target(&path))
+                            .await
+                            .map_err(|()| DeployError::HookPanic {
+                                comp: name.into(),
+                                hook: path.clone(),
+                            })?
                     } else {
-                        deployer.gateway_factory.hook_target(spec, &path).await
+                        crate::disposal::catch_future(
+                            deployer.gateway_factory.hook_target(spec, &path),
+                        )
+                        .await
+                        .map_err(|()| DeployError::HookPanic {
+                            comp: name.into(),
+                            hook: path.clone(),
+                        })?
                     }
                 };
                 let target = match tokio::time::timeout(
                     self.hooks_timeout,
-                    std::panic::AssertUnwindSafe(resolve).catch_unwind(),
+                    crate::disposal::catch_future(resolve),
                 )
                 .await
                 {
                     Ok(Ok(result)) => result?,
-                    Ok(Err(_)) => {
+                    Ok(Err(())) => {
                         return Err(DeployError::HookPanic {
                             comp: name.into(),
                             hook: path,
-                        })
+                        });
                     }
                     Err(_) => {
                         return Err(DeployError::HookTimeout {
@@ -662,27 +722,42 @@ impl AssemblingContext {
                 .hook_path(hook, instance)
                 .map_err(DeployError::Config)?;
             let result = async {
+                let hook_panic = |()| DeployError::HookPanic {
+                    comp: name.into(),
+                    hook: path.clone(),
+                };
                 let root = self.registry[name]
                     .get(index)
                     .ok_or_else(|| DeployError::Engine(format!("missing instance {instance}")))?;
                 if spec.engine == crate::manifest::EngineKind::Parrot
                     && phase != hook_phase::START
-                    && !root.is_alive().await
+                    && !crate::disposal::catch_future(root.is_alive())
+                        .await
+                        .map_err(hook_panic)?
                 {
                     // A closed mailbox is not a completed destructor. Join this
                     // exact owned reference; never look up a replacement by path.
-                    root.stop().await.map_err(|error| {
-                        DeployError::Engine(format!("join retired instance {instance}: {error}"))
-                    })?;
+                    parrot_api::address::stop_for_owned_cleanup(&**root)
+                        .await
+                        .map_err(|error| {
+                            let detail = crate::disposal::actor_error_detail(error);
+                            DeployError::Engine(format!(
+                                "join retired instance {instance}: {detail}"
+                            ))
+                        })?;
                     return Ok(HookCompletion::Retired);
                 }
                 let target = self
                     .hook_targets
                     .get(&(name.to_string(), index, path.clone()))
                     .ok_or_else(|| DeployError::Engine(format!("unresolved hook {name} {path}")))?;
-                let reply = target.send(hook_message(phase)).await.map_err(|error| {
-                    DeployError::Engine(format!("hook {name} {path} phase={phase}: {error}"))
-                })?;
+                let reply = crate::disposal::catch_future(target.send(hook_message(phase)))
+                    .await
+                    .map_err(hook_panic)?
+                    .map_err(|error| {
+                        let detail = crate::disposal::actor_error_detail(error);
+                        DeployError::Engine(format!("hook {name} {path} phase={phase}: {detail}"))
+                    })?;
                 if reply.downcast_ref::<ParrotAppHook>() != Some(&ParrotAppHook(phase)) {
                     return Err(DeployError::Engine(format!(
                         "hook {name} {path}: expected phase {phase} acknowledgement"
@@ -692,12 +767,12 @@ impl AssemblingContext {
             };
             let result = match tokio::time::timeout(
                 self.hooks_timeout,
-                std::panic::AssertUnwindSafe(result).catch_unwind(),
+                crate::disposal::catch_future(result),
             )
             .await
             {
                 Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(DeployError::HookPanic {
+                Ok(Err(())) => Err(DeployError::HookPanic {
                     comp: name.into(),
                     hook: path.clone(),
                 }),
@@ -773,7 +848,8 @@ impl AssemblingContext {
             .as_ref()
             .and_then(|host| host.upgrade())
             .ok_or_else(|| DeployError::Config("mirror host retired during assembly".into()))?;
-        let policies = crate::mirror::expand(manifest).map_err(DeployError::Config)?;
+        let policies =
+            crate::mirror::expand(manifest, &self.limits).map_err(DeployError::Config)?;
         self.mirror_group = Some(
             host.register_wire_mirror_group(policies)
                 .map_err(|e| DeployError::Engine(e.to_string()))?,
@@ -863,14 +939,22 @@ impl AssemblingContext {
                 if let Some(index) = self.paths[name].iter().position(|root| root == path) {
                     Ok(self.registry[name][index].clone_boxed())
                 } else if spec.engine == crate::manifest::EngineKind::Parrot {
-                    deployer.parrot_spawner.hook_target(path).await
+                    crate::disposal::catch_future(deployer.parrot_spawner.hook_target(path))
+                        .await
+                        .map_err(|()| {
+                            DeployError::Engine(format!("wire resolution panicked: {}", wire.to))
+                        })?
                 } else {
-                    deployer.gateway_factory.hook_target(spec, path).await
+                    crate::disposal::catch_future(deployer.gateway_factory.hook_target(spec, path))
+                        .await
+                        .map_err(|()| {
+                            DeployError::Engine(format!("wire resolution panicked: {}", wire.to))
+                        })?
                 }
             };
             let target = match tokio::time::timeout(
                 self.hooks_timeout,
-                std::panic::AssertUnwindSafe(resolve).catch_unwind(),
+                crate::disposal::catch_future(resolve),
             )
             .await
             {
@@ -880,11 +964,11 @@ impl AssemblingContext {
                         wire.from, wire.to
                     ))
                 })?,
-                Ok(Err(_)) => {
+                Ok(Err(())) => {
                     return Err(DeployError::Engine(format!(
                         "wire resolution panicked: {}",
                         wire.to
-                    )))
+                    )));
                 }
                 Err(_) => {
                     return Err(DeployError::Engine(format!(
@@ -983,14 +1067,10 @@ fn with_cleanup(primary: DeployError, cleanup: Result<(), DeployError>) -> Deplo
                 .chain(error.retained_actors())
                 .cloned()
                 .collect::<Vec<_>>();
-            if retained.is_empty() {
-                DeployError::Engine(format!("{primary}; rollback: {error}"))
-            } else {
-                DeployError::Cleanup {
-                    source: Box::new(primary),
-                    retained,
-                    detail: error.to_string(),
-                }
+            DeployError::Cleanup {
+                source: Box::new(primary),
+                retained,
+                detail: error.to_string(),
             }
         }
     }
@@ -1003,18 +1083,81 @@ async fn spawn_component(
     version: &str,
     deployer: &LocalDeployer<'_>,
 ) -> Result<Vec<BoxedActorRef>, DeployError> {
+    let stage = format!("spawn component {}", comp.name);
     match comp.engine {
         crate::manifest::EngineKind::Parrot => {
-            deployer
-                .parrot_spawner
-                .spawn_artifact(&comp.artifact, paths, comp.config.as_ref())
-                .await
+            guarded_spawn(&stage, paths, || {
+                deployer
+                    .parrot_spawner
+                    .spawn_artifact(&comp.artifact, paths, comp.config.as_ref())
+            })
+            .await
         }
         _ => {
-            deployer
-                .gateway_factory
-                .start_gateway(comp, paths, version)
-                .await
+            guarded_spawn(&stage, paths, || {
+                deployer.gateway_factory.start_gateway(comp, paths, version)
+            })
+            .await
+        }
+    }
+}
+
+fn host_call<T>(stage: &str, call: impl FnOnce() -> T) -> Result<T, DeployError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).map_err(|payload| {
+        crate::disposal::drop_catching(payload);
+        DeployError::Engine(format!("{stage} panicked"))
+    })
+}
+
+async fn host_future<T, F: std::future::Future<Output = Result<T, DeployError>>>(
+    stage: &str,
+    make: impl FnOnce() -> F,
+) -> crate::disposal::FutureCompletion<Result<T, DeployError>> {
+    match host_call(stage, make) {
+        Ok(future) => crate::disposal::catch_future_retaining_output(future).await,
+        Err(error) => crate::disposal::FutureCompletion::Ready(Err(error)),
+    }
+}
+
+fn host_disposal_error(stage: &str, source: DeployError) -> DeployError {
+    DeployError::Cleanup {
+        retained: source.retained_actors().to_vec(),
+        source: Box::new(source),
+        detail: format!("{stage} future disposal panicked"),
+    }
+}
+
+async fn guarded_spawn<F: std::future::Future<Output = Result<Vec<BoxedActorRef>, DeployError>>>(
+    stage: &str,
+    paths: &[String],
+    make: impl FnOnce() -> F,
+) -> Result<Vec<BoxedActorRef>, DeployError> {
+    use crate::disposal::FutureCompletion;
+    match host_future(stage, make).await {
+        FutureCompletion::Ready(result) => result,
+        FutureCompletion::Panicked => Err(DeployError::Engine(format!("{stage} panicked"))),
+        FutureCompletion::DisposalFailed(Err(source)) => Err(host_disposal_error(stage, source)),
+        FutureCompletion::DisposalFailed(Ok(actors)) => {
+            let detail =
+                format!("{stage} future disposal panicked; returned actors require rollback");
+            let retained = actors
+                .into_iter()
+                .enumerate()
+                .map(|(index, actor)| {
+                    let path = paths
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{stage}[{index}]"));
+                    crate::cleanup::RetainedActor::from_owned(path, detail.clone(), actor)
+                })
+                .collect();
+            Err(DeployError::Cleanup {
+                source: Box::new(DeployError::Engine(format!(
+                    "{stage} future disposal panicked"
+                ))),
+                retained,
+                detail,
+            })
         }
     }
 }
@@ -2007,7 +2150,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("spawn component panic panicked"));
+        assert!(
+            matches!(
+                error.primary_error(),
+                DeployError::Engine(detail) if detail == "Props factory app.panic panicked"
+            ),
+            "{error:?}"
+        );
         assert!(context.started().is_empty());
         assert_eq!(journal.snapshot(), vec!["spawn:/user/a", "stop:/user/a"]);
     }

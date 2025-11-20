@@ -301,7 +301,7 @@ async fn watcher_stop_and_system_drop_release_mutual_subscriptions() {
 }
 
 #[actix::test]
-async fn stalled_notification_is_bounded_counted_and_cancelled_by_unwatch() {
+async fn stalled_notification_is_bounded_and_unwatch_respects_admission() {
     let system = system(Duration::from_millis(100)).await;
     let (observer, mut events) = spawn(&system).await;
     let (entered, ready) = oneshot::channel();
@@ -321,10 +321,19 @@ async fn stalled_notification_is_bounded_counted_and_cancelled_by_unwatch() {
     cancelled.watch(observer.clone_boxed()).await.unwrap();
     cancelled.stop().await.unwrap();
     cancelled.unwatch(observer.clone_boxed()).await.unwrap();
+    assert_eq!(cancelled.death_watch().unwrap().subscriptions(), (0, 0));
     settled(&*observer).await;
     gate.notify_one();
     observer.send(Box::new(Command::Ping)).await.unwrap();
-    assert!(events.try_recv().is_err());
+    // Unwatch removes the subscription immediately. It cannot recall a notice
+    // already admitted by Actix, whose senders have individual reserved slots.
+    let mut admitted = 0;
+    while let Ok(notice) = events.try_recv() {
+        assert_eq!(notice.generation, cancelled.death_watch().unwrap().id());
+        assert_eq!(notice.reason, DeathReason::Normal);
+        admitted += 1;
+    }
+    assert!(admitted <= 1, "duplicate termination delivery");
     assert_eq!(cancelled.death_watch().unwrap().delivery_failures(), 0);
     system.shutdown().await.unwrap();
 }

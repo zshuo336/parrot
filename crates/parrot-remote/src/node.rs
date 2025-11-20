@@ -1,6 +1,7 @@
 //! 职责：NodeId/NodeAddr/NodeTable——静态种子表 + 连接状态机（DEV_01 §3.7 / 05 §2.3）。
 //!
-//! P1：静态表（配置注入）；P2 由 SWIM membership 动态维护（接口不变）。
+//! Static seeds, discovered membership endpoints and live connections retain
+//! separate ownership; the system periodically projects SWIM membership here.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

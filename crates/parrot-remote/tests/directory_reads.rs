@@ -33,7 +33,7 @@ fn query() -> DirQuery {
     }
 }
 #[test]
-fn fresh_read_barriers_prove_absence_preserve_revision_and_cannot_be_reused_or_reopened() {
+fn fresh_quorum_reads_prove_absence_preserve_revision_and_cannot_be_reused_or_reopened() {
     let p = Temp::new();
     let clock = Arc::new(ManualClock::new());
     let mut d = DurableDirectory::open(&p.0, "g", "a", vec![], clock.clone()).unwrap();
@@ -51,8 +51,8 @@ fn fresh_read_barriers_prove_absence_preserve_revision_and_cannot_be_reused_or_r
     let value = d.poll_linear_read(&mut read).unwrap().unwrap();
     assert_eq!(value.entry, d.query_local(&query()).unwrap());
     assert_eq!(value.entry.unwrap().version, 1);
-    assert_eq!(value.barrier_index, 3);
-    assert_eq!(value.applied_index, 3);
+    assert_eq!(value.barrier_index, 2);
+    assert_eq!(value.applied_index, 2);
     assert_eq!(d.state_local().unwrap(), &before);
     let mut foreign = d.begin_linear_read(&query()).unwrap();
     drop(d);
@@ -165,6 +165,15 @@ fn current_term_read_barrier_commits_prior_term_prefix_without_a_business_write(
     .unwrap();
     let mut ticket = d.begin_linear_read(&query()).unwrap();
     assert!(d.poll_linear_read(&mut ticket).unwrap().is_none());
+    assert!(
+        d.outbox()
+            .unwrap()
+            .iter()
+            .all(|(_, rpc)| !matches!(rpc, RaftRpc::ReadIndex { .. })),
+        "a new term must commit before sending read probes"
+    );
+    d.step("a".into(), RaftRpc::ReadIndexResp { term, context: 1 })
+        .unwrap();
     d.step(
         "a".into(),
         RaftRpc::AppendEntriesResp {
@@ -174,6 +183,8 @@ fn current_term_read_barrier_commits_prior_term_prefix_without_a_business_write(
         },
     )
     .unwrap();
+    assert!(d.poll_linear_read(&mut ticket).unwrap().is_none());
+    acknowledge_read(&mut d, "a");
     let result = d.poll_linear_read(&mut ticket).unwrap().unwrap();
     assert_eq!(result.barrier_index, 2);
     assert_eq!(result.term, term);
@@ -232,6 +243,8 @@ fn malformed_barrier_and_invalid_read_do_not_mutate_or_consume_log() {
         },
     )
     .unwrap();
+    assert!(d.poll_linear_read(&mut ticket).unwrap().is_none());
+    acknowledge_read(&mut d, "a");
     assert_eq!(
         d.poll_linear_read(&mut ticket)
             .unwrap()
@@ -239,6 +252,22 @@ fn malformed_barrier_and_invalid_read_do_not_mutate_or_consume_log() {
             .barrier_index,
         1
     );
+}
+
+fn acknowledge_read(d: &mut DurableDirectory, peer: &str) {
+    let probes: Vec<_> = d
+        .outbox()
+        .unwrap()
+        .into_iter()
+        .filter_map(|(target, rpc)| match rpc {
+            RaftRpc::ReadIndex { term, context, .. } if target == peer => Some((term, context)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(probes.len(), 1);
+    let (term, context) = probes[0];
+    d.step(peer.into(), RaftRpc::ReadIndexResp { term, context })
+        .unwrap();
 }
 
 fn deliver(nodes: &mut [DurableDirectory], members: &[usize]) {

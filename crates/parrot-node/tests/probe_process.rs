@@ -224,3 +224,40 @@ async fn wrong_peer_identity_fails_before_any_business_check() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("identity mismatch"));
     assert!(!String::from_utf8_lossy(&result.stdout).contains("PASS P1"));
 }
+
+#[tokio::test]
+async fn config_path_retains_a_literal_option_prefix() {
+    let mut node = Node::start("prefix-target", "").await;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("--config=selected.toml"),
+        "[remote.node]\nnode_id='prefix-probe'\n[remote.security]\nmode='insecure-development'\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("selected.toml"), "wrong file").unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new(env!("CARGO_BIN_EXE_parrot-probe"))
+            .current_dir(directory.path())
+            .args([
+                format!("prefix-target={}", node.endpoint),
+                "--smoke".into(),
+                "--config=--config=selected.toml".into(),
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("probe with explicit config exceeded deadline")
+    .unwrap();
+    let remaining = actor_count("prefix-target", &node.endpoint).await;
+    node.stop().await;
+    assert!(
+        result.status.success(),
+        "probe read the wrong config: {}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("parrot-probe SMOKE PASS"));
+    assert_eq!(remaining, 4, "probe leaked its temporary actors");
+}

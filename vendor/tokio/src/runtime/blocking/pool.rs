@@ -405,9 +405,6 @@ impl Spawner {
             return Err(SpawnError::ShuttingDown);
         }
 
-        shared.queue.push_back(task);
-        self.inner.metrics.inc_queue_depth();
-
         if self.inner.metrics.num_idle_threads() == 0 {
             // No threads are able to process the task.
 
@@ -436,7 +433,10 @@ impl Spawner {
                         }
                         Err(e) => {
                             // The OS refused to spawn the thread and there is no thread
-                            // to pick up the task that has just been pushed to the queue.
+                            // to pick up this task. Cancel outside the pool lock;
+                            // its captures may run arbitrary destructors.
+                            drop(shared);
+                            task.task.shutdown();
                             return Err(SpawnError::NoThreads(e));
                         }
                     }
@@ -452,6 +452,11 @@ impl Spawner {
             shared.num_notify += 1;
             self.inner.condvar.notify_one();
         }
+
+        // Commit only after worker creation succeeds or an existing worker can
+        // service the queue. Builder callback unwinding must not orphan a task.
+        shared.queue.push_back(task);
+        self.inner.metrics.inc_queue_depth();
 
         Ok(())
     }

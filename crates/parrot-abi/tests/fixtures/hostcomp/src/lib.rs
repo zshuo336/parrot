@@ -57,6 +57,11 @@ unsafe extern "C" fn construct(cfg: AbiStr, out: *mut *mut AbiComponent) -> u32 
             saved_parent: Vec::new(),
         });
         state.log("construct-enter");
+        assert_ne!(
+            state.config("construct_panic"),
+            Some("yes"),
+            "constructor panic fixture"
+        );
         if !state.gate("construct_gate") || state.config("fail_path") == Some(state.path()) {
             return ABI_ERR_STATE;
         }
@@ -172,6 +177,11 @@ unsafe extern "C" fn drain(ptr: *mut ()) -> u32 {
         }
         state.drained = true;
         state.log("drain");
+        assert_ne!(
+            state.config("drain_panic"),
+            Some("yes"),
+            "drain panic fixture"
+        );
         if state.config("drain_error") == Some("yes") {
             ABI_ERR_STATE
         } else {

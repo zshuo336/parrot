@@ -118,12 +118,18 @@ fn modes() -> [SchedulingMode; 3] {
     ]
 }
 fn system(mode: SchedulingMode, timeout: Duration) -> Arc<ThreadActorSystem> {
-    ThreadActorSystem::shared(ThreadActorSystemConfig {
+    let sharded = matches!(&mode, SchedulingMode::Sharded { .. });
+    let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
         default_scheduling_mode: mode,
         shared_pool_size: 2,
         shutdown_timeout: timeout,
         ..Default::default()
-    })
+    });
+    // Keep startup outside the actor creation budget; retain the short stop limit.
+    if sharded {
+        system.scheduler_group().try_sharded().unwrap();
+    }
+    system
 }
 async fn gone(system: &ThreadActorSystem) {
     tokio::time::timeout(LIMIT, async {

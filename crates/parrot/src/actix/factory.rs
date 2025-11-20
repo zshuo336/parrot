@@ -1,4 +1,6 @@
 //! Logical Actix factories own construction, generations and final retirement.
+#[cfg(test)]
+mod cancellation_contracts;
 use super::{
     actor::ActixActor,
     context::ActixContext,
@@ -45,8 +47,13 @@ struct Logical {
     path: String,
     control: Arc<ActorControl>,
     state: Mutex<State>,
+    runtime: tokio::runtime::Handle,
+    cleanup_slots: Arc<tokio::sync::Semaphore>,
 }
 impl Logical {
+    fn own_input<T: Send + 'static>(&self, value: T) -> crate::owned_payload::OwnedPayload<T> {
+        crate::owned_payload::OwnedPayload::new(value, &self.runtime, &self.cleanup_slots)
+    }
     fn current(&self) -> ActorResult<Arc<dyn ActorRef>> {
         if self.control.channel.is_sealed() {
             return Err(ActorError::Stopped);
@@ -83,6 +90,9 @@ impl std::fmt::Debug for FactoryRef {
 }
 #[async_trait::async_trait]
 impl ActorRef for FactoryRef {
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.0.control.lifetime.retirement_status()
+    }
     fn send<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         self.send_with_timeout(message, None)
     }
@@ -91,8 +101,12 @@ impl ActorRef for FactoryRef {
         message: BoxedMessage,
         timeout: Option<Duration>,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        let message = self.0.own_input(message);
         Box::pin(parrot_api::trace::capture(async move {
-            self.0.current()?.send_with_timeout(message, timeout).await
+            self.0
+                .current()?
+                .send_with_timeout(message.take(), timeout)
+                .await
         }))
     }
     fn send_with_options<'a>(
@@ -100,13 +114,18 @@ impl ActorRef for FactoryRef {
         message: BoxedMessage,
         options: MessageOptions,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        let message = self.0.own_input(message);
         Box::pin(parrot_api::trace::capture(async move {
-            self.0.current()?.send_with_options(message, options).await
+            self.0
+                .current()?
+                .send_with_options(message.take(), options)
+                .await
         }))
     }
     fn deliver<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        let message = self.0.own_input(message);
         Box::pin(parrot_api::trace::capture(async move {
-            self.0.current()?.deliver(message).await
+            self.0.current()?.deliver(message.take()).await
         }))
     }
     fn deliver_with_options<'a>(
@@ -114,10 +133,11 @@ impl ActorRef for FactoryRef {
         message: BoxedMessage,
         options: MessageOptions,
     ) -> BoxedFuture<'a, ActorResult<()>> {
+        let message = self.0.own_input(message);
         Box::pin(parrot_api::trace::capture(async move {
             self.0
                 .current()?
-                .deliver_with_options(message, options)
+                .deliver_with_options(message.take(), options)
                 .await
         }))
     }
@@ -165,6 +185,7 @@ fn spawn_generation<A>(
     logical: Arc<Logical>,
     parent: Option<BoxedActorRef>,
     gate: Option<Arc<crate::children::recovery::Recovery>>,
+    creation_deadline: Option<Instant>,
 ) -> ActorResult<Generation>
 where
     A: Actor<Context = ActixContext<ActixActor<A>>>
@@ -178,6 +199,8 @@ where
         Some(logical.control.lifetime.clone()),
         system.policy_slots.clone(),
     );
+    ActorControl::configure_timeouts(&mut control, &system.operation_timeouts);
+    control.bound_initialization(creation_deadline);
     Arc::get_mut(&mut control)
         .expect("unpublished control")
         .upstream_stop = Some(Arc::downgrade(&logical.control));
@@ -219,8 +242,10 @@ where
     let tasks = control.tasks.clone();
     let children = control.children.clone();
     let cleanup_control = control.clone();
-    if !system.arbiter_pool().next_arbiter().spawn_fn(move || {
-        actix::spawn(async move {
+    if !system
+        .arbiter_pool()
+        .reserve_arbiter()
+        .spawn_fn(move || async move {
             let execution = std::panic::AssertUnwindSafe(async move {
                 actix::Context::with_receiver(receiver)
                     .into_future(actor_base)
@@ -239,7 +264,7 @@ where
             let tasks_result = tasks.join().await;
             let children_result = children.join().await;
             let stop_result = cleanup_control
-                .stop_failure
+                .cleanup_failure
                 .lock()
                 .unwrap()
                 .take()
@@ -251,8 +276,8 @@ where
                     .and(children_result)
                     .and(stop_result),
             });
-        });
-    }) {
+        })
+    {
         logical.state.lock().unwrap().current = None;
         return Err(ActorError::InternalError(
             "Actix arbiter rejected factory generation".into(),
@@ -279,6 +304,18 @@ struct GroupBuildError {
     retirement: Option<crate::error_receipt::ActorReceipt>,
 }
 impl GroupBuildError {
+    fn is_normal_stop(
+        &self,
+        control: &ActorControl,
+        recovery: &crate::children::recovery::Recovery,
+    ) -> bool {
+        // Parent/cohort close cancels the epoch before individual member stop
+        // requests reach this driver. The epoch is authoritative in that gap.
+        self.cancelled
+            && self.retirement.is_none()
+            && (control.channel.is_sealed() || recovery.was_cancelled())
+            && !control.expired_now()
+    }
     fn stopped(error: String) -> Self {
         Self {
             cancelled: true,
@@ -321,7 +358,7 @@ where
 {
     use crate::children::recovery::Step;
     let member = logical.control.lifetime.id;
-    let work = async {
+    let retirement = async {
         logical
             .control
             .lifetime
@@ -338,27 +375,61 @@ where
         recovery
             .arrive(member, Step::Retired)
             .await
-            .map_err(GroupBuildError::stopped)?;
+            .map_err(GroupBuildError::stopped)
+    };
+    tokio::pin!(retirement);
+    let retired = tokio::select! {
+        biased;
+        result = &mut retirement => result,
+        _ = logical.control.channel.closed() => {
+            recovery.abort("explicit stop cancelled Actix cohort");
+            retirement.await
+        },
+        _ = tokio::time::sleep_until(recovery.deadline) => {
+            recovery.abort("Actix cohort retirement deadline elapsed");
+            logical.control.request_stop(recovery.deadline);
+            retirement.await
+        },
+    };
+    if let Err(error) = retired {
+        recovery.abort(error.outcome.to_string());
+        return Err(error);
+    }
+    let deadline = logical.control.reconstruction_deadline(recovery.deadline);
+    let construction = recovery
+        .creation_control(member, deadline)
+        .map_err(GroupBuildError::stopped)?;
+    let work = async {
         let prepared = parrot_api::trace::in_scope(recovery.failure_context.clone(), || {
-            factory.prepare::<ActorError>(recovery.control.clone())
+            factory.prepare::<ActorError>(construction.clone())
         })
         .await
         .map_err(GroupBuildError::construction)?;
         if let Err(error) = recovery.arrive(member, Step::Prepared).await {
-            prepared.discard().await.map_err(|error| GroupBuildError {
-                cancelled: false,
-                outcome: ActorError::InternalError(error.clone()),
-                retirement: Some(crate::error_receipt::ActorReceipt::from_error(
-                    ActorError::InternalError(error),
-                )),
-            })?;
+            prepared
+                .discard_in_lifecycle()
+                .await
+                .map_err(|error| GroupBuildError {
+                    cancelled: false,
+                    outcome: ActorError::InternalError(error.clone()),
+                    retirement: Some(crate::error_receipt::ActorReceipt::from_error(
+                        ActorError::InternalError(error),
+                    )),
+                })?;
             return Err(GroupBuildError::stopped(error));
         }
         let owner = logical.clone();
         let gate = recovery.clone();
         let generation = prepared
             .publish(move |actor| {
-                spawn_generation(system.upgrade()?, actor, owner, parent, Some(gate))
+                spawn_generation(
+                    system.upgrade()?,
+                    actor,
+                    owner,
+                    parent,
+                    Some(gate),
+                    Some(deadline),
+                )
             })
             .await
             .map_err(GroupBuildError::construction)?;
@@ -399,9 +470,9 @@ where
             recovery.abort("explicit stop cancelled Actix cohort");
             work.await
         },
-        _ = tokio::time::sleep_until(recovery.deadline) => {
-            recovery.abort("Actix cohort recovery deadline elapsed");
-            logical.control.request_stop(recovery.deadline);
+        _ = tokio::time::sleep_until(deadline) => {
+            recovery.abort("Actix cohort creation deadline elapsed");
+            logical.control.request_stop(deadline);
             work.await
         },
     };
@@ -485,31 +556,113 @@ impl ActixActorSystem {
             + 'static,
         F: Fn() -> A + Send + Sync + 'static,
     {
+        self.spawn_root_factory_in_scope(factory, Some(strategy), None, None)
+    }
+
+    /// Admit a root factory at an exact path in an explicit supervision group.
+    pub fn spawn_root_factory_in_cohort<'a, A, F>(
+        &'a self,
+        factory: F,
+        path: &'a str,
+        cohort: &'a crate::root_cohort::RootCohort,
+    ) -> impl std::future::Future<Output = ActorResult<BoxedActorRef>> + Send + 'a
+    where
+        A: Actor<Context = ActixContext<ActixActor<A>>>
+            + ActixEngineExt<Context = ActixContext<ActixActor<A>>>
+            + Unpin
+            + 'static,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.spawn_root_factory_in_scope(factory, None, Some(path), Some(cohort))
+    }
+
+    fn spawn_root_factory_in_scope<'a, A, F>(
+        &'a self,
+        factory: F,
+        strategy: Option<parrot_api::supervisor::OneForOneStrategy>,
+        path: Option<&'a str>,
+        cohort: Option<&'a crate::root_cohort::RootCohort>,
+    ) -> impl std::future::Future<Output = ActorResult<BoxedActorRef>> + Send + 'a
+    where
+        A: Actor<Context = ActixContext<ActixActor<A>>>
+            + ActixEngineExt<Context = ActixContext<ActixActor<A>>>
+            + Unpin
+            + 'static,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
         let factory =
             crate::owned_payload::OwnedPayload::new(factory, &self.runtime, &self.cleanup_slots);
         let strategy =
             crate::owned_payload::OwnedPayload::new(strategy, &self.runtime, &self.cleanup_slots);
         parrot_api::trace::capture(async move {
+            let cohort = cohort.or_else(|| self.root_cohorts.guardian());
+            let strategy = if cohort.is_some() {
+                strategy.retire().await?;
+                crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots)
+            } else {
+                strategy
+            };
             let factory = Factory::new(
                 factory.take(),
                 self.constructor_slots.clone(),
                 self.cleanup_slots.clone(),
             );
-            let lifetime = ChildLifetime::with_policy(
+            let mut lifetime = ChildLifetime::with_policy(
                 Weak::new(),
-                Some(SupervisorStrategyType::OneForOne(strategy.take())),
+                strategy.take().map(SupervisorStrategyType::OneForOne),
                 self.cleanup_slots.clone(),
             );
-            match self.start_factory(factory.clone(), None, lifetime.clone(), None) {
+            let admitted = if let Some(cohort) = cohort {
+                let mut ticket = None;
+                cohort
+                    .validate(&self.root_cohorts)
+                    .and_then(|()| {
+                        cohort.scope.spawn(|member| {
+                            lifetime = member.clone();
+                            let pending = self.start_factory(
+                                factory.clone(),
+                                None,
+                                member.clone(),
+                                path.map(str::to_owned),
+                            )?;
+                            let logical = pending.logical.clone();
+                            let reference = logical.reference();
+                            ticket = Some(pending);
+                            Ok((
+                                reference,
+                                Arc::new(move || {
+                                    logical
+                                        .control
+                                        .request_stop(Instant::now() + logical.control.timeout);
+                                    let member = member.clone();
+                                    Box::pin(async move { member.wait().await })
+                                }),
+                            ))
+                        })
+                    })
+                    .map(|()| ticket.expect("admitted root factory"))
+            } else {
+                self.start_factory(
+                    factory.clone(),
+                    None,
+                    lifetime.clone(),
+                    path.map(str::to_owned),
+                )
+            };
+            match admitted {
                 Ok(ticket) => ticket.wait().await,
                 Err(error) => {
                     // Rejection owns arbitrary captures even when the caller cancels.
-                    self.runtime
-                        .spawn(async move {
+                    self.root_cohorts
+                        .retirement_runtime()
+                        .spawn(parrot_api::trace::capture(async move {
                             let policy = lifetime.dispose_policy().await;
-                            let factory = factory.retire().await.map_err(ActorError::InternalError);
+                            let factory = factory
+                                .retire_in_lifecycle()
+                                .await
+                                .map_err(ActorError::InternalError);
                             factory.and(policy)
-                        })
+                        }))
                         .await
                         .map_err(|error| ActorError::InternalError(error.to_string()))??;
                     Err(error)
@@ -531,12 +684,13 @@ impl ActixActorSystem {
             + Unpin
             + 'static,
     {
-        let (control, finished) = ActorControl::with_lifetime(
+        let (mut control, finished) = ActorControl::with_lifetime(
             self.settings.shutdown_timeout,
             self.settings.max_context_tasks,
             Some(lifetime),
             self.policy_slots.clone(),
         );
+        ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
         let logical = Arc::new(Logical {
             path: path.unwrap_or_else(|| {
                 parent.as_ref().map_or_else(
@@ -555,6 +709,8 @@ impl ActixActorSystem {
             }),
             control,
             state: Mutex::default(),
+            runtime: self.runtime.clone(),
+            cleanup_slots: self.cleanup_slots.clone(),
         });
         let recovering = Arc::downgrade(&logical);
         logical
@@ -619,9 +775,9 @@ impl ActixActorSystem {
         let slots = self.policy_slots.clone();
         let notification_slots = self.notification_slots.clone();
         let owner = logical.clone();
-        let initial_deadline = Instant::now() + logical.control.timeout;
+        let initial_deadline = Instant::now() + logical.control.creation_timeout;
         let mut construction_context = parrot_api::trace::TraceContext::current();
-        self.runtime.spawn(async move {
+        self.root_cohorts.retirement_runtime().spawn(async move {
             let _pool_owner = pool;
             if activation.await.is_err() { owner.control.request_stop(initial_deadline); }
             let work = async {
@@ -643,7 +799,7 @@ impl ActixActorSystem {
                     // Each construction consumes its own admission or failure identity.
                     let construction = parrot_api::trace::in_scope(construction_context.take(), || {
                         factory.construct(token.clone(), move |actor| {
-                            spawn_generation(next_system.upgrade()?, actor, next_owner, next_parent, None)
+                            spawn_generation(next_system.upgrade()?, actor, next_owner, next_parent, None, Some(deadline))
                         })
                     });
                     tokio::pin!(construction);
@@ -662,10 +818,10 @@ impl ActixActorSystem {
                     };
                     if matches!(constructed, Err(ConstructionError::Cancelled | ConstructionError::Publication(ActorError::Stopped)))
                         && let Some(recovery) = owner.control.lifetime.recovery() {
-                        match group_generation(weak_system.clone(), &factory, owner.clone(), parent.as_ref().map(|p| p.clone_boxed()), recovery).await {
+                        match group_generation(weak_system.clone(), &factory, owner.clone(), parent.as_ref().map(|p| p.clone_boxed()), recovery.clone()).await {
                             Ok(generation) => { staged_generation = Some(generation); continue; },
                             Err(error) => {
-                                let cancelled = error.cancelled && error.retirement.is_none() && owner.control.channel.is_sealed() && !owner.control.expired_now();
+                                let cancelled = error.is_normal_stop(&owner.control, &recovery);
                                 if let Some(error) = error.retirement { retirement = Err(error); }
                                 break (if cancelled { Outcome::Stopped } else { Outcome::from_result(Err(error.outcome)) }, None);
                             },
@@ -704,10 +860,10 @@ impl ActixActorSystem {
                     };
                     let failure_context = control.failure_context();
                     let escalated = control.escalated.lock().unwrap().take();
-                    let failure = match outcome { Err(error) => Some(Arc::new(error)), Ok(()) => escalated.clone() };
+                    let failure = match outcome { Err(error) => Some(crate::error_receipt::ActorReceipt::from_error(error)), Ok(()) => escalated.clone() };
                     let native_status = match cleanup {
                         Err(error) => { let error = crate::error_receipt::ActorReceipt::from_error(error); retirement = Err(error.clone()); Outcome::Failed(error) },
-                        Ok(()) => failure.as_ref().map_or(Outcome::Stopped, |error| Outcome::Failed(crate::error_receipt::ActorReceipt::new(error.clone()))),
+                        Ok(()) => failure.as_ref().map_or(Outcome::Stopped, |error| Outcome::Failed(error.clone())),
                     };
                     finished.send_replace(Some(native_status.clone()));
                     // Native references are generation bound. Slow generation
@@ -755,7 +911,7 @@ impl ActixActorSystem {
                         match group_generation(weak_system.clone(), &factory, owner.clone(), parent.as_ref().map(|p| p.clone_boxed()), recovery.clone()).await {
                             Ok(generation) => { staged_generation = Some(generation); continue; },
                             Err(error) => {
-                                let cancelled = error.cancelled && error.retirement.is_none() && owner.control.channel.is_sealed() && !owner.control.expired_now();
+                                let cancelled = error.is_normal_stop(&owner.control, recovery);
                                 if let Some(error) = error.retirement { retirement = Err(error); }
                                 break (if cancelled { Outcome::Stopped } else { Outcome::from_result(Err(error.outcome)) }, None);
                             },
@@ -785,6 +941,7 @@ impl ActixActorSystem {
                                 break (native_status, Some(native_reason.clone()));
                             }
                             construction_context = failure_context;
+                            deadline = owner.control.reconstruction_deadline(deadline);
                             continue;
                         },
                         SupervisionDecision::Escalate => { if let Some(error) = failure { parrot_api::trace::in_scope(failure_context, || owner.control.lifetime.escalate(error)); } break (native_status, Some(native_reason.clone())); },
@@ -793,7 +950,7 @@ impl ActixActorSystem {
                 };
                 owner.control.begin_cleanup(Instant::now() + owner.control.timeout);
                 let policy = owner.control.lifetime.dispose_policy().await;
-                let disposal = factory.retire().await;
+                let disposal = factory.retire_in_lifecycle().await;
                 if let Err(error) = disposal.map_err(ActorError::InternalError).and(policy) {
                     let error = crate::error_receipt::ActorReceipt::from_error(error);
                     retirement = Err(error.clone());
@@ -894,7 +1051,10 @@ where
                             None => Ok(()),
                         };
                         let policy = policy.dispose().await;
-                        let factory = factory.retire().await.map_err(ActorError::InternalError);
+                        let factory = factory
+                            .retire_in_lifecycle()
+                            .await
+                            .map_err(ActorError::InternalError);
                         factory.and(policy).and(lifetime)
                     })
                     .await
@@ -942,41 +1102,21 @@ impl parrot_api::engine::AsyncFactoryRuntime for ActixActorSystem {
                 return Err(error);
             }
             let constructor = factory.take();
-            let factory = Factory::new(
+            self.spawn_root_factory_in_scope(
                 move || super::system::BoxedActixActor {
                     inner: constructor(),
                 },
-                self.constructor_slots.clone(),
-                self.cleanup_slots.clone(),
-            );
-            let lifetime = ChildLifetime::with_policy(
-                Weak::new(),
-                Some(SupervisorStrategyType::OneForOne(
+                Some(
                     parrot_api::supervisor::DefaultSupervisorStrategyFactory::one_for_one(
                         options.max_restarts,
                         options.within,
                     ),
-                )),
-                self.cleanup_slots.clone(),
-            );
-            match self.start_factory(factory.clone(), None, lifetime.clone(), options.spawn.path) {
-                Ok(ticket) => ticket.wait().await.map_err(SystemError::ActorError),
-                Err(error) => {
-                    // Install independent retirement before awaiting either input.
-                    self.runtime
-                        .spawn(async move {
-                            let policy = lifetime.dispose_policy().await;
-                            let factory = factory.retire().await.map_err(ActorError::InternalError);
-                            factory.and(policy)
-                        })
-                        .await
-                        .map_err(|e| {
-                            SystemError::ActorCreationError(crate::owned_payload::join_error(e))
-                        })?
-                        .map_err(SystemError::ActorError)?;
-                    Err(SystemError::ActorError(error))
-                }
-            }
+                ),
+                options.spawn.path.as_deref(),
+                None,
+            )
+            .await
+            .map_err(SystemError::ActorError)
         }))
     }
 }
@@ -1042,6 +1182,8 @@ mod group_publication_tests {
                 path: format!("/publication/{i}"),
                 control,
                 state: Mutex::default(),
+                runtime: system.runtime.clone(),
+                cleanup_slots: system.cleanup_slots.clone(),
             }));
             let initialized = initialized.clone();
             let dropped = dropped.clone();

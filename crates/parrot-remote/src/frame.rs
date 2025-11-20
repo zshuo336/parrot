@@ -338,7 +338,11 @@ impl Frame {
         let node = std::str::from_utf8(&payload[2..2 + nlen]).map_err(|_| bad(nlen))?;
         let alen = u16::from_le_bytes([payload[2 + nlen], payload[3 + nlen]]) as usize;
         let aoff = 2 + nlen + 2;
-        if payload.len() < aoff + alen {
+        // A route hint is a fixed-layout control payload.  Accepting bytes
+        // after the declared address would make the same frame decode
+        // differently across protocol versions and bypass strict control
+        // message validation.
+        if payload.len() != aoff + alen {
             return Err(bad(payload.len()));
         }
         let addr = std::str::from_utf8(&payload[aoff..aoff + alen]).map_err(|_| bad(alen))?;
@@ -788,10 +792,14 @@ impl Frame {
                         crate::durable::DURABLE_KEY
                             | crate::roles::directory::client::READ_KEY
                             | crate::roles::directory::client::CLIENT_KEY
+                            | crate::roles::directory::ownership::KEY
                             | crate::roles::directory::network::RAFT_KEY
                     )))
             || (self.header.flags & flags::TRACE_CONTEXT != 0
-                && !matches!(self.header.frame_type, frame_type::ASK | frame_type::TELL))
+                && !matches!(
+                    self.header.frame_type,
+                    frame_type::ASK | frame_type::TELL | frame_type::SYSTEM_EVENT
+                ))
             || (self.header.flags & flags::TELL_ACK != 0
                 && (self.header.frame_type != frame_type::TELL
                     || self.header.seq != SEQ_NONE
@@ -826,14 +834,21 @@ impl Frame {
         Ok(())
     }
 
-    /// Add a negotiated v1 causal parent before the existing business payload.
+    fn traceable_payload(&self, payload: &[u8]) -> bool {
+        matches!(self.header.frame_type, frame_type::ASK | frame_type::TELL)
+            || (self.header.frame_type == frame_type::SYSTEM_EVENT
+                && payload.first() == Some(&crate::admin::sys_event_tag::ADMIN_CMD_V2))
+    }
+
+    /// Add a negotiated v1 causal parent before the existing request payload.
+    /// Admin V2 additionally requires the management trace capability.
     /// ASK retains its reply_to prefix after this header. Batches contain one
     /// independently validated parent prefix per member, never one shared parent.
     pub fn with_trace_parent(
         mut self,
         parent: parrot_api::trace::TraceParent,
     ) -> Result<Self, FrameError> {
-        if !matches!(self.header.frame_type, frame_type::ASK | frame_type::TELL)
+        if !self.traceable_payload(&self.payload)
             || self.header.flags & (flags::BATCH | flags::TRACE_CONTEXT) != 0
         {
             return Err(FrameError::InvalidTraceContext);
@@ -860,12 +875,19 @@ impl Frame {
             return Ok((None, self.payload.clone()));
         }
         if self.header.flags & flags::BATCH != 0
-            || !matches!(self.header.frame_type, frame_type::ASK | frame_type::TELL)
+            || !matches!(
+                self.header.frame_type,
+                frame_type::ASK | frame_type::TELL | frame_type::SYSTEM_EVENT
+            )
         {
             return Err(FrameError::InvalidTraceContext);
         }
         let parent = decode_trace_parent(&self.payload)?;
-        Ok((Some(parent), self.payload.slice(TRACE_CONTEXT_BYTES..)))
+        let payload = self.payload.slice(TRACE_CONTEXT_BYTES..);
+        if !self.traceable_payload(&payload) {
+            return Err(FrameError::InvalidTraceContext);
+        }
+        Ok((Some(parent), payload))
     }
 
     /// Remove the transport extension once, retaining the validated parent for
@@ -2066,6 +2088,17 @@ mod tests {
         ));
         let frame = Frame::try_route_hint("node", "127.0.0.1:1").unwrap();
         assert_eq!(Frame::parse_route_hint(&frame.payload).unwrap().0, "node");
+    }
+
+    #[test]
+    fn route_hint_rejects_trailing_payload_bytes() {
+        let frame = Frame::try_route_hint("node", "127.0.0.1:1").unwrap();
+        let mut payload = frame.payload.to_vec();
+        payload.push(0xa5);
+        assert!(matches!(
+            Frame::parse_route_hint(&payload),
+            Err(FrameError::MalformedLengths { .. })
+        ));
     }
 
     #[test]

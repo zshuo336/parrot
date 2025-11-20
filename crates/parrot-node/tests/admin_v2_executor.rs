@@ -290,14 +290,15 @@ async fn deploy_pool_multi_instance_paths() {
             format!("/user/{name}-2"),
         ]
     );
-    // 每实例独立计数：inc 一次 → total 1（非共享）
-    for p in &paths {
+    for (index, p) in paths.iter().enumerate() {
         let r = ts.get_actor_ref(p).expect("in registry");
-        let _ = r.send(Box::new(NInc(1)) as BoxedMessage).await;
+        let value = index as u64 + 1;
+        let reply = r.send(Box::new(NInc(value)) as BoxedMessage).await.unwrap();
+        assert_eq!(*reply.downcast::<NTotal>().unwrap(), NTotal(value));
     }
-    assert_eq!(ask_total(&ts, &paths[1]).await, 1);
-    for p in &paths {
-        let _ = ts.stop_actor(p).await;
+    for (index, p) in paths.iter().enumerate() {
+        assert_eq!(ask_total(&ts, p).await, index as u64 + 1);
+        ts.stop_actor(p).await.unwrap();
     }
 }
 
@@ -318,9 +319,14 @@ async fn deploy_sharded_paths_and_kv_behavior() {
     assert_eq!(paths.len(), 2);
     // KV 行为：put/get
     let r = ts.get_actor_ref(&paths[0]).expect("in registry");
-    let _ = r
+    let reply = r
         .send(Box::new(parrot_node::NPut("k".into(), "v".into())) as BoxedMessage)
-        .await;
+        .await
+        .unwrap();
+    assert_eq!(
+        reply.downcast_ref::<parrot_node::NGot>().unwrap().0,
+        Some("v".into())
+    );
     let reply = r
         .send(Box::new(parrot_node::NGet("k".into())) as BoxedMessage)
         .await
@@ -329,8 +335,18 @@ async fn deploy_sharded_paths_and_kv_behavior() {
         reply.downcast_ref::<parrot_node::NGot>().unwrap().0,
         Some("v".into())
     );
+    let other = ts
+        .get_actor_ref(&paths[1])
+        .expect("second instance in registry");
+    let reply = other
+        .send(Box::new(parrot_node::NGet("k".into())) as BoxedMessage)
+        .await
+        .unwrap();
+    assert_eq!(reply.downcast_ref::<parrot_node::NGot>().unwrap().0, None);
+    assert_eq!(ask_total(&ts, &paths[0]).await, 1);
+    assert_eq!(ask_total(&ts, &paths[1]).await, 0);
     for p in &paths {
-        let _ = ts.stop_actor(p).await;
+        ts.stop_actor(p).await.unwrap();
     }
 }
 

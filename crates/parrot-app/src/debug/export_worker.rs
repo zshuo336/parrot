@@ -31,12 +31,14 @@ impl TraceExportConfig {
         Self {
             endpoint: endpoint.into(),
             service_name: service_name.into(),
-            capacity: 4096,
-            interval: Duration::from_secs(1),
-            request_timeout: Duration::from_secs(5),
+            capacity: parrot_config::tracing::DEFAULT_CAPACITY,
+            interval: Duration::from_millis(parrot_config::tracing::DEFAULT_INTERVAL_MS),
+            request_timeout: Duration::from_millis(
+                parrot_config::tracing::DEFAULT_REQUEST_TIMEOUT_MS,
+            ),
             retry_min: Duration::from_millis(100),
             retry_max: Duration::from_secs(30),
-            max_attempts: 8,
+            max_attempts: parrot_config::tracing::DEFAULT_MAX_ATTEMPTS,
             max_batch_bytes: 8 * 1024 * 1024,
             max_response_bytes: 64 * 1024,
             allow_insecure_http: false,

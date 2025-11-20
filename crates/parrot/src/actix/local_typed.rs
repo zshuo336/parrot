@@ -15,6 +15,7 @@ where
 {
     pub path: &'a str,
     pub parent: Option<LocalParent<'a>>,
+    pub cohort: Option<&'a crate::root_cohort::RootCohort>,
     pub repeatable: bool,
     pub erase: fn(LocalTypedActorRef<A, M>) -> parrot_api::types::BoxedActorRef,
 }
@@ -125,7 +126,7 @@ async fn run_actor<A: LocalTypedDispatch>(
         use crate::typed_supervision::Step;
         let initialization_context = inputs.creation_context.take();
         match control
-            .wait_typed_stage(parrot_api::trace::scope(initialization_context.clone(), crate::typed_supervision::guarded_stage(|| actor.init(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed))), &runtime)
+            .wait_typed_stage(parrot_api::trace::scope(initialization_context.clone(), crate::typed_supervision::recorded_lifecycle_stage(parrot_api::trace::SpanKind::ActorInit, context.path(), || actor.init(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed).with_deadline(control.initialization_deadline()))), &runtime)
             .await
         {
             Step::Stopped => return Ok(()),
@@ -139,7 +140,7 @@ async fn run_actor<A: LocalTypedDispatch>(
                     "non-repeatable parent cannot recover".into(),
                 ));
             }
-            Step::Ready(result) => result.unwrap_or_else(|message| Err(ActorError::Panic(message))).inspect_err(|_| {
+            Step::Ready(result) => result.result.unwrap_or_else(|message| Err(ActorError::Panic(message))).inspect_err(|_| {
                 control
                     .supervision_failed
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -151,12 +152,14 @@ async fn run_actor<A: LocalTypedDispatch>(
                 .wait_typed_stage(
                     parrot_api::trace::scope(
                         initialization_context.clone(),
-                        crate::typed_supervision::guarded_stage(
+                        crate::typed_supervision::recorded_lifecycle_stage(
+                            parrot_api::trace::SpanKind::ActorInitLocalStreams,
+                            context.path(),
                             || actor.init_local_streams(&context, &mut stream_context),
                             crate::typed_supervision::DispatchCleanup::new(
                                 &mut inputs.cleanup_error,
                                 &mut inputs.dispatch_cancel_failed,
-                            ),
+                            ).with_deadline(control.initialization_deadline()),
                         ),
                     ),
                     &runtime,
@@ -174,7 +177,7 @@ async fn run_actor<A: LocalTypedDispatch>(
                         "non-repeatable parent cannot recover".into(),
                     ));
                 }
-                Step::Ready(result) => result
+                Step::Ready(result) => result.result
                     .unwrap_or_else(|message| Err(ActorError::Panic(message)))
                     .inspect_err(|_| {
                         control
@@ -183,6 +186,7 @@ async fn run_actor<A: LocalTypedDispatch>(
                     })?,
             }
         }
+        control.finish_initialization();
         drop(initialization_context);
         let mut reductions = 0;
         let mut prefer_stream = true;
@@ -247,6 +251,7 @@ async fn run_actor<A: LocalTypedDispatch>(
                         &context,
                         &mut inputs.cleanup_error,
                         &mut inputs.dispatch_cancel_failed,
+                        control.message_timeout,
                     ),
                     &runtime,
                 ).await {
@@ -285,7 +290,7 @@ async fn run_actor<A: LocalTypedDispatch>(
                         crate::typed_supervision::DispatchCleanup::new(
                             &mut inputs.cleanup_error,
                             &mut inputs.dispatch_cancel_failed,
-                        ),
+                        ).with_timeout(control.message_timeout),
                     ),
                     &runtime,
                 )
@@ -337,7 +342,7 @@ async fn run_actor<A: LocalTypedDispatch>(
         tokio::select! {
             biased;
             _ = control.expired() => Err(control.enforce_deadline()),
-            result = crate::typed_supervision::guarded_stage(|| actor.before_stop(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed)) => result.unwrap_or_else(|message| Err(ActorError::Panic(message))),
+            result = parrot_api::trace::scope(control.take_stop_context(), crate::typed_supervision::recorded_lifecycle_stage(parrot_api::trace::SpanKind::ActorBeforeStop, context.path(), || actor.before_stop(&context), crate::typed_supervision::DispatchCleanup::new(&mut inputs.cleanup_error, &mut inputs.dispatch_cancel_failed))) => result.result.unwrap_or_else(|message| Err(ActorError::Panic(message))),
         }
     })
     .catch_unwind()
@@ -385,6 +390,7 @@ fn dispatch_local_event<A: LocalTypedDispatch>(
     context: &parrot_api::typed_context::TypedContext,
     cleanup_error: &mut Option<crate::error_receipt::ActorReceipt>,
     dispatch_cancel_failed: &mut bool,
+    timeout: std::time::Duration,
 ) -> impl std::future::Future<Output = ActorResult<()>> {
     let parent = event.trace_context();
     parrot_api::trace::scope(parent.as_ref().map(|parent| parent.child()), async move {
@@ -456,7 +462,8 @@ fn dispatch_local_event<A: LocalTypedDispatch>(
                 crate::typed_supervision::DispatchCleanup::new(
                     &mut guard.local_cleanup,
                     dispatch_cancel_failed,
-                ),
+                )
+                .with_timeout(timeout),
             )
             .await
             .unwrap_or_else(|message| Err(ActorError::Panic(message))),
@@ -478,7 +485,8 @@ fn dispatch_local_event<A: LocalTypedDispatch>(
                 crate::typed_supervision::DispatchCleanup::new(
                     &mut guard.local_cleanup,
                     dispatch_cancel_failed,
-                ),
+                )
+                .with_timeout(timeout),
             )
             .await
             .unwrap_or_else(|message| Err(ActorError::Panic(message))),
@@ -489,7 +497,8 @@ fn dispatch_local_event<A: LocalTypedDispatch>(
                 crate::typed_supervision::DispatchCleanup::new(
                     &mut guard.local_cleanup,
                     dispatch_cancel_failed,
-                ),
+                )
+                .with_timeout(timeout),
             )
             .await
             .unwrap_or_else(|message| Err(ActorError::Panic(message))),
@@ -508,7 +517,8 @@ fn dispatch_local_event<A: LocalTypedDispatch>(
                     crate::typed_supervision::DispatchCleanup::new(
                         &mut guard.local_cleanup,
                         dispatch_cancel_failed,
-                    ),
+                    )
+                    .with_timeout(timeout),
                 )
                 .await
                 .unwrap_or_else(|message| Err(ActorError::Panic(message)));
@@ -527,7 +537,7 @@ fn dispatch_local_event<A: LocalTypedDispatch>(
         match result {
             Ok(()) => guard.complete(streams, kind != LocalStreamEventKind::Finished),
             Err(error) => {
-                if !source_error {
+                if !source_error && guard.local_cleanup.is_none() && !*dispatch_cancel_failed {
                     let hook_error = ActorError::InternalError(error.to_string());
                     let hook = parrot_api::trace::scope(
                         parent.map(|parent| parent.child()),
@@ -538,7 +548,8 @@ fn dispatch_local_event<A: LocalTypedDispatch>(
                             crate::typed_supervision::DispatchCleanup::new(
                                 &mut guard.local_cleanup,
                                 dispatch_cancel_failed,
-                            ),
+                            )
+                            .with_timeout(timeout),
                         ),
                     )
                     .await
@@ -564,7 +575,7 @@ async fn dispatch<A: LocalTypedDispatch>(
     timeout: std::time::Duration,
     context: &parrot_api::typed_context::TypedContext,
     cleanup: crate::typed_supervision::DispatchCleanup<'_>,
-) -> Result<(), Arc<ActorError>> {
+) -> Result<(), crate::error_receipt::ActorReceipt> {
     let TypedEnvelope {
         msg,
         reply,
@@ -771,6 +782,7 @@ impl ActixActorSystem {
             policy,
             LocalSource {
                 path,
+                cohort: None,
                 parent: parent.map(|p| LocalParent {
                     scope: &p.scope,
                     identity: p.own(),
@@ -799,9 +811,29 @@ impl ActixActorSystem {
         let LocalSource {
             path,
             parent,
+            cohort,
             repeatable,
             erase,
         } = source;
+        if let Some(cohort) = cohort
+            && let Err(error) = cohort.validate(&self.root_cohorts)
+        {
+            let (factory, policy) = tokio::join!(factory.retire(), policy.retire());
+            factory.and(policy)?;
+            return Err(error);
+        }
+        let guardian = cohort.or_else(|| {
+            parent
+                .is_none()
+                .then(|| self.root_cohorts.guardian())
+                .flatten()
+        });
+        let policy = if guardian.is_some() {
+            policy.retire().await?;
+            crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots)
+        } else {
+            policy
+        };
         let receipt = factory.receipt();
         let policy_receipt = policy.receipt();
         let mut published_receipt = Some(factory.receipt());
@@ -815,12 +847,13 @@ impl ActixActorSystem {
             let (sender, receiver) = parrot_api::typed_channel::typed_channel::<LocalProtocol<A>>(
                 self.settings.mailbox_capacity,
             );
-            let (control, finished) = ActorControl::with_lifetime(
+            let (mut control, finished) = ActorControl::with_lifetime(
                 self.settings.shutdown_timeout,
                 self.settings.max_context_tasks,
                 lifetime,
                 self.policy_slots.clone(),
             );
+            ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
             let own = Arc::new(std::sync::OnceLock::new());
             let weak_stop = Arc::downgrade(&control);
             let weak_escalated = Arc::downgrade(&control);
@@ -840,14 +873,19 @@ impl ActixActorSystem {
                         }
                     }),
                     escalate: Arc::new(move |error| {
+                        let error = crate::error_receipt::ActorReceipt::new(error);
                         if let Some(control) = weak_escalated.upgrade()
                             && !control.channel.is_sealed()
                         {
                             let mut signal = control.escalated.lock().unwrap();
-                            signal.get_or_insert(error);
-                            control
-                                .begin_construction(tokio::time::Instant::now() + control.timeout);
+                            if signal.is_none() {
+                                *signal = Some(error.clone());
+                            }
+                            control.begin_construction_quiet(
+                                tokio::time::Instant::now() + control.timeout,
+                            );
                             drop(signal);
+                            control.construction_changed();
                             control.typed_escalation_changed.notify_waiters();
                         }
                     }),
@@ -868,7 +906,8 @@ impl ActixActorSystem {
                         if control.channel.is_sealed() {
                             group.abort("Local factory member is stopping");
                         }
-                        control.begin_construction(group.deadline);
+                        control.begin_construction_quiet(group.deadline);
+                        control.construction_changed();
                         control.typed_escalation_changed.notify_waiters();
                     } else {
                         group.abort("Local factory member owner disappeared");
@@ -914,10 +953,10 @@ impl ActixActorSystem {
             let source_policy = policy.take().expect("one admitted local policy");
             let task_control = control.clone();
             let runtime = self.runtime.clone();
-            if !self.arbiter_pool().next_arbiter().spawn_fn(move || {
+            if !self.arbiter_pool().reserve_arbiter().spawn_fn(move || {
                 // spawn_fn transfers a Send closure; the !Send future is
                 // created only after that closure arrives on the owner.
-                actix::spawn(async move {
+                async move {
                     let exit = std::panic::AssertUnwindSafe(run_source(
                         queued,
                         source,
@@ -945,7 +984,7 @@ impl ActixActorSystem {
                         },
                     };
                     let _ = result_tx.send(exit);
-                });
+                }
             }) {
                 return Err(ActorError::InternalError(
                     "Actix arbiter rejected local actor execution".into(),
@@ -975,9 +1014,13 @@ impl ActixActorSystem {
             );
             Ok(actor_ref)
         };
-        let admission = if let Some(parent) = &parent {
+        let scope = parent
+            .as_ref()
+            .map(|parent| parent.scope)
+            .or_else(|| guardian.map(|guardian| &guardian.scope));
+        let admission = if let Some(scope) = scope {
             let mut reference = None;
-            let result = parent.scope.spawn(|lifetime| {
+            let result = scope.spawn(|lifetime| {
                 let actor = admit(Some(lifetime.clone()))?;
                 let erased = erase(actor.clone());
                 let stop = erased.clone_boxed();

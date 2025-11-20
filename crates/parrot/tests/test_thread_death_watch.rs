@@ -350,16 +350,16 @@ async fn real_context_watches_cross_both_engine_directions() {
 
 struct BlockingDrop {
     entered: Arc<tokio::sync::Notify>,
+    exited: Arc<std::sync::atomic::AtomicBool>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 impl Drop for BlockingDrop {
     fn drop(&mut self) {
         self.entered.notify_one();
-        let _ = self
-            .release
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(3));
+        // Disconnect also releases cleanup if the test unwinds. Elapsed wall
+        // time must never release the actor before the assertions do.
+        let _ = self.release.lock().unwrap().recv();
+        self.exited.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 impl Actor for BlockingDrop {
@@ -380,19 +380,27 @@ impl Actor for BlockingDrop {
 async fn common_notification_waits_for_actual_disposal_after_stop_timeout() {
     use parrot_api::address::ActorRef;
     for mode in modes() {
+        let sharded = matches!(&mode, SchedulingMode::Sharded { .. });
         let sys = ThreadActorSystem::shared(ThreadActorSystemConfig {
             default_scheduling_mode: mode,
             shutdown_timeout: Duration::from_millis(60),
             shared_pool_size: 2,
             ..Default::default()
         });
+        // Lazy shard thread startup is setup, outside the 60 ms actor creation
+        // deadline; the stop deadline under test is unchanged.
+        if sharded {
+            sys.scheduler_group().try_sharded().unwrap();
+        }
         let (watcher, mut events) = spawn(&sys, "/watcher").await;
         let entered = Arc::new(tokio::sync::Notify::new());
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (release, gate) = std::sync::mpsc::channel();
         let target = sys
             .spawn_at(
                 BlockingDrop {
                     entered: entered.clone(),
+                    exited: exited.clone(),
                     release: std::sync::Mutex::new(gate),
                 },
                 "/target",
@@ -412,14 +420,19 @@ async fn common_notification_waits_for_actual_disposal_after_stop_timeout() {
             .await
             .unwrap();
         assert!(matches!(
-            stop.await.unwrap(),
+            tokio::time::timeout(Duration::from_secs(1), stop)
+                .await
+                .expect("stop must publish its timeout while disposal is blocked")
+                .unwrap(),
             Err(parrot_api::errors::ActorError::TimeoutDetail(_))
         ));
+        assert!(!exited.load(std::sync::atomic::Ordering::SeqCst));
         assert!(sys.get_actor_ref("/target").is_some());
         assert!(events.try_recv().is_err());
         assert_eq!(target.death_watch().unwrap().subscriptions().0, 1);
         release.send(()).unwrap();
         let notice = event(&mut events).await;
+        assert!(exited.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(notice.generation, target.death_watch().unwrap().id());
         assert!(matches!(notice.reason, parrot_api::DeathReason::Normal));
         tokio::time::timeout(Duration::from_secs(1), async {

@@ -1,10 +1,17 @@
+mod dispatch_input;
+mod dispatch_outcome;
 mod execution;
+use dispatch_input::DispatchInput;
+use dispatch_outcome::DispatchOutcome;
+#[cfg(test)]
+mod failure_contracts;
+mod initialization;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{debug, error};
 
-use parrot_api::actor::Actor;
+use parrot_api::actor::{Actor, ActorState};
 use parrot_api::errors::ActorError;
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 
@@ -14,6 +21,7 @@ use crate::thread::context::ThreadContext;
 use crate::thread::envelope::ControlMessage;
 use crate::thread::error::SystemError;
 use crate::thread::mailbox::Mailbox;
+use crate::thread::stage::{StageCleanup, StageFailures};
 
 use std::any::Any;
 use std::panic;
@@ -24,7 +32,7 @@ mod batch;
 
 #[derive(Debug)]
 struct RecordedFailure {
-    error: Arc<ActorError>,
+    error: crate::error_receipt::ActorReceipt,
     context: Option<parrot_api::trace::TraceContext>,
 }
 
@@ -143,13 +151,16 @@ pub trait ProcessorInterface: ProcessorStatsTrait + Any + Send + Sync + 'static 
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
     /// Pause a generation for its first pending descendant escalation.
-    fn begin_escalation(&self, _error: Arc<ActorError>) -> bool {
+    fn begin_escalation(&self, error: Arc<ActorError>) -> bool {
+        drop(crate::error_receipt::ActorReceipt::new(error));
         false
     }
     /// Continue the same generation after its live escalation decision.
     fn resume_after_escalation(&self, _error: &Arc<ActorError>) {}
     /// A non-resumable escalation makes the normal stop hook inapplicable.
-    fn fail_from_escalation(&self, _error: Arc<ActorError>) {}
+    fn fail_from_escalation(&self, error: Arc<ActorError>) {
+        drop(crate::error_receipt::ActorReceipt::new(error));
+    }
 
     /// Cancel suspended execution without cancelling unrelated actors.
     fn cancel_processing(&self) {}
@@ -236,6 +247,7 @@ where
     cancelled: AtomicBool,
     cancel_notify: tokio::sync::Notify,
     executions: Arc<execution::Executions>,
+    stage_failures: Arc<StageFailures>,
     children: Arc<crate::children::ChildScope>,
     group_activation: Option<Arc<crate::children::recovery::Recovery>>,
     retired: tokio::sync::watch::Sender<Option<crate::thread::system::StopOutcome>>,
@@ -245,14 +257,56 @@ impl<A> ActorProcessor<A>
 where
     A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
-    /// Create a new Actor processor
+    /// Construct a processor, panicking after input cleanup for invalid config.
+    /// Use `try_new` to receive configuration and disposal errors.
     pub fn new(
         actor: ThreadActor<A>,
         context: ThreadContext<A>,
         path: String,
         config: ThreadActorConfig,
     ) -> Self {
-        Self {
+        Self::try_new(actor, context, path, config).expect("invalid actor processor configuration")
+    }
+
+    /// Validate explicit overrides before retaining inputs or initializing the
+    /// actor. Rejection synchronously retires each input independently. A user
+    /// disposal panic is returned as `Panic`, retaining the configuration reason.
+    pub fn try_new(
+        actor: ThreadActor<A>,
+        context: ThreadContext<A>,
+        path: String,
+        config: ThreadActorConfig,
+    ) -> Result<Self, SystemError> {
+        let mut actor = crate::owned_payload::PublicationInput::new(actor);
+        let mut context = crate::owned_payload::PublicationInput::new(context);
+        let mut config = crate::owned_payload::PublicationInput::new(config);
+        if let Err(error) = config.value().validate() {
+            let reason = error.to_string();
+            let failures: Vec<_> = [
+                ("actor", actor.retire()),
+                ("context", context.retire()),
+                ("configuration", config.retire()),
+            ]
+            .into_iter()
+            .filter_map(|(input, result)| {
+                result.err().map(|error| {
+                    format!("{input}: {}", crate::error_receipt::actor_summary(&error))
+                })
+            })
+            .collect();
+            if !failures.is_empty() {
+                return Err(SystemError::Panic(format!(
+                    "invalid processor configuration: {reason}; {}",
+                    failures.join("; ")
+                )));
+            }
+            return Err(SystemError::ConfigError(reason));
+        }
+        let actor = actor.take();
+        let context = context.take();
+        let config = config.take();
+        Ok(Self {
+            stage_failures: actor.stage_failures.clone(),
             system: context.system_weak_ref(),
             mailbox: context.generation_mailbox(),
             tasks: context.tasks(),
@@ -272,7 +326,7 @@ where
             retired: tokio::sync::watch::channel(None).0,
             executions: Arc::default(),
             group_activation: None,
-        }
+        })
     }
 
     pub(crate) fn with_group_activation(
@@ -316,6 +370,21 @@ where
             let context = context_slot
                 .as_mut()
                 .ok_or_else(|| SystemError::ActorNotFound(self.path.clone()))?;
+            if self.get_status() != ProcessorStatus::Initializing
+                || self.cancelled.load(Ordering::Acquire)
+                || self.message_failed()
+                || actor.initialization_complete()
+                || actor.state() != ActorState::Starting
+            {
+                return Err(SystemError::WorkerStateError(format!(
+                    "actor at {} cannot initialize: processor={:?}, actor={:?}, initialized={}",
+                    self.path,
+                    self.get_status(),
+                    actor.state(),
+                    actor.initialization_complete()
+                )));
+            }
+            let attempt = initialization::InitializationAttempt::new(self);
             use futures::FutureExt;
             let initialized = AssertUnwindSafe(async { actor.initialize(context).await })
                 .catch_unwind()
@@ -337,9 +406,14 @@ where
                     self.path,
                     crate::error_receipt::actor_summary(&e)
                 );
-                self.record_failure(Arc::new(e));
+                let failed_context = actor
+                    .take_initialization_failure_context()
+                    .unwrap_or_else(parrot_api::trace::TraceContext::current);
+                parrot_api::trace::in_scope(failed_context, || self.record_failure(Arc::new(e)));
+                attempt.finish();
                 return Err(SystemError::ActorCreationError(message));
             }
+            attempt.finish();
             Ok(())
         })
         .await
@@ -357,18 +431,55 @@ where
         let context = context_slot
             .as_mut()
             .ok_or_else(|| SystemError::ActorNotFound(self.path.clone()))?;
-        if let Err(e) = actor.process_message(start_msg, context).await {
-            error!("Failed to start actor at {}: {}", self.path, e);
-            self.status
-                .store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
-            self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
-            return Err(SystemError::ActorCreationError(format!(
-                "Failed to start actor at {}: {}",
-                self.path, e
+        let status = self.get_status();
+        if self.cancelled.load(Ordering::Acquire) || self.message_failed() {
+            return Err(SystemError::WorkerStateError(format!(
+                "actor at {} cannot start after cancellation or failure",
+                self.path
             )));
         }
+        if status == ProcessorStatus::Running && actor.state() == ActorState::Running {
+            return Ok(());
+        }
+        if status != ProcessorStatus::Initializing
+            || actor.state() != ActorState::Starting
+            || !actor.initialization_complete()
+        {
+            return Err(SystemError::WorkerStateError(format!(
+                "actor at {} cannot start: processor={:?}, actor={:?}, initialized={}",
+                self.path,
+                status,
+                actor.state(),
+                actor.initialization_complete()
+            )));
+        }
+        if let Err(e) = actor.process_message(start_msg, context).await {
+            let message = format!(
+                "Failed to start actor at {}: {}",
+                self.path,
+                crate::error_receipt::actor_summary(&e)
+            );
+            error!("{message}");
+            self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
+            self.record_failure(Arc::new(e));
+            return Err(SystemError::ActorCreationError(message));
+        }
+        // Stop/failure/cancellation can be admitted without the actor lock. Publish Running
+        // only if that status has not already changed.
         self.status
-            .store(ProcessorStatus::Running as usize, Ordering::SeqCst);
+            .compare_exchange(
+                ProcessorStatus::Initializing as usize,
+                ProcessorStatus::Running as usize,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map_err(|status| {
+                SystemError::WorkerStateError(format!(
+                    "actor at {} activation was superseded by {:?}",
+                    self.path,
+                    ProcessorStatus::from_usize(status)
+                ))
+            })?;
         Ok(())
     }
 
@@ -406,7 +517,12 @@ where
             self.status
                 .store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
             self.stats.errors_encountered.fetch_add(1, Ordering::SeqCst);
-            return Err(SystemError::Other(anyhow::Error::new(e)));
+            return Err(match e {
+                ActorError::Panic(message) => {
+                    SystemError::Panic(format!("actor {} stop hook panicked: {message}", self.path))
+                }
+                error => SystemError::Other(anyhow::Error::new(error)),
+            });
         }
         self.status
             .store(ProcessorStatus::Stopped as usize, Ordering::SeqCst);
@@ -439,10 +555,15 @@ where
             .map_err(|error| SystemError::Panic(panic_message(error, &self.path)));
         let context_drop = panic::catch_unwind(AssertUnwindSafe(|| drop(context.take())))
             .map_err(|error| SystemError::Panic(panic_message(error, &self.path)));
+        let stages = self.stage_failures.result().map_err(|error| match error {
+            ActorError::Panic(message) => SystemError::Panic(message),
+            error => SystemError::Other(anyhow::Error::new(error)),
+        });
         self.status
             .store(ProcessorStatus::Stopped as usize, Ordering::SeqCst);
         let outcome = crate::thread::system::StopOutcome::from_result(
-            actor_drop
+            stages
+                .and(actor_drop)
                 .and(context_drop)
                 .and(executions)
                 .and(tasks)
@@ -467,53 +588,59 @@ where
     ///
     /// M5: returns the actor's reply payload (previously discarded; the
     /// by-value ask path needs it to fill the inline reply channel).
-    async fn process_message(&self, msg: BoxedMessage) -> ActorResult<BoxedMessage> {
+    fn process_message(
+        &self,
+        msg: BoxedMessage,
+    ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + Send {
         let (msg, parent) = crate::thread::envelope::TraceEnvelope::unpack(msg);
         let parent = parent.or_else(|| {
             msg.downcast_ref::<crate::thread::envelope::AskEnvelope>()
                 .and_then(|envelope| envelope.trace_context.clone())
         });
         self.process_message_with_context(msg, parent.map(|parent| parent.child()))
-            .await
     }
 
-    async fn process_message_with_context(
+    fn process_message_with_context(
         &self,
         msg: BoxedMessage,
         context: Option<parrot_api::trace::TraceContext>,
-    ) -> ActorResult<BoxedMessage> {
-        parrot_api::trace::scope(context, self.process_message_inner(msg)).await
+    ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + Send {
+        let msg = DispatchInput::new(msg, &self.stage_failures, &self.executions);
+        parrot_api::trace::scope(context, self.process_message_inner(msg))
     }
 
-    async fn process_message_inner(&self, msg: BoxedMessage) -> ActorResult<BoxedMessage> {
+    async fn process_message_inner(&self, mut msg: DispatchInput) -> ActorResult<BoxedMessage> {
         self.escalation.ready().await;
-        if self.get_status() != ProcessorStatus::Running {
-            return Err(ActorError::MessageHandlingError(format!(
-                "Actor at {} is not running, current status: {:?}",
-                self.path,
-                self.get_status()
-            )));
+        if !self.dispatch_allowed() {
+            return Err(self.reject_dispatch(msg.take()));
         }
 
-        let engine_control = msg.is::<crate::thread::envelope::ControlMessage>();
+        let engine_control = msg.value().is::<crate::thread::envelope::ControlMessage>();
         let mut actor_slot = self.actor.lock().await;
         let mut context_slot = self.context.lock().await;
+        if !self.dispatch_allowed() {
+            drop(context_slot);
+            drop(actor_slot);
+            return Err(self.reject_dispatch(msg.take()));
+        }
         let actor = actor_slot.as_mut().ok_or_else(|| ActorError::Stopped)?;
         let context = context_slot.as_mut().ok_or_else(|| ActorError::Stopped)?;
 
-        let recording = parrot_api::trace::SpanGuard::current(
+        let mut cleanup = StageCleanup::new(self.stage_failures.clone());
+        cleanup.recording = Some(parrot_api::trace::SpanGuard::current(
             parrot_api::trace::SpanKind::DynamicHandler,
             &self.path,
-        );
+        ));
         // Build the future first; `process_message` itself does not run user code,
         // the returned future does. Catch panics that occur while polling it.
         let fut = {
+            let message = msg.take();
             let result =
-                panic::catch_unwind(AssertUnwindSafe(|| actor.process_message(msg, context)));
+                panic::catch_unwind(AssertUnwindSafe(|| actor.process_message(message, context)));
             match result {
                 Ok(fut) => fut,
                 Err(panic_error) => {
-                    recording.finish(parrot_api::trace::SpanStatus::Panicked);
+                    cleanup.finish_recording(parrot_api::trace::SpanStatus::Panicked);
                     let error_msg = panic_message(panic_error, &self.path);
                     error!("{}", error_msg);
                     return Err(self
@@ -542,7 +669,7 @@ where
             }
         };
 
-        recording.finish_result(&awaited);
+        cleanup.finish_recording(parrot_api::trace::SpanStatus::from_result(&awaited));
         self.stats.messages_processed.fetch_add(1, Ordering::SeqCst);
         match awaited {
             Ok(reply) => Ok(reply),
@@ -563,10 +690,35 @@ where
     }
 
     fn message_failed(&self) -> bool {
-        self.failure_cause.lock().unwrap().is_some()
+        self.stage_failures.failed() || self.failure_cause.lock().unwrap().is_some()
+    }
+    fn dispatch_allowed(&self) -> bool {
+        self.get_status() == ProcessorStatus::Running
+            && !self.cancelled.load(Ordering::Acquire)
+            && !self.message_failed()
+    }
+    // A dequeued request owns its payload even when lifecycle admission closes.
+    // Call outside execution locks: rejection can run arbitrary user Drop code.
+    fn reject_dispatch(&self, message: BoxedMessage) -> ActorError {
+        match crate::owned_payload::PublicationInput::new(message).retire() {
+            Ok(()) => ActorError::Stopped,
+            Err(error) => {
+                let failure = Arc::new(ActorError::Panic(format!(
+                    "rejected dispatch at {} disposal failed: {}",
+                    self.path,
+                    crate::error_receipt::actor_summary(&error)
+                )));
+                self.record_failure(failure.clone());
+                crate::supervision_policy::reply_error(failure)
+            }
+        }
     }
     async fn supervise_message_error(&self, error: ActorError) -> ActorError {
         let error = Arc::new(error);
+        if self.stage_failures.failed() {
+            self.record_failure(error.clone());
+            return crate::supervision_policy::reply_error(error);
+        }
         let mut resume = false;
         if let (Some(system), Some(expected)) = (
             self.system.upgrade(),
@@ -594,7 +746,7 @@ where
                         error.clone(),
                         tokio::time::Instant::now() + system.config().shutdown_timeout,
                         matches!(fallback, crate::thread::config::SupervisorStrategy::Resume),
-                        &system.runtime_handle,
+                        system.retirement_runtime(),
                     )
                     .await;
             }
@@ -618,12 +770,24 @@ where
         max_messages: usize,
         yield_after_each_message: bool,
     ) -> Result<(usize, usize), SystemError> {
+        // The worker's turn budget and the actor's explicit/inherited budget
+        // both apply, including opt-in business batches.
+        let max_messages = match &self.config.scheduling_mode {
+            Some(crate::thread::config::SchedulingMode::SharedPool {
+                max_messages_per_run,
+            }) => max_messages.min(*max_messages_per_run),
+            _ => max_messages,
+        };
+        let yield_after_each_message = self
+            .config
+            .yield_after_each_message
+            .unwrap_or(yield_after_each_message);
         if self.config.message_batch_size.unwrap_or(1) > 1 {
             return self
                 .process_coalesced(mailbox, max_messages, yield_after_each_message)
                 .await;
         }
-        if self.get_status() != ProcessorStatus::Running {
+        if !self.dispatch_allowed() {
             return Err(SystemError::WorkerStateError(format!(
                 "Actor at {} is not running, current status: {:?}",
                 self.path,
@@ -661,7 +825,7 @@ where
         let _ = budget_exhausted_hint; // worker consults consecutive_reductions() directly
 
         for _ in 0..effective_max {
-            if self.get_status() != ProcessorStatus::Running || mailbox.is_closed().await {
+            if !self.dispatch_allowed() || mailbox.is_closed().await {
                 break;
             }
 
@@ -692,9 +856,10 @@ where
                     processed += 1;
                     match outcome {
                         Ok(resp) => {
-                            if let Some(reply) = reply {
-                                let _ = reply.send(Ok(resp));
-                            }
+                            self.publish_dispatch_outcome(
+                                DispatchOutcome::new(Ok(resp), &self.stage_failures),
+                                reply,
+                            )?;
                             self.consecutive_reductions.fetch_add(1, Ordering::Relaxed);
                             if yield_after_each_message {
                                 tokio::task::yield_now().await;
@@ -703,9 +868,10 @@ where
                         Err(e) => {
                             let must_retire = self.message_failed();
                             let repr = crate::error_receipt::actor_summary(&e);
-                            if let Some(reply) = reply {
-                                let _ = reply.send(Err(e));
-                            }
+                            self.publish_dispatch_outcome(
+                                DispatchOutcome::new(Err(e), &self.stage_failures),
+                                reply,
+                            )?;
                             error_count += 1;
                             if must_retire {
                                 return Err(SystemError::WorkerStateError(repr));
@@ -715,7 +881,11 @@ where
                 }
                 Some(crate::thread::mailbox::MailboxItem::Plain(msg)) => {
                     match self.process_message(msg).await {
-                        Ok(_) => {
+                        Ok(reply) => {
+                            self.publish_dispatch_outcome(
+                                DispatchOutcome::new(Ok(reply), &self.stage_failures),
+                                None,
+                            )?;
                             processed += 1;
                             self.consecutive_reductions.fetch_add(1, Ordering::Relaxed);
                             if yield_after_each_message {
@@ -726,10 +896,14 @@ where
                             processed += 1;
                             error_count += 1;
                             // A non-resumable failure aborts this scheduler run.
-                            if self.message_failed() {
-                                return Err(SystemError::WorkerStateError(
-                                    crate::error_receipt::actor_summary(&e),
-                                ));
+                            let failed = self.message_failed();
+                            let reason = failed.then(|| crate::error_receipt::actor_summary(&e));
+                            self.publish_dispatch_outcome(
+                                DispatchOutcome::new(Err(e), &self.stage_failures),
+                                None,
+                            )?;
+                            if let Some(reason) = reason {
+                                return Err(SystemError::WorkerStateError(reason));
                             }
                         }
                     }
@@ -757,28 +931,30 @@ where
 
     /// M3 supervision hook: notify the owning system that this actor
     /// panicked. Called by the worker after a caught panic; the supervision
-    /// executor (restart / stop / escalate) runs detached on the system
-    /// runtime so the worker loop never blocks on the decision.
+    /// executor (restart / stop / escalate) runs on the lifecycle runtime,
+    /// independently of the business worker and the creation host.
     fn record_failure(&self, error: Arc<ActorError>) {
         // The worker notifies supervision after the handler's scope has exited.
-        self.failure_cause
-            .lock()
-            .unwrap()
-            .get_or_insert_with(|| RecordedFailure {
-                error,
+        let error = crate::error_receipt::ActorReceipt::new(error);
+        {
+            let mut failure = self.failure_cause.lock().unwrap();
+            failure.get_or_insert_with(|| RecordedFailure {
+                error: error.clone(),
                 context: parrot_api::trace::TraceContext::current(),
             });
-        // Releasing the scheduler slot can race with another producer before
-        // the detached retirement owner seals the mailbox. Stop execution now.
-        self.status
-            .store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
+            // Seal dispatch before a discarded error can reenter the processor.
+            self.status
+                .store(ProcessorStatus::Failed as usize, Ordering::SeqCst);
+        }
+        // The rejected receipt may be the final owner of arbitrary user code.
+        drop(error);
     }
 
     pub(crate) fn notify_system_panic(&self, panic_msg: String) {
         if let (Some(system), Some(mailbox)) = (self.system.upgrade(), self.mailbox.clone()) {
             let (error, context) = self.failure_cause.lock().unwrap().as_ref().map_or_else(
                 || (Arc::new(ActorError::Panic(panic_msg)), None),
-                |failure| (failure.error.clone(), failure.context.clone()),
+                |failure| (failure.error.error().clone(), failure.context.clone()),
             );
             parrot_api::trace::in_scope(context, || {
                 system.runtime_spawn_supervision(self.path.clone(), mailbox, error);
@@ -856,9 +1032,10 @@ where
     A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
 {
     fn begin_escalation(&self, error: Arc<ActorError>) -> bool {
+        let error = crate::error_receipt::ActorReceipt::new(error);
         !self.cancelled.load(Ordering::Acquire)
             && !self.message_failed()
-            && self.escalation.begin(error)
+            && self.escalation.begin(error.error().clone())
     }
     fn resume_after_escalation(&self, error: &Arc<ActorError>) {
         if !self.cancelled.load(Ordering::Acquire) && !self.message_failed() {
@@ -885,6 +1062,14 @@ where
         self.children.close();
         self.tasks.close();
         self.cancelled.store(true, Ordering::Release);
+        // Seal startup admission before announcing cancellation. A Start that
+        // already committed Running is ordered before this cancellation.
+        let _ = self.status.compare_exchange(
+            ProcessorStatus::Initializing as usize,
+            ProcessorStatus::Stopping as usize,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         self.cancel_notify.notify_waiters();
     }
 
@@ -1319,6 +1504,183 @@ mod tests {
         let processor = make_processor();
         assert!(processor.self_ref().await.is_none());
     }
+
+    // Tracing callsite interest is process-global. Each boundary probe needs
+    // its own process so parallel subscribers cannot disable its callback.
+    fn isolated_activation_probe(name: &str) -> bool {
+        const FLAG: &str = "PARROT_ACTIVATION_BOUNDARY_PROBE";
+        if std::env::var(FLAG).as_deref() == Ok(name) {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(FLAG, name)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "activation boundary probe failed: {status}"
+                );
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("activation boundary probe deadlocked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_commit_cannot_overwrite_stop_admitted_during_start() {
+        if isolated_activation_probe(
+            concat!(
+                module_path!(),
+                "::activation_commit_cannot_overwrite_stop_admitted_during_start"
+            )
+            .strip_prefix("parrot::")
+            .unwrap(),
+        ) {
+            return;
+        }
+        use std::task::{Context, Poll};
+        use tracing_subscriber::prelude::*;
+
+        type PendingStop =
+            Arc<std::sync::Mutex<Option<BoxedProcessorFuture<Result<(), SystemError>>>>>;
+        // Admit a real Stop after ThreadActor activates but before the processor
+        // commits Running. Its future waits for the same actor lock.
+        struct AdmitStop {
+            processor: Arc<ActorProcessor<TestActor>>,
+            pending: PendingStop,
+            fired: Arc<AtomicBool>,
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdmitStop {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "parrot::thread::actor"
+                    || *event.metadata().level() != tracing::Level::INFO
+                    || self.fired.swap(true, Ordering::SeqCst)
+                {
+                    return;
+                }
+                let processor = self.processor.clone();
+                let mut stop: BoxedProcessorFuture<Result<(), SystemError>> =
+                    Box::pin(async move { processor.stop_actor().await });
+                assert!(
+                    stop.as_mut()
+                        .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                        .is_pending()
+                );
+                *self.pending.lock().unwrap() = Some(stop);
+            }
+        }
+
+        let processor = make_processor();
+        processor.initialize_actor().await.unwrap();
+        let pending: PendingStop = Arc::default();
+        let fired = Arc::new(AtomicBool::new(false));
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::Registry::default().with(AdmitStop {
+                processor: processor.clone(),
+                pending: pending.clone(),
+                fired: fired.clone(),
+            }));
+        let mut start = Box::pin(processor.start_actor());
+        let outcome = tracing::dispatcher::with_default(&dispatch, || {
+            start
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+        });
+        drop(start);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "Start activation boundary was not observed"
+        );
+        let stop = pending
+            .lock()
+            .unwrap()
+            .take()
+            .expect("real Stop was not polled");
+        let while_stopping = processor.get_status();
+        tokio::time::timeout(std::time::Duration::from_secs(5), stop)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(outcome, Poll::Ready(Err(_))),
+            "Start overwrote an admitted Stop: {outcome:?}"
+        );
+        assert_eq!(while_stopping, ProcessorStatus::Stopping);
+        assert_eq!(processor.get_status(), ProcessorStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn activation_commit_cannot_overwrite_cancellation_admitted_during_start() {
+        if isolated_activation_probe(
+            concat!(
+                module_path!(),
+                "::activation_commit_cannot_overwrite_cancellation_admitted_during_start"
+            )
+            .strip_prefix("parrot::")
+            .unwrap(),
+        ) {
+            return;
+        }
+        use std::task::{Context, Poll};
+        use tracing_subscriber::prelude::*;
+
+        struct CancelOnActivation {
+            processor: Arc<ActorProcessor<TestActor>>,
+            fired: Arc<AtomicBool>,
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CancelOnActivation {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == "parrot::thread::actor"
+                    && *event.metadata().level() == tracing::Level::INFO
+                    && !self.fired.swap(true, Ordering::SeqCst)
+                {
+                    self.processor.cancel_processing();
+                }
+            }
+        }
+        let processor = make_processor();
+        processor.initialize_actor().await.unwrap();
+        let fired = Arc::new(AtomicBool::new(false));
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::Registry::default().with(
+            CancelOnActivation {
+                processor: processor.clone(),
+                fired: fired.clone(),
+            },
+        ));
+        let mut start = Box::pin(processor.start_actor());
+        let outcome = tracing::dispatcher::with_default(&dispatch, || {
+            start
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+        });
+        drop(start);
+        assert!(fired.load(Ordering::SeqCst), "activation was not observed");
+        let after_cancel = processor.get_status();
+        processor.stop_actor().await.unwrap();
+        assert!(
+            matches!(outcome, Poll::Ready(Err(_))),
+            "Start overwrote an admitted cancellation: {outcome:?}"
+        );
+        assert_eq!(after_cancel, ProcessorStatus::Stopping);
+        assert_eq!(processor.get_status(), ProcessorStatus::Stopped);
+    }
 }
 
 #[cfg(test)]
@@ -1512,25 +1874,60 @@ mod recursive_panic_tests {
     }
     #[tokio::test]
     async fn initialization_secondary_panic_preserves_error_and_storage_retirement() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let processor = ActorProcessor::new(
-            ThreadActor::new_for_test(Probe(drops.clone())),
-            ThreadContext::new_for_test("/recursive-init"),
-            "/recursive-init".into(),
-            Default::default(),
-        );
-        let result = processor.initialize_and_start().await;
-        let Err(SystemError::ActorCreationError(message)) = result else {
-            panic!("wrong initialization outcome: {result:?}");
-        };
-        assert!(
-            message.contains("/recursive-init")
-                && message.contains("panic payload destructor panicked"),
-            "{message}"
-        );
-        assert_eq!(processor.get_status(), ProcessorStatus::Failed);
-        processor.retire_storage().await.unwrap();
-        processor.retire_storage().await.unwrap();
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        use parrot_api::trace::{SpanKind, SpanStatus, TraceContext, TraceRecorder};
+        for traced in [true, false] {
+            let recorder = TraceRecorder::new(2).unwrap();
+            let root = recorder.root();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let processor = parrot_api::trace::in_scope(traced.then(|| root.clone()), || {
+                ActorProcessor::new(
+                    ThreadActor::new_for_test(Probe(drops.clone())),
+                    ThreadContext::new_for_test("/recursive-init"),
+                    "/recursive-init".into(),
+                    Default::default(),
+                )
+            });
+            let result = TraceContext::root()
+                .scope(processor.initialize_and_start())
+                .await;
+            let Err(SystemError::ActorCreationError(message)) = result else {
+                panic!("wrong initialization outcome: {result:?}");
+            };
+            assert!(
+                message.contains("/recursive-init")
+                    && message.contains("panic payload destructor panicked"),
+                "{message}"
+            );
+            assert_eq!(processor.get_status(), ProcessorStatus::Failed);
+            processor.retire_storage().await.unwrap();
+            processor.retire_storage().await.unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            recorder.close();
+            let snapshot = recorder.drain();
+            assert!(snapshot.terminal);
+            assert_eq!(snapshot.records.len(), usize::from(traced));
+            let failure = processor
+                .failure_cause
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .context
+                .clone();
+            if traced {
+                let record = &snapshot.records[0];
+                assert_eq!(record.kind, SpanKind::ActorInit);
+                assert_eq!(record.status, SpanStatus::Panicked);
+                assert_eq!(record.parent_span_id, Some(root.span_id()));
+                let failure = failure.unwrap();
+                assert_eq!(failure.span_id(), record.span_id);
+                assert_eq!(failure.trace_id(), record.trace_id);
+            } else {
+                assert!(
+                    failure.is_none(),
+                    "untraced initialization must erase the poller's context"
+                );
+            }
+        }
     }
 }

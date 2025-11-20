@@ -1,3 +1,4 @@
+use futures::{StreamExt, stream::FuturesUnordered};
 use std::fmt;
 use std::sync::{
     Arc,
@@ -16,12 +17,15 @@ use crate::thread::scheduler::ThreadScheduler;
 use crate::thread::scheduler::queue::SchedulingQueue;
 
 #[cfg(test)]
+#[path = "configuration_contracts.rs"]
+mod configuration_contracts;
+#[cfg(test)]
 #[path = "shutdown_contracts.rs"]
 mod shutdown_contracts;
 
 #[path = "shutdown.rs"]
 mod shutdown;
-use shutdown::{Failures, Receipt};
+use shutdown::{Failures, MailboxClose, Receipt};
 
 /// Configuration for the shared thread pool
 #[derive(Debug, Clone)]
@@ -31,6 +35,9 @@ pub struct SharedThreadPoolConfig {
 
     /// Maximum resident ready entries shared by both priority lanes
     pub max_queue_capacity: usize,
+    /// Worker-local FIFO requeues and stealing; false keeps central FIFO selection.
+    /// The capacity is shared across global, high-priority and local ready entries.
+    pub work_stealing: bool,
 
     /// Maximum number of messages to process in one batch
     pub max_messages_per_batch: usize,
@@ -55,6 +62,7 @@ pub struct SharedThreadPoolConfig {
 
     /// Elastic-scaling: how long the queue must stay backlogged (with no
     /// idle core worker) before a burst worker is spawned.
+    /// Compared in whole microseconds without narrowing the duration.
     pub burst_backlog_threshold: Duration,
 
     /// Elastic-scaling: how long a burst worker idles before exiting.
@@ -66,6 +74,7 @@ impl Default for SharedThreadPoolConfig {
         Self {
             pool_size: num_cpus::get(),
             max_queue_capacity: 10000,
+            work_stealing: false,
             max_messages_per_batch: 10,
             idle_sleep_duration: Duration::from_millis(10),
             yield_after_each_message: false,
@@ -77,6 +86,56 @@ impl Default for SharedThreadPoolConfig {
             burst_backlog_threshold: Duration::from_millis(100),
             burst_idle_timeout: Duration::from_secs(5),
         }
+    }
+}
+
+impl SharedThreadPoolConfig {
+    /// Check the direct scheduler boundary before queues or tasks are created.
+    pub fn validate(&self) -> Result<(), SystemError> {
+        use crate::thread::scheduler::configuration::{count, duration};
+        use parrot_config::ThreadResolved;
+        for (key, value, maximum) in [
+            (
+                "scheduler.shared.pool_size",
+                self.pool_size,
+                ThreadResolved::MAX_WORKERS,
+            ),
+            (
+                "scheduler.shared.max_queue_capacity",
+                self.max_queue_capacity,
+                ThreadResolved::MAX_QUEUE_CAPACITY,
+            ),
+            (
+                "scheduler.shared.max_messages_per_batch",
+                self.max_messages_per_batch,
+                super::super::MAX_MESSAGES_PER_BATCH,
+            ),
+        ] {
+            count(key, value, 1, maximum)?;
+        }
+        if self
+            .pool_size
+            .checked_add(self.burst_workers_max)
+            .is_none_or(|total| total > ThreadResolved::MAX_WORKERS)
+        {
+            return Err(SystemError::ConfigError(format!(
+                "scheduler.shared.burst_workers_max: core and burst workers together must be <= {}",
+                ThreadResolved::MAX_WORKERS,
+            )));
+        }
+        duration(
+            "scheduler.shared.idle_sleep_duration",
+            self.idle_sleep_duration,
+        )?;
+        if self.burst_workers_max > 0 {
+            duration(
+                "scheduler.shared.burst_backlog_threshold patrol tick",
+                (self.burst_backlog_threshold / 2).max(Duration::from_millis(1)),
+            )?;
+        }
+        // burst_idle_timeout is only compared with elapsed time; no deadline
+        // is constructed from it, so Duration::MAX is a valid nonexpiring idle budget.
+        Ok(())
     }
 }
 
@@ -128,6 +187,12 @@ pub struct SchedulerMetrics {
 
     /// Registered actors waiting for ready-queue space (one marker per actor).
     pub deferred_ready: usize,
+    /// Resident normal work in core-worker local queues (included in queue_length).
+    pub local_ready: usize,
+    /// Batches selected from the selecting worker's own local queue.
+    pub local_selections: u64,
+    /// Batches selected from another core worker's local queue.
+    pub work_steals: u64,
 
     /// Whether the scheduler is shutting down
     pub is_shutting_down: bool,
@@ -218,7 +283,8 @@ impl ElasticController {
                 Ok(_) => now_us,   // we are the first observer
                 Err(prev) => prev, // keep the original timestamp
             };
-        if now_us.saturating_sub(first_us) < self.config.burst_backlog_threshold.as_micros() as u64
+        if u128::from(now_us.saturating_sub(first_us))
+            < self.config.burst_backlog_threshold.as_micros()
         {
             // Backlog not persistent enough yet; wait for more probes.
             return;
@@ -258,7 +324,7 @@ impl ElasticController {
         let batch_size = self.config.max_messages_per_batch;
         let idle_sleep = self.config.idle_sleep_duration;
 
-        let worker = Worker::new(
+        let worker = Worker::from_validated_config(
             usize::MAX,
             self.runtime.clone(),
             queue,
@@ -266,8 +332,8 @@ impl ElasticController {
             WorkerConfig {
                 batch_size,
                 idle_sleep_duration: idle_sleep,
-                yield_after_each_message: false,
-                enable_detailed_logging: false,
+                yield_after_each_message: self.config.yield_after_each_message,
+                enable_detailed_logging: self.config.enable_detailed_logging,
             },
         );
         // Burst workers share the pool shutdown flag and are joined/aborted
@@ -322,12 +388,13 @@ impl fmt::Debug for SharedThreadPool {
 /// Scheduler implementation for managing a shared thread pool
 ///
 /// SharedThreadPool maintains a group of Tokio worker tasks that pull ready
-/// mailboxes from a central [`SchedulingQueue`]. Each mailbox carries its
+/// mailboxes from a bounded [`SchedulingQueue`]. With work_stealing enabled,
+/// batches requeue locally and idle workers may steal them. Each mailbox carries its
 /// type-erased processor (`Arc<dyn ProcessorInterface>`); workers execute it
 /// without knowing the concrete actor type.
 ///
 /// # Performance Characteristics
-/// - Work stealing pattern for load balancing
+/// - Optional worker-local FIFO queues with stealing (no OS-thread affinity)
 /// - Batch processing for efficiency
 /// - Mailboxes re-queued while they still hold messages
 pub struct SharedThreadPool {
@@ -385,8 +452,36 @@ impl SharedThreadPool {
     /// * `config` - Optional configuration for the thread pool
     /// * `runtime_handle` - Tokio runtime handle
     pub fn new(config: Option<SharedThreadPoolConfig>, runtime_handle: Handle) -> Self {
+        Self::try_new(config, runtime_handle).expect("invalid shared scheduler configuration")
+    }
+
+    /// Return invalid input before allocating queue storage or spawning tasks.
+    pub fn try_new(
+        config: Option<SharedThreadPoolConfig>,
+        runtime_handle: Handle,
+    ) -> Result<Self, SystemError> {
         let config = config.unwrap_or_default();
-        let scheduling_queue = Arc::new(SchedulingQueue::new(config.max_queue_capacity));
+        config.validate()?;
+        Ok(Self::start(config, runtime_handle))
+    }
+
+    #[cfg(test)]
+    fn new_unchecked_for_test(
+        config: Option<SharedThreadPoolConfig>,
+        runtime_handle: Handle,
+    ) -> Self {
+        Self::start(config.unwrap_or_default(), runtime_handle)
+    }
+
+    fn start(config: SharedThreadPoolConfig, runtime_handle: Handle) -> Self {
+        let scheduling_queue = Arc::new(SchedulingQueue::with_workers(
+            config.max_queue_capacity,
+            if config.work_stealing {
+                config.pool_size
+            } else {
+                0
+            },
+        ));
         let is_shutting_down = Arc::new(AtomicBool::new(false));
         let status = Arc::new(AtomicUsize::new(SchedulerStatus::Initializing as usize));
 
@@ -433,7 +528,7 @@ impl SharedThreadPool {
         }
         let controller = self.elastic_controller();
         let shutting_down = self.is_shutting_down.clone();
-        let tick = self.config.burst_backlog_threshold / 2;
+        let tick = (self.config.burst_backlog_threshold / 2).max(Duration::from_millis(1));
         let handle = self.runtime_handle.spawn(async move {
             while !shutting_down.load(Ordering::Relaxed) {
                 tokio::time::sleep(tick).await;
@@ -453,7 +548,7 @@ impl SharedThreadPool {
                 enable_detailed_logging: self.config.enable_detailed_logging,
             };
 
-            let worker = Worker::new(
+            let worker = Worker::from_validated_config(
                 worker_id,
                 self.runtime_handle.clone(),
                 self.scheduling_queue.clone(),
@@ -475,21 +570,28 @@ impl SharedThreadPool {
     /// Workers process a batch and re-queue the mailbox while it still holds
     /// messages; the wake hook covers the race where a push lands after a
     /// worker decided not to re-queue an empty mailbox.
+    /// Overrides are validated here; actor policy belongs to the already
+    /// attached processor and mailbox, rather than being reconstructed here.
     pub async fn schedule(
         &self,
         path: &str,
         mailbox: Arc<dyn Mailbox>,
-        _config: Option<ThreadActorConfig>,
+        config: Option<ThreadActorConfig>,
     ) -> Result<(), SystemError> {
-        self.schedule_now(path, mailbox, _config)
+        self.schedule_now(path, mailbox, config)
     }
 
     pub(crate) fn schedule_now(
         &self,
         path: &str,
         mailbox: Arc<dyn Mailbox>,
-        _config: Option<ThreadActorConfig>,
+        config: Option<ThreadActorConfig>,
     ) -> Result<(), SystemError> {
+        if let Some(config) = &config {
+            config
+                .validate()
+                .map_err(|error| SystemError::ConfigError(error.to_string()))?;
+        }
         if self.is_shutting_down.load(Ordering::Relaxed) {
             return Err(SystemError::ShuttingDown);
         }
@@ -574,9 +676,18 @@ impl SharedThreadPool {
     /// Close admission and join every owned task. Concurrent/repeated calls share
     /// one result; cancelling a waiter does not cancel cleanup. The first caller's
     /// `timeout_ms` sets the grace period, after which pending workers are aborted
-    /// and joined. The caller-owned Tokio runtime must remain alive through cleanup.
+    /// and joined. Mailbox closure remains owned until actual cleanup completes,
+    /// even past that period. The caller-owned Tokio runtime must remain alive.
     pub async fn shutdown(&self, timeout_ms: u64) -> Result<(), SystemError> {
-        let mut receipt = self.ensure_shutdown(timeout_ms);
+        self.shutdown_on(timeout_ms, &self.runtime_handle).await
+    }
+
+    pub(crate) async fn shutdown_on(
+        &self,
+        timeout_ms: u64,
+        runtime: &Handle,
+    ) -> Result<(), SystemError> {
+        let mut receipt = self.ensure_shutdown_on(timeout_ms, runtime);
         loop {
             if let Some(result) = receipt.borrow_and_update().clone() {
                 return result.map_err(SystemError::ShutdownError);
@@ -590,6 +701,10 @@ impl SharedThreadPool {
     }
 
     fn ensure_shutdown(&self, timeout_ms: u64) -> Receipt {
+        self.ensure_shutdown_on(timeout_ms, &self.runtime_handle)
+    }
+
+    fn ensure_shutdown_on(&self, timeout_ms: u64, runtime: &Handle) -> Receipt {
         let mut receipt = self.shutdown_receipt.lock().unwrap();
         if let Some(receipt) = &*receipt {
             return receipt.clone();
@@ -610,19 +725,32 @@ impl SharedThreadPool {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         drop(_gate);
         drop(receipt);
-        self.runtime_handle.spawn(async move {
+        runtime.spawn(async move {
+            let mut closing = FuturesUnordered::new();
             // Close the queue BEFORE taking the path index: a concurrent schedule
             // holding that index must either finish registration or see closed.
             for mailbox in queue.close_and_take() {
                 failures.isolate("mailbox schedule release", || {
                     mailbox.schedule_state().force_release()
                 });
-                failures.isolate("queued mailbox destructor", || drop(mailbox));
+                closing.push(MailboxClose::new(
+                    mailbox,
+                    failures.clone(),
+                    "queued mailbox close",
+                ));
             }
             let registrations = std::mem::take(&mut *registrations.lock().unwrap());
             for mailbox in registrations.into_values() {
-                failures.isolate("registered mailbox destructor", || drop(mailbox));
+                closing.push(MailboxClose::new(
+                    mailbox,
+                    failures.clone(),
+                    "registered mailbox close",
+                ));
             }
+            // A grace expiry stops waiting here, not the individual close
+            // operations. Join/abort workers before awaiting the remaining drain,
+            // since a mailbox destructor can depend on worker retirement.
+            while let Ok(Some(())) = tokio::time::timeout_at(deadline, closing.next()).await {}
             if let Some(patrol) = patrol {
                 let already_finished = patrol.is_finished();
                 patrol.abort();
@@ -642,6 +770,7 @@ impl SharedThreadPool {
             if let Some(retirement) = retirement {
                 failures.join(retirement.await, false);
             }
+            while closing.next().await.is_some() {}
             status.store(SchedulerStatus::Shutdown as usize, Ordering::Release);
             sender.send_replace(Some(failures.result()));
         });
@@ -706,6 +835,9 @@ impl SharedThreadPool {
             queue_length: self.scheduling_queue.len(),
             queue_capacity: self.scheduling_queue.capacity(),
             deferred_ready: self.scheduling_queue.deferred_len(),
+            local_ready: self.scheduling_queue.local_len(),
+            local_selections: self.scheduling_queue.local_pops(),
+            work_steals: self.scheduling_queue.steals(),
             is_shutting_down: self.is_shutting_down.load(Ordering::Relaxed),
             status: self.status(),
             active_processors: self.worker_manager.tracked_worker_count(),

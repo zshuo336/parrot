@@ -17,6 +17,7 @@ use futures::Stream;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Runtime;
@@ -93,6 +94,9 @@ struct MockActorRef {
     id: String,
     messages: Arc<RwLock<Vec<TestMessage>>>,
     alive: Arc<RwLock<bool>>,
+    asks: Arc<AtomicUsize>,
+    deliveries: Arc<AtomicUsize>,
+    admitted: Arc<tokio::sync::Notify>,
 }
 
 impl MockActorRef {
@@ -101,6 +105,9 @@ impl MockActorRef {
             id: id.to_string(),
             messages: Arc::new(RwLock::new(Vec::new())),
             alive: Arc::new(RwLock::new(true)),
+            asks: Arc::default(),
+            deliveries: Arc::default(),
+            admitted: Arc::default(),
         }
     }
 
@@ -119,6 +126,8 @@ impl ActorRef for MockActorRef {
     fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         let alive = self.alive.clone();
         let messages = self.messages.clone();
+        let asks = self.asks.clone();
+        let admitted = self.admitted.clone();
 
         Box::pin(async move {
             if !*alive.read().unwrap() {
@@ -127,6 +136,8 @@ impl ActorRef for MockActorRef {
 
             if let Some(test_msg) = msg.downcast_ref::<TestMessage>() {
                 messages.write().unwrap().push(test_msg.clone());
+                asks.fetch_add(1, Ordering::SeqCst);
+                admitted.notify_one();
 
                 // Return doubled value as response
                 let response = test_msg.data * 2;
@@ -148,8 +159,18 @@ impl ActorRef for MockActorRef {
         })
     }
 
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async { Ok(()) })
+    fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            if !*self.alive.read().unwrap() {
+                return Err(ActorError::Stopped);
+            }
+            if let Some(msg) = msg.downcast_ref::<TestMessage>() {
+                self.messages.write().unwrap().push(msg.clone());
+                self.deliveries.fetch_add(1, Ordering::SeqCst);
+                self.admitted.notify_one();
+            }
+            Ok(())
+        })
     }
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         let alive = self.alive.clone();
@@ -776,12 +797,15 @@ mod tests {
             let result = ctx.send_self(msg.clone());
             assert!(result.is_ok());
 
-            // Allow async operation to complete
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::timeout(Duration::from_secs(5), ctx.self_ref.admitted.notified())
+                .await
+                .expect("send_self did not reach admission");
 
             // Verify message was sent to self
             let messages = ctx.self_ref.get_messages();
             assert!(messages.contains(&msg));
+            assert_eq!(ctx.self_ref.asks.load(Ordering::SeqCst), 0);
+            assert_eq!(ctx.self_ref.deliveries.load(Ordering::SeqCst), 1);
         });
     }
 
@@ -793,6 +817,72 @@ mod tests {
             result,
             Err(ActorError::InternalError(message)) if message.contains("active Tokio runtime")
         ));
+    }
+
+    struct RejectedCapture(Arc<AtomicUsize>);
+    impl Drop for RejectedCapture {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("unsupported factory capture destructor");
+        }
+    }
+
+    fn unsupported_factory_input(strategy_capture: bool) {
+        for cancel in [false, true] {
+            let spawner = MockActorSpawner::new();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let payload = RejectedCapture(drops.clone());
+            let (factory, strategy): (BoxedMessage, _) = if strategy_capture {
+                let decider = BasicDecisionFn::new(move |_| {
+                    let _ = &payload;
+                    SupervisionDecision::Stop
+                });
+                (
+                    Box::new(()),
+                    Some(SupervisorStrategyType::OneForOne(OneForOneStrategy {
+                        max_restarts: 0,
+                        within: Duration::from_secs(1),
+                        decider,
+                    })),
+                )
+            } else {
+                (Box::new(payload), None)
+            };
+            let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                spawner.spawn_factory_erased(factory, strategy)
+            }));
+            assert!(future.is_ok(), "unsupported factory input unwound at call");
+            let future = future.unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            if cancel {
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(future);
+                }))
+                .is_ok());
+            } else {
+                use futures::FutureExt;
+                let result = futures::executor::block_on(
+                    std::panic::AssertUnwindSafe(future).catch_unwind(),
+                );
+                assert!(result.is_ok(), "factory rejection leaked cleanup panic");
+                assert!(matches!(
+                    result.unwrap(),
+                    Err(ActorError::InitializationError(ref reason))
+                        if reason.contains("no repeatable factory bridge")
+                ));
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn unsupported_factory_bridge_owns_constructor_through_rejection_and_cancellation() {
+        unsupported_factory_input(false);
+    }
+
+    #[test]
+    fn unsupported_factory_bridge_owns_strategy_through_rejection_and_cancellation() {
+        unsupported_factory_input(true);
     }
 
     // Test ScheduledTask

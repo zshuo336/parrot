@@ -240,6 +240,31 @@ fn actual_capture_replays_into_fresh_actor_and_syncs_report() {
         );
     }
 }
+
+#[test]
+fn configured_run_tracing_does_not_change_real_replay_execution() {
+    let c = Case::new("");
+    assert!(run(
+        &["capture".into(), c.input.to_str().unwrap().into()],
+        c.dir.path()
+    ));
+    let socket = c.dir.path().join("trace.sock");
+    let manifest = std::fs::read_to_string(&c.manifest).unwrap();
+    // Run-only collector validation and Unix socket creation must be skipped:
+    // replay still delivers the actual captured operations and writes its report.
+    std::fs::write(&c.manifest, format!("{manifest}\n[config_overlay.tracing]\nenabled = true\notlp_endpoint = 'http://127.0.0.1:1/v1/traces'\nsocket = '{}'\n", socket.display())).unwrap();
+    let mut args = c.args();
+    args.extend(["--target-node".into(), "capture-server".into()]);
+    assert!(run(&args, c.dir.path()));
+    let report = c.read();
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["delivered"], 3);
+    assert_eq!(replies(&report), [2, 5, 9]);
+    assert!(c.journal().ends_with("stopped\ndisposed\n"));
+    assert!(!socket.exists());
+    let stderr = std::fs::read_to_string(c.dir.path().join("stderr.log")).unwrap();
+    assert!(!stderr.contains("PARROT_APP_TRACE="), "{stderr}");
+}
 #[test]
 fn legacy_requires_explicit_opt_in_before_any_actor_starts() {
     let c = Case::new("");
@@ -497,6 +522,75 @@ fn invalid_arguments_fail_before_loading_or_starting_resources() {
         assert!(!run(&args, c.dir.path()));
         assert!(c.journal().is_empty());
         assert!(!c.report.exists());
+    }
+}
+
+#[test]
+fn invalid_gateway_capacity_does_not_reserve_a_replay_report() {
+    for limit in ["0".to_owned(), usize::MAX.to_string()] {
+        let c = Case::new("");
+        c.legacy(&[(2, ASK, "rx", "/user/counter")]);
+        let original = std::fs::read(&c.input).unwrap();
+        let mut args = c.args();
+        args.extend([
+            "--allow-legacy-log".into(),
+            "--gateway-process-limit".into(),
+            limit,
+        ]);
+        assert!(!run(&args, c.dir.path()));
+        assert!(std::fs::read_to_string(c.dir.path().join("stderr.log"))
+            .unwrap()
+            .contains("gateway process group limit"));
+        assert!(!c.report.exists(), "invalid CLI reserved a report");
+        assert!(c.journal().is_empty());
+        assert_eq!(std::fs::read(&c.input).unwrap(), original);
+    }
+}
+
+#[test]
+fn empty_manifest_argument_does_not_reserve_a_replay_report() {
+    let c = Case::new("");
+    c.legacy(&[(2, ASK, "rx", "/user/counter")]);
+    let mut args = c.args();
+    args[2].clear();
+    args.push("--allow-legacy-log".into());
+    assert!(!run(&args, c.dir.path()));
+    assert!(!c.report.exists(), "empty manifest path reserved a report");
+    assert!(c.journal().is_empty());
+}
+
+#[cfg(any(feature = "dylib", feature = "wasm"))]
+#[test]
+fn missing_replay_arguments_are_rejected_before_loading_host_policies() {
+    let flags = [
+        #[cfg(feature = "dylib")]
+        "--native-messaging-policy",
+        #[cfg(feature = "dylib")]
+        "--native-service-policy",
+        #[cfg(feature = "wasm")]
+        "--wasm-messaging-policy",
+        #[cfg(feature = "wasm")]
+        "--wasm-service-policy",
+    ];
+    for flag in flags {
+        for missing in ["--input", "--report"] {
+            let c = Case::new("");
+            let mut args = c.args();
+            let index = args.iter().position(|arg| arg == missing).unwrap();
+            args.drain(index..index + 2);
+            args.extend([
+                flag.into(),
+                c.dir.path().join("missing-policy").display().to_string(),
+            ]);
+            assert!(!run(&args, c.dir.path()));
+            let error = std::fs::read_to_string(c.dir.path().join("stderr.log")).unwrap();
+            assert!(
+                error.contains(&format!("{missing} is required")),
+                "{flag}: {error}"
+            );
+            assert!(!c.report.exists());
+            assert!(c.journal().is_empty());
+        }
     }
 }
 #[test]

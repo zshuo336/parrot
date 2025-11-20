@@ -4,12 +4,12 @@ use std::{
     collections::HashMap,
     panic::AssertUnwindSafe,
     sync::{
-        Mutex, RwLock,
+        Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
-type Copiers = Arc<RwLock<HashMap<TypeId, MirrorCopier>>>;
+type Copiers = Arc<crate::system::registrations::Registry<HashMap<TypeId, MirrorCopier>>>;
 #[derive(Default)]
 struct Counts {
     attempted: AtomicU64,
@@ -303,7 +303,7 @@ impl MirrorHandle {
             // A callback may replace its own registration, leaving this clone
             // as their final owner. Retire the captures independently below.
             let copier = copier.as_ref().ok_or("message type has no mirror copier")?;
-            let size = (copier.measure)(message)?.max(1);
+            let size = (copier.measure.as_ref().expect("unretired mirror copier"))(message)?.max(1);
             if size > s.options.max_message_bytes {
                 return Err("mirror message byte budget exceeded".into());
             }
@@ -312,7 +312,7 @@ impl MirrorHandle {
                 .clone()
                 .try_acquire_many_owned(size as u32)
                 .map_err(|_| "mirror pending byte budget exceeded")?;
-            let copy = (copier.copy)(message)?;
+            let copy = (copier.copy.as_ref().expect("unretired mirror copier"))(message)?;
             Ok::<_, String>((ShadowInput::new(copy, &s.counts), bytes))
         }))
         .map_err(crate::owned_payload::panic_message);

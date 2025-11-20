@@ -42,10 +42,16 @@ use std::path::Path;
 /// 配置环境变量：文件路径覆盖（K8s/Docker 注入配置的标准做法）。
 pub const CONFIG_ENV: &str = "PARROT_CONFIG";
 
+mod input;
+#[cfg(test)]
+use input::expand_env_with;
+pub use input::MAX_CONFIG_BYTES;
+
 pub mod directory;
 pub mod endpoint;
 pub mod receptionist;
 pub mod topology;
+pub mod tracing;
 
 // ============================================================================
 // 数据模型：三层全是 Option——Some=该层显式设置，None=让位下一层
@@ -54,10 +60,11 @@ pub mod topology;
 /// 完整 Parrot 配置（thread 引擎 + remote 全域）。
 ///
 /// 每个字段三层语义：`builder 代码设置 ▷ toml 文件键 ▷ Default`。
-/// `build()` 后全部折叠为最终值（不再有 None——数值字段直接可用）。
+/// `build()` 后数值字段折叠为最终值；未配置的可选身份、端点和服务仍可为 None。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ParrotConfig {
+    pub tracing: tracing::TracingSection,
     pub topology: topology::TopologySection,
     /// `[thread]` 共享调度池。
     pub thread: ThreadSection,
@@ -74,6 +81,7 @@ pub struct ThreadSection {
     pub shared_burst_backlog_threshold_ms: Option<u64>,
     pub shared_burst_idle_timeout_ms: Option<u64>,
     pub shared_queue_capacity: Option<usize>,
+    pub shared_work_stealing: Option<bool>,
     pub max_dedicated_threads: Option<usize>,
     pub default_mailbox_capacity: Option<usize>,
     pub max_context_tasks: Option<usize>,
@@ -181,6 +189,8 @@ pub struct RemoteNodeSection {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransportSection {
+    pub connection_capacity: Option<usize>,
+    pub handshake_capacity: Option<usize>,
     pub heartbeat_interval_ms: Option<u64>,
     pub heartbeat_max_loss: Option<u32>,
     pub outbound_queue: Option<usize>,
@@ -216,6 +226,12 @@ pub struct CodecSection {
 pub struct Defaults;
 
 impl Defaults {
+    pub fn connection_capacity() -> usize {
+        1024
+    }
+    pub fn handshake_capacity() -> usize {
+        64
+    }
     pub fn heartbeat_interval_ms() -> u64 {
         2000
     }
@@ -294,9 +310,10 @@ fn num_cpus_default() -> usize {
 // 折叠后的最终值（build 产物——数值直接可用）
 // ============================================================================
 
-/// `build()` 产物：三层折叠完成的最终配置（无 Option——消费侧零样板）。
+/// `build()` 产物：数值与策略默认值已折叠，可选身份、端点和服务保留 Option。
 #[derive(Debug, Clone)]
 pub struct Resolved {
+    pub tracing: tracing::TracingResolved,
     pub topology: topology::TopologyResolved,
     pub thread: ThreadResolved,
     pub remote: RemoteResolved,
@@ -309,11 +326,105 @@ pub struct ThreadResolved {
     pub shared_burst_backlog_threshold_ms: u64,
     pub shared_burst_idle_timeout_ms: u64,
     pub shared_queue_capacity: usize,
+    pub shared_work_stealing: bool,
     pub max_dedicated_threads: usize,
     pub default_mailbox_capacity: usize,
     pub max_context_tasks: usize,
     pub default_ask_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
+}
+
+impl ThreadResolved {
+    /// Per-system worker and default queue admission limits, not an RSS budget.
+    pub const MAX_WORKERS: usize = 4096;
+    pub const MAX_QUEUE_CAPACITY: usize = 1_048_576;
+    pub const MAX_CONTEXT_TASKS: usize = 65_536;
+
+    /// Recheck public, mutable resolved values before allocating runtime resources.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (key, value, minimum, maximum) in [
+            (
+                "thread.shared_pool_size",
+                self.shared_pool_size,
+                1,
+                Self::MAX_WORKERS,
+            ),
+            (
+                "thread.shared_queue_capacity",
+                self.shared_queue_capacity,
+                1,
+                Self::MAX_QUEUE_CAPACITY,
+            ),
+            (
+                "thread.default_mailbox_capacity",
+                self.default_mailbox_capacity,
+                1,
+                Self::MAX_QUEUE_CAPACITY,
+            ),
+            (
+                "thread.max_dedicated_threads",
+                self.max_dedicated_threads,
+                0,
+                Self::MAX_WORKERS,
+            ),
+            (
+                "thread.max_context_tasks",
+                self.max_context_tasks,
+                0,
+                Self::MAX_CONTEXT_TASKS,
+            ),
+        ] {
+            if !(minimum..=maximum).contains(&value) {
+                return Err(ConfigError::Invalid {
+                    key: key.into(),
+                    reason: format!("must be in {minimum}..={maximum}"),
+                });
+            }
+        }
+        if self
+            .shared_pool_size
+            .checked_add(self.shared_burst_workers_max)
+            .is_none_or(|total| total > Self::MAX_WORKERS)
+        {
+            return Err(ConfigError::Invalid {
+                key: "thread.shared_burst_workers_max".into(),
+                reason: format!(
+                    "core and burst workers together must be <= {}",
+                    Self::MAX_WORKERS
+                ),
+            });
+        }
+        for (key, millis) in [
+            (
+                "thread.shared_burst_backlog_threshold_ms",
+                self.shared_burst_backlog_threshold_ms,
+            ),
+            (
+                "thread.shared_burst_idle_timeout_ms",
+                self.shared_burst_idle_timeout_ms,
+            ),
+            ("thread.default_ask_timeout_ms", self.default_ask_timeout_ms),
+            ("thread.shutdown_timeout_ms", self.shutdown_timeout_ms),
+        ] {
+            validate_thread_duration(key, std::time::Duration::from_millis(millis))?;
+        }
+        Ok(())
+    }
+}
+
+/// Reject durations that cannot form a monotonic deadline on this platform.
+/// Zero remains a valid immediate deadline or scaling threshold.
+pub fn validate_thread_duration(
+    key: &str,
+    duration: std::time::Duration,
+) -> Result<(), ConfigError> {
+    if std::time::Instant::now().checked_add(duration).is_none() {
+        return Err(ConfigError::Invalid {
+            key: key.into(),
+            reason: "duration cannot form a monotonic deadline on this platform".into(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +480,8 @@ impl TopologyRoleValue {
 
 #[derive(Debug, Clone)]
 pub struct TransportResolved {
+    pub connection_capacity: usize,
+    pub handshake_capacity: usize,
     pub heartbeat_interval_ms: u64,
     pub heartbeat_max_loss: u32,
     pub outbound_queue: usize,
@@ -397,6 +510,8 @@ impl ParrotConfig {
 
     /// Load a required configuration file. Unknown keys and invalid value
     /// types are errors even if a higher-priority code value overrides them.
+    /// The opened source must be a regular UTF-8 file. Raw and environment-
+    /// expanded text must each fit [`MAX_CONFIG_BYTES`]. Symlinks to files work.
     pub fn load_file(self, path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         self.read_file(path.as_ref(), false)
     }
@@ -408,7 +523,7 @@ impl ParrotConfig {
     }
 
     fn read_file(self, path: &Path, optional: bool) -> Result<Self, ConfigError> {
-        let raw = match std::fs::read_to_string(path) {
+        let raw = match input::read_source(path) {
             Ok(raw) => raw,
             Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(self)
@@ -420,7 +535,10 @@ impl ParrotConfig {
                 })
             }
         };
-        let expanded = expand_env(&raw);
+        let expanded = input::expand_env(&raw).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
         let file: Self = toml::from_str(&expanded).map_err(|source| ConfigError::Parse {
             path: path.display().to_string(),
             source,
@@ -450,14 +568,15 @@ impl ParrotConfig {
         }
         merge!(self.thread, fallback.thread; shared_pool_size, shared_burst_workers_max,
             shared_burst_backlog_threshold_ms, shared_burst_idle_timeout_ms,
-            shared_queue_capacity, max_dedicated_threads, default_mailbox_capacity,
+            shared_queue_capacity, shared_work_stealing, max_dedicated_threads, default_mailbox_capacity,
             max_context_tasks, default_ask_timeout_ms, shutdown_timeout_ms);
         merge!(self.remote.node, fallback.remote.node; node_id, bind, topology_role, direct_addr, seeds, scheme);
-        merge!(self.remote.transport, fallback.remote.transport; heartbeat_interval_ms, heartbeat_max_loss, outbound_queue, inbound_ask_capacity, inbound_ask_bytes, inbound_dispatch_capacity, inbound_dispatch_per_connection, inbound_dispatch_bytes, default_hop_limit);
+        merge!(self.remote.transport, fallback.remote.transport; connection_capacity, handshake_capacity, heartbeat_interval_ms, heartbeat_max_loss, outbound_queue, inbound_ask_capacity, inbound_ask_bytes, inbound_dispatch_capacity, inbound_dispatch_per_connection, inbound_dispatch_bytes, default_hop_limit);
         merge!(self.remote.reorder, fallback.remote.reorder; gap_timeout_ms, buffer_cap);
         merge!(self.remote.codec, fallback.remote.codec; extra_caps);
         merge!(self.remote.security, fallback.remote.security; mode, cert_path, key_path, ca_path, admin_nodes);
-        merge!(self.remote.receptionist, fallback.remote.receptionist; default_deny, roles);
+        merge!(self.remote.receptionist, fallback.remote.receptionist; default_deny, roles, relays, max_subscriptions, max_subscription_bytes, max_registrations, max_registration_bytes);
+        merge!(self.tracing, fallback.tracing; enabled, otlp_endpoint, allow_insecure_http, capacity, socket, interval_ms, request_timeout_ms, max_attempts);
         self.topology = self.topology.with_fallback(fallback.topology);
         self.remote.directory = match (self.remote.directory, fallback.remote.directory) {
             (Some(primary), Some(fallback)) => Some(primary.with_fallback(fallback)),
@@ -466,8 +585,11 @@ impl ParrotConfig {
         self
     }
 
-    /// Validate effective values and fill defaults.
+    /// Validate effective values and fill defaults, without DNS, certificate
+    /// reads or runtime allocation. Runtime consumers still check their own
+    /// capabilities and any subsequently mutated resolved values.
     pub fn build(self) -> Result<Resolved, ConfigError> {
+        let tracing = self.tracing.resolve()?;
         let security = self.remote.security.resolve()?;
         let receptionist = self.remote.receptionist.resolve()?;
         let directory = self
@@ -516,7 +638,15 @@ impl ParrotConfig {
         }
         // 校验层：非法值在 build 期报错（fail-fast，不带入运行时）
         let tr = &self.remote.transport;
+        if tr.outbound_queue.is_some_and(|v| v > usize::MAX >> 3) {
+            return Err(ConfigError::Invalid {
+                key: "remote.transport.outbound_queue".into(),
+                reason: format!("must be within 1..={}", usize::MAX >> 3),
+            });
+        }
         for (name, value) in [
+            ("connection_capacity", tr.connection_capacity),
+            ("handshake_capacity", tr.handshake_capacity),
             ("inbound_ask_capacity", tr.inbound_ask_capacity),
             ("inbound_ask_bytes", tr.inbound_ask_bytes),
             ("inbound_dispatch_capacity", tr.inbound_dispatch_capacity),
@@ -560,6 +690,25 @@ impl ParrotConfig {
                 });
             }
         }
+        let heartbeat = std::time::Duration::from_millis(
+            tr.heartbeat_interval_ms
+                .unwrap_or_else(Defaults::heartbeat_interval_ms),
+        );
+        let now = std::time::Instant::now();
+        if now.checked_add(heartbeat).is_none()
+            || heartbeat
+                .checked_mul(
+                    tr.heartbeat_max_loss
+                        .unwrap_or_else(Defaults::heartbeat_max_loss),
+                )
+                .and_then(|deadline| now.checked_add(deadline))
+                .is_none()
+        {
+            return Err(ConfigError::Invalid {
+                key: "remote.transport.heartbeat_interval_ms".into(),
+                reason: "heartbeat interval and loss deadline must fit the monotonic clock".into(),
+            });
+        }
         if let Some(v) = &self.remote.node.bind {
             if v.parse::<std::net::SocketAddr>().is_err() {
                 return Err(ConfigError::Invalid {
@@ -575,6 +724,24 @@ impl ParrotConfig {
             })?;
         }
         let scheme = self.remote.node.scheme.as_deref().unwrap_or("tcp");
+        if let Some(address) = self
+            .remote
+            .node
+            .direct_addr
+            .as_deref()
+            .filter(|_| scheme != "mem")
+        {
+            let invalid = |reason| ConfigError::Invalid {
+                key: "remote.node.direct_addr".into(),
+                reason,
+            };
+            if address.contains("://") || address.contains('@') {
+                return Err(invalid(
+                    "must be host:port without a scheme or node identity".into(),
+                ));
+            }
+            endpoint::SeedEndpoint::parse(address, scheme).map_err(invalid)?;
+        }
         for (index, seed) in self.remote.node.seeds.iter().flatten().enumerate() {
             let endpoint = endpoint::SeedEndpoint::parse(seed, scheme).map_err(|reason| {
                 ConfigError::Invalid {
@@ -598,7 +765,8 @@ impl ParrotConfig {
             .as_deref()
             .and_then(TopologyRoleValue::parse)
             .unwrap_or_default();
-        Ok(Resolved {
+        let resolved = Resolved {
+            tracing,
             topology: self.topology.resolve(),
             thread: ThreadResolved {
                 shared_pool_size: self
@@ -621,6 +789,7 @@ impl ParrotConfig {
                     .thread
                     .shared_queue_capacity
                     .unwrap_or_else(Defaults::shared_queue_capacity),
+                shared_work_stealing: self.thread.shared_work_stealing.unwrap_or(false),
                 max_dedicated_threads: self
                     .thread
                     .max_dedicated_threads
@@ -655,6 +824,12 @@ impl ParrotConfig {
                     scheme: self.remote.node.scheme.unwrap_or_else(|| "tcp".into()),
                 },
                 transport: TransportResolved {
+                    connection_capacity: tr
+                        .connection_capacity
+                        .unwrap_or_else(Defaults::connection_capacity),
+                    handshake_capacity: tr
+                        .handshake_capacity
+                        .unwrap_or_else(Defaults::handshake_capacity),
                     heartbeat_interval_ms: tr
                         .heartbeat_interval_ms
                         .unwrap_or_else(Defaults::heartbeat_interval_ms),
@@ -695,12 +870,34 @@ impl ParrotConfig {
                 },
                 extra_caps: self.remote.codec.extra_caps.unwrap_or(0),
             },
-        })
+        };
+        resolved.thread.validate()?;
+        Ok(resolved)
     }
 
-    /// 全键文档（运维参考——`parrot-config --dump-docs` 的数据源）。
+    /// 全键文档，供宿主程序展示运维参考；本 crate 不提供独立命令行程序。
     pub fn documented() -> BTreeMap<&'static str, &'static str> {
         let mut m = BTreeMap::new();
+        m.insert("tracing.enabled", "Application runner recording/export switch; defaults to endpoint presence; false suppresses inherited tracing; replay does not activate it");
+        m.insert("tracing.otlp_endpoint", "Exact OTLP/HTTP JSON collector URL, at most 8192 bytes; HTTPS by default; validated by the application runner before owning resources");
+        m.insert("tracing.allow_insecure_http", "Explicit plaintext collector permission (default false); does not affect actor transport authentication");
+        m.insert(
+            "tracing.capacity",
+            "Completed span/history capacity, 1..=65536 (default 4096)",
+        );
+        m.insert("tracing.socket", "Optional private Unix query socket path; relative to runner working directory; requires enabled tracing");
+        m.insert(
+            "tracing.interval_ms",
+            "Export polling interval, 1..=3600000 milliseconds (default 1000)",
+        );
+        m.insert(
+            "tracing.request_timeout_ms",
+            "Per-attempt collector HTTP timeout, 1..=3600000 milliseconds (default 5000)",
+        );
+        m.insert(
+            "tracing.max_attempts",
+            "Total HTTP attempts per batch including the first, 1..=1024 (default 8)",
+        );
         m.insert(
             "remote.receptionist.default_deny",
             "Deny unmatched node/service pairs (default true); false explicitly permits unmatched pairs",
@@ -709,6 +906,11 @@ impl ParrotConfig {
             "remote.receptionist.roles",
             "Node ID to service-key prefix grants; complete segment matching; higher-priority maps replace all inherited grants",
         );
+        m.insert("remote.receptionist.max_subscriptions", "Maximum retained service receivers (default 1024); closed or drained receivers count until dropped; zero disables admission");
+        m.insert("remote.receptionist.relays", "Authenticated relay node to forwarded service-key prefixes; denies forwarding by default; replaces the entire inherited map; owner grants still apply");
+        m.insert("remote.receptionist.max_subscription_bytes", "Reserved service receiver queue bytes (default 268435456); slots charged at the fixed event ceiling plus queue allowance; zero disables admission");
+        m.insert("remote.receptionist.max_registrations", "Distinct service entries across local and remote nodes (default 65536); zero disables additional entries");
+        m.insert("remote.receptionist.max_registration_bytes", "Declared retained service-table bytes (default 268435456); zero disables additional entries; not process RSS");
         m.insert(
             "topology.mode",
             "Originating business policy: hub|mesh|hybrid (default hybrid)",
@@ -737,11 +939,11 @@ impl ParrotConfig {
         );
         m.insert(
             "thread.shared_pool_size",
-            "共享调度池核心线程数（默认 CPU 核数）",
+            "共享调度池核心worker任务数1..=4096（默认CPU核数）；与burst合计不超过4096",
         );
         m.insert(
             "thread.shared_burst_workers_max",
-            "弹性突发 worker 上限（默认 CPU 核数）",
+            "弹性突发worker上限（默认CPU核数；0禁用）；与core合计不超过4096",
         );
         m.insert(
             "thread.shared_burst_backlog_threshold_ms",
@@ -753,16 +955,23 @@ impl ParrotConfig {
         );
         m.insert(
             "thread.shared_queue_capacity",
-            "共享调度队列容量（默认 10000）",
+            "共享就绪队列容量1..=1048576（默认10000）；不限制actor总数",
+        );
+        m.insert(
+            "thread.shared_work_stealing",
+            "共享池worker本地FIFO与工作窃取（默认false）；所有就绪队列共用容量",
         );
         m.insert(
             "thread.max_context_tasks",
-            "每个 actor 的待完成定时任务上限（默认 1024；0 禁用）",
+            "每个actor待完成用户定时器/stream上限0..=65536（默认1024；0禁用）",
         );
-        m.insert("thread.max_dedicated_threads", "专用线程上限（默认 32）");
+        m.insert(
+            "thread.max_dedicated_threads",
+            "专用线程上限0..=4096（默认32；0禁用）",
+        );
         m.insert(
             "thread.default_mailbox_capacity",
-            "actor 默认邮箱容量（默认 1024）",
+            "actor默认邮箱容量1..=1048576（默认1024）",
         );
         m.insert(
             "thread.default_ask_timeout_ms",
@@ -773,14 +982,17 @@ impl ParrotConfig {
             "remote.node.node_id",
             "节点唯一 id（部署身份——必填于多节点拓扑）",
         );
-        m.insert("remote.node.bind", "监听地址 host:port（如 0.0.0.0:9801）");
+        m.insert(
+            "remote.node.bind",
+            "监听IP与端口（如0.0.0.0:9801或[::1]:9801）；不解析域名",
+        );
         m.insert(
             "remote.node.topology_role",
             "拓扑角色 normal|hub|border|directory（默认 normal）",
         );
         m.insert(
             "remote.node.direct_addr",
-            "可直拨地址（方案 A——hub 据此注入 ROUTE_HINT）",
+            "网络传输的公布地址host:port，不含scheme或node@；域名保持未解析；mem忽略此项",
         );
         m.insert(
             "remote.node.seeds",
@@ -803,15 +1015,23 @@ impl ParrotConfig {
         );
         m.insert(
             "remote.transport.heartbeat_interval_ms",
-            "心跳间隔（默认 2000ms）",
+            "正数心跳间隔（默认2000ms）；间隔及间隔乘丢失次数须可形成单调时钟期限",
         );
         m.insert(
             "remote.transport.heartbeat_max_loss",
             "心跳丢失多少次判半开断开（默认 5）",
         );
         m.insert(
+            "remote.transport.connection_capacity",
+            "物理连接总上限（含握手中连接，默认 1024）",
+        );
+        m.insert(
+            "remote.transport.handshake_capacity",
+            "并发建连与握手上限（默认 64）",
+        );
+        m.insert(
             "remote.transport.outbound_queue",
-            "出站帧队列容量（默认 1024，天然反压）",
+            "出站帧队列容量1..=usize::MAX>>3（默认1024，满时反压）；不是RSS预算",
         );
         m.insert(
             "remote.transport.inbound_ask_capacity",
@@ -859,6 +1079,10 @@ impl ParrotConfig {
     }
     pub fn thread_shared_queue_capacity(mut self, v: usize) -> Self {
         self.thread.shared_queue_capacity = Some(v);
+        self
+    }
+    pub fn thread_shared_work_stealing(mut self, v: bool) -> Self {
+        self.thread.shared_work_stealing = Some(v);
         self
     }
     pub fn thread_default_mailbox_capacity(mut self, v: usize) -> Self {
@@ -963,38 +1187,6 @@ pub enum ConfigError {
 // 内部工具
 // ============================================================================
 
-/// 环境变量展开：`${VAR}` / `${VAR:-default}`（K8s ConfigMap 风格注入）。
-/// 只扫描原始配置；变量值和默认值按字面量插入，不递归解释。
-fn expand_env(raw: &str) -> String {
-    expand_env_with(raw, |name| std::env::var(name).ok())
-}
-
-fn expand_env_with(raw: &str, mut lookup: impl FnMut(&str) -> Option<String>) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut remaining = raw;
-    while let Some(start) = remaining.find("${") {
-        out.push_str(&remaining[..start]);
-        remaining = &remaining[start..];
-        let Some(end) = remaining.find('}') else {
-            break;
-        };
-        let inner = &remaining[2..end];
-        let (name, default) = match inner.split_once(":-") {
-            Some((n, d)) => (n, Some(d)),
-            None => (inner, None),
-        };
-        let val = lookup(name)
-            .filter(|value| !value.is_empty())
-            .or_else(|| default.map(String::from));
-        if let Some(value) = val {
-            out.push_str(&value);
-        }
-        remaining = &remaining[end + 1..];
-    }
-    out.push_str(remaining);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,7 +1209,8 @@ mod tests {
                 }
                 .into(),
             )
-        });
+        })
+        .unwrap();
         assert_eq!(expanded, "前:${SELF}|${B}|${A}:后");
         assert_eq!(lookups, ["SELF", "A", "B"]);
     }
@@ -1031,18 +1224,19 @@ mod tests {
                 "EMPTY" => Some(String::new()),
                 _ => None,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(expanded, "后备:empty:零::零:a:-b");
     }
 
     #[test]
     fn env_expansion_preserves_incomplete_tokens_and_literal_dollars() {
         assert_eq!(
-            expand_env_with("前 $x ${OK} 后 ${unfinished", |_| Some("值".into())),
+            expand_env_with("前 $x ${OK} 后 ${unfinished", |_| Some("值".into())).unwrap(),
             "前 $x 值 后 ${unfinished"
         );
         assert_eq!(
-            expand_env_with("no placeholders", |_| unreachable!()),
+            expand_env_with("no placeholders", |_| unreachable!()).unwrap(),
             "no placeholders"
         );
         let mut lookups = 0;
@@ -1051,7 +1245,8 @@ mod tests {
                 lookups += 1;
                 assert_eq!(lookups, 1, "replacement values must not be rescanned");
                 Some("$${unfinished}".into())
-            }),
+            })
+            .unwrap(),
             "$${unfinished}"
         );
     }
@@ -1262,6 +1457,16 @@ mod tests {
         std::fs::write(
             &tmp,
             r#"
+[tracing]
+enabled = true
+otlp_endpoint = "https://collector.example/v1/traces"
+allow_insecure_http = false
+capacity = 512
+socket = "/private/parrot/trace.sock"
+interval_ms = 200
+request_timeout_ms = 1500
+max_attempts = 3
+
 [topology]
 mode = "hub"
 relay_fallback = false
@@ -1272,6 +1477,7 @@ shared_burst_workers_max = 2
 shared_burst_backlog_threshold_ms = 50
 shared_burst_idle_timeout_ms = 3000
 shared_queue_capacity = 500
+shared_work_stealing = true
 max_dedicated_threads = 8
 default_mailbox_capacity = 64
 max_context_tasks = 42
@@ -1287,6 +1493,8 @@ seeds = ["tcp://seed-a:9800", "tcp://seed-b:9800"]
 scheme = "tcp"
 
 [remote.transport]
+connection_capacity = 127
+handshake_capacity = 11
 heartbeat_interval_ms = 1500
 heartbeat_max_loss = 3
 outbound_queue = 512
@@ -1314,6 +1522,11 @@ admin_nodes = ["operator"]
 [remote.receptionist]
 default_deny = true
 roles = { hub-1 = ["edge/public"], peer-1 = ["cloud/query"] }
+relays = { relay-1 = ["edge/public"] }
+max_subscriptions = 512
+max_subscription_bytes = 134217728
+max_registrations = 8192
+max_registration_bytes = 67108864
 
 [remote.directory]
 storage_dir = "/private/directory"
@@ -1337,7 +1550,10 @@ rpc_timeout_ms = 2400
             prefix: &str,
             keys: &mut std::collections::BTreeSet<String>,
         ) {
-            if prefix == "remote.receptionist.roles" {
+            if matches!(
+                prefix,
+                "remote.receptionist.roles" | "remote.receptionist.relays"
+            ) {
                 keys.insert(prefix.to_owned());
                 return;
             }
@@ -1369,6 +1585,20 @@ rpc_timeout_ms = 2400
             "documentation must enumerate exactly the exercised configuration keys"
         );
         let r = layer.build().unwrap();
+        assert!(r.tracing.enabled);
+        assert_eq!(
+            r.tracing.otlp_endpoint.as_deref(),
+            Some("https://collector.example/v1/traces")
+        );
+        assert!(!r.tracing.allow_insecure_http);
+        assert_eq!(r.tracing.capacity, 512);
+        assert_eq!(
+            r.tracing.socket.as_deref(),
+            Some(Path::new("/private/parrot/trace.sock"))
+        );
+        assert_eq!(r.tracing.interval_ms, 200);
+        assert_eq!(r.tracing.request_timeout_ms, 1500);
+        assert_eq!(r.tracing.max_attempts, 3);
         assert_eq!(r.topology.mode, topology::TopologyMode::Hub);
         assert!(!r.topology.relay_fallback);
         std::fs::remove_file(&tmp).ok();
@@ -1377,6 +1607,7 @@ rpc_timeout_ms = 2400
         assert_eq!(r.thread.shared_burst_backlog_threshold_ms, 50);
         assert_eq!(r.thread.shared_burst_idle_timeout_ms, 3000);
         assert_eq!(r.thread.shared_queue_capacity, 500);
+        assert!(r.thread.shared_work_stealing);
         assert_eq!(r.thread.max_dedicated_threads, 8);
         assert_eq!(r.thread.default_mailbox_capacity, 64);
         assert_eq!(r.thread.max_context_tasks, 42);
@@ -1389,6 +1620,8 @@ rpc_timeout_ms = 2400
         assert_eq!(r.remote.node.seeds.len(), 2);
         assert_eq!(r.remote.transport.heartbeat_interval_ms, 1500);
         assert_eq!(r.remote.transport.heartbeat_max_loss, 3);
+        assert_eq!(r.remote.transport.connection_capacity, 127);
+        assert_eq!(r.remote.transport.handshake_capacity, 11);
         assert_eq!(r.remote.transport.outbound_queue, 512);
         assert_eq!(r.remote.transport.inbound_ask_capacity, 19);
         assert_eq!(r.remote.transport.inbound_ask_bytes, 98304);
@@ -1403,6 +1636,18 @@ rpc_timeout_ms = 2400
         assert_eq!(r.remote.receptionist.roles.len(), 2);
         assert_eq!(r.remote.receptionist.roles["hub-1"], ["edge/public"]);
         assert_eq!(r.remote.receptionist.roles["peer-1"], ["cloud/query"]);
+        assert_eq!(r.remote.receptionist.relays.len(), 1);
+        assert_eq!(r.remote.receptionist.relays["relay-1"], ["edge/public"]);
+        assert_eq!(r.remote.receptionist.subscriptions.max_subscriptions, 512);
+        assert_eq!(r.remote.receptionist.registrations.max_registrations, 8192);
+        assert_eq!(
+            r.remote.receptionist.registrations.max_reserved_bytes,
+            67108864
+        );
+        assert_eq!(
+            r.remote.receptionist.subscriptions.max_reserved_bytes,
+            134217728
+        );
         let directory = r.remote.directory.unwrap();
         assert_eq!(directory.storage_dir, "/private/directory");
         assert_eq!(directory.group, "services");

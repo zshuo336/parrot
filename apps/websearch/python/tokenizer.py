@@ -1,12 +1,12 @@
 """websearch 中文分词索引组件（ray 方言——app 内 source of truth）。
 
-R1 架构（五运行时分工，同 crawler-lab 原则）：
-  - Rust 漫爬 worker 抓真实网页 → 整页 HTML 发本组件
+四运行时业务链：
+  - Rust 抓真实网页并抽取文本 → 文本文档发本组件
   - 本组件 jieba 中文分词 + 词频统计 → 词项条目回 Rust（Rust 转发 akka 建倒排）
   - 本组件只持有实例内存索引；段文件的落盘与回放由 JVM 检索组件负责。
 
-分词：jieba（开源中文分词——Python 原版）；与 JVM 侧 jieba-analysis、
-Rust 侧 jieba-rs 同族（词典算法一致的三语言移植）。
+分词使用 Python jieba；ASCII 字母先转小写，与 JVM jieba-analysis 的查询规则对齐。
+两者词典、中文切词和停用词仍可能不同；Rust 不再执行额外分词。
 
 协议（bin:ws/* 键空间）：
   bin:ws/Tokenize  [n u32][{docid u64|len u32|text}...] → Terms [n u32][{len u32|term|docid u64|tf u32}...]
@@ -30,6 +30,7 @@ _STOP = frozenset(
 )
 
 _lock = threading.Lock()
+_ASCII_LOWER = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
 MAX_REPLY_ENTRIES = 65_536
 MAX_REPLY_BYTES = 8 * 1024 * 1024
 
@@ -37,7 +38,7 @@ MAX_REPLY_BYTES = 8 * 1024 * 1024
 def _tokenize(text: str) -> list[str]:
     """jieba 切词 + 停用词过滤 + 单字过滤（中文单字无检索力）。"""
     with _lock:
-        words = jieba.lcut(text)
+        words = jieba.lcut(text.translate(_ASCII_LOWER))
     return [w for w in words if w.strip() and w not in _STOP and len(w.strip()) > 1]
 
 

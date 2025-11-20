@@ -4,6 +4,46 @@
 use parrot_remote::acl::{AclDecision, AclRules, RouteAcl};
 
 #[test]
+fn route_principal_validation_matches_authorization_identity_boundaries() {
+    let open = RouteAcl {
+        default_deny_cross_realm: false,
+        ..Default::default()
+    };
+    for principal in ["source", "source/cluster", "source-1", "source_2"] {
+        RouteAcl::validate_principal(principal).unwrap();
+        assert_eq!(
+            open.check_route(principal, "parrot://target/user/x"),
+            AclDecision::Allow
+        );
+    }
+    for principal in [
+        "",
+        "*",
+        "/source",
+        "source/",
+        "source//cluster",
+        ".",
+        "source/..",
+        "source%2fadmin",
+        "source?admin",
+        "source#admin",
+        "source\\admin",
+        "source\0",
+        "source\n",
+        "source admin",
+    ] {
+        assert!(
+            RouteAcl::validate_principal(principal).is_err(),
+            "{principal:?}"
+        );
+        assert_eq!(
+            open.check_route(principal, "parrot://target/user/x"),
+            AclDecision::Deny
+        );
+    }
+}
+
+#[test]
 fn route_default_denies_cross_realm_like_deserialization() {
     for rules in [
         RouteAcl::default(),

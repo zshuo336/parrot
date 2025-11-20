@@ -1,14 +1,26 @@
 //! A facade shutdown waiter never owns the remaining engines' retirement.
 use super::{ActorSystemImpl, ParrotActorSystem};
+mod errors;
+mod future;
+use crate::{
+    error_receipt::Receipt,
+    owned_payload::{PublicationInput, panic_message},
+};
+pub use errors::{ShutdownErrors, ShutdownFailure};
+use future::ShutdownFuture;
 use futures::FutureExt;
 use parrot_api::{system::SystemError, types::BoxedFuture};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::watch;
 
-type Outcome = Option<Result<(), String>>;
+#[cfg(test)]
+mod host_exit_contracts;
+
+type Outcome = Option<Result<(), ShutdownErrors>>;
 #[derive(Default)]
 pub(super) struct Lifecycle {
     pub(super) receipt: Mutex<Option<watch::Sender<Outcome>>>,
@@ -28,11 +40,11 @@ struct Completion {
 }
 impl Completion {
     fn publish_timeout(&self) {
-        self.publish(Err(
-            "facade shutdown timed out; cleanup remains owned".into()
-        ));
+        self.publish(Err(ShutdownErrors::message(
+            "facade shutdown timed out; cleanup remains owned",
+        )));
     }
-    async fn retire<F: std::future::Future<Output = Result<(), String>>>(
+    async fn retire<F: std::future::Future<Output = Result<(), ShutdownErrors>>>(
         self,
         work: F,
         deadline: Option<tokio::time::Instant>,
@@ -58,11 +70,11 @@ impl Completion {
         };
         self.finish(result);
     }
-    fn finish(&self, result: Result<(), String>) {
+    fn finish(&self, result: Result<(), ShutdownErrors>) {
         self.lifecycle.finished.store(true, Ordering::Release);
         self.publish(result);
     }
-    fn publish(&self, result: Result<(), String>) {
+    fn publish(&self, result: Result<(), ShutdownErrors>) {
         self.receipt.send_if_modified(|value| {
             if value.is_some() {
                 return false;
@@ -74,7 +86,9 @@ impl Completion {
 }
 impl Drop for Completion {
     fn drop(&mut self) {
-        self.publish(Err("facade shutdown owner ended before completion".into()));
+        self.publish(Err(ShutdownErrors::message(
+            "facade shutdown owner ended before completion",
+        )));
     }
 }
 impl ParrotActorSystem {
@@ -82,8 +96,12 @@ impl ParrotActorSystem {
     /// waiter leaves all engine and mirror retirement owned by the operation.
     /// Repeated/concurrent calls retain the first result, including timeout.
     /// A positive system_shutdown timeout bounds the receipt, not cleanup;
-    /// zero leaves deadlines to the engines. The host executor must stay alive.
+    /// zero leaves deadlines to the engines. An independent lifecycle executor
+    /// owns the operation even after the facade's original host exits.
     /// Completion first observed at or after the facade deadline is a timeout.
+    /// Completed failures are collected in [`ShutdownErrors`] with engine context
+    /// and original causes. Formatting the aggregate uses cached safe diagnostics.
+    /// A published timeout supersedes late outcomes, whose errors are safely disposed.
     pub fn shutdown_runtime(&self) -> BoxedFuture<'_, Result<(), SystemError>> {
         Box::pin(async move {
             let mut receipt = {
@@ -91,16 +109,8 @@ impl ParrotActorSystem {
                 if let Some(receipt) = &*state {
                     receipt.subscribe()
                 } else {
-                    let runtime = self
-                        .runtime
-                        .clone()
-                        .or_else(|| tokio::runtime::Handle::try_current().ok())
-                        .ok_or_else(|| {
-                            SystemError::InitializationError(
-                                "facade shutdown requires a Tokio executor".into(),
-                            )
-                        })?;
-                    let timeout = self.config.timeouts.system_shutdown;
+                    let runtime = self.runtime.clone();
+                    let timeout = self.config.value().timeouts.system_shutdown;
                     let deadline = if timeout.is_zero() {
                         None
                     } else {
@@ -119,11 +129,11 @@ impl ParrotActorSystem {
                         .read()
                         .unwrap()
                         .iter()
-                        .map(|(name, system)| (name.clone(), system.clone()))
+                        .map(|(name, system)| (name.clone(), PublicationInput::new(system.clone())))
                         .collect();
                     systems.sort_by(|a, b| a.0.cmp(&b.0));
                     let mut seen = std::collections::HashSet::new();
-                    systems.retain(|(_, system)| seen.insert(system.identity()));
+                    systems.retain(|(_, system)| seen.insert(system.value().identity()));
                     let mirrors = self.mirrors.clone();
                     let (sender, receipt) = watch::channel(None);
                     *state = Some(sender.clone());
@@ -137,7 +147,7 @@ impl ParrotActorSystem {
             };
             loop {
                 if let Some(result) = receipt.borrow_and_update().clone() {
-                    return result.map_err(|error| SystemError::Other(anyhow::anyhow!(error)));
+                    return result.map_err(|error| SystemError::Other(anyhow::Error::new(error)));
                 }
                 receipt.changed().await.map_err(|_| {
                     SystemError::Other(anyhow::anyhow!("facade shutdown receipt closed"))
@@ -147,20 +157,46 @@ impl ParrotActorSystem {
     }
 }
 
-async fn retire_engine(name: String, system: ActorSystemImpl) -> Result<(), String> {
-    let result = std::panic::AssertUnwindSafe(async move {
-        system.shutdown().await.map_err(|error| error.to_string())
-    })
-    .catch_unwind()
-    .await
-    .unwrap_or_else(|payload| Err(crate::owned_payload::panic_message(payload)));
-    result.map_err(|error| format!("engine {name:?}: {error}"))
+async fn retire_engine(
+    name: String,
+    system: PublicationInput<ActorSystemImpl>,
+) -> Vec<ShutdownFailure> {
+    // Keep the runtime owner outside both callback and future unwind boundaries.
+    let mut errors = match catch_unwind(AssertUnwindSafe(|| -> BoxedFuture<'_, _> {
+        match system.value() {
+            ActorSystemImpl::Runtime(runtime) => runtime.shutdown(),
+            ActorSystemImpl::Thread(runtime) => Box::pin(async {
+                runtime
+                    .shutdown_internal()
+                    .await
+                    .map_err(crate::error_receipt::public_system_error)
+            }),
+            ActorSystemImpl::Actix(runtime) => Box::pin(runtime.clone().shutdown()),
+        }
+    })) {
+        Ok(future) => ShutdownFuture::new(future).await,
+        Err(payload) => vec![("shutdown construction", future::panic_receipt(payload))],
+    };
+    if let Err(error) = system.retire() {
+        errors.push((
+            "runtime handle disposal",
+            Receipt::new(SystemError::ActorError(error)),
+        ));
+    }
+    errors
+        .into_iter()
+        .map(|(operation, error)| {
+            ShutdownFailure::from_receipt(Some(name.clone()), operation, error)
+        })
+        .collect()
 }
 
 async fn retire_all(
-    systems: Vec<(String, ActorSystemImpl)>,
+    // Protect each owner before the spawned task's first poll: host shutdown
+    // may cancel the whole snapshot before retire_engine has ever run.
+    systems: Vec<(String, PublicationInput<ActorSystemImpl>)>,
     mirrors: Arc<crate::mirror::MirrorRegistry>,
-) -> Result<(), String> {
+) -> Result<(), ShutdownErrors> {
     let engines = futures::future::join_all(
         systems
             .into_iter()
@@ -168,19 +204,24 @@ async fn retire_all(
     );
     let mirrors = std::panic::AssertUnwindSafe(mirrors.shutdown()).catch_unwind();
     let (engines, mirrors) = tokio::join!(engines, mirrors);
-    let mut errors: Vec<_> = engines.into_iter().filter_map(Result::err).collect();
+    let mut errors: Vec<_> = engines.into_iter().flatten().collect();
     match mirrors {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => errors.push(format!("mirrors: {error}")),
-        Err(payload) => errors.push(format!(
-            "mirrors: {}",
-            crate::owned_payload::panic_message(payload)
+        Ok(Err(error)) => errors.push(ShutdownFailure::new(
+            None,
+            "mirrors",
+            SystemError::Other(anyhow::anyhow!(error)),
+        )),
+        Err(payload) => errors.push(ShutdownFailure::new(
+            None,
+            "mirrors",
+            SystemError::Other(anyhow::anyhow!(panic_message(payload))),
         )),
     }
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("; "))
+        Err(ShutdownErrors::new(errors))
     }
 }
 
@@ -208,7 +249,13 @@ mod deadline_tests {
         )
     }
 
-    fn timeout() -> Outcome {
+    fn text(outcome: &Outcome) -> Option<Result<(), String>> {
+        outcome
+            .as_ref()
+            .map(|result| result.as_ref().map(|_| ()).map_err(ToString::to_string))
+    }
+
+    fn timeout() -> Option<Result<(), String>> {
         Some(Err(
             "facade shutdown timed out; cleanup remains owned".into()
         ))
@@ -221,7 +268,7 @@ mod deadline_tests {
         // never retry a failed case until a favorable branch is selected.
         for sample in 0..32 {
             for extra in [Duration::ZERO, Duration::from_millis(1)] {
-                for result in [Ok(()), Err("late cleanup error".into())] {
+                for result in [Ok(()), Err(ShutdownErrors::message("late cleanup error"))] {
                     let (owner, state, observed) = owner();
                     let deadline = Instant::now() + Duration::from_millis(10);
                     tokio::time::advance(Duration::from_millis(10) + extra).await;
@@ -229,7 +276,7 @@ mod deadline_tests {
                         .retire(std::future::ready(result.clone()), Some(deadline))
                         .await;
                     assert!(state.finished(), "actual retirement must finish");
-                    let actual = observed.borrow().clone();
+                    let actual = text(&observed.borrow());
                     if actual != timeout() {
                         incorrect.push((sample, extra, result, actual));
                     }
@@ -247,7 +294,7 @@ mod deadline_tests {
         let mut incorrect = Vec::new();
         for sample in 0..16 {
             for extra in [Duration::ZERO, Duration::from_millis(1)] {
-                for result in [Ok(()), Err("late cleanup error".into())] {
+                for result in [Ok(()), Err(ShutdownErrors::message("late cleanup error"))] {
                     let (owner, state, observed) = owner();
                     let deadline = Instant::now() + Duration::from_millis(10);
                     let (send, receive) = oneshot::channel();
@@ -262,7 +309,7 @@ mod deadline_tests {
                     send.send(result.clone()).unwrap();
                     retirement.await;
                     assert!(state.finished());
-                    let actual = observed.borrow().clone();
+                    let actual = text(&observed.borrow());
                     if actual != timeout() {
                         incorrect.push((sample, extra, result, actual));
                     }
@@ -277,7 +324,7 @@ mod deadline_tests {
 
     #[tokio::test(start_paused = true)]
     async fn early_retirement_preserves_success_and_error() {
-        for result in [Ok(()), Err("early cleanup error".into())] {
+        for result in [Ok(()), Err(ShutdownErrors::message("early cleanup error"))] {
             let (owner, state, observed) = owner();
             owner
                 .retire(
@@ -286,13 +333,16 @@ mod deadline_tests {
                 )
                 .await;
             assert!(state.finished());
-            assert_eq!(*observed.borrow(), Some(result));
+            assert_eq!(text(&observed.borrow()), text(&Some(result)));
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn no_facade_deadline_preserves_pending_work_and_actual_result() {
-        for result in [Ok(()), Err("unbounded cleanup error".into())] {
+        for result in [
+            Ok(()),
+            Err(ShutdownErrors::message("unbounded cleanup error")),
+        ] {
             let (owner, state, observed) = owner();
             let (send, receive) = oneshot::channel();
             let retirement =
@@ -309,7 +359,7 @@ mod deadline_tests {
             send.send(result.clone()).unwrap();
             retirement.await;
             assert!(state.finished());
-            assert_eq!(*observed.borrow(), Some(result));
+            assert_eq!(text(&observed.borrow()), text(&Some(result)));
         }
     }
 
@@ -322,7 +372,7 @@ mod deadline_tests {
 
     #[tokio::test(start_paused = true)]
     async fn public_timeout_stays_sticky_while_cleanup_remains_owned() {
-        for result in [Ok(()), Err("late cleanup error".into())] {
+        for result in [Ok(()), Err(ShutdownErrors::message("late cleanup error"))] {
             let (owner, state, observed) = owner();
             let (send, receive) = oneshot::channel();
             let drops = Arc::new(AtomicUsize::new(0));
@@ -341,17 +391,17 @@ mod deadline_tests {
                 futures::poll!(retirement.as_mut()).is_pending(),
                 "timeout must retain the pending cleanup future"
             );
-            assert_eq!(*observed.borrow(), timeout());
+            assert_eq!(text(&observed.borrow()), timeout());
             assert!(!state.finished(), "public timeout is not actual retirement");
             assert_eq!(drops.load(Ordering::SeqCst), 0);
             let late = state.receipt.lock().unwrap().as_ref().unwrap().subscribe();
-            assert_eq!(*late.borrow(), timeout());
+            assert_eq!(text(&late.borrow()), timeout());
             send.send(result).unwrap();
             retirement.await;
             assert!(state.finished());
             assert_eq!(drops.load(Ordering::SeqCst), 1);
-            assert_eq!(*observed.borrow(), timeout());
-            assert_eq!(*late.borrow(), timeout());
+            assert_eq!(text(&observed.borrow()), timeout());
+            assert_eq!(text(&late.borrow()), timeout());
         }
     }
 }

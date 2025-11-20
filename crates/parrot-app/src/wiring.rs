@@ -2,7 +2,7 @@
 //! component references retain the underlying target's stop capability.
 //! Closing a generation rejects subsequent polling of component stops and sends,
 //! including futures created before closure but not yet polled.
-//! Message futures retain their construction-time trace context (including None)
+//! Message and stop futures retain their construction-time trace context (including None)
 //! through polling and disposal. A connection adds no synthetic handler span.
 use parrot_api::{
     address::ActorRef,
@@ -61,6 +61,15 @@ impl WiredRef {
     }
 }
 impl ActorRef for WiredRef {
+    fn death_watch(&self) -> Option<parrot_api::death_watch::DeathWatch> {
+        self.target.death_watch()
+    }
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        match self.access {
+            Access::Connection => parrot_api::address::RetirementStatus::Unsupported,
+            Access::Component => self.target.retirement_status(),
+        }
+    }
     fn send<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(parrot_api::trace::capture(async move {
             self.check()?;
@@ -104,7 +113,7 @@ impl ActorRef for WiredRef {
         }))
     }
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             match self.access {
                 Access::Connection => Err(ActorError::MessageHandlingError("a wiring connection does not own its target; stop the application through its assembling context".into())),
                 Access::Component => {
@@ -112,7 +121,7 @@ impl ActorRef for WiredRef {
                     self.target.stop().await
                 }
             }
-        })
+        }))
     }
     fn path(&self) -> String {
         self.source.clone()

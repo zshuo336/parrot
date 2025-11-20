@@ -88,10 +88,8 @@ impl Drop for Fixture {
 fn source_only_beam_compiles_but_existing_bundle_preserves_sibling_modules() {
     let fixture = Fixture::new();
     let source = fixture.prepare(&[]).unwrap();
-    assert_eq!(
-        source.beam_sources.get("frontier"),
-        Some(&fixture.directory.join("frontier.erl"))
-    );
+    let frontier = std::fs::canonicalize(fixture.directory.join("frontier.erl")).unwrap();
+    assert_eq!(source.beam_sources.get("frontier"), Some(&frontier));
     std::fs::write(fixture.directory.join("frontier.beam"), "compiled").unwrap();
     assert!(fixture.prepare(&[]).unwrap().beam_sources.is_empty());
     std::fs::remove_file(fixture.directory.join("frontier.beam")).unwrap();

@@ -395,9 +395,18 @@ async fn case<C: ChildConfig>(mode: SchedulingMode, traced: bool, hold: bool) {
             bridges, expected_bridges,
             "child validation and publication must preserve the creation parent"
         );
+        let initialization = phases[0].1;
+        match (initialization, expected) {
+            (Some(child), Some(parent)) => {
+                assert_eq!(child.trace, parent.trace);
+                assert_ne!(child.span, parent.span);
+            }
+            (None, None) => {}
+            mismatch => panic!("child initialization lost its admitted parent: {mismatch:?}"),
+        }
         assert!(
-            phases.iter().all(|(_, actual)| *actual == expected),
-            "child initialization must retain its creation parent through disposal: {phases:?}"
+            phases.iter().all(|(_, actual)| *actual == initialization),
+            "child initialization must retain the hook identity through disposal: {phases:?}"
         );
         recorder.close();
         let snapshot = recorder.drain();
@@ -406,20 +415,18 @@ async fn case<C: ChildConfig>(mode: SchedulingMode, traced: bool, hold: bool) {
         assert_eq!(snapshot.counts.overwritten, 0);
         assert_eq!(snapshot.retained, 0);
         assert!(!snapshot.counts.counters_overflowed);
-        let records = 1 + u64::from(traced && !hold);
+        let records = 1 + u64::from(traced) + u64::from(traced && !hold);
         assert_eq!(snapshot.counts.started, records);
         assert_eq!(snapshot.counts.completed, records);
-        assert_eq!(snapshot.counts.ok, records);
+        assert_eq!(snapshot.counts.ok, records - u64::from(traced && hold));
+        assert_eq!(snapshot.counts.cancelled, u64::from(traced && hold));
         assert_eq!(snapshot.counts.drained, records);
         assert_eq!(snapshot.records.len() as u64, records);
-        assert!(
-            snapshot
-                .records
-                .iter()
-                .all(|record| record.kind == SpanKind::DynamicHandler
-                    && record.status == SpanStatus::Ok
-                    && record.trace_id == origin.trace_id())
-        );
+        assert!(snapshot.records.iter().all(|record| matches!(
+            record.kind,
+            SpanKind::DynamicHandler | SpanKind::ActorInit
+        ) && record.trace_id == origin.trace_id()
+            && (record.kind == SpanKind::ActorInit || record.status == SpanStatus::Ok)));
         let parent_record = snapshot
             .records
             .iter()
@@ -434,6 +441,21 @@ async fn case<C: ChildConfig>(mode: SchedulingMode, traced: bool, hold: bool) {
                     span: parent_record.span_id
                 }
             );
+            let record = snapshot
+                .records
+                .iter()
+                .find(|record| record.kind == SpanKind::ActorInit)
+                .unwrap();
+            assert_eq!(record.span_id, initialization.unwrap().span);
+            assert_eq!(record.parent_span_id, Some(parent_record.span_id));
+            assert_eq!(
+                record.status,
+                if hold {
+                    SpanStatus::Cancelled
+                } else {
+                    SpanStatus::Ok
+                }
+            );
         }
         let sink_record = snapshot
             .records
@@ -442,8 +464,8 @@ async fn case<C: ChildConfig>(mode: SchedulingMode, traced: bool, hold: bool) {
         if traced && !hold {
             assert_eq!(
                 sink_record.unwrap().parent_span_id,
-                Some(parent_record.span_id),
-                "real child init request must descend directly from the spawning parent handler"
+                Some(initialization.unwrap().span),
+                "real child init request must descend from the recorded initialization hook"
             );
         } else {
             assert!(sink_record.is_none());

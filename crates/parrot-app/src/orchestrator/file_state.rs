@@ -17,12 +17,26 @@ struct Inner {
     latest: Option<DesiredStateRecord>,
     failed: bool,
 }
+
+struct Owner {
+    file: File,
+    pid: u32,
+}
+impl Drop for Owner {
+    fn drop(&mut self) {
+        // Closing one descriptor does not release a flock inherited by a
+        // concurrent fork. Only the original process may explicitly unlock it.
+        if self.pid == std::process::id() {
+            let _ = self.file.unlock();
+        }
+    }
+}
+
 pub struct FileStateStore {
     directory: PathBuf,
     limits: ApplicationLimits,
-    pid: u32,
     inner: Mutex<Inner>,
-    _owner: File,
+    _owner: Owner,
     #[cfg(test)]
     fail_stage: std::sync::atomic::AtomicU8,
 }
@@ -40,6 +54,10 @@ impl FileStateStore {
         owner
             .try_lock()
             .map_err(|e| format!("desired owner lock: {e}"))?;
+        let owner = Owner {
+            file: owner,
+            pid: std::process::id(),
+        };
         let main = directory.join("desired.state");
         let next = directory.join("desired.next");
         let latest = if exists(&main)? {
@@ -55,7 +73,10 @@ impl FileStateStore {
             {
                 return Err("corrupt or oversized desired state snapshot".into());
             }
-            let state: DesiredStateRecord = serde_json::from_slice(&bytes[40..]).map_err(error)?;
+            let mut decoder = serde_json::Deserializer::from_slice(&bytes[40..]);
+            let state = DesiredStateRecord::deserialize_with_limits(&mut decoder, &limits)
+                .map_err(error)?;
+            decoder.end().map_err(error)?;
             state.validate(&limits)?;
             // Publish could have reached rename before a failed directory sync.
             // Reopen establishes durability before exposing that generation.
@@ -88,7 +109,6 @@ impl FileStateStore {
         Ok(Self {
             directory,
             limits,
-            pid: std::process::id(),
             inner: Mutex::new(Inner {
                 latest,
                 failed: false,
@@ -99,7 +119,7 @@ impl FileStateStore {
         })
     }
     fn check_owner(&self, inner: &Inner) -> Result<(), String> {
-        if self.pid != std::process::id() || inner.failed {
+        if self._owner.pid != std::process::id() || inner.failed {
             Err("desired state owner failed or inherited across fork; reopen required".into())
         } else {
             Ok(())
@@ -114,7 +134,7 @@ impl FileStateStore {
         }
     }
     fn ensure_pid(&self) -> Result<(), String> {
-        if self.pid != std::process::id() {
+        if self._owner.pid != std::process::id() {
             Err("desired state inherited across fork; reopen required".into())
         } else {
             Ok(())
@@ -150,7 +170,7 @@ impl DesiredStateStore for FileStateStore {
             .map_err(|_| "desired state lock poisoned")?;
         self.check_owner(&inner)?;
         check_transition(inner.latest.as_ref(), expected, state)?;
-        let bytes = encode(state)?;
+        let bytes = encode(state, &self.limits)?;
         if let Err(error) = self.publish(&bytes) {
             inner.failed = true;
             return Err(error);
@@ -177,7 +197,7 @@ impl DesiredStateStore for FileStateStore {
         Ok(inner.latest.clone())
     }
 }
-fn encode(state: &DesiredStateRecord) -> Result<Vec<u8>, String> {
+fn encode(state: &DesiredStateRecord, limits: &ApplicationLimits) -> Result<Vec<u8>, String> {
     struct Bounded(Vec<u8>);
     impl Write for Bounded {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -192,7 +212,9 @@ fn encode(state: &DesiredStateRecord) -> Result<Vec<u8>, String> {
         }
     }
     let mut writer = Bounded(Vec::new());
-    serde_json::to_writer(&mut writer, state).map_err(error)?;
+    state
+        .serialize_with_limits(&mut serde_json::Serializer::new(&mut writer), limits)
+        .map_err(error)?;
     Ok(writer.0)
 }
 fn exists(path: &Path) -> Result<bool, String> {
@@ -248,6 +270,41 @@ fn error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use crate::{ArtifactRef, ComponentSpec, EngineKind, InstancePolicy};
+
+    #[test]
+    fn owner_retirement_unlocks_even_while_a_cloned_descriptor_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStateStore::open(dir.path(), Default::default()).unwrap();
+        let inherited = store._owner.file.try_clone().unwrap();
+        drop(store);
+        let recovered = FileStateStore::open(dir.path(), Default::default()).unwrap();
+        drop(inherited);
+        assert!(FileStateStore::open(dir.path(), Default::default()).is_err());
+        recovered.commit(None, &record(1)).unwrap();
+        assert_eq!(recovered.current_revision().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn owner_retirement_in_an_inherited_process_does_not_unlock_the_original_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileStateStore::open(dir.path(), Default::default()).unwrap();
+        let original = Owner {
+            file: store._owner.file.try_clone().unwrap(),
+            pid: std::process::id(),
+        };
+        let inherited = original.file.try_clone().unwrap();
+        store._owner.pid = 0;
+        drop(store);
+        assert!(FileStateStore::open(dir.path(), Default::default()).is_err());
+        // The parent retires through its actual owner guard. Closing a raw
+        // descriptor alone depends on unrelated concurrent fork lifetimes.
+        drop(original);
+        let recovered = FileStateStore::open(dir.path(), Default::default()).unwrap();
+        drop(inherited);
+        assert!(FileStateStore::open(dir.path(), Default::default()).is_err());
+        recovered.commit(None, &record(1)).unwrap();
+    }
+
     fn record(revision: u64) -> DesiredStateRecord {
         DesiredStateRecord {
             mirrors: Default::default(),
@@ -302,7 +359,7 @@ mod tests {
     fn inherited_owner_rejects_before_accessing_possibly_inherited_mutex() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = FileStateStore::open(dir.path(), Default::default()).unwrap();
-        store.pid = 0;
+        store._owner.pid = 0;
         let _held = store.inner.lock().unwrap();
         assert!(store.latest().is_err());
         assert!(store.current_revision().is_err());

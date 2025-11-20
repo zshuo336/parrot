@@ -2,7 +2,7 @@
 
 This directory is the Tokio 1.53.3 crates.io release under its original MIT
 license. `UPSTREAM.json` records the release archive SHA-256 and all 564 upstream
-file hashes. Eleven upstream Rust files and the normalized `Cargo.toml` differ;
+file hashes. Twelve upstream Rust files and the normalized `Cargo.toml` differ;
 the package version and dependency versions are unchanged. `Cargo.toml.orig`
 is preserved byte-for-byte as upstream provenance, not an editable build input.
 
@@ -60,6 +60,45 @@ before delivery. Callback panic isolation belongs to the receptionist owner;
 the primitive normally propagates a wake panic, and suppresses a secondary panic
 only when its guard is dropped during an existing unwind.
 
+## Oneshot value handoff and waker retirement
+
+`src/sync/oneshot.rs` keeps values detached by receive or rejected send behind a
+private unwind guard until the last channel owner has been released. A user
+waker destructor can panic at that release point. The guard disposes the detached
+value independently during unwind, preserving the original waker panic instead
+of overlapping it with a value destructor panic. Normal values and send/receive
+signatures are unchanged; this adds no heap allocation or callback indirection.
+
+Final channel disposal attempts both initialized receive/send wakers separately,
+then resumes its first failure unless the caller was already unwinding. Panic
+payload destructors have a separate boundary; recursive secondary payloads are
+deliberately leaked. This cannot recover from an internal double panic within a
+single user destructor, panic=abort, or synchronous blocking. A panicking waker
+may prevent a receive from returning its value; the detached value is then
+disposed, and ordinary poll/try_recv callers can catch the original panic.
+
+## Blocking task ownership on worker creation failure
+
+`src/runtime/blocking/pool.rs` commits a blocking task to the shared queue only
+after worker creation succeeds, or an existing worker can service it. The same
+pool mutex still covers the worker decision and queue insertion. An idle worker
+cannot consume a notification before the task is queued. The upstream temporary
+OS failure fallback to existing workers is preserved.
+
+If the first worker cannot be created, the task is shut down outside the pool
+mutex before returning the spawn error. A panicking thread-name callback also
+leaves no queued task. Previously, `spawn_blocking` could panic while retaining
+the closure in the queue: captures were not retired, and a later successful
+spawn could run the supposedly failed task. Public spawn panic behavior is
+unchanged; a failed dispatch now releases its task ownership.
+
+Parrot preserves the actual input-disposal receipt when dispatch fails. Real
+Linux cgroup thread exhaustion covers all three mailboxes and a direct Tokio
+job; an ordinary regression covers worker-builder callback panic and recovery.
+The pinned upstream `task_blocking` and `rt_spawn_blocking` suites exercise normal
+blocking execution, nested blocking, shutdown, paused time and the lost-spawn
+race alongside those failure contracts.
+
 ## Platform documentation
 
 Three additional changes are documentation-only: `src/net/mod.rs` links to
@@ -90,7 +129,9 @@ applies on every platform when native support is enabled; the native runtime
 repair itself remains specific to Linux GNU. `parrot-remote` separately requires
 `tokio/parrot-deferred-mpsc` on every platform, including non-native app/node
 consumers that depend on the remote layer. Those consumers also need the root
-patch. Pure ABI without the loader requires neither marker nor Tokio.
+patch. The core `parrot` crate also requires `tokio/parrot-blocking-ownership`
+for failed blocking-dispatch cleanup, including applications without remote or
+native loading. Pure ABI without the loader requires neither marker nor Tokio.
 
 If a consumer already locks a newer registry version, merely adding the patch
 may still fail resolution. Select the patched version explicitly and retain the
@@ -120,9 +161,15 @@ Use a new output directory for each run; it retains generated consumers, logs
 and intermediate lockfiles. Full execution requires Linux GNU and a C compiler.
 `--resolution-only` checks dependency selection without claiming compilation or
 runtime coverage; `--offline` uses an already populated Cargo cache. Three native
-consumer paths each execute the eight real C-finalizer contracts. The pure ABI
+consumer paths each execute sixteen real C-finalizer contracts: eight runtime
+parking/timer contracts and eight cold Parrot trace-entry contracts. Native test
+consumers explicitly depend on `parrot-api` for those trace probes; this is a dev
+dependency, and the pure ABI consumer still requires neither it nor Tokio. The pure ABI
 consumer compiles without the root patch; three non-native app/node configurations
-require the deferred-channel patch and compile with it. Missing-patch cases must
+require the deferred-channel patch and compile with it. App host and node
+consumers additionally require the core blocking-ownership patch. A core-only
+consumer independently checks rejection without the patch
+and successful compilation/execution with it. Missing-patch cases must
 fail on a required capability, and patched consumers must resolve every required
 capability. A real registry 1.53.2 lock
 checks rejection and the explicit update recovery path.
@@ -134,7 +181,8 @@ upstream release containing the fix; this patch is not automatically published.
 
 Keep the upstream source and license intact. When upgrading, verify the new
 archive checksum, review the five native runtime changes, three deferred-channel
-changes, three documentation corrections and both capability requirements, and
+changes, three documentation corrections, blocking task ownership and all three
+capability requirements, and
 run `native_runtime_progress` and `dylib_assembly` with the real workspace
 feature union on Linux GNU. The former must detect both cold-thread defects in
 the unpatched implementation and pass with the patch; retain its current-thread
@@ -143,7 +191,7 @@ positive control and synchronous oneshot/mpsc/shutdown cases. Check the minimal
 debug/release, strict Clippy, formatting and packaging checks. Retain negative
 controls for deferred notification and receptionist lock boundaries; run
 `mpsc_deferred_contract` plus the actual pinned upstream mpsc, oneshot and
-AsyncFd suites with `scripts/check_tokio_upstream.py`. Retain negative
+AsyncFd and blocking-task suites with `scripts/check_tokio_upstream.py`. Retain negative
 controls for missing initialization and initialization after the parker mutex is
 acquired. Remove this local patch only after an upstream replacement passes
 those contracts; merely upgrading to 1.53.2 did not fix the independent probes.

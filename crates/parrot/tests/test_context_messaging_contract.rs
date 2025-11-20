@@ -7,7 +7,7 @@ use parrot::thread::context::ThreadContext;
 use parrot::thread::system::ThreadActorSystem;
 use parrot_api::actor::{ActixEngineExt, Actor, ActorState, EmptyConfig};
 use parrot_api::address::{ActorRef, ActorRefExt};
-use parrot_api::context::ActorContext;
+use parrot_api::context::{ActorContext, ActorContextMessage};
 use parrot_api::errors::ActorError;
 use parrot_api::message::{Message, MessageOptions};
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
@@ -17,10 +17,16 @@ use tokio::sync::Notify;
 
 enum Command {
     SendSelf,
+    SendSelfDetached(Arc<Notify>),
+    IncrementObserved(Arc<Notify>),
     Increment,
     Read,
     Ask(BoxedActorRef),
     Wait(Arc<Notify>),
+}
+
+impl Message for Command {
+    type Result = u64;
 }
 
 struct TightDeadline;
@@ -55,6 +61,13 @@ async fn handle(
         Command::SendSelf => {
             ctx.send(ctx.get_self_ref(), Box::new(Command::Increment))
                 .await?
+        }
+        Command::SendSelfDetached(observed) => {
+            ctx.send_self(Command::IncrementObserved(observed))?;
+        }
+        Command::IncrementObserved(observed) => {
+            *value += 1;
+            observed.notify_one();
         }
         Command::Increment => *value += 1,
         Command::Read => {}
@@ -116,6 +129,22 @@ async fn send_self(actor: &dyn ActorRef) -> ActorResult<BoxedMessage> {
         .await
 }
 
+async fn send_self_detached(actor: &dyn ActorRef) -> ActorResult<BoxedMessage> {
+    let observed = Arc::new(Notify::new());
+    actor
+        .send_with_timeout(
+            Box::new(Command::SendSelfDetached(observed.clone())),
+            Some(Duration::from_secs(5)),
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), observed.notified())
+        .await
+        .expect("detached self-delivery did not execute");
+    actor
+        .send_with_timeout(Box::new(Command::Read), Some(Duration::from_secs(5)))
+        .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_context_send_to_self_does_not_wait_for_handler() {
     let system = system();
@@ -124,6 +153,7 @@ async fn thread_context_send_to_self_does_not_wait_for_handler() {
         .await
         .unwrap();
     let result = send_self(&actor).await;
+    let detached = send_self_detached(&actor).await;
     let _ = system.shutdown_internal().await;
     assert_eq!(
         *result
@@ -132,6 +162,7 @@ async fn thread_context_send_to_self_does_not_wait_for_handler() {
             .unwrap(),
         1
     );
+    assert_eq!(*detached.unwrap().downcast::<u64>().unwrap(), 2);
 }
 
 #[test]
@@ -139,6 +170,7 @@ fn actix_context_send_to_self_does_not_wait_for_handler() {
     actix::System::new().block_on(async {
         let actor = ActixActorRef::new(ActixActor::new(ActixDriver(0)).start(), "/self".into());
         let result = send_self(&actor).await;
+        let detached = send_self_detached(&actor).await;
         assert_eq!(
             *result
                 .expect("send must only enqueue")
@@ -146,6 +178,7 @@ fn actix_context_send_to_self_does_not_wait_for_handler() {
                 .unwrap(),
             1
         );
+        assert_eq!(*detached.unwrap().downcast::<u64>().unwrap(), 2);
         actor.stop().await.unwrap();
     });
 }

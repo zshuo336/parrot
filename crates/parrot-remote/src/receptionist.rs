@@ -1,7 +1,8 @@
 //! 职责：Receptionist——key → remote_path 注册表 + 订阅流（DEV_02 §3 / 06 §2.2）。
 //!
 //! Local table and bounded subscriptions. A system-owned facade additionally
-//! synchronizes authorized direct cluster links and retires dead-node entries.
+//! synchronizes authorized cluster links with explicit sparse relay grants and
+//! retires unavailable source paths.
 //! Standalone facades keep a separate local table without automatic networking.
 
 use std::collections::{HashMap, HashSet};
@@ -12,6 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::swim::NodeAddrWire;
 
 pub use parrot_api::receptionist::{ReceptionistEvent as ApiEvent, ReceptionistKey as ApiKey};
+
+mod registrations;
+mod subscriptions;
+pub use registrations::{registration_bytes, REGISTRATION_OVERHEAD};
+pub(crate) use subscriptions::validate_event;
+pub use subscriptions::{MAX_EVENT_BYTES, RESERVED_SLOT_BYTES};
 
 /// SYSTEM_EVENT 注册表快照载荷：仅包含 from 节点自己的完整注册表。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,33 +65,16 @@ impl Notifications {
 
 impl Drop for Notifications {
     fn drop(&mut self) {
-        let mut failure = None;
-        let mut remember = |result| {
-            if let Err(payload) = result {
-                if failure.is_none() {
-                    failure = Some(payload);
-                } else {
-                    std::mem::forget(payload);
-                }
-            }
-        };
+        let cleanup = crate::ingress::unwind::Cleanup::default();
         for wake in self.wakes.drain(..) {
-            remember(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || drop(wake),
-            )));
+            cleanup.dispose(wake);
         }
         // Last-sender drop can also invoke a receiver callback.
         for sender in self.retired.drain(..) {
-            remember(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || drop(sender),
-            )));
+            cleanup.dispose(sender);
         }
-        if let Some(payload) = failure {
-            if std::thread::panicking() {
-                std::mem::forget(payload);
-            } else {
-                std::panic::resume_unwind(payload);
-            }
+        if cleanup.failed() && !std::thread::panicking() {
+            panic!("receptionist notification callback panicked after state committed");
         }
     }
 }
@@ -93,6 +83,9 @@ impl Drop for Notifications {
 
 #[derive(Default)]
 pub struct Receptionist {
+    registrations: registrations::Budget,
+    subscription_limits: parrot_config::receptionist::SubscriptionLimits,
+    subscription_usage: std::sync::Arc<subscriptions::Usage>,
     /// key → (node, remote_path) 集合。
     entries: HashMap<String, Vec<ReceptionistEntry>>,
     /// 订阅者（key → 广播通道）。
@@ -123,6 +116,7 @@ impl Receptionist {
     }
 
     /// 本节点注册。
+    /// Unchecked compatibility API; bounded callers should use `try_register`.
     pub fn register(
         &mut self,
         node: &str,
@@ -135,9 +129,12 @@ impl Receptionist {
             remote_path: remote_path.to_string(),
             node: node.to_string(),
         };
-        let list = self.entries.entry(key.as_str().to_string()).or_default();
-        if !list.contains(&e) {
-            list.push(e);
+        if !self
+            .entries
+            .get(key.as_str())
+            .is_some_and(|list| list.contains(&e))
+        {
+            self.insert_entry(e);
         }
         ReceptionistEvent::Registered {
             key: key.clone(),
@@ -148,8 +145,16 @@ impl Receptionist {
     /// 本节点去注册。
     pub fn deregister(&mut self, key: &ReceptionistKey, remote_path: &str) -> ReceptionistEvent {
         self.owners.remove(&(key.clone(), remote_path.to_owned()));
+        let registrations = &mut self.registrations;
         if let Some(list) = self.entries.get_mut(key.as_str()) {
-            list.retain(|e| e.remote_path != remote_path);
+            list.retain(|e| {
+                if e.remote_path == remote_path {
+                    registrations.remove(e);
+                    false
+                } else {
+                    true
+                }
+            });
             if list.is_empty() {
                 self.entries.remove(key.as_str());
             }
@@ -165,6 +170,25 @@ impl Receptionist {
     /// 超大容量限制在 Tokio 队列上限以内，避免合法 usize 预算触发 panic。
     /// 消费者过慢导致队列满时关闭该流；消费完已排队前缀后应重新订阅。
     pub fn subscribe(&mut self, key: &ReceptionistKey, buf: usize) -> ReceptionistStream {
+        // This legacy, infallible API cannot report an admission error. Avoid
+        // constructing a channel smaller than its snapshot: `try_send` below
+        // must never become a process panic for an oversized unchecked table.
+        let snapshot = self.entries.get(key.as_str());
+        let snapshot_len = snapshot.map_or(0, Vec::len);
+        if snapshot_len > tokio::sync::Semaphore::MAX_PERMITS
+            || snapshot.is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| validate_event(&entry.key, &entry.remote_path).is_err())
+            })
+        {
+            // The infallible compatibility API cannot return an admission
+            // error. A closed stream is the only safe result: replaying an
+            // unchecked historical entry would bypass the event envelope.
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            drop(tx);
+            return rx.into();
+        }
         let (stream, notifications) = self.subscribe_deferred(key, buf);
         drop(notifications);
         stream
@@ -201,7 +225,7 @@ impl Receptionist {
             .entry(key.as_str().to_string())
             .or_default()
             .push(tx);
-        (rx, notifications)
+        (rx.into(), notifications)
     }
 
     /// 事件广播（本地注册 + 远端同步统一入口）。
@@ -211,18 +235,24 @@ impl Receptionist {
 
     pub(crate) fn broadcast_deferred(&mut self, ev: &ReceptionistEvent) -> Notifications {
         let mut notifications = Notifications::default();
-        let key = match ev {
-            ReceptionistEvent::Registered { key, .. }
-            | ReceptionistEvent::Unregistered { key, .. } => key.as_str().to_string(),
+        let (key, remote_path) = match ev {
+            ReceptionistEvent::Registered { key, remote_path }
+            | ReceptionistEvent::Unregistered { key, remote_path } => (key, remote_path),
         };
-        if let Some(subs) = self.subscribers.get_mut(&key) {
+        // Unchecked low-level writers may hold older oversized entries. Close
+        // streams instead of enqueueing an event beyond their reserved envelope.
+        let oversized = validate_event(key, remote_path).is_err();
+        if let Some(subs) = self.subscribers.get_mut(key.as_str()) {
             notifications.retired.extend(subs.extract_if(.., |tx| {
+                if oversized {
+                    return true;
+                }
                 let (result, wake) = tx.try_send_deferred(ev.clone());
                 notifications.wakes.push(wake);
                 result.is_err()
             }));
             if subs.is_empty() {
-                self.subscribers.remove(&key);
+                self.subscribers.remove(key.as_str());
             }
         }
         notifications
@@ -232,6 +262,7 @@ impl Receptionist {
     /// 混入其他节点的快照整体拒绝，不改变表或产生事件。
     /// Checks entry ownership; network callers must additionally authenticate from.
     /// RemoteActorSystem validates its current physical connection and key ACL first.
+    /// Unchecked table capacity; use `try_merge_sync` for bounded admission.
     pub fn merge_sync(&mut self, sync: &ReceptionistSync) -> Vec<ReceptionistEvent> {
         if sync.entries.iter().any(|entry| entry.node != sync.from) {
             return Vec::new();
@@ -240,10 +271,12 @@ impl Receptionist {
         // Consume retained identities, then insert each remaining input once.
         // Per-key Vec scans would make a complete snapshot quadratic.
         let mut pending: HashSet<&ReceptionistEntry> = sync.entries.iter().collect();
+        let registrations = &mut self.registrations;
         self.entries.retain(|_, list| {
             list.retain(|entry| {
                 let keep = entry.node != sync.from || pending.remove(entry);
                 if !keep {
+                    registrations.remove(entry);
                     events.push(ReceptionistEvent::Unregistered {
                         key: entry.key.clone(),
                         remote_path: entry.remote_path.clone(),
@@ -256,10 +289,7 @@ impl Receptionist {
         // upsert 新条目
         for e in &sync.entries {
             if pending.remove(e) {
-                self.entries
-                    .entry(e.key.as_str().to_string())
-                    .or_default()
-                    .push(e.clone());
+                self.insert_entry(e.clone());
                 events.push(ReceptionistEvent::Registered {
                     key: e.key.clone(),
                     remote_path: e.remote_path.clone(),
@@ -281,6 +311,7 @@ impl Receptionist {
                 self.entries.remove(&k);
             }
             for e in removed {
+                self.registrations.remove(&e);
                 events.push(ReceptionistEvent::Unregistered {
                     key: e.key,
                     remote_path: e.remote_path,
@@ -314,21 +345,33 @@ impl Receptionist {
         available: &HashSet<String>,
     ) -> Vec<ReceptionistEvent> {
         let mut events = Vec::new();
+        let registrations = &mut self.registrations;
         self.entries.retain(|_, entries| {
             events.extend(
                 entries
                     .extract_if(.., |entry| {
                         entry.node != local && !available.contains(&entry.node)
                     })
-                    .map(|entry| ReceptionistEvent::Unregistered {
-                        key: entry.key,
-                        remote_path: entry.remote_path,
+                    .map(|entry| {
+                        registrations.remove(&entry);
+                        ReceptionistEvent::Unregistered {
+                            key: entry.key,
+                            remote_path: entry.remote_path,
+                        }
                     }),
             );
             !entries.is_empty()
         });
         self.forget_removed_owners(&events);
         events
+    }
+
+    fn insert_entry(&mut self, entry: ReceptionistEntry) {
+        self.registrations.insert(&entry);
+        self.entries
+            .entry(entry.key.as_str().to_owned())
+            .or_default()
+            .push(entry);
     }
 
     fn forget_removed_owners(&mut self, events: &[ReceptionistEvent]) {
@@ -380,9 +423,35 @@ pub struct ReceptionistFacade {
 
 impl ReceptionistFacade {
     pub fn new(node: impl Into<String>) -> Self {
+        Self::with_subscription_limits(node, Default::default())
+    }
+
+    /// Standalone local gateway with an explicit receiver-lifetime budget.
+    pub fn with_subscription_limits(
+        node: impl Into<String>,
+        limits: parrot_config::receptionist::SubscriptionLimits,
+    ) -> Self {
+        Self::with_limits(node, limits, Default::default())
+    }
+
+    pub fn with_registration_limits(
+        node: impl Into<String>,
+        limits: parrot_config::receptionist::RegistrationLimits,
+    ) -> Self {
+        Self::with_limits(node, Default::default(), limits)
+    }
+
+    pub fn with_limits(
+        node: impl Into<String>,
+        subscriptions: parrot_config::receptionist::SubscriptionLimits,
+        registrations: parrot_config::receptionist::RegistrationLimits,
+    ) -> Self {
         Self {
             node: node.into(),
-            inner: std::sync::Arc::new(std::sync::Mutex::new(Receptionist::new())),
+            inner: std::sync::Arc::new(std::sync::Mutex::new(Receptionist::with_limits(
+                subscriptions,
+                registrations,
+            ))),
             acl: crate::acl::AclRules::default(),
             system: None,
         }
@@ -421,7 +490,7 @@ impl ReceptionistFacade {
         owner: &Option<std::sync::Arc<crate::system::RemoteActorSystem>>,
     ) -> parrot_api::types::ActorResult<()> {
         if let Some(system) = owner {
-            if *system.shutdown_signal().borrow() {
+            if system.is_closing() {
                 return Err(parrot_api::errors::ActorError::Stopped);
             }
         }
@@ -472,6 +541,7 @@ impl parrot_api::receptionist::ReceptionistGateway for ReceptionistFacade {
         let notifications = {
             let mut table_guard = self.inner.lock().unwrap();
             Self::live(&owner)?;
+            table_guard.check_registration(&self.node, &key, &remote_path)?;
             scope.publish(
                 binding,
                 move || {
@@ -558,6 +628,7 @@ impl parrot_api::receptionist::ReceptionistGateway for ReceptionistFacade {
         let notifications = {
             let mut g = self.inner.lock().unwrap();
             Self::live(&owner)?;
+            g.check_registration(&self.node, &key, &remote_path)?;
             let ev = g.register(&self.node, &key, &remote_path);
             g.broadcast_deferred(&ev)
         };
@@ -594,7 +665,7 @@ impl parrot_api::receptionist::ReceptionistGateway for ReceptionistFacade {
         let (stream, notifications) = {
             let mut g = self.inner.lock().unwrap();
             Self::live(&owner)?;
-            g.subscribe_deferred(&key, 64)
+            g.try_subscribe_deferred(&key, 64)?
         };
         notifications.dispatch()?;
         Ok(stream)
@@ -607,6 +678,19 @@ mod tests {
 
     fn key(s: &str) -> ReceptionistKey {
         ReceptionistKey::new(s).unwrap()
+    }
+
+    #[test]
+    fn unchecked_subscribe_clamps_an_extreme_budget_without_panicking() {
+        let mut table = Receptionist::new();
+        let key = key("edge/oversized");
+        let mut stream = table.subscribe(&key, usize::MAX);
+        assert!(!stream.is_closed());
+        assert_eq!(stream.max_capacity(), tokio::sync::Semaphore::MAX_PERMITS);
+        assert_eq!(
+            stream.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
     }
 
     #[test]
@@ -698,15 +782,11 @@ mod tests {
             for index in 0..size {
                 let node = format!("departed-{index}");
                 let path = format!("parrot://{node}/user/service");
-                table
-                    .entries
-                    .get_mut(service.as_str())
-                    .unwrap()
-                    .push(ReceptionistEntry {
-                        key: service.clone(),
-                        node,
-                        remote_path: path.clone(),
-                    });
+                table.insert_entry(ReceptionistEntry {
+                    key: service.clone(),
+                    node,
+                    remote_path: path.clone(),
+                });
                 expected.insert(path);
             }
             let available = HashSet::from(["live".to_owned()]);
@@ -882,6 +962,9 @@ mod tests {
         assert!(ReceptionistKey::new("edge/ok key").is_err());
         assert!(ReceptionistKey::new("edge/*").is_err());
         assert!(ReceptionistKey::new("edge/#x").is_err());
+        for invalid in ["", "edge/", "edge//x", "edge/.", "edge/..", "edge/%2e"] {
+            assert!(ReceptionistKey::new(invalid).is_err(), "{invalid:?}");
+        }
         assert!(ReceptionistKey::new("edge/fine").is_ok());
     }
 

@@ -147,7 +147,7 @@ pub fn default_node(spec: &ComponentSpec) -> String {
 
 /// AppSupervisor（desired/observed 差分调和——无内部循环，测试逐形态驱动）。
 pub struct AppSupervisor {
-    limits: crate::limits::ApplicationLimits,
+    pub(super) limits: crate::limits::ApplicationLimits,
     pub(super) state: DesiredStateRecord,
     mirror_executor: bool,
     store: Arc<dyn DesiredStateStore>,
@@ -248,25 +248,30 @@ impl AppSupervisor {
             return Err("cannot change application identity".into());
         }
         self.require_current()?;
-        if canonical(&m)? == canonical(&self.state.manifest)? {
+        if canonical(&m, &self.limits)? == canonical(&self.state.manifest, &self.limits)? {
             return Ok(());
         }
         let revision = self.next_revision()?;
         let mut pending = self.state.pending.clone();
         pending.retain(|name, _| m.component(name).is_some());
         let global_change = m.version != self.state.manifest.version
-            || m.config_overlay.as_ref().map(canonical).transpose()?
+            || m.config_overlay
+                .as_ref()
+                .map(|value| canonical(value, &self.limits))
+                .transpose()?
                 != self
                     .state
                     .manifest
                     .config_overlay
                     .as_ref()
-                    .map(canonical)
+                    .map(|value| canonical(value, &self.limits))
                     .transpose()?
             || m.wiring != self.state.manifest.wiring;
         for component in &m.components {
             if let Some(old) = self.state.manifest.component(&component.name) {
-                if global_change || canonical(component)? != canonical(old)? {
+                if global_change
+                    || canonical(component, &self.limits)? != canonical(old, &self.limits)?
+                {
                     pending.insert(
                         component.name.clone(),
                         PendingUpgrade {
@@ -358,13 +363,10 @@ impl AppSupervisor {
 
     /// 调和一步：desired vs observed diff → 动作清单。
     ///
-    /// diff 五形态（E1 测试义务）：
-    /// 1. 缺失（observed 无）→ Deploy
-    /// 2. 多余（desired 无）→ Drain → Stop（两步——先排空）
-    /// 3. 版本不符 → 升级路径（in_flight 时 Wait 交 RolloutTracker；
-    ///    否则 Drain+Deploy 同步重建）
-    /// 4. 实例数不符 → Deploy（补齐）/ Drain 缺口
-    /// 5. 状态退化（非 running 且应有）→ Wait（监督自愈预期）
+    /// 缺失组件产生 Deploy；网络模式须先有目标节点的空状态回执。
+    /// 多余组件产生 Drain、Stop。版本、实例数或终态不符时，先 Drain、Stop
+    /// 原 cohort，再 Deploy 完整策略。过渡状态、缺失依赖、过期观察或在途
+    /// 升级产生 Wait。这里只生成动作，宿主须按序执行并提供新回执。
     pub fn reconcile_once(&self, observed: &ObservedState) -> ReconcileReport {
         if !self.state.manifest.mirrors.is_empty() || !self.state.mirrors.is_empty() {
             return ReconcileReport {
@@ -597,12 +599,15 @@ impl AppSupervisor {
 
     /// ComponentDeploy 生成（Deploy 动作的载荷——宿主下发 admin-v2）。
     pub fn deploy_payload(&self, spec: &ComponentSpec) -> Result<ComponentDeploy, String> {
-        spec.deployment(&self.state.manifest.version)
+        spec.deployment_with_limits(&self.state.manifest.version, &self.limits)
     }
 }
 
-fn canonical(value: &impl serde::Serialize) -> Result<String, String> {
-    toml::to_string(value).map_err(|e| e.to_string())
+fn canonical(
+    value: &impl serde::Serialize,
+    limits: &crate::ApplicationLimits,
+) -> Result<String, String> {
+    crate::encoding::canonical(value, limits.max_source_bytes).map_err(|e| e.to_string())
 }
 pub(super) fn owned_root(comp: &str, path: &str) -> bool {
     let Some(root) = path.strip_prefix("/user/") else {

@@ -77,14 +77,14 @@ pub struct ThreadActorSystemConfig {
     /// The name of this actor system.
     pub name: String,
 
-    /// The number of worker threads in the shared thread pool.
+    /// Core scheduler worker tasks on the caller-owned Tokio runtime.
     pub shared_pool_size: usize,
 
     /// Elastic scaling: max temporary burst workers for the shared pool.
     ///
     /// Burst workers are spawned when the scheduling queue stays backlogged
     /// while all core workers are busy with long CPU tasks, and are reaped
-    /// after sustained idleness. Global thread bound:
+    /// after sustained idleness. Scheduler worker-task bound:
     /// `shared_pool_size + shared_burst_workers_max`.
     pub shared_burst_workers_max: usize,
 
@@ -99,6 +99,9 @@ pub struct ThreadActorSystemConfig {
     /// Saturation coalesces readiness in existing actor registrations, without
     /// limiting actor count or bypassing the actors' bounded mailboxes.
     pub shared_queue_capacity: usize,
+    /// Opt in to worker-local FIFO queues with stealing by idle shared workers.
+    /// All resident queues still share shared_queue_capacity; no thread affinity.
+    pub shared_work_stealing: bool,
 
     /// The maximum number of dedicated threads allowed in the system.
     pub max_dedicated_threads: usize,
@@ -137,6 +140,7 @@ impl Default for ThreadActorSystemConfig {
             shared_burst_backlog_threshold_ms: 100,
             shared_burst_idle_timeout_ms: 5000,
             shared_queue_capacity: 10000,
+            shared_work_stealing: false,
             max_dedicated_threads: 32,
             default_scheduling_mode: SchedulingMode::SharedPool {
                 max_messages_per_run: 10,
@@ -157,6 +161,48 @@ impl Default for ThreadActorSystemConfig {
 }
 
 impl ThreadActorSystemConfig {
+    /// Validate before creating schedulers, semaphores or worker tasks.
+    pub fn validate(&self) -> Result<(), parrot_config::ConfigError> {
+        parrot_config::ThreadResolved {
+            shared_pool_size: self.shared_pool_size,
+            shared_burst_workers_max: self.shared_burst_workers_max,
+            shared_burst_backlog_threshold_ms: self.shared_burst_backlog_threshold_ms,
+            shared_burst_idle_timeout_ms: self.shared_burst_idle_timeout_ms,
+            shared_queue_capacity: self.shared_queue_capacity,
+            shared_work_stealing: self.shared_work_stealing,
+            max_dedicated_threads: self.max_dedicated_threads,
+            default_mailbox_capacity: self.default_mailbox_capacity,
+            max_context_tasks: self.max_context_tasks,
+            default_ask_timeout_ms: 0,
+            shutdown_timeout_ms: 0,
+        }
+        .validate()?;
+        for (key, duration) in [
+            ("thread.default_ask_timeout", self.default_ask_timeout),
+            ("thread.shutdown_timeout", self.shutdown_timeout),
+        ] {
+            parrot_config::validate_thread_duration(key, duration)?;
+        }
+        if let SupervisorStrategy::Restart { within, .. } = self.default_supervisor_strategy {
+            parrot_config::validate_thread_duration(
+                "thread.default_supervisor_strategy.within",
+                within,
+            )?;
+        }
+        if matches!(
+            self.default_scheduling_mode,
+            SchedulingMode::SharedPool {
+                max_messages_per_run: 0
+            }
+        ) {
+            return Err(parrot_config::ConfigError::Invalid {
+                key: "thread.default_scheduling_mode.max_messages_per_run".into(),
+                reason: "must be > 0".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// 配置切面：从 parrot-config 折叠结果生成（`[thread]` 节——文件层
     /// 加载由 parrot-config 负责）。未覆盖字段保持 Default（与现行为一致）。
     pub fn from_resolved(r: &parrot_config::Resolved) -> Self {
@@ -168,6 +214,7 @@ impl ThreadActorSystemConfig {
             shared_burst_backlog_threshold_ms: r.thread.shared_burst_backlog_threshold_ms,
             shared_burst_idle_timeout_ms: r.thread.shared_burst_idle_timeout_ms,
             shared_queue_capacity: r.thread.shared_queue_capacity,
+            shared_work_stealing: r.thread.shared_work_stealing,
             max_dedicated_threads: r.thread.max_dedicated_threads,
             default_mailbox_capacity: r.thread.default_mailbox_capacity,
             max_context_tasks: r.thread.max_context_tasks,
@@ -229,7 +276,7 @@ pub struct ThreadActorConfig {
     /// The scheduling mode for this actor.
     pub scheduling_mode: Option<SchedulingMode>,
 
-    /// The capacity of this actor's mailbox.
+    /// The capacity of this actor's mailbox (1..=1048576).
     pub mailbox_capacity: Option<usize>,
 
     /// The supervision strategy for this actor.
@@ -241,14 +288,71 @@ pub struct ThreadActorConfig {
     /// The backpressure strategy for this actor's mailbox.
     pub backpressure_strategy: Option<BackpressureStrategy>,
 
-    /// The size of the stack for dedicated OS threads (used when scheduling_mode is DedicatedThread)
+    /// Requested stack bytes for dedicated OS threads, at most 64 MiB.
+    /// Zero is permitted; the platform may round it up to its minimum stack.
     pub thread_stack_size: Option<usize>,
 
     /// Whether to yield after processing each message
     pub yield_after_each_message: Option<bool>,
 
-    /// Duration to sleep when idle (no messages in mailbox)
+    /// Dedicated-thread duration to sleep when idle (no messages in mailbox).
     pub idle_sleep_duration: Option<Duration>,
     // pub core_affinity: Option<usize>,
     // pub dispatcher: Option<String>,
+}
+
+impl ThreadActorConfig {
+    /// Per-thread requested stack bound, not a guarantee of available memory.
+    pub const MAX_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+    /// Check explicit overrides before publication, allocation or construction.
+    /// Omitted fields inherit the already validated system defaults. Zero ask,
+    /// idle and restart durations retain their immediate-deadline semantics.
+    pub fn validate(&self) -> Result<(), parrot_config::ConfigError> {
+        for (key, value, minimum, maximum) in [
+            ("actor.message_batch_size", self.message_batch_size, 1, 256),
+            (
+                "actor.mailbox_capacity",
+                self.mailbox_capacity,
+                1,
+                parrot_config::ThreadResolved::MAX_QUEUE_CAPACITY,
+            ),
+            (
+                "actor.thread_stack_size",
+                self.thread_stack_size,
+                0,
+                Self::MAX_THREAD_STACK_SIZE,
+            ),
+        ] {
+            if value.is_some_and(|value| !(minimum..=maximum).contains(&value)) {
+                return Err(parrot_config::ConfigError::Invalid {
+                    key: key.into(),
+                    reason: format!("must be in {minimum}..={maximum}"),
+                });
+            }
+        }
+        if matches!(
+            self.scheduling_mode,
+            Some(SchedulingMode::SharedPool {
+                max_messages_per_run: 0
+            })
+        ) {
+            return Err(parrot_config::ConfigError::Invalid {
+                key: "actor.scheduling_mode.max_messages_per_run".into(),
+                reason: "must be > 0".into(),
+            });
+        }
+        for (key, duration) in [
+            ("actor.ask_timeout", self.ask_timeout),
+            ("actor.idle_sleep_duration", self.idle_sleep_duration),
+        ] {
+            if let Some(duration) = duration {
+                parrot_config::validate_thread_duration(key, duration)?;
+            }
+        }
+        if let Some(SupervisorStrategy::Restart { within, .. }) = self.supervisor_strategy {
+            parrot_config::validate_thread_duration("actor.supervisor_strategy.within", within)?;
+        }
+        Ok(())
+    }
 }

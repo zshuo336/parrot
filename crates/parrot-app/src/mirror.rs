@@ -97,6 +97,7 @@ pub(crate) fn validate(manifest: &AppManifest) -> Result<(), String> {
 }
 pub(crate) fn expand(
     manifest: &AppManifest,
+    limits: &crate::ApplicationLimits,
 ) -> Result<Vec<(WireMirrorPolicy, WireMirrorOptions)>, String> {
     validate(manifest)?;
     let mut policies = Vec::new();
@@ -104,12 +105,12 @@ pub(crate) fn expand(
         let source = manifest
             .component(&policy.source)
             .expect("validated source")
-            .instance_paths()
+            .instance_paths_with_limits(limits)
             .map_err(|e| e.to_string())?;
         let shadow = manifest
             .component(&policy.shadow)
             .expect("validated shadow")
-            .instance_paths()
+            .instance_paths_with_limits(limits)
             .map_err(|e| e.to_string())?;
         for (index, path) in source.into_iter().enumerate() {
             let target = &shadow[if shadow.len() == 1 { 0 } else { index }];
@@ -146,6 +147,12 @@ fn remaining(
         .transpose()
 }
 impl ActorRef for MirroredRef {
+    fn death_watch(&self) -> Option<parrot_api::death_watch::DeathWatch> {
+        self.target.death_watch()
+    }
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        self.target.retirement_status()
+    }
     fn send<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(parrot_api::trace::capture(async move {
             self.handle.offer_local(&self.path, &message);

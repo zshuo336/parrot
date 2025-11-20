@@ -1,8 +1,10 @@
 //! F4 · 自研 Raft 内核（DEV_05 §4——决策档严格边界）。
 //!
-//! **只做**：leader 选举 + 日志复制 + 单一 commit 点。
+//! **只做**：leader 选举、日志复制、单一 commit 点、新鲜多数派 ReadIndex，
+//! 以及显式应用快照的绝对索引与有界分块安装。
+//! [`DurableRaft`] 与 Directory 宿主支持显式应用快照持久化及网络追赶。
 //! **不做**：membership 变更协议（joint consensus；不可通过重启替代）、
-//! snapshot 压缩（条目量小全量重放）。
+//! 自动压缩调度、持久请求历史过期或无限状态容量。
 //!
 //! 时钟注入（DEV_05 §10.2）：选举计时由 `Clock` 注入——测试确定性 /
 //! 生产 tokio interval。**勿用系统时间差判断任期**（时钟跳变混沌）。
@@ -14,6 +16,10 @@
 
 mod storage;
 pub use storage::{DurableRaft, RaftStorageError};
+mod read;
+pub(crate) use read::ReadTicket;
+mod snapshot;
+pub use snapshot::{RaftSnapshot, SnapshotError};
 
 use std::collections::HashMap;
 
@@ -49,6 +55,32 @@ pub enum RaftRpc {
         success: bool,
         /// 拒绝时：follower 日志末尾（leader 据此回退 nextIndex）。
         match_index: LogIndex,
+    },
+    ReadIndex {
+        term: Term,
+        leader: NodeId,
+        context: u64,
+    },
+    ReadIndexResp {
+        term: Term,
+        context: u64,
+    },
+    InstallSnapshot {
+        term: Term,
+        leader: NodeId,
+        index: LogIndex,
+        snapshot_term: Term,
+        digest: [u8; 32],
+        offset: u64,
+        total: u64,
+        data: Vec<u8>,
+    },
+    InstallSnapshotResp {
+        term: Term,
+        index: LogIndex,
+        digest: [u8; 32],
+        next_offset: u64,
+        installed: bool,
     },
 }
 
@@ -97,6 +129,46 @@ impl RaftRpc {
             // A fresh node can legitimately return a negative response at
             // term zero. Response progress is checked against local state.
             Self::RequestVoteResp { .. } | Self::AppendEntriesResp { .. } => {}
+            Self::ReadIndex { term, context, .. } => {
+                if *term == 0 || *context == 0 {
+                    return Err("invalid read term or context");
+                }
+            }
+            Self::ReadIndexResp { context, .. } => {
+                if *context == 0 {
+                    return Err("invalid read response context");
+                }
+            }
+            Self::InstallSnapshot {
+                term,
+                index,
+                snapshot_term,
+                offset,
+                total,
+                data,
+                ..
+            } => {
+                if *term == 0
+                    || *index == 0
+                    || *snapshot_term == 0
+                    || snapshot_term > term
+                    || *total > snapshot::MAX_BYTES as u64
+                    || data.len() > snapshot::CHUNK_BYTES
+                    || offset
+                        .checked_add(data.len() as u64)
+                        .is_none_or(|end| end > *total)
+                    || (data.is_empty() && *total != 0)
+                {
+                    return Err("invalid snapshot chunk metadata or capacity");
+                }
+            }
+            Self::InstallSnapshotResp {
+                index, next_offset, ..
+            } => {
+                if *index == 0 || *next_offset > snapshot::MAX_BYTES as u64 {
+                    return Err("invalid snapshot response metadata");
+                }
+            }
         }
         Ok(())
     }
@@ -197,7 +269,7 @@ pub struct RaftNode {
     // 持久态（论文 Figure 2）
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
-    pub log: Vec<LogEntry>, // index 从 1 起（0=哨兵）
+    pub log: Vec<LogEntry>, // retained suffix, with absolute indices after snapshot_index()
 
     // 易失态
     pub commit_index: LogIndex,
@@ -227,6 +299,8 @@ pub struct RaftNode {
     outbox: Vec<(NodeId, RaftRpc)>,
     // 待 apply 的已提交条目（宿主 drain）
     pending_apply: Vec<LogEntry>,
+    reads: read::Reads,
+    snapshots: snapshot::Snapshots,
 }
 
 impl RaftNode {
@@ -261,6 +335,8 @@ impl RaftNode {
             timeout_jitter_ms: jitter,
             outbox: Vec::new(),
             pending_apply: Vec::new(),
+            reads: Default::default(),
+            snapshots: Default::default(),
         }
     }
 
@@ -284,6 +360,7 @@ impl RaftNode {
                 if now.saturating_sub(self.last_heartbeat_ms) >= self.clock.heartbeat_ms() {
                     self.last_heartbeat_ms = now;
                     self.broadcast_append();
+                    self.send_read_probes(true);
                 }
             }
         }
@@ -348,6 +425,26 @@ impl RaftNode {
                 success,
                 match_index,
             } => self.step_append_resp(from, term, success, match_index),
+            RaftRpc::ReadIndex {
+                term,
+                leader,
+                context,
+            } => self.step_read_probe(from, term, leader, context),
+            RaftRpc::ReadIndexResp { term, context } => {
+                self.step_read_response(from, term, context)
+            }
+            rpc @ RaftRpc::InstallSnapshot { .. } => {
+                let _ = self.step_snapshot(from, rpc, |_| Ok(()));
+            }
+            RaftRpc::InstallSnapshotResp {
+                term,
+                index,
+                digest,
+                next_offset,
+                installed,
+            } => {
+                self.step_snapshot_response(from, term, index, digest, next_offset, installed);
+            }
         }
     }
 
@@ -358,7 +455,10 @@ impl RaftNode {
         if self.role != Role::Leader {
             return Err(NotLeader(self.leader_hint.clone()));
         }
-        let index = self.log.len() as LogIndex + 1;
+        let index = self
+            .last_log_index()
+            .checked_add(1)
+            .ok_or_else(|| NotLeader(self.leader_hint.clone()))?;
         self.log.push(LogEntry {
             term: self.current_term,
             index,
@@ -378,20 +478,28 @@ impl RaftNode {
     }
 
     pub(crate) fn pending_committed(&self) -> &[LogEntry] {
-        &self.pending_apply
+        if self.snapshots.pending_apply {
+            &[]
+        } else {
+            &self.pending_apply
+        }
     }
 
     /// 已提交未应用的条目（宿主 apply 到状态机后丢弃）。
     pub fn committed(&mut self) -> Vec<LogEntry> {
-        std::mem::take(&mut self.pending_apply)
+        if self.snapshots.pending_apply {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.pending_apply)
+        }
     }
 
-    fn last_log_term(&self) -> Term {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+    pub fn last_log_term(&self) -> Term {
+        self.log.last().map_or(self.snapshot_term(), |e| e.term)
     }
 
-    fn last_log_index(&self) -> LogIndex {
-        self.log.len() as LogIndex
+    pub fn last_log_index(&self) -> LogIndex {
+        self.snapshot_index() + self.log.len() as LogIndex
     }
 
     fn quorum(&self) -> usize {
@@ -419,6 +527,8 @@ impl RaftNode {
         self.match_index.clear();
         self.sent_upper.clear();
         self.outbox.clear();
+        self.reads.pending.clear();
+        self.snapshots.reset_transfer();
     }
 
     fn start_election(&mut self) {
@@ -426,6 +536,8 @@ impl RaftNode {
             return; // Exhausted terms must never wrap and reuse a prior election.
         };
         self.current_term = term;
+        self.reads.pending.clear();
+        self.snapshots.reset_transfer();
         // Redraw for every failed election. Fixed ID jitter can collide, making
         // equally paced voters split forever even on a reliable network.
         let mut hash = id_jitter(&self.id);
@@ -461,7 +573,7 @@ impl RaftNode {
     fn become_leader(&mut self) {
         self.role = Role::Leader;
         self.leader_hint = Some(self.id.clone());
-        let ni = self.last_log_index() + 1;
+        let ni = self.last_log_index().saturating_add(1);
         self.next_index.clear();
         self.match_index.clear();
         self.sent_upper.clear();
@@ -546,16 +658,31 @@ impl RaftNode {
         debug_assert_eq!(self.role, Role::Leader);
         let (term, me, commit) = (self.current_term, self.id.clone(), self.commit_index);
         let ni = *self.next_index.get(&p).unwrap_or(&1);
-        let (pli, plt) = if ni <= 1 {
+        let matched = self.match_index.get(&p).copied().unwrap_or(0);
+        if ni <= self.snapshot_index() && matched < self.snapshot_index() {
+            self.send_snapshot(p);
+            return;
+        }
+        let previous = if ni == u64::MAX && matched == u64::MAX {
+            u64::MAX
+        } else {
+            ni.saturating_sub(1)
+        };
+        let (pli, plt) = if previous == 0 {
             (0, 0)
         } else {
-            let e = &self.log[(ni - 2) as usize];
-            (e.index, e.term)
+            (
+                previous,
+                self.term_at(previous)
+                    .expect("replication cursor is in retained log"),
+            )
         };
         // Bound catch-up work before cloning it for every peer. A generic
         // caller may submit a larger single command; include that first
         // entry to preserve progress. Durable hosts cap commands at 1 MiB.
-        let suffix = &self.log[(ni as usize).saturating_sub(1)..];
+        let suffix = self
+            .entries_after(previous)
+            .expect("replication cursor is in retained log");
         let mut bytes = 0usize;
         let count = suffix
             .iter()
@@ -618,6 +745,7 @@ impl RaftNode {
         // 合法 leader——计时重置
         self.role = Role::Follower;
         self.leader_hint = Some(leader);
+        self.reads.pending.clear();
         self.last_heartbeat_ms = self.clock.now_ms();
 
         let Some((keep, skip)) = self.append_plan(prev_log_index, prev_log_term, &entries) else {
@@ -641,8 +769,9 @@ impl RaftNode {
             // 本实现 commit_index 单点由 leader 推进，follower 信任 leader_commit
             // 且 leader 已保证其 commit 过当前任期，安全）
             self.commit_index = new_commit;
-            let newly =
-                self.log[(self.last_applied as usize)..(self.commit_index as usize)].to_vec();
+            let newly = self
+                .entries_between(self.last_applied, self.commit_index)
+                .to_vec();
             self.pending_apply.extend(newly);
             self.last_applied = self.commit_index;
         }
@@ -665,18 +794,18 @@ impl RaftNode {
         prev_log_term: Term,
         entries: &[LogEntry],
     ) -> Option<(usize, usize)> {
-        if prev_log_index != 0
-            && self
-                .log
-                .get(usize::try_from(prev_log_index - 1).ok()?)?
-                .term
-                != prev_log_term
-        {
+        if self.term_at(prev_log_index) != Some(prev_log_term) {
             return None;
         }
         let mut change = None;
         for (offset, entry) in entries.iter().enumerate() {
-            let slot = usize::try_from(entry.index.checked_sub(1)?).ok()?;
+            let slot = usize::try_from(
+                entry
+                    .index
+                    .checked_sub(self.snapshot_index())?
+                    .checked_sub(1)?,
+            )
+            .ok()?;
             let old = self.log.get(slot);
             // Same index/term must identify one command, and committed entries
             // cannot be replaced. Validate the entire batch before truncation.
@@ -732,8 +861,12 @@ impl RaftNode {
                 .copied()
                 .unwrap_or(0)
                 .saturating_add(1);
+            let snapshot_index = self.snapshot_index();
             let ni = self.next_index.entry(from.clone()).or_insert(1);
-            let retry = ni.saturating_sub(1).max(floor);
+            let mut retry = ni.saturating_sub(1).max(floor);
+            if match_index < snapshot_index {
+                retry = retry.min(snapshot_index).max(floor);
+            }
             if retry >= *ni {
                 return;
             }
@@ -762,18 +895,16 @@ impl RaftNode {
         let majority = indexes[indexes.len().saturating_sub(self.quorum())];
         // §5.4.2：只提交当前任期（当前任期条目复制到多数派才推进）
         if majority > self.commit_index {
-            let cur_term_entry = self
-                .log
-                .get((majority as usize).saturating_sub(1))
-                .map(|e| e.term == self.current_term)
-                .unwrap_or(false);
+            let cur_term_entry = self.term_at(majority) == Some(self.current_term);
             if cur_term_entry {
                 self.commit_index = majority;
-                let newly =
-                    self.log[(self.last_applied as usize)..(self.commit_index as usize)].to_vec();
+                let newly = self
+                    .entries_between(self.last_applied, self.commit_index)
+                    .to_vec();
                 self.pending_apply.extend(newly);
                 self.last_applied = self.commit_index;
                 self.broadcast_append(); // 通知 follower commit
+                self.send_read_probes(false);
             }
         }
     }

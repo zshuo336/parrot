@@ -117,6 +117,25 @@ class CoverageContracts(unittest.TestCase):
             if expected != 2:
                 self.assertEqual(json.loads(result.stdout)['met'], expected == 0)
 
+    def test_duplicate_json_keys_cannot_replace_failed_counters_or_missing_sources(self):
+        report = self.root / 'report.json'
+        command = [sys.executable, str(SCRIPT), '--root', str(self.root), '--report', str(report)]
+        valid = json.dumps(self.report)
+        variants = {
+            'coverage_counter': valid.replace('"covered": 100', '"covered": 99, "covered": 100', 1),
+            'source_collection': valid.replace('"data": [', '"data": [], "data": [', 1),
+            'source_identity': valid.replace('"filename": ', '"filename": "unmeasured.rs", "filename": ', 1),
+            'report_type': valid.replace('"type": ', '"type": "invalid", "type": ', 1),
+        }
+        for name, text in variants.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(text, valid)
+                report.write_text(text)
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('duplicate', result.stderr)
+                self.assertEqual(result.stdout, '')
+
 
 if __name__ == '__main__':
     unittest.main()

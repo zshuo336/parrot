@@ -9,8 +9,65 @@ fn defaults_and_explicit_permissive_policy_are_distinct() {
     let default = parse("").unwrap().remote.receptionist;
     assert!(default.default_deny);
     assert!(default.roles.is_empty());
+    assert!(default.relays.is_empty());
     let explicit = parse("[remote.receptionist]\ndefault_deny = false").unwrap();
     assert!(!explicit.remote.receptionist.default_deny);
+}
+
+#[test]
+fn relay_grants_inherit_replace_and_clear_independently_of_owner_grants() {
+    let lower: ParrotConfig = toml::from_str("[remote.receptionist.roles]\nowner = ['edge']\n[remote.receptionist.relays]\nrelay = ['edge/one']\nbackup = ['edge/two']").unwrap();
+    let inherited = ParrotConfig::default()
+        .with_fallback(lower.clone())
+        .build()
+        .unwrap();
+    assert_eq!(inherited.remote.receptionist.relays.len(), 2);
+    let higher: ParrotConfig =
+        toml::from_str("[remote.receptionist.relays]\nrelay = ['edge/private']").unwrap();
+    let replaced = higher.with_fallback(lower.clone()).build().unwrap();
+    assert_eq!(replaced.remote.receptionist.relays.len(), 1);
+    assert_eq!(
+        replaced.remote.receptionist.relays["relay"],
+        ["edge/private"]
+    );
+    assert_eq!(replaced.remote.receptionist.roles["owner"], ["edge"]);
+    let cleared: ParrotConfig = toml::from_str("[remote.receptionist]\nrelays = {}").unwrap();
+    let cleared = cleared.with_fallback(lower).build().unwrap();
+    assert!(cleared.remote.receptionist.relays.is_empty());
+    assert_eq!(cleared.remote.receptionist.roles.len(), 1);
+}
+
+#[test]
+fn malformed_relay_identities_prefixes_and_duplicates_fail_before_runtime() {
+    for node in [
+        "",
+        "bad/node",
+        "..",
+        "bad*node",
+        "bad%node",
+        "bad\\node",
+        "bad node",
+    ] {
+        let mut config = ParrotConfig::default();
+        config.remote.receptionist.relays = Some([(node.into(), vec!["edge".into()])].into());
+        assert!(config.build().is_err(), "accepted relay {node:?}");
+    }
+    for prefix in [
+        "",
+        "/",
+        "edge//one",
+        "edge/../one",
+        "edge/*",
+        "edge/one//",
+        "edge/one?",
+        "edge/white space",
+    ] {
+        let mut config = ParrotConfig::default();
+        config.remote.receptionist.relays = Some([("relay".into(), vec![prefix.into()])].into());
+        assert!(config.build().is_err(), "accepted relay prefix {prefix:?}");
+    }
+    assert!(parse("[remote.receptionist.relays]\nrelay = ['edge']\nrelay = ['cloud']").is_err());
+    parse("[remote.receptionist.relays]\nrelay = ['edge/one/', 'cloud/query']").unwrap();
 }
 
 #[test]

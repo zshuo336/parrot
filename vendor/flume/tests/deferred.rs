@@ -101,24 +101,64 @@ fn isolated(name: &str, scenario: impl FnOnce()) {
         scenario();
         return;
     }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("FLUME_REENTRANT_CHILD", name)
-        .spawn()
-        .unwrap();
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+    fn read(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            pipe.read_to_string(&mut text).unwrap();
+            text
+        })
+    }
+    let mut child = Child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("FLUME_REENTRANT_CHILD", name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = read(child.0.stdout.take().unwrap());
+    let stderr = read(child.0.stderr.take().unwrap());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "{name}: child failed: {status}");
+        if let Some(status) = child.0.try_wait().unwrap() {
+            let stdout = stdout.join().unwrap();
+            let stderr = stderr.join().unwrap();
+            assert!(
+                status.success(),
+                "{}: child failed: {}\n{}\n{}",
+                name,
+                status,
+                stdout,
+                stderr
+            );
+            assert!(
+                stdout.contains("1 passed; 0 failed; 0 ignored;"),
+                "{}: child must execute exactly one case: {}",
+                name,
+                stdout
+            );
             return;
         }
         if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("{name}: reentrant callback deadlocked");
+            panic!("{}: reentrant callback deadlocked", name);
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+#[test]
+fn isolation_rejects_zero_case_execution() {
+    assert!(std::panic::catch_unwind(|| isolated("missing_reentrant_case", || {})).is_err());
 }
 
 struct Reenter {

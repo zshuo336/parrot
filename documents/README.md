@@ -2,7 +2,7 @@
 
 这套中文文档面向第一次接触 Parrot 的开发者。主线是仓库内真实的 `apps/websearch` 应用：先运行一个受控的小网站，再理解 Rust、Erlang、Python/Ray、Scala/Akka 如何通过 Parrot 组成搜索系统，最后学习持久化、重启、部署和扩展。
 
-文档依据当前源码编写，核对日期为 2026-11-05。本文档集的编写不代表这里列出的集成测试已经在你的机器执行通过。软件版本、依赖可用性、磁盘语义和网络条件仍需按章节验证。
+文档依据当前源码编写，本次核对日期为 2026-11-19。本文档集的编写不代表这里列出的集成测试已经在你的机器执行通过。软件版本、依赖可用性、磁盘语义和网络条件仍需按章节验证。
 
 ## 阅读路线
 
@@ -38,6 +38,6 @@
 
 ## 与仓库其他文档的关系
 
-本目录提供循序渐进的用户教程。精确实现入口见 [Websearch 原始说明](../apps/websearch/README.md)、[源码架构说明](../apps/websearch/docs/ARCHITECTURE.md)、[能力使用说明](../apps/websearch/docs/PARROT_USAGE.md) 和 [运维说明](../apps/websearch/docs/OPERATIONS.md)。历史说明中的固定组件名或早期能力描述，应与当前代码和部署回执核对。
+本目录提供循序渐进的用户教程。配套的 [Websearch 说明](../apps/websearch/README.md)、[源码架构说明](../apps/websearch/docs/ARCHITECTURE.md)、[能力使用说明](../apps/websearch/docs/PARROT_USAGE.md) 和 [运维说明](../apps/websearch/docs/OPERATIONS.md) 已按当前源码统一核对。源码是行为定义的唯一依据；实际组件地址和端口取本次部署回执，文档不将示意名称当作固定实例地址。
 
 学习框架整体结构可继续阅读[仓库 README](../README.md)。Websearch 只演示其实际使用的能力，不能据此推断所有引擎、协议、集群能力都已经经过同等验证。

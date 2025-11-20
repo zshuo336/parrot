@@ -1,7 +1,8 @@
 //! Feature-gated Wasm manifest host. Only local `file://` artifacts with a
-//! mandatory SHA-256 are admitted. Reading, verification, compilation and guest
-//! initialization run off the async executor; one pool is prepared at a time
-//! per spawner (including its clones). Guest memory and retained compiler cache
+//! mandatory SHA-256 are admitted. Reading, verification and compilation run
+//! on blocking workers; guest initialization and execution use async Wasmtime
+//! fibers. One pool is prepared at a time per spawner (including its clones).
+//! Guest memory and retained compiler cache
 //! have separate limits, neither of which bounds total process RSS.
 //!
 //! `config-get` returns strings unchanged and other top-level TOML values as
@@ -23,7 +24,7 @@ use parrot_api::{
 };
 use parrot_wasm::{
     runtime::{CompilationLimits, WasmComponent, WasmRuntime},
-    ComponentError, HostCtx, TraceParent, WasmConfig,
+    ComponentError, HostCtx, WasmConfig,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,6 +35,17 @@ use std::{
         Arc, OnceLock,
     },
 };
+
+mod initialization;
+mod messaging;
+mod policy;
+mod recording;
+mod service_policy;
+mod services;
+pub use messaging::{WasmMessageGrant, WasmMessageOperation};
+pub use policy::WasmMessagingPolicy;
+pub use service_policy::WasmServicePolicy;
+pub use services::{WasmServiceGrant, WasmServiceOperation};
 
 /// Invoke WIT `handle`; the guest controls the payload encoding.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -101,6 +113,9 @@ impl MessageAdmission for Admission {
 /// admitted can finish; `on-drain` is a cooperative notification, not a barrier
 /// for concurrent producers. Stop retires the mailbox. Guest errors use the
 /// engine's configured supervision; Resume is never implicitly selected.
+/// Explicit ambient trace contexts record actual startup/drain invocations and
+/// supply the guest recording capability. Repeated cached drain receipts do not
+/// create new lifecycle spans. No earlier message context is saved for shutdown.
 pub struct WasmActor {
     component: WasmComponent,
     admission: Arc<Admission>,
@@ -109,9 +124,19 @@ pub struct WasmActor {
 impl WasmActor {
     /// Construct from an instantiated component and run its start hook once.
     pub fn new(mut component: WasmComponent) -> ActorResult<Self> {
-        component
-            .on_start()
+        recording::on_start(&mut component)
             .map_err(|e| ActorError::InitializationError(format!("wasm on_start: {e}")))?;
+        Ok(Self {
+            component,
+            admission: Arc::default(),
+            drain_result: None,
+        })
+    }
+    /// Construct an async-linked guest and await actual successful startup.
+    pub async fn new_async(mut component: WasmComponent) -> ActorResult<Self> {
+        recording::on_start_async(&mut component)
+            .await
+            .map_err(|error| ActorError::InitializationError(format!("wasm on_start: {error}")))?;
         Ok(Self {
             component,
             admission: Arc::default(),
@@ -124,10 +149,35 @@ impl WasmActor {
     }
     /// Close business admission and attempt the guest drain hook exactly once.
     pub fn drain(&mut self) -> Result<(), ComponentError> {
+        if self.component.uses_async() {
+            return Err(ComponentError::InvalidConfig(
+                "async guest requires drain_async".into(),
+            ));
+        }
         self.admission.0.store(true, Ordering::Release);
         self.drain_result
-            .get_or_insert_with(|| self.component.on_drain())
+            .get_or_insert_with(|| recording::on_drain(&mut self.component))
             .clone()
+    }
+    pub async fn drain_async(&mut self) -> Result<(), ComponentError> {
+        if !self.component.uses_async() {
+            return self.drain();
+        }
+        self.admission.0.store(true, Ordering::Release);
+        if let Some(error) = self.component.cleanup_error() {
+            let result = Err(error);
+            self.drain_result = Some(result.clone());
+            return result;
+        }
+        if let Some(result) = &self.drain_result {
+            return result.clone();
+        }
+        // Mark an interrupted drain as failed before suspension. Repeating a
+        // cached receipt must never run the cooperative guest hook twice.
+        self.drain_result = Some(Err(ComponentError::Trap("guest drain cancelled".into())));
+        let result = recording::on_drain_async(&mut self.component).await;
+        self.drain_result = Some(result.clone());
+        result
     }
     /// Use this policy when embedding the adapter directly via `spawn_at` to
     /// reject new business requests after drain without invoking supervision.
@@ -136,24 +186,23 @@ impl WasmActor {
     }
 }
 fn guest_error(e: ComponentError) -> ActorError {
+    if let ComponentError::Panic(message) = e {
+        return ActorError::Panic(format!("wasm host panic: {message}"));
+    }
     ActorError::MessageHandlingError(match e {
         ComponentError::OutOfFuel => "wasm OverQuota: out of fuel".into(),
         e => format!("wasm trap: {e}"),
     })
 }
-impl Actor for WasmActor {
-    type Config = EmptyConfig;
-    type Context = ThreadContext<Self>;
-    fn receive_message<'a>(
-        &'a mut self,
-        msg: BoxedMessage,
-        _: &'a mut Self::Context,
-    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+impl WasmActor {
+    fn receive<'a>(&'a mut self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
             if let Some(hook) = msg.downcast_ref::<ParrotAppHook>() {
                 match hook.0 {
                     hook_phase::START => {}
-                    hook_phase::DRAIN | hook_phase::STOP => self.drain().map_err(guest_error)?,
+                    hook_phase::DRAIN | hook_phase::STOP => {
+                        self.drain_async().await.map_err(guest_error)?
+                    }
                     _ => {
                         return Err(ActorError::MessageHandlingError(
                             "invalid Wasm hook phase".into(),
@@ -163,24 +212,51 @@ impl Actor for WasmActor {
                 return Ok(Box::new(*hook) as BoxedMessage);
             }
             if let Some(ask) = msg.downcast_ref::<WasmAsk>() {
-                let parent = TraceContext::current().map(|context| TraceParent {
-                    trace_id: context.trace_id(),
-                    span_id: context.span_id(),
-                });
-                return self
-                    .component
-                    .handle_with_trace(&ask.type_key, &ask.payload, parent.as_ref())
+                if self.component.uses_async() {
+                    return self
+                        .component
+                        .handle_async(
+                            &ask.type_key,
+                            &ask.payload,
+                            TraceContext::current().map(recording::Recording::root),
+                        )
+                        .await
+                        .map(|bytes| Box::new(WasmReply(bytes)) as BoxedMessage)
+                        .map_err(guest_error);
+                }
+                let result = match TraceContext::current() {
+                    Some(context) => self.component.handle_with_recording(
+                        &ask.type_key,
+                        &ask.payload,
+                        recording::Recording::root(context),
+                    ),
+                    None => self.component.handle(&ask.type_key, &ask.payload),
+                };
+                return result
                     .map(|bytes| Box::new(WasmReply(bytes)) as BoxedMessage)
                     .map_err(guest_error);
             }
             if let Some(tell) = msg.downcast_ref::<WasmTell>() {
-                let parent = TraceContext::current().map(|context| TraceParent {
-                    trace_id: context.trace_id(),
-                    span_id: context.span_id(),
-                });
-                self.component
-                    .tell_with_trace(&tell.type_key, &tell.payload, parent.as_ref())
-                    .map_err(guest_error)?;
+                if self.component.uses_async() {
+                    self.component
+                        .tell_async(
+                            &tell.type_key,
+                            &tell.payload,
+                            TraceContext::current().map(recording::Recording::root),
+                        )
+                        .await
+                        .map_err(guest_error)?;
+                    return Ok(Box::new(WasmReply(Vec::new())) as BoxedMessage);
+                }
+                match TraceContext::current() {
+                    Some(context) => self.component.tell_with_recording(
+                        &tell.type_key,
+                        &tell.payload,
+                        recording::Recording::root(context),
+                    ),
+                    None => self.component.tell(&tell.type_key, &tell.payload),
+                }
+                .map_err(guest_error)?;
                 return Ok(Box::new(WasmReply(Vec::new())) as BoxedMessage);
             }
             Err(ActorError::MessageHandlingError(
@@ -188,8 +264,22 @@ impl Actor for WasmActor {
             ))
         })
     }
+}
+impl Actor for WasmActor {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+    fn use_async_handler(&self) -> bool {
+        self.component.uses_async()
+    }
+    fn receive_message<'a>(
+        &'a mut self,
+        msg: BoxedMessage,
+        _: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        self.receive(msg)
+    }
     fn before_stop<'a>(&'a mut self, _: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move { self.drain().map_err(guest_error) })
+        Box::pin(async move { self.drain_async().await.map_err(guest_error) })
     }
     fn state(&self) -> ActorState {
         ActorState::Running
@@ -239,6 +329,8 @@ pub(super) struct WasmHost {
     limits: CompilationLimits,
     runtime: OnceLock<Result<Arc<WasmRuntime>, String>>,
     preparation: Arc<tokio::sync::Semaphore>,
+    grants: Vec<WasmMessageGrant>,
+    service_grants: Vec<WasmServiceGrant>,
 }
 impl Default for WasmHost {
     fn default() -> Self {
@@ -252,7 +344,35 @@ impl WasmHost {
             limits,
             runtime: OnceLock::new(),
             preparation: Arc::new(tokio::sync::Semaphore::new(1)),
+            grants: Vec::new(),
+            service_grants: Vec::new(),
         }
+    }
+    pub(super) fn with_limits(&self, config: WasmConfig, limits: CompilationLimits) -> Self {
+        let mut host = Self::new(config, limits);
+        host.grants = self.grants.clone();
+        host.service_grants = self.service_grants.clone();
+        host
+    }
+    pub(super) fn with_messaging(
+        &self,
+        mut grants: Vec<WasmMessageGrant>,
+    ) -> Result<Self, DeployError> {
+        messaging::validate(&mut grants)?;
+        let mut host = Self::new(self.config.clone(), self.limits);
+        host.grants = grants;
+        host.service_grants = self.service_grants.clone();
+        Ok(host)
+    }
+    pub(super) fn with_services(
+        &self,
+        mut grants: Vec<WasmServiceGrant>,
+    ) -> Result<Self, DeployError> {
+        services::validate(&mut grants)?;
+        let mut host = Self::new(self.config.clone(), self.limits);
+        host.grants = self.grants.clone();
+        host.service_grants = grants;
+        Ok(host)
     }
     fn runtime(&self) -> Result<Arc<WasmRuntime>, DeployError> {
         self.runtime
@@ -355,19 +475,21 @@ impl WasmHost {
                     config_overlay: overlay.clone(),
                     ..Default::default()
                 };
-                let actor = engine
+                let prepared = engine
                     .runtime_handle()
                     .spawn_blocking(move || {
-                        let component = host
-                            .runtime()?
-                            .instantiate_bytes(&bytes, ctx)
-                            .map_err(|e| DeployError::Artifact(e.to_string()))?;
-                        WasmActor::new(component).map_err(|e| DeployError::Engine(e.to_string()))
+                        host.runtime()?
+                            .prepare_bytes(&bytes)
+                            .map_err(|e| DeployError::Artifact(e.to_string()))
                     })
                     .await
                     .map_err(|e| {
                         DeployError::Engine(format!("wasm initialization worker: {e}"))
                     })??;
+                let authority = messaging::Messaging::bind(engine, path, digest, &self.grants);
+                let service_grants = services::for_component(&self.service_grants, path, digest);
+                let (actor, startup) =
+                    initialization::PendingActor::new(prepared, ctx, authority, service_grants);
                 let config = ThreadActorConfig {
                     message_admission: Some(actor.message_admission()),
                     ..Default::default()
@@ -375,7 +497,7 @@ impl WasmHost {
                 engine
                     .spawn_at(actor, path, None, config)
                     .await
-                    .map(|actor| Box::new(actor) as BoxedActorRef)
+                    .map(|actor| (Box::new(actor) as BoxedActorRef, startup))
                     .map_err(|e| DeployError::Engine(format!("spawn {path}: {e}")))
             })
             .catch_unwind()
@@ -386,7 +508,19 @@ impl WasmHost {
                 )))
             });
             match result {
-                Ok(actor) => owned.push(actor),
+                Ok((actor, startup)) => {
+                    // Publication is not initialization. Retain the exact
+                    // reference before waiting so failed startup is rolled back.
+                    owned.push(actor);
+                    let started = startup.await.unwrap_or_else(|_| {
+                        Err(DeployError::Engine(
+                            "Wasm initializer retired before startup acknowledgement".into(),
+                        ))
+                    });
+                    if let Err(error) = started {
+                        return Err(cleanup.rollback(owned, error).await);
+                    }
+                }
                 Err(error) => {
                     return Err(cleanup.rollback(owned, error).await);
                 }

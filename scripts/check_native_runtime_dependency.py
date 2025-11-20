@@ -19,7 +19,9 @@ import time
 
 MARKER = 'parrot-native-progress'
 REMOTE_MARKER = 'parrot-deferred-mpsc'
+BLOCKING_MARKER = 'parrot-blocking-ownership'
 CASES = [
+    ('parrot', [], False),
     ('parrot-abi', [], False),
     ('parrot-app', [], False),
     ('parrot-app', ['host'], False),
@@ -90,14 +92,18 @@ class Check:
         if native:
             text += ('\n[features]\ndefault=["dylib"]\ndylib=[]\n'
                      '[dev-dependencies]\ntokio={version="1",features=["full"]}\n'
-                     'libloading="0.8.9"\nparking_lot="0.12.5"\ntempfile="3"\n')
+                     'libloading="0.8.9"\nparking_lot="0.12.5"\ntempfile="3"\n'
+                     'parrot-api={path=' + json.dumps(str(self.root / 'crates/parrot-api')) + '}\n')
         (consumer / 'Cargo.toml').write_text(text)
 
     def consumer(self, name, package, features, patch, native):
         consumer = self.output / 'consumers' / name
         (consumer / 'src').mkdir(parents=True)
         self.manifest(consumer, package, features, patch, native)
-        if package == 'parrot-abi':
+        if package == 'parrot':
+            body = ('assert!(parrot::thread::config::ThreadActorSystemConfig::default()'
+                    '.default_mailbox_capacity > 0);')
+        elif package == 'parrot-abi':
             body = 'assert_eq!(parrot_abi::AbiStr::of_str("external").len, 8);'
             if native:
                 body += '\nlet _loader = parrot_abi::DylibLoader;'
@@ -120,8 +126,10 @@ class Check:
                 shutil.copy2(source / relative, tests / relative)
         return consumer
 
-    def metadata(self, name, consumer, native, patch, pure_abi=False, locked=False, remote=False):
-        required = ({MARKER} if native else set()) | ({REMOTE_MARKER} if remote else set())
+    def metadata(self, name, consumer, native, patch, pure_abi=False, locked=False, remote=False,
+                 blocking=False):
+        required = (({MARKER} if native else set()) | ({REMOTE_MARKER} if remote else set())
+                    | ({BLOCKING_MARKER} if blocking else set()))
         stdout, stderr = self.run(name, consumer, ['metadata', '--format-version', '1']
                                   + (['--locked'] if locked else []),
                                   expected=101 if required and not patch else 0)
@@ -156,11 +164,14 @@ class Check:
             for patch in [False, True]:
                 name = package + '-' + ('-'.join(features) or 'default') + ('-patched' if patch else '-registry')
                 consumer = self.consumer(name, package, features, patch, native)
-                remote = package != 'parrot-abi'
+                remote = package not in {'parrot', 'parrot-abi'}
+                blocking = (package in {'parrot', 'parrot-node'} or
+                            package == 'parrot-app' and bool(features))
                 self.metadata(name + '-resolve', consumer, native, patch,
-                              pure_abi=package == 'parrot-abi' and not native, remote=remote)
+                              pure_abi=package == 'parrot-abi' and not native, remote=remote,
+                              blocking=blocking)
                 # Compile each supported consumer with its required runtime configuration.
-                if patch == (native or remote):
+                if patch == (native or remote or blocking):
                     builds.append((name, consumer, native))
 
         # Model an existing loader consumer upgrading Parrot in place. Seed the
@@ -206,8 +217,8 @@ class Check:
                 if native:
                     stdout, _ = self.run(name + '-progress', consumer,
                                          ['test', '--locked', '--test', 'native_runtime_progress'])
-                    require('test result: ok. 8 passed; 0 failed; 0 ignored;' in stdout,
-                            f'{name}: all eight actual native contracts must execute')
+                    require('test result: ok. 16 passed; 0 failed; 0 ignored;' in stdout,
+                            f'{name}: all sixteen actual native contracts must execute')
             self.run('newer-lock-selected-run', consumer=self.output / 'consumers/newer-registry-lock',
                      arguments=['run', '--locked'])
         self.save('passed')

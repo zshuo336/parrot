@@ -37,9 +37,9 @@ libc = "0.2"
 
 [features]
 default = ["tcp"]
-mem  = []   # MemoryTransport 测试载体（§10.2 回环集成；RC1-RC8 mem+tcp 双跑）
-tcp  = []   # TcpTransport（P1 主载体）
-# quic = [] # P2 增（DEV_02 K3）
+# Compatibility markers: built-in memory/TCP/QUIC transports are always compiled.
+mem  = []
+tcp  = []
 
 [[bin]]
 name = "dump-vectors"
@@ -60,6 +60,10 @@ path = "src/bin/interop_ray.rs"
 [[bin]]
 name = "interop-erl"
 path = "src/bin/interop_erl.rs"
+
+[[test]]
+name = "raft_callback_fork"
+harness = false
 
 [dev-dependencies]
 parrot-api-derive = { path = "../parrot-api-derive" }

@@ -258,6 +258,10 @@ impl Drop for Collector {
     }
 }
 struct Empty;
+
+#[path = "app_trace_cli/configuration.rs"]
+mod configuration;
+
 #[async_trait::async_trait]
 impl LocalLookup for Empty {
     async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
@@ -294,7 +298,55 @@ fn startup_span(spans: &[serde_json::Value]) -> &serde_json::Value {
         "startup must have an independent root identity"
     );
     assert_eq!(attribute(root, "parrot.span.kind"), "application");
+    if spans.iter().any(|span| span["name"] == "/user/counter") {
+        let initialization: Vec<_> = spans
+            .iter()
+            .filter(|span| attribute(span, "parrot.span.kind") == "actor_init")
+            .collect();
+        assert_eq!(initialization.len(), 1, "one actual actor initialization");
+        let init = initialization[0];
+        assert_eq!(init["name"], "/user/counter");
+        assert_eq!(init["traceId"], root["traceId"]);
+        assert_eq!(init["parentSpanId"], root["spanId"]);
+        assert_eq!(attribute(init, "parrot.span.status"), "ok");
+    }
     root
+}
+fn handler_span(spans: &[serde_json::Value]) -> &serde_json::Value {
+    let handlers: Vec<_> = spans
+        .iter()
+        .filter(|span| {
+            span["name"] == "/user/counter"
+                && attribute(span, "parrot.span.kind") == "dynamic_handler"
+        })
+        .collect();
+    assert_eq!(handlers.len(), 1);
+    handlers[0]
+}
+fn unconfirmed_startup(case: &Case, collector: &Collector, attempts: usize) {
+    let receipt = case.receipt();
+    assert_eq!(receipt["completed"], 2);
+    assert_eq!(receipt["in_flight"], 0);
+    assert_eq!(receipt["terminal"], true);
+    assert_eq!(receipt["accepted_spans"], 0);
+    assert_eq!(receipt["overwritten"], 0);
+    let pending = receipt["pending_spans"].as_u64().unwrap();
+    assert!((1..=2).contains(&pending));
+    assert_eq!(pending + receipt["retained"].as_u64().unwrap(), 2);
+    let spans = collector.spans(case);
+    assert_eq!(spans.len(), pending as usize * attempts);
+    // Initialization may finish in an earlier export batch than the startup
+    // root. Failed delivery must retain both, including an unexported remainder.
+    for batch in spans.chunks_exact(pending as usize) {
+        assert_eq!(batch, &spans[..pending as usize], "retry changed its batch");
+        for span in batch {
+            assert_eq!(attribute(span, "parrot.span.status"), "ok");
+            assert!(matches!(
+                attribute(span, "parrot.span.kind"),
+                "actor_init" | "application"
+            ));
+        }
+    }
 }
 fn attribute<'a>(span: &'a serde_json::Value, key: &str) -> &'a str {
     span["attributes"]
@@ -437,11 +489,11 @@ async fn cli_records_real_untraced_and_traced_work_and_flushes_after_signal() {
     assert!(case.text("actor.log").ends_with("stopped\ndisposed\n"));
     let receipt = case.receipt();
     assert_eq!(receipt["complete"], true);
-    assert_eq!(receipt["accepted_spans"], 4);
+    assert_eq!(receipt["accepted_spans"], 5);
     assert_eq!(receipt["in_flight"], 0);
     assert!(std::fs::metadata(capture).unwrap().len() > 0);
     let spans = collector.spans(&case);
-    assert_eq!(spans.len(), 4);
+    assert_eq!(spans.len(), 5);
     assert_eq!(attribute(startup_span(&spans), "parrot.span.status"), "ok");
     assert!(spans.iter().all(|s| s["status"]["code"] == 1));
     let known = spans
@@ -475,9 +527,13 @@ async fn live_trace_query_keeps_real_spans_after_collector_acceptance() {
         std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    tokio::time::timeout(Duration::from_secs(5), collector.received.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while collector.spans(&case).len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     let mut first = case.trace(&["trace-case", "--socket", socket_text], "query.log");
     assert!(
         case.wait(&mut first).await,
@@ -491,7 +547,7 @@ async fn live_trace_query_keeps_real_spans_after_collector_acceptance() {
     );
     assert!(before.contains("history_evicted=0"), "{before}");
     assert!(
-        before.contains("drained=1"),
+        before.contains("drained=2"),
         "collector consumed the actual startup batch: {before}"
     );
 
@@ -505,9 +561,13 @@ async fn live_trace_query_keeps_real_spans_after_collector_acceptance() {
         .downcast::<counter::Count>()
         .unwrap();
     assert_eq!(result.0, 9);
-    tokio::time::timeout(Duration::from_secs(5), collector.received.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while collector.spans(&case).len() < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     let mut next = case.trace(&["trace-case", "--socket", socket_text], "query-next.log");
     assert!(case.wait(&mut next).await);
     let text = case.text("query-next.log");
@@ -517,7 +577,7 @@ async fn live_trace_query_keeps_real_spans_after_collector_acceptance() {
         "{text}"
     );
     assert!(text.contains("target=\"/application/startup\""), "{text}");
-    assert!(text.contains("completed=2"), "{text}");
+    assert!(text.contains("completed=3"), "{text}");
     client.shutdown().await.unwrap();
     case.signal(&host);
     assert!(case.wait(&mut host).await, "{}", case.text("stderr.log"));
@@ -528,7 +588,7 @@ async fn live_trace_query_keeps_real_spans_after_collector_acceptance() {
     assert_eq!(case.receipt()["complete"], true);
     assert_eq!(
         collector.spans(&case).len(),
-        2,
+        3,
         "queries must not create, consume or acknowledge spans"
     );
 }
@@ -743,7 +803,7 @@ async fn malformed_query_frames_preserve_service_history_and_export_receipt() {
     case.signal(&host);
     assert!(case.wait(&mut host).await, "{}", case.text("stderr.log"));
     assert_eq!(case.receipt()["complete"], true);
-    assert_eq!(collector.spans(&case).len(), 1);
+    assert_eq!(collector.spans(&case).len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -785,7 +845,7 @@ async fn stalled_query_expires_then_next_client_observes_real_history() {
     case.signal(&host);
     assert!(case.wait(&mut host).await);
     assert_eq!(case.receipt()["complete"], true);
-    assert_eq!(collector.spans(&case).len(), 1);
+    assert_eq!(collector.spans(&case).len(), 2);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collector_rejection_stops_host_and_reports_unconfirmed_spans() {
@@ -797,12 +857,8 @@ async fn collector_rejection_stops_host_and_reports_unconfirmed_spans() {
     assert!(!case.wait(&mut child).await);
     let receipt = case.receipt();
     assert_eq!(receipt["complete"], false);
-    assert_eq!(receipt["pending_spans"], 1);
-    assert_eq!(receipt["accepted_spans"], 0);
+    unconfirmed_startup(&case, &collector, 1);
     assert!(case.text("actor.log").ends_with("stopped\ndisposed\n"));
-    let spans = collector.spans(&case);
-    assert_eq!(spans.len(), 1);
-    assert_eq!(attribute(startup_span(&spans), "parrot.span.status"), "ok");
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_without_requests_records_real_assembly_and_no_handler_or_transport_span() {
@@ -814,13 +870,17 @@ async fn startup_without_requests_records_real_assembly_and_no_handler_or_transp
     assert!(case.wait(&mut child).await);
     assert_eq!(
         case.receipt()["accepted_spans"],
-        1,
-        "actual startup without requests must produce its application record"
+        2,
+        "startup must record its application root and actual initialization"
     );
     assert_eq!(case.receipt()["complete"], true);
     let spans = collector.spans(&case);
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 2);
     assert_eq!(attribute(startup_span(&spans), "parrot.span.status"), "ok");
+    assert!(spans.iter().all(|span| matches!(
+        attribute(span, "parrot.span.kind"),
+        "application" | "actor_init"
+    )));
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinary_run_does_not_enable_recording() {
@@ -973,7 +1033,7 @@ async fn interrupted_one_shot_query_cancels_pending_io_without_claiming_a_snapsh
 async fn failed_startup_joins_trace_worker_and_keeps_startup_error() {
     for (case, message, expected) in [
         (Case::new("delay_ms = -1"), "delay_ms must be", 1),
-        (Case::hook("fail"), "injected startup hook error", 2),
+        (Case::hook("fail"), "injected startup hook error", 3),
     ] {
         let collector = Collector::new(200).await;
         let mut child = case.start(&["--trace-otlp", &collector.url, "--trace-allow-http"]);
@@ -994,12 +1054,18 @@ async fn failed_startup_joins_trace_worker_and_keeps_startup_error() {
             "error",
             "startup failure must not be reported as success"
         );
-        assert!(spans.iter().all(|span| span["status"]["code"] == 2));
-        if expected == 2 {
-            let hook = spans
-                .iter()
-                .find(|span| span["name"] == "/user/counter")
-                .unwrap();
+        for span in &spans {
+            assert_eq!(
+                span["status"]["code"],
+                if attribute(span, "parrot.span.kind") == "actor_init" {
+                    1
+                } else {
+                    2
+                }
+            );
+        }
+        if expected == 3 {
+            let hook = handler_span(&spans);
             assert_eq!(hook["traceId"], root["traceId"]);
             assert_eq!(hook["parentSpanId"], root["spanId"]);
             assert!(case.text("actor.log").contains("disposed"));
@@ -1016,9 +1082,9 @@ async fn failed_startup_joins_trace_worker_and_keeps_startup_error() {
     assert!(case.text("stderr.log").contains("CLI_ERROR="));
     assert!(case.text("actor.log").ends_with("stopped\ndisposed\n"));
     assert_eq!(case.receipt()["complete"], true);
-    assert_eq!(case.receipt()["accepted_spans"], 1);
+    assert_eq!(case.receipt()["accepted_spans"], 2);
     let spans = collector.spans(&case);
-    assert_eq!(spans.len(), 1);
+    assert_eq!(spans.len(), 2);
     assert_eq!(
         attribute(startup_span(&spans), "parrot.span.status"),
         "error",
@@ -1036,9 +1102,7 @@ async fn collector_hang_obeys_shutdown_deadline_without_claiming_delivery() {
     let receipt = case.receipt();
     assert_eq!(receipt["complete"], false);
     assert_eq!(receipt["end"], "ShutdownDeadline");
-    assert_eq!(receipt["pending_spans"], 1);
-    assert_eq!(receipt["accepted_spans"], 0);
-    assert_eq!(collector.spans(&case).len(), 1);
+    unconfirmed_startup(&case, &collector, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1059,10 +1123,13 @@ async fn accepted_http_does_not_hide_overwritten_records() {
         .await
         .unwrap();
     let first = collector.spans(&case);
-    assert_eq!(first.len(), 1);
-    startup_span(&first);
-    // The startup batch is owned by the blocked HTTP request. Four real
-    // handlers must finish into a two-entry ring, deterministically losing two.
+    assert!((1..=2).contains(&first.len()));
+    assert!(first.iter().all(|span| matches!(
+        attribute(span, "parrot.span.kind"),
+        "application" | "actor_init"
+    )));
+    // The first startup batch is owned by blocked HTTP. Four handlers fill the
+    // two-entry ring; any startup remainder is also overwritten and accounted.
     for _ in 0..4 {
         actor.send(Box::new(counter::Count(1))).await.unwrap();
     }
@@ -1073,11 +1140,19 @@ async fn accepted_http_does_not_hide_overwritten_records() {
     let receipt = case.receipt();
     assert_eq!(receipt["end"], "Complete");
     assert_eq!(receipt["complete"], false);
-    assert_eq!(receipt["completed"], 5);
-    assert_eq!(receipt["overwritten"], 2);
-    assert_eq!(receipt["accepted_spans"], 3);
+    assert_eq!(receipt["completed"], 6);
+    assert_eq!(receipt["overwritten"], 4 - first.len());
+    assert_eq!(receipt["accepted_spans"], first.len() + 2);
     assert_eq!(receipt["pending_spans"], 0);
-    assert_eq!(collector.spans(&case).len(), 3);
+    let spans = collector.spans(&case);
+    assert_eq!(spans.len(), first.len() + 2);
+    assert_eq!(
+        spans
+            .iter()
+            .filter(|span| attribute(span, "parrot.span.kind") == "dynamic_handler")
+            .count(),
+        2
+    );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_handler_error_is_not_relabelled_as_successful_ingress() {
@@ -1095,14 +1170,11 @@ async fn actual_handler_error_is_not_relabelled_as_successful_ingress() {
     case.wait(&mut child).await;
     let receipt = case.receipt();
     assert_eq!(receipt["complete"], true);
-    assert_eq!(receipt["accepted_spans"], 2);
+    assert_eq!(receipt["accepted_spans"], 3);
     let spans = collector.spans(&case);
-    assert_eq!(spans.len(), 2);
+    assert_eq!(spans.len(), 3);
     assert_eq!(startup_span(&spans)["status"]["code"], 1);
-    let handler = spans
-        .iter()
-        .find(|span| span["name"] == "/user/counter")
-        .unwrap();
+    let handler = handler_span(&spans);
     assert_eq!(handler["status"]["code"], 2);
     assert!(case.text("actor.log").contains("disposed"));
 }
@@ -1119,16 +1191,13 @@ async fn startup_root_reaches_real_start_hook_and_completes_before_serving() {
     assert_eq!(case.receipt()["complete"], true);
     assert_eq!(
         case.receipt()["accepted_spans"],
-        2,
-        "startup hook and application root must both be recorded"
+        3,
+        "initialization, startup hook and application root must all be recorded"
     );
     let spans = collector.spans(&case);
-    assert_eq!(spans.len(), 2);
+    assert_eq!(spans.len(), 3);
     let root = startup_span(&spans);
-    let hook = spans
-        .iter()
-        .find(|span| span["name"] == "/user/counter")
-        .unwrap();
+    let hook = handler_span(&spans);
     assert_eq!(attribute(root, "parrot.span.status"), "ok");
     assert_eq!(attribute(hook, "parrot.span.status"), "ok");
     assert_eq!(attribute(hook, "parrot.span.kind"), "dynamic_handler");
@@ -1159,21 +1228,18 @@ async fn signal_during_start_hook_records_cancelled_startup_and_joins_owners() {
     assert_eq!(case.receipt()["in_flight"], 0);
     assert_eq!(
         case.receipt()["accepted_spans"],
-        2,
-        "cancelled startup must retain root and active hook"
+        3,
+        "cancelled startup must retain root, initialization and active hook"
     );
     let spans = collector.spans(&case);
-    assert_eq!(spans.len(), 2);
+    assert_eq!(spans.len(), 3);
     let root = startup_span(&spans);
     assert_eq!(
         attribute(root, "parrot.span.status"),
         "cancelled",
         "cancelled startup must not be reported as successful or failed completion"
     );
-    let hook = spans
-        .iter()
-        .find(|span| span["name"] == "/user/counter")
-        .unwrap();
+    let hook = handler_span(&spans);
     assert_eq!(attribute(hook, "parrot.span.status"), "cancelled");
     assert_eq!(hook["traceId"], root["traceId"]);
     assert_eq!(hook["parentSpanId"], root["spanId"]);

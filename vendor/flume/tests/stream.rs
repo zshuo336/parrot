@@ -1,9 +1,8 @@
-use futures::{stream, Stream};
 #[cfg(all(feature = "async", not(target_os = "unknown")))]
 use {
     async_std::prelude::FutureExt,
     flume::*,
-    futures::{stream::FuturesUnordered, StreamExt, TryFutureExt},
+    futures::{stream, stream::FuturesUnordered, Stream, StreamExt, TryFutureExt},
     std::time::Duration,
 };
 
@@ -34,7 +33,8 @@ fn stream_recv_disconnect() {
     let (tx, rx) = bounded::<i32>(0);
 
     let t = std::thread::spawn(move || {
-        tx.send(42);
+        tx.send(42)
+            .expect("receiver must accept the value before disconnect");
         std::thread::sleep(std::time::Duration::from_millis(250));
         drop(tx)
     });
@@ -228,16 +228,20 @@ async fn stream_forward_issue_55() {
         use futures::SinkExt;
         let (tx, rx) = flume::bounded(100);
 
-        let send_task = dummy_stream().map(|i| Ok(i)).forward(
+        let send_task = dummy_stream().map(Ok).forward(
             tx.into_sink()
                 .sink_map_err(|e| panic!("send error:{:#?}", e)),
         );
 
-        let recv_task = rx.into_stream().for_each(|item| async move {});
+        let recv_task = rx.into_stream().collect::<Vec<_>>();
         (send_task, recv_task)
     };
 
-    let jh = async_std::task::spawn(send_task);
-    async_std::task::block_on(recv_task);
-    jh.await.unwrap();
+    let (sent, received) = async_std::future::timeout(Duration::from_secs(5), async {
+        futures::join!(send_task, recv_task)
+    })
+    .await
+    .expect("forwarding and receiver completion must not stall");
+    sent.unwrap();
+    assert_eq!(received, (0..1000).collect::<Vec<_>>());
 }

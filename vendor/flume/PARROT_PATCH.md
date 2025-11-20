@@ -66,6 +66,23 @@ then a verified dependency migration; current source builds use this directory.
 The vendored test workspace retains a lockfile and is tested separately from the
 main workspace. No performance benefit is claimed without measurement.
 
+The local test and benchmark targets also pass strict Clippy without ignoring
+warnings. Stream forwarding checks the complete ordered 0..1000 result and both
+task completions under a shared timeout; the disconnect fixture requires its
+send to succeed. Boolean assertions, imports, redundant casts and closures are
+updated without reducing the original channel or benchmark workloads.
+
+`Receiver::disconnect_deferred` closes admission under the channel lock and
+returns a notification guard, leaving committed values readable or drainable.
+Pending send registrations are removed without committing their values; those
+values remain owned by the send futures. Repeated disconnection is idempotent.
+Ordinary last-endpoint disconnection uses the same path. It must not pull pending
+sends into a queue that has already been drained. Parrot's native MPSC mailbox
+disconnects before draining and isolates notification failures from independent
+message disposal. The new `disconnect` tests cover delayed callbacks, repeat
+disconnection, preserved queued values, rejected pending sends and last-receiver
+release. Public send/receive APIs retain their existing signatures.
+
 The three blocking timeout/deadline tests check the API contract rather than a
 five-millisecond operating-system scheduling window. An empty connected channel
 cannot report Timeout before its deadline; errors distinguish disconnection and

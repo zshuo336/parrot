@@ -1,5 +1,8 @@
 //! Actual Wire transports and Thread actors: primary replies, shadow execution,
 //! causal parent identity, and owned shutdown must agree end to end.
+#[path = "support/network.rs"]
+mod network_support;
+
 use parrot::thread::{context::ThreadContext, system::ThreadActorSystem};
 use parrot_api::{
     actor::{Actor, ActorState, EmptyConfig},
@@ -61,6 +64,9 @@ impl LocalLookup for RawLookup {
     }
 }
 async fn exercise(tcp: bool, kind: u8, traced: bool) {
+    if tcp && network_support::skip_tcp("wire mirror TCP test") {
+        return;
+    }
     let engine = ThreadActorSystem::shared(Default::default());
     let seen = Arc::new(Mutex::new(Vec::new()));
     for (name, path) in [("primary", "/app/source"), ("shadow", "/shadow")] {

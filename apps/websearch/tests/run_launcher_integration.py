@@ -17,17 +17,19 @@ def interrupted(signum, _frame):
 signal.signal(signal.SIGTERM, interrupted)
 try:
     original = None
+    binary = None
     for name in ['direct', 'registry', 'serve-only']:
         directory = root/name
         directory.mkdir()
         with ExitStack() as stack:
-            suite = web.Suite(directory, ROOT/'target/debug/websearch', stack)
+            suite = web.Suite(directory, binary, stack)
             environment = dict(suite.env)
             for key in list(environment):
                 if key.startswith('WS_'): environment.pop(key)
             environment.update(WS_PROFILE='dev', WS_RUN_DIR=str(directory/'run'), WS_STARTUP_TIMEOUT='90',
                                WS_TIMEOUT='300', PYTHON=sys.executable, WS_RAY_HTTP_PROXY=suite.runtime_proxy.base)
-            if name != 'direct': environment['WS_SKIP_BUILD'] = '1'
+            if name != 'direct':
+                environment.update(WS_SKIP_BUILD='1', WS_BIN=str(binary))
             command = ['bash', str(ROOT/('apps/websearch/deploy/run-registry.sh' if name == 'registry' else 'apps/websearch/run.sh')), '--port', '0']
             if name == 'serve-only':
                 command += ['--serve-only', '--data', original['data']]
@@ -64,8 +66,12 @@ try:
             web.require('--insecure-development' not in app_command, 'launcher weakened the default Local transport policy')
             if name == 'serve-only': web.require('jvm' in roles and 'erl' not in roles and 'ray' not in roles, roles)
             if name == 'direct':
-                web.require(terminal['build'] == 'dev' and terminal['binary'] == str(ROOT/'target/debug/websearch'), 'wrong build provenance')
+                binary = Path(terminal['binary'])
+                web.require(terminal['build'] == 'dev' and binary.is_absolute()
+                            and binary.is_file() and os.access(binary, os.X_OK), 'wrong build provenance')
                 web.require(all(next(child for child in terminal['children'] if child['name']==stage)['exit_code']==0 for stage in ['build-rust','build-gateways','build-search','build-frontier']), 'build stage did not succeed')
+            web.require(terminal['binary'] == str(binary) and app_command[0] == str(binary),
+                        'entrypoint did not reuse the selected executable')
             report['cases'].append(dict(name=name, stats=stats, http_requests=dict(suite.corpus.requests),
                                         blocked_requests=suite.corpus.blocked, runtime_probes=suite.runtime_proxy.blocked, terminal=terminal))
         print('Passed actual entrypoint:', name, flush=True)
@@ -74,7 +80,9 @@ except (Exception, KeyboardInterrupt) as error:
     report['status'], report['error'] = 'failed', str(error)
     raise
 finally:
-    report['binary_sha256'] = hashlib.sha256((ROOT/'target/debug/websearch').read_bytes()).hexdigest()
+    if binary is not None:
+        report['binary'] = str(binary)
+        report['binary_sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
     result_text = json.dumps(report, indent=2, ensure_ascii=False)+'\n'
     (root/'result.json').write_text(result_text)
     if options.report is not None:

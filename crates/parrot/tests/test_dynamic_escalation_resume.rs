@@ -229,7 +229,7 @@ impl ActixEngineExt for ActixNode {
 }
 enum Engine {
     Thread(Arc<parrot::thread::ThreadActorSystem>),
-    Actix(parrot::actix::ActixActorSystem),
+    Actix(Box<parrot::actix::ActixActorSystem>),
 }
 impl Engine {
     async fn new(actix: bool) -> Self {
@@ -237,7 +237,7 @@ impl Engine {
     }
     async fn with_settings(actix: bool, mode: usize, timeout: Duration) -> Self {
         if actix {
-            Self::Actix(
+            Self::Actix(Box::new(
                 parrot::actix::ActixActorSystem::with_settings(
                     parrot::actix::ActixSystemSettings {
                         arbiter_count: 2,
@@ -247,7 +247,7 @@ impl Engine {
                 )
                 .await
                 .unwrap(),
-            )
+            ))
         } else {
             Self::Thread(parrot::thread::ThreadActorSystem::shared(
                 parrot::thread::ThreadActorSystemConfig {

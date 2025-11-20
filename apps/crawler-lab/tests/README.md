@@ -21,7 +21,7 @@ CLI先完整解析、后创建runtime/连接。未知/重复/缺参、非法数�
 
 run-lab.sh 是 Python launcher 的薄入口。启动器使用动态端口、私有日志、受控进程组和 EOF guardian；--skip-ts 由启动器消费，明确记为跳过。`make check-crawler-launcher` 覆盖真实子进程的并发、构建／业务失败、伪就绪、超时、TERM/INT、SIGKILL、忽略 TERM 的后代端口和已有目录保护。夹具只替换组件命令，不承担多语言业务证明；真实业务仍须运行 make test-lab、registry 场景及 run_integration.py。Ray 在 macOS 的进程组行为须由真实 Ray 进程树复验，普通 Python 夹具不够。
 
-run_regression.sh 使用同一所有权机制，从源码构建并精确比对固定 golden 的计数、查询顺序／分数和完成标记。缺失、重复、数字前缀或 JSON 数值类型变化均失败；不比较耗时／JSON 对象键序。--keep-output 保留为兼容选项，日志始终保存。历史 golden 保持原样；匹配它不代表 manifest 迁移或 cid 轨迹已实现。
+run_regression.sh 使用同一所有权机制，从源码构建并精确比对固定 golden 的计数、查询顺序／分数和完成标记。缺失、重复观察、重复 JSON 字段、数字前缀或 JSON 数值类型变化均失败；不比较耗时／JSON 对象键序。构建后通过 Cargo JSON 选择本次实际应用程序，支持自定义 target 目录；缺失或歧义产物不能回退到旧的 target/debug 程序。test_regression_build.py 使用真实受管进程及编译器夹具验证这一选择，不承担多语言业务认证。--keep-output 保留为兼容选项，日志始终保存。历史 golden 保持原样；匹配它不代表 manifest 迁移或 cid 轨迹已实现。
 
 Frontier 另由 `make check-erl` 运行真实容量契约。默认每实例 Queue 为 65,536 项／16 MiB，Seen 为 262,144 项／16 MiB；CLI 的 pages 上限不是组件容量预留或可完成页数保证。过载拒绝整批且不污染去重，消费后只释放 Queue，Seen 直到实例退休。测试实际达到默认上限，检查 32 个并发 legacy 写入、二进制引用大小及 pool 独立额度；具体配置与计费见 [Erlang 组件契约](../../../docs/ERLANG_COMPONENTS.md)。
 

@@ -1,4 +1,5 @@
 use super::{
+    checkpoint::{self, Requests},
     request::{self, StoredCommand},
     DirectoryRequestStatus,
 };
@@ -6,9 +7,12 @@ use super::{DirCmd, DirEntry, DirQuery, DirectoryApplyError, DirectorySm};
 use crate::raft::{Clock, DurableRaft, LogIndex, NodeId, RaftRpc, RaftStorageError, Role, Term};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Weak,
+    },
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +32,7 @@ pub struct DurableDirectoryProposal {
     term: Term,
     digest: [u8; 32],
     identity: Arc<()>,
+    decision: Arc<AtomicU8>,
 }
 impl DurableDirectoryProposal {
     pub fn index(&self) -> LogIndex {
@@ -43,15 +48,22 @@ pub enum DurableDirectoryStatus {
     Applied,
     Conflict,
     Foreign,
+    /// A received snapshot covers this pending receipt without retaining its
+    /// command identity. Use a persistent request ID when its exact fate matters.
+    Compacted,
+}
+struct ReceiptProof {
+    term: Term,
+    digest: [u8; 32],
+    decision: Weak<AtomicU8>,
 }
 
-/// One read invocation, bound to its owner, term, log position and query.
+/// One read invocation, bound to its owner, term, fresh quorum context and query.
 /// Poll until completion; a completed ticket cannot be reused as a new read.
 #[derive(Debug)]
 pub struct DirectoryReadTicket {
-    receipt: DurableDirectoryProposal,
+    read: crate::raft::ReadTicket,
     query: DirQuery,
-    complete: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DirectoryRead {
@@ -77,7 +89,9 @@ pub struct DurableDirectory {
     failed: bool,
     peers: Vec<NodeId>,
     identity: Arc<()>,
-    requests: HashMap<(String, String), ([u8; 32], DirectoryRequestStatus)>,
+    requests: Requests,
+    ownership: super::ownership::State,
+    receipts: BTreeMap<LogIndex, Vec<ReceiptProof>>,
 }
 impl DurableDirectory {
     pub fn open(
@@ -109,6 +123,7 @@ impl DurableDirectory {
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             },
+            checkpoint::validate_replay,
         )?;
         let mut this = Self {
             raft,
@@ -118,6 +133,8 @@ impl DurableDirectory {
             peers: members,
             identity: Arc::new(()),
             requests: HashMap::new(),
+            ownership: Default::default(),
+            receipts: BTreeMap::new(),
         };
         this.apply_pending()?;
         Ok(this)
@@ -147,7 +164,11 @@ impl DurableDirectory {
                 request::decode(&e.cmd)?;
             }
         }
-        self.raft.step(from, rpc)?;
+        self.raft.step_validated(from, rpc, |snapshot| {
+            checkpoint::decode(snapshot)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })?;
         self.apply_pending()
     }
     pub fn propose(
@@ -159,12 +180,44 @@ impl DurableDirectory {
         let digest = Sha256::digest(&bytes).into();
         let index = self.raft.propose(bytes)?;
         self.apply_pending()?;
+        let decision = Arc::new(AtomicU8::new(u8::from(index <= self.applied)));
+        if index > self.applied {
+            self.receipts.entry(index).or_default().push(ReceiptProof {
+                term: self.raft.current_term(),
+                digest,
+                decision: Arc::downgrade(&decision),
+            });
+        }
         Ok(DurableDirectoryProposal {
             index,
             term: self.raft.current_term(),
             digest,
             identity: self.identity.clone(),
+            decision,
         })
+    }
+    /// Explicit maintenance: replace the applied log prefix with one durable
+    /// checkpoint containing business state and all persistent request results.
+    /// Request history remains bounded by the group's 16 MiB state budget.
+    pub fn compact(&mut self) -> Result<LogIndex, DurableDirectoryError> {
+        self.check()?;
+        if self.applied == self.raft.snapshot_index() {
+            return Ok(self.applied);
+        }
+        let slot = (self.applied - self.raft.snapshot_index() - 1) as usize;
+        let term = self.raft.log()[slot].term;
+        let bytes = checkpoint::encode(
+            self.applied,
+            term,
+            &self.sm,
+            &self.requests,
+            &self.ownership,
+        )?;
+        self.raft.compact(self.applied, bytes)?;
+        Ok(self.applied)
+    }
+    pub fn snapshot_index(&self) -> LogIndex {
+        self.raft.snapshot_index()
     }
     pub fn outbox(&mut self) -> Result<Vec<(NodeId, RaftRpc)>, DurableDirectoryError> {
         self.check()?;
@@ -229,7 +282,7 @@ impl DurableDirectory {
             });
         }
         let mut pending = DirectoryRequestStatus::Unknown;
-        for entry in &self.raft.log()[self.applied as usize..] {
+        for entry in &self.raft.log()[(self.applied - self.raft.snapshot_index()) as usize..] {
             if let StoredCommand::Request(saved) = request::decode(&entry.cmd)? {
                 if saved.client == client && saved.id == id {
                     if super::directory_command_digest(&saved.command)? == digest {
@@ -239,6 +292,68 @@ impl DurableDirectory {
                         };
                     } else if pending == DirectoryRequestStatus::Unknown {
                         return Ok(DirectoryRequestStatus::Conflict);
+                    }
+                }
+            }
+        }
+        Ok(pending)
+    }
+    /// Submit conditional ownership metadata in the caller's trusted identity.
+    /// Network callers use OwnershipClient, which binds it to transport identity.
+    pub fn submit_ownership(
+        &mut self,
+        client: &str,
+        id: &str,
+        command: &super::ownership::OwnershipCommand,
+    ) -> Result<super::ownership::OwnershipStatus, DurableDirectoryError> {
+        use super::ownership::{self, OwnershipStatus};
+        self.check()?;
+        let bytes = ownership::encode(client, id, command)?;
+        let digest = command.digest()?;
+        let status = self.ownership_status(client, id, digest)?;
+        match &status {
+            OwnershipStatus::Applied { .. } | OwnershipStatus::Conflict => return Ok(status),
+            OwnershipStatus::Pending { term, .. } => {
+                if self.role() != Role::Leader {
+                    return Err(
+                        RaftStorageError::NotLeader(self.leader_hint().map(str::to_owned)).into(),
+                    );
+                }
+                if *term == self.current_term() {
+                    return Ok(status);
+                }
+            }
+            OwnershipStatus::Unknown => {}
+        }
+        self.raft.propose(bytes)?;
+        self.apply_pending()?;
+        self.ownership_status(client, id, digest)
+    }
+    /// Positive Applied proves that invocation committed. Unknown/Pending are
+    /// local observations and do not establish absence or current ownership.
+    pub fn ownership_status(
+        &self,
+        client: &str,
+        id: &str,
+        digest: [u8; 32],
+    ) -> Result<super::ownership::OwnershipStatus, DurableDirectoryError> {
+        use super::ownership::OwnershipStatus;
+        self.check()?;
+        request::identity(client, id)?;
+        if let Some(status) = self.ownership.status(client, id, digest) {
+            return Ok(status);
+        }
+        let mut pending = OwnershipStatus::Unknown;
+        for entry in &self.raft.log()[(self.applied - self.raft.snapshot_index()) as usize..] {
+            if let StoredCommand::Ownership(saved) = request::decode(&entry.cmd)? {
+                if saved.client == client && saved.id == id {
+                    if saved.digest == digest {
+                        pending = OwnershipStatus::Pending {
+                            index: entry.index,
+                            term: entry.term,
+                        };
+                    } else if pending == OwnershipStatus::Unknown {
+                        return Ok(OwnershipStatus::Conflict);
                     }
                 }
             }
@@ -256,19 +371,14 @@ impl DurableDirectory {
     ) -> Result<DirectoryReadTicket, DurableDirectoryError> {
         self.check()?;
         super::validate_query(query)?;
-        let bytes = request::READ_BARRIER.to_vec();
-        let digest = Sha256::digest(&bytes).into();
-        let index = self.raft.propose(bytes)?;
-        self.apply_pending()?;
+        let read = self.raft.begin_read()?;
+        if self.raft.last_log_term() != self.current_term() {
+            self.raft.propose(request::READ_BARRIER.to_vec())?;
+            self.apply_pending()?;
+        }
         Ok(DirectoryReadTicket {
-            receipt: DurableDirectoryProposal {
-                index,
-                term: self.current_term(),
-                digest,
-                identity: self.identity.clone(),
-            },
+            read,
             query: query.clone(),
-            complete: false,
         })
     }
     /// None means pending, not a successful missing-key read. Some(entry=None)
@@ -278,31 +388,15 @@ impl DurableDirectory {
         ticket: &mut DirectoryReadTicket,
     ) -> Result<Option<DirectoryRead>, DurableDirectoryError> {
         self.check()?;
-        if ticket.complete || !Arc::ptr_eq(&self.identity, &ticket.receipt.identity) {
-            return Err(
-                DirectoryApplyError::Invalid("foreign or completed read ticket".into()).into(),
-            );
-        }
-        if self.role() != Role::Leader || self.current_term() != ticket.receipt.term {
-            ticket.complete = true;
-            return Err(RaftStorageError::NotLeader(self.leader_hint().map(str::to_owned)).into());
-        }
-        match self.proposal_status(&ticket.receipt)? {
-            DurableDirectoryStatus::Applied => {
-                ticket.complete = true;
-                Ok(Some(DirectoryRead {
-                    entry: self.sm.query(&ticket.query),
-                    barrier_index: ticket.receipt.index,
-                    applied_index: self.applied,
-                    term: ticket.receipt.term,
-                }))
-            }
-            DurableDirectoryStatus::Pending => Ok(None),
-            _ => {
-                ticket.complete = true;
-                Err(DirectoryApplyError::Invalid("read barrier replaced".into()).into())
-            }
-        }
+        Ok(self
+            .raft
+            .poll_read(&mut ticket.read, self.applied)?
+            .map(|index| DirectoryRead {
+                entry: self.sm.query(&ticket.query),
+                barrier_index: index,
+                applied_index: self.applied,
+                term: ticket.read.term(),
+            }))
     }
     pub fn state_local(&self) -> Result<&DirectorySm, DurableDirectoryError> {
         self.check()?;
@@ -316,10 +410,17 @@ impl DurableDirectory {
         if !Arc::ptr_eq(&self.identity, &receipt.identity) {
             return Ok(DurableDirectoryStatus::Foreign);
         }
-        let Some(entry) = self.raft.log().get((receipt.index - 1) as usize) else {
-            // This live owner issued the receipt only after appending the
-            // entry. Without log compaction, absence means its uncommitted
-            // suffix was truncated, not that replication is still pending.
+        match receipt.decision.load(Ordering::Relaxed) {
+            1 => return Ok(DurableDirectoryStatus::Applied),
+            2 => return Ok(DurableDirectoryStatus::Conflict),
+            3 => return Ok(DurableDirectoryStatus::Compacted),
+            _ => {}
+        }
+        if receipt.index <= self.raft.snapshot_index() {
+            return Ok(DurableDirectoryStatus::Compacted);
+        }
+        let slot = (receipt.index - self.raft.snapshot_index() - 1) as usize;
+        let Some(entry) = self.raft.log().get(slot) else {
             return Ok(DurableDirectoryStatus::Conflict);
         };
         if entry.term != receipt.term || Sha256::digest(&entry.cmd)[..] != receipt.digest {
@@ -362,6 +463,32 @@ impl DurableDirectory {
         }
     }
     fn apply_pending(&mut self) -> Result<(), DurableDirectoryError> {
+        if let Some(snapshot) = self.raft.pending_snapshot()? {
+            let restored = match checkpoint::decode(snapshot) {
+                Ok(restored) => restored,
+                Err(error) => {
+                    self.failed = true;
+                    return Err(error.into());
+                }
+            };
+            let (index, term) = (snapshot.index, snapshot.term);
+            self.sm = restored.sm;
+            self.requests = restored.requests;
+            self.ownership = restored.ownership;
+            self.applied = index;
+            self.receipts.retain(|position, proofs| {
+                if *position > index {
+                    return true;
+                }
+                for proof in proofs {
+                    if let Some(decision) = proof.decision.upgrade() {
+                        decision.store(3, Ordering::Relaxed);
+                    }
+                }
+                false
+            });
+            self.raft.snapshot_applied(index, term)?;
+        }
         let commands = match self.prepare_requests() {
             Ok(commands) => commands,
             Err(e) => {
@@ -371,8 +498,20 @@ impl DurableDirectory {
         };
         let entries = self.raft.committed()?;
         for (entry, cmd) in entries.iter().zip(commands) {
+            if let Some(proofs) = self.receipts.remove(&entry.index) {
+                for proof in proofs {
+                    if let Some(decision) = proof.decision.upgrade() {
+                        let matches = proof.term == entry.term
+                            && Sha256::digest(&entry.cmd)[..] == proof.digest;
+                        decision.store(if matches { 1 } else { 2 }, Ordering::Relaxed);
+                    }
+                }
+            }
             match cmd {
                 StoredCommand::ReadBarrier => {}
+                StoredCommand::Ownership(request) => {
+                    self.ownership.apply(request, entry.index, entry.term)
+                }
                 StoredCommand::Plain(command) => self.sm.apply_validated(command),
                 StoredCommand::Request(request) => {
                     let key = (request.client, request.id);
@@ -398,6 +537,10 @@ impl DurableDirectory {
         if let Some(last) = entries.last() {
             self.applied = last.index;
         }
+        self.receipts.retain(|_, proofs| {
+            proofs.retain(|proof| proof.decision.strong_count() != 0);
+            !proofs.is_empty()
+        });
         Ok(())
     }
     fn prepare_requests(&self) -> Result<Vec<StoredCommand>, DurableDirectoryError> {
@@ -412,6 +555,7 @@ impl DurableDirectory {
         for command in &commands {
             let changes = match command {
                 StoredCommand::ReadBarrier => false,
+                StoredCommand::Ownership(_) => false,
                 StoredCommand::Plain(_) => true,
                 StoredCommand::Request(request) => {
                     let key = (request.client.clone(), request.id.clone());

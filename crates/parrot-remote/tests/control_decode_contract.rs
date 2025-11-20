@@ -1,4 +1,5 @@
 //! Control messages must reject malformed input before state changes or large allocations.
+use parrot_remote::frame::Frame;
 use parrot_remote::receptionist::{decode_sync, encode_sync, ReceptionistSync};
 use parrot_remote::swim::{decode_gossip, encode_gossip, MembershipGossip};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -61,6 +62,143 @@ fn length(value: u32) -> Vec<u8> {
     let mut out = vec![252]; // bincode 2 standard: u32 marker and LE payload.
     out.extend_from_slice(&value.to_le_bytes());
     out
+}
+
+#[test]
+fn route_hint_literal_vectors_preserve_fields_and_wire_boundaries() {
+    let wire = [1, 0, b'n', 3, 0, b'a', b':', b'1'];
+    assert_eq!(
+        Frame::parse_route_hint(&wire).unwrap(),
+        ("n".into(), "a:1".into())
+    );
+    assert_eq!(
+        Frame::try_route_hint("n", "a:1").unwrap().payload.as_ref(),
+        wire
+    );
+    assert_eq!(
+        Frame::parse_route_hint(&[0, 0, 0, 0]).unwrap(),
+        (String::new(), String::new())
+    );
+
+    let node = "n".repeat(u16::MAX as usize);
+    let addr = "a".repeat(u16::MAX as usize);
+    let frame = Frame::try_route_hint(&node, &addr).unwrap();
+    assert_eq!(
+        Frame::parse_route_hint(&frame.payload).unwrap(),
+        (node, addr)
+    );
+    let frame = Frame::try_route_hint("节点", "[::1]:9000").unwrap();
+    assert_eq!(
+        Frame::parse_route_hint(&frame.payload).unwrap(),
+        ("节点".into(), "[::1]:9000".into())
+    );
+}
+
+#[test]
+fn route_hint_rejects_truncation_invalid_utf8_and_every_unconsumed_suffix() {
+    let wire = [1, 0, b'n', 3, 0, b'a', b':', b'1'];
+    for end in 0..wire.len() {
+        assert!(
+            Frame::parse_route_hint(&wire[..end]).is_err(),
+            "prefix {end}"
+        );
+    }
+    for bad in [
+        &[1, 0, 255, 0, 0][..],
+        &[0, 0, 1, 0, 255],
+        &[255, 255, 0, 0],
+        &[0, 0, 255, 255],
+    ] {
+        assert!(
+            Frame::parse_route_hint(bad).is_err(),
+            "invalid payload {bad:?}"
+        );
+    }
+    for suffix in [&[0][..], &[0xa5], &[0, 0, 0, 0], &wire] {
+        let payload = [wire.as_slice(), suffix].concat();
+        bounded_rejection(|| Frame::parse_route_hint(&payload).is_err());
+    }
+}
+
+#[tokio::test]
+async fn real_tcp_rejects_tainted_route_hints_before_cache_mutation() {
+    use parrot_api::types::BoxedActorRef;
+    use parrot_remote::{LocalLookup, NodeAddr, RemoteActorSystem, RemoteConfig};
+    use std::{sync::Arc, time::Duration};
+    struct Empty;
+    #[async_trait::async_trait]
+    impl LocalLookup for Empty {
+        async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
+            None
+        }
+    }
+    // Suppress speculative dialing: this contract observes ingress/cache effects.
+    let server = RemoteActorSystem::new(
+        RemoteConfig::tcp("hint-server", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development()
+            .with_topology(parrot_remote::topology::TopologyConfig {
+                mode: parrot_remote::topology::TopologyMode::Hub,
+                relay_fallback: false,
+                ..Default::default()
+            }),
+        Arc::new(Empty),
+    )
+    .unwrap();
+    let client = RemoteActorSystem::new(
+        RemoteConfig::tcp("hint-client", None).with_insecure_development(),
+        Arc::new(Empty),
+    )
+    .unwrap();
+    server.start().await.unwrap();
+    client.start().await.unwrap();
+    let outcome: Result<bool, String> = async {
+        client
+            .connect(&NodeAddr::tcp("hint-server", server.local_addr().unwrap()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let sender = client.links_snapshot().await[0].1.clone();
+        sender
+            .send(Frame::try_route_hint("existing", "127.0.0.1:1").unwrap())
+            .await
+            .map_err(|e| e.to_string())?;
+        for node in ["existing", "tainted"] {
+            let mut frame = Frame::try_route_hint(node, "127.0.0.1:2").unwrap();
+            frame.payload = [frame.payload.as_ref(), &[0xa5]].concat().into();
+            sender.send(frame).await.map_err(|e| e.to_string())?;
+        }
+        sender
+            .send(Frame::try_route_hint("accepted-marker", "[::1]:3").unwrap())
+            .await
+            .map_err(|e| e.to_string())?;
+        // ROUTE_HINT frames share the ordered fast lane. The marker proves that
+        // both malformed frames were processed before inspecting their effects.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let learned = server.ingress.learned.lock().unwrap();
+                    if learned.contains_key("accepted-marker") {
+                        return learned.len() == 2
+                            && learned.get("existing").map(String::as_str) == Some("127.0.0.1:1")
+                            && learned.get("accepted-marker").map(String::as_str)
+                                == Some("[::1]:3")
+                            && !sender.is_closed();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
+    .await;
+    let client_shutdown = client.shutdown().await;
+    let server_shutdown = server.shutdown().await;
+    client_shutdown.unwrap();
+    server_shutdown.unwrap();
+    assert!(
+        outcome.expect("valid following route hint must still be processed"),
+        "a route hint with trailing bytes created or overwrote a cached route"
+    );
 }
 
 #[test]
@@ -240,12 +378,12 @@ async fn real_tcp_rejects_tainted_gossip_before_membership_mutation() {
             None
         }
     }
-    fn event(node: &str) -> parrot_remote::frame::Frame {
+    fn event(node: &str, seen_from: &str) -> parrot_remote::frame::Frame {
         let mut frame = parrot_remote::frame::Frame::try_route_hint("", "").unwrap();
         frame.header.frame_type = parrot_remote::frame::frame_type::SYSTEM_EVENT;
         frame.payload = encode_gossip(&MembershipGossip {
             events: vec![MemberEvent::Upsert(member(node))],
-            seen_from: "decode-client".into(),
+            seen_from: seen_from.into(),
             digest: 0,
             full_sync: None,
         });
@@ -273,22 +411,63 @@ async fn real_tcp_rejects_tainted_gossip_before_membership_mutation() {
             .await
             .map_err(|e| e.to_string())?;
         let sender = client.links_snapshot().await[0].1.clone();
-        let mut tainted = event("tainted-member");
+        let mut tainted = event("tainted-member", "decode-client");
         let mut bytes = tainted.payload.to_vec();
         bytes.push(0xa5);
         tainted.payload = bytes.into();
         sender.send(tainted).await.map_err(|e| e.to_string())?;
         sender
-            .send(event("accepted-marker"))
+            .send(event("forged-origin", "other-node"))
             .await
             .map_err(|e| e.to_string())?;
-        // Both gossip frames use the same ordered control lane. The valid marker
-        // proves the preceding malformed frame was handled, without a guessed sleep.
+        let mut malformed: Vec<_> = [
+            "mismatched-identity",
+            "unknown-scheme",
+            "missing-port",
+            "missing-host",
+            "wildcard-ipv4",
+            "wildcard-ipv6",
+            "bracketed-wire-ipv6",
+            "bad/node",
+        ]
+        .map(member)
+        .into();
+        malformed[0].addr.node_id = "different-node".into();
+        malformed[1].addr.scheme = "file".into();
+        malformed[2].addr.port = 0;
+        malformed[3].addr.host.clear();
+        malformed[4].addr.host = "0.0.0.0".into();
+        malformed[5].addr.host = "::".into();
+        malformed[6].addr.host = "[::1]".into();
+        for full_sync in [false, true] {
+            let mut frame = event("unused", "decode-client");
+            frame.payload = encode_gossip(&MembershipGossip {
+                events: if full_sync {
+                    Vec::new()
+                } else {
+                    malformed.iter().cloned().map(MemberEvent::Upsert).collect()
+                },
+                seen_from: "decode-client".into(),
+                digest: 0,
+                full_sync: full_sync.then(|| malformed.clone()),
+            });
+            sender.send(frame).await.map_err(|e| e.to_string())?;
+        }
+        sender
+            .send(event("accepted-marker", "decode-client"))
+            .await
+            .map_err(|e| e.to_string())?;
+        // All frames use the same ordered control lane. The valid marker proves
+        // the malformed frames were handled, without a guessed sleep.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let state = server.membership.lock().await;
                 if state.members.contains_key("accepted-marker") {
-                    return !state.members.contains_key("tainted-member");
+                    return !state.members.contains_key("tainted-member")
+                        && !state.members.contains_key("forged-origin")
+                        && malformed
+                            .iter()
+                            .all(|member| !state.members.contains_key(&member.node_id));
                 }
                 drop(state);
                 tokio::task::yield_now().await;
@@ -304,6 +483,6 @@ async fn real_tcp_rejects_tainted_gossip_before_membership_mutation() {
     server_shutdown.unwrap();
     assert!(
         outcome.expect("valid following gossip must still be processed"),
-        "a gossip payload with trailing garbage mutated the live membership table"
+        "malformed gossip or a forged origin mutated the live membership table"
     );
 }
