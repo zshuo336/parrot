@@ -14,8 +14,8 @@ impl ActixActorSystem {
     /// Child requests reject with recoverable inputs when full instead of
     /// waiting on a slot that their parent's initialization may hold.
     /// Static and dynamic factories share this initial-creation budget;
-    /// reconstruction has its own system invocation budget. Local actors still
-    /// use their existing budgets.
+    /// Local one-shot/repeatable actors share it through actor and stream init;
+    /// reconstruction has its own system invocation budget.
     pub const MAX_PENDING_INSTANCE_CREATIONS: usize = 1024;
 
     pub(in crate::actix) fn instance_creation_deadline(&self) -> Instant {

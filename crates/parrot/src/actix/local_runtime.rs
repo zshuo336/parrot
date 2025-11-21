@@ -181,6 +181,7 @@ impl AsyncLocalRuntime for ActixActorSystem {
                         parent: None,
                         cohort: None,
                         repeatable: true,
+                        creation: None,
                         erase: |reference| Box::new(LocalRef(reference)),
                     },
                 )
@@ -223,6 +224,7 @@ impl ActixActorSystem {
                         parent: None,
                         cohort: Some(cohort),
                         repeatable: true,
+                        creation: None,
                         erase: |reference| Box::new(LocalRef(reference)),
                     },
                 )
@@ -239,6 +241,33 @@ impl ActixActorSystem {
         path: &str,
         parent: super::local_typed::LocalParent<'_>,
     ) -> ActorResult<BoxedActorRef> {
+        let deadline = self.instance_creation_deadline();
+        let permit = match self.try_instance_creation() {
+            Ok(permit) => permit,
+            Err(reason) => {
+                return Err(super::local_typed::reject_local_factory(
+                    reason, factory, policy,
+                ));
+            }
+        };
+        self.spawn_neutral_local_child_admitted(
+            factory,
+            policy,
+            path,
+            parent,
+            super::system::Creation { permit, deadline },
+        )
+        .await
+    }
+
+    pub(super) async fn spawn_neutral_local_child_admitted(
+        self: &Arc<Self>,
+        factory: OwnedPayload<LocalRuntimeFactory>,
+        policy: OwnedPayload<Option<SupervisorStrategyType>>,
+        path: &str,
+        parent: super::local_typed::LocalParent<'_>,
+        creation: super::system::Creation,
+    ) -> ActorResult<BoxedActorRef> {
         let constructor = factory.take();
         let factory = OwnedPayload::new(
             move || LocalBehavior(constructor()),
@@ -254,6 +283,7 @@ impl ActixActorSystem {
                     parent: Some(parent),
                     cohort: None,
                     repeatable: true,
+                    creation: Some(creation),
                     erase: |reference| Box::new(LocalRef(reference)),
                 },
             )

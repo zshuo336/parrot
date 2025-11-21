@@ -371,7 +371,7 @@ async fn restart<A: LocalTypedDispatch, F: Fn() -> A + Send + 'static>(
 
 pub(super) async fn run<A, F>(
     mut inputs: TypedInputs<A>,
-    factory: &OwnedPayload<F>,
+    factory: &mut OwnedPayload<F>,
     control: Arc<ActorControl>,
     runtime: tokio::runtime::Handle,
 ) -> ActorExit
@@ -459,7 +459,6 @@ where
                 }
             };
             if let Err(error) = initialized {
-                control.finish_initialization();
                 let error = crate::error_receipt::ActorReceipt::from_error(error);
                 let deadline = tokio::time::Instant::now() + control.timeout;
                 let resume = parrot_api::trace::scope(
@@ -536,7 +535,6 @@ where
                     }
                 }
             };
-            control.finish_initialization();
             if let Err(error) = streams_initialized {
                 let error = crate::error_receipt::ActorReceipt::from_error(error);
                 let deadline = tokio::time::Instant::now() + control.timeout;
@@ -556,6 +554,10 @@ where
                 }
                 return Err(crate::supervision_policy::reply_error(error));
             }
+            // Initial admission covers both actor and local-stream init. A
+            // failed generation retains it through recovery or actual disposal.
+            control.finish_initialization();
+            factory.release_reservation();
             drop(initialization_context);
             let mut prefer_stream = true;
             loop {

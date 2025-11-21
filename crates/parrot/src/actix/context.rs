@@ -1048,41 +1048,85 @@ impl parrot_api::engine::AsyncLocalActorSpawner for ManagedSpawner {
         Box::pin(parrot_api::trace::capture(async move {
             if let (Some(service), Some(scope), Some(parent)) =
                 (&self.service, &self.scope, &self.parent)
-                && let Ok(system) = service.upgrade()
             {
-                // A native factory context's path.target is its physical
-                // generation. Resolve the registry's stable logical parent,
-                // retaining it weakly. The OLD scope still arbitrates admission
-                // atomically, so path reuse cannot admit through a stale context.
-                let parent_path = parent.path();
-                let identity = system
-                    .registry
-                    .read()
-                    .unwrap()
-                    .actors
-                    .get(&parent_path)
-                    .map(|entry| Arc::downgrade(&entry.actor_ref));
-                let Some(identity) = identity else {
-                    let (factory, policy) = tokio::join!(factory.retire(), policy.retire());
-                    factory.and(policy)?;
-                    return Err(ActorError::Stopped);
+                let permit = match service.instance_admission.clone().try_acquire_owned() {
+                    Ok(permit) => Arc::new(permit),
+                    Err(error) => {
+                        let reason = match error {
+                            tokio::sync::TryAcquireError::NoPermits => {
+                                super::ChildInstanceAdmissionFailure::Full
+                            }
+                            tokio::sync::TryAcquireError::Closed => {
+                                super::ChildInstanceAdmissionFailure::ShuttingDown
+                            }
+                        };
+                        return Err(super::local_typed::reject_local_factory(
+                            reason, factory, policy,
+                        ));
+                    }
                 };
-                let path = format!(
-                    "{}/{}",
-                    parent_path.trim_end_matches('/'),
-                    uuid::Uuid::new_v4()
-                );
-                return Arc::new(system)
-                    .spawn_neutral_local_child(
-                        factory,
-                        policy,
-                        &path,
-                        super::local_typed::LocalParent {
-                            scope,
-                            identity: Some(identity),
-                        },
-                    )
-                    .await;
+                let system = match service.upgrade() {
+                    Ok(system) => Arc::new(system),
+                    Err(_) => {
+                        return Err(super::local_typed::reject_local_factory(
+                            super::ChildInstanceAdmissionFailure::ShuttingDown,
+                            factory,
+                            policy,
+                        ));
+                    }
+                };
+                let deadline = system.instance_creation_deadline();
+                let factory = factory.with_reservation(&permit);
+                let policy = policy.with_reservation(&permit);
+                let timer_system = system.clone();
+                let creation = async move {
+                    // A native factory context's path.target is its physical
+                    // generation. Resolve the registry's stable logical parent,
+                    // retaining it weakly. The OLD scope still arbitrates admission
+                    // atomically, so path reuse cannot admit through a stale context.
+                    let parent_path =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parent.path()))
+                            .map_err(|panic| {
+                                ActorError::Panic(crate::owned_payload::panic_message(panic))
+                            })?;
+                    let identity = system
+                        .registry
+                        .read()
+                        .unwrap()
+                        .actors
+                        .get(&parent_path)
+                        .map(|entry| Arc::downgrade(&entry.actor_ref));
+                    let Some(identity) = identity else {
+                        let (factory, policy) = tokio::join!(factory.retire(), policy.retire());
+                        factory.and(policy)?;
+                        return Err(ActorError::Stopped);
+                    };
+                    let path = format!(
+                        "{}/{}",
+                        parent_path.trim_end_matches('/'),
+                        uuid::Uuid::new_v4()
+                    );
+                    system
+                        .spawn_neutral_local_child_admitted(
+                            factory,
+                            policy,
+                            &path,
+                            super::local_typed::LocalParent {
+                                scope,
+                                identity: Some(identity),
+                            },
+                            super::system::Creation { permit, deadline },
+                        )
+                        .await
+                };
+                return timer_system
+                    .creation_timeout(deadline, creation)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ActorError::TimeoutDetail(
+                            "Local child creation exceeded original deadline".into(),
+                        ))
+                    });
             }
             let (factory, policy) = tokio::join!(factory.retire(), policy.retire());
             factory.and(policy)?;

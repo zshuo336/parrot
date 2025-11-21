@@ -2,6 +2,8 @@
 // Root and parent-owned child construction share one owner-thread boundary.
 // Repeatable constructors never move their non-Send outputs off that owner.
 #[cfg(test)]
+mod admission_contracts;
+#[cfg(test)]
 mod construction_contracts;
 mod factory;
 
@@ -19,7 +21,20 @@ where
     pub parent: Option<LocalParent<'a>>,
     pub cohort: Option<&'a crate::root_cohort::RootCohort>,
     pub repeatable: bool,
+    pub creation: Option<super::system::Creation>,
     pub erase: fn(LocalTypedActorRef<A, M>) -> parrot_api::types::BoxedActorRef,
+}
+
+pub(crate) fn reject_local_factory<F: Send + 'static>(
+    reason: super::ChildInstanceAdmissionFailure,
+    factory: crate::owned_payload::OwnedPayload<F>,
+    policy: crate::owned_payload::OwnedPayload<
+        Option<parrot_api::supervisor::SupervisorStrategyType>,
+    >,
+) -> ActorError {
+    ActorError::Other(anyhow::Error::new(
+        super::typed::FactoryAdmissionError::new(reason, factory.take(), policy.take()),
+    ))
 }
 use crate::actix::{
     lifecycle::{ActorControl, Outcome, panic_message},
@@ -665,7 +680,7 @@ impl<A: LocalTypedDispatch> Drop for Queued<A> {
 
 async fn run_source<A, F>(
     queued: Queued<A>,
-    factory: crate::owned_payload::OwnedPayload<F>,
+    mut factory: crate::owned_payload::OwnedPayload<F>,
     policy: crate::owned_payload::OwnedPayload<
         Option<parrot_api::supervisor::SupervisorStrategyType>,
     >,
@@ -680,7 +695,7 @@ where
     let mut inputs = queued.activate();
     control.lifetime.set_strategy(policy.take());
     if repeatable {
-        let mut exit = factory::run(inputs, &factory, control, runtime).await;
+        let mut exit = factory::run(inputs, &mut factory, control, runtime).await;
         exit.cleanup = exit.cleanup.and(factory.retire().await);
         return exit;
     }
@@ -743,6 +758,9 @@ impl ActixActorSystem {
     /// stay on one arbiter. Success acknowledges admission, not initialization.
     /// Queued messages wait for construction and initialization. The constructor
     /// is called at most once; this entry does not promise factory restart.
+    /// Initial admission shares the system's root/child creation budget and
+    /// original first-poll deadline. Both actor and local-stream init must finish
+    /// before successful creation releases its slot.
     ///
     /// Unpolled cancellation retires constructor captures without constructing an
     /// actor. Stops and shutdown join real cleanup; a synchronous constructor or
@@ -818,6 +836,7 @@ impl ActixActorSystem {
                     identity: p.own(),
                 }),
                 repeatable,
+                creation: None,
                 erase: |reference| reference.into_dyn(),
             },
         )
@@ -830,7 +849,69 @@ impl ActixActorSystem {
         policy: crate::owned_payload::OwnedPayload<
             Option<parrot_api::supervisor::SupervisorStrategyType>,
         >,
+        mut source: LocalSource<'_, A, M>,
+    ) -> ActorResult<LocalTypedActorRef<A, M>>
+    where
+        A: LocalTypedDispatch,
+        M: ParrotMsgVariant<LocalProtocol<A>>,
+        F: Fn() -> A + Send + 'static,
+    {
+        let deadline = source.creation.as_ref().map_or_else(
+            || self.instance_creation_deadline(),
+            |creation| creation.deadline,
+        );
+        let operation = async move {
+            let creation = match source.creation.take() {
+                Some(creation) => creation,
+                None => {
+                    let permit = if source.parent.is_some() {
+                        match self.try_instance_creation() {
+                            Ok(permit) => permit,
+                            Err(reason) => {
+                                return Err(reject_local_factory(reason, factory, policy));
+                            }
+                        }
+                    } else {
+                        let admission = tokio::select! {
+                            biased;
+                            _ = self.creation_timer(deadline) => Err(ActorError::TimeoutDetail("Local creation admission exceeded original deadline".into())),
+                            permit = self.instance_admission.clone().acquire_owned() => permit.map(Arc::new).map_err(|_| ActorError::Stopped),
+                        };
+                        match admission {
+                            Ok(permit) => permit,
+                            Err(error) => {
+                                let (factory, policy) =
+                                    tokio::join!(factory.retire(), policy.retire());
+                                factory.and(policy)?;
+                                return Err(error);
+                            }
+                        }
+                    };
+                    super::system::Creation { permit, deadline }
+                }
+            };
+            let factory = factory.with_reservation(&creation.permit);
+            let policy = policy.with_reservation(&creation.permit);
+            self.spawn_local_admitted_source(factory, policy, source, creation)
+                .await
+        };
+        self.creation_timeout(deadline, operation)
+            .await
+            .unwrap_or_else(|_| {
+                Err(ActorError::TimeoutDetail(
+                    "Local creation exceeded original deadline".into(),
+                ))
+            })
+    }
+
+    async fn spawn_local_admitted_source<A, M, F>(
+        self: &Arc<Self>,
+        factory: crate::owned_payload::OwnedPayload<F>,
+        policy: crate::owned_payload::OwnedPayload<
+            Option<parrot_api::supervisor::SupervisorStrategyType>,
+        >,
         source: LocalSource<'_, A, M>,
+        creation: super::system::Creation,
     ) -> ActorResult<LocalTypedActorRef<A, M>>
     where
         A: LocalTypedDispatch,
@@ -844,6 +925,7 @@ impl ActixActorSystem {
             cohort,
             repeatable,
             erase,
+            creation: _,
         } = source;
         if let Some(cohort) = cohort
             && let Err(error) = cohort.validate(&self.root_cohorts)
@@ -861,6 +943,7 @@ impl ActixActorSystem {
         let policy = if guardian.is_some() {
             policy.retire().await?;
             crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots)
+                .with_reservation(&creation.permit)
         } else {
             policy
         };
@@ -871,6 +954,11 @@ impl ActixActorSystem {
         let mut factory = Some(factory);
         let mut policy = Some(policy);
         let mut admit = |lifetime: Option<Arc<crate::children::ChildLifetime>>| {
+            if tokio::time::Instant::now() >= creation.deadline {
+                return Err(ActorError::TimeoutDetail(
+                    "Local creation exceeded original deadline".into(),
+                ));
+            }
             parrot_api::engine::SpawnOptions::at(path)
                 .validate()
                 .map_err(|error| ActorError::InternalError(error.to_string()))?;
@@ -884,8 +972,10 @@ impl ActixActorSystem {
                 self.policy_slots.clone(),
             );
             ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
+            control.reserve_creation(creation.permit.clone());
+            control.bound_initialization(Some(creation.deadline));
             // Owner-thread dispatch spends the same deadline as construction.
-            control.begin_construction(tokio::time::Instant::now() + control.creation_timeout);
+            control.begin_construction(creation.deadline);
             let own = Arc::new(std::sync::OnceLock::new());
             let weak_stop = Arc::downgrade(&control);
             let weak_escalated = Arc::downgrade(&control);

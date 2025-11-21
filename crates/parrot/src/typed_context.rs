@@ -301,6 +301,8 @@ pub trait TypedContextExt {
     /// Admit a repeatable Local child. Every instance is constructed and
     /// retired on one chosen arbiter. Only the Send constructor crosses threads;
     /// it is invoked serially and need not be Sync. Inherits the parent's policy.
+    /// Actix overload or shutdown returns `FactoryAdmissionError<F>` in
+    /// `ActorError::Other`, preserving the constructor and policy for retry.
     fn spawn_local_typed_child_factory<A, M, F>(
         &self,
         constructor: F,
@@ -327,6 +329,8 @@ pub trait TypedContextExt {
     /// futures remain on their chosen arbiter, which need not be the parent's.
     /// This is one-shot construction, not a restartable factory. Admission is
     /// lazy, but constructor captures are owned immediately, even if unpolled.
+    /// Actix shares initial creation admission with Send actors; overload and
+    /// shutdown return the original inputs in `FactoryAdmissionError<F>`.
     /// Thread and foreign contexts reject this operation and retire its inputs.
     fn spawn_local_typed_child<A, M, F>(
         &self,
@@ -631,9 +635,11 @@ where
                 )
                 .await;
         }
-        let (constructor, policy) = tokio::join!(constructor.retire(), policy.retire());
-        constructor.and(policy)?;
-        return Err(ActorError::Stopped);
+        return Err(crate::actix::local_typed::reject_local_factory(
+            crate::actix::ChildInstanceAdmissionFailure::ShuttingDown,
+            constructor,
+            policy,
+        ));
     }
     let (constructor, policy) = tokio::join!(constructor.retire(), policy.retire());
     constructor.and(policy)?;
@@ -670,6 +676,13 @@ impl parrot_api::engine::AsyncLocalActorSpawner for ManagedContext {
                         },
                     )
                     .await;
+            }
+            if matches!(&self.system, Backend::Actix(_)) {
+                return Err(crate::actix::local_typed::reject_local_factory(
+                    crate::actix::ChildInstanceAdmissionFailure::ShuttingDown,
+                    factory,
+                    policy,
+                ));
             }
             let (factory, policy) = tokio::join!(factory.retire(), policy.retire());
             factory.and(policy)?;

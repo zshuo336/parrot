@@ -40,6 +40,8 @@ impl<A: ParrotTypedDispatch> std::error::Error for TypedInstanceAdmissionError<A
 /// Original factory and strategy returned without invocation or registration.
 /// Dynamic Actix child factories use `F = BoxedMessage`; retry that unchanged
 /// wrapper with the parent's `ActorSpawner::spawn_factory_erased` method.
+/// Local children return their original Send-only constructor. Neutral Local
+/// children use `F = LocalRuntimeFactory`, before any backend adapter conversion.
 pub struct FactoryAdmissionInputs<F> {
     pub factory: F,
     pub strategy: Option<SupervisorStrategyType>,

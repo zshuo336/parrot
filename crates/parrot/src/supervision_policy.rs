@@ -835,41 +835,55 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn cancelled_policy_waiter_keeps_bounded_cleanup_and_shared_receipt() {
-        for panics in [false, true] {
-            let drops = Arc::new(AtomicUsize::new(0));
-            let thread = Arc::new(Mutex::new(None));
-            let slots = Arc::new(Semaphore::new(1));
-            let permit = slots.clone().acquire_owned().await.unwrap();
-            let store = PolicyStore::new(
-                Some(strategy(Capture {
-                    drops: drops.clone(),
-                    thread: thread.clone(),
-                    panics,
-                })),
-                slots.clone(),
-            );
-            let mut waiter = Box::pin(store.dispose());
-            assert!(futures::poll!(&mut waiter).is_pending());
-            drop(waiter);
-            tokio::task::yield_now().await;
-            assert_eq!(drops.load(Ordering::SeqCst), 0, "cleanup needs its permit");
-            drop(permit);
-            let first = tokio::time::timeout(Duration::from_secs(1), store.dispose())
-                .await
-                .unwrap();
-            let repeated = store.dispose().await;
-            assert_eq!(first.is_err(), panics);
-            assert_eq!(first.is_err(), repeated.is_err());
-            assert_eq!(drops.load(Ordering::SeqCst), 1);
-            assert_ne!(*thread.lock().unwrap(), Some(std::thread::current().id()));
-            let restored = tokio::time::timeout(Duration::from_secs(1), slots.acquire_owned())
-                .await
-                .unwrap()
-                .unwrap();
-            drop(restored);
-        }
+    #[test]
+    fn cancelled_policy_waiter_keeps_bounded_cleanup_and_shared_receipt() {
+        // Other saturation cases consume process-wide cleanup ownership. Keep
+        // this worker/receipt contract's one-second bounds in its own process.
+        crate::test_support::isolated(
+            "supervision_policy::tests::cancelled_policy_waiter_keeps_bounded_cleanup_and_shared_receipt",
+            || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    for panics in [false, true] {
+                        let drops = Arc::new(AtomicUsize::new(0));
+                        let thread = Arc::new(Mutex::new(None));
+                        let slots = Arc::new(Semaphore::new(1));
+                        let permit = slots.clone().acquire_owned().await.unwrap();
+                        let store = PolicyStore::new(
+                            Some(strategy(Capture {
+                                drops: drops.clone(),
+                                thread: thread.clone(),
+                                panics,
+                            })),
+                            slots.clone(),
+                        );
+                        let mut waiter = Box::pin(store.dispose());
+                        assert!(futures::poll!(&mut waiter).is_pending());
+                        drop(waiter);
+                        tokio::task::yield_now().await;
+                        assert_eq!(drops.load(Ordering::SeqCst), 0, "cleanup needs its permit");
+                        drop(permit);
+                        let first = tokio::time::timeout(Duration::from_secs(1), store.dispose())
+                            .await
+                            .unwrap();
+                        let repeated = store.dispose().await;
+                        assert_eq!(first.is_err(), panics);
+                        assert_eq!(first.is_err(), repeated.is_err());
+                        assert_eq!(drops.load(Ordering::SeqCst), 1);
+                        assert_ne!(*thread.lock().unwrap(), Some(std::thread::current().id()));
+                        let restored =
+                            tokio::time::timeout(Duration::from_secs(1), slots.acquire_owned())
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        drop(restored);
+                    }
+                });
+            },
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

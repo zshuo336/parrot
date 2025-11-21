@@ -263,6 +263,9 @@ impl<T: Send + 'static> OwnedPayload<T> {
         self.reservation = Some(reservation.clone());
         self
     }
+    pub(crate) fn release_reservation(&mut self) {
+        drop(self.reservation.take());
+    }
     pub(crate) fn with_executor(
         mut self,
         runtime: &tokio::runtime::Handle,
