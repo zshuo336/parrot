@@ -1,7 +1,7 @@
 //! Read OS group liveness while the unreaped guardian still pins its identity.
 //! Zombies have relinquished their resources; a dead Linux thread-group leader
 //! does not prove that its other threads have done so.
-use std::time::Instant;
+use std::{collections::BTreeSet, time::Instant};
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
     if Instant::now() >= deadline {
@@ -155,6 +155,41 @@ fn has_live_scope(group: u32, session_scope: bool, deadline: Instant) -> Result<
     Ok(false)
 }
 
+/// Return every live process group observed inside a pinned session.
+///
+/// A session leader is not required to keep descendants in its process group:
+/// Ray and other runtimes may call `setpgrp()` while retaining the same
+/// session.  Retirement must therefore snapshot all groups before signalling
+/// the leader group.  The caller still owns the session leader, so these IDs
+/// remain scoped to that session rather than to arbitrary process IDs.
+#[cfg(target_os = "linux")]
+pub(super) fn session_groups(session: u32, deadline: Instant) -> Result<Vec<u32>, String> {
+    let mut groups = BTreeSet::new();
+    for process in std::fs::read_dir("/proc").map_err(|e| e.to_string())? {
+        check_deadline(deadline)?;
+        let process = match process {
+            Ok(process) => process,
+            Err(error) if disappeared(&error) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !process
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let Some((group, actual_session, state)) = stat(&process.path().join("stat"))? else {
+            continue;
+        };
+        if actual_session == session as i32 && group > 0 && !matches!(state, b'Z' | b'X' | b'x') {
+            groups.insert(group as u32);
+        }
+    }
+    Ok(groups.into_iter().collect())
+}
+
 #[cfg(target_os = "macos")]
 fn has_live_scope(group: u32, session_scope: bool, deadline: Instant) -> Result<bool, String> {
     // Darwin sys/proc_info.h: PROC_PGRP_ONLY. No stored PID is signalled here.
@@ -243,6 +278,81 @@ fn has_live_scope(group: u32, session_scope: bool, deadline: Instant) -> Result<
         };
         Ok(same_scope && info.pbi_status != libc::SZOMB)
     })
+}
+
+#[cfg(target_os = "macos")]
+fn all_pids(deadline: Instant) -> Result<Vec<i32>, String> {
+    let mut pids = vec![0i32; 256];
+    loop {
+        check_deadline(deadline)?;
+        let bytes = std::mem::size_of_val(pids.as_slice());
+        let result = unsafe {
+            *libc::__error() = 0;
+            libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes as i32)
+        };
+        let error = std::io::Error::last_os_error();
+        if result < 0
+            || (result == 0 && !matches!(error.raw_os_error(), Some(0) | Some(libc::ESRCH)))
+        {
+            return Err(format!("list gateway session processes: {error}"));
+        }
+        if result as usize >= bytes {
+            if pids.len() >= 65536 {
+                return Err("gateway session exceeds retirement observation limit".into());
+            }
+            pids.resize(pids.len() * 2, 0);
+            continue;
+        }
+        if !(result as usize).is_multiple_of(std::mem::size_of::<i32>()) {
+            return Err("invalid session process list size".into());
+        }
+        return Ok(pids[..result as usize / std::mem::size_of::<i32>()].to_vec());
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn session_groups(session: u32, deadline: Instant) -> Result<Vec<u32>, String> {
+    let mut groups = BTreeSet::new();
+    for pid in all_pids(deadline)? {
+        check_deadline(deadline)?;
+        if pid <= 0 {
+            continue;
+        }
+        let sid = unsafe { libc::getsid(pid) };
+        if sid == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(format!("read gateway session: {error}"));
+        }
+        if sid != session as i32 {
+            continue;
+        }
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                expected as i32,
+            )
+        };
+        if bytes as usize != expected {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(format!("read gateway session member: {error}"));
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pgid > 0 && info.pbi_status != libc::SZOMB {
+            groups.insert(info.pbi_pgid);
+        }
+    }
+    Ok(groups.into_iter().collect())
 }
 
 /// Observe a pinned process group without signalling any enumerated PID.

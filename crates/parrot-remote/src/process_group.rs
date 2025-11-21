@@ -1,7 +1,8 @@
 //! Owned, unreaped session leaders pin the identity used for group retirement.
 //! Callers never receive the Child, so they cannot accidentally reap it before
-//! the last signal. Signals target the owned group; retirement also observes
-//! other groups in the same session. Deliberately escaping the session is not contained.
+//! the last signal. Signals target every owned group in the session; retirement
+//! also observes all session members. Deliberately escaping the session is not
+//! contained.
 mod liveness;
 pub use liveness::has_live_group;
 use std::os::unix::process::CommandExt;
@@ -46,7 +47,7 @@ impl PinnedProcess {
             .checked_add(budget)
             .ok_or("group retirement deadline overflow")?;
         let mut errors = Vec::new();
-        let mut empty = false;
+        let mut signal_error = None;
         loop {
             // No competing child reaper or SIGCHLD=SIG_IGN is supported.
             // Detect ownership already lost before attempting any group signal.
@@ -57,41 +58,31 @@ impl PinnedProcess {
                 self.result = Some(result.clone());
                 return result;
             }
-            if unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) } == -1 {
-                let error = io::Error::last_os_error();
-                match error.raw_os_error() {
-                    // The group may have become empty between the ownership
-                    // check and the final signal. POSIX permits EPERM when
-                    // no member can be signalled; verify that this is the
-                    // harmless, already-retired case before reporting an
-                    // actual permission failure.
-                    Some(libc::EPERM) => match liveness::has_live_session(child.id(), deadline) {
-                        Ok(false) => empty = true,
-                        Ok(true) => {
-                            errors.push(format!("kill gateway group: {error}"));
-                            break;
-                        }
-                        Err(observation) => {
-                            errors.push(format!("kill gateway group: {error}; {observation}"));
-                            break;
-                        }
-                    },
-                    Some(libc::ESRCH) => {}
-                    _ => {
-                        errors.push(format!("kill gateway group: {error}"));
-                        break;
-                    }
-                }
+            if let Err(error) = signal_session_groups(child.id(), deadline) {
+                signal_error.get_or_insert(error);
             }
             match liveness::has_live_session(child.id(), deadline) {
-                Ok(false) if empty => break,
-                Ok(live) => empty = !live,
+                Ok(false) => break,
+                Ok(true) => {}
                 Err(error) => {
                     errors.push(error);
                     break;
                 }
             }
+            if Instant::now() >= deadline {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(error) = signal_error {
+            // A transient EPERM/ESRCH can race a descendant's exit. Report it
+            // only when the session remained live through the full retry
+            // window; otherwise the observed empty session is stronger.
+            if liveness::has_live_session(child.id(), Instant::now() + Duration::from_millis(1))
+                .unwrap_or(true)
+            {
+                errors.push(error);
+            }
         }
         if let Err(error) = child.wait() {
             errors.push(format!("wait gateway guardian: {error}"));
@@ -106,6 +97,35 @@ impl PinnedProcess {
         result
     }
 }
+
+/// Signal every process group currently observed in the pinned session. The
+/// guardian group is signalled last so the session identity remains anchored
+/// while escaped Ray groups are enumerated and retired.
+fn signal_session_groups(session: u32, deadline: Instant) -> Result<(), String> {
+    let mut groups = liveness::session_groups(session, deadline)?;
+    groups.sort_by_key(|group| *group == session);
+    let mut errors = Vec::new();
+    for group in groups {
+        if Instant::now() >= deadline {
+            return Err("gateway group retirement signal deadline".into());
+        }
+        if unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) } == -1 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                // A process group can disappear between enumeration and the
+                // signal. It is already retired and needs no error receipt.
+                Some(libc::ESRCH) => {}
+                _ => errors.push(format!("kill gateway group {group}: {error}")),
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 fn still_owned(pid: u32) -> io::Result<()> {
     loop {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -136,7 +156,7 @@ impl Drop for PinnedProcess {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use std::process::Stdio;
