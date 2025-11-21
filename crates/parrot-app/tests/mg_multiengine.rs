@@ -85,9 +85,8 @@ fn repo_root() -> std::path::PathBuf {
     p.parent().unwrap().parent().unwrap().to_path_buf()
 }
 
-static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20601);
 fn alloc_port() -> u16 {
-    NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    0
 }
 
 /// 网关场景串行锁（同时拉三网关子进程争资源——MG 全链必须串行）。

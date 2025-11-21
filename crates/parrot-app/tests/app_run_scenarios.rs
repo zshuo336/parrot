@@ -112,10 +112,9 @@ fn comp(name: &str, engine: EngineKind, artifact: ArtifactRef) -> ComponentSpec 
     }
 }
 
-/// 独立端口分配器（测试并行不撞端口）。
-static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(19901);
+/// 请求操作系统分配临时端口，避免不同测试二进制使用各自固定端口段。
 fn alloc_port() -> u16 {
-    NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    0
 }
 
 /// 网关场景串行锁（多测试同时拉 ray/erl/jvm 子进程会争资源——DEV_09 §6 条 1 同族坑）。

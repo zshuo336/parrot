@@ -10,7 +10,7 @@ use futures::{
     task::{ArcWake, waker_ref},
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
@@ -145,6 +145,8 @@ pub struct Worker {
 
     /// Mailbox panic counters (path -> consecutive panics)
     panic_counts: Arc<Mutex<HashMap<String, usize>>>,
+
+    cleanups: Arc<IsolatedCleanupTracker>,
 }
 
 impl Worker {
@@ -182,6 +184,7 @@ impl Worker {
             scheduling_queue,
             shutdown_flag,
             config,
+            Arc::default(),
         ))
     }
 
@@ -191,6 +194,7 @@ impl Worker {
         scheduling_queue: Arc<SchedulingQueue>,
         shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
         config: WorkerConfig,
+        cleanups: Arc<IsolatedCleanupTracker>,
     ) -> Self {
         let batch_size = config.batch_size;
 
@@ -203,6 +207,7 @@ impl Worker {
             status: Arc::new(AtomicUsize::new(WorkerStatus::Idle as usize)),
             config,
             panic_counts: Arc::new(Mutex::new(HashMap::new())),
+            cleanups,
         }
     }
 
@@ -266,9 +271,10 @@ impl Worker {
                         let lease = SharedLease::new(mailbox.clone());
                         running.push(async move {
                             let owned_mailbox = mailbox.clone();
-                            let work = poll_isolated(async move {
+                            let cleanups = worker.cleanups.clone();
+                            let work = poll_isolated_with_cleanup(async move {
                                 worker.process_mailbox_with_lease(owned_mailbox, worker.batch_size, &lease).await
-                            }, permit, slots.clone(), poll_finished.clone());
+                            }, permit, slots.clone(), poll_finished.clone(), Handle::current(), Some(cleanups.clone()));
                             if let Err(error) = work.await {
                                 let message = error.to_string();
                                 if let Some(processor) = mailbox.get_processor() {
@@ -276,10 +282,10 @@ impl Worker {
                                     // Fallback callbacks can block or panic, too. They consume
                                     // this worker's poll permit and never run on its async driver.
                                     let permit = slots.clone().acquire_owned().await.expect("worker semaphore stays open");
-                                    let _ = poll_isolated(async move {
+                                    let _ = poll_isolated_with_cleanup(async move {
                                         notify_shared_failure(&*processor, notice);
                                         Ok(())
-                                    }, permit, slots, poll_finished).await;
+                                    }, permit, slots, poll_finished, Handle::current(), Some(cleanups)).await;
                                 }
                                 crate::thread::scheduler::failure_diagnostic(|| {
                                     error!(path = %mailbox.path().path, error = %message, "worker actor failed");
@@ -704,39 +710,32 @@ struct IsolatedFuture<F: Future + Send + 'static> {
     future: Option<std::pin::Pin<Box<F>>>,
     runtime: tokio::runtime::Handle,
     cleanup_slots: Arc<Semaphore>,
+    cleanup: Option<IsolatedCleanupGuard>,
 }
 
-/// Process-owned completion accounting for futures cancelled by a scheduler
-/// worker. A worker task can be aborted before its `OwnedPayload` cleanup has
-/// actually run; shutdown must wait for that real disposal receipt rather than
-/// publishing success when only the worker task has stopped.
-struct IsolatedCleanupTracker {
+/// Pool-owned accounting follows actual poll/disposal ownership, including a
+/// queued or executing blocking poll that outlives its cancelled worker task.
+#[derive(Default)]
+pub(super) struct IsolatedCleanupTracker {
     pending: AtomicUsize,
     changed: Notify,
 }
-static ISOLATED_CLEANUPS: OnceLock<Arc<IsolatedCleanupTracker>> = OnceLock::new();
+impl IsolatedCleanupTracker {
+    fn enter(self: &Arc<Self>) -> IsolatedCleanupGuard {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        IsolatedCleanupGuard(self.clone())
+    }
 
-fn isolated_cleanup_tracker() -> Arc<IsolatedCleanupTracker> {
-    ISOLATED_CLEANUPS
-        .get_or_init(|| {
-            Arc::new(IsolatedCleanupTracker {
-                pending: AtomicUsize::new(0),
-                changed: Notify::new(),
-            })
-        })
-        .clone()
-}
-
-pub(crate) async fn await_isolated_cleanups() {
-    let tracker = isolated_cleanup_tracker();
-    loop {
-        let changed = tracker.changed.notified();
-        tokio::pin!(changed);
-        changed.as_mut().enable();
-        if tracker.pending.load(Ordering::Acquire) == 0 {
-            return;
+    pub(super) async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
         }
-        changed.await;
     }
 }
 
@@ -752,11 +751,17 @@ impl<F> IsolatedFuture<F>
 where
     F: Future + Send + 'static,
 {
-    fn new(future: F, cleanup_slots: Arc<Semaphore>, runtime: tokio::runtime::Handle) -> Self {
+    fn new(
+        future: F,
+        cleanup_slots: Arc<Semaphore>,
+        runtime: tokio::runtime::Handle,
+        cleanups: Option<Arc<IsolatedCleanupTracker>>,
+    ) -> Self {
         Self {
             future: Some(Box::pin(future)),
             runtime,
             cleanup_slots,
+            cleanup: cleanups.map(|tracker| tracker.enter()),
         }
     }
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<F::Output> {
@@ -771,41 +776,29 @@ impl<F: Future + Send + 'static> Drop for IsolatedFuture<F> {
     fn drop(&mut self) {
         if let Some(future) = self.future.take() {
             // A cancelled future may be one of many actor-owned captures.
-            // Transfer it to the bounded cleanup owner and retain its receipt
-            // until the actual destructor has completed. Shared-pool shutdown
-            // waits on this same process-owned counter.
+            // Transfer the accounting guard with the value. Cancelling an
+            // async observer or its runtime cannot impersonate real disposal.
             let payload = crate::owned_payload::OwnedPayload::new(
-                CaughtDisposal(Some(future)),
+                CaughtDisposal {
+                    value: Some(future),
+                    _cleanup: self.cleanup.take(),
+                },
                 &self.runtime,
                 &self.cleanup_slots,
             );
-            let receipt = payload.retire();
-            let tracker = isolated_cleanup_tracker();
-            tracker.pending.fetch_add(1, Ordering::AcqRel);
-            let guard = IsolatedCleanupGuard(tracker);
-            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.runtime.spawn(async move {
-                    let _ = receipt.await;
-                    drop(guard);
-                })
-            }));
-            if dispatched.is_err() {
-                // A runtime that is already closing cannot execute the
-                // observer. Do not retain a false in-flight count forever;
-                // the original OwnedPayload still owns its cleanup receipt.
-                if let Err(payload) = dispatched {
-                    let _ = crate::owned_payload::panic_message(payload);
-                }
-            }
+            drop(payload);
         }
     }
 }
 
-struct CaughtDisposal<T>(Option<T>);
+struct CaughtDisposal<T> {
+    value: Option<T>,
+    _cleanup: Option<IsolatedCleanupGuard>,
+}
 impl<T> Drop for CaughtDisposal<T> {
     fn drop(&mut self) {
         if let Err(payload) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.0.take())))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.value.take())))
         {
             let _ = crate::owned_payload::panic_message(payload);
         }
@@ -847,7 +840,30 @@ where
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let mut future = IsolatedFuture::new(future, slots.clone(), retirement_runtime);
+    poll_isolated_with_cleanup(
+        future,
+        first_permit,
+        slots,
+        poll_finished,
+        retirement_runtime,
+        None,
+    )
+    .await
+}
+
+async fn poll_isolated_with_cleanup<F, T>(
+    future: F,
+    first_permit: OwnedSemaphorePermit,
+    slots: Arc<Semaphore>,
+    poll_finished: Arc<Notify>,
+    retirement_runtime: tokio::runtime::Handle,
+    cleanups: Option<Arc<IsolatedCleanupTracker>>,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut future = IsolatedFuture::new(future, slots.clone(), retirement_runtime, cleanups);
     let wake = Arc::new(PollWake(Notify::new()));
     let mut permit = Some(first_permit);
     loop {
@@ -1114,6 +1130,7 @@ mod tests {
                     future,
                     slots.clone(),
                     tokio::runtime::Handle::current(),
+                    None,
                 ));
             }
             tokio::task::yield_now().await;
@@ -1498,12 +1515,15 @@ mod recursive_contracts {
         let drops = Arc::new(AtomicUsize::new(0));
         let payload_drops = Arc::new(AtomicUsize::new(0));
         assert_no_unwind(catch_unwind(AssertUnwindSafe(|| {
-            drop(CaughtDisposal(Some(Work {
-                drops: drops.clone(),
-                payload_drops: payload_drops.clone(),
-                panic_poll: false,
-                panic_drop: true,
-            })));
+            drop(CaughtDisposal {
+                value: Some(Work {
+                    drops: drops.clone(),
+                    payload_drops: payload_drops.clone(),
+                    panic_poll: false,
+                    panic_drop: true,
+                }),
+                _cleanup: None,
+            });
         })));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(payload_drops.load(Ordering::SeqCst), 1);

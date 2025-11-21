@@ -206,7 +206,7 @@ async fn rejected_root_disposes_actor_and_config_even_when_both_panic() {
     assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
 }
 #[actix::test]
-async fn retired_context_disposes_all_three_panicking_inputs() {
+async fn retired_context_returns_original_panicking_inputs_without_disposal() {
     let sys = system().await;
     let (_, mut ctx) = create_parent(&sys).await;
     sys.shutdown().await.unwrap();
@@ -214,19 +214,47 @@ async fn retired_context_disposes_all_three_panicking_inputs() {
     let actor = <ActixContext<ActixActor<Instance>> as ActorSpawnContext<Instance>>::wrap_spawn(
         instance(&counts, None, true),
     );
+    let config: BoxedMessage = Box::new(config(&counts, None, true));
+    let actor_identity = actor.as_ref() as *const _ as *const ();
+    let config_identity = config.as_ref() as *const _ as *const ();
     let spawner = ctx.spawner();
     let result = std::panic::AssertUnwindSafe(spawner.spawn_with_strategy(
         actor,
-        Box::new(config(&counts, None, true)),
+        config,
         strategy(&counts, true),
     ))
     .catch_unwind()
     .await;
     assert!(
         result.is_ok(),
-        "retired-context rejection must contain every destructor panic"
+        "closed admission must not run input destructors"
     );
-    assert!(result.unwrap().is_err());
+    let error = match result.unwrap() {
+        Err(parrot_api::errors::ActorError::Other(error)) => error
+            .downcast::<parrot::actix::ChildInstanceAdmissionError>()
+            .expect("closed admission must preserve the recoverable inputs"),
+        _ => panic!("closed admission must return original inputs"),
+    };
+    assert_eq!(
+        error.reason,
+        parrot::actix::ChildInstanceAdmissionFailure::ShuttingDown
+    );
+    for count in [&counts.actor, &counts.config, &counts.policy] {
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+    let parrot::actix::ChildInstanceAdmissionInputs {
+        actor,
+        config,
+        strategy,
+    } = error.into_inputs();
+    assert_eq!(actor.as_ref() as *const _ as *const (), actor_identity);
+    assert_eq!(config.as_ref() as *const _ as *const (), config_identity);
+    assert!(strategy.is_some());
+    // Rejection returns ownership. Dispose each caller-owned input separately
+    // so intentionally hostile destructors cannot double-panic the test process.
+    for input in [actor, config, Box::new(strategy)] {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(input)));
+    }
     for count in [&counts.actor, &counts.config, &counts.policy] {
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }

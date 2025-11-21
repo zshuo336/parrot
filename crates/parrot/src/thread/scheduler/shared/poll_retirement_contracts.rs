@@ -283,3 +283,180 @@ contract!(
     true,
     true
 );
+
+fn independent_pools(burst: bool, last_owner: bool) {
+    let host = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(4)
+        .build()
+        .unwrap();
+    host.block_on(async {
+        let config = SharedThreadPoolConfig {
+            pool_size: 1,
+            burst_workers_max: usize::from(burst),
+            burst_backlog_threshold: Duration::ZERO,
+            idle_sleep_duration: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let owner = SharedThreadPool::new(Some(config), Handle::current());
+        let core = if burst {
+            let (release, drops, polled, _) = schedule(&owner, "/independent-core", true).await;
+            tokio::time::timeout(WAIT, polled).await.unwrap().unwrap();
+            Some((release, drops))
+        } else {
+            None
+        };
+        let (release, drops, polled, dropping) =
+            schedule(&owner, "/independent-future", false).await;
+        tokio::time::timeout(WAIT, polled).await.unwrap().unwrap();
+        if burst {
+            assert_eq!(owner.metrics().burst_workers_alive, 1);
+        }
+        let owner_status = owner.status.clone();
+        let owner = if last_owner {
+            drop(owner);
+            None
+        } else {
+            // Discard the first receipt while its actual cleanup is blocked.
+            drop(owner.ensure_shutdown(0));
+            Some(owner)
+        };
+        tokio::time::timeout(WAIT, dropping).await.unwrap().unwrap();
+        let unrelated = SharedThreadPool::new(
+            Some(SharedThreadPoolConfig {
+                pool_size: 1,
+                burst_workers_max: 0,
+                ..Default::default()
+            }),
+            Handle::current(),
+        );
+        let unrelated_result = tokio::time::timeout(WAIT, unrelated.shutdown(0)).await;
+        let held_status = owner_status.load(Ordering::Acquire);
+        let held_drops = drops.load(Ordering::SeqCst);
+        // Release every real actor before asserting, including on old code.
+        drop(release);
+        let core_drops = core.as_ref().map(|(_, drops)| drops.clone());
+        drop(core);
+        tokio::time::timeout(WAIT, async {
+            while drops.load(Ordering::SeqCst) != 1
+                || core_drops
+                    .as_ref()
+                    .is_some_and(|drops| drops.load(Ordering::SeqCst) != 1)
+                || owner_status.load(Ordering::Acquire) != SchedulerStatus::Shutdown as usize
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        unrelated.shutdown(0).await.unwrap();
+        if let Some(owner) = owner {
+            let terminal = owner.shutdown(0).await.map_err(|error| error.to_string());
+            let repeated = owner.shutdown(0).await.map_err(|error| error.to_string());
+            assert_eq!(terminal, repeated);
+        }
+        assert_eq!(held_drops, 0);
+        assert_eq!(held_status, SchedulerStatus::ShuttingDown as usize);
+        assert!(
+            unrelated_result.is_ok_and(|result| result.is_ok()),
+            "unrelated pool shutdown waited for another pool's actor disposal"
+        );
+    });
+}
+
+macro_rules! independence_contract {
+    ($name:ident, $burst:expr, $last:expr) => {
+        #[test]
+        fn $name() {
+            crate::test_support::isolated(
+                concat!(
+                    "thread::scheduler::shared::pool::poll_retirement_contracts::",
+                    stringify!($name)
+                ),
+                || independent_pools($burst, $last),
+            );
+        }
+    };
+}
+independence_contract!(core_shutdown_is_independent_of_other_pools, false, false);
+independence_contract!(core_last_owner_is_independent_of_other_pools, false, true);
+independence_contract!(burst_shutdown_is_independent_of_other_pools, true, false);
+independence_contract!(burst_last_owner_is_independent_of_other_pools, true, true);
+
+#[test]
+fn execution_host_exit_cannot_complete_a_blocked_cleanup() {
+    crate::test_support::isolated(
+        "thread::scheduler::shared::pool::poll_retirement_contracts::execution_host_exit_cannot_complete_a_blocked_cleanup",
+        || {
+            let host = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(4)
+                .enable_all()
+                .build()
+                .unwrap();
+            let retirement = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let pool = SharedThreadPool::new(
+                Some(SharedThreadPoolConfig {
+                    pool_size: 1,
+                    burst_workers_max: 0,
+                    idle_sleep_duration: Duration::from_millis(1),
+                    ..Default::default()
+                }),
+                host.handle().clone(),
+            );
+            retirement.block_on(async {
+                let (release, drops, polled, dropping) =
+                    schedule(&pool, "/exiting-host-future", false).await;
+                tokio::time::timeout(WAIT, polled).await.unwrap().unwrap();
+                let runtime = Handle::current();
+                let mut shutdown = Box::pin(pool.shutdown_on(0, &runtime));
+                assert!(futures::poll!(&mut shutdown).is_pending());
+                tokio::time::timeout(WAIT, dropping).await.unwrap().unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                        .await
+                        .is_err()
+                );
+                host.shutdown_background();
+                let early = tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+                    .await
+                    .ok();
+                let before = pool.status();
+                let before_drops = drops.load(Ordering::SeqCst);
+                drop(release);
+                let terminal = match early.as_ref() {
+                    Some(result) => result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    None => tokio::time::timeout(WAIT, &mut shutdown)
+                        .await
+                        .unwrap()
+                        .map_err(|error| error.to_string()),
+                };
+                tokio::time::timeout(WAIT, async {
+                    while drops.load(Ordering::SeqCst) != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let repeated = pool
+                    .shutdown_on(0, &runtime)
+                    .await
+                    .map_err(|error| error.to_string());
+                assert_eq!(terminal, repeated);
+                assert_eq!(before_drops, 0);
+                assert!(
+                    early.is_none(),
+                    "host cancellation replaced actual disposal completion"
+                );
+                assert_eq!(before, SchedulerStatus::ShuttingDown);
+                assert_eq!(pool.status(), SchedulerStatus::Shutdown);
+            });
+        },
+    );
+}

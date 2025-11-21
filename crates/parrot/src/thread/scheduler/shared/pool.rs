@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use super::worker::{Worker, WorkerConfig};
+use super::worker::{IsolatedCleanupTracker, Worker, WorkerConfig};
 use super::worker_manager::WorkerManager;
 use crate::thread::config::ThreadActorConfig;
 use crate::thread::error::SystemError;
@@ -243,6 +243,7 @@ pub struct ElasticController {
     workers: std::sync::Weak<std::sync::Mutex<Vec<JoinHandle<()>>>>,
     retirement: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     failures: Arc<Failures>,
+    cleanups: Arc<IsolatedCleanupTracker>,
 }
 
 impl ElasticController {
@@ -338,6 +339,7 @@ impl ElasticController {
                 yield_after_each_message: self.config.yield_after_each_message,
                 enable_detailed_logging: self.config.enable_detailed_logging,
             },
+            self.cleanups.clone(),
         );
         // Burst workers share the pool shutdown flag and are joined/aborted
         // with core workers. Idle retirement must not cancel suspended actors.
@@ -430,6 +432,7 @@ pub struct SharedThreadPool {
 
     shutdown_receipt: std::sync::Mutex<Option<Receipt>>,
     failures: Arc<Failures>,
+    cleanups: Arc<IsolatedCleanupTracker>,
     retirement: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     patrol: std::sync::Mutex<Option<JoinHandle<()>>>,
 
@@ -502,6 +505,7 @@ impl SharedThreadPool {
             scheduled_paths: Default::default(),
             shutdown_receipt: Default::default(),
             failures: Default::default(),
+            cleanups: Default::default(),
             retirement: Default::default(),
             patrol: Default::default(),
             burst_workers_alive: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -557,6 +561,7 @@ impl SharedThreadPool {
                 self.scheduling_queue.clone(),
                 self.is_shutting_down.clone(),
                 worker_config,
+                self.cleanups.clone(),
             );
 
             self.worker_manager.track_worker(worker.status());
@@ -762,6 +767,7 @@ impl SharedThreadPool {
         let registrations = self.scheduled_paths.clone();
         let failures = self.failures.clone();
         let status = self.status.clone();
+        let cleanups = self.cleanups.clone();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         drop(_gate);
         drop(receipt);
@@ -812,9 +818,9 @@ impl SharedThreadPool {
             }
             while closing.next().await.is_some() {}
             // Worker task joins do not imply that a cancelled user future's
-            // destructor has run. Wait for the tracked OwnedPayload receipt
-            // before publishing the pool's terminal shutdown state.
-            super::worker::await_isolated_cleanups().await;
+            // destructor has run. Wait for this pool's actual poll/disposal
+            // owners before publishing its terminal shutdown state.
+            cleanups.wait().await;
             status.store(SchedulerStatus::Shutdown as usize, Ordering::Release);
             sender.send_replace(Some(failures.result()));
         });
@@ -863,6 +869,7 @@ impl SharedThreadPool {
             workers: Arc::downgrade(&self.workers),
             retirement: self.retirement.clone(),
             failures: self.failures.clone(),
+            cleanups: self.cleanups.clone(),
         })
     }
 

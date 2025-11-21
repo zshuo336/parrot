@@ -279,12 +279,18 @@ fn check(case: u8) {
             .unwrap();
         observer.block_on(async {
             if let Err(error) = system.shutdown_internal().await {
-                // Deliberately exiting the original host cancels its scheduler
-                // driver. Preserve that existing error instead of calling it a
-                // successful shutdown or confusing it with input retirement.
+                // Host exit cancels the scheduler and the live typed parent.
+                // If its lifecycle observer has not removed the parent yet,
+                // shutdown must also preserve that parent's cancellation.
+                let scheduler = "1 shared cleanup failure(s): shared task unexpectedly cancelled";
+                let parent = format!(
+                    "2 shutdown failures: Failed during shutdown: {scheduler}; Actor creation failed: typed actor /parent execution failed without a disposal receipt: Err(JoinError::Cancelled(Id("
+                );
                 assert!(
                     matches!(error, crate::thread::error::SystemError::ShutdownError(ref text)
-                    if text == "1 shared cleanup failure(s): shared task unexpectedly cancelled"),
+                    if text == scheduler || (case >= 8 && text.strip_prefix(&parent)
+                        .and_then(|id| id.strip_suffix(")))"))
+                        .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0)))),
                     "{error}"
                 );
             }
