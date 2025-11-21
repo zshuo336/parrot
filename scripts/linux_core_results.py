@@ -18,7 +18,7 @@ STAGES = (
 )
 CONFIGURATIONS = ('debug-default', 'debug-legacy', 'release-default', 'release-legacy')
 BINARIES = {
-    'library': 1587,
+    'library': 1593,
     'test_broadcast_ownership': 23,
     'test_actix_local_creation_capacity': 3,
     'test_actix_root_creation_capacity': 6,

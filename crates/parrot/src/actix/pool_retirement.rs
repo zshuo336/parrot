@@ -23,6 +23,7 @@ fn helper_cleanup_slots() -> &'static Arc<Semaphore> {
 
 struct HelperJoin {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    reservations: Arc<Mutex<Vec<NativeWorkerReservation>>>,
     finished: watch::Sender<Option<Exit>>,
     scheduled: AtomicBool,
     changed: Condvar,
@@ -49,6 +50,9 @@ impl HelperJoin {
             .map_err(crate::owned_payload::panic_message)
             .and_then(|result| result.map_err(crate::owned_payload::panic_message))
             .map_err(|message| format!("Actix retirement thread failed: {message}"));
+        for reservation in self.reservations.lock().unwrap().drain(..) {
+            reservation.release_after_join();
+        }
         let _slot = self.thread.lock().unwrap();
         self.finished.send_replace(Some(result));
         self.changed.notify_all();
@@ -68,6 +72,38 @@ impl HelperJoin {
             }
         }
     }
+
+    fn dispatch_in_lifecycle(self: &Arc<Self>, runtime: &tokio::runtime::Handle) {
+        let context = parrot_api::trace::TraceContext::current();
+        self.dispatch(|job| {
+            let slots = helper_cleanup_slots().clone();
+            // Production pools retain at least one native worker reservation
+            // through this helper's OS join. That existing process budget also
+            // bounds these once-per-helper admission waiters.
+            runtime.spawn(async move {
+                // A synchronous takeover can finish without returning any
+                // pending quota. Its completed job must stop waiting here.
+                let pending = tokio::select! {
+                    biased;
+                    _ = wait(job.owner.finished.subscribe()) => return,
+                    pending = crate::owned_payload::pending_cleanup_permit(&slots) => pending,
+                };
+                let permit = tokio::select! {
+                    biased;
+                    _ = wait(job.owner.finished.subscribe()) => return,
+                    permit = slots.acquire_owned() => permit,
+                };
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _pending = pending;
+                    let _permit = permit;
+                    parrot_api::trace::in_scope(context, || {
+                        let _ = crate::owned_payload::retire_synchronously(job);
+                    });
+                })
+                .await;
+            });
+        });
+    }
 }
 
 async fn wait(mut receipt: watch::Receiver<Option<Exit>>) -> Exit {
@@ -85,7 +121,9 @@ async fn wait(mut receipt: watch::Receiver<Option<Exit>>) -> Exit {
 struct RetireWorkers {
     owners: Vec<actix::Arbiter>,
     finished: watch::Sender<Option<Exit>>,
-    reservations: Vec<NativeWorkerReservation>,
+    // Also retained by HelperJoin on successful startup. On startup failure
+    // this guard keeps every lease until all business workers have been joined.
+    _reservations: Arc<Mutex<Vec<NativeWorkerReservation>>>,
 }
 impl Drop for RetireWorkers {
     fn drop(&mut self) {
@@ -108,9 +146,6 @@ impl Drop for RetireWorkers {
                 "Actix worker failed during shutdown ({failures} worker joins): {message}"
             ))
         });
-        for reservation in self.reservations.drain(..) {
-            reservation.release_after_join();
-        }
         self.finished.send_replace(Some(result));
     }
 }
@@ -156,12 +191,13 @@ impl Retirement {
         spawn: impl FnOnce(Job) -> std::io::Result<std::thread::JoinHandle<()>>,
     ) -> Result<Self, SystemError> {
         let (finished, receipt) = watch::channel(None);
+        let reservations = Arc::new(Mutex::new(reservations));
         // Install rollback before dispatch: failed thread creation drops its
         // closure on the constructing thread, which is outside this worker set.
         let workers = RetireWorkers {
             owners,
             finished,
-            reservations,
+            _reservations: reservations.clone(),
         };
         let runtime = crate::root_cohort::lifecycle_runtime()?;
         let (signal, receive) = mpsc::channel();
@@ -180,6 +216,7 @@ impl Retirement {
                 finished: receipt,
                 helper: Arc::new(HelperJoin {
                     thread: Mutex::new(Some(thread)),
+                    reservations,
                     finished: watch::channel(None).0,
                     scheduled: AtomicBool::new(false),
                     changed: Condvar::new(),
@@ -210,19 +247,13 @@ impl Retirement {
     }
 
     pub(super) async fn join(&self) -> ActorResult<()> {
-        self.join_with(|job| {
-            // Dropping the guard schedules the actual OS join through the
-            // bounded cleanup owner. Cancellation of this waiter cannot lose
-            // the join because the guard owns it independently.
-            drop(crate::owned_payload::OwnedPayload::new(
-                job,
-                &self.runtime,
-                helper_cleanup_slots(),
-            ));
-        })
-        .await
+        let workers = wait(self.finished.clone()).await;
+        self.helper.dispatch_in_lifecycle(&self.runtime);
+        let helper = wait(self.helper.finished.subscribe()).await;
+        Self::combine(workers, helper)
     }
 
+    #[cfg(test)]
     async fn join_with(&self, dispatch: impl FnOnce(HelperJoinJob)) -> ActorResult<()> {
         let workers = wait(self.finished.clone()).await;
         // Never await the helper until its complete business-worker join pass
@@ -276,13 +307,7 @@ impl Drop for Retirement {
             // current runtime. Keep its helper handle until an independent join.
             self.runtime.spawn(async move {
                 let _ = wait(workers).await;
-                helper.dispatch(|job| {
-                    drop(crate::owned_payload::OwnedPayload::new(
-                        job,
-                        &runtime,
-                        helper_cleanup_slots(),
-                    ));
-                });
+                helper.dispatch_in_lifecycle(&runtime);
             });
         }
     }
@@ -295,3 +320,7 @@ mod contracts;
 #[cfg(test)]
 #[path = "pool_retirement/helper_contracts.rs"]
 mod helper_contracts;
+
+#[cfg(test)]
+#[path = "pool_retirement/saturation_contracts.rs"]
+mod saturation_contracts;

@@ -789,15 +789,8 @@ impl<A: Actor + Send + Sync + 'static> ActorSpawner for ThreadContext<A> {
         strategy: Option<SupervisorStrategyType>,
     ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
         let system = self.system();
-        let slots = system
-            .as_ref()
-            .map(|system| system.cleanup_slots.clone())
-            .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(1)));
-        let runtime = system
-            .as_ref()
-            .map_or(&self.runtime_handle, |system| system.retirement_runtime());
-        let factory = crate::owned_payload::OwnedPayload::new(factory, runtime, &slots);
-        let strategy = crate::owned_payload::OwnedPayload::new(strategy, runtime, &slots);
+        let factory = self.own_schedule_input(factory);
+        let strategy = self.own_schedule_input(strategy);
         Box::pin(async move {
             let error = if self.mailbox.is_none() || system.is_none() {
                 Some(ActorError::InitializationError(

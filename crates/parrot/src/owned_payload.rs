@@ -104,6 +104,8 @@ pub(crate) async fn pending_cleanup_permit(active: &Arc<Semaphore>) -> PendingCl
 }
 
 #[cfg(test)]
+mod expired_factory_contracts;
+#[cfg(test)]
 mod expired_system_contracts;
 #[cfg(test)]
 mod host_exit_contracts;

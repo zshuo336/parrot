@@ -458,3 +458,43 @@ async fn concurrent_synchronous_join_waits_for_the_in_flight_os_join() {
     assert_eq!(fixture.helper_exited.load(Ordering::SeqCst), 1);
     assert_eq!(retirement.owned_threads(1), 0);
 }
+
+#[test]
+fn saturated_cancelled_waiter_releases_completed_helper_after_synchronous_takeover() {
+    crate::test_support::isolated(
+        "actix::pool_retirement::helper_contracts::saturated_cancelled_waiter_releases_completed_helper_after_synchronous_takeover",
+        || {
+            actix::System::new().block_on(async {
+                let fixture = fixture();
+                let _release = Release(fixture.gate.clone());
+                fixture.retirement.request();
+                fixture.retirement.receipt().await.unwrap();
+                fixture.entered.recv_timeout(WAIT).unwrap();
+                let filler = Arc::new(Semaphore::new(8));
+                let permits: Vec<_> = (0..crate::owned_payload::MAX_PENDING_CLEANUPS_GLOBAL)
+                    .map(|_| crate::owned_payload::try_pending_cleanup_permit(&filler).unwrap())
+                    .collect();
+                let weak = Arc::downgrade(&fixture.retirement.helper);
+                let mut cancelled = Box::pin(fixture.retirement.join());
+                assert!(futures::poll!(&mut cancelled).is_pending());
+                drop(cancelled);
+                fixture.gate.release();
+                fixture.retirement.join_blocking().unwrap();
+                drop(fixture.retirement);
+                let reclaimed = tokio::time::timeout(WAIT, async {
+                    while weak.upgrade().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                // Return no capacity until after observing actual reclamation.
+                drop(permits);
+                assert!(
+                    reclaimed.is_ok(),
+                    "completed helper remained owned by a saturated admission waiter"
+                );
+                assert_eq!(fixture.helper_exited.load(Ordering::SeqCst), 1);
+            });
+        },
+    );
+}
