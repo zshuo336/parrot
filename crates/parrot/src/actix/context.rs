@@ -162,6 +162,7 @@ impl ManagedSpawner {
             let actor = actor.with_reservation(&permit);
             let config = config.with_reservation(&permit);
             let strategy = strategy.with_reservation(&permit);
+            let timer_system = system.clone();
             let creation = async move {
                 let (Some(scope), Some(parent)) = (&self.scope, &self.parent) else {
                     return reject_instance(actor, config, strategy, ActorError::Stopped).await;
@@ -308,7 +309,8 @@ impl ManagedSpawner {
                     }
                 }
             };
-            tokio::time::timeout_at(deadline, creation)
+            timer_system
+                .creation_timeout(deadline, creation)
                 .await
                 .unwrap_or_else(|_| {
                     Err(ActorError::TimeoutDetail(
@@ -328,6 +330,15 @@ async fn reject_factory_payload(
     factory.and(strategy)?;
     Err(error)
 }
+fn reject_child_factory(
+    reason: super::ChildInstanceAdmissionFailure,
+    factory: super::disposal::OwnedPayload<parrot_api::types::BoxedMessage>,
+    strategy: super::disposal::OwnedPayload<Option<parrot_api::supervisor::SupervisorStrategyType>>,
+) -> ActorError {
+    ActorError::Other(anyhow::Error::new(
+        super::typed::FactoryAdmissionError::new(reason, factory.take(), strategy.take()),
+    ))
+}
 impl ActorSpawner for ManagedSpawner {
     fn spawn_factory_erased<'a>(
         &'a self,
@@ -340,33 +351,88 @@ impl ActorSpawner for ManagedSpawner {
             let Some(service) = self.service.as_ref() else {
                 return reject_factory_payload(factory, strategy, ActorError::Stopped).await;
             };
+            let permit = match service.instance_admission.clone().try_acquire_owned() {
+                Ok(permit) => Arc::new(permit),
+                Err(error) => {
+                    let reason = match error {
+                        tokio::sync::TryAcquireError::NoPermits => {
+                            super::ChildInstanceAdmissionFailure::Full
+                        }
+                        tokio::sync::TryAcquireError::Closed => {
+                            super::ChildInstanceAdmissionFailure::ShuttingDown
+                        }
+                    };
+                    return Err(reject_child_factory(reason, factory, strategy));
+                }
+            };
             let system = match service.upgrade() {
                 Ok(system) => system,
-                Err(error) => return reject_factory_payload(factory, strategy, error).await,
+                Err(_) => {
+                    return Err(reject_child_factory(
+                        super::ChildInstanceAdmissionFailure::ShuttingDown,
+                        factory,
+                        strategy,
+                    ));
+                }
             };
-            let (Some(scope), Some(parent)) = (&self.scope, &self.parent) else {
-                return reject_factory_payload(factory, strategy, ActorError::Stopped).await;
-            };
-            if !factory.value().is::<super::factory::ErasedChildFactory>() {
-                return reject_factory_payload(
+            if system.registry.read().unwrap().shutting_down {
+                return Err(reject_child_factory(
+                    super::ChildInstanceAdmissionFailure::ShuttingDown,
                     factory,
                     strategy,
-                    ActorError::InitializationError("Actix factory payload type mismatch".into()),
-                )
-                .await;
+                ));
             }
-            let factory = factory
-                .take()
-                .downcast::<super::factory::ErasedChildFactory>()
-                .expect("validated Actix factory payload");
-            factory
-                .spawn(
-                    system,
-                    parent.as_ref().clone_boxed(),
-                    scope.clone(),
-                    strategy.take(),
+            let deadline = system.instance_creation_deadline();
+            let factory = factory.with_reservation(&permit);
+            let strategy = strategy.with_reservation(&permit);
+            let timer_system = system.clone();
+            let creation = async move {
+                let (Some(scope), Some(parent)) = (&self.scope, &self.parent) else {
+                    return reject_factory_payload(factory, strategy, ActorError::Stopped).await;
+                };
+                if !factory.value().is::<super::factory::ErasedChildFactory>() {
+                    return reject_factory_payload(
+                        factory,
+                        strategy,
+                        ActorError::InitializationError(
+                            "Actix factory payload type mismatch".into(),
+                        ),
+                    )
+                    .await;
+                }
+                let factory = factory
+                    .take()
+                    .downcast::<super::factory::ErasedChildFactory>()
+                    .expect("validated Actix factory payload");
+                let factory = super::disposal::OwnedPayload::new(
+                    factory,
+                    &service.runtime,
+                    &service.cleanup_slots,
                 )
+                .with_reservation(&permit);
+                let parent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    parent.as_ref().clone_boxed()
+                }))
+                .map_err(|panic| ActorError::Panic(crate::owned_payload::panic_message(panic)))?;
+                factory
+                    .take()
+                    .spawn(
+                        system,
+                        parent,
+                        scope.clone(),
+                        strategy.take(),
+                        super::system::Creation { permit, deadline },
+                    )
+                    .await
+            };
+            timer_system
+                .creation_timeout(deadline, creation)
                 .await
+                .unwrap_or_else(|_| {
+                    Err(ActorError::TimeoutDetail(
+                        "child factory creation exceeded creation deadline".into(),
+                    ))
+                })
         })
     }
 

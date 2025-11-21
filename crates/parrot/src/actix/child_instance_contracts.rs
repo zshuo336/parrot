@@ -615,6 +615,123 @@ async fn synchronous_parent_callback_cannot_publish_after_original_deadline() {
     system.clone().shutdown().await.unwrap();
 }
 
+fn factory_input(counts: &Arc<Counts>, gate: &Arc<Gate>) -> BoxedMessage {
+    let capture = PolicyCapture(gate.clone());
+    let counts = counts.clone();
+    <ActixContext<ActixActor<Probe>> as parrot_api::context::ActorFactoryContext<Probe>>::wrap_factory(move || {
+        let _ = &capture;
+        counts.validated.fetch_add(1, Ordering::SeqCst);
+        probe(&counts)
+    })
+}
+
+#[actix::test]
+async fn overloaded_child_factory_preserves_inputs_before_parent_callbacks() {
+    let (system, parent, mut spawner) = setup().await;
+    let parent_gate = Arc::new(Gate::default());
+    let release_parent = Release(vec![parent_gate.clone()]);
+    spawner.parent = Some(Arc::new(Box::new(Reference {
+        inner: Arc::from(parent.clone_boxed()),
+        gate: parent_gate.clone(),
+        is_clone: false,
+        path_delay: Duration::from_millis(200),
+    })));
+    let occupied = system
+        .instance_admission
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let counts = Arc::new(Counts::default());
+    let capture_gate = Arc::new(Gate::default());
+    capture_gate.release();
+    let factory = factory_input(&counts, &capture_gate);
+    let identity = factory.as_ref() as *const dyn Any as *const ();
+    let mut pending = spawner.spawn_factory_erased(factory, None);
+    let std::task::Poll::Ready(Err(ActorError::Other(error))) = futures::poll!(&mut pending) else {
+        panic!("overloaded child factory must return untouched inputs immediately")
+    };
+    let error = error
+        .downcast::<crate::actix::typed::FactoryAdmissionError<BoxedMessage>>()
+        .unwrap();
+    assert_eq!(error.reason, ChildInstanceAdmissionFailure::Full);
+    assert_eq!(counts.validated.load(Ordering::SeqCst), 0);
+    assert_eq!(capture_gate.disposed.load(Ordering::SeqCst), 0);
+    assert!(futures::poll!(Box::pin(parent_gate.entered.notified())).is_pending());
+    let inputs = error.into_inputs();
+    assert_eq!(
+        inputs.factory.as_ref() as *const dyn Any as *const (),
+        identity
+    );
+    drop(inputs);
+    drop(pending);
+    drop(occupied);
+    drop(release_parent);
+    assert_eq!(capture_gate.disposed.load(Ordering::SeqCst), 1);
+    assert_eq!(parent_gate.disposed.load(Ordering::SeqCst), 0);
+    parent.stop().await.unwrap();
+    system.clone().shutdown().await.unwrap();
+}
+
+#[actix::test]
+async fn rejected_child_factory_retains_parent_disposal_after_caller_cancels() {
+    let (system, parent, mut spawner) = setup().await;
+    let gate = Arc::new(Gate::default());
+    let release = Release(vec![gate.clone()]);
+    spawner.parent = Some(Arc::new(Box::new(Reference {
+        inner: Arc::from(parent.clone_boxed()),
+        gate: gate.clone(),
+        is_clone: false,
+        path_delay: Duration::ZERO,
+    })));
+    spawner.scope.as_ref().unwrap().close();
+    let counts = Arc::new(Counts::default());
+    let capture_gate = Arc::new(Gate::default());
+    capture_gate.release();
+    let mut pending = spawner.spawn_factory_erased(factory_input(&counts, &capture_gate), None);
+    assert!(futures::poll!(&mut pending).is_pending());
+    entered(&gate).await;
+    drop(pending);
+    assert_eq!(system.instance_admission.available_permits(), 0);
+    assert_eq!(counts.validated.load(Ordering::SeqCst), 0);
+    assert_eq!(system.status().active_actors, 1);
+    drop(release);
+    until(|| system.instance_admission.available_permits() == 1).await;
+    assert_eq!(gate.disposed.load(Ordering::SeqCst), 1);
+    assert_eq!(capture_gate.disposed.load(Ordering::SeqCst), 1);
+    parent.stop().await.unwrap();
+    system.clone().shutdown().await.unwrap();
+}
+
+#[actix::test]
+async fn slow_parent_callback_cannot_publish_dynamic_factory_after_original_deadline() {
+    let (mut system, parent, mut spawner) = setup().await;
+    system.operation_timeouts.actor_creation = Duration::from_millis(50);
+    spawner.service = Some(system.downgrade());
+    let gate = Arc::new(Gate::default());
+    gate.release();
+    spawner.parent = Some(Arc::new(Box::new(Reference {
+        inner: Arc::from(parent.clone_boxed()),
+        gate: gate.clone(),
+        is_clone: false,
+        path_delay: Duration::from_millis(200),
+    })));
+    let counts = Arc::new(Counts::default());
+    let capture_gate = Arc::new(Gate::default());
+    capture_gate.release();
+    let outcome = spawner
+        .spawn_factory_erased(factory_input(&counts, &capture_gate), None)
+        .await;
+    assert!(matches!(outcome, Err(ActorError::TimeoutDetail(_))));
+    until(|| system.instance_admission.available_permits() == 1).await;
+    assert_eq!(counts.validated.load(Ordering::SeqCst), 0);
+    assert_eq!(capture_gate.disposed.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.disposed.load(Ordering::SeqCst), 1);
+    assert_eq!(system.status().active_actors, 1);
+    parent.stop().await.unwrap();
+    system.clone().shutdown().await.unwrap();
+}
+
 struct ParentDuringInit {
     counts: Arc<Counts>,
     reply: Option<oneshot::Sender<ActorResult<BoxedActorRef>>>,

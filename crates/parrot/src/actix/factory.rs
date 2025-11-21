@@ -1,12 +1,14 @@
 //! Logical Actix factories own construction, generations and final retirement.
 #[cfg(test)]
+mod admission_contracts;
+#[cfg(test)]
 mod cancellation_contracts;
 use super::{
     actor::ActixActor,
     context::ActixContext,
     lifecycle::{ActorControl, ActorExit, Outcome},
     reference::ActixActorRef,
-    system::{ActixActorSystem, Registration, remove_registration},
+    system::{ActixActorSystem, Creation, Registration, remove_registration},
 };
 use crate::{
     children::ChildLifetime,
@@ -518,6 +520,9 @@ impl Drop for Ticket {
 impl ActixActorSystem {
     /// Create a root logical actor using the OneForOne policy of three restarts per 60 seconds.
     /// Construction is bounded and cancellation-safe; initialization is asynchronous.
+    /// Root requests wait for shared instance-creation capacity on first poll,
+    /// spending the same deadline on admission and construction. A returned
+    /// reference can still be initializing and retains capacity until init succeeds.
     /// Factory captures and explicit engine configuration/policy are owned at
     /// call time. Dropping an unpolled creation future retires inputs without
     /// invoking the constructor or registering an actor.
@@ -595,80 +600,123 @@ impl ActixActorSystem {
         let strategy =
             crate::owned_payload::OwnedPayload::new(strategy, &self.runtime, &self.cleanup_slots);
         parrot_api::trace::capture(async move {
-            let cohort = cohort.or_else(|| self.root_cohorts.guardian());
-            let strategy = if cohort.is_some() {
-                strategy.retire().await?;
-                crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots)
-            } else {
-                strategy
-            };
-            let factory = Factory::with_admission(
-                factory.take(),
-                self.constructor_slots.clone(),
-                self.cleanup_slots.clone(),
-                self.factory_admission.clone(),
-            );
-            let mut lifetime = ChildLifetime::with_policy(
-                Weak::new(),
-                strategy.take().map(SupervisorStrategyType::OneForOne),
-                self.cleanup_slots.clone(),
-            );
-            let admitted = if let Some(cohort) = cohort {
-                let mut ticket = None;
-                cohort
-                    .validate(&self.root_cohorts)
-                    .and_then(|()| {
-                        cohort.scope.spawn(|member| {
-                            lifetime = member.clone();
-                            let pending = self.start_factory(
-                                factory.clone(),
-                                None,
-                                member.clone(),
-                                path.map(str::to_owned),
-                            )?;
-                            let logical = pending.logical.clone();
-                            let reference = logical.reference();
-                            ticket = Some(pending);
-                            Ok((
-                                reference,
-                                Arc::new(move || {
-                                    logical
-                                        .control
-                                        .request_stop(Instant::now() + logical.control.timeout);
-                                    let member = member.clone();
-                                    Box::pin(async move { member.wait().await })
-                                }),
-                            ))
+            let deadline = self.instance_creation_deadline();
+            let creation = async move {
+                let permit = tokio::select! {
+                    biased;
+                    _ = self.creation_timer(deadline) => Err(ActorError::TimeoutDetail(
+                        "factory admission exceeded creation deadline".into(),
+                    )),
+                    permit = self.instance_admission.clone().acquire_owned() => {
+                        permit.map(Arc::new).map_err(|_| ActorError::Stopped)
+                    },
+                };
+                let permit = match permit {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        let (factory, strategy) = tokio::join!(factory.retire(), strategy.retire());
+                        factory.and(strategy)?;
+                        return Err(error);
+                    }
+                };
+                let factory = factory.with_reservation(&permit);
+                let strategy = strategy.with_reservation(&permit);
+                let cohort = cohort.or_else(|| self.root_cohorts.guardian());
+                let strategy = if cohort.is_some() {
+                    strategy.retire().await?;
+                    crate::owned_payload::OwnedPayload::new(
+                        None,
+                        &self.runtime,
+                        &self.cleanup_slots,
+                    )
+                } else {
+                    strategy
+                };
+                let factory = Factory::with_admission(
+                    factory.take(),
+                    self.constructor_slots.clone(),
+                    self.cleanup_slots.clone(),
+                    self.factory_admission.clone(),
+                );
+                factory.reserve_creation(&permit);
+                let mut lifetime = ChildLifetime::with_policy(
+                    Weak::new(),
+                    strategy.take().map(SupervisorStrategyType::OneForOne),
+                    self.cleanup_slots.clone(),
+                );
+                let admitted = if let Some(cohort) = cohort {
+                    let mut ticket = None;
+                    cohort
+                        .validate(&self.root_cohorts)
+                        .and_then(|()| {
+                            cohort.scope.spawn(|member| {
+                                lifetime = member.clone();
+                                let pending = self.start_factory(
+                                    factory.clone(),
+                                    None,
+                                    member.clone(),
+                                    path.map(str::to_owned),
+                                    Creation {
+                                        permit: permit.clone(),
+                                        deadline,
+                                    },
+                                )?;
+                                let logical = pending.logical.clone();
+                                let reference = logical.reference();
+                                ticket = Some(pending);
+                                Ok((
+                                    reference,
+                                    Arc::new(move || {
+                                        logical
+                                            .control
+                                            .request_stop(Instant::now() + logical.control.timeout);
+                                        let member = member.clone();
+                                        Box::pin(async move { member.wait().await })
+                                    }),
+                                ))
+                            })
                         })
-                    })
-                    .map(|()| ticket.expect("admitted root factory"))
-            } else {
-                self.start_factory(
-                    factory.clone(),
-                    None,
-                    lifetime.clone(),
-                    path.map(str::to_owned),
-                )
-            };
-            match admitted {
-                Ok(ticket) => ticket.wait().await,
-                Err(error) => {
-                    // Rejection owns arbitrary captures even when the caller cancels.
-                    self.root_cohorts
-                        .retirement_runtime()
-                        .spawn(parrot_api::trace::capture(async move {
-                            let policy = lifetime.dispose_policy().await;
-                            let factory = factory
-                                .retire_in_lifecycle()
-                                .await
-                                .map_err(ActorError::InternalError);
-                            factory.and(policy)
-                        }))
-                        .await
-                        .map_err(|error| ActorError::InternalError(error.to_string()))??;
-                    Err(error)
+                        .map(|()| ticket.expect("admitted root factory"))
+                } else {
+                    self.start_factory(
+                        factory.clone(),
+                        None,
+                        lifetime.clone(),
+                        path.map(str::to_owned),
+                        Creation {
+                            permit: permit.clone(),
+                            deadline,
+                        },
+                    )
+                };
+                match admitted {
+                    Ok(ticket) => ticket.wait().await,
+                    Err(error) => {
+                        // Rejection owns arbitrary captures even when the caller cancels.
+                        self.root_cohorts
+                            .retirement_runtime()
+                            .spawn(parrot_api::trace::capture(async move {
+                                let _permit = permit;
+                                let policy = lifetime.dispose_policy().await;
+                                let factory = factory
+                                    .retire_in_lifecycle()
+                                    .await
+                                    .map_err(ActorError::InternalError);
+                                factory.and(policy)
+                            }))
+                            .await
+                            .map_err(|error| ActorError::InternalError(error.to_string()))??;
+                        Err(error)
+                    }
                 }
-            }
+            };
+            self.creation_timeout(deadline, creation)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ActorError::TimeoutDetail(
+                        "Actix factory creation deadline elapsed".into(),
+                    ))
+                })
         })
     }
 
@@ -678,6 +726,7 @@ impl ActixActorSystem {
         parent: Option<BoxedActorRef>,
         lifetime: Arc<ChildLifetime>,
         path: Option<String>,
+        creation: Creation,
     ) -> ActorResult<Ticket>
     where
         A: Actor<Context = ActixContext<ActixActor<A>>>
@@ -685,6 +734,14 @@ impl ActixActorSystem {
             + Unpin
             + 'static,
     {
+        let parent =
+            crate::owned_payload::OwnedPayload::new(parent, &self.runtime, &self.cleanup_slots)
+                .with_reservation(&creation.permit);
+        if Instant::now() >= creation.deadline {
+            return Err(ActorError::TimeoutDetail(
+                "factory creation exceeded creation deadline".into(),
+            ));
+        }
         let (mut control, finished) = ActorControl::with_lifetime(
             self.settings.shutdown_timeout,
             self.settings.max_context_tasks,
@@ -692,9 +749,19 @@ impl ActixActorSystem {
             self.policy_slots.clone(),
         );
         ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
+        control.bound_initialization(Some(creation.deadline));
+        control.reserve_creation(creation.permit);
+        let source = Arc::downgrade(&factory);
+        Arc::get_mut(&mut control)
+            .expect("unpublished control")
+            .initialization_hook = Some(Arc::new(move || {
+            if let Some(source) = source.upgrade() {
+                source.release_creation();
+            }
+        }));
         let logical = Arc::new(Logical {
             path: path.unwrap_or_else(|| {
-                parent.as_ref().map_or_else(
+                parent.value().as_ref().map_or_else(
                     || {
                         format!(
                             "actix://{}/{}",
@@ -776,7 +843,12 @@ impl ActixActorSystem {
         let slots = self.policy_slots.clone();
         let notification_slots = self.notification_slots.clone();
         let owner = logical.clone();
-        let initial_deadline = Instant::now() + logical.control.creation_timeout;
+        let initial_deadline = creation.deadline;
+        let parent = crate::owned_payload::OwnedPayload::new(
+            parent.take(),
+            &self.runtime,
+            &self.cleanup_slots,
+        );
         let mut construction_context = parrot_api::trace::TraceContext::current();
         self.root_cohorts.retirement_runtime().spawn(async move {
             let _pool_owner = pool;
@@ -794,7 +866,7 @@ impl ActixActorSystem {
                         state.construction = Some(token.clone());
                         if owner.control.channel.is_sealed() { token.cancel(); }
                     }
-                    let next_parent = parent.as_ref().map(|parent| parent.clone_boxed());
+                    let next_parent = parent.value().as_ref().map(|parent| parent.clone_boxed());
                     let next_owner = owner.clone();
                     let next_system = weak_system.clone();
                     // Each construction consumes its own admission or failure identity.
@@ -819,7 +891,7 @@ impl ActixActorSystem {
                     };
                     if matches!(constructed, Err(ConstructionError::Cancelled | ConstructionError::Publication(ActorError::Stopped)))
                         && let Some(recovery) = owner.control.lifetime.recovery() {
-                        match group_generation(weak_system.clone(), &factory, owner.clone(), parent.as_ref().map(|p| p.clone_boxed()), recovery.clone()).await {
+                        match group_generation(weak_system.clone(), &factory, owner.clone(), parent.value().as_ref().map(|p| p.clone_boxed()), recovery.clone()).await {
                             Ok(generation) => { staged_generation = Some(generation); continue; },
                             Err(error) => {
                                 let cancelled = error.is_normal_stop(&owner.control, &recovery);
@@ -909,7 +981,7 @@ impl ActixActorSystem {
                     if owner.control.channel.is_sealed() { break (native_status, Some(native_reason.clone())); }
                     if let Some(recovery) = &policy.recovery {
                         deadline = recovery.deadline;
-                        match group_generation(weak_system.clone(), &factory, owner.clone(), parent.as_ref().map(|p| p.clone_boxed()), recovery.clone()).await {
+                        match group_generation(weak_system.clone(), &factory, owner.clone(), parent.value().as_ref().map(|p| p.clone_boxed()), recovery.clone()).await {
                             Ok(generation) => { staged_generation = Some(generation); continue; },
                             Err(error) => {
                                 let cancelled = error.is_normal_stop(&owner.control, recovery);
@@ -952,13 +1024,15 @@ impl ActixActorSystem {
                 owner.control.begin_cleanup(Instant::now() + owner.control.timeout);
                 let policy = owner.control.lifetime.dispose_policy().await;
                 let disposal = factory.retire_in_lifecycle().await;
-                if let Err(error) = disposal.map_err(ActorError::InternalError).and(policy) {
+                let parent = parent.retire().await;
+                if let Err(error) = disposal.map_err(ActorError::InternalError).and(policy).and(parent) {
                     let error = crate::error_receipt::ActorReceipt::from_error(error);
                     retirement = Err(error.clone());
                     status = Outcome::Failed(error);
                     reason = None;
                 }
                 remove_registration(&registry, &owner.path, &owner.control);
+                owner.control.release_creation();
                 let notification = owner.control.lifetime.finish(retirement);
                 (status, notification, reason)
             };
@@ -995,6 +1069,7 @@ trait ChildFactory: Send {
         parent: BoxedActorRef,
         scope: Arc<crate::children::ChildScope>,
         strategy: Option<SupervisorStrategyType>,
+        creation: Creation,
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>>;
 }
 pub(super) struct ErasedChildFactory(Box<dyn ChildFactory>);
@@ -1012,52 +1087,90 @@ where
         parent: BoxedActorRef,
         scope: Arc<crate::children::ChildScope>,
         strategy: Option<SupervisorStrategyType>,
+        creation: Creation,
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
+        let source =
+            crate::owned_payload::OwnedPayload::new(self, &system.runtime, &system.cleanup_slots)
+                .with_reservation(&creation.permit);
+        let parent =
+            crate::owned_payload::OwnedPayload::new(parent, &system.runtime, &system.cleanup_slots)
+                .with_reservation(&creation.permit);
+        let strategy = crate::owned_payload::OwnedPayload::new(
+            strategy,
+            &system.runtime,
+            &system.cleanup_slots,
+        )
+        .with_reservation(&creation.permit);
         Box::pin(async move {
             let factory = Factory::with_admission(
-                self.0,
+                source.take().0,
                 system.constructor_slots.clone(),
                 system.cleanup_slots.clone(),
                 system.factory_admission.clone(),
             );
+            factory.reserve_creation(&creation.permit);
+            let path = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                format!(
+                    "{}/{}",
+                    parent.value().path(),
+                    uuid::Uuid::new_v4().simple()
+                )
+            }))
+            .map_err(|panic| ActorError::Panic(crate::owned_payload::panic_message(panic)));
             let mut ticket = None;
             let mut strategy = Some(strategy);
+            let mut parent = Some(parent);
             let mut admitted_lifetime = None;
-            let admitted = scope.spawn(|lifetime| {
-                admitted_lifetime = Some(lifetime.clone());
-                lifetime.set_strategy(strategy.take().expect("one factory admission"));
-                let pending =
-                    system.start_factory(factory.clone(), Some(parent), lifetime.clone(), None)?;
-                let logical = pending.logical.clone();
-                let child = logical.reference();
-                let stop: crate::children::StopChild = Arc::new(move || {
-                    logical
-                        .control
-                        .request_stop(Instant::now() + logical.control.timeout);
-                    let lifetime = lifetime.clone();
-                    Box::pin(async move { lifetime.wait().await })
-                });
-                ticket = Some(pending);
-                Ok((child, stop))
+            let admitted = path.and_then(|path| {
+                scope.spawn(|lifetime| {
+                    admitted_lifetime = Some(lifetime.clone());
+                    lifetime.set_strategy(strategy.take().expect("one factory admission").take());
+                    let pending = system.start_factory(
+                        factory.clone(),
+                        Some(parent.take().expect("one parent admission").take()),
+                        lifetime.clone(),
+                        Some(path),
+                        Creation {
+                            permit: creation.permit.clone(),
+                            deadline: creation.deadline,
+                        },
+                    )?;
+                    let logical = pending.logical.clone();
+                    let child = logical.reference();
+                    let stop: crate::children::StopChild = Arc::new(move || {
+                        logical
+                            .control
+                            .request_stop(Instant::now() + logical.control.timeout);
+                        let lifetime = lifetime.clone();
+                        Box::pin(async move { lifetime.wait().await })
+                    });
+                    ticket = Some(pending);
+                    Ok((child, stop))
+                })
             });
             if let Err(error) = admitted {
-                let policy = crate::supervision_policy::PolicyStore::new(
-                    strategy.flatten(),
-                    system.cleanup_slots.clone(),
-                );
                 system
-                    .runtime
+                    .root_cohorts
+                    .retirement_runtime()
                     .spawn(async move {
+                        let _permit = creation.permit;
                         let lifetime = match admitted_lifetime {
                             Some(lifetime) => lifetime.dispose_policy().await,
                             None => Ok(()),
                         };
-                        let policy = policy.dispose().await;
+                        let policy = match strategy {
+                            Some(strategy) => strategy.retire().await,
+                            None => Ok(()),
+                        };
+                        let parent = match parent {
+                            Some(parent) => parent.retire().await,
+                            None => Ok(()),
+                        };
                         let factory = factory
                             .retire_in_lifecycle()
                             .await
                             .map_err(ActorError::InternalError);
-                        factory.and(policy).and(lifetime)
+                        factory.and(policy).and(lifetime).and(parent)
                     })
                     .await
                     .map_err(|error| ActorError::InternalError(error.to_string()))??;
@@ -1084,8 +1197,9 @@ impl ErasedChildFactory {
         parent: BoxedActorRef,
         scope: Arc<crate::children::ChildScope>,
         strategy: Option<SupervisorStrategyType>,
+        creation: Creation,
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-        self.0.spawn(system, parent, scope, strategy)
+        self.0.spawn(system, parent, scope, strategy, creation)
     }
 }
 

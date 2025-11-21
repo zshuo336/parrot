@@ -38,6 +38,8 @@ impl<A: ParrotTypedDispatch> std::fmt::Debug for TypedInstanceAdmissionError<A> 
 impl<A: ParrotTypedDispatch> std::error::Error for TypedInstanceAdmissionError<A> {}
 
 /// Original factory and strategy returned without invocation or registration.
+/// Dynamic Actix child factories use `F = BoxedMessage`; retry that unchanged
+/// wrapper with the parent's `ActorSpawner::spawn_factory_erased` method.
 pub struct FactoryAdmissionInputs<F> {
     pub factory: F,
     pub strategy: Option<SupervisorStrategyType>,
@@ -53,7 +55,7 @@ impl<F: Send + 'static> FactoryAdmissionError<F> {
             .into_inner()
             .unwrap_or_else(|error| error.into_inner())
     }
-    pub(super) fn new(
+    pub(in crate::actix) fn new(
         reason: ChildInstanceAdmissionFailure,
         factory: F,
         strategy: Option<SupervisorStrategyType>,

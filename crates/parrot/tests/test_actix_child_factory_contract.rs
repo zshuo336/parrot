@@ -318,7 +318,16 @@ impl Actor for Parent {
                     }));
                 }
                 let error = pending.next().await.unwrap().unwrap_err();
-                assert!(error.to_string().contains("child capacity exhausted"));
+                let parrot_api::errors::ActorError::Other(error) = error else {
+                    panic!("pending system creation capacity must return recoverable inputs")
+                };
+                let error = error
+                    .downcast::<parrot::actix::typed::FactoryAdmissionError<BoxedMessage>>()
+                    .unwrap();
+                assert_eq!(
+                    error.reason,
+                    parrot::actix::ChildInstanceAdmissionFailure::Full
+                );
                 request.ready.send(1024).unwrap();
                 request.cancel.notified().await;
                 drop(pending);
@@ -1261,7 +1270,7 @@ impl Drop for CaptureThread {
     }
 }
 #[actix::test]
-async fn retired_system_factory_rejection_keeps_capture_disposal_off_the_caller_executor() {
+async fn retired_system_factory_rejection_returns_caller_owned_capture_without_disposal() {
     let sys = ActixActorSystem::with_arbiter_count(1).await.unwrap();
     let counts = Arc::new(Counts::default());
     let parent = sys
@@ -1291,23 +1300,31 @@ async fn retired_system_factory_rejection_keeps_capture_disposal_off_the_caller_
             next()
         })
         .await;
-    assert!(matches!(
-        result,
-        Err(parrot_api::errors::ActorError::Stopped)
-    ));
+    let Err(parrot_api::errors::ActorError::Other(error)) = result else {
+        panic!("recoverable shutdown rejection expected")
+    };
+    let error = error
+        .downcast::<parrot::actix::typed::FactoryAdmissionError<BoxedMessage>>()
+        .unwrap();
+    assert_eq!(
+        error.reason,
+        parrot::actix::ChildInstanceAdmissionFailure::ShuttingDown
+    );
     assert_eq!(counts.made.load(Ordering::SeqCst), 0);
+    assert!(disposed_on.lock().unwrap().is_none());
+    drop(error.into_inputs());
     let disposed_on = disposed_on
         .lock()
         .unwrap()
         .expect("factory captures must be disposed before rejection receipt");
-    assert_ne!(
+    assert_eq!(
         disposed_on,
         std::thread::current().id(),
-        "rejected factory capture destructor ran on the caller's executor thread"
+        "explicit disposal of returned inputs belongs to the caller"
     );
 }
 #[actix::test]
-async fn retired_system_factory_rejection_contains_capture_destructor_panic() {
+async fn retired_system_factory_rejection_preserves_panicking_capture_for_explicit_disposal() {
     use futures::FutureExt;
     let sys = ActixActorSystem::with_arbiter_count(1).await.unwrap();
     let counts = Arc::new(Counts::default());
@@ -1336,15 +1353,25 @@ async fn retired_system_factory_rejection_contains_capture_destructor_panic() {
     }))
     .catch_unwind()
     .await;
-    assert!(
-        matches!(result, Ok(Err(_))),
-        "factory rejection leaked a capture destructor panic into its caller"
+    let Ok(Err(parrot_api::errors::ActorError::Other(error))) = result else {
+        panic!("recoverable shutdown rejection expected")
+    };
+    let error = error
+        .downcast::<parrot::actix::typed::FactoryAdmissionError<BoxedMessage>>()
+        .unwrap();
+    assert_eq!(
+        error.reason,
+        parrot::actix::ChildInstanceAdmissionFailure::ShuttingDown
     );
     assert_eq!(counts.made.load(Ordering::SeqCst), 0);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(error.into_inputs())))
+            .is_err()
+    );
 }
 
 #[actix::test]
-async fn retired_system_rejection_keeps_cleanup_owned_after_the_waiter_is_cancelled() {
+async fn retired_system_factory_inputs_remain_owned_after_waiter_disposal() {
     let sys = ActixActorSystem::with_arbiter_count(1).await.unwrap();
     let counts = Arc::new(Counts::default());
     let parent = sys
@@ -1383,21 +1410,32 @@ async fn retired_system_rejection_keeps_cleanup_owned_after_the_waiter_is_cancel
         dropped: dropped.clone(),
     };
     let next = factory(&counts, false);
-    {
+    let inputs = {
         let request = context.spawner().spawn_factory(move || {
             let _ = &captured;
             next()
         });
         tokio::pin!(request);
-        assert!(futures::poll!(&mut request).is_pending());
-        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
-            .await
+        let std::task::Poll::Ready(Err(parrot_api::errors::ActorError::Other(error))) =
+            futures::poll!(&mut request)
+        else {
+            panic!("recoverable shutdown rejection expected")
+        };
+        let error = error
+            .downcast::<parrot::actix::typed::FactoryAdmissionError<BoxedMessage>>()
             .unwrap();
-    }
+        assert_eq!(
+            error.reason,
+            parrot::actix::ChildInstanceAdmissionFailure::ShuttingDown
+        );
+        error.into_inputs()
+    };
     neighbor.send(Box::new(Children)).await.unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     assert_eq!(counts.made.load(Ordering::SeqCst), 0);
+    assert!(futures::poll!(Box::pin(gate.entered.notified())).is_pending());
     gate.release();
+    drop(inputs);
     tokio::time::timeout(Duration::from_secs(2), async {
         while dropped.load(Ordering::SeqCst) != 1 {
             tokio::task::yield_now().await;

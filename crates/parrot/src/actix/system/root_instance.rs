@@ -13,9 +13,9 @@ impl ActixActorSystem {
     /// releases the slot; failed or cancelled inputs retain it through disposal.
     /// Child requests reject with recoverable inputs when full instead of
     /// waiting on a slot that their parent's initialization may hold.
-    /// Static factories share this initial-creation budget; reconstruction has
-    /// its own system invocation budget. Local and dynamic factories still use
-    /// their existing budgets.
+    /// Static and dynamic factories share this initial-creation budget;
+    /// reconstruction has its own system invocation budget. Local actors still
+    /// use their existing budgets.
     pub const MAX_PENDING_INSTANCE_CREATIONS: usize = 1024;
 
     pub(in crate::actix) fn instance_creation_deadline(&self) -> Instant {
@@ -25,6 +25,22 @@ impl ActixActorSystem {
             self.operation_timeouts.actor_creation
         };
         Instant::now() + timeout
+    }
+
+    pub(in crate::actix) fn creation_timer(&self, deadline: Instant) -> tokio::time::Sleep {
+        // A creation waiter may resume on a different host after its original
+        // Tokio runtime exits. Its timer belongs to the retained lifecycle runtime.
+        let _runtime = self.runtime.enter();
+        tokio::time::sleep_until(deadline)
+    }
+
+    pub(in crate::actix) fn creation_timeout<F: std::future::Future>(
+        &self,
+        deadline: Instant,
+        work: F,
+    ) -> tokio::time::Timeout<F> {
+        let _runtime = self.runtime.enter();
+        tokio::time::timeout_at(deadline, work)
     }
 
     pub(super) fn spawn_root_instance<'a, A>(
@@ -51,7 +67,7 @@ impl ActixActorSystem {
             let creation = async move {
                 let permit = tokio::select! {
                     biased;
-                    _ = tokio::time::sleep_until(deadline) => Err(SystemError::ActorError(
+                    _ = self.creation_timer(deadline) => Err(SystemError::ActorError(
                         ActorError::TimeoutDetail("instance admission exceeded creation deadline".into()),
                     )),
                     permit = self.instance_admission.clone().acquire_owned() => {
@@ -193,7 +209,7 @@ impl ActixActorSystem {
                     .await
                     .map_err(SystemError::ActorError)
             };
-            tokio::time::timeout_at(deadline, creation)
+            self.creation_timeout(deadline, creation)
                 .await
                 .unwrap_or_else(|_| {
                     Err(SystemError::ActorError(ActorError::TimeoutDetail(

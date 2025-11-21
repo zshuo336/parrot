@@ -94,6 +94,7 @@ pub(crate) struct ActorControl {
     pub(crate) initialization_gate: Option<Completion>,
     pub(crate) group_activation: Option<Arc<crate::children::recovery::Recovery>>,
     pub(crate) upstream_stop: Option<Weak<ActorControl>>,
+    pub(super) initialization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(crate) stop_hook: OnceLock<Arc<dyn Fn(Instant) + Send + Sync>>,
     pub tasks: Arc<crate::context_tasks::ContextTasks>,
     pub children: Arc<crate::children::ChildScope>,
@@ -159,6 +160,14 @@ impl ActorControl {
     pub(crate) fn finish_initialization(&self) {
         self.initialization_deadline.lock().unwrap().take();
         self.release_creation();
+        if let Some(hook) = &self.initialization_hook {
+            hook();
+        }
+        // Physical factory generations complete their logical owner's first
+        // initialization too; construction alone does not release its slot.
+        if let Some(owner) = self.upstream_stop.as_ref().and_then(Weak::upgrade) {
+            owner.finish_initialization();
+        }
     }
     pub(super) fn reserve_creation(&self, permit: Arc<tokio::sync::OwnedSemaphorePermit>) {
         *self.creation_reservation.lock().unwrap() = Some(permit);
@@ -235,6 +244,7 @@ impl ActorControl {
                 initialization_gate: None,
                 group_activation: None,
                 upstream_stop: None,
+                initialization_hook: None,
                 stop_hook: OnceLock::new(),
                 tasks: crate::context_tasks::ContextTasks::new(limit),
                 deadline: Mutex::new(None),

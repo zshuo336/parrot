@@ -482,7 +482,7 @@ impl ActixActorSystem {
                     } else {
                         let admission = tokio::select! {
                             biased;
-                            _ = tokio::time::sleep_until(deadline) => Err(ActorError::TimeoutDetail("static creation admission exceeded original deadline".into())),
+                            _ = self.creation_timer(deadline) => Err(ActorError::TimeoutDetail("static creation admission exceeded original deadline".into())),
                             permit = self.instance_admission.clone().acquire_owned() => permit.map(Arc::new).map_err(|_| ActorError::Stopped),
                         };
                         match admission {
@@ -506,7 +506,7 @@ impl ActixActorSystem {
             )
             .await
         };
-        tokio::time::timeout_at(deadline, operation)
+        self.creation_timeout(deadline, operation)
             .await
             .unwrap_or_else(|_| {
                 Err(ActorError::TimeoutDetail(

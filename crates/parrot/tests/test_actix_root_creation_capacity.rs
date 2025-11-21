@@ -100,6 +100,60 @@ impl Actor for Probe {
 }
 
 #[actix::test]
+async fn production_dynamic_factory_cannot_bypass_initializing_root_capacity() {
+    let system = ActixActorSystem::with_settings(ActixSystemSettings {
+        arbiter_count: 2,
+        shutdown_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let counts = Arc::new(Counts::default());
+    let init = Arc::new(Semaphore::new(0));
+    let mut references = Vec::new();
+    for _ in 0..1024 {
+        references.push(
+            system
+                .spawn_root_typed(
+                    Probe {
+                        counts: counts.clone(),
+                        init: init.clone(),
+                    },
+                    Config(counts.clone()),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let next_counts = counts.clone();
+    let next_init = init.clone();
+    let mut pending = Box::pin(system.spawn_root_factory(move || Probe {
+        counts: next_counts.clone(),
+        init: next_init.clone(),
+    }));
+    let first_poll = futures::poll!(&mut pending);
+    let registered = system.status().active_actors;
+    init.add_permits(1025);
+    let last = match first_poll {
+        Poll::Ready(result) => result.unwrap(),
+        Poll::Pending => pending.await.unwrap(),
+    };
+    last.send(Box::new(())).await.unwrap();
+    references.push(last);
+    for actor in references {
+        actor.stop().await.unwrap();
+    }
+    system.clone().shutdown().await.unwrap();
+    assert_eq!(counts.actors.load(Ordering::SeqCst), 1025);
+    assert_eq!(counts.configs.load(Ordering::SeqCst), 1024);
+    assert_eq!(counts.initialized.load(Ordering::SeqCst), 1025);
+    assert_eq!(
+        registered, 1024,
+        "dynamic factory bypassed shared creation capacity"
+    );
+}
+
+#[actix::test]
 async fn production_root_limit_bounds_initializing_instances_before_publication() {
     let system = ActixActorSystem::with_settings(ActixSystemSettings {
         arbiter_count: 2,
