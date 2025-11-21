@@ -61,9 +61,18 @@ impl HelperJoin {
         };
         drop(slot);
         let result = Self::join_thread(thread, &self.reservations);
-        let _slot = self.thread.lock().unwrap();
-        self.finished.send_replace(Some(result));
-        self.changed.notify_all();
+        // Receipt wakers may synchronously reenter join. Publish outside the
+        // join lock, and notify blocking observers even if a waker panics.
+        let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.finished.send_replace(Some(result));
+        }));
+        {
+            let _slot = self.thread.lock().unwrap();
+            self.changed.notify_all();
+        }
+        if let Err(payload) = notified {
+            let _ = crate::owned_payload::panic_message(payload);
+        }
     }
     fn dispatch(self: &Arc<Self>, dispatch: impl FnOnce(HelperJoinJob)) {
         if !self.scheduled.swap(true, Ordering::AcqRel) {

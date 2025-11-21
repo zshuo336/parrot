@@ -375,6 +375,93 @@ fn orphaned_helper_owner_keeps_actual_join_and_native_lease() {
     reclaimed.release_after_join();
 }
 
+#[test]
+fn helper_completion_waker_can_reenter_synchronous_join() {
+    crate::test_support::isolated_with_timeout(
+        "actix::pool_retirement::helper_contracts::helper_completion_waker_can_reenter_synchronous_join",
+        WAIT,
+        || {
+            struct Reenter {
+                helper: Arc<HelperJoin>,
+                calls: AtomicUsize,
+            }
+            impl futures::task::ArcWake for Reenter {
+                fn wake_by_ref(this: &Arc<Self>) {
+                    this.helper.join_blocking();
+                    assert!(matches!(*this.helper.finished.borrow(), Some(Ok(()))));
+                    this.calls.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let fixture = actix::System::new().block_on(async { fixture() });
+            let _release = Release(fixture.gate.clone());
+            fixture.retirement.request();
+            futures::executor::block_on(fixture.retirement.receipt()).unwrap();
+            fixture.entered.recv_timeout(WAIT).unwrap();
+            let helper = fixture.retirement.helper.clone();
+            let reenter = Arc::new(Reenter {
+                helper: helper.clone(),
+                calls: AtomicUsize::new(0),
+            });
+            let waker = futures::task::waker(reenter.clone());
+            let mut context = std::task::Context::from_waker(&waker);
+            let mut receipt = Box::pin(wait(helper.finished.subscribe()));
+            assert!(receipt.as_mut().poll(&mut context).is_pending());
+            fixture.gate.release();
+            fixture.retirement.join_blocking().unwrap();
+            assert_eq!(reenter.calls.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                receipt.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert_eq!(fixture.helper_exited.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.retirement.owned_threads(1), 0);
+        },
+    );
+}
+
+#[test]
+fn helper_completion_waker_panic_preserves_join_receipt() {
+    crate::test_support::isolated_with_timeout(
+        "actix::pool_retirement::helper_contracts::helper_completion_waker_panic_preserves_join_receipt",
+        WAIT,
+        || {
+            struct WakePanic(AtomicUsize);
+            impl futures::task::ArcWake for WakePanic {
+                fn wake_by_ref(this: &Arc<Self>) {
+                    this.0.fetch_add(1, Ordering::SeqCst);
+                    panic!("helper completion wake failure");
+                }
+            }
+
+            let fixture = actix::System::new().block_on(async { fixture() });
+            let _release = Release(fixture.gate.clone());
+            fixture.retirement.request();
+            futures::executor::block_on(fixture.retirement.receipt()).unwrap();
+            fixture.entered.recv_timeout(WAIT).unwrap();
+            let wake = Arc::new(WakePanic(AtomicUsize::new(0)));
+            let waker = futures::task::waker(wake.clone());
+            let mut context = std::task::Context::from_waker(&waker);
+            let mut receipt = Box::pin(wait(fixture.retirement.helper.finished.subscribe()));
+            assert!(receipt.as_mut().poll(&mut context).is_pending());
+            fixture.gate.release();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fixture.retirement.join_blocking()
+            }));
+            assert!(result.is_ok(), "a receipt waker unwound the join owner");
+            result.unwrap().unwrap();
+            assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                receipt.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            fixture.retirement.join_blocking().unwrap();
+            assert_eq!(fixture.helper_exited.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.retirement.owned_threads(1), 0);
+        },
+    );
+}
+
 fn observer_wait(
     receipt: watch::Receiver<Option<Exit>>,
 ) -> Result<Exit, tokio::time::error::Elapsed> {
