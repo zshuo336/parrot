@@ -60,6 +60,16 @@ impl HelperJoin {
         result
     }
 
+    fn publish_finished(finished: &watch::Sender<Option<Exit>>, result: Exit) {
+        let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finished.send_replace(Some(result));
+        }));
+        if let Err(payload) = notified {
+            let message = crate::owned_payload::panic_message(payload);
+            tracing::warn!(error = %message, "Actix retirement receipt waker panicked");
+        }
+    }
+
     fn join_blocking(&self) {
         let mut slot = self.thread.lock().unwrap();
         let Some(thread) = slot.take() else {
@@ -72,15 +82,10 @@ impl HelperJoin {
         let result = Self::join_thread(thread, &self.reservations);
         // Receipt wakers may synchronously reenter join. Publish outside the
         // join lock, and notify blocking observers even if a waker panics.
-        let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.finished.send_replace(Some(result));
-        }));
+        Self::publish_finished(&self.finished, result);
         {
             let _slot = self.thread.lock().unwrap();
             self.changed.notify_all();
-        }
-        if let Err(payload) = notified {
-            let _ = crate::owned_payload::panic_message(payload);
         }
     }
     fn dispatch(self: &Arc<Self>, dispatch: impl FnOnce(HelperJoinJob)) {
@@ -146,7 +151,7 @@ impl HelperJoin {
             return;
         }
         let result = Self::join_thread(thread, &reservations);
-        finished.send_replace(Some(result));
+        Self::publish_finished(&finished, result);
     }
 }
 impl Drop for HelperJoin {
@@ -173,7 +178,7 @@ impl Drop for HelperJoin {
                         return;
                     };
                     let result = Self::join_thread(thread, &reservations);
-                    finished.send_replace(Some(result));
+                    Self::publish_finished(&finished, result);
                 })
         }));
         if !matches!(spawned, Ok(Ok(_))) {
