@@ -10,6 +10,10 @@ use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture};
 use std::sync::Arc;
 use std::sync::RwLock;
 
+#[cfg(test)]
+#[path = "child_instance_contracts.rs"]
+mod child_instance_contracts;
+
 #[derive(Clone, Default)]
 struct ManagedSpawner {
     service: Option<crate::actix::system::WeakSystem>,
@@ -24,6 +28,8 @@ trait SpawnPayload: Send {
         parent: BoxedActorRef,
         lifetime: Arc<crate::children::ChildLifetime>,
         config: parrot_api::types::BoxedMessage,
+        path: String,
+        creation: super::system::Creation,
     ) -> Result<super::system::InstanceTicket, super::disposal::RejectedSpawn>;
 }
 struct ErasedSpawn(Box<dyn SpawnPayload>);
@@ -45,12 +51,21 @@ where
         parent: BoxedActorRef,
         lifetime: Arc<crate::children::ChildLifetime>,
         config: parrot_api::types::BoxedMessage,
+        path: String,
+        creation: super::system::Creation,
     ) -> Result<super::system::InstanceTicket, super::disposal::RejectedSpawn> {
         // The private bridge validated this exact config before admission.
         let config = *config
             .downcast::<A::Config>()
             .expect("validated Actix child config");
-        system.spawn_managed(self.0, config, Some(parent), Some(lifetime))
+        system.spawn_managed_with_creation(
+            self.0,
+            config,
+            Some(parent),
+            Some(lifetime),
+            Some(path),
+            Some(creation),
+        )
     }
 }
 impl<A> parrot_api::context::ActorSpawnContext<A>
@@ -94,7 +109,8 @@ impl ManagedSpawner {
         let actor = self.own(actor);
         let config = self.own(config);
         let strategy = self.own(strategy);
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
+            use super::child_instance::{self, ChildInstanceAdmissionFailure};
             use super::disposal::OwnedPayload;
             let Some(service) = self.service.as_ref() else {
                 return reject_instance(
@@ -107,106 +123,199 @@ impl ManagedSpawner {
                 )
                 .await;
             };
-            let system = match service.upgrade() {
-                Ok(system) => system,
-                Err(error) => return reject_instance(actor, config, strategy, error).await,
-            };
-            let (Some(scope), Some(parent)) = (&self.scope, &self.parent) else {
-                return reject_instance(actor, config, strategy, ActorError::Stopped).await;
-            };
-            let payload = match actor.take().downcast::<ErasedSpawn>() {
-                Ok(payload) => OwnedPayload::new(payload, &service.runtime, &service.cleanup_slots),
-                Err(actor) => {
-                    return reject_instance(
-                        OwnedPayload::new(actor, &service.runtime, &service.cleanup_slots),
-                        config,
-                        strategy,
-                        ActorError::InitializationError("Actix spawn payload type mismatch".into()),
-                    )
-                    .await;
+            // A parent may still hold the last creation slot in its own init.
+            // Rejection returns the untouched inputs instead of waiting on it.
+            let permit = match service.instance_admission.clone().try_acquire_owned() {
+                Ok(permit) => Arc::new(permit),
+                Err(error) => {
+                    let reason = match error {
+                        tokio::sync::TryAcquireError::NoPermits => {
+                            ChildInstanceAdmissionFailure::Full
+                        }
+                        tokio::sync::TryAcquireError::Closed => {
+                            ChildInstanceAdmissionFailure::ShuttingDown
+                        }
+                    };
+                    return Err(child_instance::reject(reason, actor, config, strategy));
                 }
             };
-            if !payload.value().0.accepts_config(config.value()) {
-                let actor = OwnedPayload::new(
-                    payload.take() as parrot_api::types::BoxedMessage,
-                    &service.runtime,
-                    &service.cleanup_slots,
-                );
-                return reject_instance(
+            let system = match service.upgrade() {
+                Ok(system) => system,
+                Err(_) => {
+                    return Err(child_instance::reject(
+                        ChildInstanceAdmissionFailure::ShuttingDown,
+                        actor,
+                        config,
+                        strategy,
+                    ));
+                }
+            };
+            if system.registry.read().unwrap().shutting_down {
+                return Err(child_instance::reject(
+                    ChildInstanceAdmissionFailure::ShuttingDown,
                     actor,
                     config,
                     strategy,
-                    ActorError::InitializationError("child configuration type mismatch".into()),
-                )
-                .await;
+                ));
             }
-            let mut payload = Some(payload);
-            let mut config = Some(config);
-            let mut ticket = None;
-            let mut strategy = Some(strategy);
-            let mut rejected = None;
-            let mut lifetime_owner = None;
-            let result = scope.spawn(|lifetime| {
-                lifetime_owner = Some(lifetime.clone());
-                lifetime.set_strategy(strategy.take().expect("one instance admission").take());
-                let pending = match payload
-                    .take()
-                    .expect("one instance admission")
-                    .take()
-                    .0
-                    .spawn(
-                        &system,
-                        parent.as_ref().clone_boxed(),
-                        lifetime.clone(),
-                        config.take().expect("one config admission").take(),
-                    ) {
-                    Ok(created) => created,
-                    Err(failed) => {
-                        rejected = Some(failed.retired);
-                        return Err(match failed.error {
-                            parrot_api::system::SystemError::ShuttingDown => ActorError::Stopped,
-                            error => ActorError::InternalError(error.to_string()),
-                        });
+            let deadline = system.instance_creation_deadline();
+            let actor = actor.with_reservation(&permit);
+            let config = config.with_reservation(&permit);
+            let strategy = strategy.with_reservation(&permit);
+            let creation = async move {
+                let (Some(scope), Some(parent)) = (&self.scope, &self.parent) else {
+                    return reject_instance(actor, config, strategy, ActorError::Stopped).await;
+                };
+                let payload = match actor.take().downcast::<ErasedSpawn>() {
+                    Ok(payload) => {
+                        OwnedPayload::new(payload, &service.runtime, &service.cleanup_slots)
+                            .with_reservation(&permit)
+                    }
+                    Err(actor) => {
+                        return reject_instance(
+                            OwnedPayload::new(actor, &service.runtime, &service.cleanup_slots)
+                                .with_reservation(&permit),
+                            config,
+                            strategy,
+                            ActorError::InitializationError(
+                                "Actix spawn payload type mismatch".into(),
+                            ),
+                        )
+                        .await;
                     }
                 };
-                let child = pending.actor_ref.clone_boxed();
-                let control = pending.control.clone();
-                ticket = Some(pending);
-                let stop: crate::children::StopChild = Arc::new(move || {
-                    control.request_stop(tokio::time::Instant::now() + control.timeout);
-                    let lifetime = lifetime.clone();
-                    Box::pin(async move { lifetime.wait().await })
-                });
-                Ok((child, stop))
-            });
-            match result {
-                Ok(_) => ticket.expect("admitted instance has a ticket").wait().await,
-                Err(error) => {
-                    let mut cleanup: Vec<BoxedFuture<'static, ActorResult<()>>> = Vec::new();
-                    if let Some(payload) = payload {
-                        cleanup.push(payload.retire());
-                    }
-                    if let Some(strategy) = strategy {
-                        cleanup.push(strategy.retire());
-                    }
-                    if let Some(config) = config {
-                        cleanup.push(config.retire());
-                    }
-                    if let Some(rejected) = rejected {
-                        cleanup.push(rejected);
-                    }
-                    if let Some(lifetime) = lifetime_owner {
-                        cleanup.push(Box::pin(async move { lifetime.dispose_policy().await }));
-                    }
-                    let mut result = Ok(());
-                    for finished in futures::future::join_all(cleanup).await {
-                        result = result.and(finished);
-                    }
-                    result?;
-                    Err(error)
+                if !payload.value().0.accepts_config(config.value()) {
+                    let actor = OwnedPayload::new(
+                        payload.take() as parrot_api::types::BoxedMessage,
+                        &service.runtime,
+                        &service.cleanup_slots,
+                    )
+                    .with_reservation(&permit);
+                    return reject_instance(
+                        actor,
+                        config,
+                        strategy,
+                        ActorError::InitializationError("child configuration type mismatch".into()),
+                    )
+                    .await;
                 }
-            }
-        })
+                // Reference callbacks run before taking ChildScope's topology lock.
+                let parent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    parent.as_ref().clone_boxed()
+                }))
+                .map_err(|panic| ActorError::Panic(crate::owned_payload::panic_message(panic)))?;
+                let parent = OwnedPayload::new(parent, &service.runtime, &service.cleanup_slots)
+                    .with_reservation(&permit);
+                let path = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    format!(
+                        "{}/{}",
+                        parent.value().path(),
+                        uuid::Uuid::new_v4().simple()
+                    )
+                }))
+                .map_err(|panic| ActorError::Panic(crate::owned_payload::panic_message(panic)))?;
+                let mut parent = Some(parent);
+                let mut payload = Some(payload);
+                let mut config = Some(config);
+                let mut ticket = None;
+                let mut strategy = Some(strategy);
+                let mut rejected = None;
+                let mut lifetime_owner = None;
+                let result = scope.spawn(|lifetime| {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ActorError::TimeoutDetail(
+                            "child creation exceeded creation deadline".into(),
+                        ));
+                    }
+                    lifetime_owner = Some(lifetime.clone());
+                    lifetime.set_strategy(strategy.take().expect("one instance admission").take());
+                    let pending = match payload
+                        .take()
+                        .expect("one instance admission")
+                        .take()
+                        .0
+                        .spawn(
+                            &system,
+                            parent.take().expect("one parent admission").take(),
+                            lifetime.clone(),
+                            config.take().expect("one config admission").take(),
+                            path,
+                            super::system::Creation {
+                                permit: permit.clone(),
+                                deadline,
+                            },
+                        ) {
+                        Ok(created) => created,
+                        Err(failed) => {
+                            rejected = Some(failed.retired);
+                            return Err(match failed.error {
+                                parrot_api::system::SystemError::ShuttingDown => {
+                                    ActorError::Stopped
+                                }
+                                error => ActorError::InternalError(error.to_string()),
+                            });
+                        }
+                    };
+                    let child = pending.actor_ref.clone_boxed();
+                    let control = pending.control.clone();
+                    ticket = Some(pending);
+                    let stop: crate::children::StopChild = Arc::new(move || {
+                        control.request_stop(tokio::time::Instant::now() + control.timeout);
+                        let lifetime = lifetime.clone();
+                        Box::pin(async move { lifetime.wait().await })
+                    });
+                    Ok((child, stop))
+                });
+                match result {
+                    Ok(_) => ticket.expect("admitted instance has a ticket").wait().await,
+                    Err(error) => {
+                        return system
+                            .root_cohorts
+                            .retirement_runtime()
+                            .spawn(parrot_api::trace::capture(async move {
+                                let _permit = permit;
+                                let mut cleanup: Vec<BoxedFuture<'static, ActorResult<()>>> =
+                                    Vec::new();
+                                if let Some(payload) = payload {
+                                    cleanup.push(payload.retire());
+                                }
+                                if let Some(strategy) = strategy {
+                                    cleanup.push(strategy.retire());
+                                }
+                                if let Some(config) = config {
+                                    cleanup.push(config.retire());
+                                }
+                                if let Some(parent) = parent {
+                                    cleanup.push(parent.retire());
+                                }
+                                if let Some(rejected) = rejected {
+                                    cleanup.push(rejected);
+                                }
+                                if let Some(lifetime) = lifetime_owner {
+                                    cleanup.push(Box::pin(async move {
+                                        lifetime.dispose_policy().await
+                                    }));
+                                }
+                                let mut result = Ok(());
+                                for finished in futures::future::join_all(cleanup).await {
+                                    result = result.and(finished);
+                                }
+                                result?;
+                                Err(error)
+                            }))
+                            .await
+                            .map_err(|error| ActorError::InternalError(error.to_string()))?;
+                    }
+                }
+            };
+            tokio::time::timeout_at(deadline, creation)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ActorError::TimeoutDetail(
+                        "child creation exceeded creation deadline".into(),
+                    ))
+                })
+        }))
     }
 }
 

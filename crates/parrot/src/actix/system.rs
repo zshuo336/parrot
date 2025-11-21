@@ -29,6 +29,7 @@ mod shutdown;
 
 #[path = "system/root_instance.rs"]
 mod root_instance;
+pub(super) use root_instance::Creation;
 
 #[cfg(test)]
 #[path = "system/root_instance_contracts.rs"]
@@ -787,6 +788,7 @@ impl ActixActorSystem {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn spawn_managed<A>(
         &self,
         actor: A,
@@ -800,27 +802,10 @@ impl ActixActorSystem {
             + Unpin
             + 'static,
     {
-        self.spawn_managed_at(actor, config, parent, lifetime, None)
+        self.spawn_managed_with_creation(actor, config, parent, lifetime, None, None)
     }
 
-    fn spawn_managed_at<A>(
-        &self,
-        actor: A,
-        config: A::Config,
-        parent: Option<BoxedActorRef>,
-        lifetime: Option<Arc<crate::children::ChildLifetime>>,
-        path: Option<String>,
-    ) -> Result<InstanceTicket, RejectedSpawn>
-    where
-        A: ParrotActor<Context = ActixContext<ActixActor<A>>>
-            + parrot_api::actor::ActixEngineExt<Context = ActixContext<ActixActor<A>>>
-            + Unpin
-            + 'static,
-    {
-        self.spawn_managed_with_creation(actor, config, parent, lifetime, path, None)
-    }
-
-    fn spawn_managed_with_creation<A>(
+    pub(super) fn spawn_managed_with_creation<A>(
         &self,
         actor: A,
         config: A::Config,
@@ -837,9 +822,12 @@ impl ActixActorSystem {
     {
         let mut actor = OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots);
         let mut config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
+        let mut parent =
+            parent.map(|parent| OwnedPayload::new(parent, &self.runtime, &self.cleanup_slots));
         if let Some(creation) = &creation {
             actor = actor.with_reservation(&creation.permit);
             config = config.with_reservation(&creation.permit);
+            parent = parent.map(|parent| parent.with_reservation(&creation.permit));
         }
         if parent.is_none()
             && lifetime.is_none()
@@ -927,14 +915,21 @@ impl ActixActorSystem {
             None
         };
         if let Some(error) = rejection {
+            drop(registry);
             return Err(RejectedSpawn {
                 error,
                 retired: {
                     let actor = actor.retire();
                     let config = config.retire();
+                    let parent = parent.map(OwnedPayload::retire);
                     Box::pin(async move {
-                        let (actor, config) = tokio::join!(actor, config);
-                        actor.and(config)
+                        let (actor, config, parent) = tokio::join!(actor, config, async move {
+                            match parent {
+                                Some(parent) => parent.await,
+                                None => Ok(()),
+                            }
+                        });
+                        actor.and(config).and(parent)
                     })
                 },
             });
@@ -946,7 +941,7 @@ impl ActixActorSystem {
         let path = path.unwrap_or_else(|| {
             parent.as_ref().map_or_else(
                 || format!("actix://{name}/{}", Uuid::new_v4().simple()),
-                |parent| format!("{}/{}", parent.path(), Uuid::new_v4().simple()),
+                |parent| format!("{}/{}", parent.value().path(), Uuid::new_v4().simple()),
             )
         });
         let (mut control, finished) = ActorControl::with_lifetime(
@@ -976,7 +971,7 @@ impl ActixActorSystem {
             self.settings.mailbox_capacity,
             self.settings.ask_timeout,
         )
-        .with_spawn_service(self.downgrade(), parent);
+        .with_spawn_service(self.downgrade(), parent.map(OwnedPayload::take));
         let (sender, receiver) = actix::dev::channel::channel(self.settings.mailbox_capacity);
         let addr = actix::Addr::new(sender);
         let actor_ref =
@@ -1037,6 +1032,7 @@ impl ActixActorSystem {
                 });
             }
         }) {
+            drop(registry);
             return Err(RejectedSpawn {
                 error: SystemError::ActorError(ActorError::InternalError(
                     "Actix arbiter rejected actor execution".into(),

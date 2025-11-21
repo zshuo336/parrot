@@ -2,6 +2,7 @@
 use parrot::actix::{ActixActor, ActixActorSystem, ActixContext, ActixSystemSettings};
 use parrot_api::{
     actor::{ActixEngineExt, Actor, ActorConfig, ActorState},
+    context::{ActorContext, ActorSpawnerExt},
     types::{ActorResult, BoxedFuture, BoxedMessage},
 };
 use std::{
@@ -31,6 +32,7 @@ struct Probe {
     counts: Arc<Counts>,
     init: Arc<Semaphore>,
 }
+struct MakeChild(Arc<Counts>);
 impl Drop for Probe {
     fn drop(&mut self) {
         self.counts.actors.fetch_add(1, Ordering::SeqCst);
@@ -56,9 +58,26 @@ impl Actor for Probe {
     fn receive_message<'a>(
         &'a mut self,
         message: BoxedMessage,
-        _: &'a mut Self::Context,
+        ctx: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async move { Ok(message) })
+        Box::pin(async move {
+            match message.downcast::<MakeChild>() {
+                Ok(request) => {
+                    let result = ctx
+                        .spawner()
+                        .spawn_typed(
+                            Probe {
+                                counts: request.0.clone(),
+                                init: Arc::new(Semaphore::new(1)),
+                            },
+                            Config(request.0),
+                        )
+                        .await;
+                    Ok(Box::new(result) as BoxedMessage)
+                }
+                Err(message) => Ok(message),
+            }
+        })
     }
 }
 
@@ -122,6 +141,77 @@ async fn production_root_limit_bounds_initializing_instances_before_publication(
     assert_eq!(counts.actors.load(Ordering::SeqCst), 1025);
     assert_eq!(counts.configs.load(Ordering::SeqCst), 1025);
     assert_eq!(counts.initialized.load(Ordering::SeqCst), 1025);
+}
+
+#[actix::test]
+async fn production_child_cannot_bypass_exhausted_root_creation_capacity() {
+    use parrot_api::types::BoxedActorRef;
+    let system = ActixActorSystem::with_settings(ActixSystemSettings {
+        arbiter_count: 2,
+        shutdown_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let parent_counts = Arc::new(Counts::default());
+    let parent = system
+        .spawn_root_typed(
+            Probe {
+                counts: parent_counts.clone(),
+                init: Arc::new(Semaphore::new(1)),
+            },
+            Config(parent_counts),
+        )
+        .await
+        .unwrap();
+    parent.send(Box::new(())).await.unwrap();
+    let counts = Arc::new(Counts::default());
+    let init = Arc::new(Semaphore::new(0));
+    let mut roots = Vec::new();
+    for _ in 0..1024 {
+        roots.push(
+            system
+                .spawn_root_typed(
+                    Probe {
+                        counts: counts.clone(),
+                        init: init.clone(),
+                    },
+                    Config(counts.clone()),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let child_counts = Arc::new(Counts::default());
+    let result = *parent
+        .send(Box::new(MakeChild(child_counts.clone())))
+        .await
+        .unwrap()
+        .downcast::<ActorResult<BoxedActorRef>>()
+        .unwrap();
+    let rejected = result.is_err();
+    let registered = system.status().active_actors;
+    init.add_permits(1024);
+    match result {
+        Ok(child) => child.stop().await.unwrap(),
+        Err(error) => drop(error),
+    }
+    for actor in roots {
+        actor.stop().await.unwrap();
+    }
+    parent.stop().await.unwrap();
+    system.clone().shutdown().await.unwrap();
+    assert_eq!(
+        registered, 1025,
+        "child published despite exhausted shared creation capacity"
+    );
+    assert!(
+        rejected,
+        "overloaded child request did not return its inputs"
+    );
+    assert_eq!(child_counts.initialized.load(Ordering::SeqCst), 0);
+    assert_eq!(child_counts.actors.load(Ordering::SeqCst), 1);
+    assert_eq!(child_counts.configs.load(Ordering::SeqCst), 1);
 }
 
 #[derive(Default)]

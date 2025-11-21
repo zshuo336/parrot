@@ -5,6 +5,7 @@
 
 pub mod actor;
 mod cancellation_executor;
+mod child_instance;
 mod cohort;
 pub mod context;
 mod disposal;
@@ -26,6 +27,9 @@ pub mod types;
 
 pub use actor::ActixActor;
 pub use actor::{ActorBase, IntoActorBase};
+pub use child_instance::{
+    ChildInstanceAdmissionError, ChildInstanceAdmissionFailure, ChildInstanceAdmissionInputs,
+};
 pub use context::ActixContext;
 pub use message::*;
 pub use reference::ActixActorRef;

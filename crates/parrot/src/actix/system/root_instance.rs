@@ -2,17 +2,28 @@
 use super::*;
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
-pub(super) struct Creation {
+pub(in crate::actix) struct Creation {
     pub permit: Arc<OwnedSemaphorePermit>,
     pub deadline: Instant,
 }
 
 impl ActixActorSystem {
-    /// Maximum admitted dynamic root instance creations, shared by clones and
+    /// Maximum admitted dynamic root and child creations, shared by clones and
     /// weak-system upgrades. Admission starts on first poll. Successful init
     /// releases the slot; failed or cancelled inputs retain it through disposal.
-    /// Static, Local, child and factory creation use their existing budgets.
+    /// Child requests reject with recoverable inputs when full instead of
+    /// waiting on a slot that their parent's initialization may hold.
+    /// Static, Local and factory creation use their existing budgets.
     pub const MAX_PENDING_INSTANCE_CREATIONS: usize = 1024;
+
+    pub(in crate::actix) fn instance_creation_deadline(&self) -> Instant {
+        let timeout = if self.operation_timeouts.actor_creation.is_zero() {
+            self.settings.shutdown_timeout
+        } else {
+            self.operation_timeouts.actor_creation
+        };
+        Instant::now() + timeout
+    }
 
     pub(super) fn spawn_root_instance<'a, A>(
         &'a self,
@@ -32,12 +43,7 @@ impl ActixActorSystem {
         let config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
         let strategy = OwnedPayload::new(strategy, &self.runtime, &self.cleanup_slots);
         parrot_api::trace::capture(async move {
-            let timeout = if self.operation_timeouts.actor_creation.is_zero() {
-                self.settings.shutdown_timeout
-            } else {
-                self.operation_timeouts.actor_creation
-            };
-            let deadline = Instant::now() + timeout;
+            let deadline = self.instance_creation_deadline();
             // Cleanup receipts can wait on user destructors. The public request
             // spends one deadline while their independent owners finish retirement.
             let creation = async move {
