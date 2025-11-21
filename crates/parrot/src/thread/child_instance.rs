@@ -486,9 +486,9 @@ impl ThreadActorSystem {
                                 SystemError::Other(anyhow::Error::new(error.clone().into_error()))
                             }),
                         );
-                        pending.retired.send_replace(Some(outcome.clone()));
+                        crate::owned_payload::publish_watch(&pending.retired, outcome.clone());
                         if pending.finished.borrow().is_none() {
-                            pending.finished.send_replace(Some(outcome));
+                            crate::owned_payload::publish_watch(&pending.finished, outcome);
                         }
                         return retirement.map_err(CreationError::Cause).and(result);
                     }
@@ -509,15 +509,18 @@ impl ThreadActorSystem {
                                     .receipt()
                                     .into_error(),
                             ))));
-                        pending.retired.send_replace(Some(outcome.clone()));
+                        crate::owned_payload::publish_watch(&pending.retired, outcome.clone());
                         if pending.finished.borrow().is_none() {
-                            pending.finished.send_replace(Some(outcome));
+                            crate::owned_payload::publish_watch(&pending.finished, outcome);
                         }
                         return result;
                     }
                     if result.is_ok() {
-                        pending.finished.send_replace(Some(StopOutcome::Stopped));
-                        pending.retired.send_replace(Some(StopOutcome::Stopped));
+                        crate::owned_payload::publish_watch(
+                            &pending.finished,
+                            StopOutcome::Stopped,
+                        );
+                        crate::owned_payload::publish_watch(&pending.retired, StopOutcome::Stopped);
                         return result;
                     }
                     pending.watches.close();
@@ -544,9 +547,9 @@ impl ThreadActorSystem {
                     let outcome = StopOutcome::from_result(retirement.map_err(|error| {
                         SystemError::Other(anyhow::Error::new(error.into_error()))
                     }));
-                    pending.retired.send_replace(Some(outcome.clone()));
+                    crate::owned_payload::publish_watch(&pending.retired, outcome.clone());
                     if pending.finished.borrow().is_none() {
-                        pending.finished.send_replace(Some(outcome));
+                        crate::owned_payload::publish_watch(&pending.finished, outcome);
                     }
                     child_notification = Some(notification);
                     result
@@ -558,7 +561,7 @@ impl ThreadActorSystem {
                     _ = tokio::time::sleep_until(deadline) => {
                         pending.control.cancel();
                         let error = "child instance creation exceeded deadline".to_string();
-                        pending.finished.send_replace(Some(StopOutcome::TimedOut(error.clone())));
+                        crate::owned_payload::publish_watch(&pending.finished, StopOutcome::TimedOut(error.clone()));
                         if let Some(send) = send.take() { let _ = send.send(Err(CreationError::Timeout(error))); }
                         work.await
                     }
