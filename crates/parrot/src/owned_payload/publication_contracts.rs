@@ -188,11 +188,10 @@ fn direct_watch_publication_waker_panic_preserves_terminal_value() {
             let waker = futures::task::waker(wake.clone());
             let mut pending = Box::pin(async move {
                 let mut receiver = receiver;
-                receiver
+                *receiver
                     .wait_for(|value| value.is_some())
                     .await
                     .expect("watch receipt should remain open")
-                    .clone()
             });
             assert!(
                 pending
