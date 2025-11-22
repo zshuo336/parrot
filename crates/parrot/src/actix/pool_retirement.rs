@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 type Exit = Result<(), String>;
 type Job = Box<dyn FnOnce() + Send>;
@@ -21,12 +21,20 @@ fn helper_cleanup_slots() -> &'static Arc<Semaphore> {
     SLOTS.get_or_init(|| Arc::new(Semaphore::new(HELPER_CLEANUP_SLOTS)))
 }
 
+#[derive(Default)]
+struct HelperCleanup {
+    closed: bool,
+    pending: Option<crate::owned_payload::PendingCleanupPermit>,
+    active: Option<OwnedSemaphorePermit>,
+}
+
 struct HelperJoin {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     reservations: Arc<Mutex<Vec<NativeWorkerReservation>>>,
     finished: watch::Sender<Option<Exit>>,
     scheduled: AtomicBool,
     changed: Condvar,
+    cleanup: Mutex<HelperCleanup>,
 }
 type FallbackOwner = Arc<
     Mutex<
@@ -46,6 +54,36 @@ impl Drop for HelperJoinJob {
     }
 }
 impl HelperJoin {
+    fn retain_pending(&self, pending: crate::owned_payload::PendingCleanupPermit) {
+        let mut cleanup = self.cleanup.lock().unwrap();
+        if cleanup.closed {
+            drop(cleanup);
+            drop(pending);
+        } else {
+            cleanup.pending = Some(pending);
+        }
+    }
+
+    fn retain_active(&self, permit: OwnedSemaphorePermit) {
+        let mut cleanup = self.cleanup.lock().unwrap();
+        if cleanup.closed {
+            drop(cleanup);
+            drop(permit);
+        } else {
+            cleanup.active = Some(permit);
+        }
+    }
+
+    fn release_cleanup(&self) {
+        let (active, pending) = {
+            let mut cleanup = self.cleanup.lock().unwrap();
+            cleanup.closed = true;
+            (cleanup.active.take(), cleanup.pending.take())
+        };
+        drop(active);
+        drop(pending);
+    }
+
     fn join_thread(
         thread: std::thread::JoinHandle<()>,
         reservations: &Arc<Mutex<Vec<NativeWorkerReservation>>>,
@@ -80,6 +118,9 @@ impl HelperJoin {
         };
         drop(slot);
         let result = Self::join_thread(thread, &self.reservations);
+        // Quotas belong to the shared OS join, including synchronous takeover
+        // while the original asynchronous job is still waiting for a worker.
+        self.release_cleanup();
         // Receipt wakers may synchronously reenter join. Publish outside the
         // join lock, and notify blocking observers even if a waker panics.
         Self::publish_finished(&self.finished, result);
@@ -119,14 +160,16 @@ impl HelperJoin {
                     _ = wait(job.owner.finished.subscribe()) => return,
                     pending = crate::owned_payload::pending_cleanup_permit(&slots) => pending,
                 };
+                job.owner.retain_pending(pending);
                 let permit = tokio::select! {
                     biased;
                     _ = wait(job.owner.finished.subscribe()) => return,
                     permit = slots.acquire_owned() => permit,
                 };
+                if let Ok(permit) = permit {
+                    job.owner.retain_active(permit);
+                }
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _pending = pending;
-                    let _permit = permit;
                     parrot_api::trace::in_scope(context, || {
                         let _ = crate::owned_payload::retire_synchronously(job);
                     });
@@ -301,6 +344,7 @@ impl Retirement {
                     finished: watch::channel(None).0,
                     scheduled: AtomicBool::new(false),
                     changed: Condvar::new(),
+                    cleanup: Mutex::default(),
                 }),
             }),
             Err(message) => {

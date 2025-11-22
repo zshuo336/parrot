@@ -2,7 +2,7 @@
 use super::{ConstructionControl, ConstructionError, Factory, Invocation, panic_message};
 use parrot_api::types::BoxedFuture;
 use std::sync::Arc;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 const MAX_LIFECYCLE_DISCARD_WAITERS: usize = 1024;
 
@@ -74,11 +74,17 @@ impl<A> Drop for OutputLease<A> {
 struct Discard<A> {
     output: OutputLease<A>,
     finished: watch::Sender<Option<Result<(), String>>>,
-    _pending: Option<crate::owned_payload::PendingCleanupPermit>,
+    pending: Option<crate::owned_payload::PendingCleanupPermit>,
+    active: Option<OwnedSemaphorePermit>,
+    waiter: Option<OwnedSemaphorePermit>,
 }
 impl<A> Drop for Discard<A> {
     fn drop(&mut self) {
-        crate::owned_payload::publish_watch(&self.finished, self.output.retire());
+        let result = self.output.retire();
+        drop(self.active.take());
+        drop(self.pending.take());
+        drop(self.waiter.take());
+        crate::owned_payload::publish_watch(&self.finished, result);
     }
 }
 
@@ -109,20 +115,21 @@ impl<A: Send + 'static> Prepared<A> {
         let mut owner = Discard {
             output: OutputLease::new(actor, invocation, self.context.clone()),
             finished,
-            _pending: None,
+            pending: None,
+            active: None,
+            waiter: None,
         };
         if crate::owned_payload::DisposalScope::active() {
             drop(owner);
         } else if let Some(pending) =
             crate::owned_payload::try_pending_cleanup_permit(&self.cleanup)
         {
-            owner._pending = Some(pending);
+            owner.pending = Some(pending);
             self.runtime.spawn(async move {
                 // Normal retirement remains bounded. If the host cancels this task,
                 // the same owner isolates destructors and reports actual disposal.
-                let permit = cleanup.acquire_owned().await;
+                owner.active = cleanup.acquire_owned().await.ok();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
                     drop(owner);
                 })
                 .await;
@@ -153,18 +160,19 @@ impl<A: Send + 'static> Prepared<A> {
         let mut owner = Discard {
             output: OutputLease::new(actor, invocation, self.context.clone()),
             finished,
-            _pending: None,
+            pending: None,
+            active: None,
+            waiter: None,
         };
         if crate::owned_payload::DisposalScope::active() {
             drop(owner);
             return wait_receipt(receipt);
         }
         if let Some(pending) = crate::owned_payload::try_pending_cleanup_permit(&cleanup) {
-            owner._pending = Some(pending);
+            owner.pending = Some(pending);
             runtime.spawn(async move {
-                let permit = cleanup.acquire_owned().await;
+                owner.active = cleanup.acquire_owned().await.ok();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
                     drop(owner);
                 })
                 .await;
@@ -177,13 +185,12 @@ impl<A: Send + 'static> Prepared<A> {
             drop(owner);
             return wait_receipt(receipt);
         };
+        owner.waiter = Some(waiter);
         runtime.spawn(async move {
             let pending = crate::owned_payload::pending_cleanup_permit(&cleanup).await;
-            owner._pending = Some(pending);
-            let permit = cleanup.acquire_owned().await;
+            owner.pending = Some(pending);
+            owner.active = cleanup.acquire_owned().await.ok();
             let _ = tokio::task::spawn_blocking(move || {
-                let _waiter = waiter;
-                let _permit = permit;
                 drop(owner);
             })
             .await;

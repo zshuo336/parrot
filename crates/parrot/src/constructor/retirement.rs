@@ -4,6 +4,8 @@ use super::*;
 #[cfg(test)]
 mod pending_contracts;
 #[cfg(test)]
+mod receipt_contracts;
+#[cfg(test)]
 mod saturation_contracts;
 
 type Finished = watch::Sender<Option<Result<(), String>>>;
@@ -27,7 +29,7 @@ struct CaptureDisposal<A> {
     failure: Option<String>,
     finished: Option<Finished>,
     cleanup: Option<Arc<OwnedSemaphorePermit>>,
-    _pending: Option<crate::owned_payload::PendingCleanupPermit>,
+    pending: Option<crate::owned_payload::PendingCleanupPermit>,
     creation_reservation: Option<Arc<OwnedSemaphorePermit>>,
 }
 impl<A> CaptureDisposal<A> {
@@ -42,7 +44,7 @@ impl<A> CaptureDisposal<A> {
             failure: state.retirement_failure.clone(),
             finished,
             cleanup,
-            _pending: state.retirement_pending.take(),
+            pending: state.retirement_pending.take(),
             creation_reservation: state.creation_reservation.take(),
         }
     }
@@ -62,10 +64,12 @@ impl<A> CaptureDisposal<A> {
             // successful capture retirement or a later capture failure.
             let result = self.failure.take().map_or(captures, Err);
             drop(self.creation_reservation.take());
+            // Completion wakers may immediately reuse these same quotas.
+            drop(self.cleanup.take());
+            drop(self.pending.take());
             if let Some(finished) = self.finished.take() {
                 publish_finished(&finished, result.clone());
             }
-            drop(self.cleanup.take());
             result
         })
     }
@@ -83,7 +87,7 @@ impl<A> Drop for FactoryState<A> {
             failure: self.retirement_failure.take(),
             finished: self.fallback.take(),
             cleanup: None,
-            _pending: self.retirement_pending.take(),
+            pending: self.retirement_pending.take(),
             creation_reservation: self.creation_reservation.take(),
         });
     }
@@ -117,7 +121,7 @@ impl<A: Send + 'static> Retirement<A> {
         // The last invocation inherits this quota if the host cancels us.
         self.state.lock().unwrap().retirement_pending = Some(pending);
         runtime.spawn(async move {
-            let captures = loop {
+            let mut captures = loop {
                 let notified = changed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
@@ -126,9 +130,8 @@ impl<A: Send + 'static> Retirement<A> {
                 }
                 notified.await;
             };
-            let permit = slots.acquire_owned().await;
+            captures.cleanup = slots.acquire_owned().await.ok().map(Arc::new);
             let _ = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
                 drop(captures);
             })
             .await

@@ -362,6 +362,7 @@ fn orphaned_helper_owner_keeps_actual_join_and_native_lease() {
         finished,
         scheduled: AtomicBool::new(false),
         changed: Condvar::new(),
+        cleanup: Mutex::default(),
     });
 
     drop(helper);
@@ -417,6 +418,108 @@ fn helper_completion_waker_can_reenter_synchronous_join() {
             assert_eq!(fixture.helper_exited.load(Ordering::SeqCst), 1);
             assert_eq!(fixture.retirement.owned_threads(1), 0);
         },
+    );
+}
+
+fn check_completion_quota(takeover: bool) {
+    struct Observe {
+        exited: Arc<AtomicUsize>,
+        snapshots: mpsc::Sender<(bool, usize, usize)>,
+    }
+    impl futures::task::ArcWake for Observe {
+        fn wake_by_ref(this: &Arc<Self>) {
+            let pending = crate::owned_payload::try_pending_cleanup_permit(helper_cleanup_slots());
+            let _ = this.snapshots.send((
+                pending.is_some(),
+                helper_cleanup_slots().available_permits(),
+                this.exited.load(Ordering::SeqCst),
+            ));
+        }
+    }
+    let fixture = actix::System::new().block_on(async { fixture() });
+    let release = Release(fixture.gate.clone());
+    fixture.retirement.request();
+    futures::executor::block_on(fixture.retirement.receipt()).unwrap();
+    fixture.entered.recv_timeout(WAIT).unwrap();
+    let filler = Arc::new(Semaphore::new(8));
+    let fillers: Vec<_> = (0..crate::owned_payload::MAX_PENDING_CLEANUPS_GLOBAL - 1)
+        .map(|_| crate::owned_payload::try_pending_cleanup_permit(&filler).unwrap())
+        .collect();
+    let active: Vec<_> = (0..if takeover { HELPER_CLEANUP_SLOTS } else { 0 })
+        .map(|_| helper_cleanup_slots().clone().try_acquire_owned().unwrap())
+        .collect();
+    let (snapshots, observed) = mpsc::channel();
+    let observer = Arc::new(Observe {
+        exited: fixture.helper_exited.clone(),
+        snapshots,
+    });
+    let waker = futures::task::waker(observer);
+    let mut receipt = Box::pin(wait(fixture.retirement.helper.finished.subscribe()));
+    assert!(
+        receipt
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    fixture
+        .retirement
+        .helper
+        .dispatch_in_lifecycle(&fixture.retirement.runtime);
+    let synchronous = takeover.then(|| {
+        let deadline = std::time::Instant::now() + WAIT;
+        while crate::owned_payload::try_pending_cleanup_permit(helper_cleanup_slots()).is_some()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            crate::owned_payload::try_pending_cleanup_permit(helper_cleanup_slots()).is_none(),
+            "the queued asynchronous owner must hold the final pending quota"
+        );
+        let helper = fixture.retirement.helper.clone();
+        std::thread::spawn(move || helper.join_blocking())
+    });
+    let deadline = std::time::Instant::now() + WAIT;
+    while fixture.retirement.helper.thread.lock().unwrap().is_some()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let claimed = fixture.retirement.helper.thread.lock().unwrap().is_none();
+    let incomplete = fixture.retirement.helper.finished.borrow().is_none();
+    drop(release);
+    let snapshot = observed.recv_timeout(WAIT);
+    futures::executor::block_on(receipt).unwrap();
+    fixture.retirement.join_blocking().unwrap();
+    if let Some(synchronous) = synchronous {
+        synchronous.join().unwrap();
+    }
+    drop(active);
+    drop(fillers);
+    assert!(
+        claimed && incomplete,
+        "join must claim the real helper and wait for TLS exit"
+    );
+    assert_eq!(
+        snapshot.unwrap(),
+        (true, if takeover { 0 } else { HELPER_CLEANUP_SLOTS }, 1),
+        "helper completion waker must be able to reuse its pending and active cleanup quotas"
+    );
+}
+
+#[test]
+fn helper_completion_waker_can_reuse_its_global_cleanup_quota() {
+    crate::test_support::isolated(
+        "actix::pool_retirement::helper_contracts::helper_completion_waker_can_reuse_its_global_cleanup_quota",
+        || check_completion_quota(false),
+    );
+}
+
+#[test]
+fn helper_takeover_waker_can_reuse_admitted_quota_while_original_owner_waits() {
+    crate::test_support::isolated(
+        "actix::pool_retirement::helper_contracts::helper_takeover_waker_can_reuse_admitted_quota_while_original_owner_waits",
+        || check_completion_quota(true),
     );
 }
 
