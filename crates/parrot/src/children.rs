@@ -45,10 +45,12 @@ impl<T> ChildInput<T> {
 impl<T> Drop for ChildInput<T> {
     fn drop(&mut self) {
         if let Err(error) = crate::owned_payload::PublicationInput::new(self.0.take()).retire() {
-            tracing::error!(
-                error = %crate::error_receipt::actor_summary(&error),
-                "child ownership input disposal failed"
-            );
+            crate::owned_payload::cleanup_diagnostic(|| {
+                tracing::error!(
+                    error = %crate::error_receipt::actor_summary(&error),
+                    "child ownership input disposal failed"
+                );
+            });
         }
     }
 }

@@ -1,6 +1,8 @@
 use super::*;
 use std::{any::Any, panic::AssertUnwindSafe, sync::atomic::AtomicUsize};
 
+mod diagnostic_contracts;
+
 #[derive(Default)]
 struct Counts {
     references: AtomicUsize,
