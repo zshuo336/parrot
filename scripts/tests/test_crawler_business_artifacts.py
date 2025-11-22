@@ -35,7 +35,7 @@ class BuildReceipts(unittest.TestCase):
         (self.root / 'apps/crawler-lab/wasm/Cargo.lock').write_text('locked wasm graph\n')
         self.target = self.root / 'target'
         self.commands = []
-        self.fail = None
+        self.fail_command = None
         self.change_during_build = False
         self.runner = patch.object(business, 'run', side_effect=self.run_tool)
         self.runner.start()
@@ -57,7 +57,7 @@ class BuildReceipts(unittest.TestCase):
 
     def run_tool(self, command, root, environment, capture=False):
         self.commands.append(command)
-        if self.fail and self.fail(command):
+        if self.fail_command and self.fail_command(command):
             raise subprocess.CalledProcessError(23, command)
         if '--version' in command:
             return subprocess.CompletedProcess(command, 0, stdout='fixture tool 1\n')
@@ -150,7 +150,7 @@ class BuildReceipts(unittest.TestCase):
 
     def test_failed_native_build_invalidates_previous_success(self):
         artifacts = self.build()
-        self.fail = lambda cmd: 'build' in cmd and 'crawler-lab-dylib' in cmd
+        self.fail_command = lambda cmd: 'build' in cmd and 'crawler-lab-dylib' in cmd
         with self.assertRaises(subprocess.CalledProcessError): self.build()
         self.assertFalse((self.root / business.RECEIPT).exists())
         self.assertTrue(Path(artifacts['dylib']['path']).is_file())
@@ -159,9 +159,9 @@ class BuildReceipts(unittest.TestCase):
     def test_failed_metadata_and_component_validation_cannot_leave_a_receipt(self):
         for stage in ['metadata', 'validate']:
             with self.subTest(stage=stage):
-                self.fail = None
+                self.fail_command = None
                 self.build()
-                self.fail = lambda cmd: stage in cmd
+                self.fail_command = lambda cmd: stage in cmd
                 with self.assertRaises(subprocess.CalledProcessError): self.build()
                 with self.assertRaises(business.ArtifactError): self.verify()
 
@@ -226,6 +226,32 @@ class BuildReceipts(unittest.TestCase):
         encoded = business.native_environment({'CARGO_ENCODED_RUSTFLAGS': '--cfg\x1foriginal'})
         self.assertEqual(encoded['CARGO_ENCODED_RUSTFLAGS'],
                          '--cfg\x1foriginal\x1f-C\x1fprefer-dynamic')
+
+    def test_empty_encoded_flags_take_precedence_and_still_require_dynamic_std(self):
+        environment = {'RUSTFLAGS': '--cfg ignored', 'CARGO_ENCODED_RUSTFLAGS': ''}
+        actual = business.native_environment(environment)
+        self.assertEqual(actual['CARGO_ENCODED_RUSTFLAGS'], '-C\x1fprefer-dynamic')
+        self.assertEqual(environment['CARGO_ENCODED_RUSTFLAGS'], '')
+        self.assertEqual(actual['RUSTFLAGS'], '--cfg ignored')
+
+    def test_later_static_std_preference_cannot_disable_unload_safety(self):
+        for key, separator in [('RUSTFLAGS', ' '), ('CARGO_ENCODED_RUSTFLAGS', '\x1f')]:
+            for disabling in ['-C prefer-dynamic=no', '-Cprefer-dynamic=no']:
+                with self.subTest(key=key, disabling=disabling):
+                    supplied = separator.join(['-C', 'prefer-dynamic'] + disabling.split())
+                    actual = business.native_environment({key: supplied})
+                    self.assertEqual(actual[key], supplied + separator + '-C' + separator + 'prefer-dynamic')
+                    self.assertEqual(business.native_environment(actual), actual)
+
+    def test_encoded_flags_keep_arguments_with_spaces_and_ignore_ordinary_flags(self):
+        environment = {
+            'RUSTFLAGS': '--cfg ignored',
+            'CARGO_ENCODED_RUSTFLAGS': '-C\x1flink-arg=/path with spaces/lib',
+        }
+        actual = business.native_environment(environment)
+        self.assertEqual(actual['CARGO_ENCODED_RUSTFLAGS'].split('\x1f'),
+                         ['-C', 'link-arg=/path with spaces/lib', '-C', 'prefer-dynamic'])
+        self.assertEqual(actual['RUSTFLAGS'], environment['RUSTFLAGS'])
 
     def test_corrupt_partial_and_incomplete_receipts_are_rejected(self):
         for replacement in ['{', '{}', '{"schema":1}']:

@@ -159,16 +159,15 @@ def native_environment(environment):
     """
     result = dict(environment)
     encoded = result.get('CARGO_ENCODED_RUSTFLAGS')
-    if encoded:
-        parts = encoded.split('\x1f')
-        if list(NATIVE_UNLOAD_RUST_FLAG) not in [parts[index:index + 2]
-                                                  for index in range(len(parts) - 1)]:
+    # Empty encoded flags still override RUSTFLAGS; the last codegen option wins.
+    if encoded is not None:
+        parts = encoded.split('\x1f') if encoded else []
+        if parts[-2:] != list(NATIVE_UNLOAD_RUST_FLAG):
             parts.extend(NATIVE_UNLOAD_RUST_FLAG)
         result['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(parts)
         return result
     flags = result.get('RUSTFLAGS', '').split()
-    if list(NATIVE_UNLOAD_RUST_FLAG) not in [flags[index:index + 2]
-                                             for index in range(len(flags) - 1)]:
+    if flags[-2:] != list(NATIVE_UNLOAD_RUST_FLAG):
         flags.extend(NATIVE_UNLOAD_RUST_FLAG)
     result['RUSTFLAGS'] = ' '.join(flags)
     return result

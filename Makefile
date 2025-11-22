@@ -428,6 +428,7 @@ check-business-artifacts: ## 校验业务构建回执、输入变化和失败重
 check-make: ## 验证真实 recipe／递归 make 的失败传播（无需外部网关）
 	python3 scripts/tests/test_make_contracts.py -v
 	python3 scripts/tests/test_cpp_make_contracts.py -v
+	python3 scripts/tests/test_run_tests.py -v
 
 .PHONY: check-implementation-contracts
 check-implementation-contracts: ## Check DEV task accounting; this does not certify implementation acceptance

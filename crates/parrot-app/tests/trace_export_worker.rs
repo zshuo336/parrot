@@ -717,26 +717,21 @@ mod native_recording {
     use sha2::{Digest, Sha256};
     use std::{path::PathBuf, sync::OnceLock};
 
+    mod fixture_build {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../parrot-abi/tests/common/build.rs"
+        ));
+    }
+
     fn fixture() -> &'static PathBuf {
         static PATH: OnceLock<PathBuf> = OnceLock::new();
         PATH.get_or_init(|| {
             let root =
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../parrot-abi/tests/fixtures");
-            let rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-            let rustflags = if rustflags
-                .split_whitespace()
-                .any(|flag| flag == "prefer-dynamic")
-            {
-                rustflags
-            } else if rustflags.is_empty() {
-                "-C prefer-dynamic".to_owned()
-            } else {
-                format!("{rustflags} -C prefer-dynamic")
-            };
-            let output = std::process::Command::new("cargo")
+            let output = fixture_build::cargo()
                 .args(["build", "--release", "--locked", "--target-dir"])
                 .arg(root.join("target"))
-                .env("RUSTFLAGS", rustflags)
                 .current_dir(&root)
                 .output()
                 .unwrap();
