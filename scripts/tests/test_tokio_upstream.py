@@ -86,6 +86,43 @@ class RuntimeGateTests(unittest.TestCase):
                 with self.subTest(fault=fault), self.assertRaises(ValueError):
                     GATE.build_artifacts(text, 'consumer', ['sync_mpsc'], ROOT, target, 'debug')
 
+    def test_minimal_notification_suite_requires_its_real_test_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory).resolve()
+            name = 'parrot_notification_fanout'
+            binary = target / 'debug/deps' / name
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b'explicit synthetic artifact-selection fixture; never executed')
+            artifact = dict(reason='compiler-artifact', package_id='minimal-consumer', executable=str(binary),
+                            target=dict(name=name, src_path=str(ROOT / 'vendor/tokio/tests' / (name + '.rs')),
+                                        kind=['test']), profile=dict(test=True))
+            result = GATE.build_artifacts(json.dumps(artifact), 'minimal-consumer', [name], ROOT,
+                                          target, 'debug', minimal=True)
+            self.assertEqual(result, {name: binary})
+            for fault in ['source', 'kind', 'profile']:
+                changed = copy.deepcopy(artifact)
+                if fault == 'source':
+                    changed['target']['src_path'] = str(ROOT / 'scripts/fixtures/tokio-minimal/src/main.rs')
+                elif fault == 'kind':
+                    changed['target']['kind'] = ['bin']
+                else:
+                    changed['profile']['test'] = False
+                with self.subTest(fault=fault), self.assertRaises(ValueError):
+                    GATE.build_artifacts(json.dumps(changed), 'minimal-consumer', [name], ROOT,
+                                         target, 'debug', minimal=True)
+            companion = target / 'debug' / GATE.MINIMAL
+            companion.write_bytes(b'explicit synthetic companion binary; never executed')
+            main = dict(reason='compiler-artifact', package_id='minimal-consumer', executable=str(companion),
+                        target=dict(name=GATE.MINIMAL, src_path=str(ROOT / 'scripts/fixtures/tokio-minimal/src/main.rs'),
+                                    kind=['bin']), profile=dict(test=False))
+            text = json.dumps(artifact) + '\n' + json.dumps(main)
+            result = GATE.build_artifacts(text, 'minimal-consumer', [name, GATE.MINIMAL], ROOT,
+                                          target, 'debug', minimal=True)
+            self.assertEqual(result, {name: binary, GATE.MINIMAL: companion})
+            with self.assertRaises(ValueError):
+                GATE.build_artifacts(json.dumps(artifact), 'minimal-consumer', [name, GATE.MINIMAL], ROOT,
+                                     target, 'debug', minimal=True)
+
 
 if __name__ == '__main__':
     unittest.main()

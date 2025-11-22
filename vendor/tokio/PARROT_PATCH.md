@@ -2,7 +2,7 @@
 
 This directory is the Tokio 1.53.3 crates.io release under its original MIT
 license. `UPSTREAM.json` records the release archive SHA-256 and all 564 upstream
-file hashes. Twelve upstream Rust files and the normalized `Cargo.toml` differ;
+file hashes. Sixteen upstream Rust files and the normalized `Cargo.toml` differ;
 the package version and dependency versions are unchanged. `Cargo.toml.orig`
 is preserved byte-for-byte as upstream provenance, not an editable build input.
 
@@ -177,11 +177,36 @@ checks rejection and the explicit update recovery path.
 Publishing independent Parrot crates needs a separate packaging decision or an
 upstream release containing the fix; this patch is not automatically published.
 
+## Notification fanout under waker panic
+
+Storing a terminal watch value does not prove that every pending observer has
+been notified. Upstream `WakeList` stops at the first panicking waker, `Notify`
+can abandon later batches, and watch's `BigNotify` can skip later shards. Catching
+the panic only at the Parrot publisher therefore leaves independent observers
+asleep even though the terminal value is available.
+
+`src/util/wake_list.rs` now drains its wake batch before resuming the first panic.
+`Notify` completes all batches and watch completes all shards before propagating
+that same panic. Later panic payloads are disposed under `catch_unwind`; a payload
+from a recursively panicking destructor is retained rather than double-panicking.
+Callbacks run outside the existing locks. Reentrant registrations remain in the
+next notification generation. Normal notification and unchanged watch updates
+retain their existing semantics.
+
+`tests/parrot_notification_fanout.rs` adds eight contracts for multiple batches
+and shards, cancelled waiters, first-panic identity, hostile payload destructors,
+reentrant registration, sender close, and unchanged updates. The gate runs these
+contracts with both full runtime features and minimal `sync + parking_lot`, in
+debug and release, alongside the pinned upstream Notify and watch suites. This
+does not change the public Tokio API or suppress the caller's first wake panic;
+Parrot's existing publishers continue to contain it at their ownership boundary.
+
 ## Maintenance and removal
 
 Keep the upstream source and license intact. When upgrading, verify the new
 archive checksum, review the five native runtime changes, three deferred-channel
-changes, three documentation corrections, blocking task ownership and all three
+changes, three documentation corrections, blocking task ownership, notification
+fanout and all three
 capability requirements, and
 run `native_runtime_progress` and `dylib_assembly` with the real workspace
 feature union on Linux GNU. The former must detect both cold-thread defects in
@@ -191,7 +216,8 @@ positive control and synchronous oneshot/mpsc/shutdown cases. Check the minimal
 debug/release, strict Clippy, formatting and packaging checks. Retain negative
 controls for deferred notification and receptionist lock boundaries; run
 `mpsc_deferred_contract` plus the actual pinned upstream mpsc, oneshot and
-AsyncFd and blocking-task suites with `scripts/check_tokio_upstream.py`. Retain negative
+AsyncFd, blocking-task, Notify, watch and notification-fanout suites with
+`scripts/check_tokio_upstream.py`. Retain negative
 controls for missing initialization and initialization after the parker mutex is
 acquired. Remove this local patch only after an upstream replacement passes
 those contracts; merely upgrading to 1.53.2 did not fix the independent probes.

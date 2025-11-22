@@ -9,7 +9,7 @@ use crate::loom::cell::UnsafeCell;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::Mutex;
 use crate::util::linked_list::{self, GuardedLinkedList, LinkedList};
-use crate::util::WakeList;
+use crate::util::{WakeList, WakePanic};
 
 use std::future::Future;
 use std::marker::PhantomPinned;
@@ -774,6 +774,7 @@ impl Notify {
         let mut list = NotifyWaitersList::new(std::mem::take(&mut *waiters), guard.as_ref(), self);
 
         let mut wakers = WakeList::new();
+        let mut panics = WakePanic::default();
         'outer: loop {
             while wakers.can_push() {
                 match list.pop_back_locked(&mut waiters) {
@@ -800,9 +801,8 @@ impl Notify {
             // Release the lock before notifying.
             drop(waiters);
 
-            // One of the wakers may panic, but the remaining waiters will still
-            // be unlinked from the list in `NotifyWaitersList` destructor.
-            wakers.wake_all();
+            // Drain every batch before propagating the first waker panic.
+            panics.capture(|| wakers.wake_all());
 
             // Acquire the lock again.
             waiters = self.waiters.lock();
@@ -811,7 +811,8 @@ impl Notify {
         // Release the lock before notifying
         drop(waiters);
 
-        wakers.wake_all();
+        panics.capture(|| wakers.wake_all());
+        panics.resume();
     }
 
     pub(crate) fn lock_waiter_list(&self) -> NotifyGuard<'_> {

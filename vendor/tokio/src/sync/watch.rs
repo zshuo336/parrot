@@ -372,6 +372,7 @@ pub mod error {
 mod big_notify {
     use super::Notify;
     use crate::sync::notify::Notified;
+    use crate::util::WakePanic;
 
     // To avoid contention on the lock inside the `Notify`, we store multiple
     // copies of it. Then, we use either circular access or randomness to spread
@@ -404,9 +405,11 @@ mod big_notify {
         }
 
         pub(super) fn notify_waiters(&self) {
+            let mut panics = WakePanic::default();
             for notify in &self.inner {
-                notify.notify_waiters();
+                panics.capture(|| notify.notify_waiters());
             }
+            panics.resume();
         }
 
         /// This function implements the case where randomness is not available.

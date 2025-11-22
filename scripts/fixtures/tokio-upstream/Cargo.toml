@@ -2,6 +2,7 @@
 name = "parrot-tokio-upstream-contracts"
 version = "0.0.0"
 edition = "2021"
+rust-version = "1.71"
 publish = false
 autotests = false
 
@@ -34,6 +35,18 @@ path = "../../../vendor/tokio/tests/sync_mpsc.rs"
 [[test]]
 name = "sync_oneshot"
 path = "../../../vendor/tokio/tests/sync_oneshot.rs"
+
+[[test]]
+name = "sync_notify"
+path = "../../../vendor/tokio/tests/sync_notify.rs"
+
+[[test]]
+name = "sync_watch"
+path = "../../../vendor/tokio/tests/sync_watch.rs"
+
+[[test]]
+name = "parrot_notification_fanout"
+path = "../../../vendor/tokio/tests/parrot_notification_fanout.rs"
 
 [[test]]
 name = "task_blocking"

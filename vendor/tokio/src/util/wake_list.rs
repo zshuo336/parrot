@@ -2,6 +2,30 @@ use core::mem::MaybeUninit;
 use core::ptr;
 use std::task::Waker;
 
+// Finish notifying independent waiters before propagating the first wake panic.
+#[derive(Default)]
+pub(crate) struct WakePanic(Option<Box<dyn std::any::Any + Send>>);
+
+impl WakePanic {
+    pub(crate) fn capture(&mut self, wake: impl FnOnce()) {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(wake)) {
+            if self.0.is_none() {
+                self.0 = Some(payload);
+            } else if let Err(secondary) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+            {
+                std::mem::forget(secondary);
+            }
+        }
+    }
+
+    pub(crate) fn resume(mut self) {
+        if let Some(payload) = self.0.take() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 const NUM_WAKERS: usize = 32;
 
 /// A list of wakers to be woken.
@@ -62,14 +86,15 @@ impl WakeList {
             self.curr = 0;
             DropGuard { start, end }
         };
+        let mut panics = WakePanic::default();
         while !ptr::eq(guard.start, guard.end) {
             // SAFETY: `start` is always initialized if `start != end`.
             let waker = unsafe { ptr::read(guard.start) };
             // SAFETY: The resulting pointer is in bounds or one after the length of the same object.
             guard.start = unsafe { guard.start.add(1) };
-            // If this panics, then `guard` will clean up the remaining wakers.
-            waker.wake();
+            panics.capture(|| waker.wake());
         }
+        panics.resume();
     }
 }
 

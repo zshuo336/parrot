@@ -43,6 +43,14 @@ mod wake_list;
 pub(crate) use wake_list::WakeList;
 
 #[cfg(any(
+    feature = "sync",
+    feature = "rt",
+    feature = "signal",
+    all(unix, feature = "process")
+))]
+pub(crate) use wake_list::WakePanic;
+
+#[cfg(any(
     feature = "fs",
     feature = "net",
     feature = "process",

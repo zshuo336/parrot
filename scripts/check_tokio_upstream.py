@@ -17,6 +17,9 @@ import uuid
 SUITES = {'io_async_fd': {'Linux': 27, 'Darwin': 24},
           'sync_mpsc': {'Linux': 107, 'Darwin': 107},
           'sync_oneshot': {'Linux': 22, 'Darwin': 22},
+          'sync_notify': {'Linux': 19, 'Darwin': 19},
+          'sync_watch': {'Linux': 22, 'Darwin': 22},
+          'parrot_notification_fanout': {'Linux': 8, 'Darwin': 8},
           'task_blocking': {'Linux': 16, 'Darwin': 16},
           'rt_spawn_blocking': {'Linux': 1, 'Darwin': 1}}
 MINIMAL = 'parrot-minimal-sync-contract'
@@ -81,12 +84,13 @@ def build_artifacts(log, package, expected, root, target, profile, minimal=False
             continue
         name = item['target']['name']
         require(name in expected and name not in result, 'unexpected or duplicate consumer executable')
-        expected_source = (root / 'scripts/fixtures/tokio-minimal/src/main.rs' if minimal else
+        binary_target = minimal and name == MINIMAL
+        expected_source = (root / 'scripts/fixtures/tokio-minimal/src/main.rs' if binary_target else
                            root / 'vendor/tokio/tests' / (name + '.rs'))
         binary = Path(item['executable']).resolve()
         require(Path(item['target']['src_path']).resolve() == expected_source and
-                item['target']['kind'] == (['bin'] if minimal else ['test']) and
-                item['profile']['test'] is (not minimal) and binary.is_file() and
+                item['target']['kind'] == (['bin'] if binary_target else ['test']) and
+                item['profile']['test'] is (not binary_target) and binary.is_file() and
                 binary.is_relative_to(target / profile), 'consumer executable source/profile/ownership differs')
         result[name] = binary
     require(set(result) == set(expected), 'compiled consumer targets are missing')
@@ -194,13 +198,25 @@ class Check:
             saved = self.save_binary('minimal-' + profile, binaries[MINIMAL])
             log = self.run('minimal-' + profile, [str(saved)], timeout=60)
             require(log.splitlines() == [COMPLETED], 'minimal sync/parking_lot runtime contract did not complete')
-        require(len(self.rows) == 20 and self.capture() == self.inputs and len(self.artifacts) == 12 and
+            notification = 'parrot_notification_fanout'
+            text = self.cargo('minimal-notification-build-' + profile,
+                              ['test', '--manifest-path', manifests['minimal'], '--test', notification,
+                               '--no-run', '--message-format=json', *flags])
+            # Cargo also builds the package binary for integration tests.
+            binaries = build_artifacts(text, self.resolutions['minimal']['consumer'], [MINIMAL, notification],
+                                       self.root, self.target, profile, minimal=True)
+            require(sha(binaries[MINIMAL]) == sha(saved), 'minimal companion binary changed feature/profile identity')
+            saved = self.save_binary('minimal-notification-' + profile, binaries[notification])
+            log = self.run('minimal-notification-' + profile, [str(saved), '--test-threads=2'], timeout=60)
+            verify_suite(log, 0, SUITES[notification][system])
+        require(len(self.rows) == 30 and self.capture() == self.inputs and len(self.artifacts) == 20 and
                 all(sha(self.output / item['path']) == item['sha256'] for item in self.artifacts),
                 'runtime gate stage/source/artifact selection changed')
-        save(self.output / 'verified.json', dict(status='verified', platform=system, stages=20, cargo_build_jobs=2,
+        save(self.output / 'verified.json', dict(status='verified', platform=system, stages=30, cargo_build_jobs=2,
              upstream_tests_per_profile=sum(counts[system] for counts in SUITES.values()),
-             minimal_sync_profiles=2, resolutions=self.resolutions, artifacts=self.artifacts,
-             source_unchanged=True, test_sources='actual-vendored-upstream', commands=self.rows))
+             minimal_sync_profiles=2, minimal_notification_tests_per_profile=8,
+             resolutions=self.resolutions, artifacts=self.artifacts, source_unchanged=True,
+             test_sources=['actual-vendored-upstream', 'parrot-notification-contracts'], commands=self.rows))
 
 
 def main():
