@@ -213,6 +213,19 @@ class BuildReceipts(unittest.TestCase):
         self.assertEqual(self.verify(test_executable=executable), artifacts)
         receipt = json.loads((self.root / business.RECEIPT).read_text())
         self.assertEqual(receipt['build_environment']['RUSTFLAGS'], '--cfg original')
+        self.assertEqual(receipt['native_build_environment']['RUSTFLAGS'],
+                         '--cfg original -C prefer-dynamic')
+
+    def test_native_environment_adds_unload_safe_stdlib_flag_without_clobbering_flags(self):
+        ordinary = business.native_environment({'RUSTFLAGS': '--cfg original'})
+        self.assertEqual(ordinary['RUSTFLAGS'], '--cfg original -C prefer-dynamic')
+        self.assertEqual(
+            business.native_environment(ordinary)['RUSTFLAGS'],
+            '--cfg original -C prefer-dynamic',
+        )
+        encoded = business.native_environment({'CARGO_ENCODED_RUSTFLAGS': '--cfg\x1foriginal'})
+        self.assertEqual(encoded['CARGO_ENCODED_RUSTFLAGS'],
+                         '--cfg\x1foriginal\x1f-C\x1fprefer-dynamic')
 
     def test_corrupt_partial_and_incomplete_receipts_are_rejected(self):
         for replacement in ['{', '{}', '{"schema":1}']:

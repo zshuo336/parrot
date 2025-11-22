@@ -30,6 +30,10 @@ class RunTestsContracts(unittest.TestCase):
     def test_workspace_command_is_locked_and_discovers_all_test_kinds(self):
         self.assertRegex(
             self.source,
+            r'make --no-print-directory build-crawler-business',
+        )
+        self.assertRegex(
+            self.source,
             r"cargo test --locked --workspace --all-targets --lib --bins --tests --benches",
         )
 

@@ -28,6 +28,7 @@ RECIPES = ['Cargo.toml', 'Cargo.lock', 'Makefile', 'apps/crawler-lab/Cargo.toml'
            'scripts/crawler_business_artifacts.py', 'scripts/build_crawler_wasm.sh']
 BUILD_ENV = ['RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC', 'RUSTC_WRAPPER',
              'RUSTC_WORKSPACE_WRAPPER', 'RUSTUP_TOOLCHAIN', 'CARGO_BUILD_TARGET']
+NATIVE_UNLOAD_RUST_FLAG = ('-C', 'prefer-dynamic')
 
 
 class ArtifactError(RuntimeError):
@@ -148,6 +149,31 @@ def environment_inputs(environment):
     return {key: environment.get(key) for key in sorted(keys)}
 
 
+def native_environment(environment):
+    """Build native cdylibs with libstd outside the unloadable image.
+
+    The ABI loader rejects TLS destructors in a library that may be unloaded.
+    Keeping Rust's standard library in the shared runtime avoids attributing
+    its process-wide TLS teardown to the business component. Preserve caller
+    flags and support Cargo's encoded form as well as ordinary RUSTFLAGS.
+    """
+    result = dict(environment)
+    encoded = result.get('CARGO_ENCODED_RUSTFLAGS')
+    if encoded:
+        parts = encoded.split('\x1f')
+        if list(NATIVE_UNLOAD_RUST_FLAG) not in [parts[index:index + 2]
+                                                  for index in range(len(parts) - 1)]:
+            parts.extend(NATIVE_UNLOAD_RUST_FLAG)
+        result['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(parts)
+        return result
+    flags = result.get('RUSTFLAGS', '').split()
+    if list(NATIVE_UNLOAD_RUST_FLAG) not in [flags[index:index + 2]
+                                             for index in range(len(flags) - 1)]:
+        flags.extend(NATIVE_UNLOAD_RUST_FLAG)
+    result['RUSTFLAGS'] = ' '.join(flags)
+    return result
+
+
 def run(command, root, environment, capture=False):
     return subprocess.run(command, cwd=root, env=environment, check=True, text=True,
                           stdout=subprocess.PIPE if capture else sys.stderr)
@@ -235,7 +261,8 @@ def build(root=ROOT, environment=None):
         atomic_copy(application, application_output, executable=True)
         native_target = target_directory / 'parrot-business-build/native'
         wasm_target = target_directory / 'parrot-business-build/wasm'
-        native = cargo_artifact([cargo, 'build', '--locked', '--target-dir', str(native_target), '-p', 'crawler-lab-dylib', '--lib'], root, environment, 'crawler-lab-dylib', 'crawler_lab_dylib', native_identity)
+        native_env = native_environment(environment)
+        native = cargo_artifact([cargo, 'build', '--locked', '--target-dir', str(native_target), '-p', 'crawler-lab-dylib', '--lib'], root, native_env, 'crawler-lab-dylib', 'crawler_lab_dylib', native_identity)
         raw_wasm = cargo_artifact([cargo, 'build', '--locked', '--manifest-path', 'apps/crawler-lab/wasm/Cargo.toml', '--target-dir', str(wasm_target), '--target', 'wasm32-unknown-unknown', '--release'], root, environment, 'crawler-lab-wasm', 'crawler_lab_wasm', wasm_identity)
         native_build_path = native
         layout = native.relative_to(native_target).parts
@@ -267,7 +294,8 @@ def build(root=ROOT, environment=None):
         if source_inputs(root, roots) != inputs or cargo_configs(root, environment) != configs:
             raise ArtifactError('source/build configuration changed during the build')
         receipt = dict(schema=1, repository=str(root), source_roots=roots, inputs=inputs,
-                       cargo_configs=configs, build_environment=env_inputs, tools=versions,
+                       cargo_configs=configs, build_environment=env_inputs,
+                       native_build_environment=environment_inputs(native_env), tools=versions,
                        target_directory=str(target_directory),
                        native_build_path=str(native_build_path), wasm_build_path=str(raw_wasm),
                        test_platform_directory=str(test_platform_directory),
@@ -302,8 +330,12 @@ def verify(root=ROOT, environment=None, test_executable=None):
             # Cargo injects compiler/profile variables into test processes. The
             # receipt records the component build options; test executable location
             # binds those consumers to the actual target directory instead.
-            if not test_executable and environment_inputs(environment) != receipt['build_environment']:
-                raise ArtifactError('business build configuration changed; rebuild required')
+            if not test_executable:
+                if environment_inputs(environment) != receipt['build_environment']:
+                    raise ArtifactError('business build configuration changed; rebuild required')
+                if (environment_inputs(native_environment(environment))
+                        != receipt['native_build_environment']):
+                    raise ArtifactError('native business build configuration changed; rebuild required')
             target = Path(receipt['target_directory'])
             if test_executable:
                 executable = Path(test_executable).resolve()

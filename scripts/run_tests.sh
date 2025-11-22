@@ -12,6 +12,13 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
 
+# The workspace contains an integration target that loads the generated
+# crawler Dylib/Wasm artifacts. Prepare a current-source receipt before Cargo
+# starts tests; set PARROT_PREPARE_CRAWLER=0 for intentionally core-only runs.
+if [[ "${PARROT_PREPARE_CRAWLER:-1}" != "0" ]]; then
+    make --no-print-directory build-crawler-business
+fi
+
 echo "Running all tests (excluding doctests)..."
 
 # Change to workspace root directory
