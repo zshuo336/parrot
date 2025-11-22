@@ -104,7 +104,9 @@ impl HelperJoin {
         }));
         if let Err(payload) = notified {
             let message = crate::owned_payload::panic_message(payload);
-            tracing::warn!(error = %message, "Actix retirement receipt waker panicked");
+            crate::owned_payload::cleanup_diagnostic(|| {
+                tracing::warn!(error = %message, "Actix retirement receipt waker panicked");
+            });
         }
     }
 
@@ -140,7 +142,9 @@ impl HelperJoin {
                 dispatch(job);
             })) {
                 let message = crate::owned_payload::panic_message(payload);
-                tracing::warn!(error = %message, "Actix helper join dispatch failed; actual join receipt retained");
+                crate::owned_payload::cleanup_diagnostic(|| {
+                    tracing::warn!(error = %message, "Actix helper join dispatch failed; actual join receipt retained");
+                });
             }
         }
     }

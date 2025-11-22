@@ -104,6 +104,8 @@ pub(crate) async fn pending_cleanup_permit(active: &Arc<Semaphore>) -> PendingCl
 }
 
 #[cfg(test)]
+pub(crate) mod diagnostic_contracts;
+#[cfg(test)]
 mod expired_factory_contracts;
 #[cfg(test)]
 mod expired_system_contracts;
@@ -211,13 +213,21 @@ pub(crate) fn join_error(error: tokio::task::JoinError) -> String {
     }
 }
 
+// Subscribers are user code too. A failed diagnostic must neither unwind a
+// cleanup owner nor recursively report its own failure.
+pub(crate) fn cleanup_diagnostic(report: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(report)) {
+        let _ = panic_message(payload);
+    }
+}
+
 pub(crate) fn publish_watch_value<T>(sender: &watch::Sender<T>, value: T) {
     let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sender.send_replace(value);
     }));
     if let Err(payload) = notified {
         let message = panic_message(payload);
-        tracing::warn!(error = %message, "Watch receipt waker panicked");
+        cleanup_diagnostic(|| tracing::warn!(error = %message, "Watch receipt waker panicked"));
     }
 }
 
@@ -234,7 +244,7 @@ pub(crate) fn publish_watch_if_modified<T>(
     }));
     if let Err(payload) = notified {
         let message = panic_message(payload);
-        tracing::warn!(error = %message, "Watch receipt waker panicked");
+        cleanup_diagnostic(|| tracing::warn!(error = %message, "Watch receipt waker panicked"));
     }
 }
 
@@ -247,7 +257,9 @@ fn publish_finished(
     }));
     if let Err(payload) = notified {
         let message = panic_message(payload);
-        tracing::warn!(error = %message, "Owned payload cleanup receipt waker panicked");
+        cleanup_diagnostic(|| {
+            tracing::warn!(error = %message, "Owned payload cleanup receipt waker panicked");
+        });
     }
 }
 

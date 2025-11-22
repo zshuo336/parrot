@@ -17,7 +17,9 @@ fn publish_finished(finished: &Finished, result: Result<(), String>) {
     }));
     if let Err(payload) = notified {
         let message = panic_message(payload);
-        tracing::warn!(error = %message, "Factory retirement receipt waker panicked");
+        crate::owned_payload::cleanup_diagnostic(|| {
+            tracing::warn!(error = %message, "Factory retirement receipt waker panicked");
+        });
     }
 }
 

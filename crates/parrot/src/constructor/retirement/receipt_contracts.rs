@@ -8,6 +8,50 @@ use std::{
 
 const WAIT: Duration = Duration::from_secs(5);
 
+fn receipt_diagnostic(during_unwind: bool) {
+    struct Counted(Arc<AtomicUsize>);
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let captured = Counted(drops.clone());
+    let (sender, _) = watch::channel(None);
+    let disposal = CaptureDisposal::<()> {
+        context: None,
+        function: Some(Arc::new(move || {
+            std::hint::black_box(&captured);
+        })),
+        failure: Some("original factory retirement failure".into()),
+        finished: Some(sender.clone()),
+        cleanup: None,
+        pending: None,
+        creation_reservation: None,
+    };
+    owned_payload::diagnostic_contracts::verify(
+        &sender,
+        during_unwind,
+        1,
+        || drop(disposal),
+        |value| {
+            assert_eq!(
+                value.as_ref().unwrap_err(),
+                "original factory retirement failure"
+            );
+        },
+    );
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+owned_payload::diagnostic_contracts::contract!(
+    receipt_diagnostic_factory,
+    receipt_diagnostic(false)
+);
+owned_payload::diagnostic_contracts::contract!(
+    receipt_diagnostic_factory_unwind,
+    receipt_diagnostic(true)
+);
+
 #[derive(Default)]
 struct Gate {
     released: Mutex<bool>,

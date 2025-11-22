@@ -19,7 +19,9 @@ fn publish_finished(
     }));
     if let Err(payload) = notified {
         let message = crate::owned_payload::panic_message(payload);
-        tracing::warn!(error = %message, "Root retirement receipt waker panicked");
+        crate::owned_payload::cleanup_diagnostic(|| {
+            tracing::warn!(error = %message, "Root retirement receipt waker panicked");
+        });
     }
 }
 
@@ -37,7 +39,9 @@ fn publish_abandoned(finished: &watch::Sender<Option<Result<(), ActorReceipt>>>)
     }));
     if let Err(payload) = notified {
         let message = crate::owned_payload::panic_message(payload);
-        tracing::warn!(error = %message, "Root retirement fallback receipt waker panicked");
+        crate::owned_payload::cleanup_diagnostic(|| {
+            tracing::warn!(error = %message, "Root retirement fallback receipt waker panicked");
+        });
     }
 }
 
@@ -225,3 +229,45 @@ async fn wait(mut completion: Completion) -> ActorResult<()> {
 mod saturation_contracts;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod diagnostic_contracts {
+    use super::*;
+    use crate::owned_payload::diagnostic_contracts::{contract, verify};
+
+    fn check(abandoned: bool, during_unwind: bool) {
+        let (sender, _) = watch::channel(None);
+        let original = Arc::new(ActorError::InternalError(
+            "original root retirement failure".into(),
+        ));
+        verify(
+            &sender,
+            during_unwind,
+            1,
+            || {
+                if abandoned {
+                    drop(Publish(sender.clone()));
+                } else {
+                    publish_finished(&sender, Err(original.clone().into()));
+                }
+            },
+            |value| {
+                let error = value.as_ref().unwrap_err();
+                if abandoned {
+                    assert!(
+                        error
+                            .error()
+                            .to_string()
+                            .contains("root retirement task ended without completing disposal")
+                    );
+                } else {
+                    assert!(error.same_error(&original));
+                }
+            },
+        );
+    }
+    contract!(receipt_diagnostic_root, check(false, false));
+    contract!(receipt_diagnostic_root_unwind, check(false, true));
+    contract!(receipt_diagnostic_root_abandoned, check(true, false));
+    contract!(receipt_diagnostic_root_abandoned_unwind, check(true, true));
+}

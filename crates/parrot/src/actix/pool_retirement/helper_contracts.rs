@@ -782,3 +782,49 @@ fn failed_fallback_thread_creation_is_joined_by_a_non_owner() {
     assert!(weak.upgrade().is_none());
     assert_eq!(receipt.borrow_and_update().clone(), Some(Ok(())));
 }
+
+fn receipt_diagnostic(dispatch_failure: bool, during_unwind: bool) {
+    let fixture = actix::System::new().block_on(async { fixture() });
+    let _release = Release(fixture.gate.clone());
+    fixture.retirement.request();
+    futures::executor::block_on(fixture.retirement.receipt()).unwrap();
+    fixture.entered.recv_timeout(WAIT).unwrap();
+    fixture.gate.release();
+    crate::owned_payload::diagnostic_contracts::verify(
+        &fixture.retirement.helper.finished,
+        during_unwind,
+        if dispatch_failure { 2 } else { 1 },
+        || {
+            if dispatch_failure {
+                fixture
+                    .retirement
+                    .helper
+                    .dispatch(|_job| panic!("original dispatch failure"));
+            } else {
+                fixture.retirement.join_blocking().unwrap();
+            }
+        },
+        |value| assert!(value.is_ok()),
+    );
+    fixture.retirement.join_blocking().unwrap();
+    assert_eq!(fixture.helper_exited.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.worker_disposed.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.retirement.owned_threads(1), 0);
+}
+use crate::owned_payload::diagnostic_contracts::contract;
+contract!(
+    receipt_diagnostic_helper_join,
+    receipt_diagnostic(false, false)
+);
+contract!(
+    receipt_diagnostic_helper_join_unwind,
+    receipt_diagnostic(false, true)
+);
+contract!(
+    receipt_diagnostic_helper_dispatch,
+    receipt_diagnostic(true, false)
+);
+contract!(
+    receipt_diagnostic_helper_dispatch_unwind,
+    receipt_diagnostic(true, true)
+);
