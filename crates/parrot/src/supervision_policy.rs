@@ -1,5 +1,7 @@
 //! Owned user policy state. Callback and final capture disposal share bounded workers.
 #[cfg(test)]
+mod receipt_contracts;
+#[cfg(test)]
 mod trace_contracts;
 use parrot_api::{
     errors::ActorError,
@@ -10,7 +12,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 #[derive(Clone)]
 pub(crate) struct OwnedStrategy {
@@ -249,13 +251,16 @@ pub(crate) fn decide(
 struct Disposal {
     strategy: Option<OwnedStrategy>,
     finished: watch::Sender<Option<Result<(), String>>>,
-    // Keep the pending owner with the actual capture until its Drop and
-    // receipt publication finish, even if the submitting runtime exits.
+    // Keep quotas through actual capture disposal, including host cancellation.
     pending: Option<crate::owned_payload::PendingCleanupPermit>,
+    active: Option<OwnedSemaphorePermit>,
 }
 impl Drop for Disposal {
     fn drop(&mut self) {
-        crate::owned_payload::publish_watch(&self.finished, retire_strategy(self.strategy.take()));
+        let result = retire_strategy(self.strategy.take());
+        drop(self.active.take());
+        drop(self.pending.take());
+        crate::owned_payload::publish_watch(&self.finished, result);
     }
 }
 
@@ -345,6 +350,7 @@ impl PolicyStore {
                                 strategy,
                                 finished: sender,
                                 pending: None,
+                                active: None,
                             }),
                         ))
                     }
@@ -373,11 +379,10 @@ impl PolicyStore {
                 let mut disposal = Some(disposal);
                 disposal.as_mut().expect("policy disposal owner").pending = Some(pending);
                 let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let disposal = disposal.take().expect("policy disposal owner");
+                    let mut disposal = disposal.take().expect("policy disposal owner");
                     tokio::spawn(async move {
-                        let permit = slots.acquire_owned().await;
+                        disposal.active = slots.acquire_owned().await.ok();
                         let _ = tokio::task::spawn_blocking(move || {
-                            let _permit = permit;
                             drop(disposal);
                         })
                         .await;

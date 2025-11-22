@@ -112,6 +112,8 @@ mod host_exit_contracts;
 #[cfg(test)]
 mod publication_contracts;
 #[cfg(test)]
+mod quota_contracts;
+#[cfg(test)]
 mod saturation_contracts;
 
 std::thread_local! {
@@ -258,6 +260,7 @@ struct Disposal<T> {
     reservation: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pending: Option<OwnedSemaphorePermit>,
     global_pending: Option<OwnedSemaphorePermit>,
+    active: Option<OwnedSemaphorePermit>,
 }
 impl<T> Drop for Disposal<T> {
     fn drop(&mut self) {
@@ -272,6 +275,7 @@ impl<T> Drop for Disposal<T> {
                         )
                     });
             drop(self.reservation.take());
+            drop(self.active.take());
             drop(self.pending.take());
             drop(self.global_pending.take());
             publish_finished(&self.finished, result);
@@ -410,6 +414,7 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
                     reservation,
                     pending: None,
                     global_pending: None,
+                    active: None,
                 });
                 return;
             }
@@ -428,17 +433,19 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
                     reservation,
                     pending: None,
                     global_pending: None,
+                    active: None,
                 });
                 return;
             }
         };
-        let disposal = Disposal {
+        let mut disposal = Disposal {
             context: self.context.clone(),
             value: Some(value),
             finished: finished.clone(),
             reservation,
             pending,
             global_pending,
+            active: None,
         };
         // Reentrant cleanup already owns a bounded disposal executor. Waiting
         // for another permit can deadlock a destructor closing another owner.
@@ -452,13 +459,12 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
         };
         runtime.spawn(async move {
             // These private pools remain open through system retirement.
-            let permit = slots.acquire_owned().await;
+            disposal.active = slots.acquire_owned().await.ok();
             // Spawn can panic before returning a JoinHandle (OS exhaustion or
             // a worker-builder callback). Failed dispatch retires its captures;
             // retain that actual result instead of unwinding this cleanup task.
             let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
                     drop(disposal);
                 })
             }));
