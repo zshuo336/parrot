@@ -467,34 +467,36 @@ async fn actix_rejects_scheduler_capacity_without_substituting_mailbox_capacity(
 }
 
 #[tokio::test]
-async fn borrowed_executor_rejects_settings_it_cannot_apply() {
-    for case in 0..4 {
-        let mut config = RuntimeConfig::default();
-        let field = match case {
-            0 => {
-                config.worker_threads = Some(1);
-                "worker_threads"
-            }
-            1 => {
-                config.io_threads = Some(1);
-                "io_threads"
-            }
-            2 => {
-                config.scheduler_config.load_balancing = LoadBalancingStrategy::Random;
-                "load_balancing"
-            }
-            _ => {
-                config.scheduler_config.load_balancing = LoadBalancingStrategy::LeastLoaded;
-                "load_balancing"
-            }
-        };
-        let result = TokioActorRuntime::start(config).await;
-        if let Ok(runtime) = result {
-            runtime.shutdown().await.unwrap();
-            panic!("borrowed executor silently accepted {field}");
-        }
-        let error = result.unwrap_err();
+async fn tokio_runtime_applies_explicit_counts_and_rejects_only_unrepresentable_policy() {
+    for config in [
+        RuntimeConfig {
+            worker_threads: Some(1),
+            ..RuntimeConfig::default()
+        },
+        RuntimeConfig {
+            io_threads: Some(1),
+            ..RuntimeConfig::default()
+        },
+    ] {
+        let runtime = TokioActorRuntime::start(config)
+            .await
+            .expect("explicit Tokio thread settings must be applied");
+        runtime.shutdown().await.unwrap();
+    }
+    for strategy in [
+        LoadBalancingStrategy::Random,
+        LoadBalancingStrategy::LeastLoaded,
+    ] {
+        let error = TokioActorRuntime::start(RuntimeConfig {
+            scheduler_config: parrot_api::runtime::SchedulerConfig {
+                load_balancing: strategy,
+                ..Default::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .await
+        .expect_err("Tokio cannot provide actor placement policy");
         assert!(matches!(error, ActorError::InitializationError(_)));
-        assert!(error.to_string().contains(field), "{error}");
+        assert!(error.to_string().contains("load_balancing"), "{error}");
     }
 }

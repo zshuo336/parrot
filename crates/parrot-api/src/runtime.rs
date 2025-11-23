@@ -44,8 +44,13 @@
 use crate::errors::ActorError;
 use async_trait::async_trait;
 use futures::FutureExt;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
 use tokio::sync::{Notify, Semaphore};
 
 #[cfg(test)]
@@ -54,21 +59,25 @@ mod lifecycle_contracts;
 
 /// Configuration for the actor system runtime.
 ///
-/// Each runtime applies the settings it owns. Built-in native adapters reject
-/// unsupported explicit settings; they cannot resize a caller-owned executor.
+/// Each runtime applies the settings it owns. The default Tokio adapter borrows
+/// the caller's executor; specifying a worker or I/O count gives it an owned
+/// Tokio runtime so those settings have real execution semantics.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeConfig {
     /// Number of threads for processing actor messages.
     ///
     /// Native Thread maps this to core worker tasks, Actix to owned arbiters.
-    /// None preserves the native settings. TokioActorRuntime borrows its executor
-    /// and rejects explicit counts; native counts are limited to 1..=4096.
+    /// None preserves the native settings. TokioActorRuntime borrows the caller
+    /// executor when both counts are `None`; an explicit value makes it own a
+    /// multi-thread Tokio runtime. Native counts are limited to 1..=4096.
     pub worker_threads: Option<usize>,
 
     /// Number of threads for handling I/O operations.
     ///
-    /// None uses the host's I/O driver. Built-in runtimes currently reject an
-    /// explicit value because they do not own a separate configurable I/O pool.
+    /// None uses the host's I/O driver when no explicit worker count is given.
+    /// For TokioActorRuntime, an explicit value owns a runtime and configures
+    /// Tokio's blocking/I/O helper thread limit (`max_blocking_threads`). Tokio
+    /// has one readiness driver per runtime rather than a separately sized pool.
     pub io_threads: Option<usize>,
 
     /// Configuration for the task scheduler.
@@ -229,10 +238,14 @@ pub struct RuntimeMetrics {
 /// plus truncation/cleanup annotations. Their payload is disposed before the
 /// task is retired; a payload destructor panic is retained in that receipt.
 ///
-/// This adapter borrows the caller's executor. Explicit `worker_threads`,
-/// `io_threads`, and nondefault `load_balancing` are rejected because they
-/// cannot reconfigure that executor. Queue capacities exceeding
-/// [`Semaphore::MAX_PERMITS`] and unrepresentable task deadlines are rejected.
+/// With default thread settings this adapter borrows the caller's executor.
+/// Supplying `worker_threads` or `io_threads` creates an owned multi-thread
+/// Tokio runtime, so the requested worker and blocking/I/O helper limits are
+/// applied instead of silently ignored. Tokio's readiness driver is shared by
+/// that runtime and has no independent thread-count knob. Nondefault
+/// `load_balancing` remains rejected because Tokio does not expose actor
+/// placement. Queue capacities exceeding [`Semaphore::MAX_PERMITS`] and
+/// unrepresentable task deadlines are rejected.
 #[derive(Clone)]
 pub struct TokioActorRuntime {
     inner: Arc<TokioRuntimeInner>,
@@ -241,8 +254,47 @@ pub struct TokioActorRuntime {
 struct TokioRuntimeInner {
     permits: Option<Arc<Semaphore>>,
     timeout: Duration,
+    owned_runtime: Option<Arc<OwnedRuntime>>,
     state: Mutex<TaskState>,
     changed: Notify,
+}
+
+/// Tokio forbids dropping a multi-thread runtime from an async context because
+/// its destructor joins worker threads. Keep that blocking join off the host
+/// executor while retaining normal ownership and shutdown semantics.
+struct OwnedRuntime {
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl OwnedRuntime {
+    fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    fn spawn<F, T>(&self, future: F) -> tokio::task::JoinHandle<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.runtime
+            .as_ref()
+            .expect("owned Tokio runtime missing before drop")
+            .spawn(future)
+    }
+}
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("owned Tokio runtime dropped twice");
+        let _ = std::thread::Builder::new()
+            .name("parrot-tokio-runtime-drop".into())
+            .spawn(move || drop(runtime));
+    }
 }
 
 #[derive(Default)]
@@ -254,30 +306,32 @@ struct TaskState {
 
 // Field order keeps the accepted input alive in accounting until its actual
 // destructor returns, including cancellation while waiting for a permit.
-struct PendingTask<'a, F> {
+struct PendingTask<F> {
     future: F,
-    registration: PendingGuard<'a>,
+    registration: PendingGuard,
 }
 
-struct PendingGuard<'a> {
-    inner: &'a TokioRuntimeInner,
+struct PendingGuard {
+    inner: Arc<TokioRuntimeInner>,
     armed: bool,
 }
 
-impl<'a> PendingGuard<'a> {
-    fn activate(&mut self) -> Result<ActiveGuard<'a>, ActorError> {
-        let mut state = self.inner.state.lock().unwrap();
+impl PendingGuard {
+    fn activate(&mut self) -> Result<ActiveGuard, ActorError> {
+        let inner = self.inner.clone();
+        let mut state = inner.state.lock().unwrap();
         if state.shutting_down {
             return Err(ActorError::Stopped);
         }
         state.pending -= 1;
         state.active += 1;
         self.armed = false;
-        Ok(ActiveGuard { inner: self.inner })
+        drop(state);
+        Ok(ActiveGuard { inner })
     }
 }
 
-impl Drop for PendingGuard<'_> {
+impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.armed {
             self.inner.state.lock().unwrap().pending -= 1;
@@ -286,14 +340,37 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
-struct ActiveGuard<'a> {
-    inner: &'a TokioRuntimeInner,
+struct ActiveGuard {
+    inner: Arc<TokioRuntimeInner>,
 }
 
-impl Drop for ActiveGuard<'_> {
+impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.inner.state.lock().unwrap().active -= 1;
         self.inner.changed.notify_waiters();
+    }
+}
+
+/// A detached Tokio task must be aborted when the caller drops the public
+/// `spawn` future. Plain `JoinHandle` drop detaches the task, which would leak
+/// active accounting and let user work outlive a cancelled submission.
+struct AbortOnDrop<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // JoinHandle is safe to poll through a pinned mutable reference; its
+        // own future implementation does not move the handle's allocation.
+        Pin::new(&mut self.handle).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
@@ -323,18 +400,65 @@ impl TokioActorRuntime {
     }
 }
 
+async fn run_task<F, T>(
+    inner: Arc<TokioRuntimeInner>,
+    mut task: PendingTask<F>,
+) -> Result<T, ActorError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = match inner.permits.as_ref() {
+        Some(permits) => match permits.clone().acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(_) => return Err(ActorError::Stopped),
+        },
+        None => None,
+    };
+    let deadline = if inner.timeout.is_zero() {
+        None
+    } else {
+        Some(
+            tokio::time::Instant::now()
+                .checked_add(inner.timeout)
+                .ok_or_else(|| {
+                    ActorError::InitializationError(
+                        "runtime task_timeout cannot form a monotonic deadline".into(),
+                    )
+                })?,
+        )
+    };
+    let active_guard = task.registration.activate()?;
+    let result = std::panic::AssertUnwindSafe(task.future).catch_unwind();
+    let result = match deadline {
+        None => Ok(result.await),
+        Some(deadline) => tokio::time::timeout_at(deadline, result)
+            .await
+            .map_err(|_| ActorError::Timeout),
+    };
+    let result = match result {
+        Err(error) => Err(error),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(payload)) => Err(crate::owned_input::panic_error(payload)),
+    };
+    drop(active_guard);
+    drop(permit);
+    result
+}
+
 #[async_trait]
 impl ActorRuntime for TokioActorRuntime {
     async fn start(config: RuntimeConfig) -> Result<Self, ActorError> {
-        if config.worker_threads.is_some() {
-            return Err(ActorError::InitializationError(
-                "runtime worker_threads cannot reconfigure the caller-owned Tokio executor".into(),
-            ));
-        }
-        if config.io_threads.is_some() {
-            return Err(ActorError::InitializationError(
-                "runtime io_threads cannot reconfigure the caller-owned Tokio I/O driver".into(),
-            ));
+        const MAX_RUNTIME_THREADS: usize = 4096;
+        for (name, count) in [
+            ("worker_threads", config.worker_threads),
+            ("io_threads", config.io_threads),
+        ] {
+            if count.is_some_and(|count| count == 0 || count > MAX_RUNTIME_THREADS) {
+                return Err(ActorError::InitializationError(format!(
+                    "runtime {name} must be in 1..={MAX_RUNTIME_THREADS}"
+                )));
+            }
         }
         if !matches!(
             config.scheduler_config.load_balancing,
@@ -359,11 +483,31 @@ impl ActorRuntime for TokioActorRuntime {
                 "runtime task_timeout cannot form a monotonic deadline".into(),
             ));
         }
+        let owned_runtime = if config.worker_threads.is_some() || config.io_threads.is_some() {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.enable_all();
+            if let Some(worker_threads) = config.worker_threads {
+                builder.worker_threads(worker_threads);
+            }
+            if let Some(io_threads) = config.io_threads {
+                builder.max_blocking_threads(io_threads);
+            }
+            Some(Arc::new(OwnedRuntime::new(builder.build().map_err(
+                |error| {
+                    ActorError::InitializationError(format!(
+                        "failed to build owned Tokio runtime: {error}"
+                    ))
+                },
+            )?)))
+        } else {
+            None
+        };
         let permits = (capacity > 0).then(|| Arc::new(Semaphore::new(capacity)));
         Ok(Self {
             inner: Arc::new(TokioRuntimeInner {
                 permits,
                 timeout: config.scheduler_config.task_timeout,
+                owned_runtime,
                 state: Mutex::new(TaskState::default()),
                 changed: Notify::new(),
             }),
@@ -371,9 +515,10 @@ impl ActorRuntime for TokioActorRuntime {
     }
 
     async fn shutdown(self) -> Result<(), ActorError> {
-        self.inner.state.lock().unwrap().shutting_down = true;
-        self.inner.changed.notify_waiters();
-        Self::wait_for_idle(&self.inner).await;
+        let inner = self.inner.clone();
+        inner.state.lock().unwrap().shutting_down = true;
+        inner.changed.notify_waiters();
+        Self::wait_for_idle(&inner).await;
         Ok(())
     }
 
@@ -382,7 +527,7 @@ impl ActorRuntime for TokioActorRuntime {
         F: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let mut task = {
+        let task = {
             let mut state = self.inner.state.lock().unwrap();
             if state.shutting_down {
                 return Err(ActorError::Stopped);
@@ -391,49 +536,24 @@ impl ActorRuntime for TokioActorRuntime {
             PendingTask {
                 future,
                 registration: PendingGuard {
-                    inner: &self.inner,
+                    inner: self.inner.clone(),
                     armed: true,
                 },
             }
         };
-        let permit = match self.inner.permits.as_ref() {
-            Some(permits) => match permits.clone().acquire_owned().await {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    return Err(ActorError::Stopped);
-                }
-            },
-            None => None,
-        };
-        let deadline = if self.inner.timeout.is_zero() {
-            None
+        if let Some(runtime) = self.inner.owned_runtime.clone() {
+            let handle = runtime.spawn(run_task(self.inner.clone(), task));
+            let mut handle = AbortOnDrop { handle };
+            match (&mut handle).await {
+                Ok(result) => result,
+                Err(error) if error.is_cancelled() => Err(ActorError::Stopped),
+                Err(error) => Err(ActorError::Panic(format!(
+                    "owned Tokio runtime task panicked: {error}"
+                ))),
+            }
         } else {
-            Some(
-                tokio::time::Instant::now()
-                    .checked_add(self.inner.timeout)
-                    .ok_or_else(|| {
-                        ActorError::InitializationError(
-                            "runtime task_timeout cannot form a monotonic deadline".into(),
-                        )
-                    })?,
-            )
-        };
-        let active_guard = task.registration.activate()?;
-        let result = std::panic::AssertUnwindSafe(task.future).catch_unwind();
-        let result = match deadline {
-            None => Ok(result.await),
-            Some(deadline) => tokio::time::timeout_at(deadline, result)
-                .await
-                .map_err(|_| ActorError::Timeout),
-        };
-        let result = match result {
-            Err(error) => Err(error),
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(payload)) => Err(crate::owned_input::panic_error(payload)),
-        };
-        drop(active_guard);
-        drop(permit);
-        result
+            run_task(self.inner.clone(), task).await
+        }
     }
 
     fn metrics(&self) -> RuntimeMetrics {
@@ -663,6 +783,55 @@ mod tests {
                 Err(ActorError::InitializationError(_))
             ));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokio_runtime_explicit_counts_use_an_owned_executor() {
+        let host = std::thread::current().id();
+        let runtime = TokioActorRuntime::start(RuntimeConfig {
+            worker_threads: Some(1),
+            io_threads: Some(2),
+            ..RuntimeConfig::default()
+        })
+        .await
+        .unwrap();
+        let worker = runtime
+            .spawn(async { std::thread::current().id() })
+            .await
+            .unwrap();
+        assert_ne!(
+            worker, host,
+            "explicit worker_threads still used the host runtime"
+        );
+        assert!(runtime.inner.owned_runtime.is_some());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokio_runtime_cancelling_owned_task_aborts_user_work_and_retires_it() {
+        let runtime = TokioActorRuntime::start(RuntimeConfig {
+            worker_threads: Some(1),
+            io_threads: Some(1),
+            ..RuntimeConfig::default()
+        })
+        .await
+        .unwrap();
+        let mut task = Box::pin(runtime.spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        assert!(futures::poll!(&mut task).is_pending());
+        drop(task);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.metrics().active_actors == 0 && runtime.metrics().pending_messages == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned task abort did not retire accounting");
+        runtime.shutdown().await.unwrap();
     }
 
     #[test]
