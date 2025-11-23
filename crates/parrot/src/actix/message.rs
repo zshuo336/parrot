@@ -45,10 +45,12 @@ impl Drop for ActixMessageWrapper {
             crate::owned_payload::PublicationInput::new(sender).retire(),
         ] {
             if let Err(error) = result {
-                tracing::error!(
-                    error = %crate::error_receipt::actor_summary(&error),
-                    "Actix input disposal failed"
-                );
+                crate::owned_payload::cleanup_diagnostic(|| {
+                    tracing::error!(
+                        error = %crate::error_receipt::actor_summary(&error),
+                        "Actix input disposal failed"
+                    );
+                });
             }
         }
     }
@@ -92,10 +94,12 @@ impl Drop for ActixReply {
     fn drop(&mut self) {
         if let Err(error) = crate::owned_payload::PublicationInput::new(self.result.take()).retire()
         {
-            tracing::error!(
-                error = %crate::error_receipt::actor_summary(&error),
-                "Actix reply disposal failed"
-            );
+            crate::owned_payload::cleanup_diagnostic(|| {
+                tracing::error!(
+                    error = %crate::error_receipt::actor_summary(&error),
+                    "Actix reply disposal failed"
+                );
+            });
         }
     }
 }

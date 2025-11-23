@@ -258,10 +258,20 @@ async fn expires(mode: SchedulingMode, stage: u8) {
             .spawn_child_erased(actor, config, None, ancestor, ancestor_path, &children)
             .await
     });
-    if stage != 2 {
+    if stage == 2 {
+        // Spawn does not guarantee a first poll. Observe admission (or an
+        // already completed caller) before measuring its creation deadline.
+        until(|| system.actor_count() == 2 || caller.is_finished()).await;
+    } else {
         tokio::time::timeout(WAIT, observed).await.unwrap().unwrap();
     }
     let outcome = tokio::time::timeout(Duration::from_secs(1), &mut caller).await;
+    let outcome_detail = match &outcome {
+        Err(error) => format!("caller observation expired: {error}"),
+        Ok(Err(error)) => format!("caller task failed: {error}"),
+        Ok(Ok(Err(error))) => format!("creation returned: {error:?}"),
+        Ok(Ok(Ok(child))) => format!("child was published: {}", child.path()),
+    };
     if stage != 2 {
         release.send(()).unwrap();
     }
@@ -277,7 +287,7 @@ async fn expires(mode: SchedulingMode, stage: u8) {
     retired(&system, &parent, &scope, &state).await;
     assert!(
         matches!(outcome, Ok(Ok(Err(ActorError::TimeoutDetail(_))))),
-        "configured child creation deadline did not reach the caller"
+        "configured child creation deadline did not reach the caller; stage={stage}; {outcome_detail}"
     );
     assert_eq!(state.publication.load(Ordering::SeqCst), 0);
     assert_eq!(state.initialized.load(Ordering::SeqCst), 0);

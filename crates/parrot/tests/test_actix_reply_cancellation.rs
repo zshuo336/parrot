@@ -15,6 +15,8 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod diagnostic_contracts;
+
 #[derive(Clone, Copy)]
 enum Command {
     Reply,
