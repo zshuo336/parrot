@@ -20,6 +20,8 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(test)]
+mod expired_actix_contracts;
+#[cfg(test)]
 mod signal_contracts;
 
 #[derive(Clone)]
@@ -353,6 +355,8 @@ pub trait TypedContextExt {
         M: ParrotMsgVariant<LocalProtocol<A>>,
         F: Fn() -> A + Send + 'static;
     /// Admit a repeatable child using the parent's live child strategy.
+    /// Actix overload or shutdown returns `FactoryAdmissionError<F>`, including
+    /// after the original system has expired, so the caller can retry elsewhere.
     fn spawn_typed_child_factory<A, M, F>(
         &self,
         factory: F,
@@ -372,6 +376,8 @@ pub trait TypedContextExt {
         M: ParrotMsgVariant<A>,
         F: Fn() -> A + Send + Sync + 'static;
 
+    /// Actix rejection before admission returns `TypedInstanceAdmissionError<A>`
+    /// with the untouched instance and policy, even after system expiration.
     fn spawn_typed_child<A, M>(
         &self,
         actor: A,
@@ -427,6 +433,13 @@ async fn spawn<A: ParrotTypedDispatch, M: ParrotMsgVariant<A>>(
                     .spawn_typed_child_source(actor, strategy, &path, services)
                     .await;
             }
+            return Err(ActorError::Other(anyhow::Error::new(
+                crate::actix::typed::TypedInstanceAdmissionError::new(
+                    crate::actix::ChildInstanceAdmissionFailure::ShuttingDown,
+                    actor.take(),
+                    strategy.take(),
+                ),
+            )));
         }
     }
     let (actor, strategy) = tokio::join!(actor.retire(), strategy.retire());
@@ -471,6 +484,13 @@ where
                     .spawn_typed_child_factory_source(factory, policy, &path, services)
                     .await;
             }
+            return Err(ActorError::Other(anyhow::Error::new(
+                crate::actix::typed::FactoryAdmissionError::new(
+                    crate::actix::ChildInstanceAdmissionFailure::ShuttingDown,
+                    factory.take(),
+                    policy.take(),
+                ),
+            )));
         }
     }
     let (factory, policy) = tokio::join!(factory.retire(), policy.retire());

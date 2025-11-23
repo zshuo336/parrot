@@ -465,17 +465,11 @@ impl ActixActorSystem {
                             Ok(permit) => permit,
                             Err(reason) => {
                                 return Err(ActorError::Other(anyhow::Error::new(
-                                    TypedInstanceAdmissionError {
+                                    TypedInstanceAdmissionError::new(
                                         reason,
-                                        inputs: std::sync::Mutex::new(
-                                            TypedInstanceAdmissionInputs {
-                                                actor: payload
-                                                    .expect("child instance input")
-                                                    .take(),
-                                                strategy: policy.take(),
-                                            },
-                                        ),
-                                    },
+                                        payload.expect("child instance input").take(),
+                                        policy.take(),
+                                    ),
                                 )));
                             }
                         }

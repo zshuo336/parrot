@@ -826,10 +826,12 @@ mod receipt_contracts {
         runtime.block_on(async {
             let count = Arc::new(AtomicUsize::new(0));
             let mut active = Vec::with_capacity(MAX_PENDING_CLEANUPS_GLOBAL + 1);
+            let mut receipts = Vec::with_capacity(MAX_PENDING_CLEANUPS_GLOBAL + 1);
             for _ in 0..=MAX_PENDING_CLEANUPS_GLOBAL {
                 let slots = Arc::new(Semaphore::new(1));
                 active.push(slots.clone().acquire_owned().await.unwrap());
                 let input = OwnedPayload::new(Counted(count.clone()), runtime.handle(), &slots);
+                receipts.push(input.receipt());
                 drop(input.retire());
             }
 
@@ -846,12 +848,18 @@ mod receipt_contracts {
 
             drop(active);
             tokio::time::timeout(Duration::from_secs(10), async {
-                while count.load(Ordering::SeqCst) != MAX_PENDING_CLEANUPS_GLOBAL + 1 {
-                    tokio::task::yield_now().await;
+                // The destructor's counter precedes quota release. Its actual
+                // receipt proves both, even after another observer was cancelled.
+                for receipt in receipts {
+                    receipt.await.unwrap();
                 }
             })
             .await
             .expect("global cleanup owners did not drain");
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                MAX_PENDING_CLEANUPS_GLOBAL + 1
+            );
             assert_eq!(
                 global_pending_cleanup_slots().available_permits(),
                 MAX_PENDING_CLEANUPS_GLOBAL,

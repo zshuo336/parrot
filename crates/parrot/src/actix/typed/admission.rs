@@ -17,6 +17,16 @@ pub struct TypedInstanceAdmissionError<A: ParrotTypedDispatch> {
     pub(super) inputs: Mutex<TypedInstanceAdmissionInputs<A>>,
 }
 impl<A: ParrotTypedDispatch> TypedInstanceAdmissionError<A> {
+    pub(crate) fn new(
+        reason: ChildInstanceAdmissionFailure,
+        actor: A,
+        strategy: Option<SupervisorStrategyType>,
+    ) -> Self {
+        Self {
+            reason,
+            inputs: Mutex::new(TypedInstanceAdmissionInputs { actor, strategy }),
+        }
+    }
     pub fn into_inputs(self) -> TypedInstanceAdmissionInputs<A> {
         self.inputs
             .into_inner()
@@ -57,7 +67,7 @@ impl<F: Send + 'static> FactoryAdmissionError<F> {
             .into_inner()
             .unwrap_or_else(|error| error.into_inner())
     }
-    pub(in crate::actix) fn new(
+    pub(crate) fn new(
         reason: ChildInstanceAdmissionFailure,
         factory: F,
         strategy: Option<SupervisorStrategyType>,
