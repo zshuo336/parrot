@@ -12,7 +12,9 @@ pub enum ChildInstanceAdmissionFailure {
 
 /// Original context arguments returned without validation or background cleanup.
 /// The actor remains in its engine wrapper and can be passed back to `spawn`.
-/// Rejected inputs and unpolled futures remain caller-owned.
+/// Rejected inputs remain caller-owned. Before admission, the returned future
+/// protects the original inputs; dropping it unpolled retires them through the
+/// context's cleanup executor, including after the system or host has exited.
 pub struct ChildInstanceAdmissionInputs {
     pub actor: BoxedMessage,
     pub config: BoxedMessage,

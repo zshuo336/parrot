@@ -13,6 +13,9 @@ use std::sync::RwLock;
 #[cfg(test)]
 #[path = "child_instance_contracts.rs"]
 mod child_instance_contracts;
+#[cfg(test)]
+#[path = "context/expired_contracts.rs"]
+mod expired_contracts;
 
 #[derive(Clone, Default)]
 struct ManagedSpawner {
