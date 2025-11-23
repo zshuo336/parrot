@@ -331,6 +331,13 @@ fn check(sharded: bool, route: Route, outcome: Outcome) {
                     .unwrap();
                 (parent, neighbour)
             });
+            let processor = Arc::downgrade(
+                &system
+                    .get_mailbox("/parent")
+                    .unwrap()
+                    .get_processor()
+                    .unwrap(),
+            );
             drop(host);
             let driver = runtime();
             let cause = traced.then(TraceContext::root);
@@ -362,27 +369,34 @@ fn check(sharded: bool, route: Route, outcome: Outcome) {
                 }
                 trace::scope(Some(TraceContext::root()), async {
                     let mut stopped = None;
-                    for _ in 0..2 {
+                    for attempt in 0..2 {
+                        let started = Instant::now();
                         let result = parent.stop().await;
+                        let diagnostic = || {
+                            let processor = processor.upgrade()
+                                .map(|processor| (processor.is_initialized(), processor.has_failed(), processor.get_statistics()));
+                            format!("sharded={sharded} route={route:?} outcome={outcome:?} traced={traced} hostile={hostile} attempt={attempt} elapsed={:?} retirement={:?} processor(initialized,failed,stats)={processor:?} state={state:?} neighbour={neighbour_state:?}",
+                                started.elapsed(), parent.retirement_status())
+                        };
                         let receipt = format!("{result:?}");
                         if let Some(previous) = &stopped {
-                            assert_eq!(&receipt, previous, "retirement receipt changed");
+                            assert_eq!(&receipt, previous, "retirement receipt changed; {}", diagnostic());
                         }
                         stopped = Some(receipt);
                         if hostile {
                             assert!(matches!(&result, Err(ActorError::Panic(text))
                                 if text.contains("context message future disposal")
-                                && text.contains("panic payload destructor panicked")), "{result:?}");
-                            assert!(matches!(parent.retirement_status(), RetirementStatus::Retired(Err(_))));
+                                && text.contains("panic payload destructor panicked")), "{result:?}; {}", diagnostic());
+                            assert!(matches!(parent.retirement_status(), RetirementStatus::Retired(Err(_))), "{}", diagnostic());
                         } else if outcome == Outcome::Cancel {
                             assert!(matches!(&result, Err(ActorError::Other(error))
                                 if ["Actor system is already shutting down",
                                     "Failed during shutdown: actor /parent execution cancelled"]
-                                    .contains(&error.to_string().as_str())), "{result:?}");
-                            assert!(matches!(parent.retirement_status(), RetirementStatus::Retired(Err(_))));
+                                    .contains(&error.to_string().as_str())), "{result:?}; {}", diagnostic());
+                            assert!(matches!(parent.retirement_status(), RetirementStatus::Retired(Err(_))), "{}", diagnostic());
                         } else {
-                            result.unwrap();
-                            assert!(matches!(parent.retirement_status(), RetirementStatus::Retired(Ok(()))));
+                            assert!(result.is_ok(), "{result:?}; {}", diagnostic());
+                            assert!(matches!(parent.retirement_status(), RetirementStatus::Retired(Ok(()))), "{}", diagnostic());
                         }
                     }
                     assert_eq!(*neighbour.send(Box::new(43u32)).await.unwrap().downcast::<u32>().unwrap(), 43);
