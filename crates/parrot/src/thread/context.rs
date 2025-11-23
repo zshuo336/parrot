@@ -18,6 +18,10 @@ use parrot_api::supervisor::SupervisorStrategyType;
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use std::sync::RwLock;
 
+#[cfg(test)]
+#[path = "context/deferred_identity_contracts.rs"]
+mod deferred_identity_contracts;
+
 struct ThreadChildRecipient(crate::thread::mailbox::WeakMailboxRef);
 impl crate::children::ChildRecipient for ThreadChildRecipient {
     fn deliver(&self, event: crate::children::ChildTerminated) -> BoxedFuture<'_, ActorResult<()>> {
@@ -791,7 +795,7 @@ impl<A: Actor + Send + Sync + 'static> ActorSpawner for ThreadContext<A> {
         let system = self.system();
         let factory = self.own_schedule_input(factory);
         let strategy = self.own_schedule_input(strategy);
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             let error = if self.mailbox.is_none() || system.is_none() {
                 Some(ActorError::InitializationError(
                     "Thread spawner is not bound to a live managed actor".into(),
@@ -838,7 +842,7 @@ impl<A: Actor + Send + Sync + 'static> ActorSpawner for ThreadContext<A> {
                     reservation,
                 )
                 .await
-        })
+        }))
     }
 
     fn spawn<'a>(
