@@ -20,6 +20,8 @@ use std::{
 };
 
 const WAIT: Duration = Duration::from_secs(5);
+#[path = "recovery_contracts/retired_calls.rs"]
+mod retired_calls;
 type Context = ActixContext<ActixActor<Native>>;
 #[derive(Default)]
 struct Counts {
