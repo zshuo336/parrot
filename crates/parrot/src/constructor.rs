@@ -9,6 +9,8 @@ pub(crate) mod prepared;
 #[cfg(test)]
 mod reentrant_cleanup_contracts;
 mod retirement;
+#[cfg(test)]
+mod worker_quota_contracts;
 use crate::owned_payload::{join_error, panic_message};
 use parrot_api::types::BoxedFuture;
 use std::sync::{
@@ -16,6 +18,18 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+
+struct WorkerPermit(Option<OwnedSemaphorePermit>);
+impl WorkerPermit {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self(Some(permit))
+    }
+}
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        crate::owned_payload::release_quota(self.0.take());
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum ConstructionError<E> {
@@ -217,6 +231,7 @@ impl<A: Send + 'static> Factory<A> {
                 _ = control.cancelled() => return Err(ConstructionError::Cancelled),
                 permit = self.workers.clone().acquire_owned() => permit.map_err(|e| ConstructionError::WorkerFailed(e.to_string()))?,
             };
+            let permit = WorkerPermit::new(permit);
             tokio::task::spawn_blocking(scoped_blocking(
                 parrot_api::trace::TraceContext::current(),
                 move || {

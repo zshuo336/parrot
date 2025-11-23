@@ -1,5 +1,7 @@
 //! A staged output releases construction capacity while retaining its invocation.
-use super::{ConstructionControl, ConstructionError, Factory, Invocation, panic_message};
+use super::{
+    ConstructionControl, ConstructionError, Factory, Invocation, WorkerPermit, panic_message,
+};
 use parrot_api::types::BoxedFuture;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -228,6 +230,7 @@ impl<A: Send + 'static> Prepared<A> {
                     }
                 },
             };
+            let permit = WorkerPermit::new(permit);
             let (actor, invocation) = self.parts.take().expect("one prepared publication");
             let mut output = OutputLease::new(actor, invocation, self.context.clone());
             tokio::task::spawn_blocking(super::scoped_blocking(self.context.clone(), move || {
@@ -324,6 +327,7 @@ impl<A: Send + 'static> Factory<A> {
                 _ = control.cancelled() => return Err(ConstructionError::Cancelled),
                 permit = self.workers.clone().acquire_owned() => permit.map_err(|error| ConstructionError::WorkerFailed(error.to_string()))?,
             };
+            let permit = WorkerPermit::new(permit);
             let workers = self.workers.clone();
             let cleanup = self.cleanup.clone();
             let runtime = tokio::runtime::Handle::current();
