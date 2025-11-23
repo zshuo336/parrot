@@ -35,6 +35,10 @@ pub(super) use root_instance::Creation;
 #[path = "system/root_instance_contracts.rs"]
 mod root_instance_contracts;
 
+#[cfg(test)]
+#[path = "system/cleanup_saturation_contracts.rs"]
+mod cleanup_saturation_contracts;
+
 struct ArbiterOwners {
     workers: Vec<ArbiterHandle>,
     threads: Vec<std::thread::ThreadId>,
