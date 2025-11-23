@@ -21,6 +21,9 @@ SUITES = {'io_async_fd': {'Linux': 27, 'Darwin': 24},
           'sync_watch': {'Linux': 22, 'Darwin': 22},
           'sync_semaphore': {'Linux': 21, 'Darwin': 21},
           'sync_semaphore_owned': {'Linux': 10, 'Darwin': 10},
+          'sync_mutex': {'Linux': 7, 'Darwin': 7},
+          'sync_mutex_owned': {'Linux': 6, 'Darwin': 6},
+          'sync_rwlock': {'Linux': 19, 'Darwin': 19},
           'parrot_notification_fanout': {'Linux': 16, 'Darwin': 16},
           'task_blocking': {'Linux': 16, 'Darwin': 16},
           'rt_spawn_blocking': {'Linux': 1, 'Darwin': 1}}
@@ -211,10 +214,10 @@ class Check:
             saved = self.save_binary('minimal-notification-' + profile, binaries[notification])
             log = self.run('minimal-notification-' + profile, [str(saved), '--test-threads=2'], timeout=60)
             verify_suite(log, 0, SUITES[notification][system])
-        require(len(self.rows) == 34 and self.capture() == self.inputs and len(self.artifacts) == 24 and
+        require(len(self.rows) == 40 and self.capture() == self.inputs and len(self.artifacts) == 30 and
                 all(sha(self.output / item['path']) == item['sha256'] for item in self.artifacts),
                 'runtime gate stage/source/artifact selection changed')
-        save(self.output / 'verified.json', dict(status='verified', platform=system, stages=34, cargo_build_jobs=2,
+        save(self.output / 'verified.json', dict(status='verified', platform=system, stages=40, cargo_build_jobs=2,
              upstream_tests_per_profile=sum(counts[system] for counts in SUITES.values()),
              minimal_sync_profiles=2, minimal_notification_tests_per_profile=16,
              resolutions=self.resolutions, artifacts=self.artifacts, source_unchanged=True,

@@ -210,6 +210,11 @@ close, reentrant FIFO ordering and hostile panic payloads. This
 does not change the public Tokio API or suppress the caller's first wake panic;
 Parrot's existing publishers continue to contain it at their ownership boundary.
 
+The gate also runs the pinned borrowed/owned Mutex and RwLock suites in debug
+and release. These locks share the semaphore implementation; their cancellation,
+fairness, mapping, downgrade and multithreaded behavior must remain covered when
+the underlying wake and permit-distribution paths change.
+
 ## Maintenance and removal
 
 Keep the upstream source and license intact. When upgrading, verify the new

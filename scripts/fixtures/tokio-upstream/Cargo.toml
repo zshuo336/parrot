@@ -53,6 +53,18 @@ name = "sync_semaphore_owned"
 path = "../../../vendor/tokio/tests/sync_semaphore_owned.rs"
 
 [[test]]
+name = "sync_mutex"
+path = "../../../vendor/tokio/tests/sync_mutex.rs"
+
+[[test]]
+name = "sync_mutex_owned"
+path = "../../../vendor/tokio/tests/sync_mutex_owned.rs"
+
+[[test]]
+name = "sync_rwlock"
+path = "../../../vendor/tokio/tests/sync_rwlock.rs"
+
+[[test]]
 name = "parrot_notification_fanout"
 path = "../../../vendor/tokio/tests/parrot_notification_fanout.rs"
 
