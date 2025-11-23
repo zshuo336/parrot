@@ -4,6 +4,8 @@ use super::*;
 #[cfg(test)]
 mod pending_contracts;
 #[cfg(test)]
+mod permit_wake_contracts;
+#[cfg(test)]
 mod receipt_contracts;
 #[cfg(test)]
 mod saturation_contracts;
@@ -65,10 +67,10 @@ impl<A> CaptureDisposal<A> {
             // An earlier unpublished-output failure must not be hidden by either
             // successful capture retirement or a later capture failure.
             let result = self.failure.take().map_or(captures, Err);
-            drop(self.creation_reservation.take());
+            crate::owned_payload::release_quota(self.creation_reservation.take());
             // Completion wakers may immediately reuse these same quotas.
-            drop(self.cleanup.take());
-            drop(self.pending.take());
+            crate::owned_payload::release_quota(self.cleanup.take());
+            crate::owned_payload::release_quota(self.pending.take());
             if let Some(finished) = self.finished.take() {
                 publish_finished(&finished, result.clone());
             }
@@ -165,10 +167,11 @@ impl<A> Drop for Retirement<A> {
 pub(super) fn invocation_finished<A>(invocation: &mut Invocation<A>) -> Result<(), String> {
     // Both explicit retirement and Drop may visit the same invocation.
     if invocation.function.is_none() {
-        drop(invocation.cleanup.take());
+        crate::owned_payload::release_quota(invocation.cleanup.take());
         return Ok(());
     }
     drop(invocation.function.take());
+    let mut cleanup = invocation.cleanup.take();
     let captures = {
         let mut state = invocation.state.lock().unwrap();
         state.active -= 1;
@@ -177,25 +180,21 @@ pub(super) fn invocation_finished<A>(invocation: &mut Invocation<A>) -> Result<(
                 Some(CaptureDisposal::take(
                     &mut state,
                     Some(finished),
-                    invocation.cleanup.take(),
+                    cleanup.take(),
                 ))
             } else if Arc::strong_count(&invocation.state) == 1 {
                 // No Factory or retirement owner survives: the prepared
                 // output's discard receipt must include this last capture.
-                Some(CaptureDisposal::take(
-                    &mut state,
-                    None,
-                    invocation.cleanup.take(),
-                ))
+                Some(CaptureDisposal::take(&mut state, None, cleanup.take()))
             } else {
-                drop(invocation.cleanup.take());
                 None
             }
         } else {
-            drop(invocation.cleanup.take());
             None
         }
     };
+    // Quota release can invoke an admission waiter's user-supplied waker.
+    crate::owned_payload::release_quota(cleanup);
     invocation.changed.notify_waiters();
     captures.map_or(Ok(()), |mut captures| captures.retire())
 }

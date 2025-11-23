@@ -67,40 +67,45 @@ fn pending_cleanup_slots(active: &Arc<Semaphore>) -> Arc<Semaphore> {
 /// means the caller must apply synchronous backpressure or leave the receipt
 /// with an already-live owner; it must not create another suspended task.
 pub(crate) struct PendingCleanupPermit {
-    _local: OwnedSemaphorePermit,
-    _global: OwnedSemaphorePermit,
+    local: Option<OwnedSemaphorePermit>,
+    global: Option<OwnedSemaphorePermit>,
+}
+impl Drop for PendingCleanupPermit {
+    fn drop(&mut self) {
+        release_quota(self.local.take());
+        release_quota(self.global.take());
+    }
 }
 
 pub(crate) fn try_pending_cleanup_permit(active: &Arc<Semaphore>) -> Option<PendingCleanupPermit> {
     let local = pending_cleanup_slots(active).try_acquire_owned().ok()?;
-    let global = match global_pending_cleanup_slots().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            drop(local);
-            return None;
-        }
+    let mut reservation = PendingCleanupPermit {
+        local: Some(local),
+        global: None,
     };
-    Some(PendingCleanupPermit {
-        _local: local,
-        _global: global,
-    })
+    reservation.global = Some(global_pending_cleanup_slots().try_acquire_owned().ok()?);
+    Some(reservation)
 }
 
 /// Wait before transferring a value out of an existing owner. Cancelling this
 /// admission releases any partial reservation and leaves the value in place.
 pub(crate) async fn pending_cleanup_permit(active: &Arc<Semaphore>) -> PendingCleanupPermit {
-    let local = pending_cleanup_slots(active)
-        .acquire_owned()
-        .await
-        .expect("private pending cleanup pool remains open");
-    let global = global_pending_cleanup_slots()
-        .acquire_owned()
-        .await
-        .expect("private global pending cleanup pool remains open");
-    PendingCleanupPermit {
-        _local: local,
-        _global: global,
-    }
+    let mut reservation = PendingCleanupPermit {
+        local: Some(
+            pending_cleanup_slots(active)
+                .acquire_owned()
+                .await
+                .expect("private pending cleanup pool remains open"),
+        ),
+        global: None,
+    };
+    reservation.global = Some(
+        global_pending_cleanup_slots()
+            .acquire_owned()
+            .await
+            .expect("private global pending cleanup pool remains open"),
+    );
+    reservation
 }
 
 #[cfg(test)]
@@ -111,6 +116,8 @@ mod expired_factory_contracts;
 mod expired_system_contracts;
 #[cfg(test)]
 mod host_exit_contracts;
+#[cfg(test)]
+pub(crate) mod permit_wake_contracts;
 #[cfg(test)]
 mod publication_contracts;
 #[cfg(test)]
@@ -221,6 +228,15 @@ pub(crate) fn cleanup_diagnostic(report: impl FnOnce()) {
     }
 }
 
+/// Returning capacity invokes waiter wakers. Their panic must not interrupt
+/// retirement, skip other quotas, or replace the actual user disposal result.
+pub(crate) fn release_quota<T>(quota: T) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(quota))) {
+        let message = panic_message(payload);
+        cleanup_diagnostic(|| tracing::warn!(error = %message, "Cleanup quota waker panicked"));
+    }
+}
+
 pub(crate) fn publish_watch_value<T>(sender: &watch::Sender<T>, value: T) {
     let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sender.send_replace(value);
@@ -286,10 +302,10 @@ impl<T> Drop for Disposal<T> {
                             panic_message(payload)
                         )
                     });
-            drop(self.reservation.take());
-            drop(self.active.take());
-            drop(self.pending.take());
-            drop(self.global_pending.take());
+            release_quota(self.reservation.take());
+            release_quota(self.active.take());
+            release_quota(self.pending.take());
+            release_quota(self.global_pending.take());
             publish_finished(&self.finished, result);
         });
     }
@@ -328,7 +344,7 @@ impl<T: Send + 'static> OwnedPayload<T> {
         self
     }
     pub(crate) fn release_reservation(&mut self) {
-        drop(self.reservation.take());
+        release_quota(self.reservation.take());
     }
     pub(crate) fn with_executor(
         mut self,
@@ -371,7 +387,7 @@ impl<T: Send + 'static> OwnedPayload<T> {
     }
     pub(crate) fn take(mut self) -> T {
         let value = self.value.take().expect("unconsumed payload");
-        drop(self.reservation.take());
+        release_quota(self.reservation.take());
         if let Some(finished) = self.finished.get() {
             publish_finished(finished, Ok(()));
         }
@@ -403,7 +419,7 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
         };
         if !std::mem::needs_drop::<T>() {
             drop(value);
-            drop(self.reservation.take());
+            release_quota(self.reservation.take());
             if let Some(finished) = self.finished.get() {
                 publish_finished(finished, Ok(()));
             }
@@ -437,7 +453,7 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
                 // The process-wide owner budget is exhausted. Release the
                 // local reservation before applying synchronous backpressure;
                 // the value still receives the same isolated receipt.
-                drop(pending);
+                release_quota(pending);
                 drop(Disposal {
                     context: self.context.clone(),
                     value: Some(value),

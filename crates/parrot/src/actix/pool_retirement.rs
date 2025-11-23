@@ -68,7 +68,7 @@ impl HelperJoin {
         let mut cleanup = self.cleanup.lock().unwrap();
         if cleanup.closed {
             drop(cleanup);
-            drop(permit);
+            crate::owned_payload::release_quota(permit);
         } else {
             cleanup.active = Some(permit);
         }
@@ -80,8 +80,8 @@ impl HelperJoin {
             cleanup.closed = true;
             (cleanup.active.take(), cleanup.pending.take())
         };
-        drop(active);
-        drop(pending);
+        crate::owned_payload::release_quota(active);
+        crate::owned_payload::release_quota(pending);
     }
 
     fn join_thread(
@@ -449,6 +449,9 @@ mod contracts;
 #[cfg(test)]
 #[path = "pool_retirement/helper_contracts.rs"]
 mod helper_contracts;
+
+#[cfg(test)]
+mod permit_wake_contracts;
 
 #[cfg(test)]
 #[path = "pool_retirement/saturation_contracts.rs"]

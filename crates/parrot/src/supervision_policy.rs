@@ -1,5 +1,7 @@
 //! Owned user policy state. Callback and final capture disposal share bounded workers.
 #[cfg(test)]
+mod permit_wake_contracts;
+#[cfg(test)]
 mod receipt_contracts;
 #[cfg(test)]
 mod trace_contracts;
@@ -258,8 +260,8 @@ struct Disposal {
 impl Drop for Disposal {
     fn drop(&mut self) {
         let result = retire_strategy(self.strategy.take());
-        drop(self.active.take());
-        drop(self.pending.take());
+        crate::owned_payload::release_quota(self.active.take());
+        crate::owned_payload::release_quota(self.pending.take());
         crate::owned_payload::publish_watch(&self.finished, result);
     }
 }

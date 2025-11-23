@@ -4,6 +4,9 @@ use parrot_api::types::BoxedFuture;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
+#[cfg(test)]
+mod permit_wake_contracts;
+
 const MAX_LIFECYCLE_DISCARD_WAITERS: usize = 1024;
 
 fn lifecycle_discard_waiters() -> Arc<Semaphore> {
@@ -81,9 +84,9 @@ struct Discard<A> {
 impl<A> Drop for Discard<A> {
     fn drop(&mut self) {
         let result = self.output.retire();
-        drop(self.active.take());
-        drop(self.pending.take());
-        drop(self.waiter.take());
+        crate::owned_payload::release_quota(self.active.take());
+        crate::owned_payload::release_quota(self.pending.take());
+        crate::owned_payload::release_quota(self.waiter.take());
         crate::owned_payload::publish_watch(&self.finished, result);
     }
 }
