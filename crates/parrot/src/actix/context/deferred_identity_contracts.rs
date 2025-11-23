@@ -84,7 +84,7 @@ impl Drop for Capture {
     }
 }
 fn request(
-    context: &Context,
+    context: &mut Context,
     events: Events,
     entry: u8,
     policy: bool,
@@ -152,12 +152,12 @@ fn check(entry: u8, traced: bool) {
                         .unwrap();
                     let (reply, receive) = tokio::sync::oneshot::channel::<Context>();
                     parent.deliver(Box::new(reply)).await.unwrap();
-                    let context = receive.await.unwrap();
+                    let mut context = receive.await.unwrap();
                     let events = Events::default();
                     let origin = traced.then(TraceContext::root);
                     let polling = polling_traced.then(TraceContext::root);
                     let work = trace::in_scope(origin.clone(), || {
-                        request(&context, events.clone(), entry, explicit_policy)
+                        request(&mut context, events.clone(), entry, explicit_policy)
                     });
                     assert!(
                         events.lock().unwrap().is_empty(),

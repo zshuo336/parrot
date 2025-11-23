@@ -78,6 +78,13 @@ impl Actor for Dynamic {
     fn init<'a>(&'a mut self, _: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
         panic!("an unpolled dynamic instance must never initialize");
     }
+    fn receive_message<'a>(
+        &'a mut self,
+        _: BoxedMessage,
+        _: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        panic!("an unpolled dynamic instance must never receive a message");
+    }
 }
 struct Target(Mutex<Probe>);
 impl std::fmt::Debug for Target {
@@ -111,6 +118,15 @@ impl parrot_api::address::ActorRef for Target {
     }
     fn path(&self) -> String {
         "/unpolled-watch-target".into()
+    }
+    fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+        panic!("an unpolled watch target must not be queried");
+    }
+    fn clone_boxed(&self) -> BoxedActorRef {
+        panic!("an unpolled watch target must not be cloned");
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 impl Actor for Parent {

@@ -353,7 +353,7 @@ impl ActorSpawner for ManagedSpawner {
     ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
         let factory = self.own(factory);
         let strategy = self.own(strategy);
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             let Some(service) = self.service.as_ref() else {
                 return reject_factory_payload(factory, strategy, ActorError::Stopped).await;
             };
@@ -439,7 +439,7 @@ impl ActorSpawner for ManagedSpawner {
                         "child factory creation exceeded creation deadline".into(),
                     ))
                 })
-        })
+        }))
     }
 
     fn spawn<'a>(
