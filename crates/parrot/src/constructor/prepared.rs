@@ -6,6 +6,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 #[cfg(test)]
 mod permit_wake_contracts;
+#[cfg(test)]
+mod publication_contracts;
 
 const MAX_LIFECYCLE_DISCARD_WAITERS: usize = 1024;
 
@@ -245,13 +247,22 @@ impl<A: Send + 'static> Prepared<A> {
                         panic_message(panic)
                     )))
                 });
-                if let Err(ConstructionError::DisposalPanicked(error)) = &result {
+                let mut result = crate::owned_payload::PublicationInput::new(result);
+                if let Err(ConstructionError::DisposalPanicked(error)) = result.value() {
                     output.record_failure(error);
                 }
-                output
-                    .retire()
-                    .map_err(ConstructionError::DisposalPanicked)?;
-                result
+                if let Err(mut message) = output.retire() {
+                    // The capture failure owns this outcome. Retire it before
+                    // releasing the worker, preserving any secondary failure.
+                    if let Err(error) = result.retire() {
+                        message.push_str(&format!(
+                            "; discarded prepared publication outcome disposal failed: {}",
+                            crate::error_receipt::actor_summary(&error)
+                        ));
+                    }
+                    return Err(ConstructionError::DisposalPanicked(message));
+                }
+                result.take()
             }))
             .await
             .map_err(|error| {
