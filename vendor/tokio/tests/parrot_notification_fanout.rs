@@ -9,7 +9,7 @@ use std::{
     },
     task::{Context, Wake, Waker},
 };
-use tokio::sync::{watch, Notify};
+use tokio::sync::{watch, Notify, Semaphore};
 
 struct Noop;
 impl Wake for Noop {
@@ -306,4 +306,287 @@ fn watch_unchanged_update_remains_silent_and_the_next_update_notifies_everyone()
             std::task::Poll::Ready(Ok(()))
         ));
     }
+}
+
+fn semaphore_release(count: usize, owned: bool) {
+    let semaphore = Arc::new(Semaphore::new(if owned { count * 3 + 11 } else { 0 }));
+    let held = owned.then(|| {
+        semaphore
+            .clone()
+            .try_acquire_many_owned((count * 3 + 11) as u32)
+            .unwrap()
+    });
+    let observers = observers(count);
+    let mut pending: Vec<_> = observers
+        .iter()
+        .map(|observer| {
+            let mut future = Box::pin(semaphore.clone().acquire_many_owned(3));
+            register(&mut future, observer);
+            future
+        })
+        .collect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if owned {
+            drop(held);
+        } else {
+            semaphore.add_permits(count * 3 + 11);
+        }
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        semaphore.available_permits(),
+        11,
+        "unassigned permits were lost after wake panic"
+    );
+    let mut acquired = Vec::new();
+    for (future, observer) in pending.iter_mut().zip(&observers) {
+        assert_eq!(
+            observer.calls.load(Ordering::SeqCst),
+            1,
+            "semaphore waiter lost its wake"
+        );
+        match future.as_mut().poll(&mut Context::from_waker(&noop())) {
+            std::task::Poll::Ready(Ok(permit)) => acquired.push(permit),
+            other => panic!("assigned semaphore waiter did not complete: {other:?}"),
+        }
+    }
+    drop(acquired);
+    assert_eq!(semaphore.available_permits(), count * 3 + 11);
+}
+
+#[test]
+fn semaphore_add_permits_finishes_every_batch_and_preserves_excess() {
+    semaphore_release(96, false);
+}
+
+#[test]
+fn semaphore_owned_permit_drop_finishes_every_batch_and_preserves_excess() {
+    semaphore_release(96, true);
+}
+
+#[test]
+fn semaphore_exact_batch_release_keeps_all_assigned_permits() {
+    semaphore_release(32, false);
+}
+
+fn semaphore_close(cancel: bool) {
+    let semaphore = Semaphore::new(0);
+    let observers = observers(192);
+    let mut pending: Vec<_> = observers
+        .iter()
+        .enumerate()
+        .map(|(index, observer)| {
+            let mut future = Box::pin(semaphore.acquire());
+            register(&mut future, observer);
+            if cancel && index % 3 == 0 {
+                None
+            } else {
+                Some(future)
+            }
+        })
+        .collect();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| semaphore.close())).is_err());
+    assert!(semaphore.is_closed());
+    for (index, (future, observer)) in pending.iter_mut().zip(&observers).enumerate() {
+        assert_eq!(
+            observer.calls.load(Ordering::SeqCst),
+            usize::from(!cancel || index % 3 != 0),
+            "closed semaphore failed to wake an independent waiter"
+        );
+        if let Some(future) = future {
+            assert!(matches!(
+                future.as_mut().poll(&mut Context::from_waker(&noop())),
+                std::task::Poll::Ready(Err(_))
+            ));
+        }
+    }
+    semaphore.close();
+    assert!(matches!(
+        semaphore.try_acquire(),
+        Err(tokio::sync::TryAcquireError::Closed)
+    ));
+}
+
+#[test]
+fn semaphore_close_notifies_every_batch_despite_a_panicking_waker() {
+    semaphore_close(false);
+}
+
+#[test]
+fn semaphore_close_after_cancellation_notifies_all_remaining_waiters() {
+    semaphore_close(true);
+}
+
+#[test]
+fn semaphore_cancelled_partial_acquisition_returns_every_assigned_permit() {
+    let semaphore = Semaphore::new(0);
+    let mut head = Box::pin(semaphore.acquire_many(128));
+    assert!(head
+        .as_mut()
+        .poll(&mut Context::from_waker(&noop()))
+        .is_pending());
+    let observers = observers(96);
+    let mut pending: Vec<_> = observers
+        .iter()
+        .map(|observer| {
+            let mut future = Box::pin(semaphore.acquire());
+            register(&mut future, observer);
+            future
+        })
+        .collect();
+    semaphore.add_permits(96);
+    assert_eq!(semaphore.available_permits(), 0);
+    assert!(observers
+        .iter()
+        .all(|observer| observer.calls.load(Ordering::SeqCst) == 0));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(head))).is_err());
+    let mut acquired = Vec::new();
+    for (future, observer) in pending.iter_mut().zip(&observers) {
+        assert_eq!(observer.calls.load(Ordering::SeqCst), 1);
+        match future.as_mut().poll(&mut Context::from_waker(&noop())) {
+            std::task::Poll::Ready(Ok(permit)) => acquired.push(permit),
+            other => panic!("cancelled head lost assigned permits: {other:?}"),
+        }
+    }
+    drop(acquired);
+    assert_eq!(semaphore.available_permits(), 96);
+}
+
+#[test]
+fn semaphore_reentrant_acquisition_stays_behind_existing_waiters() {
+    type Acquisition = Pin<
+        Box<
+            dyn Future<
+                    Output = Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>,
+                > + Send,
+        >,
+    >;
+    struct Reenter {
+        semaphore: Arc<Semaphore>,
+        next: Mutex<Option<Acquisition>>,
+        stayed_pending: AtomicBool,
+    }
+    impl Wake for Reenter {
+        fn wake(self: Arc<Self>) {
+            let mut next: Acquisition = Box::pin(self.semaphore.clone().acquire_owned());
+            self.stayed_pending.store(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(&noop()))
+                    .is_pending(),
+                Ordering::SeqCst,
+            );
+            *self.next.lock().unwrap() = Some(next);
+            panic!("reentrant semaphore wake witness");
+        }
+    }
+    let semaphore = Arc::new(Semaphore::new(0));
+    let reenter = Arc::new(Reenter {
+        semaphore: semaphore.clone(),
+        next: Mutex::new(None),
+        stayed_pending: AtomicBool::new(false),
+    });
+    let mut head = Box::pin(semaphore.clone().acquire_owned());
+    assert!(head
+        .as_mut()
+        .poll(&mut Context::from_waker(&Waker::from(reenter.clone())))
+        .is_pending());
+    let observers = observers(96);
+    // This case has one hostile reentrant waker; ordinary followers never panic.
+    observers[0].first.store(true, Ordering::SeqCst);
+    let mut pending: Vec<_> = observers
+        .iter()
+        .map(|observer| {
+            let mut future = Box::pin(semaphore.clone().acquire_owned());
+            register(&mut future, observer);
+            future
+        })
+        .collect();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| semaphore.add_permits(97)))
+            .is_err()
+    );
+    assert!(reenter.stayed_pending.load(Ordering::SeqCst));
+    let mut next = reenter.next.lock().unwrap().take().unwrap();
+    assert!(next
+        .as_mut()
+        .poll(&mut Context::from_waker(&noop()))
+        .is_pending());
+    let mut acquired = Vec::new();
+    for future in std::iter::once(&mut head).chain(pending.iter_mut()) {
+        match future.as_mut().poll(&mut Context::from_waker(&noop())) {
+            std::task::Poll::Ready(Ok(permit)) => acquired.push(permit),
+            other => panic!("reentrant waiter bypassed earlier queued work: {other:?}"),
+        }
+    }
+    assert!(observers
+        .iter()
+        .all(|observer| observer.calls.load(Ordering::SeqCst) == 1));
+    assert_eq!(semaphore.available_permits(), 0);
+    drop(acquired);
+    let permit = match next.as_mut().poll(&mut Context::from_waker(&noop())) {
+        std::task::Poll::Ready(Ok(permit)) => permit,
+        other => panic!("reentrant acquisition never received returned capacity: {other:?}"),
+    };
+    drop(permit);
+    assert_eq!(semaphore.available_permits(), 97);
+}
+
+#[test]
+fn semaphore_preserves_first_panic_across_batches_with_hostile_payloads() {
+    struct Payload {
+        id: usize,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("semaphore panic payload disposal witness");
+        }
+    }
+    struct Hostile {
+        id: usize,
+        drops: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Wake for Hostile {
+        fn wake(self: Arc<Self>) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(Payload {
+                id: self.id,
+                drops: self.drops.clone(),
+            });
+        }
+    }
+    let semaphore = Semaphore::new(0);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pending: Vec<_> = (0..96)
+        .map(|id| {
+            let mut future = Box::pin(semaphore.acquire());
+            let waker = Waker::from(Arc::new(Hostile {
+                id,
+                drops: drops.clone(),
+                calls: calls.clone(),
+            }));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            future
+        })
+        .collect();
+    let payload =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| semaphore.close())).unwrap_err();
+    let id = payload.downcast_ref::<Payload>().map(|payload| payload.id);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))).is_err());
+    assert_eq!(id, Some(0));
+    assert_eq!(calls.load(Ordering::SeqCst), 96);
+    assert_eq!(drops.load(Ordering::SeqCst), 96);
+    for future in &mut pending {
+        assert!(matches!(
+            future.as_mut().poll(&mut Context::from_waker(&noop())),
+            std::task::Poll::Ready(Err(_))
+        ));
+    }
+    assert_eq!(semaphore.available_permits(), 0);
 }

@@ -45,6 +45,14 @@ name = "sync_watch"
 path = "../../../vendor/tokio/tests/sync_watch.rs"
 
 [[test]]
+name = "sync_semaphore"
+path = "../../../vendor/tokio/tests/sync_semaphore.rs"
+
+[[test]]
+name = "sync_semaphore_owned"
+path = "../../../vendor/tokio/tests/sync_semaphore_owned.rs"
+
+[[test]]
 name = "parrot_notification_fanout"
 path = "../../../vendor/tokio/tests/parrot_notification_fanout.rs"
 

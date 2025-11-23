@@ -193,11 +193,20 @@ Callbacks run outside the existing locks. Reentrant registrations remain in the
 next notification generation. Normal notification and unchanged watch updates
 retain their existing semantics.
 
-`tests/parrot_notification_fanout.rs` adds eight contracts for multiple batches
+Semaphore permit release, partial-acquisition cancellation and close also span
+multiple wake batches. They now finish assigning every released permit and
+notifying every affected waiter before resuming the first wake panic. Without
+this outer boundary, an aborted release loses its unassigned permit remainder
+and close can leave independent waiters asleep. Reentrant acquisition retains
+FIFO order, and excess permits remain available after the panic.
+
+`tests/parrot_notification_fanout.rs` adds sixteen contracts for multiple batches
 and shards, cancelled waiters, first-panic identity, hostile payload destructors,
 reentrant registration, sender close, and unchanged updates. The gate runs these
 contracts with both full runtime features and minimal `sync + parking_lot`, in
-debug and release, alongside the pinned upstream Notify and watch suites. This
+debug and release, alongside the pinned upstream Notify, watch and borrowed/owned
+semaphore suites. Semaphore cases include permit conservation, cancellation,
+close, reentrant FIFO ordering and hostile panic payloads. This
 does not change the public Tokio API or suppress the caller's first wake panic;
 Parrot's existing publishers continue to contain it at their ownership boundary.
 
@@ -216,7 +225,7 @@ positive control and synchronous oneshot/mpsc/shutdown cases. Check the minimal
 debug/release, strict Clippy, formatting and packaging checks. Retain negative
 controls for deferred notification and receptionist lock boundaries; run
 `mpsc_deferred_contract` plus the actual pinned upstream mpsc, oneshot and
-AsyncFd, blocking-task, Notify, watch and notification-fanout suites with
+AsyncFd, blocking-task, Notify, watch, semaphore and notification-fanout suites with
 `scripts/check_tokio_upstream.py`. Retain negative
 controls for missing initialization and initialization after the parker mutex is
 acquired. Remove this local patch only after an upstream replacement passes
