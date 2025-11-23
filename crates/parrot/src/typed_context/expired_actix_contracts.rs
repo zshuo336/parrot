@@ -9,6 +9,7 @@ use parrot_api::{
 };
 use std::sync::atomic::AtomicUsize;
 
+mod local_recovery;
 mod unpolled;
 
 const WAIT: Duration = Duration::from_secs(5);

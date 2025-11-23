@@ -19,6 +19,9 @@ mod deferred_identity_contracts;
 #[cfg(test)]
 #[path = "context/expired_contracts.rs"]
 mod expired_contracts;
+#[cfg(test)]
+#[path = "context/recovery_contracts.rs"]
+mod recovery_contracts;
 
 #[derive(Clone, Default)]
 struct ManagedSpawner {
