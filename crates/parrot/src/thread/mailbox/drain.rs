@@ -4,9 +4,23 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const CAPACITY: usize = 32;
 
+pub(super) struct DrainPermit(Option<OwnedSemaphorePermit>);
+
+impl From<OwnedSemaphorePermit> for DrainPermit {
+    fn from(permit: OwnedSemaphorePermit) -> Self {
+        Self(Some(permit))
+    }
+}
+
+impl Drop for DrainPermit {
+    fn drop(&mut self) {
+        crate::owned_payload::release_quota(self.0.take());
+    }
+}
+
 struct Join {
     thread: Option<std::thread::JoinHandle<()>>,
-    _permit: OwnedSemaphorePermit,
+    _permit: DrainPermit,
 }
 
 impl Drop for Join {
@@ -22,7 +36,7 @@ impl Drop for Join {
 pub(super) enum Reservation {
     Inline,
     Native {
-        permit: OwnedSemaphorePermit,
+        permit: DrainPermit,
         runtime: tokio::runtime::Handle,
     },
 }
@@ -39,7 +53,7 @@ impl Reservation {
                 static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
                 let slots = SLOTS.get_or_init(|| Arc::new(Semaphore::new(CAPACITY)));
                 Self::Native {
-                    permit: slots.clone().acquire_owned().await.unwrap(),
+                    permit: slots.clone().acquire_owned().await.unwrap().into(),
                     runtime,
                 }
             }
@@ -97,3 +111,6 @@ impl Reservation {
         }
     }
 }
+
+#[cfg(test)]
+mod permit_wake_contracts;

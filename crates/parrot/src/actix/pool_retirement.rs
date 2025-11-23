@@ -88,9 +88,17 @@ impl HelperJoin {
         thread: std::thread::JoinHandle<()>,
         reservations: &Arc<Mutex<Vec<NativeWorkerReservation>>>,
     ) -> Exit {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| thread.join()))
+        let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| thread.join()))
+            .unwrap_or_else(Err);
+        Self::finish_join(joined, reservations)
+    }
+
+    fn finish_join(
+        joined: std::thread::Result<()>,
+        reservations: &Arc<Mutex<Vec<NativeWorkerReservation>>>,
+    ) -> Exit {
+        let result = joined
             .map_err(crate::owned_payload::panic_message)
-            .and_then(|result| result.map_err(crate::owned_payload::panic_message))
             .map_err(|message| format!("Actix retirement thread failed: {message}"));
         for reservation in reservations.lock().unwrap().drain(..) {
             reservation.release_after_join();
@@ -185,16 +193,16 @@ impl HelperJoin {
 
     /// Finish an owner when the independent fallback thread could not be
     /// created. A non-owner caller can safely join synchronously; only the
-    /// worker itself must retain the handle to avoid joining itself.
+    /// worker itself transfers its handle to the prestarted process owner.
     fn finish_fallback(owner: FallbackOwner) {
         let Some((thread, reservations, finished)) = owner.lock().unwrap().take() else {
             return;
         };
         if thread.thread().id() == std::thread::current().id() {
-            *owner.lock().unwrap() = Some((thread, reservations, finished));
-            // There is no safe synchronous self-join. Keep the exact owner
-            // alive until the process/runtime can make progress.
-            std::mem::forget(owner);
+            crate::thread::native_budget::defer_join(thread, move |joined| {
+                let result = Self::finish_join(joined, &reservations);
+                Self::publish_finished(&finished, result);
+            });
             return;
         }
         let result = Self::join_thread(thread, &reservations);
@@ -327,6 +335,8 @@ impl Retirement {
             finished,
             _reservations: reservations.clone(),
         };
+        crate::thread::native_budget::prepare_join_fallback()
+            .map_err(|error| SystemError::InitializationError(error.to_string()))?;
         let runtime = crate::root_cohort::lifecycle_runtime()?;
         let (signal, receive) = mpsc::channel();
         let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -4,7 +4,7 @@
 //! covers independently-created Thread and Actix systems and is held until the
 //! corresponding OS join has completed.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::thread::error::SystemError;
@@ -33,6 +33,9 @@ impl NativeWorkerBudget {
     }
 
     pub(crate) fn try_reserve(self: &Arc<Self>) -> Result<NativeWorkerReservation, SystemError> {
+        // Self-owned workers cannot start another joiner under PID exhaustion.
+        // Establish that independent owner before admitting a business worker.
+        prepare_join_fallback()?;
         let permit = self.slots.clone().try_acquire_owned().map_err(|_| {
             SystemError::ThreadSetupError(format!(
                 "native worker budget exhausted ({} live or retiring threads)",
@@ -60,13 +63,128 @@ impl NativeWorkerReservation {
 
 type NativeJoinResult = Result<(), String>;
 
-fn join_native_worker(
-    handle: std::thread::JoinHandle<NativeJoinResult>,
+trait PendingJoin: Send {
+    fn is_finished(&self) -> bool;
+    fn finish(self: Box<Self>);
+}
+
+struct DeferredJoin<T, F> {
+    thread: std::thread::JoinHandle<T>,
+    finished: F,
+}
+
+impl<T: Send + 'static, F: FnOnce(std::thread::Result<T>) + Send> PendingJoin
+    for DeferredJoin<T, F>
+{
+    fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
+    fn finish(self: Box<Self>) {
+        (self.finished)(self.thread.join());
+    }
+}
+
+struct JoinFallback {
+    sender: mpsc::Sender<Box<dyn PendingJoin>>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl JoinFallback {
+    fn shared() -> Result<Arc<Self>, SystemError> {
+        static SHARED: OnceLock<Mutex<Option<Arc<JoinFallback>>>> = OnceLock::new();
+        let mut shared = SHARED.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        if let Some(owner) = &*shared {
+            return Ok(owner.clone());
+        }
+        let (sender, receiver) = mpsc::channel::<Box<dyn PendingJoin>>();
+        let thread = std::thread::Builder::new()
+            .name("parrot-native-join-owner".into())
+            .spawn(move || {
+                let mut pending: Vec<Box<dyn PendingJoin>> = Vec::new();
+                loop {
+                    let received = if pending.is_empty() {
+                        receiver.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    } else {
+                        receiver.recv_timeout(std::time::Duration::from_millis(1))
+                    };
+                    match received {
+                        Ok(job) => pending.push(job),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) if pending.is_empty() => return,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                    // Bound intake per pass so a stream of exits cannot starve
+                    // joins already ready to return their native reservations.
+                    pending.extend(receiver.try_iter().take(63));
+                    let mut index = 0;
+                    while index < pending.len() {
+                        if !pending[index].is_finished() {
+                            index += 1;
+                            continue;
+                        }
+                        let job = pending.swap_remove(index);
+                        if let Err(payload) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.finish()))
+                        {
+                            let message = crate::owned_payload::panic_message(payload);
+                            diagnostic(|| tracing::error!(error = %message, "native join completion failed"));
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                SystemError::ThreadSetupError(format!(
+                    "native join owner initialization failed: {error}"
+                ))
+            })?;
+        let owner = Arc::new(Self {
+            sender,
+            _thread: thread,
+        });
+        *shared = Some(owner.clone());
+        Ok(owner)
+    }
+}
+
+pub(crate) fn prepare_join_fallback() -> Result<(), SystemError> {
+    JoinFallback::shared().map(|_| ())
+}
+
+/// Transfer an already admitted native owner without allocating another OS
+/// thread. Production callers retain native reservations through this join;
+/// those process-wide reservations also bound the number of queued owners.
+pub(crate) fn defer_join<T: Send + 'static>(
+    thread: std::thread::JoinHandle<T>,
+    finished: impl FnOnce(std::thread::Result<T>) + Send + 'static,
+) {
+    let job: Box<dyn PendingJoin> = Box::new(DeferredJoin { thread, finished });
+    match JoinFallback::shared() {
+        Ok(owner) => {
+            if let Err(mpsc::SendError(job)) = owner.sender.send(job) {
+                // The prestarted process owner should never disappear. Keep
+                // the exact handle/lease if that invariant has been violated.
+                std::mem::forget(job);
+                diagnostic(|| tracing::error!("native join owner unexpectedly ended"));
+            }
+        }
+        Err(error) => {
+            std::mem::forget(job);
+            diagnostic(
+                || tracing::error!(%error, "native join owner was not prepared before admission"),
+            );
+        }
+    }
+}
+
+fn finish_native_worker(
+    joined: std::thread::Result<NativeJoinResult>,
     reservation: Option<NativeWorkerReservation>,
 ) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.join()))
+    let result = joined
         .map_err(crate::owned_payload::panic_message)
-        .and_then(|joined| joined.map_err(crate::owned_payload::panic_message))
         .and_then(|result| result);
     if let Some(reservation) = reservation {
         reservation.release_after_join();
@@ -74,6 +192,15 @@ fn join_native_worker(
     if let Err(error) = result {
         diagnostic(|| tracing::error!(%error, "native worker failed during implicit shutdown"));
     }
+}
+
+fn join_native_worker(
+    handle: std::thread::JoinHandle<NativeJoinResult>,
+    reservation: Option<NativeWorkerReservation>,
+) {
+    let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.join()))
+        .unwrap_or_else(Err);
+    finish_native_worker(joined, reservation);
 }
 
 /// Owns a native join until the OS thread has actually been joined. Its Drop
@@ -106,27 +233,9 @@ impl Drop for NativeJoinJob {
             return;
         }
 
-        // A scheduler can be dropped by its own worker. Never self-join; move
-        // the exact owner to a separate OS thread instead. The Arc keeps the
-        // reservation and handle alive if thread creation itself is rejected.
-        let owner = Arc::new(Mutex::new(Some((handle, reservation))));
-        let queued = owner.clone();
-        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            std::thread::Builder::new()
-                .name("parrot-native-join".into())
-                .spawn(move || {
-                    if let Some((handle, reservation)) = queued.lock().unwrap().take() {
-                        join_native_worker(handle, reservation);
-                    }
-                })
-        }));
-        if !matches!(spawned, Ok(Ok(_))) {
-            // There is no safe synchronous fallback on the worker itself.
-            // Retain the owner rather than detaching the worker or releasing
-            // its budget early; a later process teardown can reclaim it.
-            std::mem::forget(owner);
-            diagnostic(|| tracing::error!("native worker join thread creation failed"));
-        }
+        defer_join(handle, move |joined| {
+            finish_native_worker(joined, reservation)
+        });
     }
 }
 
@@ -165,6 +274,9 @@ fn diagnostic(report: impl FnOnce()) {
         let _ = crate::owned_payload::panic_message(payload);
     }
 }
+
+#[cfg(test)]
+mod fallback_contracts;
 
 #[cfg(test)]
 mod tests {

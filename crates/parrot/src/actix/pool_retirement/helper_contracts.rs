@@ -783,6 +783,57 @@ fn failed_fallback_thread_creation_is_joined_by_a_non_owner() {
     assert_eq!(receipt.borrow_and_update().clone(), Some(Ok(())));
 }
 
+#[test]
+fn failed_fallback_on_its_own_worker_eventually_returns_the_native_lease() {
+    self_owned_fallback(false);
+}
+
+#[test]
+fn self_owned_fallback_preserves_worker_panic_and_returns_the_native_lease() {
+    self_owned_fallback(true);
+}
+
+fn self_owned_fallback(panics: bool) {
+    let budget = Arc::new(crate::thread::native_budget::NativeWorkerBudget::with_capacity(1));
+    let reservation = budget.try_reserve().unwrap();
+    let (finished, receipt) = watch::channel(None);
+    let (send, receive) = mpsc::sync_channel(1);
+    let (started, observe_started) = mpsc::sync_channel(1);
+    let (release, wait) = mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        HelperJoin::finish_fallback(receive.recv().unwrap());
+        started.send(()).unwrap();
+        wait.recv_timeout(WAIT).unwrap();
+        assert!(!panics, "self-owned helper panic");
+    });
+    let owner: FallbackOwner = Arc::new(Mutex::new(Some((
+        worker,
+        Arc::new(Mutex::new(vec![reservation])),
+        finished,
+    ))));
+    send.send(owner).unwrap();
+    observe_started.recv_timeout(WAIT).unwrap();
+    let retained = budget.try_reserve().is_err();
+    let premature = receipt.borrow().is_some();
+    release.send(()).unwrap();
+    let result = observer_wait(receipt);
+    assert!(
+        retained && !premature,
+        "helper lease/receipt preceded actual exit"
+    );
+    let result = result.expect("self-owned helper join was stranded");
+    if panics {
+        assert_eq!(
+            result,
+            Err("Actix retirement thread failed: self-owned helper panic".into())
+        );
+    } else {
+        assert_eq!(result, Ok(()));
+    }
+    let reclaimed = budget.try_reserve().unwrap();
+    reclaimed.release_after_join();
+}
+
 fn receipt_diagnostic(dispatch_failure: bool, during_unwind: bool) {
     let fixture = actix::System::new().block_on(async { fixture() });
     let _release = Release(fixture.gate.clone());
