@@ -62,7 +62,8 @@ impl State {
     }
     fn release(&self) {
         self.release.store(true, Ordering::SeqCst);
-        if let Some(waker) = self.waker.lock().unwrap().take() {
+        let waker = self.waker.lock().unwrap().take();
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -140,12 +141,17 @@ impl<I: Unpin, T> Future for Delegate<'_, I, T> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let state = &self.target.state;
         assert_eq!(state.target_drops.load(Ordering::SeqCst), 0);
+        let mut registered = state.waker.lock().unwrap();
         if !state.release.load(Ordering::SeqCst) {
-            *state.waker.lock().unwrap() = Some(cx.waker().clone());
+            *registered = Some(cx.waker().clone());
+            drop(registered);
             state.note("pending");
             state.pending.fetch_add(1, Ordering::SeqCst);
             return Poll::Pending;
         }
+        let stale = registered.take();
+        drop(registered);
+        drop(stale);
         state.note("complete");
         state.completed.fetch_add(1, Ordering::SeqCst);
         if self.target.outcome == Outcome::Error {

@@ -26,6 +26,10 @@ use crate::thread::scheduler::queue::SchedulingQueue;
 #[path = "work_stealing_contracts.rs"]
 mod work_stealing_contracts;
 
+#[cfg(test)]
+#[path = "isolated_output_contracts.rs"]
+mod isolated_output_contracts;
+
 /// Bound diagnostic state independently of the number of short-lived actors.
 /// Panic counts are advisory metrics; retaining every historical path would
 /// turn a recoverable actor churn pattern into an unbounded worker allocation.
@@ -875,22 +879,33 @@ where
         let finished = poll_finished.clone();
         let task = tokio::task::spawn_blocking(move || {
             let waker = waker_ref(&poll_wake);
-            let mut result = future.poll(&mut Context::from_waker(&waker));
-            if result.is_ready() {
+            let mut result = crate::owned_payload::PublicationInput::new(
+                future.poll(&mut Context::from_waker(&waker)),
+            );
+            if result.value().is_ready() {
                 // Completed futures are disposed on this same blocking poll;
                 // only cancelled Pending work needs the owned fallback task.
                 if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     drop(future.future.take())
                 })) {
-                    result = Poll::Ready(Err(anyhow::anyhow!(
+                    let mut message = format!(
                         "isolated future destructor panicked: {}",
                         crate::owned_payload::panic_message(payload)
+                    );
+                    if let Err(error) = result.retire() {
+                        message.push_str(&format!(
+                            "; discarded isolated outcome disposal failed: {}",
+                            crate::error_receipt::actor_summary(&error)
+                        ));
+                    }
+                    result = crate::owned_payload::PublicationInput::new(Poll::Ready(Err(
+                        anyhow::anyhow!(message),
                     )));
                 }
             }
             drop(slot);
             finished.notify_one();
-            (future, result)
+            (future, result.take())
         });
         let cancel_on_drop = AbortQueuedPoll(task.abort_handle());
         let (returned_future, result) = task
