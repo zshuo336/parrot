@@ -1406,7 +1406,7 @@ impl ThreadActorSystem {
             self.retirement_runtime(),
             &self.cleanup_slots,
         );
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             if !actor.value().is::<ErasedSpawnBox>() {
                 let (actor, config) = tokio::join!(actor.retire(), config.retire());
                 actor.and(config)?;
@@ -1426,7 +1426,7 @@ impl ThreadActorSystem {
                 .0
                 .spawn_on(self.clone(), config.take(), thread_config)
                 .await
-        })
+        }))
     }
 
     /// Inject the gateway used for explicit `parrot://` paths. Gateways that
@@ -2183,13 +2183,13 @@ impl ErasedSpawnBox {
             system.retirement_runtime(),
             &system.cleanup_slots,
         );
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             payload
                 .take()
                 .0
                 .spawn_on_path(system, path, engine.take())
                 .await
-        })
+        }))
     }
 
     /// Downcast-friendly BoxedMessage form.
@@ -2263,7 +2263,7 @@ where
             system.retirement_runtime(),
             &system.cleanup_slots,
         );
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             if !config.value().is::<A::Config>() || payload.value().actor.is_none() {
                 let (payload, config, engine) =
                     tokio::join!(payload.retire(), config.retire(), engine.retire());
@@ -2283,7 +2283,7 @@ where
                 .await
                 .map_err(ActorError::from)?;
             Ok(Box::new(reference) as BoxedActorRef)
-        })
+        }))
     }
 
     /// Supervision respawn: keep the child's original path (the supervisor
@@ -2307,7 +2307,7 @@ where
             system.retirement_runtime(),
             &system.cleanup_slots,
         );
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             if payload.value().actor.is_none() {
                 let (payload, engine) = tokio::join!(payload.retire(), engine.retire());
                 payload.and(engine)?;
@@ -2321,7 +2321,7 @@ where
                 .await
                 .map_err(|error| ActorError::InternalError(error.to_string()))?;
             Ok(Box::new(reference) as BoxedActorRef)
-        })
+        }))
     }
 }
 
@@ -2535,7 +2535,7 @@ impl ActorSystem for ThreadActorSystem {
             self.retirement_runtime(),
             &self.cleanup_slots,
         );
-        Box::pin(async move {
+        Box::pin(parrot_api::trace::capture(async move {
             let Some(system) = self.self_arc() else {
                 let (actor, config) = tokio::join!(actor.retire(), config.retire());
                 actor
@@ -2553,7 +2553,7 @@ impl ActorSystem for ThreadActorSystem {
                     parrot_api::system::SystemError::ActorCreationError(error.to_string())
                 })?;
             Ok(Box::new(typed) as Box<dyn ActorRef>)
-        })
+        }))
     }
 
     async fn get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
