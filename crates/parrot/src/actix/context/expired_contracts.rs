@@ -62,6 +62,57 @@ impl Drop for Parent {
     }
 }
 impl ActixEngineExt for Parent {}
+
+struct Dynamic(Option<Mutex<Probe>>);
+impl Drop for Dynamic {
+    fn drop(&mut self) {
+        drop(self.0.take());
+    }
+}
+impl Actor for Dynamic {
+    type Config = parrot_api::engine::InstanceConfig;
+    type Context = dyn ActorContext;
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+    fn init<'a>(&'a mut self, _: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        panic!("an unpolled dynamic instance must never initialize");
+    }
+}
+struct Target(Mutex<Probe>);
+impl std::fmt::Debug for Target {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = &self.0;
+        formatter.write_str("UnpolledWatchTarget")
+    }
+}
+impl parrot_api::address::ActorRef for Target {
+    fn send<'a>(&'a self, _: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        panic!("unpolled watch input was sent a message");
+    }
+    fn send_with_timeout<'a>(
+        &'a self,
+        _: BoxedMessage,
+        _: Option<Duration>,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        panic!("unpolled watch input was asked a message");
+    }
+    fn deliver<'a>(&'a self, _: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        panic!("unpolled watch input was delivered a message");
+    }
+    fn watch<'a>(&'a self, _: BoxedActorRef) -> BoxedFuture<'a, ActorResult<()>> {
+        panic!("an unpolled watch delegate must never execute");
+    }
+    fn unwatch<'a>(&'a self, _: BoxedActorRef) -> BoxedFuture<'a, ActorResult<()>> {
+        panic!("an unpolled unwatch delegate must never execute");
+    }
+    fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
+        panic!("an unpolled watch target must not be stopped");
+    }
+    fn path(&self) -> String {
+        "/unpolled-watch-target".into()
+    }
+}
 impl Actor for Parent {
     type Config = Config;
     type Context = Context;
@@ -243,6 +294,43 @@ fn check(case: u8) {
                             .map(|_| ()),
                     )
                 }
+                13..=15 => {
+                    let (actor, config, strategy) = match case {
+                        13 => (
+                            Dynamic(Some(Mutex::new(probe))),
+                            Box::new(()) as parrot_api::engine::InstanceConfig,
+                            None,
+                        ),
+                        14 => (
+                            Dynamic(None),
+                            Box::new(probe) as parrot_api::engine::InstanceConfig,
+                            None,
+                        ),
+                        _ => (
+                            Dynamic(None),
+                            Box::new(()) as parrot_api::engine::InstanceConfig,
+                            Some(policy(Some(probe))),
+                        ),
+                    };
+                    Box::pin(
+                        ctx.async_spawner()
+                            .unwrap()
+                            .spawn(Box::new(actor), config, strategy)
+                            .map(|_| ()),
+                    )
+                }
+                16 => {
+                    let factory: parrot_api::engine::RuntimeFactory =
+                        Box::new(|| panic!("an unpolled dynamic factory must never execute"));
+                    Box::pin(
+                        ctx.async_spawner()
+                            .unwrap()
+                            .spawn_factory(factory, Some(policy(Some(probe))))
+                            .map(|_| ()),
+                    )
+                }
+                17 => Box::pin(ctx.watch(Box::new(Target(Mutex::new(probe)))).map(|_| ())),
+                18 => Box::pin(ctx.unwatch(Box::new(Target(Mutex::new(probe)))).map(|_| ())),
                 _ => unreachable!(),
             }
         });
@@ -272,7 +360,7 @@ fn check(case: u8) {
     let (caller, remaining) = cancelled.expect("unpolled cancellation blocked after host exit");
     let owned = if case == 4 {
         1
-    } else if (5..=7).contains(&case) {
+    } else if (5..=7).contains(&case) || (13..=15).contains(&case) {
         3
     } else {
         2
@@ -332,3 +420,9 @@ contract!(factory_policy_after_host_exit, 9);
 contract!(dynamic_factory_capture_after_host_exit, 10);
 contract!(local_factory_capture_after_host_exit, 11);
 contract!(local_factory_policy_after_host_exit, 12);
+contract!(dynamic_instance_actor_after_host_exit, 13);
+contract!(dynamic_instance_config_after_host_exit, 14);
+contract!(dynamic_instance_policy_after_host_exit, 15);
+contract!(dynamic_factory_policy_after_host_exit, 16);
+contract!(watch_target_after_host_exit, 17);
+contract!(unwatch_target_after_host_exit, 18);

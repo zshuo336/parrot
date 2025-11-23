@@ -14,6 +14,9 @@ use std::sync::RwLock;
 #[path = "child_instance_contracts.rs"]
 mod child_instance_contracts;
 #[cfg(test)]
+#[path = "context/deferred_identity_contracts.rs"]
+mod deferred_identity_contracts;
+#[cfg(test)]
 #[path = "context/expired_contracts.rs"]
 mod expired_contracts;
 
