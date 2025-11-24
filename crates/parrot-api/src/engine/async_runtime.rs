@@ -63,6 +63,11 @@ impl SpawnOptions {
 /// Any lets facades preserve native identity and recognize known facade cycles.
 /// Existing static implementations require no additional method.
 pub trait AsyncEngineRuntime: Any + Send + Sync {
+    /// Independent I/O execution, when configured and supported by this engine.
+    fn io_runtime(&self) -> Option<&dyn super::AsyncIoRuntime> {
+        None
+    }
+
     /// Optional explicit root supervision groups, bound to this runtime.
     fn cohort_runtime(&self) -> Option<&dyn super::AsyncCohortRuntime> {
         None

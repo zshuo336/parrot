@@ -11,6 +11,9 @@ use std::{any::Any, sync::Arc};
 /// An engine supplies identity and ownership services; business messages still
 /// use the actor's concrete `Msg` and `Reply` types.
 pub trait TypedContextServices: Any + Send + Sync {
+    fn io_runtime(&self) -> Option<&dyn crate::engine::AsyncIoRuntime> {
+        None
+    }
     /// Optional generation-owned service publication. Foreign contexts retain
     /// the default unavailable result; custom gateways define their own cleanup.
     fn receptionist_register(
@@ -58,6 +61,10 @@ pub trait TypedContextServices: Any + Send + Sync {
 #[derive(Clone)]
 pub struct TypedContext(Arc<dyn TypedContextServices>);
 impl TypedContext {
+    pub fn io_runtime(&self) -> Option<&dyn crate::engine::AsyncIoRuntime> {
+        self.0.io_runtime()
+    }
+
     /// Publish this actor's path using the gateway captured at invocation. Native
     /// contexts with a built-in gateway withdraw all publications before their
     /// generation's retirement completes. Calls first polled after retirement

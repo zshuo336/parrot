@@ -485,6 +485,16 @@ impl std::fmt::Debug for TokioActorRuntime {
 }
 
 impl TokioActorRuntime {
+    /// Whether shutdown on the current execution would wait for itself.
+    /// Composite runtimes use this before closing their own admission.
+    pub fn shutdown_would_wait_for_current_task(&self) -> bool {
+        SubmissionScope::contains(&self.inner)
+            || [&self.inner.owned_runtime, &self.inner.io_runtime]
+                .into_iter()
+                .flatten()
+                .any(|runtime| runtime.is_current())
+    }
+
     async fn wait_for_idle(inner: &TokioRuntimeInner) {
         loop {
             let notified = inner.changed.notified();

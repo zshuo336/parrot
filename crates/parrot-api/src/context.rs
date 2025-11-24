@@ -288,6 +288,11 @@ impl ReadOnlyChildrenVec {
 /// - Async operations
 /// - Minimized blocking
 pub trait ActorContext: Send + Sync {
+    /// Generation-bound access to the engine's configured I/O executor.
+    fn io_runtime(&self) -> Option<&dyn crate::engine::AsyncIoRuntime> {
+        None
+    }
+
     /// Returns self reference
     ///
     /// ## Thread Safety

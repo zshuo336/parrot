@@ -41,6 +41,8 @@ pub use local_runtime::{
     AsyncLocalActorSpawner, AsyncLocalRuntime, LocalActor, LocalRuntimeActor, LocalRuntimeFactory,
 };
 mod async_runtime;
+mod io_runtime;
+pub use io_runtime::{AsyncIoRuntime, AsyncIoRuntimeExt};
 mod root_cohort;
 pub use async_runtime::{
     AsyncActorSpawner, AsyncEngineRuntime, AsyncFactoryRuntime, FactoryOptions, InstanceConfig,
