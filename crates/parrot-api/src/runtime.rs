@@ -353,8 +353,43 @@ impl TaskState {
 // Field order keeps the accepted input alive in accounting until its actual
 // destructor returns, including cancellation while waiting for a permit.
 struct PendingTask<F> {
-    future: F,
+    future: SubmittedFuture<F>,
     registration: PendingGuard,
+}
+
+pin_project_lite::pin_project! {
+    struct SubmittedFuture<F> {
+        inner: Arc<TokioRuntimeInner>,
+        #[pin]
+        future: Option<F>,
+    }
+
+    impl<F> PinnedDrop for SubmittedFuture<F> {
+        fn drop(this: Pin<&mut Self>) {
+            let mut this = this.project();
+            let _scope = SubmissionScope::enter(this.inner);
+            this.future.set(None);
+        }
+    }
+}
+
+impl<F: Future> Future for SubmittedFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let _scope = SubmissionScope::enter(this.inner);
+        let result = this
+            .future
+            .as_mut()
+            .as_pin_mut()
+            .expect("submission polled after completion")
+            .poll(cx);
+        if result.is_ready() {
+            this.future.set(None);
+        }
+        result
+    }
 }
 
 struct PendingGuard {
@@ -520,10 +555,6 @@ where
     let result = {
         let result = std::panic::AssertUnwindSafe(task.future).catch_unwind();
         tokio::pin!(result);
-        let result = std::future::poll_fn(|cx| {
-            let _scope = SubmissionScope::enter(&inner);
-            result.as_mut().poll(cx)
-        });
         match deadline {
             None => Ok(result.await),
             Some(deadline) => tokio::time::timeout_at(deadline, result)
@@ -531,10 +562,13 @@ where
                 .map_err(|_| ActorError::Timeout),
         }
     };
-    let result = match result {
-        Err(error) => Err(error),
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(payload)) => Err(crate::owned_input::panic_error(payload)),
+    let result = {
+        let _scope = SubmissionScope::enter(&inner);
+        match result {
+            Err(error) => Err(error),
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(payload)) => Err(crate::owned_input::panic_error(payload)),
+        }
     };
     drop(active_guard);
     drop(permit);
@@ -674,7 +708,10 @@ impl ActorRuntime for TokioActorRuntime {
             state.pending += 1;
             state.workers[worker].pending += 1;
             PendingTask {
-                future,
+                future: SubmittedFuture {
+                    inner: self.inner.clone(),
+                    future: Some(future),
+                },
                 registration: PendingGuard {
                     inner: self.inner.clone(),
                     worker: Some(worker),
@@ -713,7 +750,10 @@ impl ActorRuntime for TokioActorRuntime {
             }
             state.pending += 1;
             PendingTask {
-                future,
+                future: SubmittedFuture {
+                    inner: self.inner.clone(),
+                    future: Some(future),
+                },
                 registration: PendingGuard {
                     inner: self.inner.clone(),
                     worker: None,
