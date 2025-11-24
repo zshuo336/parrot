@@ -521,23 +521,15 @@ both!(
 );
 
 async fn rejected_runtime_configuration(hostile: bool) {
-    use parrot_api::{runtime::LoadBalancingStrategy, system::SystemError};
+    use parrot_api::system::SystemError;
 
     for entry in 0..3 {
-        for invalid in 0..5 {
+        for invalid in 0..3 {
             let drops = Arc::new(AtomicUsize::new(0));
             let mut config = captured(&drops, hostile);
             match invalid {
                 0 => config.runtime_config.worker_threads = Some(0),
                 1 => config.runtime_config.io_threads = Some(0),
-                2 => {
-                    config.runtime_config.scheduler_config.load_balancing =
-                        LoadBalancingStrategy::LeastLoaded;
-                }
-                3 => {
-                    config.runtime_config.scheduler_config.load_balancing =
-                        LoadBalancingStrategy::Random;
-                }
                 _ => {
                     config.timeouts.message_handling = Duration::from_secs(2);
                     config.runtime_config.scheduler_config.task_timeout = Duration::from_secs(1);
@@ -570,6 +562,25 @@ async fn rejected_runtime_configuration(hostile: bool) {
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn accepted_thread_placement_configurations_start_and_shutdown() {
+    use parrot_api::runtime::LoadBalancingStrategy;
+
+    for strategy in [
+        LoadBalancingStrategy::Random,
+        LoadBalancingStrategy::LeastLoaded,
+    ] {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut config = captured(&drops, false);
+        config.runtime_config.scheduler_config.load_balancing = strategy;
+        let system = ParrotActorSystem::with_thread(config, Default::default())
+            .await
+            .unwrap();
+        system.shutdown_runtime().await.unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
 
