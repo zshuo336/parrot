@@ -5,8 +5,10 @@ use crate::{
     owned_payload::{OwnedPayload, PublicationInput},
     thread::{ThreadActorSystem, ThreadActorSystemConfig},
 };
+#[cfg(test)]
+use parrot_api::runtime::LoadBalancingStrategy;
 use parrot_api::{
-    runtime::{LoadBalancingStrategy, RuntimeConfig},
+    runtime::RuntimeConfig,
     system::{ActorSystemConfig, SystemError, SystemTimeouts},
     types::BoxedFuture,
 };
@@ -16,21 +18,14 @@ use parrot_api::{
 mod input_contracts;
 
 /// Apply RuntimeConfig fields that have an exact native Thread meaning.
-/// Unsupported scheduler policies are rejected instead of silently ignored.
+/// The shared scheduler receives the placement policy separately; this helper
+/// applies the scalar settings before any scheduler is constructed.
 pub(crate) fn apply_thread_runtime_config(
     settings: &mut ThreadActorSystemConfig,
     timeouts: &mut SystemTimeouts,
     runtime: &RuntimeConfig,
 ) -> Result<(), SystemError> {
     validate_runtime_config(timeouts, runtime)?;
-    if !matches!(
-        runtime.scheduler_config.load_balancing,
-        LoadBalancingStrategy::RoundRobin
-    ) {
-        return Err(SystemError::InitializationError(
-            "runtime load_balancing currently supports only RoundRobin for Thread".into(),
-        ));
-    }
     if let Some(worker_threads) = runtime.worker_threads {
         settings.shared_pool_size = worker_threads;
     }
@@ -128,8 +123,9 @@ impl ParrotActorSystem {
     /// Create a default Thread engine using explicit native settings and the
     /// facade's guardian. A nonempty facade name overrides the native name.
     /// Positive system timeouts configure this engine's operation deadlines.
-    /// RuntimeConfig maps worker count, ready capacity and handler timeout.
-    /// Separate I/O threads and non-RoundRobin policies are rejected.
+    /// RuntimeConfig maps worker count, ready capacity, handler timeout and
+    /// shared-pool placement policy. Native Thread still rejects separate I/O
+    /// thread counts because its caller-owned Tokio driver has no such pool.
     pub fn with_thread(
         config: ActorSystemConfig,
         mut settings: ThreadActorSystemConfig,
@@ -145,6 +141,12 @@ impl ParrotActorSystem {
                 config.retire().await.map_err(SystemError::ActorError)?;
                 return Err(error);
             }
+            let worker_strategy = config
+                .value()
+                .runtime_config
+                .scheduler_config
+                .load_balancing
+                .clone();
             let mut value = config.take();
             let guardian = std::mem::take(&mut value.guardian_config);
             value.timeouts = timeouts;
@@ -154,10 +156,11 @@ impl ParrotActorSystem {
             }
             let guardian = config.protect(guardian);
             let facade = Self::empty(config).await?;
-            let engine = ThreadActorSystem::with_guardian_and_timeouts(
+            let engine = ThreadActorSystem::with_guardian_and_timeouts_and_strategy(
                 settings,
                 guardian.take(),
                 facade.config.value().timeouts.clone(),
+                worker_strategy,
             )
             .await?;
             facade.register_system(
@@ -267,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_runtime_config_rejects_ambiguous_or_unsupported_settings() {
+    fn thread_runtime_config_rejects_conflicts_and_accepts_placement_settings() {
         let mut settings = ThreadActorSystemConfig::default();
         let mut timeouts = SystemTimeouts {
             message_handling: Duration::from_secs(2),
@@ -286,7 +289,7 @@ mod tests {
         );
         assert!(matches!(conflict, Err(SystemError::InitializationError(_))));
 
-        let unsupported = apply_thread_runtime_config(
+        let placement = apply_thread_runtime_config(
             &mut settings,
             &mut SystemTimeouts::default(),
             &RuntimeConfig {
@@ -297,9 +300,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(matches!(
-            unsupported,
-            Err(SystemError::InitializationError(_))
-        ));
+        assert!(placement.is_ok());
     }
 }

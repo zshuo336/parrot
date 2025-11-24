@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 
 use crate::thread::mailbox::Mailbox;
+use parrot_api::runtime::LoadBalancingStrategy;
 
 #[cfg(test)]
 #[path = "queue/work_stealing_contracts.rs"]
@@ -188,6 +189,7 @@ pub struct SchedulingQueue {
     state: Mutex<State>,
     notify: Arc<Notify>,
     max_capacity: usize,
+    worker_strategy: LoadBalancingStrategy,
 }
 impl fmt::Debug for SchedulingQueue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -212,6 +214,17 @@ impl SchedulingQueue {
         Self::with_workers(max_capacity, 0)
     }
     pub(crate) fn with_workers(max_capacity: usize, workers: usize) -> Self {
+        Self::with_workers_and_strategy(max_capacity, workers, LoadBalancingStrategy::RoundRobin)
+    }
+
+    /// Construct a queue with an explicit worker admission strategy. Local
+    /// queues are used by the caller when it wants non-default placement;
+    /// `RoundRobin` preserves the historical central FIFO when `workers == 0`.
+    pub(crate) fn with_workers_and_strategy(
+        max_capacity: usize,
+        workers: usize,
+        worker_strategy: LoadBalancingStrategy,
+    ) -> Self {
         assert!(
             max_capacity > 0,
             "scheduling queue capacity must be positive"
@@ -231,7 +244,31 @@ impl SchedulingQueue {
             }),
             notify: Arc::new(Notify::new()),
             max_capacity,
+            worker_strategy,
         }
+    }
+
+    fn choose_worker(&self, state: &mut State) -> Option<usize> {
+        if state.local.is_empty() {
+            return None;
+        }
+        let workers = state.local.len();
+        let worker = match self.worker_strategy {
+            // RoundRobin is the historical central FIFO mode. Worker-local
+            // placement is supplied explicitly by work-stealing workers;
+            // generic admissions remain global so requeues cannot overtake
+            // older injected work.
+            LoadBalancingStrategy::RoundRobin => return None,
+            LoadBalancingStrategy::Random => fastrand::usize(..workers),
+            LoadBalancingStrategy::LeastLoaded => state
+                .local
+                .iter()
+                .enumerate()
+                .min_by_key(|(worker, queue)| (queue.len(), *worker))
+                .map(|(worker, _)| worker)
+                .unwrap_or(0),
+        };
+        Some(worker)
     }
     /// Nonblocking normal-lane admission. Err returns ownership when full/closed.
     pub fn push(&self, mailbox: ReadyMailbox) -> Result<(), ReadyMailbox> {
@@ -245,7 +282,12 @@ impl SchedulingQueue {
         if state.closed || state.len() >= self.max_capacity {
             return Err(mailbox);
         }
-        let admission = state.admission(lane, None);
+        let worker = if matches!(lane, Lane::Normal) {
+            self.choose_worker(&mut state)
+        } else {
+            None
+        };
+        let admission = state.admission(lane, worker);
         state.append(Entry { mailbox, admission });
         drop(state);
         self.notify.notify_one();
@@ -289,6 +331,13 @@ impl SchedulingQueue {
             deferred.lane = deferred.lane.min(lane);
         } else {
             state.refill(self.max_capacity);
+            let worker = worker.or_else(|| {
+                if matches!(lane, Lane::Normal) {
+                    self.choose_worker(&mut state)
+                } else {
+                    None
+                }
+            });
             let admission = state.admission(lane, worker);
             if state.len() < self.max_capacity {
                 state.append(Entry {
@@ -438,6 +487,17 @@ impl SchedulingQueue {
             .map(VecDeque::len)
             .sum()
     }
+
+    #[cfg(test)]
+    fn local_lengths(&self) -> Vec<usize> {
+        self.state
+            .lock()
+            .unwrap()
+            .local
+            .iter()
+            .map(VecDeque::len)
+            .collect()
+    }
     pub(crate) fn local_pops(&self) -> u64 {
         self.state.lock().unwrap().local_pops
     }
@@ -471,6 +531,41 @@ mod tests {
 
     fn make_mailbox(name: &str) -> Arc<dyn Mailbox> {
         Arc::new(MpscMailbox::new(4, ActorPath::placeholder(name)))
+    }
+
+    #[test]
+    fn explicit_worker_strategies_assign_ready_entries_to_local_workers() {
+        for strategy in [
+            LoadBalancingStrategy::RoundRobin,
+            LoadBalancingStrategy::Random,
+            LoadBalancingStrategy::LeastLoaded,
+        ] {
+            let queue = SchedulingQueue::with_workers_and_strategy(8, 3, strategy.clone());
+            let mailboxes: Vec<_> = (0..6)
+                .map(|index| make_mailbox(&format!("strategy/{index}")))
+                .collect();
+            for mailbox in &mailboxes {
+                assert!(queue.register(mailbox));
+                assert!(queue.enqueue_registered(mailbox.clone(), Lane::Normal));
+            }
+            let lengths = queue.local_lengths();
+            assert_eq!(queue.len(), 6);
+            match strategy {
+                LoadBalancingStrategy::RoundRobin => {
+                    assert_eq!(lengths, vec![0, 0, 0]);
+                    assert_eq!(queue.normal_len(), 6);
+                }
+                LoadBalancingStrategy::LeastLoaded => {
+                    assert_eq!(lengths.iter().sum::<usize>(), 6);
+                    assert_eq!(lengths, vec![2, 2, 2]);
+                }
+                LoadBalancingStrategy::Random => {
+                    assert!(lengths.iter().sum::<usize>() <= 6);
+                    assert!(lengths.iter().any(|length| *length > 0));
+                }
+            }
+            queue.close();
+        }
     }
 
     #[test]

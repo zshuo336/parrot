@@ -538,9 +538,23 @@ impl ThreadActorSystem {
     }
 
     pub(crate) fn with_guardian_and_timeouts(
+        config: ThreadActorSystemConfig,
+        guardian: parrot_api::system::GuardianConfig,
+        timeouts: parrot_api::system::SystemTimeouts,
+    ) -> BoxedFuture<'static, Result<Arc<Self>, parrot_api::system::SystemError>> {
+        Self::with_guardian_and_timeouts_and_strategy(
+            config,
+            guardian,
+            timeouts,
+            parrot_api::runtime::LoadBalancingStrategy::RoundRobin,
+        )
+    }
+
+    pub(crate) fn with_guardian_and_timeouts_and_strategy(
         mut config: ThreadActorSystemConfig,
         guardian: parrot_api::system::GuardianConfig,
         timeouts: parrot_api::system::SystemTimeouts,
+        worker_strategy: parrot_api::runtime::LoadBalancingStrategy,
     ) -> BoxedFuture<'static, Result<Arc<Self>, parrot_api::system::SystemError>> {
         let guardian = crate::owned_payload::OwnedPayload::unbound(guardian);
         Box::pin(parrot_api::trace::capture(async move {
@@ -553,7 +567,7 @@ impl ThreadActorSystem {
             }
             let strategy = crate::root_cohort::guardian_strategy(guardian).await?;
             let strategy = crate::owned_payload::OwnedPayload::unbound(strategy);
-            let system = match Self::try_new(config) {
+            let system = match Self::try_new_with_strategy(config, worker_strategy) {
                 Ok(mut system) => {
                     system.operation_timeouts = timeouts;
                     let system = Arc::new(system);
@@ -595,12 +609,22 @@ impl ThreadActorSystem {
 
     /// Return configuration/runtime errors before allocating or spawning workers.
     pub fn try_new(config: ThreadActorSystemConfig) -> Result<Self, SystemError> {
+        Self::try_new_with_strategy(
+            config,
+            parrot_api::runtime::LoadBalancingStrategy::RoundRobin,
+        )
+    }
+
+    fn try_new_with_strategy(
+        config: ThreadActorSystemConfig,
+        worker_strategy: parrot_api::runtime::LoadBalancingStrategy,
+    ) -> Result<Self, SystemError> {
         config
             .validate()
             .map_err(|error| SystemError::ConfigError(error.to_string()))?;
         let runtime = Handle::try_current()
             .map_err(|error| SystemError::ThreadSetupError(error.to_string()))?;
-        Self::try_with_runtime_handle(config, runtime)
+        Self::try_with_runtime_handle_and_strategy(config, runtime, worker_strategy)
     }
 
     /// Create a new system bound to a specific runtime handle.
@@ -617,6 +641,18 @@ impl ThreadActorSystem {
     pub fn try_with_runtime_handle(
         config: ThreadActorSystemConfig,
         runtime_handle: Handle,
+    ) -> Result<Self, SystemError> {
+        Self::try_with_runtime_handle_and_strategy(
+            config,
+            runtime_handle,
+            parrot_api::runtime::LoadBalancingStrategy::RoundRobin,
+        )
+    }
+
+    fn try_with_runtime_handle_and_strategy(
+        config: ThreadActorSystemConfig,
+        runtime_handle: Handle,
+        worker_strategy: parrot_api::runtime::LoadBalancingStrategy,
     ) -> Result<Self, SystemError> {
         config
             .validate()
@@ -645,9 +681,11 @@ impl ThreadActorSystem {
             max_threads: config.max_dedicated_threads,
             ..Default::default()
         };
-        let scheduler_group = Arc::new(
-            factory.try_create_scheduler_group(Some(pool_config), Some(dedicated_config))?,
-        );
+        let scheduler_group = Arc::new(factory.try_create_scheduler_group_with_strategy(
+            Some(pool_config),
+            Some(dedicated_config),
+            worker_strategy,
+        )?);
 
         Ok(Self {
             operation_timeouts: Default::default(),
@@ -2445,6 +2483,12 @@ impl ActorSystem for ThreadActorSystem {
                     ));
                 }
             };
+            let worker_strategy = config
+                .value()
+                .runtime_config
+                .scheduler_config
+                .load_balancing
+                .clone();
             let guardian =
                 crate::owned_payload::OwnedPayload::unbound(config.take().guardian_config);
             let strategy = crate::root_cohort::guardian_strategy(guardian).await?;
@@ -2455,7 +2499,11 @@ impl ActorSystem for ThreadActorSystem {
                 timeouts.system_shutdown
             };
 
-            let system = match Self::try_with_runtime_handle(thread_config, runtime_handle) {
+            let system = match Self::try_with_runtime_handle_and_strategy(
+                thread_config,
+                runtime_handle,
+                worker_strategy,
+            ) {
                 Ok(mut system) => {
                     system.operation_timeouts = timeouts;
                     system

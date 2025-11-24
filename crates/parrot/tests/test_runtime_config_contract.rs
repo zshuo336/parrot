@@ -364,8 +364,10 @@ async fn rejects_configuration(actix: bool, hostile: bool) {
     let entries = if actix { 1 } else { 4 };
     for entry in 0..entries {
         for case in 0..12 {
-            if actix && matches!(case, 4 | 5) {
-                // Actix owns worker placement and now implements both policies.
+            if matches!(case, 4 | 5) {
+                // Thread and Actix both route these policies through their
+                // native scheduler; they are covered by positive placement
+                // contracts below rather than the invalid-input matrix.
                 continue;
             }
             let dropped = Arc::new(AtomicUsize::new(0));

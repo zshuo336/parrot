@@ -48,6 +48,7 @@ use crate::thread::processor::ProcessorInterface;
 use crate::thread::scheduler::dedicated_thread::DedicatedThreadScheduler;
 use crate::thread::scheduler::sharded::ShardedScheduler;
 use crate::thread::scheduler::shared::SharedThreadPool;
+use parrot_api::runtime::LoadBalancingStrategy;
 
 // Failure diagnostics run during cancellation and Drop, too. A subscriber is
 // another user callback; never retry logging a failure from that callback.
@@ -592,6 +593,21 @@ impl ThreadSchedulerFactory {
         config: Option<shared::SharedThreadPoolConfig>,
         dedicated_config: Option<dedicated_thread::DedicatedThreadConfig>,
     ) -> Result<SchedulerGroup, SystemError> {
+        self.try_create_scheduler_group_with_strategy(
+            config,
+            dedicated_config,
+            LoadBalancingStrategy::RoundRobin,
+        )
+    }
+
+    /// Create schedulers with the requested shared-pool admission strategy.
+    /// Dedicated and sharded modes retain their native ownership semantics.
+    pub fn try_create_scheduler_group_with_strategy(
+        &self,
+        config: Option<shared::SharedThreadPoolConfig>,
+        dedicated_config: Option<dedicated_thread::DedicatedThreadConfig>,
+        worker_strategy: LoadBalancingStrategy,
+    ) -> Result<SchedulerGroup, SystemError> {
         let config = config.unwrap_or_default();
         let dedicated_config = dedicated_config.unwrap_or_default();
         config.validate()?;
@@ -604,9 +620,10 @@ impl ThreadSchedulerFactory {
             DedicatedThreadScheduler::try_new(Some(dedicated_config))?
                 .with_runtime_handle(self.runtime_handle.clone()),
         );
-        let shared_scheduler = Arc::new(SharedThreadPool::try_new(
+        let shared_scheduler = Arc::new(SharedThreadPool::try_new_with_strategy(
             Some(config),
             self.runtime_handle.clone(),
+            worker_strategy,
         )?);
         Ok(SchedulerGroup {
             shared_scheduler,

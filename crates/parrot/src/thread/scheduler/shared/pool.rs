@@ -15,6 +15,7 @@ use crate::thread::error::SystemError;
 use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::ThreadScheduler;
 use crate::thread::scheduler::queue::SchedulingQueue;
+use parrot_api::runtime::LoadBalancingStrategy;
 
 #[cfg(test)]
 #[path = "configuration_contracts.rs"]
@@ -466,9 +467,17 @@ impl SharedThreadPool {
         config: Option<SharedThreadPoolConfig>,
         runtime_handle: Handle,
     ) -> Result<Self, SystemError> {
+        Self::try_new_with_strategy(config, runtime_handle, LoadBalancingStrategy::RoundRobin)
+    }
+
+    pub fn try_new_with_strategy(
+        config: Option<SharedThreadPoolConfig>,
+        runtime_handle: Handle,
+        worker_strategy: LoadBalancingStrategy,
+    ) -> Result<Self, SystemError> {
         let config = config.unwrap_or_default();
         config.validate()?;
-        Ok(Self::start(config, runtime_handle))
+        Ok(Self::start(config, runtime_handle, worker_strategy))
     }
 
     #[cfg(test)]
@@ -476,17 +485,29 @@ impl SharedThreadPool {
         config: Option<SharedThreadPoolConfig>,
         runtime_handle: Handle,
     ) -> Self {
-        Self::start(config.unwrap_or_default(), runtime_handle)
+        Self::start(
+            config.unwrap_or_default(),
+            runtime_handle,
+            LoadBalancingStrategy::RoundRobin,
+        )
     }
 
-    fn start(config: SharedThreadPoolConfig, runtime_handle: Handle) -> Self {
-        let scheduling_queue = Arc::new(SchedulingQueue::with_workers(
+    fn start(
+        config: SharedThreadPoolConfig,
+        runtime_handle: Handle,
+        worker_strategy: LoadBalancingStrategy,
+    ) -> Self {
+        let local_workers = if config.work_stealing
+            || !matches!(worker_strategy, LoadBalancingStrategy::RoundRobin)
+        {
+            config.pool_size
+        } else {
+            0
+        };
+        let scheduling_queue = Arc::new(SchedulingQueue::with_workers_and_strategy(
             config.max_queue_capacity,
-            if config.work_stealing {
-                config.pool_size
-            } else {
-                0
-            },
+            local_workers,
+            worker_strategy,
         ));
         let is_shutting_down = Arc::new(AtomicBool::new(false));
         let status = Arc::new(AtomicUsize::new(SchedulerStatus::Initializing as usize));
