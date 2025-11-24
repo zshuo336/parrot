@@ -34,6 +34,8 @@ mod configuration_contracts;
 mod global_budget_contracts;
 #[cfg(test)]
 mod notification_contracts;
+#[cfg(test)]
+mod retirement_submission_contracts;
 
 use std::error::Error;
 use std::fmt;

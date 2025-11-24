@@ -98,7 +98,9 @@ pub(super) async fn isolated_async(
         );
         return;
     }
-    let module = if name.starts_with("control_") {
+    let module = if name.starts_with("retirement_") {
+        "thread::scheduler::retirement_submission_contracts"
+    } else if name.starts_with("control_") {
         "thread::scheduler::control_panic_contracts"
     } else if name.starts_with("observer_") {
         "thread::scheduler::cancellation_contracts"
