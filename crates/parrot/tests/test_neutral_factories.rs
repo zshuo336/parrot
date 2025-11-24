@@ -22,15 +22,45 @@ async fn bounded<F: std::future::Future>(f: F) -> F::Output {
         .await
         .expect("contract deadline")
 }
-async fn engine(actix: bool) -> Arc<dyn AsyncEngineRuntime> {
-    if actix {
-        Arc::new(
-            parrot::actix::ActixActorSystem::with_arbiter_count(1)
+#[derive(Clone, Copy)]
+struct Entry {
+    actix: bool,
+    facade: bool,
+}
+async fn engine(entry: Entry) -> Arc<dyn AsyncEngineRuntime> {
+    let facade = if entry.facade {
+        Some(
+            parrot::system::ParrotActorSystem::new(Default::default())
                 .await
                 .unwrap(),
         )
     } else {
-        parrot::thread::ThreadActorSystem::shared(Default::default())
+        None
+    };
+    if entry.actix {
+        let native = parrot::actix::ActixActorSystem::with_arbiter_count(1)
+            .await
+            .unwrap();
+        if let Some(facade) = facade {
+            facade
+                .register_actix_system("selected".into(), native, true)
+                .await
+                .unwrap();
+            Arc::new(facade)
+        } else {
+            Arc::new(native)
+        }
+    } else {
+        let native = parrot::thread::ThreadActorSystem::shared(Default::default());
+        if let Some(facade) = facade {
+            facade
+                .register_thread_system("selected".into(), native, true)
+                .await
+                .unwrap();
+            Arc::new(facade)
+        } else {
+            native
+        }
     }
 }
 #[derive(Default)]
@@ -158,8 +188,8 @@ async fn drained(runtime: &dyn AsyncEngineRuntime) {
     })
     .await;
 }
-async fn root_restart(actix: bool) {
-    let runtime = engine(actix).await;
+async fn root_restart(entry: Entry) {
+    let runtime = engine(entry).await;
     let counts = Arc::new(Counts::default());
     let reference = bounded(
         runtime
@@ -189,8 +219,8 @@ async fn root_restart(actix: bool) {
     assert_eq!(counts.capture.load(Ordering::SeqCst), 1);
     bounded(runtime.shutdown()).await.unwrap();
 }
-async fn duplicate(actix: bool) {
-    let runtime = engine(actix).await;
+async fn duplicate(entry: Entry) {
+    let runtime = engine(entry).await;
     let counts = Arc::new(Counts::default());
     let reference = runtime
         .factory_runtime()
@@ -240,8 +270,9 @@ async fn duplicate(actix: bool) {
     bounded(runtime.shutdown()).await.unwrap();
     assert_eq!(counts.capture.load(Ordering::SeqCst), 3);
 }
-async fn rejected_inputs(actix: bool) {
-    let runtime = engine(actix).await;
+async fn rejected_inputs(entry: Entry) {
+    let runtime = engine(entry).await;
+    let factories = runtime.factory_runtime().expect("live factory capability");
     for mode in 0..4 {
         let counts = Arc::new(Counts::default());
         if mode == 3 {
@@ -254,10 +285,7 @@ async fn rejected_inputs(actix: bool) {
         if mode == 2 {
             opt.within = Duration::ZERO;
         }
-        let future = runtime
-            .factory_runtime()
-            .unwrap()
-            .spawn_factory(factory(&counts, true), opt);
+        let future = factories.spawn_factory(factory(&counts, true), opt);
         if mode == 0 {
             assert!(
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(future))).is_ok()
@@ -378,8 +406,8 @@ impl Actor for Parent {
         })
     }
 }
-async fn child_scope(actix: bool, factory_child: bool) {
-    let runtime = engine(actix).await;
+async fn child_scope(entry: Entry, factory_child: bool) {
+    let runtime = engine(entry).await;
     let parent = runtime
         .spawn(
             Box::new(Parent),
@@ -424,8 +452,8 @@ async fn child_scope(actix: bool, factory_child: bool) {
     assert!(!child.is_alive().await);
     bounded(runtime.shutdown()).await.unwrap();
 }
-async fn child_restart(actix: bool) {
-    let runtime = engine(actix).await;
+async fn child_restart(entry: Entry) {
+    let runtime = engine(entry).await;
     let parent = runtime
         .spawn(Box::new(Parent), Box::new(()), SpawnOptions::at("/parent"))
         .await
@@ -471,8 +499,11 @@ async fn child_restart(actix: bool) {
 }
 macro_rules! pair {
     ($thread:ident, $actix:ident, $body:ident $(, $arg:expr)*) => {
-        #[tokio::test] async fn $thread() { $body(false $(, $arg)*).await; }
-        #[actix::test] async fn $actix() { $body(true $(, $arg)*).await; }
+        pair!(@entries false; $thread, $actix, $body $(, $arg)*);
+    };
+    (@entries $facade:expr; $thread:ident, $actix:ident, $body:ident $(, $arg:expr)*) => {
+        #[tokio::test] async fn $thread() { $body(Entry { actix: false, facade: $facade } $(, $arg)*).await; }
+        #[actix::test] async fn $actix() { $body(Entry { actix: true, facade: $facade } $(, $arg)*).await; }
     }
 }
 pair!(
@@ -505,8 +536,8 @@ struct ConstructionGate {
     release: Mutex<std::sync::mpsc::Receiver<()>>,
     capture: Capture,
 }
-async fn cancelled_construction(actix: bool) {
-    let runtime = engine(actix).await;
+async fn cancelled_construction(entry: Entry) {
+    let runtime = engine(entry).await;
     let counts = Arc::new(Counts::default());
     let (entered, observed) = tokio::sync::oneshot::channel();
     let (release, held) = std::sync::mpsc::channel();
@@ -592,8 +623,8 @@ impl Drop for RetiringCapture {
         self.count.fetch_add(1, Ordering::SeqCst);
     }
 }
-async fn cancelled_rejection(actix: bool) {
-    let runtime = engine(actix).await;
+async fn cancelled_rejection(entry: Entry) {
+    let runtime = engine(entry).await;
     let count = Arc::new(AtomicUsize::new(0));
     let (entered, observed) = tokio::sync::oneshot::channel();
     let (release, held) = std::sync::mpsc::channel();
@@ -634,8 +665,8 @@ pair!(
     cancelled_rejection
 );
 
-async fn malformed_child_inputs(actix: bool) {
-    let runtime = engine(actix).await;
+async fn malformed_child_inputs(entry: Entry) {
+    let runtime = engine(entry).await;
     let parent = runtime
         .spawn(Box::new(Parent), Box::new(()), SpawnOptions::at("/parent"))
         .await
@@ -672,3 +703,17 @@ pair!(
     actix_malformed_child_inputs,
     malformed_child_inputs
 );
+
+mod facade {
+    use super::*;
+
+    pair!(@entries true; thread_root_restart_budget, actix_root_restart_budget, root_restart);
+    pair!(@entries true; thread_shared_namespace, actix_shared_namespace, duplicate);
+    pair!(@entries true; thread_factory_input_retirement, actix_factory_input_retirement, rejected_inputs);
+    pair!(@entries true; thread_child_instance_scope, actix_child_instance_scope, child_scope, false);
+    pair!(@entries true; thread_child_factory_scope, actix_child_factory_scope, child_scope, true);
+    pair!(@entries true; thread_child_restart, actix_child_restart, child_restart);
+    pair!(@entries true; thread_cancelled_construction, actix_cancelled_construction, cancelled_construction);
+    pair!(@entries true; thread_cancelled_rejection, actix_cancelled_rejection, cancelled_rejection);
+    pair!(@entries true; thread_malformed_child_inputs, actix_malformed_child_inputs, malformed_child_inputs);
+}

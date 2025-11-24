@@ -175,16 +175,29 @@ fn factory(
         receive,
     )
 }
+async fn native_engine() -> parrot::actix::ActixActorSystem {
+    parrot::actix::ActixActorSystem::with_settings(parrot::actix::ActixSystemSettings {
+        arbiter_count: 1,
+        mailbox_capacity: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
 async fn engine() -> Arc<dyn AsyncEngineRuntime> {
-    Arc::new(
-        parrot::actix::ActixActorSystem::with_settings(parrot::actix::ActixSystemSettings {
-            arbiter_count: 1,
-            mailbox_capacity: 1,
-            ..Default::default()
-        })
-        .await
-        .unwrap(),
-    )
+    Arc::new(native_engine().await)
+}
+async fn lifecycle_engine(via_facade: bool) -> Arc<dyn AsyncEngineRuntime> {
+    if via_facade {
+        let facade = facade().await;
+        facade
+            .register_actix_system("local".into(), native_engine().await, true)
+            .await
+            .unwrap();
+        Arc::new(facade)
+    } else {
+        engine().await
+    }
 }
 async fn facade() -> parrot::system::ParrotActorSystem {
     parrot::system::ParrotActorSystem::new(Default::default())
@@ -305,10 +318,9 @@ async fn facade_preserves_local_capability_and_shared_shutdown() {
     })
     .await;
 }
-#[actix::test]
-async fn local_death_watch_uses_original_dynamic_event_and_logical_identity() {
+async fn death_watch(via_facade: bool) {
     bounded(async {
-        let runtime = engine().await;
+        let runtime = lifecycle_engine(via_facade).await;
         let (f, mut events) = factory(&Arc::new(Counts::default()), Gates::default());
         let watcher = runtime
             .local_runtime()
@@ -339,10 +351,9 @@ async fn local_death_watch_uses_original_dynamic_event_and_logical_identity() {
     })
     .await;
 }
-#[actix::test]
-async fn deadline_and_cancelled_capacity_wait_do_not_deliver_unadmitted_messages() {
+async fn unadmitted_messages(via_facade: bool) {
     bounded(async {
-        let runtime = engine().await;
+        let runtime = lifecycle_engine(via_facade).await;
         let counts = Arc::new(Counts::default());
         let (release, gate) = tokio::sync::oneshot::channel();
         let (f, mut events) = factory(
@@ -416,10 +427,10 @@ async fn unpolled_factory_inputs_retire_without_invoking_constructor() {
     })
     .await;
 }
-#[actix::test]
-async fn rejected_inputs_are_disposed_and_cleanup_errors_remain_visible() {
+async fn rejected_inputs(via_facade: bool) {
     bounded(async {
-        let runtime = engine().await;
+        let runtime = lifecycle_engine(via_facade).await;
+        let local = runtime.local_runtime().expect("live Local capability");
         for invalid in [
             options("", 1),
             FactoryOptions {
@@ -435,20 +446,13 @@ async fn rejected_inputs_are_disposed_and_cleanup_errors_remain_visible() {
                     ..Default::default()
                 },
             );
-            let error = runtime
-                .local_runtime()
-                .unwrap()
-                .spawn_local_factory(f, invalid)
-                .await
-                .unwrap_err();
+            let error = local.spawn_local_factory(f, invalid).await.unwrap_err();
             assert!(error.to_string().contains("late capture drop"), "{error}");
             assert_eq!(counts.built.load(Ordering::SeqCst), 0);
             assert_eq!(counts.captures.load(Ordering::SeqCst), 1);
         }
         let (f, _) = factory(&Arc::new(Counts::default()), Gates::default());
-        let original = runtime
-            .local_runtime()
-            .unwrap()
+        let original = local
             .spawn_local_factory(f, options("/dup", 0))
             .await
             .unwrap();
@@ -456,9 +460,7 @@ async fn rejected_inputs_are_disposed_and_cleanup_errors_remain_visible() {
         let counts = Arc::new(Counts::default());
         let (f, _) = factory(&counts, Gates::default());
         assert!(
-            runtime
-                .local_runtime()
-                .unwrap()
+            local
                 .spawn_local_factory(f, options("/dup", 0))
                 .await
                 .is_err()
@@ -478,9 +480,7 @@ async fn rejected_inputs_are_disposed_and_cleanup_errors_remain_visible() {
         runtime.shutdown().await.unwrap();
         let (f, _) = factory(&counts, Gates::default());
         assert!(
-            runtime
-                .local_runtime()
-                .unwrap()
+            local
                 .spawn_local_factory(f, options("/closed", 0))
                 .await
                 .is_err()
@@ -553,10 +553,9 @@ async fn named_and_default_selection_is_captured_before_polling() {
     })
     .await;
 }
-#[actix::test]
-async fn cancelled_stop_keeps_hook_and_capture_owned_until_actual_retirement() {
+async fn cancelled_stop(via_facade: bool) {
     bounded(async {
-        let runtime = engine().await;
+        let runtime = lifecycle_engine(via_facade).await;
         let counts = Arc::new(Counts::default());
         let (release, gate) = tokio::sync::oneshot::channel();
         let (f, mut events) = factory(
@@ -590,11 +589,10 @@ async fn cancelled_stop_keeps_hook_and_capture_owned_until_actual_retirement() {
     })
     .await;
 }
-#[actix::test]
-async fn local_stop_receipts_keep_first_cleanup_error_through_neutral_reference() {
+async fn cleanup_errors(via_facade: bool) {
     bounded(async {
         for actor_drop in [false, true] {
-            let runtime = engine().await;
+            let runtime = lifecycle_engine(via_facade).await;
             let counts = Arc::new(Counts::default());
             let (f, mut events) = factory(
                 &counts,
@@ -633,10 +631,9 @@ async fn local_stop_receipts_keep_first_cleanup_error_through_neutral_reference(
     })
     .await;
 }
-#[actix::test]
-async fn reused_path_has_distinct_identity_and_old_reference_cannot_stop_replacement() {
+async fn reused_path(via_facade: bool) {
     bounded(async {
-        let runtime = engine().await;
+        let runtime = lifecycle_engine(via_facade).await;
         let (f, _) = factory(&Arc::new(Counts::default()), Gates::default());
         let old = runtime
             .local_runtime()
@@ -672,10 +669,9 @@ async fn reused_path_has_distinct_identity_and_old_reference_cannot_stop_replace
     .await;
 }
 
-#[actix::test]
-async fn stopping_pending_local_init_retires_state_without_normal_stop_hook() {
+async fn pending_init(via_facade: bool) {
     bounded(async {
-        let runtime = engine().await;
+        let runtime = lifecycle_engine(via_facade).await;
         let counts = Arc::new(Counts::default());
         let (_release, gate) = tokio::sync::oneshot::channel();
         let (f, mut events) = factory(
@@ -702,11 +698,10 @@ async fn stopping_pending_local_init_retires_state_without_normal_stop_hook() {
     .await;
 }
 
-#[actix::test]
-async fn zero_and_finite_restart_budgets_are_honored_through_neutral_options() {
+async fn restart_budgets(via_facade: bool) {
     bounded(async {
         for max in [0, 1] {
-            let runtime = engine().await;
+            let runtime = lifecycle_engine(via_facade).await;
             let counts = Arc::new(Counts::default());
             let (f, mut events) = factory(&counts, Gates::default());
             let actor = runtime
@@ -735,10 +730,9 @@ async fn zero_and_finite_restart_budgets_are_honored_through_neutral_options() {
     })
     .await;
 }
-#[actix::test]
-async fn constructor_panic_is_reported_after_admission_and_retires_its_capture() {
+async fn constructor_panic(via_facade: bool) {
     bounded(async {
-        let runtime = engine().await;
+        let runtime = lifecycle_engine(via_facade).await;
         let counts = Arc::new(Counts::default());
         let capture = Capture(counts.clone(), false);
         let actor = runtime
@@ -770,3 +764,61 @@ async fn constructor_panic_is_reported_after_admission_and_retires_its_capture()
     })
     .await;
 }
+
+macro_rules! lifecycle_cases {
+    ($native:ident, $facade:ident, $body:ident) => {
+        #[actix::test]
+        async fn $native() {
+            $body(false).await;
+        }
+        #[actix::test]
+        async fn $facade() {
+            $body(true).await;
+        }
+    };
+}
+lifecycle_cases!(
+    local_death_watch_uses_original_dynamic_event_and_logical_identity,
+    facade_local_death_watch_preserves_logical_identity,
+    death_watch
+);
+lifecycle_cases!(
+    deadline_and_cancelled_capacity_wait_do_not_deliver_unadmitted_messages,
+    facade_local_deadline_and_cancelled_capacity_do_not_deliver,
+    unadmitted_messages
+);
+lifecycle_cases!(
+    rejected_inputs_are_disposed_and_cleanup_errors_remain_visible,
+    facade_local_rejected_inputs_keep_cleanup_errors,
+    rejected_inputs
+);
+lifecycle_cases!(
+    cancelled_stop_keeps_hook_and_capture_owned_until_actual_retirement,
+    facade_local_cancelled_stop_keeps_actual_retirement_owned,
+    cancelled_stop
+);
+lifecycle_cases!(
+    local_stop_receipts_keep_first_cleanup_error_through_neutral_reference,
+    facade_local_stop_preserves_first_cleanup_error,
+    cleanup_errors
+);
+lifecycle_cases!(
+    reused_path_has_distinct_identity_and_old_reference_cannot_stop_replacement,
+    facade_local_old_reference_cannot_stop_reused_path,
+    reused_path
+);
+lifecycle_cases!(
+    stopping_pending_local_init_retires_state_without_normal_stop_hook,
+    facade_local_pending_init_retires_without_stop_hook,
+    pending_init
+);
+lifecycle_cases!(
+    zero_and_finite_restart_budgets_are_honored_through_neutral_options,
+    facade_local_restart_budgets_are_honored,
+    restart_budgets
+);
+lifecycle_cases!(
+    constructor_panic_is_reported_after_admission_and_retires_its_capture,
+    facade_local_constructor_panic_retires_capture,
+    constructor_panic
+);
