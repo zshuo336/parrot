@@ -469,7 +469,7 @@ async fn actix_rejects_scheduler_capacity_without_substituting_mailbox_capacity(
 }
 
 #[tokio::test]
-async fn tokio_runtime_applies_explicit_counts_and_rejects_only_unrepresentable_policy() {
+async fn tokio_runtime_applies_explicit_counts_and_supports_placement_policies() {
     for config in [
         RuntimeConfig {
             worker_threads: Some(1),
@@ -489,7 +489,8 @@ async fn tokio_runtime_applies_explicit_counts_and_rejects_only_unrepresentable_
         LoadBalancingStrategy::Random,
         LoadBalancingStrategy::LeastLoaded,
     ] {
-        let error = TokioActorRuntime::start(RuntimeConfig {
+        let runtime = TokioActorRuntime::start(RuntimeConfig {
+            worker_threads: Some(2),
             scheduler_config: parrot_api::runtime::SchedulerConfig {
                 load_balancing: strategy,
                 ..Default::default()
@@ -497,8 +498,7 @@ async fn tokio_runtime_applies_explicit_counts_and_rejects_only_unrepresentable_
             ..RuntimeConfig::default()
         })
         .await
-        .expect_err("Tokio cannot provide actor placement policy");
-        assert!(matches!(error, ActorError::InitializationError(_)));
-        assert!(error.to_string().contains("load_balancing"), "{error}");
+        .expect("Tokio placement policy must create an owned worker pool");
+        runtime.shutdown().await.unwrap();
     }
 }

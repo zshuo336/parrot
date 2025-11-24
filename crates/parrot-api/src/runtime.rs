@@ -108,8 +108,8 @@ pub struct SchedulerConfig {
     /// Requested worker distribution policy. Native Actix places actor executions
     /// on its owned arbiters with all three policies. LeastLoaded counts reserved
     /// executions, including idle actors through future disposal, not message
-    /// backlog or CPU. Native Thread and the borrowed Tokio adapter currently
-    /// reject nondefault policies.
+    /// backlog or CPU. Tokio uses an owned single-thread worker pool for
+    /// nondefault policies; the borrowed caller executor remains RoundRobin-only.
     pub load_balancing: LoadBalancingStrategy,
 }
 
@@ -221,10 +221,11 @@ pub struct RuntimeMetrics {
 
 /// Tokio-backed implementation of [`ActorRuntime`].
 ///
-/// The implementation deliberately runs on the caller's Tokio runtime. It
-/// does not create a second executor or claim to measure process CPU/memory;
-/// those fields remain zero because portable, dependency-free measurement is
-/// not available at this layer. `task_queue_capacity == 0` means unbounded,
+/// The default RoundRobin implementation runs on the caller's Tokio runtime.
+/// Explicit counts and nondefault placement create owned worker runtimes. It
+/// does not claim to measure process CPU/memory; those fields remain zero
+/// because portable, dependency-free measurement is not available at this
+/// layer. `task_queue_capacity == 0` means unbounded,
 /// while a positive value bounds tasks holding an execution permit. Callers
 /// waiting for permits remain separately counted pending inputs, with no
 /// resident queue bound at this layer. A task timeout of zero disables the timeout.
@@ -238,14 +239,15 @@ pub struct RuntimeMetrics {
 /// plus truncation/cleanup annotations. Their payload is disposed before the
 /// task is retired; a payload destructor panic is retained in that receipt.
 ///
-/// With default thread settings this adapter borrows the caller's executor.
+/// With default RoundRobin settings this adapter borrows the caller's executor.
 /// Supplying `worker_threads` or `io_threads` creates an owned multi-thread
 /// Tokio runtime, so the requested worker and blocking/I/O helper limits are
-/// applied instead of silently ignored. Tokio's readiness driver is shared by
-/// that runtime and has no independent thread-count knob. Nondefault
-/// `load_balancing` remains rejected because Tokio does not expose actor
-/// placement. Queue capacities exceeding [`Semaphore::MAX_PERMITS`] and
-/// unrepresentable task deadlines are rejected.
+/// applied instead of silently ignored. A nondefault load-balancing strategy
+/// creates an owned pool of single-worker runtimes so each task has an actual
+/// worker-thread placement; omitted `worker_threads` uses two placement workers.
+/// Tokio's readiness driver is shared by each runtime and has no independent
+/// thread-count knob. Queue capacities exceeding [`Semaphore::MAX_PERMITS`]
+/// and unrepresentable task deadlines are rejected.
 #[derive(Clone)]
 pub struct TokioActorRuntime {
     inner: Arc<TokioRuntimeInner>,
@@ -255,6 +257,7 @@ struct TokioRuntimeInner {
     permits: Option<Arc<Semaphore>>,
     timeout: Duration,
     owned_runtime: Option<Arc<OwnedRuntime>>,
+    strategy: LoadBalancingStrategy,
     state: Mutex<TaskState>,
     changed: Notify,
 }
@@ -263,37 +266,97 @@ struct TokioRuntimeInner {
 /// its destructor joins worker threads. Keep that blocking join off the host
 /// executor while retaining normal ownership and shutdown semantics.
 struct OwnedRuntime {
-    runtime: Option<tokio::runtime::Runtime>,
+    runtimes: Option<Vec<tokio::runtime::Runtime>>,
+    handles: Vec<tokio::runtime::Handle>,
 }
 
 impl OwnedRuntime {
-    fn new(runtime: tokio::runtime::Runtime) -> Self {
-        Self {
-            runtime: Some(runtime),
-        }
+    fn new(
+        worker_threads: Option<usize>,
+        io_threads: Option<usize>,
+        strategy: &LoadBalancingStrategy,
+    ) -> Result<Self, String> {
+        const DEFAULT_PLACEMENT_WORKERS: usize = 2;
+        let runtimes = if matches!(strategy, LoadBalancingStrategy::RoundRobin) {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.enable_all();
+            if let Some(worker_threads) = worker_threads {
+                builder.worker_threads(worker_threads);
+            }
+            if let Some(io_threads) = io_threads {
+                builder.max_blocking_threads(io_threads);
+            }
+            vec![builder
+                .build()
+                .map_err(|error| format!("failed to build owned Tokio runtime: {error}"))?]
+        } else {
+            let placement_workers = worker_threads.unwrap_or(DEFAULT_PLACEMENT_WORKERS);
+            let mut runtimes = Vec::with_capacity(placement_workers);
+            for _ in 0..placement_workers {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder.worker_threads(1).enable_all();
+                if let Some(io_threads) = io_threads {
+                    builder.max_blocking_threads(io_threads);
+                }
+                match builder.build() {
+                    Ok(runtime) => runtimes.push(runtime),
+                    Err(error) => {
+                        retire_runtimes(runtimes);
+                        return Err(format!("failed to build owned Tokio runtime: {error}"));
+                    }
+                }
+            }
+            runtimes
+        };
+        let handles = runtimes
+            .iter()
+            .map(tokio::runtime::Runtime::handle)
+            .cloned()
+            .collect();
+        Ok(Self {
+            runtimes: Some(runtimes),
+            handles,
+        })
     }
 
-    fn spawn<F, T>(&self, future: F) -> tokio::task::JoinHandle<T>
+    fn worker_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    fn spawn_on<F, T>(&self, worker: usize, future: F) -> tokio::task::JoinHandle<T>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.runtime
-            .as_ref()
-            .expect("owned Tokio runtime missing before drop")
-            .spawn(future)
+        self.handles[worker % self.handles.len()].spawn(future)
     }
 }
 
 impl Drop for OwnedRuntime {
     fn drop(&mut self) {
-        let runtime = self
-            .runtime
-            .take()
-            .expect("owned Tokio runtime dropped twice");
-        let _ = std::thread::Builder::new()
-            .name("parrot-tokio-runtime-drop".into())
-            .spawn(move || drop(runtime));
+        if let Some(runtimes) = self.runtimes.take() {
+            retire_runtimes(runtimes);
+        }
+    }
+}
+
+fn retire_runtimes(runtimes: Vec<tokio::runtime::Runtime>) {
+    let holder = Arc::new(Mutex::new(Some(runtimes)));
+    let worker_holder = holder.clone();
+    let spawn = std::thread::Builder::new()
+        .name("parrot-tokio-runtime-drop".into())
+        .spawn(move || {
+            if let Some(runtimes) = worker_holder.lock().unwrap().take() {
+                drop(runtimes);
+            }
+        });
+    if spawn.is_err() {
+        if let Some(runtimes) = holder.lock().unwrap().take() {
+            // A destructor cannot report a thread-creation failure. Leaking
+            // the runtimes is preferable to joining them on an async executor
+            // thread.
+            std::mem::forget(runtimes);
+        }
     }
 }
 
@@ -302,6 +365,37 @@ struct TaskState {
     shutting_down: bool,
     active: usize,
     pending: usize,
+    next_worker: usize,
+    workers: Vec<WorkerLoad>,
+}
+
+#[derive(Default)]
+struct WorkerLoad {
+    active: usize,
+    pending: usize,
+}
+
+impl TaskState {
+    fn choose_worker(&mut self, strategy: &LoadBalancingStrategy, worker_count: usize) -> usize {
+        if worker_count <= 1 {
+            return 0;
+        }
+        match strategy {
+            LoadBalancingStrategy::RoundRobin => {
+                let worker = self.next_worker % worker_count;
+                self.next_worker = self.next_worker.wrapping_add(1);
+                worker
+            }
+            LoadBalancingStrategy::Random => fastrand::usize(..worker_count),
+            LoadBalancingStrategy::LeastLoaded => self
+                .workers
+                .iter()
+                .enumerate()
+                .min_by_key(|(worker, load)| (load.active + load.pending, *worker))
+                .map(|(worker, _)| worker)
+                .unwrap_or(0),
+        }
+    }
 }
 
 // Field order keeps the accepted input alive in accounting until its actual
@@ -313,6 +407,7 @@ struct PendingTask<F> {
 
 struct PendingGuard {
     inner: Arc<TokioRuntimeInner>,
+    worker: usize,
     armed: bool,
 }
 
@@ -325,16 +420,23 @@ impl PendingGuard {
         }
         state.pending -= 1;
         state.active += 1;
+        state.workers[self.worker].pending -= 1;
+        state.workers[self.worker].active += 1;
         self.armed = false;
         drop(state);
-        Ok(ActiveGuard { inner })
+        Ok(ActiveGuard {
+            inner,
+            worker: self.worker,
+        })
     }
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.inner.state.lock().unwrap().pending -= 1;
+            let mut state = self.inner.state.lock().unwrap();
+            state.pending -= 1;
+            state.workers[self.worker].pending -= 1;
             self.inner.changed.notify_waiters();
         }
     }
@@ -342,11 +444,14 @@ impl Drop for PendingGuard {
 
 struct ActiveGuard {
     inner: Arc<TokioRuntimeInner>,
+    worker: usize,
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        self.inner.state.lock().unwrap().active -= 1;
+        let mut state = self.inner.state.lock().unwrap();
+        state.active -= 1;
+        state.workers[self.worker].active -= 1;
         self.inner.changed.notify_waiters();
     }
 }
@@ -460,14 +565,7 @@ impl ActorRuntime for TokioActorRuntime {
                 )));
             }
         }
-        if !matches!(
-            config.scheduler_config.load_balancing,
-            LoadBalancingStrategy::RoundRobin
-        ) {
-            return Err(ActorError::InitializationError(
-                "runtime load_balancing cannot reconfigure the caller-owned Tokio scheduler".into(),
-            ));
-        }
+        let strategy = config.scheduler_config.load_balancing.clone();
         let capacity = config.scheduler_config.task_queue_capacity;
         if capacity > Semaphore::MAX_PERMITS {
             return Err(ActorError::InitializationError(format!(
@@ -483,22 +581,14 @@ impl ActorRuntime for TokioActorRuntime {
                 "runtime task_timeout cannot form a monotonic deadline".into(),
             ));
         }
-        let owned_runtime = if config.worker_threads.is_some() || config.io_threads.is_some() {
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
-            builder.enable_all();
-            if let Some(worker_threads) = config.worker_threads {
-                builder.worker_threads(worker_threads);
-            }
-            if let Some(io_threads) = config.io_threads {
-                builder.max_blocking_threads(io_threads);
-            }
-            Some(Arc::new(OwnedRuntime::new(builder.build().map_err(
-                |error| {
-                    ActorError::InitializationError(format!(
-                        "failed to build owned Tokio runtime: {error}"
-                    ))
-                },
-            )?)))
+        let needs_owned_runtime = config.worker_threads.is_some()
+            || config.io_threads.is_some()
+            || !matches!(strategy, LoadBalancingStrategy::RoundRobin);
+        let owned_runtime = if needs_owned_runtime {
+            Some(Arc::new(
+                OwnedRuntime::new(config.worker_threads, config.io_threads, &strategy)
+                    .map_err(ActorError::InitializationError)?,
+            ))
         } else {
             None
         };
@@ -508,6 +598,7 @@ impl ActorRuntime for TokioActorRuntime {
                 permits,
                 timeout: config.scheduler_config.task_timeout,
                 owned_runtime,
+                strategy,
                 state: Mutex::new(TaskState::default()),
                 changed: Notify::new(),
             }),
@@ -532,17 +623,29 @@ impl ActorRuntime for TokioActorRuntime {
             if state.shutting_down {
                 return Err(ActorError::Stopped);
             }
+            let worker_count = self
+                .inner
+                .owned_runtime
+                .as_ref()
+                .map_or(1, |runtime| runtime.worker_count());
+            if state.workers.len() != worker_count {
+                state.workers.resize_with(worker_count, WorkerLoad::default);
+            }
+            let worker = state.choose_worker(&self.inner.strategy, worker_count);
             state.pending += 1;
+            state.workers[worker].pending += 1;
             PendingTask {
                 future,
                 registration: PendingGuard {
                     inner: self.inner.clone(),
+                    worker,
                     armed: true,
                 },
             }
         };
         if let Some(runtime) = self.inner.owned_runtime.clone() {
-            let handle = runtime.spawn(run_task(self.inner.clone(), task));
+            let worker = task.registration.worker;
+            let handle = runtime.spawn_on(worker, run_task(self.inner.clone(), task));
             let mut handle = AbortOnDrop { handle };
             match (&mut handle).await {
                 Ok(result) => result,
@@ -570,6 +673,7 @@ impl ActorRuntime for TokioActorRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn runtime_config_defaults_are_none() {
@@ -804,6 +908,70 @@ mod tests {
             "explicit worker_threads still used the host runtime"
         );
         assert!(runtime.inner.owned_runtime.is_some());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokio_runtime_least_loaded_uses_distinct_owned_worker_threads() {
+        let host = std::thread::current().id();
+        let runtime = TokioActorRuntime::start(RuntimeConfig {
+            worker_threads: Some(2),
+            scheduler_config: SchedulerConfig {
+                load_balancing: LoadBalancingStrategy::LeastLoaded,
+                ..Default::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .await
+        .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_runtime = runtime.clone();
+        let first = {
+            let barrier = barrier.clone();
+            first_runtime.spawn(async move {
+                let id = std::thread::current().id();
+                barrier.wait().await;
+                id
+            })
+        };
+        let second_runtime = runtime.clone();
+        let second = {
+            let barrier = barrier.clone();
+            second_runtime.spawn(async move {
+                let id = std::thread::current().id();
+                barrier.wait().await;
+                id
+            })
+        };
+        let (first, second) = tokio::join!(first, second);
+        let ids = HashSet::from([first.unwrap(), second.unwrap()]);
+        assert_eq!(ids.len(), 2, "LeastLoaded did not spread concurrent work");
+        assert!(!ids.contains(&host), "owned task ran on the host executor");
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokio_runtime_random_uses_owned_worker_pool() {
+        let host = std::thread::current().id();
+        let runtime = TokioActorRuntime::start(RuntimeConfig {
+            worker_threads: Some(2),
+            scheduler_config: SchedulerConfig {
+                load_balancing: LoadBalancingStrategy::Random,
+                ..Default::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime.inner.owned_runtime.as_ref().unwrap().worker_count(),
+            2
+        );
+        let worker = runtime
+            .spawn(async { std::thread::current().id() })
+            .await
+            .unwrap();
+        assert_ne!(worker, host, "random placement ran on the host executor");
         runtime.shutdown().await.unwrap();
     }
 

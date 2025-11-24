@@ -1894,6 +1894,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cu-bincode",
+ "fastrand",
  "flume",
  "futures",
  "inventory",
