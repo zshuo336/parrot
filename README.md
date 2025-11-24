@@ -64,6 +64,16 @@ For call-time admission of dynamic Thread instances, `try_spawn_typed_with_confi
 
 For engine-neutral async actors, run `cargo run --locked -p parrot --example neutral_runtime` (instances, factories and parent-owned children). Run `cargo run --locked -p parrot --example facade_runtime` for the existing facade with native and application-defined runtimes, named creation, actual lookup and shared shutdown. See the [engine migration guide](docs/ENGINE_MIGRATION_GUIDE.md) for selection, replacement, cancellation and capability boundaries.
 
+For static protocols, `ParrotActorSystem::spawn_typed` and `spawn_typed_factory`
+return the native `TypedActorRef` on Thread or Actix. Named `_on` variants and
+explicit supervision variants capture the selected engine before polling,
+including nested facades; messages keep their concrete typed mailbox. See
+[static facade creation](docs/ENGINE_MIGRATION_GUIDE.md#static-protocols-through-the-facade).
+The matching `spawn_typed_single*` methods use the existing single-protocol
+adapter. `native_root_cohort` / `native_root_cohort_on` create a
+`FacadeRootCohort` accepting typed and dynamic members, plus Actix Local members,
+under one native policy and recovery barrier. See [root groups](docs/ROOT_COHORTS.md).
+
 More examples live in [crates/parrot/examples](crates/parrot/examples). Some are interactive or require services; they are not all finite smoke tests. The [websearch application](apps/websearch/README.md) has a separate build and integration workflow.
 
 The application runner can explicitly record incoming request chains and export them over OTLP/HTTP with `run --trace-otlp <https-url>`. It checks delivery and loss counts during shutdown; see [application tracing](docs/APP_TRACE_INGRESS.md) for options and the supported capture boundary.

@@ -1,13 +1,16 @@
+mod cohort;
 pub(crate) mod registrations;
 mod runtime;
 mod shutdown;
 pub(crate) mod startup;
 mod topology;
+mod typed;
 use crate::actix::ActixActorSystem;
 use crate::owned_payload::PublicationInput;
 use crate::thread::system::ThreadActorSystem;
 use anyhow;
 use async_trait::async_trait;
+pub use cohort::FacadeRootCohort;
 use parrot_api::{
     actor::Actor,
     address::{ActorPath, ActorRef},
@@ -22,6 +25,7 @@ pub use shutdown::{ShutdownErrors, ShutdownFailure};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+pub use typed::SingleActorRef;
 
 // Commit first, release every displaced registration outside all locks, then
 // report cleanup errors. One destructor panic must not skip later retirements.

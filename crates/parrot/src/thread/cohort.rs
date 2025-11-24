@@ -17,6 +17,18 @@ struct Cohort {
     group: RootCohort,
 }
 
+impl ThreadActorSystem {
+    pub(crate) fn bind_root_cohort(
+        self: &Arc<Self>,
+        group: RootCohort,
+    ) -> Arc<dyn AsyncRootCohort> {
+        Arc::new(Cohort {
+            system: self.clone(),
+            group,
+        })
+    }
+}
+
 impl AsyncCohortRuntime for ThreadActorSystem {
     fn root_cohort(
         &self,
@@ -35,7 +47,7 @@ impl AsyncCohortRuntime for ThreadActorSystem {
                 .root_cohort(strategy.take())
                 .await
                 .map_err(SystemError::ActorError)?;
-            Ok(Arc::new(Cohort { system, group }) as Arc<dyn AsyncRootCohort>)
+            Ok(system.bind_root_cohort(group))
         }))
     }
 }

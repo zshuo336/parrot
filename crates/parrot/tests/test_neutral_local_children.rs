@@ -338,14 +338,8 @@ async fn runtime_for(
         system.clone()
     }
 }
-fn parent_flavors(via_facade: bool) -> &'static [Flavor] {
-    if via_facade {
-        // Static typed root creation has no facade entry yet; do not bypass it
-        // through the native handle and claim that the facade created the root.
-        &[Flavor::Local, Flavor::Native]
-    } else {
-        &[Flavor::Local, Flavor::Typed, Flavor::Native]
-    }
+fn parent_flavors(_via_facade: bool) -> &'static [Flavor] {
+    &[Flavor::Local, Flavor::Typed, Flavor::Native]
 }
 // Typed parents are called through TypedActorRef::ask; its declared result is
 // already BoxedMessage. The ordinary into_dyn bridge adds its documented result
@@ -394,10 +388,18 @@ async fn root_with_runtime(
             .await
             .unwrap(),
         Flavor::Typed => {
-            let actor = s
-                .spawn_typed_factory::<_, Cmd, _>(|| TypedParent, "/parent")
-                .await
-                .unwrap();
+            let actor = if let Some(facade) =
+                (runtime as &dyn Any).downcast_ref::<parrot::system::ParrotActorSystem>()
+            {
+                facade
+                    .spawn_typed_factory::<_, Cmd, _>(|| TypedParent, "/parent")
+                    .await
+                    .unwrap()
+            } else {
+                s.spawn_typed_factory::<_, Cmd, _>(|| TypedParent, "/parent")
+                    .await
+                    .unwrap()
+            };
             let reference = actor.clone().into_dyn();
             typed = Some(actor);
             reference

@@ -17,6 +17,15 @@ struct Cohort {
     group: RootCohort,
 }
 
+impl ActixActorSystem {
+    pub(crate) fn bind_root_cohort(&self, group: RootCohort) -> Arc<dyn AsyncRootCohort> {
+        Arc::new(Cohort {
+            system: self.clone(),
+            group,
+        })
+    }
+}
+
 impl AsyncCohortRuntime for ActixActorSystem {
     fn root_cohort(
         &self,
@@ -26,7 +35,7 @@ impl AsyncCohortRuntime for ActixActorSystem {
         let system = self.clone();
         Box::pin(async move {
             let group = group.await.map_err(SystemError::ActorError)?;
-            Ok(Arc::new(Cohort { system, group }) as Arc<dyn AsyncRootCohort>)
+            Ok(system.bind_root_cohort(group))
         })
     }
 }

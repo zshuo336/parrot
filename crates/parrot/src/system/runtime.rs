@@ -216,10 +216,13 @@ impl ParrotActorSystem {
         name: &str,
         strategy: parrot_api::supervisor::SupervisorStrategyType,
     ) -> BoxedFuture<'_, Result<Arc<dyn AsyncRootCohort>, SystemError>> {
-        self.cohort_selected(self.get_cohort_system(Some(name)), strategy)
+        self.cohort_selected(self.get_leaf_creation_system(Some(name)), strategy)
     }
 
-    fn get_cohort_system(&self, name: Option<&str>) -> Result<ActorSystemImpl, SystemError> {
+    pub(super) fn get_leaf_creation_system(
+        &self,
+        name: Option<&str>,
+    ) -> Result<ActorSystemImpl, SystemError> {
         let mut system = self.get_creation_system(name)?;
         let mut seen = std::collections::HashSet::new();
         loop {
@@ -488,7 +491,7 @@ impl AsyncCohortRuntime for ParrotActorSystem {
         &self,
         strategy: parrot_api::supervisor::SupervisorStrategyType,
     ) -> BoxedFuture<'_, Result<Arc<dyn AsyncRootCohort>, SystemError>> {
-        self.cohort_selected(self.get_cohort_system(None), strategy)
+        self.cohort_selected(self.get_leaf_creation_system(None), strategy)
     }
 }
 
