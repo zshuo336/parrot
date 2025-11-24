@@ -31,7 +31,9 @@ type Input<T> = crate::owned_payload::OwnedPayload<T>;
 // Each detached value therefore needs its own synchronous unwind boundary.
 fn retire_on_drop<T>(value: T, stage: &'static str) {
     if let Err(error) = crate::owned_payload::PublicationInput::new(value).retire() {
-        tracing::error!(stage, error = %error, "final mailbox owner disposal failed");
+        crate::owned_payload::cleanup_diagnostic(|| {
+            tracing::error!(stage, error = %error, "final mailbox owner disposal failed");
+        });
     }
 }
 
@@ -45,7 +47,9 @@ async fn finish_push<T: Send + 'static>(
     if let Some(rejected) = rejected
         && let Err(error) = rejected.retire().await
     {
-        tracing::error!(error = %error, rejection = ?result, "rejected mailbox input disposal failed");
+        crate::owned_payload::cleanup_diagnostic(|| {
+            tracing::error!(error = %error, rejection = ?result, "rejected mailbox input disposal failed");
+        });
     }
     if let Some(evicted) = evicted
         && let Err(error) = evicted.retire().await
@@ -56,7 +60,9 @@ async fn finish_push<T: Send + 'static>(
                 crate::error_receipt::actor_summary(&error)
             )));
         }
-        tracing::error!(error = %error, rejection = ?result, "evicted mailbox input disposal failed after rejection");
+        crate::owned_payload::cleanup_diagnostic(|| {
+            tracing::error!(error = %error, rejection = ?result, "evicted mailbox input disposal failed after rejection");
+        });
     }
     result
 }
