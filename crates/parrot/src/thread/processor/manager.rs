@@ -31,7 +31,9 @@ impl std::fmt::Debug for ActorProcessorManager {
 impl Drop for ActorProcessorManager {
     fn drop(&mut self) {
         if let Err(error) = self.try_clear() {
-            tracing::warn!(%error, "processor registry disposal failed");
+            crate::owned_payload::cleanup_diagnostic(|| {
+                tracing::warn!(%error, "processor registry disposal failed");
+            });
         }
     }
 }
@@ -86,7 +88,9 @@ impl ActorProcessorManager {
     /// This does not retire actor storage on its execution scheduler.
     pub async fn shutdown_all(&self) {
         if let Err(error) = self.try_shutdown_all().await {
-            tracing::warn!(%error, "processor snapshot shutdown failed");
+            crate::owned_payload::cleanup_diagnostic(|| {
+                tracing::warn!(%error, "processor snapshot shutdown failed");
+            });
         }
     }
 

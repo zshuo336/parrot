@@ -564,3 +564,6 @@ fn manager_preserves_send_sync_and_unwind_safety_traits() {
     let manager = ActorProcessorManager::new();
     assert!(std::panic::catch_unwind(|| manager.is_empty()).unwrap());
 }
+
+#[path = "support/manager_diagnostics.rs"]
+mod diagnostics;

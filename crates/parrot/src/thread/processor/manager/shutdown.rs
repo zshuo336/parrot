@@ -80,10 +80,12 @@ impl Future for StopFuture {
 impl Drop for StopFuture {
     fn drop(&mut self) {
         if let Some(error) = self.dispose() {
-            tracing::warn!(
-                error = %system_summary(error.error()),
-                "processor stop future disposal failed during cancellation"
-            );
+            crate::owned_payload::cleanup_diagnostic(|| {
+                tracing::warn!(
+                    error = %system_summary(error.error()),
+                    "processor stop future disposal failed during cancellation"
+                );
+            });
         }
     }
 }
