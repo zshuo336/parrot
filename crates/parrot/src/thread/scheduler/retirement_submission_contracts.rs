@@ -208,6 +208,29 @@ async fn public_stop() {
         .await
         .unwrap();
     actor.send(Box::new(31_u32)).await.unwrap();
+    let processor = system
+        .get_mailbox("/retirement-diagnostic")
+        .unwrap()
+        .get_processor()
+        .unwrap();
+    // Retire actual storage on its affinity thread before closing the shard.
+    // An idle shard's shutdown alone does not retire registered actor storage.
+    let (completion, result) = tokio::sync::oneshot::channel();
+    scheduler
+        .enqueue_stop_hook_until(
+            "retirement-diagnostic",
+            StopHookRequest {
+                trace_context: None,
+                path: "/retirement-diagnostic".into(),
+                processor,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(3),
+                completion,
+                retire_only: true,
+            },
+        )
+        .await
+        .unwrap();
+    result.await.unwrap().unwrap();
     scheduler
         .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(3))
         .await

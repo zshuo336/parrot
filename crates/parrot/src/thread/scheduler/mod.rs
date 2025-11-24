@@ -483,7 +483,9 @@ impl SchedulerGroup {
             )
             .await;
         if let Err(error) = submitted {
-            tracing::error!(%path, %error, "actor retirement submission failed; retaining registration until disposal receipt");
+            failure_diagnostic(|| {
+                tracing::error!(%path, %error, "actor retirement submission failed; retaining registration until disposal receipt");
+            });
         } else {
             let _ = result.await;
         }
