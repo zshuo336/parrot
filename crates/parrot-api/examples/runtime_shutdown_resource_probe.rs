@@ -3,11 +3,7 @@
 #[cfg(target_os = "linux")]
 fn main() {
     use parrot_api::runtime::{ActorRuntime, RuntimeConfig, TokioActorRuntime};
-    use std::{
-        sync::{Arc, Condvar, Mutex},
-        thread,
-        time::Duration,
-    };
+    use std::{sync::mpsc, thread, time::Duration};
 
     fn threads() -> usize {
         std::fs::read_dir("/proc/self/task").unwrap().count()
@@ -36,27 +32,22 @@ fn main() {
     }
 
     struct Exhausted {
-        gate: Arc<(Mutex<bool>, Condvar)>,
-        threads: Vec<thread::JoinHandle<()>>,
+        threads: Vec<(thread::JoinHandle<()>, mpsc::Sender<()>)>,
     }
 
     impl Exhausted {
         fn new(limit: usize) -> Self {
             let mut owner = Self {
-                gate: Arc::new((Mutex::new(false), Condvar::new())),
                 threads: Vec::new(),
             };
             for _ in 0..=limit {
-                let gate = owner.gate.clone();
+                let (release, gate) = mpsc::channel();
                 match thread::Builder::new()
                     .stack_size(128 * 1024)
                     .spawn(move || {
-                        let (lock, changed) = &*gate;
-                        let _open = changed
-                            .wait_while(lock.lock().unwrap(), |open| !*open)
-                            .unwrap();
+                        let _ = gate.recv();
                     }) {
-                    Ok(thread) => owner.threads.push(thread),
+                    Ok(thread) => owner.threads.push((thread, release)),
                     Err(error) => {
                         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
                         assert!(!owner.threads.is_empty());
@@ -66,21 +57,32 @@ fn main() {
             }
             panic!("isolated cgroup did not enforce the declared PID limit");
         }
-    }
 
-    impl Drop for Exhausted {
-        fn drop(&mut self) {
-            *self.gate.0.lock().unwrap() = true;
-            self.gate.1.notify_all();
-            for thread in self.threads.drain(..) {
+        fn release(&mut self, count: usize) {
+            for _ in 0..count {
+                let (thread, release) = self.threads.pop().unwrap();
+                release.send(()).unwrap();
                 thread.join().unwrap();
             }
         }
     }
 
-    assert_eq!(
-        std::env::args().nth(1).as_deref(),
-        Some("--isolated-pid-probe")
+    impl Drop for Exhausted {
+        fn drop(&mut self) {
+            for (thread, release) in self.threads.drain(..) {
+                let _ = release.send(());
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    assert!(
+        matches!(
+            mode.as_str(),
+            "--isolated-pid-probe" | "--isolated-worker-startup-probe"
+        ),
+        "explicit isolated probe mode required"
     );
     let limit: usize = std::fs::read_to_string("/sys/fs/cgroup/pids.max")
         .expect("isolated cgroup v2 PID limit required")
@@ -102,6 +104,54 @@ fn main() {
             io_threads: Some(1),
             ..Default::default()
         };
+        if mode == "--isolated-worker-startup-probe" {
+            let lane = std::env::args().nth(2).expect("actor or io lane required");
+            let slots: usize = std::env::args().nth(3).unwrap().parse().unwrap();
+            assert!(matches!(lane.as_str(), "actor" | "io"));
+            assert!((1..=6).contains(&slots));
+            // Initialize the process join service before reserving exact PID headroom.
+            TokioActorRuntime::start(config).await.unwrap().shutdown().await.unwrap();
+            wait_threads(baseline + 1, "warm-service");
+            let mut exhausted = Exhausted::new(limit);
+            exhausted.release(slots);
+            let reserved = baseline + 1 + exhausted.threads.len();
+            wait_threads(reserved, "reserved-worker-slots");
+            let denied = std::fs::read_to_string("/sys/fs/cgroup/pids.events").unwrap();
+            let startup = RuntimeConfig {
+                worker_threads: Some(if lane == "actor" { 4 } else { 1 }),
+                io_threads: (lane == "io").then_some(4),
+                ..Default::default()
+            };
+            let result = tokio::time::timeout(Duration::from_secs(10), TokioActorRuntime::start(startup))
+                .await.expect("worker startup did not finish within 10 seconds");
+            println!("WORKER_STARTUP lane={lane} slots={slots} live={} reserved={reserved} result={result:?}", threads());
+            println!("PIDS_EVENTS before={denied:?} after={:?}", std::fs::read_to_string("/sys/fs/cgroup/pids.events").unwrap());
+            let failed = match result {
+                Ok(runtime) => {
+                    runtime.spawn(async {}).await.unwrap();
+                    runtime.shutdown().await.unwrap();
+                    false
+                }
+                Err(error) => {
+                    assert!(matches!(error, parrot_api::errors::ActorError::InitializationError(_)), "{error}");
+                    true
+                }
+            };
+            wait_threads(reserved, "partial-worker-rollback");
+            drop(exhausted);
+            wait_threads(baseline + 1, "partial-worker-released");
+            assert!(failed, "startup accepted fewer OS workers than configured: lane={lane} slots={slots}");
+            // Recovery must still accept real actor and I/O work after resources return.
+            let recovered = TokioActorRuntime::start(RuntimeConfig {
+                worker_threads: Some(4), io_threads: Some(4), ..Default::default()
+            }).await.unwrap();
+            assert_eq!(recovered.spawn(async { 41 }).await.unwrap(), 41);
+            assert_eq!(recovered.spawn_io(async { 42 }).await.unwrap(), 42);
+            recovered.shutdown().await.unwrap();
+            wait_threads(baseline + 1, "post-failure-recovery");
+            println!("WORKER_STARTUP_EXHAUSTION_OK lane={lane} slots={slots}");
+            return;
+        }
         let cold = Exhausted::new(limit);
         let error = TokioActorRuntime::start(config.clone())
             .await
@@ -134,7 +184,9 @@ fn main() {
         drop(warm);
         wait_threads(baseline + 1, "warm-rollback");
     });
-    println!("PID_EXHAUSTION_OK: cold startup rollback, warm startup rollback, actor/I/O OS join; one process join service retained");
+    if mode == "--isolated-pid-probe" {
+        println!("PID_EXHAUSTION_OK: cold startup rollback, warm startup rollback, actor/I/O OS join; one process join service retained");
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

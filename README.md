@@ -21,7 +21,7 @@ Actix: count=5
 Thread: count=5
 ```
 
-External path/git consumers using `parrot`, `parrot-remote` (including the app and node
+External path/git consumers using `parrot-api`, `parrot`, `parrot-remote` (including the app and node
 crates), or native ABI loading, must select this repository's Tokio
 copy in their own workspace root. Cargo does not inherit a dependency's root
 patches. Add `[patch.crates-io]` with `tokio = { path = "path/to/parrot/vendor/tokio" }`

@@ -2051,7 +2051,7 @@ cfg_rt_multi_thread! {
 
             // Spawn the thread pool workers
             let _enter = handle.enter();
-            launch.launch();
+            launch.launch(&handle)?;
 
             Ok(Runtime::from_parts(Scheduler::MultiThread(scheduler), handle, blocking_pool))
         }

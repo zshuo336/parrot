@@ -76,5 +76,21 @@ path = "../../../vendor/tokio/tests/task_blocking.rs"
 name = "rt_spawn_blocking"
 path = "../../../vendor/tokio/tests/rt_spawn_blocking.rs"
 
+[[test]]
+name = "parrot_worker_startup"
+path = "../../../vendor/tokio/tests/parrot_worker_startup.rs"
+
+[[test]]
+name = "rt_threaded"
+path = "../../../vendor/tokio/tests/rt_threaded.rs"
+
+[[test]]
+name = "rt_panic"
+path = "../../../vendor/tokio/tests/rt_panic.rs"
+
+[[test]]
+name = "rt_shutdown_err"
+path = "../../../vendor/tokio/tests/rt_shutdown_err.rs"
+
 [patch.crates-io]
 tokio = { path = "../../../vendor/tokio" }

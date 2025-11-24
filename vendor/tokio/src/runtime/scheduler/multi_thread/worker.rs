@@ -509,9 +509,31 @@ where
 }
 
 impl Launch {
-    pub(crate) fn launch(mut self) {
+    pub(crate) fn launch(mut self, handle: &runtime::Handle) -> std::io::Result<()> {
+        for worker in &self.0 {
+            let worker = worker.clone();
+            handle
+                .inner
+                .blocking_spawner()
+                .spawn_worker(handle, move || run(worker))?;
+        }
+        self.0.clear();
+        Ok(())
+    }
+}
+
+impl Drop for Launch {
+    fn drop(&mut self) {
+        // A failed OS spawn or builder callback must retire cores that have
+        // no worker. Live workers observe close and retire their own cores.
+        if let Some(worker) = self.0.first() {
+            worker.handle.shutdown();
+        }
         for worker in self.0.drain(..) {
-            runtime::spawn_blocking(move || run(worker));
+            if let Some(mut core) = worker.core.take() {
+                core.pre_shutdown(&worker);
+                worker.handle.shutdown_core(core);
+            }
         }
     }
 }

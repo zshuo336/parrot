@@ -2,7 +2,7 @@
 
 This directory is the Tokio 1.53.3 crates.io release under its original MIT
 license. `UPSTREAM.json` records the release archive SHA-256 and all 564 upstream
-file hashes. Sixteen upstream Rust files and the normalized `Cargo.toml` differ;
+file hashes. Eighteen upstream Rust files and the normalized `Cargo.toml` differ;
 the package version and dependency versions are unchanged. `Cargo.toml.orig`
 is preserved byte-for-byte as upstream provenance, not an editable build input.
 
@@ -99,6 +99,31 @@ The pinned upstream `task_blocking` and `rt_spawn_blocking` suites exercise norm
 blocking execution, nested blocking, shutdown, paused time and the lost-spawn
 race alongside those failure contracts.
 
+## Fallible scheduler worker startup
+
+Scheduler workers now require distinct OS threads during multi-thread runtime
+construction. `blocking/pool.rs` has a private worker-dispatch path which returns
+the actual OS error, including EAGAIN after earlier threads were created. It does
+not queue scheduler workers behind another live scheduler worker. Ordinary
+blocking jobs retain their existing temporary-failure fallback and queue rules.
+
+`scheduler/multi_thread/worker.rs` retains all cores behind a launch guard until
+every worker spawn succeeds. Error or callback unwinding closes the scheduler,
+cancels startup-callback tasks, and retires cores which have not begun running.
+Existing workers retire their own cores. `runtime/builder.rs` propagates the
+spawn error through `Builder::build` and drops the blocking pool, joining threads
+and TLS before returning. Callback panics retain their original panic behavior.
+User callbacks or TLS that block forever still prevent bounded retirement.
+
+`parrot-api` requires the empty `parrot-worker-startup` feature, so external API
+consumers must configure this workspace patch too. The external consumer gate
+checks missing-patch rejection and real actor/I/O execution after applying it.
+`tests/parrot_worker_startup.rs` tests successful worker startup and rollback of
+tasks/TLS after a later thread-name callback panics. The pinned consumer also runs
+the original threaded runtime, runtime panic and shutdown-error suites. Real
+Linux cgroup PID exhaustion tests cover first and partial actor/I/O worker
+creation, complete thread retirement and recovery when resources return.
+
 ## Platform documentation
 
 Three additional changes are documentation-only: `src/net/mod.rs` links to
@@ -131,7 +156,8 @@ repair itself remains specific to Linux GNU. `parrot-remote` separately requires
 consumers that depend on the remote layer. Those consumers also need the root
 patch. The core `parrot` crate also requires `tokio/parrot-blocking-ownership`
 for failed blocking-dispatch cleanup, including applications without remote or
-native loading. Pure ABI without the loader requires neither marker nor Tokio.
+native loading. The API crate requires `tokio/parrot-worker-startup` for fallible
+scheduler worker launch. Pure ABI without the loader requires neither marker nor Tokio.
 
 If a consumer already locks a newer registry version, merely adding the patch
 may still fail resolution. Select the patched version explicitly and retain the
@@ -220,7 +246,7 @@ the underlying wake and permit-distribution paths change.
 Keep the upstream source and license intact. When upgrading, verify the new
 archive checksum, review the five native runtime changes, three deferred-channel
 changes, three documentation corrections, blocking task ownership, notification
-fanout and all three
+fanout, fallible scheduler worker launch and all four
 capability requirements, and
 run `native_runtime_progress` and `dylib_assembly` with the real workspace
 feature union on Linux GNU. The former must detect both cold-thread defects in

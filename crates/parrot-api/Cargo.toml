@@ -18,7 +18,7 @@ thiserror = "2.0.11"
 futures = "0.3"
 fastrand = "2.5"
 pin-project-lite = "0.2"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["full", "parrot-worker-startup"] }
 # This fork adds required notification semantics; registry 0.11.1 is not a substitute.
 flume = { path = "../../vendor/flume" }
 tracing = "0.1"

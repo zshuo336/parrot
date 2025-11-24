@@ -375,6 +375,36 @@ impl Spawner {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        self.spawn_blocking_inner_with_worker(func, is_mandatory, spawn_meta, rt, false)
+    }
+
+    #[cfg(feature = "rt-multi-thread")]
+    pub(crate) fn spawn_worker<F>(&self, rt: &Handle, func: F) -> io::Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (_, result) = self.spawn_blocking_inner_with_worker(
+            func,
+            Mandatory::NonMandatory,
+            SpawnMeta::new_unnamed(std::mem::size_of::<F>()),
+            rt,
+            true,
+        );
+        result.map_err(Into::into)
+    }
+
+    fn spawn_blocking_inner_with_worker<F, R>(
+        &self,
+        func: F,
+        is_mandatory: Mandatory,
+        spawn_meta: SpawnMeta<'_>,
+        rt: &Handle,
+        worker: bool,
+    ) -> (JoinHandle<R>, Result<(), SpawnError>)
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
         let id = task::Id::next();
         let fut =
             blocking_task::<F, BlockingTask<F>>(BlockingTask::new(func), spawn_meta, id.as_u64());
@@ -386,11 +416,11 @@ impl Spawner {
             task::SpawnLocation::capture(),
         );
 
-        let spawned = self.spawn_task(Task::new(task, is_mandatory), rt);
+        let spawned = self.spawn_task(Task::new(task, is_mandatory), rt, worker);
         (handle, spawned)
     }
 
-    fn spawn_task(&self, task: Task, rt: &Handle) -> Result<(), SpawnError> {
+    fn spawn_task(&self, task: Task, rt: &Handle, worker: bool) -> Result<(), SpawnError> {
         let mut shared = self.inner.shared.lock();
 
         if shared.shutdown {
@@ -405,10 +435,18 @@ impl Spawner {
             return Err(SpawnError::ShuttingDown);
         }
 
-        if self.inner.metrics.num_idle_threads() == 0 {
+        if worker || self.inner.metrics.num_idle_threads() == 0 {
             // No threads are able to process the task.
 
             if self.inner.metrics.num_threads() == self.inner.thread_cap {
+                if worker {
+                    drop(shared);
+                    task.task.shutdown();
+                    return Err(SpawnError::NoThreads(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "scheduler worker thread capacity exhausted",
+                    )));
+                }
                 // At max number of threads
             } else {
                 assert!(shared.shutdown_tx.is_some());
@@ -424,7 +462,7 @@ impl Spawner {
                             shared.worker_threads.insert(id, handle);
                         }
                         Err(ref e)
-                            if is_temporary_os_thread_error(e)
+                            if !worker && is_temporary_os_thread_error(e)
                                 && self.inner.metrics.num_threads() > 0 =>
                         {
                             // OS temporarily failed to spawn a new thread.

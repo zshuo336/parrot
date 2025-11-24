@@ -44,7 +44,7 @@ class ConsumerGateContracts(unittest.TestCase):
         gate = gate_module()
         class Check(gate.Check):
             def metadata(self, name, consumer, native, patched, pure_abi=False, locked=False, remote=False,
-                         blocking=False):
+                         blocking=False, startup=False):
                 if patched and not pure_abi:
                     self.resolutions.append(dict(name=name, tokio=[dict(version='1.53.3', source=None)]))
 
@@ -73,7 +73,7 @@ class ConsumerGateContracts(unittest.TestCase):
             with self.subTest(counts=counts), self.assertRaisesRegex(RuntimeError, 'contracts must execute'):
                 self.runtime_receipt(*counts)
 
-    def check_metadata(self, stdout, stderr, *, patch, native=False, remote=True, blocking=False):
+    def check_metadata(self, stdout, stderr, *, patch, native=False, remote=True, blocking=False, startup=False):
         gate = gate_module()
         class Check(gate.Check):
             def run(self, name, consumer, arguments, expected=0):
@@ -85,7 +85,7 @@ class ConsumerGateContracts(unittest.TestCase):
             checker = Check(SimpleNamespace(root=ROOT, output_dir=directory / 'evidence',
                                             target_dir=directory / 'target', offline=True,
                                             resolution_only=True))
-            checker.metadata('external', directory, native, patch, remote=remote, blocking=blocking)
+            checker.metadata('external', directory, native, patch, remote=remote, blocking=blocking, startup=startup)
             return checker.expected_exit, checker.resolutions
 
     def test_remote_only_missing_patch_must_identify_the_deferred_mpsc_capability(self):
@@ -136,7 +136,7 @@ class ConsumerGateContracts(unittest.TestCase):
 
         class Check(gate.Check):
             def metadata(self, name, consumer, native, patch, pure_abi=False, locked=False, remote=False,
-                         blocking=False):
+                         blocking=False, startup=False):
                 if patch and not pure_abi and versions is not None:
                     self.resolutions.append(dict(name=name, tokio=[dict(version=next(versions), source=None)]))
 
@@ -163,6 +163,23 @@ class ConsumerGateContracts(unittest.TestCase):
             with self.subTest(version=version):
                 arguments = self.migrate(itertools.repeat(version))
                 self.assertEqual(arguments, ['update', '-p', 'tokio', '--precise', version])
+
+    def test_api_consumer_requires_worker_startup_capability(self):
+        gate = gate_module()
+        expected, resolutions = self.check_metadata(
+            '', gate.STARTUP_MARKER + ': does not have that feature',
+            patch=False, remote=False, startup=True)
+        self.assertEqual((expected, resolutions), (101, []))
+        for stderr in ['network unavailable', gate.BLOCKING_MARKER + ': does not have that feature']:
+            with self.subTest(stderr=stderr), self.assertRaisesRegex(RuntimeError, 'missing capability'):
+                self.check_metadata('', stderr, patch=False, remote=False, startup=True)
+        data = dict(packages=[dict(name='tokio', id='patched', version='1.53.3',
+                    source=None, manifest_path=str(ROOT / 'vendor/tokio/Cargo.toml'))],
+                    resolve=dict(nodes=[dict(id='patched', features=[])]))
+        with self.assertRaisesRegex(RuntimeError, 'capabilities missing'):
+            self.check_metadata(json.dumps(data), '', patch=True, remote=False, startup=True)
+        data['resolve']['nodes'][0]['features'] = [gate.STARTUP_MARKER]
+        self.check_metadata(json.dumps(data), '', patch=True, remote=False, startup=True)
 
     def test_missing_patched_identity_cannot_select_a_version(self):
         with self.assertRaisesRegex(RuntimeError, 'agree on one runtime version'):

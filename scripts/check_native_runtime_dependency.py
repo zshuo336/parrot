@@ -20,7 +20,9 @@ import time
 MARKER = 'parrot-native-progress'
 REMOTE_MARKER = 'parrot-deferred-mpsc'
 BLOCKING_MARKER = 'parrot-blocking-ownership'
+STARTUP_MARKER = 'parrot-worker-startup'
 CASES = [
+    ('parrot-api', [], False),
     ('parrot', [], False),
     ('parrot-abi', [], False),
     ('parrot-app', [], False),
@@ -89,6 +91,8 @@ class Check:
                 + json.dumps(dependency['path']) + ', features = ' + json.dumps(features) + ' }\n')
         if patch:
             text += '\n[patch.crates-io]\ntokio = { path = ' + json.dumps(str(self.root / 'vendor/tokio')) + ' }\n'
+        if package == 'parrot-api':
+            text += '\n[dependencies.tokio]\nversion="1"\nfeatures=["full"]\n'
         if native:
             text += ('\n[features]\ndefault=["dylib"]\ndylib=[]\n'
                      '[dev-dependencies]\ntokio={version="1",features=["full"]}\n'
@@ -100,7 +104,16 @@ class Check:
         consumer = self.output / 'consumers' / name
         (consumer / 'src').mkdir(parents=True)
         self.manifest(consumer, package, features, patch, native)
-        if package == 'parrot':
+        if package == 'parrot-api':
+            body = ('use parrot_api::runtime::{ActorRuntime, RuntimeConfig, TokioActorRuntime};\n'
+                    'let host = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();\n'
+                    'host.block_on(async {\n'
+                    'let runtime = TokioActorRuntime::start(RuntimeConfig { worker_threads: Some(2), '
+                    'io_threads: Some(2), ..Default::default() }).await.unwrap();\n'
+                    'assert_eq!(runtime.spawn(async { 41 }).await.unwrap(), 41);\n'
+                    'assert_eq!(runtime.spawn_io(async { 42 }).await.unwrap(), 42);\n'
+                    'runtime.shutdown().await.unwrap();\n});')
+        elif package == 'parrot':
             body = ('assert!(parrot::thread::config::ThreadActorSystemConfig::default()'
                     '.default_mailbox_capacity > 0);')
         elif package == 'parrot-abi':
@@ -127,9 +140,10 @@ class Check:
         return consumer
 
     def metadata(self, name, consumer, native, patch, pure_abi=False, locked=False, remote=False,
-                 blocking=False):
+                 blocking=False, startup=False):
         required = (({MARKER} if native else set()) | ({REMOTE_MARKER} if remote else set())
-                    | ({BLOCKING_MARKER} if blocking else set()))
+                    | ({BLOCKING_MARKER} if blocking else set())
+                    | ({STARTUP_MARKER} if startup else set()))
         stdout, stderr = self.run(name, consumer, ['metadata', '--format-version', '1']
                                   + (['--locked'] if locked else []),
                                   expected=101 if required and not patch else 0)
@@ -164,14 +178,15 @@ class Check:
             for patch in [False, True]:
                 name = package + '-' + ('-'.join(features) or 'default') + ('-patched' if patch else '-registry')
                 consumer = self.consumer(name, package, features, patch, native)
-                remote = package not in {'parrot', 'parrot-abi'}
+                remote = package not in {'parrot-api', 'parrot', 'parrot-abi'}
+                startup = package != 'parrot-abi' or native
                 blocking = (package in {'parrot', 'parrot-node'} or
                             package == 'parrot-app' and bool(features))
                 self.metadata(name + '-resolve', consumer, native, patch,
                               pure_abi=package == 'parrot-abi' and not native, remote=remote,
-                              blocking=blocking)
+                              blocking=blocking, startup=startup)
                 # Compile each supported consumer with its required runtime configuration.
-                if patch == (native or remote or blocking):
+                if patch == (native or remote or blocking or startup):
                     builds.append((name, consumer, native))
 
         # Model an existing loader consumer upgrading Parrot in place. Seed the
@@ -188,19 +203,22 @@ class Check:
         self.manifest(consumer, 'parrot-abi', ['loader'], False, True, legacy)
         manifest = consumer / 'Cargo.toml'
         manifest.write_text(manifest.read_text().replace('tokio={version="1"', 'tokio={version="=1.53.2"'))
+        # The historical loader had no API startup capability dependency.
+        manifest.write_text('\n'.join(line for line in manifest.read_text().splitlines()
+                                      if not line.startswith('parrot-api=')) + '\n')
         stdout, _ = self.run('newer-lock-seed', consumer, ['metadata', '--format-version', '1'])
         tokio = [p for p in json.loads(stdout)['packages'] if p['name'] == 'tokio']
         require(len(tokio) == 1 and tokio[0]['version'] == '1.53.2'
                 and (tokio[0]['source'] or '').startswith('registry+'), 'seed must use real registry 1.53.2')
         (legacy / 'Cargo.toml').write_text(guarded)
         self.manifest(consumer, 'parrot-abi', ['loader'], False, True, legacy)
-        self.metadata('newer-lock-unpatched', consumer, True, False)
+        self.metadata('newer-lock-unpatched', consumer, True, False, startup=True)
         self.manifest(consumer, 'parrot-abi', ['loader'], True, True, legacy)
         # An existing lock isn't repaired by merely adding [patch]. Preserve
         # the failure and then perform the documented explicit selection.
         _, stderr = self.run('newer-lock-patched-not-selected', consumer,
                              ['metadata', '--format-version', '1', '--locked'], expected=101)
-        missing_capability = MARKER in stderr and 'does not have that feature' in stderr
+        missing_capability = (MARKER in stderr or STARTUP_MARKER in stderr) and 'does not have that feature' in stderr
         locked_change = '--locked' in stderr and ('lock file' in stderr or 'lockfile' in stderr)
         require(missing_capability or locked_change,
                 'locked migration must fail on capability or required lock update, not an unrelated error')
@@ -209,7 +227,7 @@ class Check:
         require(len(patched_versions) == 1, 'patched consumers must agree on one runtime version')
         patched_version = patched_versions.pop()
         self.run('newer-lock-select-patch', consumer, ['update', '-p', 'tokio', '--precise', patched_version])
-        self.metadata('newer-lock-selected', consumer, True, True, locked=True)
+        self.metadata('newer-lock-selected', consumer, True, True, locked=True, startup=True)
 
         if not self.args.resolution_only:
             for name, consumer, native in builds:
