@@ -12,6 +12,7 @@ type Work = BoxedFuture<'static, ActorResult<BoxedMessage>>;
 enum Request {
     Tcp,
     Capture(PendingInput),
+    CaptureWork(Work),
 }
 
 fn execute(ctx: &dyn ActorContext, message: BoxedMessage) -> Work {
@@ -26,6 +27,10 @@ fn execute(ctx: &dyn ActorContext, message: BoxedMessage) -> Work {
         }
         Request::Capture(input) => {
             let work = io.run_io(Box::pin(input));
+            Box::pin(async move { Ok(Box::new(work) as BoxedMessage) })
+        }
+        Request::CaptureWork(input) => {
+            let work = io.run_io(input);
             Box::pin(async move { Ok(Box::new(work) as BoxedMessage) })
         }
     }
@@ -66,7 +71,7 @@ impl Actor for ActixProbe {
 }
 impl ActixEngineExt for ActixProbe {}
 
-async fn facade(actix: bool) -> ParrotActorSystem {
+pub(super) async fn facade(actix: bool) -> ParrotActorSystem {
     if actix {
         ParrotActorSystem::with_actix(config(), Default::default())
             .await
@@ -74,6 +79,28 @@ async fn facade(actix: bool) -> ParrotActorSystem {
     } else {
         ParrotActorSystem::start(config()).await.unwrap()
     }
+}
+
+pub(super) async fn capture_work(
+    facade: &ParrotActorSystem,
+    actix: bool,
+    input: Work,
+) -> (BoxedActorRef, Work) {
+    let actor: BoxedActorRef = if actix {
+        bounded(facade.spawn_root_actix(ActixProbe, EmptyConfig))
+            .await
+            .unwrap()
+    } else {
+        bounded(facade.spawn_root_thread(ThreadProbe, EmptyConfig))
+            .await
+            .unwrap()
+    };
+    let work = *bounded(actor.send(Box::new(Request::CaptureWork(input))))
+        .await
+        .unwrap()
+        .downcast::<Work>()
+        .unwrap();
+    (actor, work)
 }
 
 async fn dynamic_context(actix: bool) {

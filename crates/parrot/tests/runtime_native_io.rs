@@ -26,6 +26,8 @@ const LIMIT: Duration = Duration::from_secs(10);
 mod contexts;
 #[path = "runtime_native_io/failures.rs"]
 mod failures;
+#[path = "runtime_native_io/output.rs"]
+mod output;
 async fn bounded<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(LIMIT, future)
         .await

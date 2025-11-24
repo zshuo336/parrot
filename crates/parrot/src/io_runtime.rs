@@ -20,7 +20,33 @@ use std::{
 };
 
 type Work = BoxedFuture<'static, ActorResult<BoxedMessage>>;
-type Failure = Arc<Mutex<Option<ActorReceipt>>>;
+struct Failure {
+    error: Mutex<Option<ActorReceipt>>,
+    owner: Arc<ContextTasks>,
+    generation: Option<Arc<ContextTasks>>,
+    admission: Admission,
+}
+
+impl Failure {
+    fn primary(&self, error: ActorError) -> ActorReceipt {
+        let error = ActorReceipt::from_error(error);
+        let mut failure = self.error.lock().unwrap();
+        failure.get_or_insert(error).clone()
+    }
+
+    fn cleanup(&self, error: ActorError) {
+        let message = crate::error_receipt::actor_summary(&error);
+        if self.admission.io.load(Ordering::Acquire) {
+            self.owner.record_message_disposal_failure(&message);
+        }
+        if let Some(generation) = &self.generation
+            && self.admission.generation.load(Ordering::Acquire)
+        {
+            generation.record_message_disposal_failure(&message);
+        }
+        self.primary(error);
+    }
+}
 
 #[derive(Default)]
 struct Admission {
@@ -29,7 +55,7 @@ struct Admission {
 }
 
 fn rejection(failure: &Failure, error: ActorError) -> ActorError {
-    let cleanup = failure.lock().unwrap().clone();
+    let cleanup = failure.error.lock().unwrap().clone();
     cleanup.map_or(error, ActorReceipt::into_error)
 }
 
@@ -88,25 +114,31 @@ impl IoRuntime {
         let input = OwnedPayload::new(future, &self.retirement, &self.cleanup);
         let io = self.clone();
         Box::pin(parrot_api::trace::capture(async move {
-            let failure: Failure = Arc::default();
-            let admission = Arc::new(Admission::default());
+            let failure = Arc::new(Failure {
+                error: Mutex::default(),
+                owner: io.tasks.clone(),
+                generation: generation.clone(),
+                admission: Admission::default(),
+            });
             let (send, receive) = tokio::sync::oneshot::channel();
             let work = Input {
                 future: Some(PublicationInput::new(input.take())),
                 failure: failure.clone(),
-                owner: io.tasks.clone(),
-                generation: generation.clone(),
-                admission: admission.clone(),
             };
+            let reply_failure = failure.clone();
             let task = io
                 .tasks
                 .user_task(async move {
                     // The result stays protected if cancellation drops its receiver.
-                    let _ = send.send(PublicationInput::new(work.await));
+                    if let Err(reply) = send.send(PublicationInput::new(work.await))
+                        && let Err(error) = reply.retire()
+                    {
+                        reply_failure.cleanup(error);
+                    }
                     Ok(())
                 })
                 .map_err(|error| rejection(&failure, error))?;
-            admission.io.store(true, Ordering::Release);
+            failure.admission.io.store(true, Ordering::Release);
             let task: BoxedFuture<'static, anyhow::Result<()>> = match generation {
                 Some(generation) => Box::pin(
                     generation
@@ -119,9 +151,9 @@ impl IoRuntime {
                 ),
                 None => Box::pin(task),
             };
-            admission.generation.store(true, Ordering::Release);
+            failure.admission.generation.store(true, Ordering::Release);
             let _ = io.runtime.spawn(task).await?;
-            let failed = failure.lock().unwrap().clone();
+            let failed = failure.error.lock().unwrap().clone();
             if let Some(error) = failed {
                 return Err(error.into_error());
             }
@@ -139,34 +171,17 @@ pub(crate) fn reject(future: Work) -> Work {
 }
 
 struct Input {
-    admission: Arc<Admission>,
     future: Option<PublicationInput<Work>>,
-    failure: Failure,
-    owner: Arc<ContextTasks>,
-    generation: Option<Arc<ContextTasks>>,
+    failure: Arc<Failure>,
 }
 
 impl Input {
     fn primary(&self, error: ActorError) -> ActorReceipt {
-        let error = ActorReceipt::from_error(error);
-        let mut failure = self.failure.lock().unwrap();
-        if failure.is_none() {
-            *failure = Some(error.clone());
-        }
-        failure.as_ref().unwrap().clone()
+        self.failure.primary(error)
     }
 
     fn cleanup_failure(&self, error: ActorError) {
-        let message = crate::error_receipt::actor_summary(&error);
-        if self.admission.io.load(Ordering::Acquire) {
-            self.owner.record_message_disposal_failure(&message);
-        }
-        if let Some(generation) = &self.generation
-            && self.admission.generation.load(Ordering::Acquire)
-        {
-            generation.record_message_disposal_failure(&message);
-        }
-        self.primary(error);
+        self.failure.cleanup(error);
     }
 
     fn dispose(&mut self) -> ActorResult<()> {
