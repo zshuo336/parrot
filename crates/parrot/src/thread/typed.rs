@@ -9,13 +9,15 @@
 //! M4 引擎中立化：通道机制、`TypedActorRef`、桥接与错误语义全部在
 //! 规范面 `parrot_api::typed_channel`（与 actix 引擎共享通道准入和回复实现，
 //! 生命周期仍由各自引擎负责，不能由共用通道推断完全等价）；本文件负责 thread 引擎接线：
-//! 系统持有注册与清理；用户 poll 在有界阻塞池许可下隔离执行。
+//! 系统持有注册与清理；SharedPool 使用有界隔离 poll，DedicatedThread 与
+//! Sharded 在现有原生调度器的所属线程执行整个静态生命周期。
 
 #[cfg(test)]
 mod admission_contracts;
 #[cfg(test)]
 mod admission_lifecycle_contracts;
 mod factory;
+mod scheduler;
 
 pub use parrot_api::typed_channel::{DEFAULT_ASK_TIMEOUT, TypedActorRef, TypedEnvelope};
 
@@ -1020,7 +1022,10 @@ impl ThreadActorSystem {
                 let system = Arc::downgrade(self);
                 let path = path.to_owned();
                 let slots = self.typed_slots.clone();
-                let batch_size = match self.config().default_scheduling_mode {
+                let mode = self.config().default_scheduling_mode.clone();
+                let group = self.scheduler_group.clone();
+                let cleanup_slots = self.cleanup_slots.clone();
+                let batch_size = match mode {
                     crate::thread::config::SchedulingMode::SharedPool {
                         max_messages_per_run,
                     } => max_messages_per_run,
@@ -1048,18 +1053,34 @@ impl ThreadActorSystem {
                 let retirement_runtime = self.retirement_runtime().clone();
                 self.retirement_runtime().spawn(async move {
                 let task_control = control.clone();
-                let execution = execution_runtime.spawn(async move {
-                    let permit = slots.clone().acquire_owned().await?;
-                    crate::thread::scheduler::shared::poll_isolated_with_retirement(
-                        async move {
+                let work = async move {
                             let mut inputs = inputs.take();
                             inputs.actor = payload.map(|value| value.take());
                             let strategy = policy.take();
                             task_control.lifetime.set_strategy(strategy);
                             run_typed_actor(inputs, task_control, batch_size, runtime).await
-                        }, permit, slots, Arc::new(tokio::sync::Notify::new()), retirement_runtime
-                    ).await
-                });
+                };
+                let (execution, driver) = if matches!(mode, crate::thread::config::SchedulingMode::SharedPool { .. }) {
+                    (execution_runtime.spawn(async move {
+                        let permit = slots.clone().acquire_owned().await?;
+                        crate::thread::scheduler::shared::poll_isolated_with_retirement(
+                            work, permit, slots, Arc::new(tokio::sync::Notify::new()), retirement_runtime
+                        ).await
+                    }), None)
+                } else {
+                    let (driver, result) = scheduler::Driver::new(work, retirement_runtime, cleanup_slots.clone());
+                    let cancel = scheduler::CancelOnDrop(driver.clone());
+                    let task_driver = driver.clone();
+                    let group = group.clone();
+                    let path = path.clone();
+                    let mode = mode.clone();
+                    let execution = execution_runtime.spawn(async move {
+                        let _cancel = cancel;
+                        task_driver.schedule(&group, &path, &mode)?;
+                        result.await?.take()
+                    });
+                    (execution, Some(driver))
+                };
                 let (execution, mut timed_out) = control.join_until_expired(execution, || {
                     control.request_stop(control.deadline());
                     crate::owned_payload::publish_watch(
@@ -1070,10 +1091,26 @@ impl ThreadActorSystem {
                     );
                 }).await;
                 control.begin_cleanup(control.deadline());
+                let native_retirement = if let Some(driver) = driver {
+                    let (retired, expired) = control.join_until_expired(
+                        driver.finish(&group, &path, &mode, cleanup_slots, control.deadline()), || {
+                            crate::owned_payload::publish_watch(&finished, StopOutcome::TimedOut(format!(
+                                "typed actor {path} native worker join exceeded configured deadline"
+                            )));
+                        }
+                    ).await;
+                    timed_out |= expired;
+                    retired
+                } else { Ok(()) };
                 let (result, mut reason, cleanup_failed, failure) = match execution {
                     Ok(Ok(exit)) => (exit.result, Some(exit.reason), exit.cleanup_failed, exit.failure),
                     error => (Err(SystemError::ActorCreationError(format!("typed actor {path} execution failed without a disposal receipt: {error:?}"))), None, false, None),
                 };
+                if let Err(error) = &native_retirement {
+                    reason = Some(DeathReason::Failed(crate::error_receipt::system_summary(error)));
+                }
+                let cleanup_failed = cleanup_failed || native_retirement.is_err();
+                let result = result.and(native_retirement);
                 let mut result = result.map_err(crate::error_receipt::SystemReceipt::new);
                 let mut retirement = if cleanup_failed { result.as_ref().map(|_| ()).map_err(|error| error.actor_receipt()) } else { Ok(()) };
                 let disposal = async {

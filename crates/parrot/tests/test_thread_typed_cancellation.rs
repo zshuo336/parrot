@@ -1,5 +1,8 @@
 //! Host-runtime cancellation must not retain queued payloads in surviving refs.
-use parrot::thread::ThreadActorSystem;
+use parrot::thread::{
+    ThreadActorSystem,
+    config::{SchedulingMode, ThreadActorSystemConfig},
+};
 use parrot_api::{
     message::Message,
     typed::{ParrotMsgVariant, ParrotTypedDispatch},
@@ -92,7 +95,21 @@ fn isolated(name: &str, live: bool, panics: bool) {
         let future_drops = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
         let (system, reference) = runtime.block_on(async {
-            let system = ThreadActorSystem::shared(Default::default());
+            let mode = if name.starts_with("dedicated_") {
+                SchedulingMode::DedicatedThread
+            } else if name.starts_with("sharded_") {
+                SchedulingMode::Sharded {
+                    affinity_key: "host-exit".into(),
+                }
+            } else {
+                SchedulingMode::SharedPool {
+                    max_messages_per_run: 10,
+                }
+            };
+            let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
+                default_scheduling_mode: mode,
+                ..Default::default()
+            });
             let actor = system
                 .spawn_typed::<_, Op>(
                     Probe {
@@ -248,4 +265,23 @@ fn unpolled_runtime_cancellation_isolates_mailbox_panics() {
         false,
         true,
     );
+}
+
+macro_rules! native_host_exit {
+    ($($name:ident: $live:literal, $panics:literal;)*) => {$ (
+        #[test]
+        fn $name() {
+            isolated(stringify!($name), $live, $panics);
+        }
+    )*};
+}
+native_host_exit! {
+    dedicated_unpolled_runtime_cancellation: false, false;
+    dedicated_live_runtime_cancellation: true, false;
+    dedicated_unpolled_runtime_cancellation_panics: false, true;
+    dedicated_live_runtime_cancellation_panics: true, true;
+    sharded_unpolled_runtime_cancellation: false, false;
+    sharded_live_runtime_cancellation: true, false;
+    sharded_unpolled_runtime_cancellation_panics: false, true;
+    sharded_live_runtime_cancellation_panics: true, true;
 }
