@@ -72,12 +72,13 @@ pub struct RuntimeConfig {
     /// multi-thread Tokio runtime. Native counts are limited to 1..=4096.
     pub worker_threads: Option<usize>,
 
-    /// Number of threads for handling I/O operations.
+    /// Number of worker threads in the owned Tokio I/O runtime.
     ///
-    /// None uses the host's I/O driver when no explicit worker count is given.
-    /// For TokioActorRuntime, an explicit value owns a runtime and configures
-    /// Tokio's blocking/I/O helper thread limit (`max_blocking_threads`). Tokio
-    /// has one readiness driver per runtime rather than a separately sized pool.
+    /// None keeps [`ActorRuntime::spawn_io`] on the actor runtime (or the
+    /// caller's runtime when the actor runtime is borrowed). Tokio's readiness
+    /// driver and I/O futures then have an independent owned runtime whenever a
+    /// value is supplied. Native Thread and Actix engines reject this field
+    /// because they do not expose an equivalent I/O runtime boundary.
     pub io_threads: Option<usize>,
 
     /// Configuration for the task scheduler.
@@ -95,8 +96,10 @@ pub struct SchedulerConfig {
     /// Thread maps positive values to resident ready entries (not mailbox size
     /// or actor count), coalescing readiness when full. Actix rejects positive
     /// values because its scheduler does not expose an equivalent ready queue.
-    /// TokioActorRuntime bounds active tasks with a semaphore; waiting callers
-    /// remain pending and are not a bounded resident queue.
+    /// TokioActorRuntime bounds active tasks with a semaphore per execution
+    /// lane (actor and explicitly configured I/O); waiting callers remain
+    /// pending and are not a bounded resident queue. Separate lane permits let
+    /// an actor await its I/O submission without consuming all I/O capacity.
     pub task_queue_capacity: usize,
 
     /// Maximum time allowed for task execution.
@@ -183,6 +186,20 @@ pub trait ActorRuntime: Send + Sync + 'static {
         F: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static;
 
+    /// Submits an I/O future to the runtime's I/O execution boundary.
+    ///
+    /// Implementations without a separate I/O runtime may use the normal
+    /// execution path. TokioActorRuntime routes this method to the owned I/O
+    /// runtime when `RuntimeConfig::io_threads` is set, so readiness state and
+    /// I/O work do not share actor worker threads.
+    async fn spawn_io<F, T>(&self, future: F) -> Result<T, ActorError>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawn(future).await
+    }
+
     /// Retrieves current runtime performance metrics.
     ///
     /// Use this method to monitor:
@@ -240,14 +257,13 @@ pub struct RuntimeMetrics {
 /// task is retired; a payload destructor panic is retained in that receipt.
 ///
 /// With default RoundRobin settings this adapter borrows the caller's executor.
-/// Supplying `worker_threads` or `io_threads` creates an owned multi-thread
-/// Tokio runtime, so the requested worker and blocking/I/O helper limits are
-/// applied instead of silently ignored. A nondefault load-balancing strategy
-/// creates an owned pool of single-worker runtimes so each task has an actual
-/// worker-thread placement; omitted `worker_threads` uses two placement workers.
-/// Tokio's readiness driver is shared by each runtime and has no independent
-/// thread-count knob. Queue capacities exceeding [`Semaphore::MAX_PERMITS`]
-/// and unrepresentable task deadlines are rejected.
+/// Supplying either thread count creates an owned actor runtime. Supplying
+/// `io_threads` additionally creates an independent owned I/O runtime used by
+/// [`ActorRuntime::spawn_io`]. A nondefault load-balancing strategy creates an
+/// owned pool of single-worker runtimes so each actor task has an actual
+/// worker-thread placement; omitted `worker_threads` uses two placement
+/// workers. Queue capacities exceeding [`Semaphore::MAX_PERMITS`] and
+/// unrepresentable task deadlines are rejected.
 #[derive(Clone)]
 pub struct TokioActorRuntime {
     inner: Arc<TokioRuntimeInner>,
@@ -255,8 +271,10 @@ pub struct TokioActorRuntime {
 
 struct TokioRuntimeInner {
     permits: Option<Arc<Semaphore>>,
+    io_permits: Option<Arc<Semaphore>>,
     timeout: Duration,
     owned_runtime: Option<Arc<OwnedRuntime>>,
+    io_runtime: Option<Arc<OwnedRuntime>>,
     strategy: LoadBalancingStrategy,
     state: Mutex<TaskState>,
     changed: Notify,
@@ -316,6 +334,22 @@ impl OwnedRuntime {
         Ok(Self {
             runtimes: Some(runtimes),
             handles,
+        })
+    }
+
+    fn new_io(io_threads: usize) -> Result<Self, String> {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(io_threads)
+            .max_blocking_threads(io_threads)
+            .enable_all();
+        let runtime = builder
+            .build()
+            .map_err(|error| format!("failed to build owned Tokio I/O runtime: {error}"))?;
+        let handle = runtime.handle().clone();
+        Ok(Self {
+            runtimes: Some(vec![runtime]),
+            handles: vec![handle],
         })
     }
 
@@ -407,7 +441,7 @@ struct PendingTask<F> {
 
 struct PendingGuard {
     inner: Arc<TokioRuntimeInner>,
-    worker: usize,
+    worker: Option<usize>,
     armed: bool,
 }
 
@@ -420,8 +454,10 @@ impl PendingGuard {
         }
         state.pending -= 1;
         state.active += 1;
-        state.workers[self.worker].pending -= 1;
-        state.workers[self.worker].active += 1;
+        if let Some(worker) = self.worker {
+            state.workers[worker].pending -= 1;
+            state.workers[worker].active += 1;
+        }
         self.armed = false;
         drop(state);
         Ok(ActiveGuard {
@@ -436,7 +472,9 @@ impl Drop for PendingGuard {
         if self.armed {
             let mut state = self.inner.state.lock().unwrap();
             state.pending -= 1;
-            state.workers[self.worker].pending -= 1;
+            if let Some(worker) = self.worker {
+                state.workers[worker].pending -= 1;
+            }
             self.inner.changed.notify_waiters();
         }
     }
@@ -444,14 +482,16 @@ impl Drop for PendingGuard {
 
 struct ActiveGuard {
     inner: Arc<TokioRuntimeInner>,
-    worker: usize,
+    worker: Option<usize>,
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         let mut state = self.inner.state.lock().unwrap();
         state.active -= 1;
-        state.workers[self.worker].active -= 1;
+        if let Some(worker) = self.worker {
+            state.workers[worker].active -= 1;
+        }
         self.inner.changed.notify_waiters();
     }
 }
@@ -513,7 +553,12 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let permit = match inner.permits.as_ref() {
+    let permits = if task.registration.worker.is_some() {
+        &inner.permits
+    } else {
+        &inner.io_permits
+    };
+    let permit = match permits {
         Some(permits) => match permits.clone().acquire_owned().await {
             Ok(permit) => Some(permit),
             Err(_) => return Err(ActorError::Stopped),
@@ -592,12 +637,24 @@ impl ActorRuntime for TokioActorRuntime {
         } else {
             None
         };
+        let io_runtime = config
+            .io_threads
+            .map(|io_threads| {
+                OwnedRuntime::new_io(io_threads)
+                    .map(Arc::new)
+                    .map_err(ActorError::InitializationError)
+            })
+            .transpose()?;
         let permits = (capacity > 0).then(|| Arc::new(Semaphore::new(capacity)));
+        let io_permits =
+            (capacity > 0 && io_runtime.is_some()).then(|| Arc::new(Semaphore::new(capacity)));
         Ok(Self {
             inner: Arc::new(TokioRuntimeInner {
                 permits,
+                io_permits,
                 timeout: config.scheduler_config.task_timeout,
                 owned_runtime,
+                io_runtime,
                 strategy,
                 state: Mutex::new(TaskState::default()),
                 changed: Notify::new(),
@@ -638,13 +695,13 @@ impl ActorRuntime for TokioActorRuntime {
                 future,
                 registration: PendingGuard {
                     inner: self.inner.clone(),
-                    worker,
+                    worker: Some(worker),
                     armed: true,
                 },
             }
         };
         if let Some(runtime) = self.inner.owned_runtime.clone() {
-            let worker = task.registration.worker;
+            let worker = task.registration.worker.unwrap_or(0);
             let handle = runtime.spawn_on(worker, run_task(self.inner.clone(), task));
             let mut handle = AbortOnDrop { handle };
             match (&mut handle).await {
@@ -656,6 +713,40 @@ impl ActorRuntime for TokioActorRuntime {
             }
         } else {
             run_task(self.inner.clone(), task).await
+        }
+    }
+
+    async fn spawn_io<F, T>(&self, future: F) -> Result<T, ActorError>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let Some(runtime) = self.inner.io_runtime.clone() else {
+            return self.spawn(future).await;
+        };
+        let task = {
+            let mut state = self.inner.state.lock().unwrap();
+            if state.shutting_down {
+                return Err(ActorError::Stopped);
+            }
+            state.pending += 1;
+            PendingTask {
+                future,
+                registration: PendingGuard {
+                    inner: self.inner.clone(),
+                    worker: None,
+                    armed: true,
+                },
+            }
+        };
+        let handle = runtime.spawn_on(0, run_task(self.inner.clone(), task));
+        let mut handle = AbortOnDrop { handle };
+        match (&mut handle).await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Err(ActorError::Stopped),
+            Err(error) => Err(ActorError::Panic(format!(
+                "owned Tokio I/O runtime task panicked: {error}"
+            ))),
         }
     }
 
@@ -912,6 +1003,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokio_runtime_io_tasks_use_an_independent_owned_executor() {
+        let host = std::thread::current().id();
+        let runtime = TokioActorRuntime::start(RuntimeConfig {
+            worker_threads: Some(1),
+            io_threads: Some(1),
+            ..RuntimeConfig::default()
+        })
+        .await
+        .unwrap();
+        let actor_worker = runtime
+            .spawn(async { std::thread::current().id() })
+            .await
+            .unwrap();
+        let io_worker = runtime
+            .spawn_io(async { std::thread::current().id() })
+            .await
+            .unwrap();
+        assert_ne!(actor_worker, host, "actor task ran on the host executor");
+        assert_ne!(io_worker, host, "I/O task ran on the host executor");
+        assert_ne!(
+            actor_worker, io_worker,
+            "I/O task shared the actor runtime worker"
+        );
+        assert_eq!(runtime.inner.io_runtime.as_ref().unwrap().worker_count(), 1);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tokio_runtime_least_loaded_uses_distinct_owned_worker_threads() {
         let host = std::thread::current().id();
         let runtime = TokioActorRuntime::start(RuntimeConfig {
@@ -999,6 +1118,32 @@ mod tests {
         })
         .await
         .expect("owned task abort did not retire accounting");
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokio_runtime_cancelling_io_task_retires_accounting() {
+        let runtime = TokioActorRuntime::start(RuntimeConfig {
+            io_threads: Some(1),
+            ..RuntimeConfig::default()
+        })
+        .await
+        .unwrap();
+        let mut task = Box::pin(runtime.spawn_io(async {
+            std::future::pending::<()>().await;
+        }));
+        assert!(futures::poll!(&mut task).is_pending());
+        drop(task);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.metrics().active_actors == 0 && runtime.metrics().pending_messages == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned I/O task abort did not retire accounting");
         runtime.shutdown().await.unwrap();
     }
 

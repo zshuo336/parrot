@@ -177,8 +177,9 @@ async fn queued_shutdown_rejection_retains_admission_until_future_is_disposed() 
     queued_cleanup(false).await;
 }
 
-async fn active_cleanup(completion: Completion, cancel: bool, timeout: bool) {
+async fn active_cleanup(completion: Completion, cancel: bool, timeout: bool, io: bool) {
     let runtime = TokioActorRuntime::start(RuntimeConfig {
+        io_threads: io.then_some(1),
         scheduler_config: SchedulerConfig {
             task_timeout: if timeout {
                 Duration::from_millis(30)
@@ -194,7 +195,13 @@ async fn active_cleanup(completion: Completion, cancel: bool, timeout: bool) {
     let (input, observed, mut release) = probe(completion);
     let (polls, drops) = (input.polls.clone(), input.drops.clone());
     let task_runtime = runtime.clone();
-    let task = tokio::spawn(async move { task_runtime.spawn(input).await });
+    let task = tokio::spawn(async move {
+        if io {
+            task_runtime.spawn_io(input).await
+        } else {
+            task_runtime.spawn(input).await
+        }
+    });
     if cancel {
         until(|| polls.load(Ordering::SeqCst) > 0).await;
         task.abort();
@@ -235,19 +242,39 @@ async fn active_cleanup(completion: Completion, cancel: bool, timeout: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_cancellation_retains_admission_until_future_is_disposed() {
-    active_cleanup(Completion::Pending, true, false).await;
+    active_cleanup(Completion::Pending, true, false, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_timeout_retains_admission_until_future_is_disposed() {
-    active_cleanup(Completion::Pending, false, true).await;
+    active_cleanup(Completion::Pending, false, true, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ready_future_is_disposed_before_admission_is_released() {
-    active_cleanup(Completion::Ready, false, false).await;
+    active_cleanup(Completion::Ready, false, false, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn panicking_future_is_disposed_before_admission_is_released() {
-    active_cleanup(Completion::Panic, false, false).await;
+    active_cleanup(Completion::Panic, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn io_cancellation_waits_for_actual_input_disposal() {
+    active_cleanup(Completion::Pending, true, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn io_timeout_waits_for_actual_input_disposal() {
+    active_cleanup(Completion::Pending, false, true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn io_ready_future_is_disposed_before_admission_is_released() {
+    active_cleanup(Completion::Ready, false, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn io_panicking_future_is_disposed_before_admission_is_released() {
+    active_cleanup(Completion::Panic, false, false, true).await;
 }
 
 #[tokio::test]
