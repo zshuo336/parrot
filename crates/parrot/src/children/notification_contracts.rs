@@ -111,6 +111,47 @@ impl ChildRecipient for Recipient {
     }
 }
 
+#[tokio::test]
+async fn retirement_receipt_precedes_notification_capacity_release() {
+    let counts = Arc::new(Counts::default());
+    let scope = ChildScope::new(Duration::from_secs(2), Arc::new(Semaphore::new(1)));
+    let _other_children = scope
+        .slots
+        .clone()
+        .try_acquire_many_owned((MAX_CHILDREN - 1) as u32)
+        .unwrap();
+    let mut lifetime = None;
+    scope
+        .spawn(|child| {
+            lifetime = Some(child);
+            Ok((
+                Box::new(Reference {
+                    counts: counts.clone(),
+                    registered: true,
+                    kind: 0,
+                }),
+                Arc::new(|| Box::pin(async { Ok(()) })),
+            ))
+        })
+        .unwrap();
+    assert_eq!(scope.slots.available_permits(), 0);
+    let lifetime = lifetime.unwrap();
+    let notification = lifetime.finish(Ok(()));
+    lifetime.wait().await.unwrap();
+    assert!(scope.children.lock().unwrap().is_empty());
+    assert_eq!(scope.slots.available_permits(), 0);
+    assert!(matches!(
+        scope.spawn(|_| panic!("pending notification must retain child capacity")),
+        Err(ActorError::InternalError(message))
+            if message == "child capacity exhausted (1024 live children or pending termination notifications)"
+    ));
+    notification.await;
+    lifetime.wait_for_notification().await.unwrap();
+    assert_eq!(scope.slots.available_permits(), 1);
+    assert_eq!(counts.references.load(Ordering::SeqCst), 1);
+    scope.join().await.unwrap();
+}
+
 async fn exercise(mode: u8, kind: u8) {
     let counts = Arc::new(Counts::default());
     let scope = ChildScope::new(Duration::from_millis(20), Arc::new(Semaphore::new(1)));

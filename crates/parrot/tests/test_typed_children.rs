@@ -495,8 +495,19 @@ async fn typed_child_capacity_is_released_only_by_actual_retirement() {
         .await
         .unwrap();
     let ctx = context(&root).await;
+    let gate = Arc::new(DropGate::default());
+    let _release = ReleaseGate(gate.clone());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let blocked = ctx
+        .spawn_typed_child::<_, Ping>(BlockedChild {
+            gate: gate.clone(),
+            drops: drops.clone(),
+        })
+        .await
+        .unwrap();
+    blocked.ask(Ping).await.unwrap();
     let mut children = Vec::new();
-    for _ in 0..1024 {
+    for _ in 0..1023 {
         children.push(
             ctx.spawn_typed_child::<_, Op>(Family::new(stats.clone(), 0))
                 .await
@@ -510,11 +521,46 @@ async fn typed_child_capacity_is_released_only_by_actual_retirement() {
             .is_err()
     );
     assert_eq!(s.actor_count(), 1025);
-    children.pop().unwrap().stop().await.unwrap();
-    let replacement = ctx
-        .spawn_typed_child::<_, Op>(Family::new(stats.clone(), 0))
+    let mut stop = Box::pin(blocked.stop());
+    assert!(futures::poll!(&mut stop).is_pending());
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
         .await
         .unwrap();
+    assert!(futures::poll!(&mut stop).is_pending());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(ctx.children().len(), 1024);
+    assert_eq!(s.actor_count(), 1025);
+    assert!(matches!(
+        ctx.spawn_typed_child::<_, Op>(Family::new(stats.clone(), 0)).await,
+        Err(ActorError::InternalError(message))
+            if message == "child capacity exhausted (1024 live children or pending termination notifications)"
+    ));
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(3), stop)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    // The stop receipt may wake us before the separate notification owner
+    // releases its capacity. Only that documented rejection permits a retry.
+    let replacement = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ctx
+                .spawn_typed_child::<_, Op>(Family::new(stats.clone(), 0))
+                .await
+            {
+                Ok(actor) => break actor,
+                Err(ActorError::InternalError(message))
+                    if message == "child capacity exhausted (1024 live children or pending termination notifications)" =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected child admission failure: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("retired child did not release capacity");
     assert_eq!(ctx.children().len(), 1024);
     assert!(replacement.is_alive());
     root.stop().await.unwrap();
