@@ -44,11 +44,18 @@ jobs:
           python3 scripts/project_inputs.py verify --root "$RUNNER_TEMP/project-inputs/source" --manifest "$RUNNER_TEMP/project-inputs/manifest.json" --exact
           python3 scripts/project_inputs.py verify --root . --manifest "$RUNNER_TEMP/project-inputs/manifest.json" --selection
           python3 scripts/project_inputs.py archive --bundle "$RUNNER_TEMP/project-inputs" --output "$RUNNER_TEMP/project-inputs.tar.gz"
-          mkdir "$RUNNER_TEMP/project-inputs-unpacked"
-          tar -xzf "$RUNNER_TEMP/project-inputs.tar.gz" -C "$RUNNER_TEMP/project-inputs-unpacked"
+          archive_sha=$(python3 -c 'import hashlib,pathlib,sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$RUNNER_TEMP/project-inputs.tar.gz")
+          python3 scripts/project_inputs.py unpack --archive "$RUNNER_TEMP/project-inputs.tar.gz" --output "$RUNNER_TEMP/project-inputs-unpacked" --sha256 "$archive_sha"
           python3 scripts/project_inputs.py verify --root "$RUNNER_TEMP/project-inputs-unpacked/source" --manifest "$RUNNER_TEMP/project-inputs-unpacked/manifest.json" --exact
           python3 scripts/project_inputs.py build-target --root "$RUNNER_TEMP/project-inputs-unpacked/source" --manifest "$RUNNER_TEMP/project-inputs-unpacked/manifest.json" --output "$RUNNER_TEMP/project-validation-targets"
           python3 -B "$RUNNER_TEMP/project-inputs/source/scripts/check_implementation_contracts.py" --root "$RUNNER_TEMP/project-inputs/source" --catalog "$RUNNER_TEMP/project-inputs/source/scripts/implementation_contracts.json"
+      - name: Own package licenses and retained third-party notices
+        if: matrix.python == '3.11'
+        run: |
+          python3 -B -m unittest discover -s scripts/tests -p test_licenses.py -v
+          python3 -B -O -m unittest discover -s scripts/tests -p test_licenses.py -v
+          python3 -B scripts/check_licenses.py
+          python3 -B "$RUNNER_TEMP/project-inputs/source/scripts/check_licenses.py" --root "$RUNNER_TEMP/project-inputs/source" --manifest "$RUNNER_TEMP/project-inputs/manifest.json"
 
   timeout-wrapper-contracts:
     name: Timeout status and process-group retirement (${{ matrix.os }})

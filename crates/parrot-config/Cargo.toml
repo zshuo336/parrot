@@ -1,9 +1,10 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE"
 name = "parrot-config"
 version = "0.1.0"
 edition = "2021"
 description = "Parrot 配置切面：TOML 加载 + 三层合并（代码 > 文件 > 默认）+ 运行时旋钮参数化。纯数据 crate，无运行时依赖。"
-license = "MIT"
 
 [dependencies]
 parrot-api = { path = "../parrot-api" }

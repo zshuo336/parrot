@@ -1,8 +1,9 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE"
 name = "websearch"
 version = "1.0.0"
 edition = "2021"
-license = "MIT"
 description = "真实搜索引擎应用：五运行时分工（erl frontier / rust 漫爬 / ray 中文分词索引 / akka 检索 / TS 查询页）"
 
 [[bin]]

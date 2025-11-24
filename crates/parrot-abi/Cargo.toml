@@ -1,9 +1,10 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE"
 name = "parrot-abi"
 version = "0.1.0"
 edition = "2021"
 description = "Parrot dylib component ABI: repr(C) boundary contract + trusted native load/unload protocol (DEV_09 D)"
-license = "MIT"
 
 # D 阶段（DEV_09 §3.4 / 09 §4.3）：
 # - lib.rs   = D1 纯类型（repr(C)——dylib 双端共同依赖，零 std 之外依赖）

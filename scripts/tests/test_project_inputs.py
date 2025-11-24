@@ -1,6 +1,7 @@
 """Real Git and compiler fixtures for validation source export and verification."""
 import json
 import hashlib
+import io
 import os
 from pathlib import Path
 import runpy
@@ -272,6 +273,127 @@ class ProjectInputs(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'archive input identity mismatch: source/Cargo.toml'):
                 implementation(self.bundle, self.base / 'inputs.tar.gz', [])
         self.assertFalse((self.base / 'inputs.tar.gz').exists())
+
+    def unpack(self, archive=None, output=None, digest=None):
+        archive = archive or self.base / 'inputs.tar.gz'
+        digest = digest or hashlib.sha256(archive.read_bytes()).hexdigest()
+        return self.run_script('unpack', '--archive', archive,
+                               '--output', output or self.base / 'unpacked', '--sha256', digest)
+
+    def test_unpack_preserves_real_appledouble_bytes_and_executable_helpers(self):
+        # A valid AppleDouble header makes macOS tar consume this selected file
+        # as metadata. It must remain an ordinary byte input to our restore path.
+        sidecar = bytes.fromhex('0005160700020000') + bytes(16) + bytes(2)
+        sidepath = self.root / 'src/._lib.rs'
+        sidepath.parent.mkdir()
+        sidepath.write_bytes(sidecar)
+        self.write('src/lib.rs', 'pub fn current() {}\n')
+        self.git('add', '.')
+        manifest = self.exported()
+        self.write('verify.sh', '#!/bin/sh\nexit 0\n', directory=self.bundle).chmod(0o755)
+        self.assertEqual(self.archive(includes=['verify.sh']).returncode, 0)
+        result = self.unpack()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unpacked = self.base / 'unpacked'
+        self.assertEqual((unpacked / 'source/src/._lib.rs').read_bytes(), sidecar)
+        self.assertTrue((unpacked / 'verify.sh').stat().st_mode & 0o111)
+        self.assertEqual(json.loads((unpacked / 'manifest.json').read_text()), manifest)
+        self.assertEqual(self.run_script('verify', '--root', unpacked / 'source',
+                                        '--manifest', unpacked / 'manifest.json', '--exact').returncode, 0)
+
+    def test_unpack_rejects_wrong_digest_and_never_overwrites_existing_output(self):
+        self.exported()
+        self.assertEqual(self.archive().returncode, 0)
+        result = self.unpack(digest='0' * 64)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('archive SHA-256 mismatch', result.stderr)
+        self.assertFalse((self.base / 'unpacked').exists())
+        for invalid in ['z' * 64, 'short']:
+            self.assertNotEqual(self.unpack(digest=invalid).returncode, 0)
+        self.assertEqual(self.unpack().returncode, 0)
+        marker = self.base / 'unpacked/private.txt'
+        marker.write_text('retain existing user data')
+        self.assertNotEqual(self.unpack().returncode, 0)
+        self.assertEqual(marker.read_text(), 'retain existing user data')
+
+    def hostile_archive(self, entries):
+        archive = self.base / 'hostile.tar.gz'
+        with tarfile.open(archive, 'w:gz') as packed:
+            for name, kind, data in entries:
+                header = tarfile.TarInfo(name)
+                header.type = kind
+                header.mode = 0o7777
+                if kind == tarfile.REGTYPE:
+                    header.size = len(data)
+                    packed.addfile(header, io.BytesIO(data))
+                else:
+                    header.linkname = str(self.base / 'outside')
+                    packed.addfile(header)
+        return archive
+
+    def test_unpack_rejects_path_escape_symlink_hardlink_device_and_duplicates(self):
+        entries = [('../outside', tarfile.REGTYPE, b'bad'),
+                   ('/absolute', tarfile.REGTYPE, b'bad'),
+                   ('.git/config', tarfile.REGTYPE, b'bad'),
+                   ('link', tarfile.SYMTYPE, b''), ('hardlink', tarfile.LNKTYPE, b''),
+                   ('device', tarfile.CHRTYPE, b'')]
+        for entry in entries:
+            with self.subTest(entry=entry):
+                archive = self.hostile_archive([entry])
+                self.assertNotEqual(self.unpack(archive=archive).returncode, 0)
+                self.assertFalse((self.base / 'unpacked').exists())
+                self.assertFalse((self.base / 'outside').exists())
+        archive = self.hostile_archive([('same', tarfile.REGTYPE, b'one'),
+                                        ('same', tarfile.REGTYPE, b'two')])
+        result = self.unpack(archive=archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('duplicate archive member', result.stderr)
+
+    def test_unpack_rejects_missing_manifest_extra_or_same_length_changed_source(self):
+        manifest = self.exported()
+        raw = (self.bundle / 'manifest.json').read_bytes()
+        entries = [('manifest.json', tarfile.REGTYPE, raw)]
+        entries += [('source/' + name, tarfile.REGTYPE, (self.bundle / 'source' / name).read_bytes())
+                    for name in manifest['files']]
+        for variant in [entries[1:], entries + [('source/extra', tarfile.REGTYPE, b'extra')],
+                        [(name, kind, b'x' * len(data) if name == 'source/Cargo.toml' else data)
+                         for name, kind, data in entries]]:
+            with self.subTest(variant=[entry[0] for entry in variant]):
+                self.assertNotEqual(self.unpack(archive=self.hostile_archive(variant)).returncode, 0)
+                self.assertFalse((self.base / 'unpacked').exists())
+
+    def test_unpack_strips_special_permissions_and_detects_during_read_mutation(self):
+        manifest = self.exported()
+        entries = [('manifest.json', tarfile.REGTYPE, (self.bundle / 'manifest.json').read_bytes())]
+        entries += [('source/' + name, tarfile.REGTYPE, (self.bundle / 'source' / name).read_bytes())
+                    for name in manifest['files']]
+        # Make regular source nonexecutable and helper executable with extra bits.
+        archive = self.base / 'permissions.tar.gz'
+        with tarfile.open(archive, 'w:gz') as packed:
+            for name, kind, data in entries + [('verify.sh', tarfile.REGTYPE, b'#!/bin/sh\n')]:
+                header = tarfile.TarInfo(name)
+                header.size = len(data)
+                header.mode = 0o7755 if name == 'verify.sh' else 0o6644
+                packed.addfile(header, io.BytesIO(data))
+        self.assertEqual(self.unpack(archive=archive).returncode, 0)
+        self.assertEqual((self.base / 'unpacked/verify.sh').stat().st_mode & 0o7777, 0o755)
+        implementation = runpy.run_path(str(SCRIPT))['unpack']
+        original = shutil.copyfileobj
+        changed = False
+        def mutate(incoming, target, *args):
+            nonlocal changed
+            result = original(incoming, target, *args)
+            if not changed:
+                with archive.open('ab') as packed:
+                    packed.write(b'changed during unpack')
+                changed = True
+            return result
+        destination = self.base / 'mutated-unpack'
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        with mock.patch.object(shutil, 'copyfileobj', mutate):
+            with self.assertRaisesRegex(ValueError, 'archive changed during unpack'):
+                implementation(archive, destination, digest)
+        self.assertFalse(destination.exists())
 
     def test_same_length_content_tampering_is_detected(self):
         self.exported()

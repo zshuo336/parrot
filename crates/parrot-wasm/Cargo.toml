@@ -1,9 +1,10 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE"
 name = "parrot-wasm"
 version = "0.1.0"
 edition = "2021"
 description = "Parrot wasm component runtime: wasmtime + WIT parrot:component@0.1.0 + fuel/epoch sandbox"
-license = "MIT"
 
 # C 阶段（DEV_09 §3.3）：wasmtime 集成。
 # 默认零依赖（仅错误类型）——wasmtime 重编译成本高（R1 风险），feature gate：

@@ -5,8 +5,8 @@ use parrot_api::{
     actor::{Actor, ActorState},
     context::ActorContext,
     engine::{
-        AsyncEngineRuntime, AsyncFactoryRuntime, AsyncLocalRuntime, FactoryOptions, LocalActor,
-        LocalRuntimeFactory, SpawnOptions,
+        AsyncEngineRuntime, AsyncLocalRuntime, FactoryOptions, LocalActor, LocalRuntimeFactory,
+        SpawnOptions,
     },
     errors::ActorError,
     local_typed::LocalBoxedFuture,
@@ -321,6 +321,32 @@ enum Flavor {
 async fn system() -> Arc<ActixActorSystem> {
     Arc::new(ActixActorSystem::with_arbiter_count(1).await.unwrap())
 }
+async fn runtime_for(
+    system: &Arc<ActixActorSystem>,
+    via_facade: bool,
+) -> Arc<dyn AsyncEngineRuntime> {
+    if via_facade {
+        let facade = parrot::system::ParrotActorSystem::new(Default::default())
+            .await
+            .unwrap();
+        facade
+            .register_actix_system("children".into(), system.as_ref().clone(), true)
+            .await
+            .unwrap();
+        Arc::new(facade)
+    } else {
+        system.clone()
+    }
+}
+fn parent_flavors(via_facade: bool) -> &'static [Flavor] {
+    if via_facade {
+        // Static typed root creation has no facade entry yet; do not bypass it
+        // through the native handle and claim that the facade created the root.
+        &[Flavor::Local, Flavor::Native]
+    } else {
+        &[Flavor::Local, Flavor::Typed, Flavor::Native]
+    }
+}
 // Typed parents are called through TypedActorRef::ask; its declared result is
 // already BoxedMessage. The ordinary into_dyn bridge adds its documented result
 // box, so treating that bridge's result as a raw Local reply is a test error.
@@ -344,11 +370,20 @@ impl Parent {
     }
 }
 async fn root(s: &Arc<ActixActorSystem>, flavor: Flavor) -> Parent {
+    root_with_runtime(s, s.as_ref(), flavor).await
+}
+async fn root_with_runtime(
+    s: &Arc<ActixActorSystem>,
+    runtime: &dyn AsyncEngineRuntime,
+    flavor: Flavor,
+) -> Parent {
     let mut typed = None;
     let native_ready = Arc::new(AtomicUsize::new(0));
     let ready = native_ready.clone();
     let reference = match flavor {
-        Flavor::Local => s
+        Flavor::Local => runtime
+            .local_runtime()
+            .expect("live Local capability")
             .spawn_local_factory(
                 factory(&Arc::new(Stats::default()), Setup::default()),
                 FactoryOptions {
@@ -367,7 +402,9 @@ async fn root(s: &Arc<ActixActorSystem>, flavor: Flavor) -> Parent {
             typed = Some(actor);
             reference
         }
-        Flavor::Native => s
+        Flavor::Native => runtime
+            .factory_runtime()
+            .expect("live factory capability")
             .spawn_factory(
                 Box::new(move || {
                     Box::new(NativeParent {
@@ -425,12 +462,12 @@ fn all() -> SupervisorStrategyType {
     })
 }
 
-#[actix::test]
-async fn all_parent_flavors_own_real_local_children_and_parent_identity() {
+async fn case_ownership(via_facade: bool) {
     bounded(async {
-        for flavor in [Flavor::Local, Flavor::Typed, Flavor::Native] {
+        for flavor in parent_flavors(via_facade).iter().copied() {
             let s = system().await;
-            let parent = root(&s, flavor).await;
+            let runtime = runtime_for(&s, via_facade).await;
+            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
             let stats = Arc::new(Stats::default());
             let actor = child(&parent, &stats, Setup::default(), None).await;
             let r = report(&actor).await;
@@ -450,7 +487,7 @@ async fn all_parent_flavors_own_real_local_children_and_parent_identity() {
                     .unwrap(),
                 1
             );
-            let found = AsyncEngineRuntime::get_actor(s.as_ref(), &actor.path())
+            let found = AsyncEngineRuntime::get_actor(runtime.as_ref(), &actor.path())
                 .await
                 .unwrap();
             assert_eq!(
@@ -464,22 +501,24 @@ async fn all_parent_flavors_own_real_local_children_and_parent_identity() {
             assert_eq!(stats.captures.load(Ordering::SeqCst), 1);
             stats.affinity();
             assert!(
-                AsyncEngineRuntime::get_actor(s.as_ref(), &actor.path())
+                AsyncEngineRuntime::get_actor(runtime.as_ref(), &actor.path())
                     .await
                     .is_none()
             );
-            s.as_ref().clone().shutdown().await.unwrap();
+            runtime.shutdown().await.unwrap();
         }
     })
     .await;
 }
-#[actix::test]
-async fn single_owner_init_can_create_and_wait_for_neutral_local_child() {
+async fn case_nested_init(via_facade: bool) {
     bounded(async {
         let s = system().await;
+        let runtime = runtime_for(&s, via_facade).await;
         let nested = Arc::new(Stats::default());
         let outer = Arc::new(Stats::default());
-        let parent = s
+        let parent = runtime
+            .local_runtime()
+            .expect("live Local capability")
             .spawn_local_factory(
                 factory(
                     &outer,
@@ -498,16 +537,16 @@ async fn single_owner_init_can_create_and_wait_for_neutral_local_child() {
         assert_eq!(nested.drops.load(Ordering::SeqCst), 1);
         nested.affinity();
         outer.affinity();
-        s.as_ref().clone().shutdown().await.unwrap();
+        runtime.shutdown().await.unwrap();
     })
     .await;
 }
-#[actix::test]
-async fn parent_replacement_retires_old_subtree_and_old_context_cannot_admit() {
+async fn case_replacement(via_facade: bool) {
     bounded(async {
-        for flavor in [Flavor::Local, Flavor::Typed, Flavor::Native] {
+        for flavor in parent_flavors(via_facade).iter().copied() {
             let s = system().await;
-            let parent = root(&s, flavor).await;
+            let runtime = runtime_for(&s, via_facade).await;
+            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
             let stats = Arc::new(Stats::default());
             let nested = Arc::new(Stats::default());
             let actor = child(
@@ -548,17 +587,17 @@ async fn parent_replacement_retires_old_subtree_and_old_context_cannot_admit() {
             let fresh = child(&parent, &Arc::new(Stats::default()), Setup::default(), None).await;
             report(&fresh).await;
             parent.stop().await.unwrap();
-            s.as_ref().clone().shutdown().await.unwrap();
+            runtime.shutdown().await.unwrap();
         }
     })
     .await;
 }
-#[actix::test]
-async fn local_child_inherits_live_policy_and_respects_override() {
+async fn case_policy(via_facade: bool) {
     bounded(async {
-        for flavor in [Flavor::Local, Flavor::Typed, Flavor::Native] {
+        for flavor in parent_flavors(via_facade).iter().copied() {
             let s = system().await;
-            let parent = root(&s, flavor).await;
+            let runtime = runtime_for(&s, via_facade).await;
+            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
             // Leave unused budget in the original policy: after changing to
             // zero, a cached policy must still allow a restart and fail this test.
             parent.send(Box::new(Cmd::Policy(one(3)))).await.unwrap();
@@ -586,17 +625,17 @@ async fn local_child_inherits_live_policy_and_respects_override() {
             own.initialized(2).await;
             assert_eq!(report(&overridden).await.generation, 2);
             parent.stop().await.unwrap();
-            s.as_ref().clone().shutdown().await.unwrap();
+            runtime.shutdown().await.unwrap();
         }
     })
     .await;
 }
-#[actix::test]
-async fn one_for_all_rebuilds_local_siblings_under_every_parent_flavor() {
+async fn case_cohort(via_facade: bool) {
     bounded(async {
-        for flavor in [Flavor::Local, Flavor::Typed, Flavor::Native] {
+        for flavor in parent_flavors(via_facade).iter().copied() {
             let s = system().await;
-            let parent = root(&s, flavor).await;
+            let runtime = runtime_for(&s, via_facade).await;
+            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
             parent.send(Box::new(Cmd::Policy(all()))).await.unwrap();
             let a = Arc::new(Stats::default());
             let b = Arc::new(Stats::default());
@@ -622,16 +661,16 @@ async fn one_for_all_rebuilds_local_siblings_under_every_parent_flavor() {
             parent.stop().await.unwrap();
             assert_eq!(a.drops.load(Ordering::SeqCst), 2);
             assert_eq!(b.drops.load(Ordering::SeqCst), 2);
-            s.as_ref().clone().shutdown().await.unwrap();
+            runtime.shutdown().await.unwrap();
         }
     })
     .await;
 }
-#[actix::test]
-async fn unpolled_and_closed_context_inputs_retire_without_construction() {
+async fn case_rejected_inputs(via_facade: bool) {
     bounded(async {
         let s = system().await;
-        let parent = root(&s, Flavor::Local).await;
+        let runtime = runtime_for(&s, via_facade).await;
+        let parent = root_with_runtime(&s, runtime.as_ref(), Flavor::Local).await;
         let ctx = *parent
             .send(Box::new(Cmd::Context))
             .await
@@ -680,16 +719,16 @@ async fn unpolled_and_closed_context_inputs_retire_without_construction() {
         );
         assert_eq!(closed.built.load(Ordering::SeqCst), 0);
         assert_eq!(closed.captures.load(Ordering::SeqCst), 1);
-        s.as_ref().clone().shutdown().await.unwrap();
+        runtime.shutdown().await.unwrap();
     })
     .await;
 }
-#[actix::test]
-async fn parent_stop_cancellation_keeps_local_child_cleanup_owned() {
+async fn case_cancelled_stop(via_facade: bool) {
     bounded(async {
-        for flavor in [Flavor::Local, Flavor::Typed, Flavor::Native] {
+        for flavor in parent_flavors(via_facade).iter().copied() {
             let s = system().await;
-            let parent = root(&s, flavor).await;
+            let runtime = runtime_for(&s, via_facade).await;
+            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
             let stats = Arc::new(Stats::default());
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
             let actor = child(
@@ -719,7 +758,7 @@ async fn parent_stop_cancellation_keeps_local_child_cleanup_owned() {
             parent.stop().await.unwrap();
             assert_eq!(stats.drops.load(Ordering::SeqCst), 1);
             assert_eq!(stats.captures.load(Ordering::SeqCst), 1);
-            s.as_ref().clone().shutdown().await.unwrap();
+            runtime.shutdown().await.unwrap();
         }
     })
     .await;
@@ -822,12 +861,12 @@ impl Actor for NativeSibling {
         Box::pin(async { Ok(Box::new(self.0.generation) as BoxedMessage) })
     }
 }
-#[actix::test]
-async fn neutral_local_and_send_factories_form_one_native_parent_cohort() {
+async fn case_mixed_cohort(via_facade: bool) {
     bounded(async {
-        for flavor in [Flavor::Local, Flavor::Typed, Flavor::Native] {
+        for flavor in parent_flavors(via_facade).iter().copied() {
             let s = system().await;
-            let parent = root(&s, flavor).await;
+            let runtime = runtime_for(&s, via_facade).await;
+            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
             parent.send(Box::new(Cmd::Policy(all()))).await.unwrap();
             let local = Arc::new(Stats::default());
             let send = Arc::new(Stats::default());
@@ -875,17 +914,17 @@ async fn neutral_local_and_send_factories_form_one_native_parent_cohort() {
             parent.stop().await.unwrap();
             assert_eq!(local.drops.load(Ordering::SeqCst), 2);
             assert_eq!(send.drops.load(Ordering::SeqCst), 2);
-            s.as_ref().clone().shutdown().await.unwrap();
+            runtime.shutdown().await.unwrap();
         }
     })
     .await;
 }
-#[actix::test]
-async fn parent_stop_propagates_child_cleanup_failure_without_later_capture_overwrite() {
+async fn case_cleanup_error(via_facade: bool) {
     bounded(async {
-        for flavor in [Flavor::Local, Flavor::Typed, Flavor::Native] {
+        for flavor in parent_flavors(via_facade).iter().copied() {
             let s = system().await;
-            let parent = root(&s, flavor).await;
+            let runtime = runtime_for(&s, via_facade).await;
+            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
             let stats = Arc::new(Stats::default());
             let actor = child(
                 &parent,
@@ -918,7 +957,7 @@ async fn parent_stop_propagates_child_cleanup_failure_without_later_capture_over
                     .to_string()
                     .contains("child instance drop failed")
             );
-            s.as_ref().clone().shutdown().await.unwrap();
+            runtime.shutdown().await.unwrap();
         }
     })
     .await;
@@ -1128,12 +1167,12 @@ async fn native_and_typed_child_factory_inputs_have_independent_cancellation_and
     .await;
 }
 
-#[actix::test]
-async fn failed_cohort_construction_never_activates_partial_local_replacements() {
+async fn case_failed_construction(via_facade: bool) {
     bounded(async {
-        for flavor in [Flavor::Local, Flavor::Typed, Flavor::Native] {
+        for flavor in parent_flavors(via_facade).iter().copied() {
             let s = system().await;
-            let parent = root(&s, flavor).await;
+            let runtime = runtime_for(&s, via_facade).await;
+            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
             parent.send(Box::new(Cmd::Policy(all()))).await.unwrap();
             let mut children = Vec::new();
             let mut stats = Vec::new();
@@ -1175,7 +1214,7 @@ async fn failed_cohort_construction_never_activates_partial_local_replacements()
                 assert!(!actor.is_alive().await);
                 assert!(actor.stop().await.is_err());
                 assert!(
-                    AsyncEngineRuntime::get_actor(s.as_ref(), &actor.path())
+                    AsyncEngineRuntime::get_actor(runtime.as_ref(), &actor.path())
                         .await
                         .is_none()
                 );
@@ -1195,8 +1234,71 @@ async fn failed_cohort_construction_never_activates_partial_local_replacements()
                 counts.affinity();
             }
             parent.stop().await.unwrap();
-            s.as_ref().clone().shutdown().await.unwrap();
+            runtime.shutdown().await.unwrap();
         }
     })
     .await;
 }
+
+macro_rules! lifecycle_cases {
+    ($native:ident, $facade:ident, $body:ident) => {
+        #[actix::test]
+        async fn $native() {
+            $body(false).await;
+        }
+        #[actix::test]
+        async fn $facade() {
+            $body(true).await;
+        }
+    };
+}
+lifecycle_cases!(
+    all_parent_flavors_own_real_local_children_and_parent_identity,
+    facade_local_and_dynamic_parents_own_real_local_children,
+    case_ownership
+);
+lifecycle_cases!(
+    single_owner_init_can_create_and_wait_for_neutral_local_child,
+    facade_single_owner_init_waits_for_real_local_child,
+    case_nested_init
+);
+lifecycle_cases!(
+    parent_replacement_retires_old_subtree_and_old_context_cannot_admit,
+    facade_parent_replacement_retires_local_subtree_and_stale_context,
+    case_replacement
+);
+lifecycle_cases!(
+    local_child_inherits_live_policy_and_respects_override,
+    facade_local_child_inherits_live_policy_and_override,
+    case_policy
+);
+lifecycle_cases!(
+    one_for_all_rebuilds_local_siblings_under_every_parent_flavor,
+    facade_one_for_all_rebuilds_real_local_siblings,
+    case_cohort
+);
+lifecycle_cases!(
+    unpolled_and_closed_context_inputs_retire_without_construction,
+    facade_local_child_unpolled_and_closed_inputs_retire,
+    case_rejected_inputs
+);
+lifecycle_cases!(
+    parent_stop_cancellation_keeps_local_child_cleanup_owned,
+    facade_cancelled_parent_stop_keeps_local_child_owned,
+    case_cancelled_stop
+);
+lifecycle_cases!(
+    neutral_local_and_send_factories_form_one_native_parent_cohort,
+    facade_local_and_send_siblings_share_real_parent_cohort,
+    case_mixed_cohort
+);
+lifecycle_cases!(
+    parent_stop_propagates_child_cleanup_failure_without_later_capture_overwrite,
+    facade_parent_stop_preserves_first_local_child_cleanup_error,
+    case_cleanup_error
+);
+lifecycle_cases!(
+    failed_cohort_construction_never_activates_partial_local_replacements,
+    facade_failed_local_cohort_never_activates_partial_replacements,
+    case_failed_construction
+);

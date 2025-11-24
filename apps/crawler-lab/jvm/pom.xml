@@ -13,6 +13,14 @@
     <version>1.0.0</version>
     <packaging>jar</packaging>
 
+    <licenses>
+        <license>
+            <name>AGPL-3.0-only</name>
+            <url>https://www.gnu.org/licenses/agpl-3.0.html</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
@@ -45,6 +53,14 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource><directory>src/main/resources</directory></resource>
+            <resource>
+                <directory>${project.basedir}/../../..</directory>
+                <includes><include>LICENSE</include></includes>
+                <targetPath>META-INF</targetPath>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>net.alchim31.maven</groupId>

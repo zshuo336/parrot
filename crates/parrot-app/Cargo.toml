@@ -1,9 +1,10 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE"
 name = "parrot-app"
 version = "0.1.0"
 edition = "2021"
 description = "Parrot 应用体系：AppManifest 声明式应用模型 + Planner + AssemblingContext（DEV_09 A 阶段）"
-license = "MIT"
 
 # 默认库提供应用定义和宿主注入接口；host feature 启用直接依赖 parrot 的 Runner。
 [dependencies]

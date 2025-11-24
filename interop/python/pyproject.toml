@@ -4,6 +4,15 @@ version = "0.1.0"
 description = "Parrot Wire 1.0 Python protocol stack + Ray adapter (DEV_03 §5 / E4)"
 requires-python = ">=3.9"
 dependencies = ["tomli>=2; python_version < '3.11'"]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+
+[build-system]
+requires = ["setuptools>=77.0.3,<81"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["parrot_protocol*"]
 
 [project.optional-dependencies]
 ray = ["ray>=2.9", "virtualenv!=20.21.1,>=20.0.24"]

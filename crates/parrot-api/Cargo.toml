@@ -1,9 +1,10 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE"
 name = "parrot-api"
 version = "0.1.0"
 edition = "2021"
 description = "An abstract Actor programming model interface layer"
-license = "MIT"
 
 [features]
 # 远程消息契约（DEV_01 §3.4）：启用后暴露 RemoteMessage trait 与 CodecRegistration。

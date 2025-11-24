@@ -1,4 +1,6 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../../LICENSE"
 name = "parrot-tokio-upstream-contracts"
 version = "0.0.0"
 edition = "2021"

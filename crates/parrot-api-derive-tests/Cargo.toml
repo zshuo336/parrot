@@ -1,4 +1,6 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE"
 name = "parrot-api-derive-tests"
 version = "0.1.0"
 edition = "2021"
@@ -9,4 +11,4 @@ parrot-api-derive = { path = "../parrot-api-derive" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-async-trait = { workspace = true } 
+async-trait = { workspace = true }

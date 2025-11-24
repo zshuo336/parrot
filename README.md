@@ -1,5 +1,9 @@
 # Parrot Actor Framework
 
+Parrot's own code, examples, tests and documentation are licensed under
+[AGPL-3.0-only](LICENSE). Third-party components retain their original licenses;
+see the [license scope and distribution policy](docs/LICENSE_POLICY.md).
+
 Parrot is a Rust actor framework with a shared API, Actix and thread runtime implementations, a remote protocol stack, and application orchestration across Rust, JVM, Erlang, and Python gateways.
 
 The project is under active development. Local actor runtimes and remote request/reply paths have executable contracts; cluster recovery, control-plane authorization, and some orchestration capabilities remain incomplete. See the [review and repair ledger](docs/review/independent-2026-10-08/REVIEW_AND_REPAIR.md) for verified behavior and outstanding work. Design documents describe both implemented behavior and planned capabilities.

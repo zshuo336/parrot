@@ -250,6 +250,50 @@ def archive(bundle, output, includes):
     return manifest
 
 
+def unpack(archive_path, output, expected_sha256):
+    archive_path, output = Path(archive_path).resolve(), Path(output).absolute()
+    if (len(expected_sha256) != 64
+            or any(c not in '0123456789abcdef' for c in expected_sha256)):
+        raise InputError('invalid expected archive SHA-256')
+    # Read and hash the same opened archive used below. Fresh regular-file writes
+    # preserve selected ._ bytes without platform metadata interpretation.
+    with archive_path.open('rb') as source:
+        digest = hashlib.sha256()
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+        if digest.hexdigest() != expected_sha256:
+            raise InputError('archive SHA-256 mismatch')
+        source.seek(0)
+        output.mkdir(parents=True, exist_ok=False)
+        try:
+            seen = set()
+            with tarfile.open(fileobj=source, mode='r|gz') as packed:
+                for member in packed:
+                    name = valid_name(member.name)
+                    if not member.isfile() or name in seen:
+                        raise InputError('nonregular or duplicate archive member: ' + name)
+                    seen.add(name)
+                    destination = output.joinpath(*PurePosixPath(name).parts)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with packed.extractfile(member) as incoming, destination.open('xb') as target:
+                        shutil.copyfileobj(incoming, target)
+                    destination.chmod(0o755 if member.mode & 0o111 else 0o644)
+            manifest = load_manifest(output / 'manifest.json')
+            verify(output / 'source', manifest, exact=True)
+            # Recheck the archive so an in-place modification cannot be certified
+            # solely by the digest computed before extraction.
+            source.seek(0)
+            digest = hashlib.sha256()
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(block)
+            if digest.hexdigest() != expected_sha256:
+                raise InputError('archive changed during unpack')
+        except BaseException:
+            shutil.rmtree(output)
+            raise
+    return manifest
+
+
 def build_target(root, manifest_path, output):
     root, manifest_path = Path(root).resolve(), Path(manifest_path).resolve()
     expected = identity(manifest_path)
@@ -283,6 +327,10 @@ def main():
     pack.add_argument('--output', type=Path, required=True)
     pack.add_argument('--include', action='append', default=[],
                       help='explicit bundle-relative helper file; may be repeated')
+    extract = actions.add_parser('unpack', help='restore a digest-bound archive without platform metadata handling')
+    extract.add_argument('--archive', type=Path, required=True)
+    extract.add_argument('--output', type=Path, required=True)
+    extract.add_argument('--sha256', required=True, help='previously recorded archive SHA-256')
     build = actions.add_parser('build-target', help='create a fresh manifest-bound Cargo target outside verified source')
     build.add_argument('--root', type=Path, required=True)
     build.add_argument('--manifest', type=Path, required=True)
@@ -293,6 +341,8 @@ def main():
             manifest = export(args.root, args.output)
         elif args.action == 'archive':
             manifest = archive(args.bundle, args.output, args.include)
+        elif args.action == 'unpack':
+            manifest = unpack(args.archive, args.output, args.sha256)
         elif args.action == 'build-target':
             manifest, target, digest = build_target(args.root, args.manifest, args.output)
             print(json.dumps({'status': 'ok', 'files': len(manifest['files']),

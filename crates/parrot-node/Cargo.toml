@@ -1,9 +1,10 @@
 [package]
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE"
 name = "parrot-node"
 version = "0.1.0"
 edition = "2021"
 description = "Parrot standard node runtime: facade + thread engine + remote TCP (deployment unit)"
-license = "MIT"
 
 # 部署单元（应用层组装 crate）：parrot(facade) + parrot-remote(传输) 在此合流。
 # 这是 E5.2 分层的预期组装点——库 crate 之间互不依赖，部署产物统一组装。
