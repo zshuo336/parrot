@@ -53,6 +53,32 @@ use std::{
 };
 use tokio::sync::{Notify, Semaphore};
 
+mod owned_runtime;
+use owned_runtime::OwnedRuntime;
+
+thread_local! {
+    static SUBMISSIONS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct SubmissionScope;
+
+impl SubmissionScope {
+    fn enter(inner: &Arc<TokioRuntimeInner>) -> Self {
+        SUBMISSIONS.with(|stack| stack.borrow_mut().push(Arc::as_ptr(inner) as usize));
+        Self
+    }
+
+    fn contains(inner: &Arc<TokioRuntimeInner>) -> bool {
+        SUBMISSIONS.with(|stack| stack.borrow().contains(&(Arc::as_ptr(inner) as usize)))
+    }
+}
+
+impl Drop for SubmissionScope {
+    fn drop(&mut self) {
+        SUBMISSIONS.with(|stack| stack.borrow_mut().pop());
+    }
+}
+
 #[cfg(test)]
 #[path = "runtime/lifecycle_contracts.rs"]
 mod lifecycle_contracts;
@@ -252,6 +278,12 @@ pub struct RuntimeMetrics {
 /// cancelled submissions. Cancelling a shutdown waiter keeps admission closed;
 /// another clone can join the remaining cleanup. User code runs outside the
 /// accounting lock. Synchronous polling and disposal remain cooperative.
+/// Owned shutdown also joins all actor/I/O workers, blocking helpers and their
+/// prestarted retirement owners, even while other adapter clones remain alive.
+/// It must be awaited outside this adapter's submitted tasks and owned
+/// executors; self-dependent shutdown returns `ActorError::InternalError`
+/// without closing admission. Implicit last-drop retirement survives caller
+/// executor exit but does not synchronously wait for completion.
 /// Poll panics become `ActorError::Panic` with at most 1024 diagnostic characters
 /// plus truncation/cleanup annotations. Their payload is disposed before the
 /// task is retired; a payload destructor panic is retained in that receipt.
@@ -278,120 +310,6 @@ struct TokioRuntimeInner {
     strategy: LoadBalancingStrategy,
     state: Mutex<TaskState>,
     changed: Notify,
-}
-
-/// Tokio forbids dropping a multi-thread runtime from an async context because
-/// its destructor joins worker threads. Keep that blocking join off the host
-/// executor while retaining normal ownership and shutdown semantics.
-struct OwnedRuntime {
-    runtimes: Option<Vec<tokio::runtime::Runtime>>,
-    handles: Vec<tokio::runtime::Handle>,
-}
-
-impl OwnedRuntime {
-    fn new(
-        worker_threads: Option<usize>,
-        io_threads: Option<usize>,
-        strategy: &LoadBalancingStrategy,
-    ) -> Result<Self, String> {
-        const DEFAULT_PLACEMENT_WORKERS: usize = 2;
-        let runtimes = if matches!(strategy, LoadBalancingStrategy::RoundRobin) {
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
-            builder.enable_all();
-            if let Some(worker_threads) = worker_threads {
-                builder.worker_threads(worker_threads);
-            }
-            if let Some(io_threads) = io_threads {
-                builder.max_blocking_threads(io_threads);
-            }
-            vec![builder
-                .build()
-                .map_err(|error| format!("failed to build owned Tokio runtime: {error}"))?]
-        } else {
-            let placement_workers = worker_threads.unwrap_or(DEFAULT_PLACEMENT_WORKERS);
-            let mut runtimes = Vec::with_capacity(placement_workers);
-            for _ in 0..placement_workers {
-                let mut builder = tokio::runtime::Builder::new_multi_thread();
-                builder.worker_threads(1).enable_all();
-                if let Some(io_threads) = io_threads {
-                    builder.max_blocking_threads(io_threads);
-                }
-                match builder.build() {
-                    Ok(runtime) => runtimes.push(runtime),
-                    Err(error) => {
-                        retire_runtimes(runtimes);
-                        return Err(format!("failed to build owned Tokio runtime: {error}"));
-                    }
-                }
-            }
-            runtimes
-        };
-        let handles = runtimes
-            .iter()
-            .map(tokio::runtime::Runtime::handle)
-            .cloned()
-            .collect();
-        Ok(Self {
-            runtimes: Some(runtimes),
-            handles,
-        })
-    }
-
-    fn new_io(io_threads: usize) -> Result<Self, String> {
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder
-            .worker_threads(io_threads)
-            .max_blocking_threads(io_threads)
-            .enable_all();
-        let runtime = builder
-            .build()
-            .map_err(|error| format!("failed to build owned Tokio I/O runtime: {error}"))?;
-        let handle = runtime.handle().clone();
-        Ok(Self {
-            runtimes: Some(vec![runtime]),
-            handles: vec![handle],
-        })
-    }
-
-    fn worker_count(&self) -> usize {
-        self.handles.len()
-    }
-
-    fn spawn_on<F, T>(&self, worker: usize, future: F) -> tokio::task::JoinHandle<T>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.handles[worker % self.handles.len()].spawn(future)
-    }
-}
-
-impl Drop for OwnedRuntime {
-    fn drop(&mut self) {
-        if let Some(runtimes) = self.runtimes.take() {
-            retire_runtimes(runtimes);
-        }
-    }
-}
-
-fn retire_runtimes(runtimes: Vec<tokio::runtime::Runtime>) {
-    let holder = Arc::new(Mutex::new(Some(runtimes)));
-    let worker_holder = holder.clone();
-    let spawn = std::thread::Builder::new()
-        .name("parrot-tokio-runtime-drop".into())
-        .spawn(move || {
-            if let Some(runtimes) = worker_holder.lock().unwrap().take() {
-                drop(runtimes);
-            }
-        });
-    if spawn.is_err() {
-        if let Some(runtimes) = holder.lock().unwrap().take() {
-            // A destructor cannot report a thread-creation failure. Leaking
-            // the runtimes is preferable to joining them on an async executor
-            // thread.
-            std::mem::forget(runtimes);
-        }
-    }
 }
 
 #[derive(Default)]
@@ -475,6 +393,8 @@ impl Drop for PendingGuard {
             if let Some(worker) = self.worker {
                 state.workers[worker].pending -= 1;
             }
+            drop(state);
+            self.inner.retire_if_idle();
             self.inner.changed.notify_waiters();
         }
     }
@@ -492,6 +412,8 @@ impl Drop for ActiveGuard {
         if let Some(worker) = self.worker {
             state.workers[worker].active -= 1;
         }
+        drop(state);
+        self.inner.retire_if_idle();
         self.inner.changed.notify_waiters();
     }
 }
@@ -545,6 +467,22 @@ impl TokioActorRuntime {
     }
 }
 
+impl TokioRuntimeInner {
+    fn retire_if_idle(&self) {
+        let state = self.state.lock().unwrap();
+        let idle = state.shutting_down && state.active == 0 && state.pending == 0;
+        drop(state);
+        if idle {
+            for runtime in [&self.owned_runtime, &self.io_runtime]
+                .into_iter()
+                .flatten()
+            {
+                runtime.request_stop();
+            }
+        }
+    }
+}
+
 async fn run_task<F, T>(
     inner: Arc<TokioRuntimeInner>,
     mut task: PendingTask<F>,
@@ -579,12 +517,19 @@ where
         )
     };
     let active_guard = task.registration.activate()?;
-    let result = std::panic::AssertUnwindSafe(task.future).catch_unwind();
-    let result = match deadline {
-        None => Ok(result.await),
-        Some(deadline) => tokio::time::timeout_at(deadline, result)
-            .await
-            .map_err(|_| ActorError::Timeout),
+    let result = {
+        let result = std::panic::AssertUnwindSafe(task.future).catch_unwind();
+        tokio::pin!(result);
+        let result = std::future::poll_fn(|cx| {
+            let _scope = SubmissionScope::enter(&inner);
+            result.as_mut().poll(cx)
+        });
+        match deadline {
+            None => Ok(result.await),
+            Some(deadline) => tokio::time::timeout_at(deadline, result)
+                .await
+                .map_err(|_| ActorError::Timeout),
+        }
     };
     let result = match result {
         Err(error) => Err(error),
@@ -631,20 +576,31 @@ impl ActorRuntime for TokioActorRuntime {
             || !matches!(strategy, LoadBalancingStrategy::RoundRobin);
         let owned_runtime = if needs_owned_runtime {
             Some(Arc::new(
-                OwnedRuntime::new(config.worker_threads, config.io_threads, &strategy)
+                OwnedRuntime::new(config.worker_threads, config.io_threads, strategy.clone())
+                    .await
                     .map_err(ActorError::InitializationError)?,
             ))
         } else {
             None
         };
-        let io_runtime = config
-            .io_threads
-            .map(|io_threads| {
-                OwnedRuntime::new_io(io_threads)
-                    .map(Arc::new)
-                    .map_err(ActorError::InitializationError)
-            })
-            .transpose()?;
+        let io_runtime = if let Some(io_threads) = config.io_threads {
+            match OwnedRuntime::new_io(io_threads).await {
+                Ok(runtime) => Some(Arc::new(runtime)),
+                Err(error) => {
+                    if let Some(runtime) = &owned_runtime {
+                        runtime.request_stop();
+                        if let Err(cleanup) = runtime.wait().await {
+                            return Err(ActorError::InitializationError(format!(
+                                "{error}; actor runtime cleanup failed: {cleanup}"
+                            )));
+                        }
+                    }
+                    return Err(ActorError::InitializationError(error));
+                }
+            }
+        } else {
+            None
+        };
         let permits = (capacity > 0).then(|| Arc::new(Semaphore::new(capacity)));
         let io_permits =
             (capacity > 0 && io_runtime.is_some()).then(|| Arc::new(Semaphore::new(capacity)));
@@ -664,10 +620,36 @@ impl ActorRuntime for TokioActorRuntime {
 
     async fn shutdown(self) -> Result<(), ActorError> {
         let inner = self.inner.clone();
+        if SubmissionScope::contains(&inner) {
+            return Err(ActorError::InternalError(
+                "runtime shutdown must be awaited outside its submitted tasks".into(),
+            ));
+        }
+        if [&inner.owned_runtime, &inner.io_runtime]
+            .into_iter()
+            .flatten()
+            .any(|runtime| runtime.is_current())
+        {
+            return Err(ActorError::InternalError(
+                "owned Tokio shutdown must be awaited outside its actor/I/O executors".into(),
+            ));
+        }
         inner.state.lock().unwrap().shutting_down = true;
+        inner.retire_if_idle();
         inner.changed.notify_waiters();
         Self::wait_for_idle(&inner).await;
-        Ok(())
+        let mut result = Ok(());
+        for runtime in [&inner.owned_runtime, &inner.io_runtime]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = runtime.wait().await {
+                if result.is_ok() {
+                    result = Err(ActorError::InternalError(error));
+                }
+            }
+        }
+        result
     }
 
     async fn spawn<F, T>(&self, future: F) -> Result<T, ActorError>
