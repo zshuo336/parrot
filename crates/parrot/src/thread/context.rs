@@ -438,6 +438,10 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
 }
 
 impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
+    fn io_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncIoRuntime> {
+        self.system.upgrade()?.io.as_ref()?;
+        Some(self)
+    }
     fn resolve_actor(&self, path: &str) -> Option<BoxedActorRef> {
         self.system()?.resolve_actor(path)
     }
@@ -695,6 +699,18 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
     }
     fn async_spawner(&self) -> Option<&dyn parrot_api::engine::AsyncActorSpawner> {
         Some(self)
+    }
+}
+
+impl<A: Actor + Send + Sync + 'static> parrot_api::engine::AsyncIoRuntime for ThreadContext<A> {
+    fn run_io(
+        &self,
+        future: BoxedFuture<'static, ActorResult<BoxedMessage>>,
+    ) -> BoxedFuture<'static, ActorResult<BoxedMessage>> {
+        match self.system.upgrade().and_then(|system| system.io.clone()) {
+            Some(io) => io.run(future, Some(self.tasks.clone())),
+            None => crate::io_runtime::reject(future),
+        }
     }
 }
 

@@ -51,6 +51,15 @@ pub(crate) struct ManagedContext {
     registrations: Arc<crate::context_tasks::ContextTasks>,
 }
 impl ManagedContext {
+    fn io(&self) -> Option<Arc<crate::io_runtime::IoRuntime>> {
+        if self.scope.is_closed() {
+            return None;
+        }
+        match &self.system {
+            Backend::Thread(system) => system.upgrade()?.io.clone(),
+            Backend::Actix(system) => system.upgrade().ok()?.io.clone(),
+        }
+    }
     fn close(&self) {
         self.scope.close();
         self.registrations.close();
@@ -80,6 +89,10 @@ impl ManagedContext {
     }
 }
 impl TypedContextServices for ManagedContext {
+    fn io_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncIoRuntime> {
+        self.io()
+            .map(|_| self as &dyn parrot_api::engine::AsyncIoRuntime)
+    }
     fn receptionist_register(
         &self,
         key: parrot_api::receptionist::ReceptionistKey,
@@ -169,6 +182,18 @@ impl TypedContextServices for ManagedContext {
     }
 }
 
+impl parrot_api::engine::AsyncIoRuntime for ManagedContext {
+    fn run_io(
+        &self,
+        future: BoxedFuture<'static, ActorResult<parrot_api::types::BoxedMessage>>,
+    ) -> BoxedFuture<'static, ActorResult<parrot_api::types::BoxedMessage>> {
+        match self.io() {
+            Some(io) => io.run(future, Some(self.registrations.clone())),
+            None => crate::io_runtime::reject(future),
+        }
+    }
+}
+
 /// A logical actor retains the current generation's actual child owner.
 pub(crate) struct TypedTree {
     current: Mutex<Arc<ManagedContext>>,
@@ -217,7 +242,9 @@ impl TypedTree {
                 hooks,
                 runtime,
                 cleanup,
-                registrations: crate::context_tasks::ContextTasks::new(0),
+                registrations: crate::context_tasks::ContextTasks::new(
+                    crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS,
+                ),
             })),
             stopped: AtomicBool::new(false),
             pending_failure: Mutex::new(None),
@@ -285,7 +312,9 @@ impl TypedTree {
             hooks: current.hooks.clone(),
             runtime: current.runtime.clone(),
             cleanup: current.cleanup.clone(),
-            registrations: crate::context_tasks::ContextTasks::new(0),
+            registrations: crate::context_tasks::ContextTasks::new(
+                crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS,
+            ),
         });
         Ok(())
     }

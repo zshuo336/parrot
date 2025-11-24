@@ -72,10 +72,11 @@ fn validate_runtime_config(
     {
         return Err(invalid("runtime worker_threads must be in 1..=4096"));
     }
-    if runtime.io_threads.is_some() {
-        return Err(invalid(
-            "runtime io_threads cannot reconfigure the caller-owned I/O driver",
-        ));
+    if runtime
+        .io_threads
+        .is_some_and(|threads| threads == 0 || threads > parrot_config::ThreadResolved::MAX_WORKERS)
+    {
+        return Err(invalid("runtime io_threads must be in 1..=4096"));
     }
     if runtime.scheduler_config.task_queue_capacity
         > parrot_config::ThreadResolved::MAX_QUEUE_CAPACITY
@@ -124,8 +125,8 @@ impl ParrotActorSystem {
     /// facade's guardian. A nonempty facade name overrides the native name.
     /// Positive system timeouts configure this engine's operation deadlines.
     /// RuntimeConfig maps worker count, ready capacity, handler timeout and
-    /// shared-pool placement policy. Native Thread still rejects separate I/O
-    /// thread counts because its caller-owned Tokio driver has no such pool.
+    /// shared-pool placement policy. An explicit I/O count creates a separate
+    /// engine-owned executor exposed through AsyncEngineRuntime::io_runtime.
     pub fn with_thread(
         config: ActorSystemConfig,
         mut settings: ThreadActorSystemConfig,
@@ -161,6 +162,7 @@ impl ParrotActorSystem {
                 guardian.take(),
                 facade.config.value().timeouts.clone(),
                 worker_strategy,
+                facade.config.value().runtime_config.io_threads,
             )
             .await?;
             facade.register_system(
@@ -177,7 +179,8 @@ impl ParrotActorSystem {
     /// guardian. Requires a running Actix System, as the native constructor does.
     /// RuntimeConfig worker count overrides arbiter_count; task_timeout sets the
     /// handler budget; load_balancing selects actor placement on owned arbiters.
-    /// Explicit I/O count and ready capacity fail.
+    /// An explicit I/O count creates an engine-owned executor; ready capacity
+    /// still requires native mailbox configuration.
     pub fn with_actix(
         config: ActorSystemConfig,
         mut settings: ActixSystemSettings,
@@ -199,10 +202,11 @@ impl ParrotActorSystem {
             let config = OwnedPayload::unbound(value);
             let guardian = config.protect(guardian);
             let facade = Self::empty(config).await?;
-            let engine = ActixActorSystem::with_guardian_and_timeouts(
+            let engine = ActixActorSystem::with_guardian_timeouts_and_io(
                 settings,
                 guardian.take(),
                 facade.config.value().timeouts.clone(),
+                facade.config.value().runtime_config.io_threads,
             )
             .await?;
             facade.register_system(

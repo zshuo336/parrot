@@ -264,6 +264,7 @@ type RemoteSlot =
 /// the last handle starts the same owned drain as explicit shutdown. Two shared
 /// process-lifetime threads perform owned-worker cancellation joins.
 pub struct ActixActorSystem {
+    pub(crate) io: Option<Arc<crate::io_runtime::IoRuntime>>,
     leases: Arc<AtomicUsize>,
     cancellation: Arc<super::cancellation_executor::Reservation>,
     pub(crate) operation_timeouts: parrot_api::system::SystemTimeouts,
@@ -301,6 +302,7 @@ impl Drop for ActixActorSystem {
 /// Contexts hold weak system resources: retaining an actor never retains its registry.
 #[derive(Clone)]
 pub(crate) struct WeakSystem {
+    io: Option<Weak<crate::io_runtime::IoRuntime>>,
     leases: Weak<AtomicUsize>,
     cancellation: Weak<super::cancellation_executor::Reservation>,
     operation_timeouts: parrot_api::system::SystemTimeouts,
@@ -327,6 +329,11 @@ impl WeakSystem {
     }
 
     pub(crate) fn upgrade(&self) -> ActorResult<ActixActorSystem> {
+        let io = self
+            .io
+            .as_ref()
+            .map(|io| io.upgrade().ok_or(ActorError::Stopped))
+            .transpose()?;
         let leases = self.leases.upgrade().ok_or(ActorError::Stopped)?;
         let cancellation = self.cancellation.upgrade().ok_or(ActorError::Stopped)?;
         let root_cohorts = self.root_cohorts.upgrade().ok_or(ActorError::Stopped)?;
@@ -346,6 +353,7 @@ impl WeakSystem {
             })
             .map_err(|_| ActorError::Stopped)?;
         Ok(ActixActorSystem {
+            io,
             leases,
             cancellation,
             operation_timeouts: self.operation_timeouts.clone(),
@@ -492,6 +500,14 @@ impl ParrotActor for BoxedActixActor {
 impl ActixEngineExt for BoxedActixActor {}
 
 impl parrot_api::engine::AsyncEngineRuntime for ActixActorSystem {
+    fn shutdown_would_wait_for_current_task(&self) -> bool {
+        self.io.as_ref().is_some_and(|io| io.is_current())
+    }
+    fn io_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncIoRuntime> {
+        self.io
+            .as_ref()
+            .map(|_| self as &dyn parrot_api::engine::AsyncIoRuntime)
+    }
     fn cohort_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncCohortRuntime> {
         Some(self)
     }
@@ -545,6 +561,29 @@ impl parrot_api::engine::AsyncEngineRuntime for ActixActorSystem {
 }
 
 impl ActixActorSystem {
+    /// Start a native engine with the same runtime settings and independent I/O
+    /// ownership as the facade. Requires a running host Actix System.
+    pub fn with_runtime_config(
+        mut settings: ActixSystemSettings,
+        runtime: parrot_api::runtime::RuntimeConfig,
+    ) -> BoxedFuture<'static, Result<Self, SystemError>> {
+        Box::pin(async move {
+            let mut timeouts = parrot_api::system::SystemTimeouts::default();
+            crate::system::startup::apply_actix_runtime_config(
+                &mut settings,
+                &mut timeouts,
+                &runtime,
+            )?;
+            Self::with_guardian_timeouts_and_io(
+                settings,
+                Default::default(),
+                timeouts,
+                runtime.io_threads,
+            )
+            .await
+        })
+    }
+
     /// Create a system with automatic supervision of ordinary root actors.
     pub fn with_guardian(
         settings: ActixSystemSettings,
@@ -554,9 +593,18 @@ impl ActixActorSystem {
     }
 
     pub(crate) fn with_guardian_and_timeouts(
+        settings: ActixSystemSettings,
+        guardian: parrot_api::system::GuardianConfig,
+        timeouts: parrot_api::system::SystemTimeouts,
+    ) -> BoxedFuture<'static, Result<Self, SystemError>> {
+        Self::with_guardian_timeouts_and_io(settings, guardian, timeouts, None)
+    }
+
+    pub(crate) fn with_guardian_timeouts_and_io(
         mut settings: ActixSystemSettings,
         guardian: parrot_api::system::GuardianConfig,
         timeouts: parrot_api::system::SystemTimeouts,
+        io_threads: Option<usize>,
     ) -> BoxedFuture<'static, Result<Self, SystemError>> {
         let guardian = crate::owned_payload::OwnedPayload::unbound(guardian);
         Box::pin(parrot_api::trace::capture(async move {
@@ -576,6 +624,22 @@ impl ActixActorSystem {
             let system = match Self::with_settings(settings).await {
                 Ok(mut system) => {
                     system.operation_timeouts = timeouts;
+                    if let Some(count) = io_threads {
+                        match crate::io_runtime::IoRuntime::new(
+                            count,
+                            &system.runtime,
+                            &system.cleanup_slots,
+                        )
+                        .await
+                        {
+                            Ok(io) => system.io = Some(io),
+                            Err(error) => {
+                                system.shutdown().await?;
+                                strategy.retire().await?;
+                                return Err(error.into());
+                            }
+                        }
+                    }
                     system
                 }
                 Err(error) => {
@@ -637,6 +701,7 @@ impl ActixActorSystem {
             settings.load_balancing.clone(),
         )?;
         Ok(Self {
+            io: None,
             leases: Arc::new(AtomicUsize::new(1)),
             cancellation,
             operation_timeouts: Default::default(),
@@ -716,6 +781,7 @@ impl ActixActorSystem {
 
     pub(super) fn downgrade(&self) -> WeakSystem {
         WeakSystem {
+            io: self.io.as_ref().map(Arc::downgrade),
             leases: Arc::downgrade(&self.leases),
             cancellation: Arc::downgrade(&self.cancellation),
             operation_timeouts: self.operation_timeouts.clone(),
@@ -1347,12 +1413,20 @@ impl ActixActorSystem {
     /// Close admission, stop all actors, and join only this system's workers.
     /// Concurrent callers share one owned operation; cancelling a caller does not cancel cleanup.
     pub async fn shutdown(self) -> Result<(), SystemError> {
+        if self.io.as_ref().is_some_and(|io| io.is_current()) {
+            return Err(SystemError::ActorError(ActorError::InternalError(
+                "I/O task cannot wait for its own system shutdown".into(),
+            )));
+        }
         await_completion(self.begin_shutdown())
             .await
             .map_err(SystemError::from)
     }
 
     fn begin_shutdown(&self) -> tokio::sync::watch::Receiver<Option<Outcome>> {
+        if let Some(io) = &self.io {
+            io.close();
+        }
         self.instance_admission.close();
         self.root_cohorts.close();
         let (completion, start) = {
@@ -1385,9 +1459,11 @@ impl ActixActorSystem {
                 finished,
                 self.cancellation.clone(),
                 self.root_cohorts.clone(),
+                self.io.clone(),
             );
             let pool = self.arbiters.clone();
             let root_cohorts = self.root_cohorts.clone();
+            let io = self.io.clone();
             let timer = owner.timer();
             self.root_cohorts.retirement_runtime().spawn(async move {
                 let results = futures::future::join_all(actors.into_iter().map(
@@ -1403,7 +1479,11 @@ impl ActixActorSystem {
                 .await;
                 let cohorts = root_cohorts.join().await;
                 let joined = pool.stop_and_join().await;
-                let result = joined.and(cohorts).and(
+                let io = match io {
+                    Some(io) => io.shutdown().await,
+                    None => Ok(()),
+                };
+                let result = joined.and(cohorts).and(io).and(
                     results
                         .into_iter()
                         .collect::<ActorResult<Vec<_>>>()
@@ -1434,8 +1514,25 @@ impl ActixActorSystem {
                     .arbiters
                     .inner
                     .retirement
-                    .owned_threads(self.arbiters.size()),
+                    .owned_threads(self.arbiters.size())
+                    .saturating_add(if registry.stopped {
+                        0
+                    } else {
+                        self.io.as_ref().map_or(0, |io| io.worker_count())
+                    }),
             },
+        }
+    }
+}
+
+impl parrot_api::engine::AsyncIoRuntime for ActixActorSystem {
+    fn run_io(
+        &self,
+        future: BoxedFuture<'static, ActorResult<BoxedMessage>>,
+    ) -> BoxedFuture<'static, ActorResult<BoxedMessage>> {
+        match &self.io {
+            Some(io) => io.run(future, None),
+            None => crate::io_runtime::reject(future),
         }
     }
 }

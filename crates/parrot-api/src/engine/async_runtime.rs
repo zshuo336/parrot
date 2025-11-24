@@ -63,6 +63,10 @@ impl SpawnOptions {
 /// Any lets facades preserve native identity and recognize known facade cycles.
 /// Existing static implementations require no additional method.
 pub trait AsyncEngineRuntime: Any + Send + Sync {
+    /// Composite owners check this before closing admission or dispatching shutdown.
+    fn shutdown_would_wait_for_current_task(&self) -> bool {
+        false
+    }
     /// Independent I/O execution, when configured and supported by this engine.
     fn io_runtime(&self) -> Option<&dyn super::AsyncIoRuntime> {
         None

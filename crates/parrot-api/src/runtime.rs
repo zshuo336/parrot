@@ -103,8 +103,9 @@ pub struct RuntimeConfig {
     /// None keeps [`ActorRuntime::spawn_io`] on the actor runtime (or the
     /// caller's runtime when the actor runtime is borrowed). Tokio's readiness
     /// driver and I/O futures then have an independent owned runtime whenever a
-    /// value is supplied. Native Thread and Actix engines reject this field
-    /// because they do not expose an equivalent I/O runtime boundary.
+    /// value is supplied. Native Thread and Actix engines expose their separate
+    /// owned executor through `AsyncEngineRuntime::io_runtime` and actor contexts.
+    /// Native counts are limited to 1..=4096.
     pub io_threads: Option<usize>,
 
     /// Configuration for the task scheduler.

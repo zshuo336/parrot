@@ -315,7 +315,7 @@ fn invalid(config: &mut ActorSystemConfig, case: usize) -> &'static str {
             "io_threads"
         }
         2 => {
-            config.runtime_config.io_threads = Some(1);
+            config.runtime_config.io_threads = Some(4097);
             "io_threads"
         }
         3 => {

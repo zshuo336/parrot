@@ -104,6 +104,13 @@ impl ParrotActorSystem {
     /// A published timeout supersedes late outcomes, whose errors are safely disposed.
     pub fn shutdown_runtime(&self) -> BoxedFuture<'_, Result<(), SystemError>> {
         Box::pin(async move {
+            if self.shutdown_would_wait_for_io() {
+                return Err(SystemError::ActorError(
+                    parrot_api::errors::ActorError::InternalError(
+                        "I/O task cannot wait for its own facade shutdown".into(),
+                    ),
+                ));
+            }
             let mut receipt = {
                 let mut state = self.lifecycle.receipt.lock().unwrap();
                 if let Some(receipt) = &*state {

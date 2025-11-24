@@ -76,6 +76,14 @@ pub(super) struct BoxedThreadActor {
 }
 
 impl parrot_api::engine::AsyncEngineRuntime for ThreadActorSystem {
+    fn shutdown_would_wait_for_current_task(&self) -> bool {
+        self.io.as_ref().is_some_and(|io| io.is_current())
+    }
+    fn io_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncIoRuntime> {
+        self.io
+            .as_ref()
+            .map(|_| self as &dyn parrot_api::engine::AsyncIoRuntime)
+    }
     fn cohort_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncCohortRuntime> {
         Some(self)
     }
@@ -450,6 +458,7 @@ impl Message for Terminated {
 /// `Weak<ThreadActorSystem>` is distributed to contexts so actors can spawn
 /// children and register watches without creating reference cycles.
 pub struct ThreadActorSystem {
+    pub(crate) io: Option<Arc<crate::io_runtime::IoRuntime>>,
     pub(crate) operation_timeouts: parrot_api::system::SystemTimeouts,
     pub(crate) root_cohorts: Arc<crate::root_cohort::RootCohorts>,
     // A per-system scheduling rendezvous for deterministic stop-race tests.
@@ -525,6 +534,53 @@ impl fmt::Debug for ThreadActorSystem {
 }
 
 impl ThreadActorSystem {
+    /// Start a managed native engine with explicit actor and independent I/O
+    /// workers. Scalar runtime settings use the same validation as the facade.
+    pub fn with_runtime_config(
+        mut settings: ThreadActorSystemConfig,
+        runtime: parrot_api::runtime::RuntimeConfig,
+    ) -> BoxedFuture<'static, Result<Arc<Self>, parrot_api::system::SystemError>> {
+        Box::pin(async move {
+            let mut timeouts = parrot_api::system::SystemTimeouts::default();
+            crate::system::startup::apply_thread_runtime_config(
+                &mut settings,
+                &mut timeouts,
+                &runtime,
+            )?;
+            Self::with_guardian_and_timeouts_and_strategy(
+                settings,
+                Default::default(),
+                timeouts,
+                runtime.scheduler_config.load_balancing,
+                runtime.io_threads,
+            )
+            .await
+        })
+    }
+
+    async fn configure_io(
+        &mut self,
+        count: Option<usize>,
+    ) -> Result<(), parrot_api::system::SystemError> {
+        if let Some(count) = count {
+            match crate::io_runtime::IoRuntime::new(
+                count,
+                self.retirement_runtime(),
+                &self.cleanup_slots,
+            )
+            .await
+            {
+                Ok(io) => self.io = Some(io),
+                Err(error) => {
+                    self.shutdown_internal()
+                        .await
+                        .map_err(crate::error_receipt::public_system_error)?;
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn retirement_runtime(&self) -> &Handle {
         self.root_cohorts.retirement_runtime()
     }
@@ -547,6 +603,7 @@ impl ThreadActorSystem {
             guardian,
             timeouts,
             parrot_api::runtime::LoadBalancingStrategy::RoundRobin,
+            None,
         )
     }
 
@@ -555,6 +612,7 @@ impl ThreadActorSystem {
         guardian: parrot_api::system::GuardianConfig,
         timeouts: parrot_api::system::SystemTimeouts,
         worker_strategy: parrot_api::runtime::LoadBalancingStrategy,
+        io_threads: Option<usize>,
     ) -> BoxedFuture<'static, Result<Arc<Self>, parrot_api::system::SystemError>> {
         let guardian = crate::owned_payload::OwnedPayload::unbound(guardian);
         Box::pin(parrot_api::trace::capture(async move {
@@ -570,6 +628,10 @@ impl ThreadActorSystem {
             let system = match Self::try_new_with_strategy(config, worker_strategy) {
                 Ok(mut system) => {
                     system.operation_timeouts = timeouts;
+                    if let Err(error) = system.configure_io(io_threads).await {
+                        strategy.retire().await?;
+                        return Err(error);
+                    }
                     let system = Arc::new(system);
                     system.set_self_weak(Arc::downgrade(&system));
                     system
@@ -688,6 +750,7 @@ impl ThreadActorSystem {
         )?);
 
         Ok(Self {
+            io: None,
             operation_timeouts: Default::default(),
             root_cohorts,
             typed_slots: Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1))),
@@ -1860,6 +1923,11 @@ impl ThreadActorSystem {
     /// Join one owned shutdown operation. Every caller observes completion;
     /// dropping a caller does not cancel resource cleanup or erase errors.
     pub async fn shutdown_internal(&self) -> Result<(), SystemError> {
+        if self.io.as_ref().is_some_and(|io| io.is_current()) {
+            return Err(SystemError::ShutdownError(
+                "I/O task cannot wait for its own system shutdown".into(),
+            ));
+        }
         let completion = {
             let mut state = self.shutdown_completion.lock().unwrap();
             if let Some(completion) = state.as_ref() {
@@ -1899,6 +1967,10 @@ impl ThreadActorSystem {
         &self,
         deadline: tokio::time::Instant,
     ) -> parrot_api::types::BoxedFuture<'static, Result<(), SystemError>> {
+        let io = self.io.clone();
+        if let Some(io) = &io {
+            io.close();
+        }
         self.root_cohorts.close();
         let root_cohorts = self.root_cohorts.clone();
         // Reserve all stops while the registry still retains every generation.
@@ -1920,6 +1992,12 @@ impl ThreadActorSystem {
         Box::pin(async move {
             let results = futures::future::join_all(completions.into_iter().map(await_stop)).await;
             let cohorts = root_cohorts.join().await;
+            let io = match io {
+                Some(io) => io.shutdown().await.map_err(|error| {
+                    SystemError::ShutdownError(crate::error_receipt::actor_summary(&error))
+                }),
+                None => Ok(()),
+            };
             // Affinity schedulers remain alive until every actor was disposed.
             let cleanup_deadline = deadline.max(tokio::time::Instant::now() + timeout);
             let sharded = scheduler_group.sharded_scheduler.lock().unwrap().clone();
@@ -1968,6 +2046,7 @@ impl ThreadActorSystem {
                 shared,
                 dedicated,
                 shards,
+                io,
                 cohorts.map_err(|error| {
                     SystemError::ShutdownError(crate::error_receipt::actor_summary(&error))
                 }),
@@ -2489,6 +2568,7 @@ impl ActorSystem for ThreadActorSystem {
                 .scheduler_config
                 .load_balancing
                 .clone();
+            let io_threads = config.value().runtime_config.io_threads;
             let guardian =
                 crate::owned_payload::OwnedPayload::unbound(config.take().guardian_config);
             let strategy = crate::root_cohort::guardian_strategy(guardian).await?;
@@ -2506,6 +2586,10 @@ impl ActorSystem for ThreadActorSystem {
             ) {
                 Ok(mut system) => {
                     system.operation_timeouts = timeouts;
+                    if let Err(error) = system.configure_io(io_threads).await {
+                        strategy.retire().await?;
+                        return Err(error);
+                    }
                     system
                 }
                 Err(error) => {
@@ -2660,6 +2744,7 @@ impl ActorSystem for ThreadActorSystem {
                         .dedicated_scheduler
                         .metrics_thread_count()
                         .saturating_add(shards.map_or(0, |s| s.owned_thread_count()))
+                        .saturating_add(self.io.as_ref().map_or(0, |io| io.worker_count()))
                 },
             },
         }
@@ -2669,6 +2754,18 @@ impl ActorSystem for ThreadActorSystem {
         self.shutdown_internal()
             .await
             .map_err(crate::error_receipt::public_system_error)
+    }
+}
+
+impl parrot_api::engine::AsyncIoRuntime for ThreadActorSystem {
+    fn run_io(
+        &self,
+        future: BoxedFuture<'static, ActorResult<BoxedMessage>>,
+    ) -> BoxedFuture<'static, ActorResult<BoxedMessage>> {
+        match &self.io {
+            Some(io) => io.run(future, None),
+            None => crate::io_runtime::reject(future),
+        }
     }
 }
 

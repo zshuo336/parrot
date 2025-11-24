@@ -42,6 +42,41 @@ impl ActorSystemImpl {
     }
 }
 impl ParrotActorSystem {
+    /// Execute I/O on a named engine's independent executor.
+    pub fn run_io_on(
+        &self,
+        name: &str,
+        future: BoxedFuture<
+            'static,
+            parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>,
+        >,
+    ) -> BoxedFuture<'static, parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
+        self.io_selected(self.get_creation_system(Some(name)), future)
+    }
+
+    fn io_selected(
+        &self,
+        system: Result<ActorSystemImpl, SystemError>,
+        future: BoxedFuture<
+            'static,
+            parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>,
+        >,
+    ) -> BoxedFuture<'static, parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
+        match system {
+            Ok(system) if !self.lifecycle.started() => match system.runtime().io_runtime() {
+                Some(io) => io.run_io(future),
+                None => crate::io_runtime::reject(future),
+            },
+            _ => crate::io_runtime::reject(future),
+        }
+    }
+
+    pub(super) fn shutdown_would_wait_for_io(&self) -> bool {
+        let systems: Vec<_> = self.systems.read().unwrap().values().cloned().collect();
+        systems
+            .iter()
+            .any(|system| system.runtime().shutdown_would_wait_for_current_task())
+    }
     /// Register any asynchronous engine. Names retain the facade's opaque-key
     /// semantics. Replacement returns the previous registration without stopping
     /// it; callers retain responsibility for removed/replaced engines. Shutdown
@@ -348,6 +383,18 @@ impl ParrotActorSystem {
     }
 }
 impl AsyncEngineRuntime for ParrotActorSystem {
+    fn shutdown_would_wait_for_current_task(&self) -> bool {
+        self.shutdown_would_wait_for_io()
+    }
+    fn io_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncIoRuntime> {
+        self.get_creation_system(None).ok().and_then(|system| {
+            system
+                .runtime()
+                .io_runtime()
+                .is_some()
+                .then_some(self as &dyn parrot_api::engine::AsyncIoRuntime)
+        })
+    }
     fn cohort_runtime(&self) -> Option<&dyn AsyncCohortRuntime> {
         self.get_creation_system(None).ok().and_then(|system| {
             system
@@ -414,6 +461,18 @@ impl AsyncEngineRuntime for ParrotActorSystem {
         self.shutdown_runtime()
     }
 }
+impl parrot_api::engine::AsyncIoRuntime for ParrotActorSystem {
+    fn run_io(
+        &self,
+        future: BoxedFuture<
+            'static,
+            parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>,
+        >,
+    ) -> BoxedFuture<'static, parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
+        self.io_selected(self.get_creation_system(None), future)
+    }
+}
+
 impl AsyncFactoryRuntime for ParrotActorSystem {
     fn spawn_factory<'a>(
         &'a self,

@@ -1,5 +1,8 @@
 //! Optional, engine-owned execution for Send I/O futures.
-use crate::{errors::ActorError, types::{ActorResult, BoxedFuture, BoxedMessage}};
+use crate::{
+    errors::ActorError,
+    types::{ActorResult, BoxedFuture, BoxedMessage},
+};
 use std::future::Future;
 
 /// A separate I/O executor owned and retired by an actor engine.
@@ -8,8 +11,10 @@ use std::future::Future;
 /// and workers. Polling and disposal must cooperate: blocking user code cannot
 /// be forcibly terminated. Unaccepted inputs are still retired on cancellation.
 pub trait AsyncIoRuntime: Send + Sync {
-    fn run_io(&self, future: BoxedFuture<'static, ActorResult<BoxedMessage>>)
-        -> BoxedFuture<'static, ActorResult<BoxedMessage>>;
+    fn run_io(
+        &self,
+        future: BoxedFuture<'static, ActorResult<BoxedMessage>>,
+    ) -> BoxedFuture<'static, ActorResult<BoxedMessage>>;
 }
 
 /// Typed convenience over the object-safe I/O capability.
@@ -23,9 +28,15 @@ pub trait AsyncIoRuntimeExt: AsyncIoRuntime {
             future.await.map(|value| Box::new(value) as BoxedMessage)
         }));
         Box::pin(async move {
-            result.await?.downcast::<T>().map(|value| *value).map_err(|_| {
-                ActorError::InternalError("I/O executor returned a different output type".into())
-            })
+            result
+                .await?
+                .downcast::<T>()
+                .map(|value| *value)
+                .map_err(|_| {
+                    ActorError::InternalError(
+                        "I/O executor returned a different output type".into(),
+                    )
+                })
         })
     }
 }

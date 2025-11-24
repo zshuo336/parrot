@@ -16,6 +16,7 @@ struct ShutdownWork {
     finished: watch::Sender<Option<Outcome>>,
     deadline: Instant,
     root_cohorts: Arc<crate::root_cohort::RootCohorts>,
+    io: Option<Arc<crate::io_runtime::IoRuntime>>,
 }
 
 fn publish(finished: &watch::Sender<Option<Outcome>>, outcome: Outcome) {
@@ -43,6 +44,7 @@ impl ShutdownOwner {
         finished: watch::Sender<Option<Outcome>>,
         cancellation: Arc<super::super::cancellation_executor::Reservation>,
         root_cohorts: Arc<crate::root_cohort::RootCohorts>,
+        io: Option<Arc<crate::io_runtime::IoRuntime>>,
     ) -> Self {
         Self {
             work: Some(ShutdownWork {
@@ -51,6 +53,7 @@ impl ShutdownOwner {
                 finished,
                 deadline,
                 root_cohorts,
+                io,
             }),
             cancellation,
         }
@@ -97,11 +100,15 @@ impl ShutdownWork {
         }
         let joined = self.pool.inner.retirement.join_blocking();
         let cohorts = futures::executor::block_on(self.root_cohorts.join());
+        let io = match self.io.as_ref() {
+            Some(io) => futures::executor::block_on(io.shutdown()),
+            None => Ok(()),
+        };
         let disposal = self.clear();
         let mut message =
             "Actix shutdown task cancelled; owned workers retired without graceful completion"
                 .to_owned();
-        for result in [joined, cohorts, disposal] {
+        for result in [joined, cohorts, io, disposal] {
             if let Err(error) = result {
                 message.push_str("; ");
                 message.push_str(&crate::error_receipt::actor_summary(&error));

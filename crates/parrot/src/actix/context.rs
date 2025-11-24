@@ -6,7 +6,7 @@ use parrot_api::context::{
 };
 use parrot_api::errors::ActorError;
 use parrot_api::message::{CloneableMessage, Message};
-use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture};
+use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -627,6 +627,10 @@ impl<A> ActorContext for ActixContext<A>
 where
     A: actix::Actor<Context = ActixCtx<A>>,
 {
+    fn io_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncIoRuntime> {
+        self.spawner.service.as_ref()?.upgrade().ok()?.io.as_ref()?;
+        Some(self)
+    }
     fn resolve_actor(&self, path: &str) -> Option<BoxedActorRef> {
         self.spawner
             .service
@@ -927,6 +931,27 @@ where
                 None => Err(ActorError::InternalError("receptionist not enabled".into())),
             }
         })
+    }
+}
+
+impl<A> parrot_api::engine::AsyncIoRuntime for ActixContext<A>
+where
+    A: actix::Actor<Context = ActixCtx<A>>,
+{
+    fn run_io(
+        &self,
+        future: BoxedFuture<'static, ActorResult<BoxedMessage>>,
+    ) -> BoxedFuture<'static, ActorResult<BoxedMessage>> {
+        let io = self
+            .spawner
+            .service
+            .as_ref()
+            .and_then(|system| system.upgrade().ok())
+            .and_then(|system| system.io.clone());
+        match io {
+            Some(io) => io.run(future, Some(self.tasks.clone())),
+            None => crate::io_runtime::reject(future),
+        }
     }
 }
 
