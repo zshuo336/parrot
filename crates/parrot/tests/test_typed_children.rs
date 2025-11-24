@@ -1014,7 +1014,7 @@ fn host_shutdown_isolates_parent_and_child_policy_capture_panics() {
             .unwrap();
         let stats = Arc::new(Stats::default());
         let captures = Arc::new(AtomicUsize::new(0));
-        let (system, actor) = runtime.block_on(async {
+        let (system, actors, paths) = runtime.block_on(async {
             let system = system();
             let actor = system
                 .spawn_typed_with_strategy::<_, Op>(
@@ -1025,7 +1025,19 @@ fn host_shutdown_isolates_parent_and_child_policy_capture_panics() {
                 .await
                 .unwrap();
             actor.ask(Op::Policy(policy(&captures))).await.unwrap();
-            (system, actor)
+            let branch = child(&actor, 0).await;
+            let leaf = child(&branch, 0).await;
+            let paths = [
+                info(&actor).await.0,
+                info(&branch).await.0,
+                info(&leaf).await.0,
+            ];
+            assert_eq!(info(&actor).await.2, 1);
+            assert_eq!(info(&branch).await.1, Some(paths[0].clone()));
+            assert_eq!(info(&branch).await.2, 1);
+            assert_eq!(info(&leaf).await.1, Some(paths[1].clone()));
+            assert_eq!(system.actor_count(), 3);
+            (system, [actor, branch, leaf], paths)
         });
         runtime.shutdown_timeout(Duration::from_secs(1));
         println!("POLICY_HOST_STOPPED");
@@ -1035,7 +1047,7 @@ fn host_shutdown_isolates_parent_and_child_policy_capture_panics() {
         // owner. Its receipt must follow both isolated policy destructors.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match actor.retirement_status() {
+            match actors[0].retirement_status() {
                 parrot_api::address::RetirementStatus::Retired(result) => {
                     assert!(
                         result
@@ -1057,9 +1069,31 @@ fn host_shutdown_isolates_parent_and_child_policy_capture_panics() {
                 }
             }
         }
+        for actor in &actors[1..] {
+            assert!(matches!(
+                actor.retirement_status(),
+                parrot_api::address::RetirementStatus::Retired(_)
+            ));
+        }
+        assert!(actors.iter().all(|actor| !actor.is_alive()));
         assert_eq!(captures.load(Ordering::SeqCst), 2);
-        assert_eq!(stats.drops.load(Ordering::SeqCst), 1);
-        drop(actor);
+        assert_eq!(stats.drops.load(Ordering::SeqCst), 3);
+        let events = stats.events.lock().unwrap().clone();
+        // Host cancellation releases finite inputs, but cannot run normal
+        // asynchronous stop hooks or impose child-before-parent destruction.
+        for path in &paths {
+            for event in ["init", "drop"] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|(p, e)| p == path && *e == event)
+                        .count(),
+                    1,
+                    "{path}: expected one {event}, got {events:?}"
+                );
+            }
+        }
+        drop(actors);
         println!("POLICY_HOST_RETIRED");
         return;
     }
