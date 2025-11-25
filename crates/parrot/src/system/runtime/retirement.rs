@@ -5,6 +5,7 @@ use crate::owned_payload::{
     pending_cleanup_permit,
 };
 use parrot_api::{
+    address::RetirementStatus,
     engine::AsyncRootCohort,
     errors::ActorError,
     types::{ActorResult, BoxedActorRef, BoxedFuture},
@@ -13,14 +14,21 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     task::Poll,
+    time::Duration,
 };
 
 pub(in crate::system) trait CreationOutput: Send + Sync + 'static {
     fn retire(&self) -> BoxedFuture<'_, ActorResult<()>>;
+    fn retirement_status(&self) -> RetirementStatus {
+        RetirementStatus::Unsupported
+    }
 }
 impl CreationOutput for BoxedActorRef {
     fn retire(&self) -> BoxedFuture<'_, ActorResult<()>> {
         self.stop()
+    }
+    fn retirement_status(&self) -> RetirementStatus {
+        self.as_ref().retirement_status()
     }
 }
 impl CreationOutput for Arc<dyn AsyncRootCohort> {
@@ -49,7 +57,7 @@ impl CreationRetirement {
 }
 
 // Poll and dispose an arbitrary borrowed stop future in separate unwind scopes.
-async fn stop<T: CreationOutput>(value: &T) -> ActorResult<()> {
+async fn request_stop<T: CreationOutput>(value: &T) -> ActorResult<()> {
     let future = catch_unwind(AssertUnwindSafe(|| value.retire()))
         .map_err(|payload| ActorError::Panic(panic_message(payload)))?;
     let mut future = PublicationInput::new(future);
@@ -64,6 +72,43 @@ async fn stop<T: CreationOutput>(value: &T) -> ActorResult<()> {
     let disposal = future.retire();
     let result = result.take();
     if result.is_err() { result } else { disposal }
+}
+
+async fn stop<T: CreationOutput>(value: &T) -> ActorResult<()> {
+    let mut stopped = PublicationInput::new(request_stop(value).await);
+    let mut pending = false;
+    let mut warned = false;
+    let mut delay = Duration::from_millis(1);
+    loop {
+        match catch_unwind(AssertUnwindSafe(|| value.retirement_status())) {
+            Ok(RetirementStatus::Retired(result)) => return result,
+            Ok(RetirementStatus::Unsupported) if !pending => return stopped.take(),
+            Ok(RetirementStatus::Pending) => pending = true,
+            Ok(RetirementStatus::Unsupported) => {
+                if !warned {
+                    warned = true;
+                    cleanup_diagnostic(|| {
+                        tracing::warn!(
+                            "unpublished actor lost its pending retirement receipt; retaining ownership"
+                        )
+                    });
+                }
+            }
+            Err(payload) => {
+                let error = PublicationInput::new(ActorError::Panic(panic_message(payload)));
+                if !warned {
+                    warned = true;
+                    cleanup_diagnostic(
+                        || tracing::warn!(error = %error.value(), "unpublished retirement observation failed; retaining ownership"),
+                    );
+                }
+            }
+        }
+        // A public deadline closes admission before actual Drop/OS cleanup.
+        // Retain the bounded owner without occupying a disposal worker.
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(50));
+    }
 }
 
 struct Unpublished<T: CreationOutput, E: Send + 'static> {
