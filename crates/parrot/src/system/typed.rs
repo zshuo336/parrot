@@ -11,6 +11,16 @@ use std::sync::Arc;
 
 mod single;
 
+impl<A, M> super::runtime::CreationOutput for TypedActorRef<A, M>
+where
+    A: ParrotTypedDispatch,
+    M: ParrotMsgVariant<A>,
+{
+    fn retire(&self) -> BoxedFuture<'_, ActorResult<()>> {
+        Box::pin(self.stop())
+    }
+}
+
 /// Concrete reference for the native single-protocol adapter.
 pub type SingleActorRef<A, M> = TypedActorRef<
     crate::thread::typed::SingleDispatch<A, M>,
@@ -88,44 +98,56 @@ impl ParrotActorSystem {
         A: ParrotTypedDispatch,
         M: ParrotMsgVariant<A>,
     {
-        let selected = self.get_leaf_creation_system(name);
+        let selected = self
+            .get_leaf_creation_system(name)
+            .map(|system| self.own(system));
         let actor = self.own(actor);
         let strategy = self.own(strategy);
         Box::pin(parrot_api::trace::capture(async move {
             let selected = match selected {
-                Ok(selected) if !self.lifecycle.started() => selected,
-                result => {
+                Ok(selected) => selected,
+                Err(error) => {
                     let (actor, strategy) = tokio::join!(actor.retire(), strategy.retire());
                     actor.and(strategy)?;
-                    return Err(selection_error(result.err()));
+                    return Err(selection_error(Some(error)));
                 }
             };
-            match selected {
-                ActorSystemImpl::Thread(system) => match strategy.take() {
-                    Some(strategy) => {
-                        system
-                            .spawn_typed_with_strategy(actor.take(), path, strategy)
-                            .await
-                    }
-                    None => system.spawn_typed(actor.take(), path).await,
-                },
-                ActorSystemImpl::Actix(system) => {
-                    let system = Arc::new(system);
-                    match strategy.take() {
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                if self.lifecycle.started() {
+                    let (actor, strategy) = tokio::join!(actor.retire(), strategy.retire());
+                    actor.and(strategy)?;
+                    return Err(selection_error(None));
+                }
+                match selected.value() {
+                    ActorSystemImpl::Thread(system) => match strategy.take() {
                         Some(strategy) => {
                             system
                                 .spawn_typed_with_strategy(actor.take(), path, strategy)
                                 .await
                         }
                         None => system.spawn_typed(actor.take(), path).await,
+                    },
+                    ActorSystemImpl::Actix(system) => {
+                        let system = Arc::new(system.clone());
+                        match strategy.take() {
+                            Some(strategy) => {
+                                system
+                                    .spawn_typed_with_strategy(actor.take(), path, strategy)
+                                    .await
+                            }
+                            None => system.spawn_typed(actor.take(), path).await,
+                        }
+                    }
+                    ActorSystemImpl::Runtime(_) => {
+                        let (actor, strategy) = tokio::join!(actor.retire(), strategy.retire());
+                        actor.and(strategy)?;
+                        Err(unsupported())
                     }
                 }
-                ActorSystemImpl::Runtime(_) => {
-                    let (actor, strategy) = tokio::join!(actor.retire(), strategy.retire());
-                    actor.and(strategy)?;
-                    Err(unsupported())
-                }
             }
+            .await;
+            super::runtime::finish_creation(selected, result, retirement).await
         }))
     }
 
@@ -202,44 +224,60 @@ impl ParrotActorSystem {
         M: ParrotMsgVariant<A>,
         F: Fn() -> A + Send + Sync + 'static,
     {
-        let selected = self.get_leaf_creation_system(name);
+        let selected = self
+            .get_leaf_creation_system(name)
+            .map(|system| self.own(system));
         let factory = self.own(factory);
         let strategy = self.own(strategy);
         Box::pin(parrot_api::trace::capture(async move {
             let selected = match selected {
-                Ok(selected) if !self.lifecycle.started() => selected,
-                result => {
+                Ok(selected) => selected,
+                Err(error) => {
                     let (factory, strategy) = tokio::join!(factory.retire(), strategy.retire());
                     factory.and(strategy)?;
-                    return Err(selection_error(result.err()));
+                    return Err(selection_error(Some(error)));
                 }
             };
-            match selected {
-                ActorSystemImpl::Thread(system) => match strategy.take() {
-                    Some(strategy) => {
-                        system
-                            .spawn_typed_factory_with_strategy(factory.take(), path, strategy)
-                            .await
-                    }
-                    None => system.spawn_typed_factory(factory.take(), path).await,
-                },
-                ActorSystemImpl::Actix(system) => {
-                    let system = Arc::new(system);
-                    match strategy.take() {
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                if self.lifecycle.started() {
+                    let (factory, strategy) = tokio::join!(factory.retire(), strategy.retire());
+                    factory.and(strategy)?;
+                    return Err(selection_error(None));
+                }
+                match selected.value() {
+                    ActorSystemImpl::Thread(system) => match strategy.take() {
                         Some(strategy) => {
                             system
                                 .spawn_typed_factory_with_strategy(factory.take(), path, strategy)
                                 .await
                         }
                         None => system.spawn_typed_factory(factory.take(), path).await,
+                    },
+                    ActorSystemImpl::Actix(system) => {
+                        let system = Arc::new(system.clone());
+                        match strategy.take() {
+                            Some(strategy) => {
+                                system
+                                    .spawn_typed_factory_with_strategy(
+                                        factory.take(),
+                                        path,
+                                        strategy,
+                                    )
+                                    .await
+                            }
+                            None => system.spawn_typed_factory(factory.take(), path).await,
+                        }
+                    }
+                    ActorSystemImpl::Runtime(_) => {
+                        let (factory, strategy) = tokio::join!(factory.retire(), strategy.retire());
+                        factory.and(strategy)?;
+                        Err(unsupported())
                     }
                 }
-                ActorSystemImpl::Runtime(_) => {
-                    let (factory, strategy) = tokio::join!(factory.retire(), strategy.retire());
-                    factory.and(strategy)?;
-                    Err(unsupported())
-                }
             }
+            .await;
+            super::runtime::finish_creation(selected, result, retirement).await
         }))
     }
 }

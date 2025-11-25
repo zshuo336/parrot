@@ -1,6 +1,6 @@
 //! Open runtime dispatch through the existing application-facing facade.
 use super::{ActorSystemImpl, ParrotActorSystem, retire_registrations};
-use crate::owned_payload::PublicationInput;
+use crate::owned_payload::{OwnedPayload, PublicationInput, cleanup_diagnostic};
 use parrot_api::{
     engine::{
         AsyncCohortRuntime, AsyncEngineRuntime, AsyncFactoryRuntime, AsyncLocalRuntime,
@@ -12,11 +12,36 @@ use parrot_api::{
 };
 use std::{any::Any, sync::Arc};
 
+mod retirement;
+pub(super) use retirement::{CreationOutput, CreationRetirement, finish_creation};
+
+pub(super) async fn finish_selected<T, E>(
+    owner: OwnedPayload<ActorSystemImpl>,
+    result: Result<T, E>,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: From<parrot_api::errors::ActorError> + Send + 'static,
+{
+    let result = owner.protect(result);
+    match owner.retire().await {
+        Ok(()) => result.take(),
+        Err(error) if result.value().is_err() => {
+            cleanup_diagnostic(
+                || tracing::warn!(error = %error, "selected runtime cleanup failed after operation error"),
+            );
+            result.take()
+        }
+        Err(error) => {
+            let _ = result.retire().await;
+            Err(error.into())
+        }
+    }
+}
+
 impl ActorSystemImpl {
     fn from_runtime(runtime: Arc<dyn AsyncEngineRuntime>) -> Self {
-        // Canonicalize known engines, so mixed typed/neutral aliases share the
-        // same registry identity and receptionist propagation. External engines
-        // retain their actual trait object and use Arc identity for aliases.
+        // Canonicalize known engines so aliases share native registry identity.
         let erased: Arc<dyn Any + Send + Sync> = runtime.clone();
         match erased.downcast::<crate::thread::ThreadActorSystem>() {
             Ok(thread) => Self::Thread(thread),
@@ -62,20 +87,43 @@ impl ParrotActorSystem {
             parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>,
         >,
     ) -> BoxedFuture<'static, parrot_api::types::ActorResult<parrot_api::types::BoxedMessage>> {
+        let future = self.own(future);
         match system {
-            Ok(system) if !self.lifecycle.started() => match system.runtime().io_runtime() {
-                Some(io) => io.run_io(future),
-                None => crate::io_runtime::reject(future),
-            },
-            _ => crate::io_runtime::reject(future),
+            Ok(system) => {
+                let system = self.own(system);
+                let work = if !self.lifecycle.started() {
+                    match system.value().runtime().io_runtime() {
+                        Some(io) => io.run_io(future.take()),
+                        None => crate::io_runtime::reject(future.take()),
+                    }
+                } else {
+                    crate::io_runtime::reject(future.take())
+                };
+                let work = system.protect(work);
+                Box::pin(parrot_api::trace::capture(async move {
+                    let result = super::snapshot::callback(work.take()).await;
+                    finish_selected(system, result).await
+                }))
+            }
+            Err(_) => crate::io_runtime::reject(future.take()),
         }
     }
 
     pub(super) fn shutdown_would_wait_for_io(&self) -> bool {
-        let systems: Vec<_> = self.systems.read().unwrap().values().cloned().collect();
-        systems
-            .iter()
-            .any(|system| system.runtime().shutdown_would_wait_for_current_task())
+        let systems: Vec<_> = self
+            .systems
+            .read()
+            .unwrap()
+            .values()
+            .map(|system| PublicationInput::new(system.clone()))
+            .collect();
+        let mut waiting = false;
+        for mut system in systems {
+            waiting = super::lookup_owned(system.take(), |system| {
+                waiting || system.runtime().shutdown_would_wait_for_current_task()
+            });
+        }
+        waiting
     }
     /// Register any asynchronous engine. Names retain the facade's opaque-key
     /// semantics. Replacement returns the previous registration without stopping
@@ -209,6 +257,9 @@ impl ParrotActorSystem {
     pub(super) fn own<T: Send + 'static>(&self, value: T) -> crate::owned_payload::OwnedPayload<T> {
         crate::owned_payload::OwnedPayload::new(value, &self.runtime, &self.cleanup_slots)
     }
+    pub(super) async fn creation_retirement(&self) -> CreationRetirement {
+        CreationRetirement::reserve(&self.runtime, &self.cleanup_slots).await
+    }
     /// Create a root group on a named engine captured at call time. The group
     /// retains that engine even when registrations or the default later change.
     pub fn root_cohort_on(
@@ -246,23 +297,32 @@ impl ParrotActorSystem {
         system: Result<ActorSystemImpl, SystemError>,
         strategy: parrot_api::supervisor::SupervisorStrategyType,
     ) -> BoxedFuture<'_, Result<Arc<dyn AsyncRootCohort>, SystemError>> {
+        let system = system.map(|system| self.own(system));
         let strategy = self.own(strategy);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match system {
-                Ok(system) if !self.lifecycle.started() => system,
-                result => {
-                    let error = result.err().unwrap_or(SystemError::ShuttingDown);
+                Ok(system) => system,
+                Err(error) => {
                     strategy.retire().await.map_err(SystemError::ActorError)?;
                     return Err(error);
                 }
             };
-            let Some(runtime) = system.runtime().cohort_runtime() else {
-                strategy.retire().await.map_err(SystemError::ActorError)?;
-                return Err(SystemError::ActorCreationError(
-                    "selected runtime does not expose root cohorts".into(),
-                ));
-            };
-            runtime.root_cohort(strategy.take()).await
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                if self.lifecycle.started() {
+                    strategy.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(SystemError::ShuttingDown);
+                }
+                let Some(runtime) = system.value().runtime().cohort_runtime() else {
+                    strategy.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(SystemError::ActorCreationError(
+                        "selected runtime does not expose root cohorts".into(),
+                    ));
+                };
+                super::snapshot::callback(runtime.root_cohort(strategy.take())).await
+            }
+            .await;
+            finish_creation(system, result, retirement).await
         }))
     }
     /// Named engine creation with a real underlying path. Selection is captured
@@ -283,27 +343,39 @@ impl ParrotActorSystem {
         config: InstanceConfig,
         options: SpawnOptions,
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
+        let system = system.map(|system| self.own(system));
         let actor = self.own(actor);
         let config = self.own(config);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match system {
-                Ok(system) if !self.lifecycle.started() => system,
-                result => {
-                    let error = result.err().unwrap_or(SystemError::ShuttingDown);
+                Ok(system) => system,
+                Err(error) => {
                     let (actor, config) = tokio::join!(actor.retire(), config.retire());
                     actor.and(config).map_err(SystemError::ActorError)?;
                     return Err(error);
                 }
             };
-            if let Err(error) = options.validate() {
-                let (actor, config) = tokio::join!(actor.retire(), config.retire());
-                actor.and(config).map_err(SystemError::ActorError)?;
-                return Err(error);
-            }
-            system
-                .runtime()
-                .spawn(actor.take(), config.take(), options)
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                if self.lifecycle.started() {
+                    let (actor, config) = tokio::join!(actor.retire(), config.retire());
+                    actor.and(config).map_err(SystemError::ActorError)?;
+                    return Err(SystemError::ShuttingDown);
+                }
+                if let Err(error) = options.validate() {
+                    let (actor, config) = tokio::join!(actor.retire(), config.retire());
+                    actor.and(config).map_err(SystemError::ActorError)?;
+                    return Err(error);
+                }
+                super::snapshot::callback(system.value().runtime().spawn(
+                    actor.take(),
+                    config.take(),
+                    options,
+                ))
                 .await
+            }
+            .await;
+            finish_creation(system, result, retirement).await
         }))
     }
     /// Named-engine factory creation, preserving the selected runtime's real
@@ -322,27 +394,36 @@ impl ParrotActorSystem {
         factory: RuntimeFactory,
         options: FactoryOptions,
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
+        let system = system.map(|system| self.own(system));
         let factory = self.own(factory);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match system {
-                Ok(system) if !self.lifecycle.started() => system,
-                result => {
-                    let error = result.err().unwrap_or(SystemError::ShuttingDown);
+                Ok(system) => system,
+                Err(error) => {
                     factory.retire().await.map_err(SystemError::ActorError)?;
                     return Err(error);
                 }
             };
-            if let Err(error) = options.validate() {
-                factory.retire().await.map_err(SystemError::ActorError)?;
-                return Err(error);
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                if self.lifecycle.started() {
+                    factory.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(SystemError::ShuttingDown);
+                }
+                if let Err(error) = options.validate() {
+                    factory.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(error);
+                }
+                let Some(runtime) = system.value().runtime().factory_runtime() else {
+                    factory.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(SystemError::ActorCreationError(
+                        "selected runtime does not expose factories".into(),
+                    ));
+                };
+                super::snapshot::callback(runtime.spawn_factory(factory.take(), options)).await
             }
-            let Some(runtime) = system.runtime().factory_runtime() else {
-                factory.retire().await.map_err(SystemError::ActorError)?;
-                return Err(SystemError::ActorCreationError(
-                    "selected runtime does not expose factories".into(),
-                ));
-            };
-            runtime.spawn_factory(factory.take(), options).await
+            .await;
+            finish_creation(system, result, retirement).await
         }))
     }
     /// Named-engine Local factory creation, preserving the selected runtime's real
@@ -361,27 +442,37 @@ impl ParrotActorSystem {
         factory: LocalRuntimeFactory,
         options: FactoryOptions,
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
+        let system = system.map(|system| self.own(system));
         let factory = self.own(factory);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match system {
-                Ok(system) if !self.lifecycle.started() => system,
-                result => {
-                    let error = result.err().unwrap_or(SystemError::ShuttingDown);
+                Ok(system) => system,
+                Err(error) => {
                     factory.retire().await.map_err(SystemError::ActorError)?;
                     return Err(error);
                 }
             };
-            if let Err(error) = options.validate() {
-                factory.retire().await.map_err(SystemError::ActorError)?;
-                return Err(error);
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                if self.lifecycle.started() {
+                    factory.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(SystemError::ShuttingDown);
+                }
+                if let Err(error) = options.validate() {
+                    factory.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(error);
+                }
+                let Some(runtime) = system.value().runtime().local_runtime() else {
+                    factory.retire().await.map_err(SystemError::ActorError)?;
+                    return Err(SystemError::ActorCreationError(
+                        "selected runtime does not expose Local factories".into(),
+                    ));
+                };
+                super::snapshot::callback(runtime.spawn_local_factory(factory.take(), options))
+                    .await
             }
-            let Some(runtime) = system.runtime().local_runtime() else {
-                factory.retire().await.map_err(SystemError::ActorError)?;
-                return Err(SystemError::ActorCreationError(
-                    "selected runtime does not expose Local factories".into(),
-                ));
-            };
-            runtime.spawn_local_factory(factory.take(), options).await
+            .await;
+            finish_creation(system, result, retirement).await
         }))
     }
 }
@@ -391,38 +482,46 @@ impl AsyncEngineRuntime for ParrotActorSystem {
     }
     fn io_runtime(&self) -> Option<&dyn parrot_api::engine::AsyncIoRuntime> {
         self.get_creation_system(None).ok().and_then(|system| {
-            system
-                .runtime()
-                .io_runtime()
-                .is_some()
-                .then_some(self as &dyn parrot_api::engine::AsyncIoRuntime)
+            super::lookup_owned(system, |system| {
+                system
+                    .runtime()
+                    .io_runtime()
+                    .is_some()
+                    .then_some(self as &dyn parrot_api::engine::AsyncIoRuntime)
+            })
         })
     }
     fn cohort_runtime(&self) -> Option<&dyn AsyncCohortRuntime> {
         self.get_creation_system(None).ok().and_then(|system| {
-            system
-                .runtime()
-                .cohort_runtime()
-                .is_some()
-                .then_some(self as &dyn AsyncCohortRuntime)
+            super::lookup_owned(system, |system| {
+                system
+                    .runtime()
+                    .cohort_runtime()
+                    .is_some()
+                    .then_some(self as &dyn AsyncCohortRuntime)
+            })
         })
     }
     fn local_runtime(&self) -> Option<&dyn AsyncLocalRuntime> {
         self.get_creation_system(None).ok().and_then(|system| {
-            system
-                .runtime()
-                .local_runtime()
-                .is_some()
-                .then_some(self as &dyn AsyncLocalRuntime)
+            super::lookup_owned(system, |system| {
+                system
+                    .runtime()
+                    .local_runtime()
+                    .is_some()
+                    .then_some(self as &dyn AsyncLocalRuntime)
+            })
         })
     }
     fn factory_runtime(&self) -> Option<&dyn AsyncFactoryRuntime> {
         self.get_creation_system(None).ok().and_then(|system| {
-            system
-                .runtime()
-                .factory_runtime()
-                .is_some()
-                .then_some(self as &dyn AsyncFactoryRuntime)
+            super::lookup_owned(system, |system| {
+                system
+                    .runtime()
+                    .factory_runtime()
+                    .is_some()
+                    .then_some(self as &dyn AsyncFactoryRuntime)
+            })
         })
     }
     fn spawn<'a>(
@@ -441,20 +540,23 @@ impl AsyncEngineRuntime for ParrotActorSystem {
                 .read()
                 .unwrap()
                 .iter()
-                .map(|(name, system)| (name.clone(), system.clone()))
+                .map(|(name, system)| (name.clone(), self.own(system.clone())))
                 .collect();
             systems.sort_by(|a, b| {
                 (Some(&a.0) != default.as_ref(), &a.0).cmp(&(Some(&b.0) != default.as_ref(), &b.0))
             });
             let mut seen = std::collections::HashSet::new();
+            let mut found = None;
             for (_, system) in systems {
-                if seen.insert(system.identity())
-                    && let Some(reference) = system.runtime().get_actor(path).await
-                {
-                    return Some(reference);
+                if found.is_none() && seen.insert(system.value().identity()) {
+                    found =
+                        super::snapshot::callback(system.value().runtime().get_actor(path)).await;
                 }
+                found = finish_selected(system, Ok::<_, parrot_api::errors::ActorError>(found))
+                    .await
+                    .unwrap_or_else(|error| panic!("lookup owner retirement failed: {error}"));
             }
-            None
+            found
         })
     }
     fn status(&self) -> SystemStatus {

@@ -2,6 +2,7 @@ mod cohort;
 pub(crate) mod registrations;
 mod runtime;
 mod shutdown;
+mod snapshot;
 pub(crate) mod startup;
 mod topology;
 mod typed;
@@ -118,7 +119,11 @@ impl ActorSystemImpl {
                 <ThreadActorSystem as ActorSystem>::spawn_root_boxed(&**sys, actor, config)
             }
             Self::Actix(sys) => Box::pin(sys.spawn_root_boxed(actor, config)),
-            Self::Runtime(sys) => sys.spawn(actor, config, Default::default()),
+            Self::Runtime(sys) => Box::pin(snapshot::callback(sys.spawn(
+                actor,
+                config,
+                Default::default(),
+            ))),
         }
     }
 
@@ -171,27 +176,14 @@ impl ActorSystemImpl {
 
     /// Forward get_actor method
     pub async fn get_actor(&self, path: &ActorPath) -> Option<Box<dyn ActorRef>> {
-        // Clone path to avoid borrowing the original in the async block
-        let path_copy = ActorPath {
-            path: path.path.clone(),
-            target: path.target.clone(),
-        };
-        let self_clone = self.clone();
-
-        async move {
-            match self_clone {
-                ActorSystemImpl::Actix(sys) => {
-                    // ActixActorSystem's get_actor method expects a &String
-                    sys.get_actor(&path_copy.path).await
-                }
-                ActorSystemImpl::Thread(sys) => {
-                    use parrot_api::system::ActorSystem as _;
-                    sys.get_actor(&path_copy).await
-                }
-                ActorSystemImpl::Runtime(sys) => sys.get_actor(&path_copy.path).await,
+        match self {
+            ActorSystemImpl::Actix(sys) => sys.get_actor(&path.path).await,
+            ActorSystemImpl::Thread(sys) => {
+                use parrot_api::system::ActorSystem as _;
+                sys.get_actor(path).await
             }
+            ActorSystemImpl::Runtime(sys) => snapshot::callback(sys.get_actor(&path.path)).await,
         }
-        .await
     }
 
     /// Forward broadcast method
@@ -322,6 +314,8 @@ struct LocalMirrorLookup {
     systems: std::sync::Weak<Registry<HashMap<String, ActorSystemImpl>>>,
     default_system: std::sync::Weak<RwLock<Option<String>>>,
     prefixes: std::sync::Weak<PrefixHandlers>,
+    runtime: tokio::runtime::Handle,
+    cleanup_slots: Arc<tokio::sync::Semaphore>,
 }
 impl crate::mirror::MirrorLookup for LocalMirrorLookup {
     fn lookup<'a>(
@@ -335,16 +329,35 @@ impl crate::mirror::MirrorLookup for LocalMirrorLookup {
                 let guard = registry.read().ok()?;
                 let mut systems: Vec<_> = guard
                     .iter()
-                    .map(|(name, system)| (name.clone(), system.clone()))
+                    .map(|(name, system)| {
+                        (
+                            name.clone(),
+                            crate::owned_payload::OwnedPayload::new(
+                                system.clone(),
+                                &self.runtime,
+                                &self.cleanup_slots,
+                            ),
+                        )
+                    })
                     .collect();
                 systems.sort_by_key(|(name, _)| (Some(name) != default.as_ref(), name.clone()));
                 systems
             };
             let actor_path = ActorPath::placeholder(path);
+            let mut result = None;
             for (_, system) in systems {
-                if let Some(actor) = system.get_actor(&actor_path).await {
-                    return Some(actor);
+                if result.is_none() {
+                    result = system.value().get_actor(&actor_path).await;
                 }
+                result = runtime::finish_selected(
+                    system,
+                    Ok::<_, parrot_api::errors::ActorError>(result),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("lookup owner retirement failed: {error}"));
+            }
+            if result.is_some() {
+                return result;
             }
             let registry = self.prefixes.upgrade()?;
             resolve_prefix(&registry, path)
@@ -636,10 +649,14 @@ impl ParrotActorSystem {
         let config = self.own(config);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match self.get_creation_system(None) {
-                Ok(system) => system,
+                Ok(system) => self.own(system),
                 Err(error) => return reject_spawn(actor, config, error).await,
             };
-            system.spawn_root_typed(actor.take(), config.take()).await
+            let result = system
+                .value()
+                .spawn_root_typed(actor.take(), config.take())
+                .await;
+            runtime::finish_selected(system, result).await
         }))
     }
 
@@ -654,10 +671,14 @@ impl ParrotActorSystem {
         let config = self.own(config);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match self.get_creation_system(Some(system_name)) {
-                Ok(system) => system,
+                Ok(system) => self.own(system),
                 Err(error) => return reject_spawn(actor, config, error).await,
             };
-            system.spawn_root_typed(actor.take(), config.take()).await
+            let result = system
+                .value()
+                .spawn_root_typed(actor.take(), config.take())
+                .await;
+            runtime::finish_selected(system, result).await
         }))
     }
 
@@ -678,7 +699,7 @@ impl ParrotActorSystem {
         let default_system = self.get_default_system_name().ok();
         if let Some(default_name) = default_system.as_ref()
             && let Ok(system) = self.get_system_impl(default_name)
-            && let Some(actor) = system.get_actor(path).await
+            && let Some(actor) = snapshot::lookup(self.own(system), path).await
         {
             return Some(actor);
         }
@@ -692,7 +713,7 @@ impl ParrotActorSystem {
                 }
 
                 if let Ok(system) = self.get_system_impl(&name)
-                    && let Some(actor) = system.get_actor(path).await
+                    && let Some(actor) = snapshot::lookup(self.own(system), path).await
                 {
                     return Some(actor);
                 }
@@ -716,6 +737,8 @@ impl ParrotActorSystem {
                 systems: Arc::downgrade(&self.systems),
                 default_system: Arc::downgrade(&self.default_system),
                 prefixes: Arc::downgrade(&self.prefix_handlers),
+                runtime: self.runtime.clone(),
+                cleanup_slots: self.cleanup_slots.clone(),
             });
             return Some(Box::new(crate::mirror::MirrorRef::new(
                 std::sync::Arc::from(actor),
@@ -745,30 +768,44 @@ impl ParrotActorSystem {
     ) -> parrot_api::types::BoxedFuture<'_, Result<(), SystemError>> {
         let mut source = crate::broadcast::Input::new(self.own(msg), self.cleanup_slots.clone());
         Box::pin(parrot_api::trace::capture(async move {
+            // Protect each snapshot entry before invoking user Clone or an engine.
+            let systems: Vec<_> = self
+                .systems
+                .read()
+                .unwrap()
+                .values()
+                .map(|system| self.own(system.clone()))
+                .collect();
             let result = async {
-                // Capture one stable selection before invoking any user Clone or engine.
-                let systems: Vec<_> = self.systems.read().unwrap().values().cloned().collect();
                 if systems
                     .iter()
-                    .any(|system| matches!(system, ActorSystemImpl::Runtime(_)))
+                    .any(|system| matches!(system.value(), ActorSystemImpl::Runtime(_)))
                 {
                     return Err(SystemError::Other(anyhow::anyhow!(
                         "registered asynchronous runtime does not expose broadcast"
                     )));
                 }
                 let mut seen = std::collections::HashSet::new();
-                for system in systems {
-                    if seen.insert(system.identity()) {
+                for system in &systems {
+                    if seen.insert(system.value().identity()) {
                         let msg = source.copy().await?;
-                        system.broadcast(msg.take()).await?;
+                        system.value().broadcast(msg.take()).await?;
                     }
                 }
 
                 Ok(())
             }
             .await;
-            crate::broadcast::finish(source, result, crate::error_receipt::public_system_summary)
-                .await
+            let mut result = self.own(result);
+            for system in systems {
+                result = self.own(runtime::finish_selected(system, result.take()).await);
+            }
+            crate::broadcast::finish(
+                source,
+                result.take(),
+                crate::error_receipt::public_system_summary,
+            )
+            .await
         }))
     }
 
@@ -797,12 +834,14 @@ impl ParrotActorSystem {
         let config = self.own(config);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match self.get_creation_system(None) {
-                Ok(system) => system,
+                Ok(system) => self.own(system),
                 Err(error) => return reject_spawn(actor, config, error).await,
             };
-            match system {
+            let retirement = self.creation_retirement().await;
+            let result = match system.value() {
                 ActorSystemImpl::Actix(_) => {
                     system
+                        .value()
                         .spawn_root_typed_actix(actor.take(), config.take())
                         .await
                 }
@@ -816,7 +855,8 @@ impl ParrotActorSystem {
                     )
                     .await
                 }
-            }
+            };
+            runtime::finish_creation(system, result, retirement).await
         }))
     }
 
@@ -836,28 +876,33 @@ impl ParrotActorSystem {
         let config = self.own(config);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match self.get_creation_system(None) {
-                Ok(system) => system,
+                Ok(system) => self.own(system),
                 Err(error) => return reject_spawn(actor, config, error).await,
             };
-            match system {
-                ActorSystemImpl::Thread(sys) => {
-                    let reference = sys
-                        .spawn_root_typed_thread(actor.take(), config.take())
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                match system.value() {
+                    ActorSystemImpl::Thread(sys) => {
+                        let reference = sys
+                            .spawn_root_typed_thread(actor.take(), config.take())
+                            .await
+                            .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
+                        Ok(Box::new(reference) as Box<dyn ActorRef>)
+                    }
+                    _ => {
+                        reject_spawn(
+                            actor,
+                            config,
+                            SystemError::ActorCreationError(
+                                "Default system is not a thread engine system".to_string(),
+                            ),
+                        )
                         .await
-                        .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
-                    Ok(Box::new(reference) as Box<dyn ActorRef>)
-                }
-                _ => {
-                    reject_spawn(
-                        actor,
-                        config,
-                        SystemError::ActorCreationError(
-                            "Default system is not a thread engine system".to_string(),
-                        ),
-                    )
-                    .await
+                    }
                 }
             }
+            .await;
+            runtime::finish_creation(system, result, retirement).await
         }))
     }
 
@@ -875,29 +920,34 @@ impl ParrotActorSystem {
         let config = self.own(config);
         Box::pin(parrot_api::trace::capture(async move {
             let system = match self.get_creation_system(Some(system_name)) {
-                Ok(system) => system,
+                Ok(system) => self.own(system),
                 Err(error) => return reject_spawn(actor, config, error).await,
             };
-            match system {
-                ActorSystemImpl::Thread(sys) => {
-                    let reference = sys
-                        .spawn_root_typed_thread(actor.take(), config.take())
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                match system.value() {
+                    ActorSystemImpl::Thread(sys) => {
+                        let reference = sys
+                            .spawn_root_typed_thread(actor.take(), config.take())
+                            .await
+                            .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
+                        Ok(Box::new(reference) as Box<dyn ActorRef>)
+                    }
+                    _ => {
+                        reject_spawn(
+                            actor,
+                            config,
+                            SystemError::ActorCreationError(format!(
+                                "System '{}' is not a thread engine system",
+                                system_name
+                            )),
+                        )
                         .await
-                        .map_err(|error| SystemError::ActorCreationError(error.to_string()))?;
-                    Ok(Box::new(reference) as Box<dyn ActorRef>)
-                }
-                _ => {
-                    reject_spawn(
-                        actor,
-                        config,
-                        SystemError::ActorCreationError(format!(
-                            "System '{}' is not a thread engine system",
-                            system_name
-                        )),
-                    )
-                    .await
+                    }
                 }
             }
+            .await;
+            runtime::finish_creation(system, result, retirement).await
         }))
     }
 
@@ -1036,12 +1086,17 @@ impl ParrotActorSystem {
 
     /// Get a thread engine system by name
     pub fn get_thread_system(&self, name: &str) -> Result<Arc<ThreadActorSystem>, SystemError> {
-        match self.get_system_impl(name)? {
-            ActorSystemImpl::Thread(sys) => Ok(sys),
+        let system = PublicationInput::new(self.get_system_impl(name)?);
+        let result = match system.value() {
+            ActorSystemImpl::Thread(sys) => Ok(sys.clone()),
             _ => Err(SystemError::Other(anyhow::anyhow!(format!(
                 "System '{}' is not a thread engine system",
                 name
             )))),
+        };
+        match (result, system.retire()) {
+            (result, Ok(())) | (result @ Err(_), Err(_)) => result,
+            (Ok(_), Err(error)) => Err(SystemError::ActorError(error)),
         }
     }
 }
@@ -1133,7 +1188,13 @@ impl ActorSystem for ParrotActorSystem {
     /// Empty registries are ready for registration (Running); otherwise state
     /// preference is Running, Starting, ShuttingDown, then all Stopped.
     fn status(&self) -> SystemStatus {
-        let systems: Vec<_> = self.systems.read().unwrap().values().cloned().collect();
+        let systems: Vec<_> = self
+            .systems
+            .read()
+            .unwrap()
+            .values()
+            .map(|system| PublicationInput::new(system.clone()))
+            .collect();
         let mut seen = HashSet::new();
         let mut state_rank = 0;
         let mut result = SystemStatus {
@@ -1146,15 +1207,19 @@ impl ActorSystem for ParrotActorSystem {
                 thread_count: 0,
             },
         };
-        for system in &systems {
-            let identity = system.identity();
-            if !seen.insert(identity) {
+        for mut system in systems {
+            let status = lookup_owned(system.take(), |system| {
+                if !seen.insert(system.identity()) {
+                    return None;
+                }
+                Some(match system {
+                    ActorSystemImpl::Actix(s) => s.status(),
+                    ActorSystemImpl::Thread(s) => s.status(),
+                    ActorSystemImpl::Runtime(s) => s.status(),
+                })
+            });
+            let Some(status) = status else {
                 continue;
-            }
-            let status = match system {
-                ActorSystemImpl::Actix(s) => s.status(),
-                ActorSystemImpl::Thread(s) => s.status(),
-                ActorSystemImpl::Runtime(s) => s.status(),
             };
             let rank = match status.state {
                 SystemState::Stopped => 0,

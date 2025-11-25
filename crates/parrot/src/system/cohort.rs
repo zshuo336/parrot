@@ -32,6 +32,12 @@ pub struct FacadeRootCohort {
     dynamic: Arc<dyn AsyncRootCohort>,
 }
 
+impl super::runtime::CreationOutput for Arc<FacadeRootCohort> {
+    fn retire(&self) -> BoxedFuture<'_, ActorResult<()>> {
+        self.stop()
+    }
+}
+
 impl ParrotActorSystem {
     /// Capture the default native engine and create one mixed-protocol root group.
     /// External dynamic-only groups remain available through `cohort_runtime`.
@@ -56,39 +62,49 @@ impl ParrotActorSystem {
         selected: Result<ActorSystemImpl, SystemError>,
         strategy: SupervisorStrategyType,
     ) -> BoxedFuture<'_, Result<Arc<FacadeRootCohort>, SystemError>> {
+        let selected = selected.map(|system| self.own(system));
         let strategy = self.own(strategy);
         Box::pin(parrot_api::trace::capture(async move {
             let selected = match selected {
-                Ok(system) if !self.lifecycle.started() => system,
-                result => {
+                Ok(system) => system,
+                Err(error) => {
                     strategy.retire().await.map_err(SystemError::ActorError)?;
-                    return Err(result.err().unwrap_or(SystemError::ShuttingDown));
+                    return Err(error);
                 }
             };
-            let (system, group, dynamic) = match selected {
-                ActorSystemImpl::Thread(system) => {
-                    let group = system.root_cohort(strategy.take()).await?;
-                    let dynamic = system.bind_root_cohort(group.clone());
-                    (NativeSystem::Thread(system), group, dynamic)
-                }
-                ActorSystemImpl::Actix(system) => {
-                    let system = Arc::new(system);
-                    let group = system.root_cohort(strategy.take()).await?;
-                    let dynamic = system.bind_root_cohort(group.clone());
-                    (NativeSystem::Actix(system), group, dynamic)
-                }
-                ActorSystemImpl::Runtime(_) => {
+            let retirement = self.creation_retirement().await;
+            let result = async {
+                if self.lifecycle.started() {
                     strategy.retire().await.map_err(SystemError::ActorError)?;
-                    return Err(SystemError::ActorCreationError(
-                        "selected runtime has no native static root cohort bridge".into(),
-                    ));
+                    return Err(SystemError::ShuttingDown);
                 }
-            };
-            Ok(Arc::new(FacadeRootCohort {
-                system,
-                group,
-                dynamic,
-            }))
+                let (system, group, dynamic) = match selected.value() {
+                    ActorSystemImpl::Thread(system) => {
+                        let group = system.root_cohort(strategy.take()).await?;
+                        let dynamic = system.bind_root_cohort(group.clone());
+                        (NativeSystem::Thread(system.clone()), group, dynamic)
+                    }
+                    ActorSystemImpl::Actix(system) => {
+                        let system = Arc::new(system.clone());
+                        let group = system.root_cohort(strategy.take()).await?;
+                        let dynamic = system.bind_root_cohort(group.clone());
+                        (NativeSystem::Actix(system), group, dynamic)
+                    }
+                    ActorSystemImpl::Runtime(_) => {
+                        strategy.retire().await.map_err(SystemError::ActorError)?;
+                        return Err(SystemError::ActorCreationError(
+                            "selected runtime has no native static root cohort bridge".into(),
+                        ));
+                    }
+                };
+                Ok(Arc::new(FacadeRootCohort {
+                    system,
+                    group,
+                    dynamic,
+                }))
+            }
+            .await;
+            super::runtime::finish_creation(selected, result, retirement).await
         }))
     }
 }
