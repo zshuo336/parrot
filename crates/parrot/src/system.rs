@@ -119,11 +119,7 @@ impl ActorSystemImpl {
                 <ThreadActorSystem as ActorSystem>::spawn_root_boxed(&**sys, actor, config)
             }
             Self::Actix(sys) => Box::pin(sys.spawn_root_boxed(actor, config)),
-            Self::Runtime(sys) => Box::pin(snapshot::callback(sys.spawn(
-                actor,
-                config,
-                Default::default(),
-            ))),
+            Self::Runtime(sys) => runtime::spawn_external(sys.clone(), actor, config),
         }
     }
 

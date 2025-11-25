@@ -29,9 +29,10 @@ impl CreationOutput for Arc<dyn AsyncRootCohort> {
     }
 }
 
+#[derive(Clone)]
 pub(in crate::system) struct CreationRetirement {
     runtime: tokio::runtime::Handle,
-    permit: PendingCleanupPermit,
+    permit: Arc<PendingCleanupPermit>,
     context: Option<parrot_api::trace::TraceContext>,
 }
 impl CreationRetirement {
@@ -41,7 +42,7 @@ impl CreationRetirement {
     ) -> Self {
         Self {
             runtime: runtime.clone(),
-            permit: pending_cleanup_permit(slots).await,
+            permit: Arc::new(pending_cleanup_permit(slots).await),
             context: parrot_api::trace::TraceContext::current(),
         }
     }
@@ -71,6 +72,13 @@ struct Unpublished<T: CreationOutput, E: Send + 'static> {
     finished: Option<tokio::sync::oneshot::Sender<()>>,
 }
 impl<T: CreationOutput, E: Send + 'static> Unpublished<T, E> {
+    fn new(result: OwnedPayload<Result<T, E>>, retirement: CreationRetirement) -> Self {
+        Self {
+            result: Some(result),
+            retirement: Some(retirement),
+            finished: None,
+        }
+    }
     fn failed(&self) -> bool {
         self.result.as_ref().unwrap().value().is_err()
     }
@@ -82,6 +90,36 @@ impl<T: CreationOutput, E: Send + 'static> Unpublished<T, E> {
         self.finished = Some(sender);
         drop(self);
         let _ = receiver.await;
+    }
+}
+
+pub(in crate::system) async fn callback_creation<T, E>(
+    future: BoxedFuture<'_, Result<T, E>>,
+    owner: &OwnedPayload<ActorSystemImpl>,
+    retirement: &CreationRetirement,
+) -> Result<T, E>
+where
+    T: CreationOutput,
+    E: From<ActorError> + Send + 'static,
+{
+    // A borrowed future's destructor can fail after returning a live actor.
+    // Install cancellation-safe retirement before running that destructor.
+    let (result, cleanup) = super::super::snapshot::protected_callback(future, |result| {
+        Unpublished::new(owner.protect(result), retirement.clone())
+    })
+    .await;
+    match cleanup {
+        Ok(()) => result.take(),
+        Err(error) if result.failed() => {
+            cleanup_diagnostic(|| {
+                tracing::warn!(error = %error, "creation future cleanup failed after operation error");
+            });
+            result.take()
+        }
+        Err(error) => {
+            result.retire().await;
+            Err(error.into())
+        }
     }
 }
 impl<T: CreationOutput, E: Send + 'static> Drop for Unpublished<T, E> {
@@ -118,11 +156,7 @@ where
     T: CreationOutput,
     E: From<ActorError> + Send + 'static,
 {
-    let result = Unpublished {
-        result: Some(owner.protect(result)),
-        retirement: Some(retirement),
-        finished: None,
-    };
+    let result = Unpublished::new(owner.protect(result), retirement);
     match owner.retire().await {
         Ok(()) => result.take(),
         Err(error) if result.failed() => {

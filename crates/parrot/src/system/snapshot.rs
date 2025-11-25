@@ -4,14 +4,17 @@ use crate::owned_payload::{OwnedPayload, PublicationInput};
 use parrot_api::{
     address::ActorPath,
     errors::ActorError,
-    types::{BoxedActorRef, BoxedFuture},
+    types::{ActorResult, BoxedActorRef, BoxedFuture},
 };
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     task::Poll,
 };
 
-pub(super) async fn callback<R: Send + 'static>(future: BoxedFuture<'_, R>) -> R {
+pub(super) async fn protected_callback<R, S>(
+    future: BoxedFuture<'_, R>,
+    protect: impl FnOnce(R) -> S,
+) -> (S, ActorResult<()>) {
     let mut future = PublicationInput::new(future);
     let outcome = std::future::poll_fn(|cx| {
         match catch_unwind(AssertUnwindSafe(|| future.value_mut().as_mut().poll(cx))) {
@@ -22,16 +25,38 @@ pub(super) async fn callback<R: Send + 'static>(future: BoxedFuture<'_, R>) -> R
     })
     .await;
     let mut outcome = PublicationInput::new(outcome);
-    let cleanup = future.retire();
     match outcome.take() {
-        Err(payload) => std::panic::resume_unwind(payload),
-        Ok(value) => match cleanup {
-            Ok(()) => value,
-            Err(error) => {
-                let _ = PublicationInput::new(value).retire();
-                panic!("lookup future retirement failed: {error}");
-            }
-        },
+        Err(payload) => {
+            let mut payload = PublicationInput::new(payload);
+            let _ = future.retire();
+            std::panic::resume_unwind(payload.take())
+        }
+        Ok(value) => {
+            let value = protect(value);
+            (value, future.retire())
+        }
+    }
+}
+
+pub(super) async fn callback<R: Send + 'static>(future: BoxedFuture<'_, R>) -> R {
+    let (mut value, cleanup) = protected_callback(future, PublicationInput::new).await;
+    match cleanup {
+        Ok(()) => value.take(),
+        Err(error) => {
+            let _ = value.retire();
+            panic!("lookup future retirement failed: {error}");
+        }
+    }
+}
+
+pub(super) async fn result_callback<R>(future: BoxedFuture<'_, ActorResult<R>>) -> ActorResult<R> {
+    let (mut result, cleanup) = protected_callback(future, PublicationInput::new).await;
+    match cleanup {
+        Err(error) if result.value().is_ok() => {
+            let _ = result.retire();
+            Err(error)
+        }
+        _ => result.take(),
     }
 }
 

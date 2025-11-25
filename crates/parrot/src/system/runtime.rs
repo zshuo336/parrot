@@ -13,7 +13,9 @@ use parrot_api::{
 use std::{any::Any, sync::Arc};
 
 mod retirement;
-pub(super) use retirement::{CreationOutput, CreationRetirement, finish_creation};
+pub(super) use retirement::{
+    CreationOutput, CreationRetirement, callback_creation, finish_creation,
+};
 
 pub(super) async fn finish_selected<T, E>(
     owner: OwnedPayload<ActorSystemImpl>,
@@ -37,6 +39,42 @@ where
             Err(error.into())
         }
     }
+}
+
+pub(super) fn spawn_external(
+    runtime: Arc<dyn AsyncEngineRuntime>,
+    actor: RuntimeActor,
+    config: InstanceConfig,
+) -> BoxedFuture<'static, Result<BoxedActorRef, SystemError>> {
+    let owner = OwnedPayload::unbound(ActorSystemImpl::Runtime(runtime));
+    let actor = OwnedPayload::unbound(actor);
+    let config = OwnedPayload::unbound(config);
+    Box::pin(parrot_api::trace::capture(async move {
+        let runtime = match crate::root_cohort::lifecycle_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let (actor, config) = tokio::join!(actor.retire(), config.retire());
+                actor.and(config).map_err(SystemError::ActorError)?;
+                return Err(SystemError::ActorError(error));
+            }
+        };
+        static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)));
+        let owner = owner.with_executor(&runtime, slots);
+        let actor = actor.with_executor(&runtime, slots);
+        let config = config.with_executor(&runtime, slots);
+        let retirement = CreationRetirement::reserve(&runtime, slots).await;
+        let result = callback_creation(
+            owner
+                .value()
+                .runtime()
+                .spawn(actor.take(), config.take(), Default::default()),
+            &owner,
+            &retirement,
+        )
+        .await;
+        finish_creation(owner, result, retirement).await
+    }))
 }
 
 impl ActorSystemImpl {
@@ -101,7 +139,7 @@ impl ParrotActorSystem {
                 };
                 let work = system.protect(work);
                 Box::pin(parrot_api::trace::capture(async move {
-                    let result = super::snapshot::callback(work.take()).await;
+                    let result = super::snapshot::result_callback(work.take()).await;
                     finish_selected(system, result).await
                 }))
             }
@@ -319,7 +357,7 @@ impl ParrotActorSystem {
                         "selected runtime does not expose root cohorts".into(),
                     ));
                 };
-                super::snapshot::callback(runtime.root_cohort(strategy.take())).await
+                callback_creation(runtime.root_cohort(strategy.take()), &system, &retirement).await
             }
             .await;
             finish_creation(system, result, retirement).await
@@ -367,11 +405,14 @@ impl ParrotActorSystem {
                     actor.and(config).map_err(SystemError::ActorError)?;
                     return Err(error);
                 }
-                super::snapshot::callback(system.value().runtime().spawn(
-                    actor.take(),
-                    config.take(),
-                    options,
-                ))
+                callback_creation(
+                    system
+                        .value()
+                        .runtime()
+                        .spawn(actor.take(), config.take(), options),
+                    &system,
+                    &retirement,
+                )
                 .await
             }
             .await;
@@ -420,7 +461,12 @@ impl ParrotActorSystem {
                         "selected runtime does not expose factories".into(),
                     ));
                 };
-                super::snapshot::callback(runtime.spawn_factory(factory.take(), options)).await
+                callback_creation(
+                    runtime.spawn_factory(factory.take(), options),
+                    &system,
+                    &retirement,
+                )
+                .await
             }
             .await;
             finish_creation(system, result, retirement).await
@@ -468,8 +514,12 @@ impl ParrotActorSystem {
                         "selected runtime does not expose Local factories".into(),
                     ));
                 };
-                super::snapshot::callback(runtime.spawn_local_factory(factory.take(), options))
-                    .await
+                callback_creation(
+                    runtime.spawn_local_factory(factory.take(), options),
+                    &system,
+                    &retirement,
+                )
+                .await
             }
             .await;
             finish_creation(system, result, retirement).await
