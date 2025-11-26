@@ -128,6 +128,60 @@ class LicenseContracts(unittest.TestCase):
             self.selection.add(name)
         self.assertTrue(self.check()['success'])
 
+    def add_dependency_manifests(self):
+        dependencies = {
+            'node_modules/plain/package.json': '{"name":"plain","license":"MIT"}',
+            'interop/typescript-lite/node_modules/typescript/package.json':
+                '{"name":"typescript","license":"Apache-2.0"}',
+            'apps/websearch/node_modules/@third-party/helper/package.json':
+                '{"name":"@third-party/helper","license":"BSD-3-Clause"}',
+            'apps/websearch/node_modules/native/Cargo.toml':
+                '[package]\nname = "native"\nlicense = "MIT"\n',
+            'apps/websearch/node_modules/python/pyproject.toml':
+                '[project]\nname = "dependency"\nlicense = "MIT"\n',
+            'apps/websearch/node_modules/java/pom.xml': '<dependency-not-a-project/>',
+        }
+        for name, text in dependencies.items():
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+            self.selection.add(name)
+        return dependencies
+
+    def test_installed_dependencies_keep_their_licenses_and_are_not_own_packages(self):
+        original = self.check()
+        dependencies = self.add_dependency_manifests()
+        report = self.check()
+        self.assertEqual(report['counts'], original['counts'])
+        self.assertEqual(report['inputs'], original['inputs'])
+        for name, text in dependencies.items():
+            self.assertEqual((self.root / name).read_text(), text)
+
+    def test_installed_dependencies_do_not_hide_invalid_own_package(self):
+        self.add_dependency_manifests()
+        path = self.root / 'apps/node_modules-tools/package.json'
+        path.parent.mkdir(parents=True)
+        path.write_text('{"name":"own-tools","license":"MIT"}')
+        self.selection.add(path.relative_to(self.root).as_posix())
+        with self.assertRaisesRegex(ValueError, 'incorrect npm license: apps/node_modules-tools/'):
+            self.check()
+
+    def test_frozen_cli_accepts_dependencies_but_still_rejects_tampering(self):
+        self.add_dependency_manifests()
+        manifest = self.root.parent / (self.root.name + '-dependencies.json')
+        self.addCleanup(manifest.unlink, missing_ok=True)
+        manifest.write_text(json.dumps({
+            'schema': project_inputs.SCHEMA, 'exclusions': list(project_inputs.EXCLUSIONS),
+            'files': {name: project_inputs.identity(self.root / name) for name in self.selection}}))
+        arguments = ['check_licenses', '--root', str(self.root), '--manifest', str(manifest)]
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(sys, 'argv', arguments):
+            self.assertEqual(checker.main(), 0)
+        self.replace('interop/typescript-lite/node_modules/typescript/package.json', 'Apache-2.0', 'MIT')
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            with mock.patch.object(sys, 'argv', arguments):
+                self.assertEqual(checker.main(), 1)
+        self.assertIn('input identity mismatch', errors.getvalue())
+
     def test_frozen_cli_rejects_tampered_input_even_when_license_still_matches(self):
         manifest = self.root.parent / (self.root.name + '-manifest.json')
         self.addCleanup(manifest.unlink, missing_ok=True)

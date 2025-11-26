@@ -2456,12 +2456,25 @@ impl Ingress {
         map.insert(from.to_owned(), tx.clone());
         self.reorder_tasks.spawn(async move {
             let _registration = registration;
-            Ingress::reorder_loop(this, &_registration, rx, cancel).await;
+            Ingress::reorder_loop(this, &_registration, rx, cancel, 1).await;
         });
         Some(tx)
     }
 
-    /// per 源节点重排循环：expected/BTreeMap 状态机 + recv 超时冲刷。
+    /// Forward distance in the ordered sequence space; zero is an unordered sentinel.
+    fn sequence_distance(expected: u32, sequence: u32) -> u32 {
+        if sequence >= expected {
+            sequence - expected
+        } else {
+            u32::MAX - expected + sequence
+        }
+    }
+
+    fn next_sequence(sequence: u32) -> u32 {
+        sequence.wrapping_add(1).max(1)
+    }
+
+    /// per 源节点重排循环：expected/BTreeMap 状态机 + 缺口期限冲刷。
     ///
     /// 冷启动缺口（expected=1，首帧 seq=N>1）与运行中缺口共用同一条
     /// 250ms 超时路径：超时放行最小 seq（跳缺口），expected 跳至其+1；
@@ -2474,9 +2487,9 @@ impl Ingress {
         registration: &ReorderRegistration,
         mut rx: tokio::sync::mpsc::Receiver<Frame>,
         cancel: tokio_util::sync::CancellationToken,
+        mut expected: u32,
     ) {
         let from = &registration.source;
-        let mut expected: u32 = 1;
         let mut buf: std::collections::BTreeMap<u32, Frame> = Default::default();
         // 旋钮启动时快照（任务生命周期内固定——避免运行中改配置引发
         // expected 语义漂移；下个任务自然用新值）
@@ -2496,32 +2509,26 @@ impl Ingress {
             })
             .unwrap_or((std::time::Duration::from_millis(250), 1024));
         let idle_gc = tokio::time::Duration::from_secs(30);
+        let mut gap_deadline = tokio::time::Instant::now() + idle_gap;
         let work = async {
             loop {
                 let f = tokio::select! {
-                    f = rx.recv() => match f {
-                        Some(f) => f,
-                        None => return,
-                    },
-                    _ = tokio::time::sleep(idle_gap), if !buf.is_empty() => {
-                        // 缺口超时：放行最小 seq（跳缺口）
-                        let min_seq = *buf.keys().next().unwrap();
+                    biased;
+                    _ = tokio::time::sleep_until(gap_deadline), if !buf.is_empty() => {
+                        // Numeric key order does not represent serial order across wrap.
+                        let min_seq = *buf.keys().min_by_key(|seq| Self::sequence_distance(expected, **seq)).unwrap();
                         let f = buf.remove(&min_seq).unwrap();
                         REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             from = %from, expected, got = min_seq,
                             "reorder gap timeout: released buffered TELL (missing frame presumed lost)"
                         );
-                        expected = min_seq.wrapping_add(1);
+                        expected = Self::next_sequence(min_seq);
                         // 连续后继一并放行
                         let mut chain = vec![f];
-                        while let Some(&k) = buf.keys().next() {
-                            if k == expected {
-                                chain.push(buf.remove(&k).unwrap());
-                                expected = expected.wrapping_add(1);
-                            } else {
-                                break;
-                            }
+                        while let Some(frame) = buf.remove(&expected) {
+                            chain.push(frame);
+                            expected = Self::next_sequence(expected);
                         }
                         if let Some(this) = weak_ing.upgrade() {
                             let back = FrameSender::detached();
@@ -2532,7 +2539,12 @@ impl Ingress {
                             REORDER_DROPPED_ON_SHUTDOWN
                                 .fetch_add(chain.len() as u64, Ordering::Relaxed);
                         }
+                        gap_deadline = tokio::time::Instant::now() + idle_gap;
                         continue;
+                    },
+                    f = rx.recv() => match f {
+                        Some(f) => f,
+                        None => return,
                     },
                     _ = tokio::time::sleep(idle_gc), if buf.is_empty() => {
                         // A sender clone may have been handed to a concurrent
@@ -2549,27 +2561,24 @@ impl Ingress {
                         return;
                     }
                 };
+                let previous_expected = expected;
+                let had_gap = !buf.is_empty();
                 let seq = f.header.seq;
                 if seq == expected {
                     if let Some(this) = weak_ing.upgrade() {
                         let back = FrameSender::detached();
                         this.tell_deliver_or_relay(f, &back).await;
                     }
-                    expected = expected.wrapping_add(1);
+                    expected = Self::next_sequence(expected);
                     // drain 连续后继
-                    while let Some(&k) = buf.keys().next() {
-                        if k == expected {
-                            let fr = buf.remove(&k).unwrap();
-                            if let Some(this) = weak_ing.upgrade() {
-                                let back = FrameSender::detached();
-                                this.tell_deliver_or_relay(fr, &back).await;
-                            }
-                            expected = expected.wrapping_add(1);
-                        } else {
-                            break;
+                    while let Some(fr) = buf.remove(&expected) {
+                        if let Some(this) = weak_ing.upgrade() {
+                            let back = FrameSender::detached();
+                            this.tell_deliver_or_relay(fr, &back).await;
                         }
+                        expected = Self::next_sequence(expected);
                     }
-                } else if seq.wrapping_sub(expected) > u32::MAX / 2 {
+                } else if Self::sequence_distance(expected, seq) > u32::MAX / 2 {
                     // seq "小于" expected（回绕安全比较）→ 迟到帧，丢弃
                     LATE_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(from = %from, seq, expected, "late TELL dropped (gap already flushed)");
@@ -2581,31 +2590,32 @@ impl Ingress {
                     }
                     if buf.len() > buffer_cap {
                         // 防打爆上限：放行最小 seq（跳缺口）
-                        let min_seq = *buf.keys().next().unwrap();
+                        let min_seq = *buf
+                            .keys()
+                            .min_by_key(|seq| Self::sequence_distance(expected, **seq))
+                            .unwrap();
                         let f = buf.remove(&min_seq).unwrap();
                         REORDER_GAP_FLUSHED.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             from = %from, expected, got = min_seq, buffered = buf.len(),
                             "reorder buffer overflow cap: released min seq"
                         );
-                        expected = min_seq.wrapping_add(1);
+                        expected = Self::next_sequence(min_seq);
                         if let Some(this) = weak_ing.upgrade() {
                             let back = FrameSender::detached();
                             this.tell_deliver_or_relay(f, &back).await;
                         }
-                        while let Some(&k) = buf.keys().next() {
-                            if k == expected {
-                                let fr = buf.remove(&k).unwrap();
-                                if let Some(this) = weak_ing.upgrade() {
-                                    let back = FrameSender::detached();
-                                    this.tell_deliver_or_relay(fr, &back).await;
-                                }
-                                expected = expected.wrapping_add(1);
-                            } else {
-                                break;
+                        while let Some(fr) = buf.remove(&expected) {
+                            if let Some(this) = weak_ing.upgrade() {
+                                let back = FrameSender::detached();
+                                this.tell_deliver_or_relay(fr, &back).await;
                             }
+                            expected = Self::next_sequence(expected);
                         }
                     }
+                }
+                if !buf.is_empty() && (!had_gap || expected != previous_expected) {
+                    gap_deadline = tokio::time::Instant::now() + idle_gap;
                 }
             }
         };
@@ -2938,6 +2948,128 @@ mod tests {
     use parrot_api::address::ActorRef;
     use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
     use std::any::Any;
+    use std::time::Duration;
+
+    fn reorder_at(ingress: &Arc<Ingress>, expected: u32) -> tokio::sync::mpsc::Sender<Frame> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(256);
+        let registration = ReorderRegistration {
+            map: Arc::downgrade(&ingress.reorder_tx),
+            source: "wrap-source".into(),
+            sender: sender.downgrade(),
+        };
+        ingress
+            .reorder_tx
+            .lock()
+            .unwrap()
+            .insert("wrap-source".into(), sender.clone());
+        let weak = Arc::downgrade(ingress);
+        let cancel = ingress.reorder_cancel.clone();
+        ingress.reorder_tasks.spawn(async move {
+            let _registration = registration;
+            Ingress::reorder_loop(weak, &_registration, receiver, cancel, expected).await;
+        });
+        sender
+    }
+
+    async fn reorder_queue_consumed(sender: &tokio::sync::mpsc::Sender<Frame>) {
+        for _ in 0..1000 {
+            if sender.capacity() == sender.max_capacity() {
+                tokio::task::yield_now().await;
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("reorder worker did not consume admitted frames");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reorder_wrap_contiguous_skips_unordered_zero() {
+        let (ingress, sink) = recording_ingress();
+        let sender = reorder_at(&ingress, u32::MAX);
+        sender.send(seq_tell(10, u32::MAX)).await.unwrap();
+        sender.send(seq_tell(11, 1)).await.unwrap();
+        reorder_queue_consumed(&sender).await;
+        assert_eq!(
+            *sink.lock().unwrap(),
+            vec![10, 11],
+            "contiguous wrap must not wait for a nonexistent sequence zero"
+        );
+        ingress.close();
+        ingress.wait_closed().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reorder_wrap_drains_expected_instead_of_numeric_first() {
+        let (ingress, sink) = recording_ingress();
+        let sender = reorder_at(&ingress, u32::MAX - 1);
+        for (value, seq) in [(12, 1), (11, u32::MAX), (10, u32::MAX - 1)] {
+            sender.send(seq_tell(value, seq)).await.unwrap();
+        }
+        reorder_queue_consumed(&sender).await;
+        assert_eq!(
+            *sink.lock().unwrap(),
+            vec![10, 11, 12],
+            "numeric BTree order must not hide the contiguous pre-wrap successor"
+        );
+        ingress.close();
+        ingress.wait_closed().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reorder_wrap_gap_flush_uses_serial_distance() {
+        let (ingress, sink) = recording_ingress();
+        let sender = reorder_at(&ingress, u32::MAX - 1);
+        sender.send(seq_tell(12, 1)).await.unwrap();
+        sender.send(seq_tell(11, u32::MAX)).await.unwrap();
+        reorder_queue_consumed(&sender).await;
+        assert!(sink.lock().unwrap().is_empty());
+        tokio::time::advance(Duration::from_millis(251)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *sink.lock().unwrap(),
+            vec![11, 12],
+            "missing MAX-1 permits MAX then 1, never 1 before MAX"
+        );
+        ingress.close();
+        ingress.wait_closed().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reorder_wrap_capacity_flush_uses_serial_distance() {
+        let (ingress, sink) = recording_ingress();
+        ingress.set_reorder_knobs(Duration::from_millis(250), 1);
+        let sender = reorder_at(&ingress, u32::MAX - 1);
+        sender.send(seq_tell(12, 1)).await.unwrap();
+        sender.send(seq_tell(11, u32::MAX)).await.unwrap();
+        reorder_queue_consumed(&sender).await;
+        assert_eq!(
+            *sink.lock().unwrap(),
+            vec![11, 12],
+            "capacity flush must preserve serial order across wrap"
+        );
+        ingress.close();
+        ingress.wait_closed().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reorder_gap_deadline_is_not_renewed_by_more_out_of_order_frames() {
+        let (ingress, sink) = recording_ingress();
+        let sender = reorder_at(&ingress, 1);
+        sender.send(seq_tell(3, 3)).await.unwrap();
+        reorder_queue_consumed(&sender).await;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            sender.send(seq_tell(3, 3)).await.unwrap();
+            reorder_queue_consumed(&sender).await;
+        }
+        assert_eq!(
+            *sink.lock().unwrap(),
+            vec![3],
+            "traffic must not extend the original gap budget indefinitely"
+        );
+        ingress.close();
+        ingress.wait_closed().await;
+    }
 
     /// 回声 ActorRef 桩（LocalLookup 测试实现）。
     #[derive(Debug)]

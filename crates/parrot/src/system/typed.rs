@@ -19,6 +19,9 @@ where
     fn retire(&self) -> BoxedFuture<'_, ActorResult<()>> {
         Box::pin(self.stop())
     }
+    fn retirement_status(&self) -> parrot_api::address::RetirementStatus {
+        TypedActorRef::retirement_status(self)
+    }
 }
 
 /// Concrete reference for the native single-protocol adapter.

@@ -67,6 +67,7 @@ def evaluate(root, selected):
     counts = {'rust_packages': 0, 'python_packages': 0, 'npm_packages': 0, 'maven_projects': 0}
     manifests = sorted(name for name in selected
                        if not name.startswith(THIRD_PARTY_PREFIXES)
+                       and 'node_modules' not in Path(name).parts
                        and not project_inputs.excluded(name))
     for name in manifests:
         base = Path(name).name
