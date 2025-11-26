@@ -208,6 +208,10 @@ pub struct TransportSection {
 pub struct ReorderSection {
     pub gap_timeout_ms: Option<u64>,
     pub buffer_cap: Option<usize>,
+    pub stream_capacity: Option<usize>,
+    pub frame_capacity: Option<usize>,
+    pub byte_capacity: Option<usize>,
+    pub ordered_relays: Option<Vec<String>>,
 }
 
 /// `[remote.codec]` 编解码协商。
@@ -264,6 +268,15 @@ impl Defaults {
     }
     pub fn reorder_buffer_cap() -> usize {
         1024
+    }
+    pub fn reorder_stream_capacity() -> usize {
+        256
+    }
+    pub fn reorder_frame_capacity() -> usize {
+        4096
+    }
+    pub fn reorder_byte_capacity() -> usize {
+        64 * 1024 * 1024
     }
     pub fn callback_capacity() -> usize {
         65536
@@ -497,6 +510,10 @@ pub struct TransportResolved {
 pub struct ReorderResolved {
     pub gap_timeout_ms: u64,
     pub buffer_cap: usize,
+    pub stream_capacity: usize,
+    pub frame_capacity: usize,
+    pub byte_capacity: usize,
+    pub ordered_relays: Vec<String>,
 }
 
 // ============================================================================
@@ -572,7 +589,7 @@ impl ParrotConfig {
             max_context_tasks, default_ask_timeout_ms, shutdown_timeout_ms);
         merge!(self.remote.node, fallback.remote.node; node_id, bind, topology_role, direct_addr, seeds, scheme);
         merge!(self.remote.transport, fallback.remote.transport; connection_capacity, handshake_capacity, heartbeat_interval_ms, heartbeat_max_loss, outbound_queue, inbound_ask_capacity, inbound_ask_bytes, inbound_dispatch_capacity, inbound_dispatch_per_connection, inbound_dispatch_bytes, default_hop_limit);
-        merge!(self.remote.reorder, fallback.remote.reorder; gap_timeout_ms, buffer_cap);
+        merge!(self.remote.reorder, fallback.remote.reorder; gap_timeout_ms, buffer_cap, stream_capacity, frame_capacity, byte_capacity, ordered_relays);
         merge!(self.remote.codec, fallback.remote.codec; extra_caps);
         merge!(self.remote.security, fallback.remote.security; mode, cert_path, key_path, ca_path, admin_nodes);
         merge!(self.remote.receptionist, fallback.remote.receptionist; default_deny, roles, relays, max_subscriptions, max_subscription_bytes, max_registrations, max_registration_bytes);
@@ -663,6 +680,31 @@ impl ParrotConfig {
                 return Err(ConfigError::Invalid {
                     key: format!("remote.transport.{name}"),
                     reason: format!("must be within 1..={max}"),
+                });
+            }
+        }
+        for (name, value) in [
+            ("stream_capacity", self.remote.reorder.stream_capacity),
+            ("frame_capacity", self.remote.reorder.frame_capacity),
+            ("byte_capacity", self.remote.reorder.byte_capacity),
+        ] {
+            let max = (usize::MAX >> 3).min(u32::MAX as usize);
+            if value.is_some_and(|v| v == 0 || v > max) {
+                return Err(ConfigError::Invalid {
+                    key: format!("remote.reorder.{name}"),
+                    reason: format!("must be within 1..={max}"),
+                });
+            }
+        }
+        if let Some(nodes) = &self.remote.reorder.ordered_relays {
+            if nodes.len() > 4096
+                || nodes
+                    .iter()
+                    .any(|node| endpoint::validate_node_id(node).is_err())
+            {
+                return Err(ConfigError::Invalid {
+                    key: "remote.reorder.ordered_relays".into(),
+                    reason: "must contain at most 4096 valid relay node IDs".into(),
                 });
             }
         }
@@ -867,6 +909,27 @@ impl ParrotConfig {
                         .reorder
                         .buffer_cap
                         .unwrap_or_else(Defaults::reorder_buffer_cap),
+                    stream_capacity: self
+                        .remote
+                        .reorder
+                        .stream_capacity
+                        .unwrap_or_else(Defaults::reorder_stream_capacity),
+                    frame_capacity: self
+                        .remote
+                        .reorder
+                        .frame_capacity
+                        .unwrap_or_else(Defaults::reorder_frame_capacity),
+                    byte_capacity: self
+                        .remote
+                        .reorder
+                        .byte_capacity
+                        .unwrap_or_else(Defaults::reorder_byte_capacity),
+                    ordered_relays: self
+                        .remote
+                        .reorder
+                        .ordered_relays
+                        .clone()
+                        .unwrap_or_default(),
                 },
                 extra_caps: self.remote.codec.extra_caps.unwrap_or(0),
             },
@@ -1062,6 +1125,22 @@ impl ParrotConfig {
             "TELL 重排缺口等待上限（默认 250ms）",
         );
         m.insert("remote.reorder.buffer_cap", "重排缓冲帧数上限（默认 1024）");
+        m.insert(
+            "remote.reorder.stream_capacity",
+            "节点累计存活重排worker上限（默认256）",
+        );
+        m.insert(
+            "remote.reorder.frame_capacity",
+            "节点累计重排排队、缓冲、投递帧上限（默认4096）",
+        );
+        m.insert(
+            "remote.reorder.byte_capacity",
+            "节点累计重排编码字节上限，含帧头和长度前缀（默认67108864）",
+        );
+        m.insert(
+            "remote.reorder.ordered_relays",
+            "可为有序TELL原始来源背书的已认证中继节点（默认空）",
+        );
         m.insert(
             "remote.codec.extra_caps",
             "附加能力位（连 pb-only 对端时叠加）",
@@ -1508,6 +1587,10 @@ default_hop_limit = 12
 [remote.reorder]
 gap_timeout_ms = 100
 buffer_cap = 128
+stream_capacity = 17
+frame_capacity = 257
+byte_capacity = 262144
+ordered_relays = ["hub-1", "relay-1"]
 
 [remote.codec]
 extra_caps = 2
@@ -1631,6 +1714,10 @@ rpc_timeout_ms = 2400
         assert_eq!(r.remote.transport.default_hop_limit, 12);
         assert_eq!(r.remote.reorder.gap_timeout_ms, 100);
         assert_eq!(r.remote.reorder.buffer_cap, 128);
+        assert_eq!(r.remote.reorder.stream_capacity, 17);
+        assert_eq!(r.remote.reorder.frame_capacity, 257);
+        assert_eq!(r.remote.reorder.byte_capacity, 262144);
+        assert_eq!(r.remote.reorder.ordered_relays, ["hub-1", "relay-1"]);
         assert_eq!(r.remote.extra_caps, 2);
         assert!(r.remote.receptionist.default_deny);
         assert_eq!(r.remote.receptionist.roles.len(), 2);

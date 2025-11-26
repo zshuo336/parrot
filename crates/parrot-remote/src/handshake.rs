@@ -71,6 +71,8 @@ pub mod caps {
     pub const RECEPTIONIST_ROUTES: u32 = 1 << 21;
     /// Existing bounded ASK/TELL/REPLY BATCH envelope, negotiated on each link.
     pub const BATCH_FRAMES: u32 = 1 << 22;
+    /// Receiver-challenged, origin-bound ordered TELL sessions and retirement.
+    pub const ORDERED_TELL: u32 = 1 << 23;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

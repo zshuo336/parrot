@@ -779,6 +779,23 @@ impl Frame {
             | flags::BATCH
             | flags::TRACE_CONTEXT
             | flags::MIRROR_SHADOW;
+        if (self.type_key == crate::ordered::CONTROL_KEY
+            && (self.header.frame_type != frame_type::ASK
+                || self.header.flags != 0
+                || self.header.seq != 0
+                || self.header.correlation_id == 0))
+            || (self.type_key == crate::ordered::DATA_KEY
+                && (self.header.frame_type != frame_type::TELL
+                    || self.header.seq != 0
+                    || self.header.correlation_id != 0
+                    || self.header.flags
+                        & !(flags::TRACING | flags::URGENT | flags::TRACE_CONTEXT)
+                        != 0))
+        {
+            return Err(FrameError::UnsupportedFlags {
+                flags: self.header.flags,
+            });
+        }
         if (self.type_key == crate::durable::DURABLE_KEY
             && (self.header.frame_type != frame_type::TELL
                 || self.header.flags & flags::TELL_ACK == 0))

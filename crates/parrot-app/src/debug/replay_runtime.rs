@@ -303,6 +303,24 @@ impl ReplayLog {
                     .validate_payload_flags()
                     .map_err(|e| failed(record.seq, 0, e))?;
             }
+            if matches!(
+                frame.type_key.as_str(),
+                parrot_remote::ordered::CONTROL_KEY | parrot_remote::ordered::DATA_KEY
+            ) {
+                if record.wire.is_none() {
+                    return Err(failed(
+                        record.seq,
+                        0,
+                        "ordered capture requires complete wire metadata",
+                    ));
+                }
+                let Some(business) = parrot_remote::ordered::business_frame(frame)
+                    .map_err(|error| failed(record.seq, 0, error))?
+                else {
+                    continue;
+                };
+                frame = business;
+            }
             let members: Box<dyn Iterator<Item = (Option<usize>, Frame)> + Send + '_> =
                 if frame.header.flags & flags::BATCH != 0 {
                     Box::new(

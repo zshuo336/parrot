@@ -399,6 +399,30 @@ fn direct_configs_reject_invalid_values_before_transport_side_effects() {
             ..Default::default()
         },
         parrot_remote::transport::RuntimeKnobs {
+            reorder_stream_capacity: 0,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
+            reorder_stream_capacity: usize::MAX,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
+            reorder_frame_capacity: 0,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
+            reorder_frame_capacity: usize::MAX,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
+            reorder_byte_capacity: 0,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
+            reorder_byte_capacity: usize::MAX,
+            ..Default::default()
+        },
+        parrot_remote::transport::RuntimeKnobs {
             outbound_queue: usize::MAX,
             ..Default::default()
         },

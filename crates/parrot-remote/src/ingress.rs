@@ -24,7 +24,10 @@ use tracing::Instrument;
 mod admin_trace_tests;
 #[cfg(test)]
 mod notification_contracts;
+mod ordered;
+mod reorder_budget;
 pub(crate) mod unwind;
+use reorder_budget::Pending as ReorderPending;
 use unwind::Cleanup;
 
 /// TELL 重排：迟到帧（缺口超时放行后到达）丢弃计数。
@@ -39,6 +42,8 @@ pub static REORDER_DROPPED_ON_SHUTDOWN: std::sync::atomic::AtomicU64 =
 /// TELL 重排：重排任务空闲自清次数（idle GC——防任务累积）。
 pub static REORDER_TASK_RECYCLED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Frames rejected by the node-wide reorder worker/frame/encoded-byte budget.
+pub static REORDER_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 本地 actor 解析出口（trait 倒置：parrot facade 在应用层注入实现）。
 #[async_trait::async_trait]
@@ -311,8 +316,14 @@ pub struct Ingress {
     pub learned: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// TELL 端到端重排（per 源节点任务——直连连接 from_node=唯一 seq 源）。
     /// hub 中转帧多源复用同一连接，seq 流不可归因 → 不进重排（bypass）。
-    reorder_tx:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>>,
+    reorder_tx: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::Sender<ReorderPending>>,
+        >,
+    >,
+    reorder_budget: Arc<reorder_budget::Budget>,
+    ordered: std::sync::Mutex<ordered::Sessions>,
+    ordered_relays: std::sync::RwLock<std::collections::BTreeSet<String>>,
     reorder_tasks: tokio_util::task::TaskTracker,
     reorder_cancel: tokio_util::sync::CancellationToken,
     reorder_closed: std::sync::atomic::AtomicBool,
@@ -390,10 +401,13 @@ impl Drop for ResolvePendingLease {
 // A stale worker must never remove a newer worker for the same source.
 struct ReorderRegistration {
     map: std::sync::Weak<
-        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Frame>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::Sender<ReorderPending>>,
+        >,
     >,
     source: String,
-    sender: tokio::sync::mpsc::WeakSender<Frame>,
+    sender: tokio::sync::mpsc::WeakSender<ReorderPending>,
+    _stream: reorder_budget::Permit,
 }
 impl Drop for ReorderRegistration {
     fn drop(&mut self) {
@@ -473,6 +487,16 @@ impl Ingress {
             relay_table: Arc::new(RelayTable::new()),
             learned: std::sync::Mutex::new(Default::default()),
             reorder_tx: Arc::new(std::sync::Mutex::new(Default::default())),
+            reorder_budget: reorder_budget::Budget::new(
+                parrot_config::Defaults::reorder_stream_capacity(),
+                parrot_config::Defaults::reorder_frame_capacity(),
+                parrot_config::Defaults::reorder_byte_capacity(),
+            )
+            .expect("valid default reorder limits"),
+            ordered: std::sync::Mutex::new(ordered::Sessions::new(
+                parrot_config::Defaults::reorder_stream_capacity(),
+            )),
+            ordered_relays: Default::default(),
             reorder_tasks: tokio_util::task::TaskTracker::new(),
             reorder_cancel: tokio_util::sync::CancellationToken::new(),
             reorder_closed: false.into(),
@@ -589,6 +613,7 @@ impl Ingress {
         let _ = cleanup.call(|| self.ask_tasks.close());
         let _ = cleanup.call(|| self.ask_cancel.cancel());
         let _ = cleanup.call(|| self.reorder_cancel.cancel());
+        let _ = cleanup.call(|| self.close_ordered());
         for sender in retired.into_values() {
             cleanup.dispose(sender);
         }
@@ -610,6 +635,32 @@ impl Ingress {
             self.mirrors.wait_closed().await;
         })
         .await;
+    }
+
+    /// Configure node-wide live workers, retained frames and encoded bytes.
+    /// An admitted frame keeps its charge through queueing, gaps and delivery.
+    /// Saturation rejects the frame and closes only its incoming connection.
+    /// This bounds encoded frames, not decoded application allocations.
+    pub fn with_reorder_limits(
+        mut self,
+        streams: usize,
+        frames: usize,
+        bytes: usize,
+    ) -> Result<Self, crate::error::RemoteError> {
+        if !self.reorder_budget.is_empty()
+            || !self.ordered.lock().unwrap().is_empty()
+            || self.reorder_closed.load(Ordering::Acquire)
+        {
+            return Err(crate::error::RemoteError::Transport(
+                "cannot replace active or closed reorder limits".into(),
+            ));
+        }
+        self.reorder_budget =
+            reorder_budget::Budget::new(streams, frames, bytes).ok_or_else(|| {
+                crate::error::RemoteError::Transport("invalid node reorder limits".into())
+            })?;
+        self.ordered.lock().unwrap().set_capacity(streams);
+        Ok(self)
     }
 
     /// 配置切面：重排旋钮注入（RemoteActorSystem 构造时下发）。
@@ -715,6 +766,14 @@ impl Ingress {
     }
 
     async fn dispatch_inner(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
+        if matches!(
+            frame.type_key.as_str(),
+            crate::ordered::CONTROL_KEY | crate::ordered::DATA_KEY
+        ) && !back.supports_ordered_tell()
+        {
+            back.close();
+            return;
+        }
         if frame.validate_payload_flags().is_err()
             || (frame.header.flags & crate::frame::flags::TRACE_CONTEXT != 0
                 && !back.supports_trace_for(&frame))
@@ -1562,7 +1621,11 @@ impl Ingress {
         Ok(self.trace_recorder.context(parent))
     }
 
-    async fn on_request(&self, mut frame: Frame, back: &FrameSender) {
+    async fn on_request(self: &Arc<Self>, mut frame: Frame, back: &FrameSender) {
+        if frame.type_key == crate::ordered::CONTROL_KEY {
+            self.on_ordered_control(frame, back).await;
+            return;
+        }
         let Ok(context) = self.request_context(&mut frame) else {
             back.close();
             return;
@@ -2208,6 +2271,15 @@ impl Ingress {
             ));
             return Some(ErrCode::ProtocolViolation);
         }
+        if frame.type_key == crate::ordered::CONTROL_KEY && !sender.supports_ordered_tell() {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                &frame.path,
+                ErrCode::NotRemotable,
+                "next hop does not support ordered TELL sessions",
+            ));
+            return Some(ErrCode::NotRemotable);
+        }
         if frame.type_key == crate::durable::DURABLE_KEY
             && sender.peer_capabilities() & crate::handshake::caps::DURABLE_DELIVERY == 0
         {
@@ -2224,7 +2296,12 @@ impl Ingress {
         let mut fwd = frame.clone();
         fwd.header.correlation_id = forward_cid;
         fwd.header.hop_count = next_hop;
-        let fwd = match sender.trace_request(fwd) {
+        let traced = if fwd.type_key == crate::ordered::CONTROL_KEY {
+            Ok(fwd)
+        } else {
+            sender.trace_request(fwd)
+        };
+        let fwd = match traced {
             Ok(frame) => frame,
             Err(error) => {
                 back.send_reply(Frame::reply_err(
@@ -2398,6 +2475,10 @@ impl Ingress {
             DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        if frame.type_key == crate::ordered::DATA_KEY {
+            self.on_ordered_tell(frame, back).await;
+            return;
+        }
         let seq = frame.header.seq;
         let self_node = self
             .relay
@@ -2416,10 +2497,13 @@ impl Ingress {
         }
         // An idle worker may retire between sender acquisition and enqueue.
         // Retry through the registered worker, never bypass FIFO via direct delivery.
-        let mut pending = frame;
+        let Some(mut pending) = self.charge_reorder(frame) else {
+            self.reject_reorder(back);
+            return;
+        };
         loop {
             let Some(tx) = self.reorder_tx_of(from_node) else {
-                DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                self.reject_reorder(back);
                 return;
             };
             tokio::select! {
@@ -2436,8 +2520,25 @@ impl Ingress {
         }
     }
 
+    fn charge_reorder(&self, frame: Frame) -> Option<ReorderPending> {
+        let bytes = frame.validate_size(crate::frame::MAX_FRAME_LEN).ok()? as usize + 4;
+        let permit = self.reorder_budget.frame(bytes)?;
+        Some(ReorderPending { frame, permit })
+    }
+
+    fn reject_reorder(&self, back: &FrameSender) {
+        DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+        if !self.reorder_closed.load(Ordering::Acquire) {
+            REORDER_REJECTED.fetch_add(1, Ordering::Relaxed);
+            back.close();
+        }
+    }
+
     /// Register at most one worker per source, atomically with the close fence.
-    fn reorder_tx_of(self: &Arc<Self>, from: &str) -> Option<tokio::sync::mpsc::Sender<Frame>> {
+    fn reorder_tx_of(
+        self: &Arc<Self>,
+        from: &str,
+    ) -> Option<tokio::sync::mpsc::Sender<ReorderPending>> {
         let mut map = self.reorder_tx.lock().unwrap();
         if self.reorder_closed.load(Ordering::Acquire) {
             return None;
@@ -2445,11 +2546,13 @@ impl Ingress {
         if let Some(tx) = map.get(from).filter(|tx| !tx.is_closed()) {
             return Some(tx.clone());
         }
-        let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(256);
+        let stream = self.reorder_budget.stream()?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<ReorderPending>(256);
         let registration = ReorderRegistration {
             map: Arc::downgrade(&self.reorder_tx),
             source: from.to_owned(),
             sender: tx.downgrade(),
+            _stream: stream,
         };
         let this = Arc::downgrade(self);
         let cancel = self.reorder_cancel.clone();
@@ -2485,12 +2588,12 @@ impl Ingress {
     async fn reorder_loop(
         weak_ing: std::sync::Weak<Ingress>,
         registration: &ReorderRegistration,
-        mut rx: tokio::sync::mpsc::Receiver<Frame>,
+        mut rx: tokio::sync::mpsc::Receiver<ReorderPending>,
         cancel: tokio_util::sync::CancellationToken,
         mut expected: u32,
     ) {
         let from = &registration.source;
-        let mut buf: std::collections::BTreeMap<u32, Frame> = Default::default();
+        let mut buf: std::collections::BTreeMap<u32, ReorderPending> = Default::default();
         // 旋钮启动时快照（任务生命周期内固定——避免运行中改配置引发
         // expected 语义漂移；下个任务自然用新值）
         let (idle_gap, buffer_cap) = weak_ing
@@ -2533,7 +2636,7 @@ impl Ingress {
                         if let Some(this) = weak_ing.upgrade() {
                             let back = FrameSender::detached();
                             for fr in chain {
-                                this.tell_deliver_or_relay(fr, &back).await;
+                                this.deliver_reordered(fr, &back).await;
                             }
                         } else {
                             REORDER_DROPPED_ON_SHUTDOWN
@@ -2563,18 +2666,18 @@ impl Ingress {
                 };
                 let previous_expected = expected;
                 let had_gap = !buf.is_empty();
-                let seq = f.header.seq;
+                let seq = f.frame.header.seq;
                 if seq == expected {
                     if let Some(this) = weak_ing.upgrade() {
                         let back = FrameSender::detached();
-                        this.tell_deliver_or_relay(f, &back).await;
+                        this.deliver_reordered(f, &back).await;
                     }
                     expected = Self::next_sequence(expected);
                     // drain 连续后继
                     while let Some(fr) = buf.remove(&expected) {
                         if let Some(this) = weak_ing.upgrade() {
                             let back = FrameSender::detached();
-                            this.tell_deliver_or_relay(fr, &back).await;
+                            this.deliver_reordered(fr, &back).await;
                         }
                         expected = Self::next_sequence(expected);
                     }
@@ -2583,9 +2686,10 @@ impl Ingress {
                     LATE_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(from = %from, seq, expected, "late TELL dropped (gap already flushed)");
                 } else {
-                    // seq "大于" expected → 缓冲（BTreeMap 去重天然幂等——
-                    // 同 seq 重复帧只保一个，防对端 bug 打爆内存）
-                    if buf.insert(seq, f).is_none() {
+                    // Keep the first accepted content for a sequence. A later
+                    // duplicate must not overwrite buffered business data.
+                    if let std::collections::btree_map::Entry::Vacant(entry) = buf.entry(seq) {
+                        entry.insert(f);
                         REORDER_BUFFERED.fetch_add(1, Ordering::Relaxed);
                     }
                     if buf.len() > buffer_cap {
@@ -2603,12 +2707,12 @@ impl Ingress {
                         expected = Self::next_sequence(min_seq);
                         if let Some(this) = weak_ing.upgrade() {
                             let back = FrameSender::detached();
-                            this.tell_deliver_or_relay(f, &back).await;
+                            this.deliver_reordered(f, &back).await;
                         }
                         while let Some(fr) = buf.remove(&expected) {
                             if let Some(this) = weak_ing.upgrade() {
                                 let back = FrameSender::detached();
-                                this.tell_deliver_or_relay(fr, &back).await;
+                                this.deliver_reordered(fr, &back).await;
                             }
                             expected = Self::next_sequence(expected);
                         }
@@ -2628,6 +2732,12 @@ impl Ingress {
     }
 
     /// TELL 实际投递（本地命中 / hub 中转 / 死信）——原 on_tell 主体。
+    async fn deliver_reordered(&self, pending: ReorderPending, back: &FrameSender) {
+        let ReorderPending { frame, permit } = pending;
+        self.tell_deliver_or_relay(frame, back).await;
+        drop(permit);
+    }
+
     async fn tell_deliver_or_relay(&self, frame: Frame, back: &FrameSender) {
         tokio::select! {
             biased;
@@ -2646,12 +2756,14 @@ impl Ingress {
             back.close();
             return;
         };
-        parrot_api::trace::scope(context, self.tell_deliver_scoped(frame, back)).await;
+        parrot_api::trace::scope(context, self.tell_deliver_scoped(frame, back, true)).await;
     }
 
-    async fn tell_deliver_scoped(&self, mut frame: Frame, back: &FrameSender) {
+    async fn tell_deliver_scoped(&self, mut frame: Frame, back: &FrameSender, forward: bool) {
         self.mirror_application(&frame);
-        self.resolve_application_path(&mut frame);
+        if forward {
+            self.resolve_application_path(&mut frame);
+        }
         if self.is_remote_target(&frame.path) {
             if !self.try_relay_tell(&frame, back) {
                 DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2713,7 +2825,7 @@ impl Ingress {
             }
             Ok(None) => {
                 decoded.retire();
-                failed = cleanup.failed() || !self.try_relay_tell(&frame, back);
+                failed = cleanup.failed() || !forward || !self.try_relay_tell(&frame, back);
             }
             Err(()) => failed = true,
         }
@@ -2950,12 +3062,16 @@ mod tests {
     use std::any::Any;
     use std::time::Duration;
 
-    fn reorder_at(ingress: &Arc<Ingress>, expected: u32) -> tokio::sync::mpsc::Sender<Frame> {
+    fn reorder_at(
+        ingress: &Arc<Ingress>,
+        expected: u32,
+    ) -> tokio::sync::mpsc::Sender<ReorderPending> {
         let (sender, receiver) = tokio::sync::mpsc::channel(256);
         let registration = ReorderRegistration {
             map: Arc::downgrade(&ingress.reorder_tx),
             source: "wrap-source".into(),
             sender: sender.downgrade(),
+            _stream: ingress.reorder_budget.stream().unwrap(),
         };
         ingress
             .reorder_tx
@@ -2971,7 +3087,7 @@ mod tests {
         sender
     }
 
-    async fn reorder_queue_consumed(sender: &tokio::sync::mpsc::Sender<Frame>) {
+    async fn reorder_queue_consumed(sender: &tokio::sync::mpsc::Sender<ReorderPending>) {
         for _ in 0..1000 {
             if sender.capacity() == sender.max_capacity() {
                 tokio::task::yield_now().await;
@@ -2986,8 +3102,14 @@ mod tests {
     async fn reorder_wrap_contiguous_skips_unordered_zero() {
         let (ingress, sink) = recording_ingress();
         let sender = reorder_at(&ingress, u32::MAX);
-        sender.send(seq_tell(10, u32::MAX)).await.unwrap();
-        sender.send(seq_tell(11, 1)).await.unwrap();
+        sender
+            .send(ingress.charge_reorder(seq_tell(10, u32::MAX)).unwrap())
+            .await
+            .unwrap();
+        sender
+            .send(ingress.charge_reorder(seq_tell(11, 1)).unwrap())
+            .await
+            .unwrap();
         reorder_queue_consumed(&sender).await;
         assert_eq!(
             *sink.lock().unwrap(),
@@ -3003,7 +3125,10 @@ mod tests {
         let (ingress, sink) = recording_ingress();
         let sender = reorder_at(&ingress, u32::MAX - 1);
         for (value, seq) in [(12, 1), (11, u32::MAX), (10, u32::MAX - 1)] {
-            sender.send(seq_tell(value, seq)).await.unwrap();
+            sender
+                .send(ingress.charge_reorder(seq_tell(value, seq)).unwrap())
+                .await
+                .unwrap();
         }
         reorder_queue_consumed(&sender).await;
         assert_eq!(
@@ -3019,8 +3144,14 @@ mod tests {
     async fn reorder_wrap_gap_flush_uses_serial_distance() {
         let (ingress, sink) = recording_ingress();
         let sender = reorder_at(&ingress, u32::MAX - 1);
-        sender.send(seq_tell(12, 1)).await.unwrap();
-        sender.send(seq_tell(11, u32::MAX)).await.unwrap();
+        sender
+            .send(ingress.charge_reorder(seq_tell(12, 1)).unwrap())
+            .await
+            .unwrap();
+        sender
+            .send(ingress.charge_reorder(seq_tell(11, u32::MAX)).unwrap())
+            .await
+            .unwrap();
         reorder_queue_consumed(&sender).await;
         assert!(sink.lock().unwrap().is_empty());
         tokio::time::advance(Duration::from_millis(251)).await;
@@ -3039,8 +3170,14 @@ mod tests {
         let (ingress, sink) = recording_ingress();
         ingress.set_reorder_knobs(Duration::from_millis(250), 1);
         let sender = reorder_at(&ingress, u32::MAX - 1);
-        sender.send(seq_tell(12, 1)).await.unwrap();
-        sender.send(seq_tell(11, u32::MAX)).await.unwrap();
+        sender
+            .send(ingress.charge_reorder(seq_tell(12, 1)).unwrap())
+            .await
+            .unwrap();
+        sender
+            .send(ingress.charge_reorder(seq_tell(11, u32::MAX)).unwrap())
+            .await
+            .unwrap();
         reorder_queue_consumed(&sender).await;
         assert_eq!(
             *sink.lock().unwrap(),
@@ -3055,11 +3192,17 @@ mod tests {
     async fn reorder_gap_deadline_is_not_renewed_by_more_out_of_order_frames() {
         let (ingress, sink) = recording_ingress();
         let sender = reorder_at(&ingress, 1);
-        sender.send(seq_tell(3, 3)).await.unwrap();
+        sender
+            .send(ingress.charge_reorder(seq_tell(3, 3)).unwrap())
+            .await
+            .unwrap();
         reorder_queue_consumed(&sender).await;
         for _ in 0..3 {
             tokio::time::advance(Duration::from_millis(100)).await;
-            sender.send(seq_tell(3, 3)).await.unwrap();
+            sender
+                .send(ingress.charge_reorder(seq_tell(3, 3)).unwrap())
+                .await
+                .unwrap();
             reorder_queue_consumed(&sender).await;
         }
         assert_eq!(
@@ -3613,12 +3756,24 @@ mod tests {
     }
 
     fn recording_ingress() -> (Arc<Ingress>, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        recording_ingress_with_limits(256, 4096, 64 * 1024 * 1024)
+    }
+
+    fn recording_ingress_with_limits(
+        streams: usize,
+        frames: usize,
+        bytes: usize,
+    ) -> (Arc<Ingress>, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
         let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         (
-            Arc::new(Ingress::new(
-                Arc::new(RecordingLookup(sink.clone())),
-                Arc::new(CallbackRegistry::new(64)),
-            )),
+            Arc::new(
+                Ingress::new(
+                    Arc::new(RecordingLookup(sink.clone())),
+                    Arc::new(CallbackRegistry::new(64)),
+                )
+                .with_reorder_limits(streams, frames, bytes)
+                .unwrap(),
+            ),
             sink,
         )
     }
@@ -4305,7 +4460,9 @@ mod tests {
             !tx.is_closed(),
             "idle GC invalidated a dispatcher-held sender"
         );
-        tx.send(seq_tell(1, 1)).await.unwrap();
+        tx.send(ingress.charge_reorder(seq_tell(1, 1)).unwrap())
+            .await
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while sink.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
@@ -4327,6 +4484,7 @@ mod tests {
             map: Arc::downgrade(&ingress.reorder_tx),
             source: "same-source".into(),
             sender: old.downgrade(),
+            _stream: ingress.reorder_budget.stream().unwrap(),
         };
         let replacement = ingress.reorder_tx_of("same-source").unwrap();
         drop(old_registration);
@@ -4334,5 +4492,103 @@ mod tests {
         assert!(current.same_channel(&replacement));
         ingress.close();
         ingress.wait_closed().await;
+    }
+
+    #[tokio::test]
+    async fn node_reorder_duplicate_late_and_contiguous_charges_are_released() {
+        let (ingress, sink) = recording_ingress_with_limits(2, 3, 4096);
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let back = FrameSender::anon(sender);
+        ingress.dispatch(seq_tell(2, 2), &back, "source").await;
+        ingress.dispatch(seq_tell(9, 2), &back, "source").await;
+        let tx = ingress.reorder_tx_of("source").unwrap();
+        reorder_queue_consumed(&tx).await;
+        let bytes = seq_tell(2, 2)
+            .validate_size(crate::frame::MAX_FRAME_LEN)
+            .unwrap() as usize
+            + 4;
+        assert_eq!(ingress.reorder_budget.usage(), (1, 1, bytes));
+        ingress.dispatch(seq_tell(1, 1), &back, "source").await;
+        reorder_queue_consumed(&tx).await;
+        assert_eq!(*sink.lock().unwrap(), vec![1, 2]);
+        assert_eq!(ingress.reorder_budget.usage(), (1, 0, 0));
+        ingress.dispatch(seq_tell(9, 1), &back, "source").await;
+        reorder_queue_consumed(&tx).await;
+        assert_eq!(*sink.lock().unwrap(), vec![1, 2]);
+        assert_eq!(ingress.reorder_budget.usage(), (1, 0, 0));
+        ingress.close();
+        ingress.wait_closed().await;
+        assert_eq!(ingress.reorder_budget.usage(), (0, 0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn node_reorder_gap_and_overflow_flush_return_encoded_charges() {
+        let (ingress, sink) = recording_ingress_with_limits(2, 4, 4096);
+        ingress.set_reorder_knobs(Duration::from_millis(100), 1);
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let back = FrameSender::anon(sender);
+        ingress.dispatch(seq_tell(3, 3), &back, "source").await;
+        ingress.dispatch(seq_tell(4, 4), &back, "source").await;
+        let tx = ingress.reorder_tx_of("source").unwrap();
+        reorder_queue_consumed(&tx).await;
+        assert_eq!(*sink.lock().unwrap(), vec![3, 4]);
+        assert_eq!(ingress.reorder_budget.usage(), (1, 0, 0));
+        ingress.dispatch(seq_tell(6, 6), &back, "source").await;
+        reorder_queue_consumed(&tx).await;
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*sink.lock().unwrap(), vec![3, 4, 6]);
+        assert_eq!(ingress.reorder_budget.usage(), (1, 0, 0));
+        ingress.close();
+        ingress.wait_closed().await;
+        assert_eq!(ingress.reorder_budget.usage(), (0, 0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn node_reorder_idle_gc_returns_stream_capacity_to_valid_traffic() {
+        let (ingress, sink) = recording_ingress_with_limits(1, 4, 4096);
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let back = FrameSender::anon(sender);
+        ingress.dispatch(seq_tell(1, 1), &back, "source").await;
+        let tx = ingress.reorder_tx_of("source").unwrap();
+        reorder_queue_consumed(&tx).await;
+        drop(tx);
+        let (sender, _rx2) = tokio::sync::mpsc::channel(4);
+        let overflow = FrameSender::anon(sender);
+        ingress
+            .dispatch(seq_tell(2, 1), &overflow, "overflow")
+            .await;
+        assert!(overflow.is_closed());
+        assert!(!back.is_closed());
+        assert_eq!(ingress.reorder_budget.usage(), (1, 0, 0));
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(ingress.reorder_budget.usage(), (0, 0, 0));
+        ingress.dispatch(seq_tell(3, 1), &back, "next-source").await;
+        let tx = ingress.reorder_tx_of("next-source").unwrap();
+        reorder_queue_consumed(&tx).await;
+        assert_eq!(*sink.lock().unwrap(), vec![1, 3]);
+        assert!(!back.is_closed());
+        ingress.close();
+        ingress.wait_closed().await;
+    }
+
+    #[tokio::test]
+    async fn node_reorder_close_reclaims_all_queued_and_buffered_frames() {
+        let (ingress, _) = recording_ingress_with_limits(2, 8, 4096);
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let back = FrameSender::anon(sender);
+        for source in ["one", "two"] {
+            for seq in 2..5 {
+                ingress
+                    .dispatch(seq_tell(seq as u64, seq), &back, source)
+                    .await;
+            }
+        }
+        assert_eq!(ingress.reorder_budget.usage().0, 2);
+        assert_eq!(ingress.reorder_budget.usage().1, 6);
+        ingress.close();
+        ingress.wait_closed().await;
+        assert_eq!(ingress.reorder_budget.usage(), (0, 0, 0));
     }
 }

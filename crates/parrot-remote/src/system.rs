@@ -82,6 +82,8 @@ pub struct RemoteConfig {
     pub direct_addr: Option<String>,
     /// Connection settings; None selects the current bounded defaults.
     pub knobs: Option<crate::transport::RuntimeKnobs>,
+    /// Authenticated relays permitted to preserve third-party ordered origins.
+    pub ordered_relays: std::collections::BTreeSet<String>,
     pub swim: crate::swim::SwimConfig,
 }
 
@@ -136,6 +138,7 @@ impl RemoteConfig {
             topology: Default::default(),
             direct_addr: None,
             knobs: None,
+            ordered_relays: Default::default(),
             swim: Default::default(),
         }
     }
@@ -171,6 +174,11 @@ impl RemoteConfig {
         self
     }
 
+    pub fn with_ordered_relays(mut self, nodes: impl IntoIterator<Item = String>) -> Self {
+        self.ordered_relays = nodes.into_iter().collect();
+        self
+    }
+
     /// 声明可直拨地址（方案 A：spoke 有 listen 端口时设置——hub 会把它
     /// 以 ROUTE_HINT 注入给通信对端，促成 spoke 两两直连）。
     pub fn with_direct_addr(mut self, addr: impl Into<String>) -> Self {
@@ -198,6 +206,7 @@ impl RemoteConfig {
             topology: Default::default(),
             direct_addr: None,
             knobs: None,
+            ordered_relays: Default::default(),
             swim: Default::default(),
         }
     }
@@ -223,6 +232,7 @@ impl RemoteConfig {
             topology: Default::default(),
             direct_addr: None,
             knobs: None,
+            ordered_relays: Default::default(),
             swim: Default::default(),
         }
     }
@@ -368,6 +378,7 @@ impl RemoteConfig {
         cfg.topology.mode = r.topology.mode;
         cfg.topology.relay_fallback = r.topology.relay_fallback;
         cfg.extra_caps = r.remote.extra_caps;
+        cfg.ordered_relays = r.remote.reorder.ordered_relays.iter().cloned().collect();
         cfg.knobs = Some(crate::transport::RuntimeKnobs {
             connection_capacity: r.remote.transport.connection_capacity,
             handshake_capacity: r.remote.transport.handshake_capacity,
@@ -382,6 +393,9 @@ impl RemoteConfig {
             inbound_dispatch_bytes: r.remote.transport.inbound_dispatch_bytes,
             reorder_gap_timeout_ms: r.remote.reorder.gap_timeout_ms,
             reorder_buffer_cap: r.remote.reorder.buffer_cap,
+            reorder_stream_capacity: r.remote.reorder.stream_capacity,
+            reorder_frame_capacity: r.remote.reorder.frame_capacity,
+            reorder_byte_capacity: r.remote.reorder.byte_capacity,
             default_hop_limit: r.remote.transport.default_hop_limit,
         });
         cfg.validate()
@@ -465,6 +479,13 @@ impl RemoteConfig {
         HandshakeBody {
             node_id: self.node_id.clone(),
             capabilities: crate::handshake::caps::BIN
+                | if self.scheme == "mem"
+                    || !matches!(&self.security, crate::security::RemoteSecurity::Local)
+                {
+                    crate::handshake::caps::ORDERED_TELL
+                } else {
+                    0
+                }
                 | crate::handshake::caps::BATCH_FRAMES
                 | crate::handshake::caps::TRACE_CONTEXT
                 | crate::handshake::caps::ADMIN_TRACE_CONTEXT
@@ -493,6 +514,16 @@ impl RemoteConfig {
     }
 
     fn validate(&self) -> Result<(), RemoteError> {
+        if self.ordered_relays.len() > 4096
+            || self
+                .ordered_relays
+                .iter()
+                .any(|node| parrot_config::endpoint::validate_node_id(node).is_err())
+        {
+            return Err(RemoteError::Transport(
+                "invalid ordered relay grants".into(),
+            ));
+        }
         self.receptionist_acl
             .validate()
             .map_err(RemoteError::Transport)?;
@@ -579,6 +610,9 @@ impl RemoteConfig {
                 k.inbound_dispatch_per_connection,
             ),
             ("inbound_dispatch_bytes", k.inbound_dispatch_bytes),
+            ("reorder_stream_capacity", k.reorder_stream_capacity),
+            ("reorder_frame_capacity", k.reorder_frame_capacity),
+            ("reorder_byte_capacity", k.reorder_byte_capacity),
         ] {
             if limit == 0 || limit > max {
                 return Err(invalid(format!("{name} must be within 1..={max}")));
@@ -682,6 +716,7 @@ pub struct RemoteActorSystem {
     pub callbacks: Arc<CallbackRegistry>,
     pub ingress: Arc<Ingress>,
     seq_counters: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    pub(crate) outbound_ordered: Arc<crate::ordered::Outbound>,
     /// K1/S1：SWIM 成员表（gossip 入站合并点——Arc 共享给钩子与驱动）。
     pub membership: Arc<tokio::sync::Mutex<crate::swim::Membership>>,
     pub(crate) receptionist: Arc<std::sync::Mutex<crate::receptionist::Receptionist>>,
@@ -768,8 +803,16 @@ impl RemoteActorSystem {
                 knobs.inbound_ask_capacity,
                 knobs.inbound_ask_bytes,
             )?
-            .with_control_policy(config.security.control_policy()),
+            .with_control_policy(config.security.control_policy())
+            .with_reorder_limits(
+                knobs.reorder_stream_capacity,
+                knobs.reorder_frame_capacity,
+                knobs.reorder_byte_capacity,
+            )?,
         );
+        ingress
+            .set_ordered_relays(config.ordered_relays.clone())
+            .map_err(RemoteError::Transport)?;
         // 配置切面：重排旋钮下发（None=默认 250ms/1024，等价迁移前行为）
         if let Some(k) = &config.knobs {
             ingress.set_reorder_knobs(
@@ -860,6 +903,10 @@ impl RemoteActorSystem {
         let subscription_limits = config.receptionist_subscriptions;
         let registration_limits = config.receptionist_registrations;
         let system = Arc::new(Self {
+            outbound_ordered: Arc::new(crate::ordered::Outbound::new(
+                config.node_id.clone(),
+                knobs.reorder_stream_capacity,
+            )),
             config,
             nodes,
             callbacks,
@@ -2230,6 +2277,7 @@ impl RemoteActorSystem {
             return;
         }
         self.ingress.close_admission();
+        self.outbound_ordered.close_admission();
         self.probes.close_admission();
         self.admin_pending.close_admission();
         self.admin_pending_v2.close_admission();
@@ -2256,6 +2304,7 @@ impl RemoteActorSystem {
         let cleanup = crate::ingress::unwind::Cleanup::default();
         let _ = cleanup.call(|| self.shutdown_tx.send_replace(true));
         let _ = cleanup.call(|| self.ingress.close());
+        let _ = cleanup.call(|| self.outbound_ordered.close());
         let _ = cleanup.call(|| self.probes.close());
         let _ = cleanup.call(|| self.background.close());
         let _ = cleanup.call(|| self.direct_connections.close());

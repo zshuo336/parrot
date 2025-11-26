@@ -156,6 +156,10 @@ impl FrameSender {
         self.negotiated_capabilities & crate::handshake::caps::BATCH_FRAMES != 0
     }
 
+    pub fn supports_ordered_tell(&self) -> bool {
+        self.negotiated_capabilities & crate::handshake::caps::ORDERED_TELL != 0
+    }
+
     /// Admin parents are separately negotiated so business-only peers keep
     /// receiving their original SYSTEM_EVENT payload and flags.
     pub fn supports_admin_trace_context(&self) -> bool {
@@ -184,6 +188,15 @@ impl FrameSender {
     }
 
     fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+        if matches!(
+            frame.type_key.as_str(),
+            crate::ordered::CONTROL_KEY | crate::ordered::DATA_KEY
+        ) && !self.supports_ordered_tell()
+        {
+            return Err(RemoteError::Transport(
+                "ordered TELL was not negotiated on this link".into(),
+            ));
+        }
         if (frame.header.flags & crate::frame::flags::BATCH != 0 && !self.supports_batch_frames())
             || (frame.header.flags & crate::frame::flags::TRACE_CONTEXT != 0
                 && !self.supports_trace_for(frame))
@@ -500,6 +513,12 @@ pub struct RuntimeKnobs {
     pub reorder_gap_timeout_ms: u64,
     /// 重排缓冲帧数上限（缺省 1024）。
     pub reorder_buffer_cap: usize,
+    /// Node-wide live reorder workers, including retiring workers.
+    pub reorder_stream_capacity: usize,
+    /// Node-wide frames retained in reorder queues, buffers and delivery.
+    pub reorder_frame_capacity: usize,
+    /// Node-wide retained encoded reorder bytes, including the length prefix.
+    pub reorder_byte_capacity: usize,
     /// 帧默认跳数上限（缺省 8）。
     pub default_hop_limit: u8,
 }
@@ -521,6 +540,9 @@ impl Default for RuntimeKnobs {
             inbound_dispatch_bytes: parrot_config::Defaults::inbound_dispatch_bytes(),
             reorder_gap_timeout_ms: 250,
             reorder_buffer_cap: 1024,
+            reorder_stream_capacity: parrot_config::Defaults::reorder_stream_capacity(),
+            reorder_frame_capacity: parrot_config::Defaults::reorder_frame_capacity(),
+            reorder_byte_capacity: parrot_config::Defaults::reorder_byte_capacity(),
             default_hop_limit: crate::frame::DEFAULT_HOP_LIMIT,
         }
     }

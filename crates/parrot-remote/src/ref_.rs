@@ -148,6 +148,138 @@ impl RemoteActorRef {
         &self.node_id
     }
 
+    /// Require an authenticated, end-to-end confirmed TELL session. Ordering
+    /// starts with this node session; admission is not a business completion
+    /// receipt. Unsupported routes fail before publishing the business frame.
+    pub fn deliver_ordered<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        self.deliver_mode(msg, options, true)
+    }
+
+    /// Cancel this destination's session and wait for its actual receiver worker
+    /// to retire. Already admitted actor work is not retracted. Explicit close
+    /// frees the bounded source-side destination slot.
+    pub async fn close_ordered_session(&self, timeout: Duration) -> ActorResult<()> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .filter(|_| !timeout.is_zero())
+            .ok_or_else(|| {
+                ErrCode::ProtocolViolation.to_actor_error("invalid ordered close deadline".into())
+            })?;
+        tokio::time::timeout_at(deadline, async {
+            let outbound = self
+                .inner
+                .system
+                .as_ref()
+                .and_then(|system| system.upgrade())
+                .map(|system| system.outbound_ordered.clone())
+                .ok_or_else(|| {
+                    ErrCode::NotRemotable
+                        .to_actor_error("ordered sessions require an owning remote system".into())
+                })?;
+            let sender = self
+                .inner
+                .ensure_sender(&self.node_id)
+                .await
+                .ok_or_else(|| {
+                    ErrCode::ConnectionLost.to_actor_error("ordered close route unavailable".into())
+                })?;
+            outbound
+                .close_lane(
+                    &self.node_id,
+                    &sender,
+                    &self.inner.callbacks,
+                    &self.path,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await
+        })
+        .await
+        .unwrap_or(Err(ActorError::Timeout))
+    }
+
+    fn deliver_mode<'a>(
+        &'a self,
+        msg: BoxedMessage,
+        options: MessageOptions,
+        required: bool,
+    ) -> BoxedFuture<'a, ActorResult<()>> {
+        let mut input = OutboundInput(Some(msg));
+        Box::pin(parrot_api::trace::capture(async move {
+            let result = async {
+                let input = &mut input;
+                options.validate_single_attempt()?;
+                let started = tokio::time::Instant::now();
+                let (key, payload) = self.encode_outgoing(input.value())?;
+                let timeout = remaining_budget(started, options.timeout)?;
+                let delivery = async {
+                    let sender =
+                        self.inner
+                            .ensure_sender(&self.node_id)
+                            .await
+                            .ok_or_else(|| {
+                                ActorError::InternalError(format!(
+                                    "remote link to {} unavailable",
+                                    self.node_id
+                                ))
+                            })?;
+                    let mut frame = self
+                        .inner
+                        .outgoing(Frame::tell_with_seq(&self.path, &key, payload, 0));
+                    if options.priority.value() >= 70 {
+                        frame.header.flags |= crate::frame::flags::URGENT;
+                    }
+                    let outbound = self
+                        .inner
+                        .system
+                        .as_ref()
+                        .and_then(|system| system.upgrade())
+                        .map(|system| system.outbound_ordered.clone());
+                    if let Some(outbound) = outbound {
+                        match outbound
+                            .send(
+                                &self.node_id,
+                                &sender,
+                                &self.inner.callbacks,
+                                frame,
+                                required,
+                            )
+                            .await?
+                        {
+                            None => return Ok(()),
+                            Some(legacy) => frame = legacy,
+                        }
+                    } else if required {
+                        return Err(ErrCode::NotRemotable.to_actor_error(
+                            "ordered sessions require an owning remote system".into(),
+                        ));
+                    }
+                    frame = sender
+                        .trace_request(frame)
+                        .map_err(|error| error.to_actor_error())?;
+                    let permit = sender
+                        .reserve(&frame)
+                        .await
+                        .map_err(|error| error.to_actor_error())?;
+                    frame.header.seq = self.inner.next_seq(self.node_id.clone());
+                    permit.send(frame);
+                    Ok(())
+                };
+                match timeout {
+                    Some(duration) => tokio::time::timeout(duration, delivery)
+                        .await
+                        .map_err(|_| ActorError::Timeout)?,
+                    None => delivery.await,
+                }
+            }
+            .await;
+            input.finish(result)
+        }))
+    }
+
     /// Wait for the remote handler to complete successfully, without requiring a
     /// serializable business reply. Each hop must advertise TELL_COMPLETION.
     /// The deadline covers queue admission and the return path. Cancellation,
@@ -466,54 +598,7 @@ impl ActorRef for RemoteActorRef {
         msg: BoxedMessage,
         options: MessageOptions,
     ) -> BoxedFuture<'a, ActorResult<()>> {
-        let mut input = OutboundInput(Some(msg));
-        Box::pin(parrot_api::trace::capture(async move {
-            let result = async {
-                let input = &mut input;
-                options.validate_single_attempt()?;
-                let started = tokio::time::Instant::now();
-                let (key, payload) = self.encode_outgoing(input.value())?;
-                let timeout = remaining_budget(started, options.timeout)?;
-                let delivery = async move {
-                    let sender =
-                        self.inner
-                            .ensure_sender(&self.node_id)
-                            .await
-                            .ok_or_else(|| {
-                                ActorError::InternalError(format!(
-                                    "remote link to {} unavailable",
-                                    self.node_id
-                                ))
-                            })?;
-                    let mut frame = self
-                        .inner
-                        .outgoing(Frame::tell_with_seq(&self.path, &key, payload, 0));
-                    frame = sender
-                        .trace_request(frame)
-                        .map_err(|e| e.to_actor_error())?;
-                    // Allocate a sequence only after size validation and queue admission: cancellation
-                    // cannot create a gap, and urgent traffic still obeys wire order.
-                    let permit = sender
-                        .reserve(&frame)
-                        .await
-                        .map_err(|e| e.to_actor_error())?;
-                    frame.header.seq = self.inner.next_seq(self.node_id.clone());
-                    if options.priority.value() >= 70 {
-                        frame.header.flags |= crate::frame::flags::URGENT;
-                    }
-                    permit.send(frame);
-                    Ok(())
-                };
-                match timeout {
-                    Some(duration) => tokio::time::timeout(duration, delivery)
-                        .await
-                        .map_err(|_| ActorError::Timeout)?,
-                    None => delivery.await,
-                }
-            }
-            .await;
-            input.finish(result)
-        }))
+        self.deliver_mode(msg, options, false)
     }
 
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {

@@ -28,6 +28,7 @@ pub mod mirror;
 pub mod mirror_control;
 pub mod mqtt;
 pub mod node;
+pub mod ordered;
 pub mod pb;
 pub mod raft;
 pub mod receptionist;
