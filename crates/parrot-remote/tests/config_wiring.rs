@@ -76,6 +76,41 @@ fn configured_transport_is_preserved() {
     }
 }
 
+#[tokio::test]
+async fn configured_ordered_receiver_state_is_bound_and_released_by_real_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut configuration = resolved("tcp", "configured-receiver");
+    configuration.remote.reorder.receiver_state = Some(parrot_config::OrderedReceiverState {
+        directory: directory.path().into(),
+        realm: "configured-realm".into(),
+    });
+    let runtime = RemoteConfig::from_resolved(&configuration).unwrap();
+    assert_eq!(
+        runtime.ordered_receiver_state,
+        configuration.remote.reorder.receiver_state
+    );
+    let first = RemoteActorSystem::new(runtime.clone(), Arc::new(Lookup)).unwrap();
+    first.start().await.unwrap();
+    assert!(RemoteActorSystem::new(runtime.clone(), Arc::new(Lookup)).is_err());
+    first.shutdown().await.unwrap();
+    let second = RemoteActorSystem::new(runtime, Arc::new(Lookup)).unwrap();
+    second.start().await.unwrap();
+    second.shutdown().await.unwrap();
+    let mut foreign = configuration.clone();
+    foreign
+        .remote
+        .reorder
+        .receiver_state
+        .as_mut()
+        .unwrap()
+        .realm = "other-realm".into();
+    assert!(RemoteActorSystem::new(
+        RemoteConfig::from_resolved(&foreign).unwrap(),
+        Arc::new(Lookup)
+    )
+    .is_err());
+}
+
 #[test]
 fn receptionist_relay_grants_are_wired_with_independent_default_deny() {
     use parrot_remote::acl::AclDecision;

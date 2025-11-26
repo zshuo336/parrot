@@ -75,6 +75,8 @@ pub mod caps {
     pub const ORDERED_TELL_V1: u32 = 1 << 23;
     /// Receiver-instance-bound ordered TELL v2 sessions and retirement receipts.
     pub const ORDERED_TELL: u32 = 1 << 24;
+    /// Optional ordered v2 Recover control, forwarded only by capable links.
+    pub const ORDERED_RECOVERY: u32 = 1 << 25;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

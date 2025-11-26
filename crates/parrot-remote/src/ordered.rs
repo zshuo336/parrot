@@ -2,6 +2,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
 pub(crate) mod outbound;
+pub(crate) mod recovery;
 pub(crate) use outbound::Outbound;
 
 pub const CONTROL_KEY: &str = "parrot:ordered-control#v2";
@@ -16,11 +17,11 @@ pub(crate) fn identity() -> Identity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
 pub(crate) enum Operation {
-    Open = 0,
-    Commit = 1,
-    Close = 2,
+    Open,
+    Commit,
+    Close,
+    Recover { receiver: Identity, epoch: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +40,7 @@ pub(crate) struct Receipt {
     pub ticket: Identity,
     pub generation: u64,
     pub lease_ms: u32,
+    pub epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,14 +84,33 @@ impl Control {
             return Err("ordered control ticket disagrees with operation".into());
         }
         let length = u16::try_from(self.source.len()).map_err(|_| "ordered source too long")?;
-        let mut output = BytesMut::with_capacity(52 + self.source.len());
+        let recovery = if let Operation::Recover { receiver, epoch } = self.operation {
+            nonzero(receiver)?;
+            if epoch == 0 {
+                return Err("zero ordered recovery epoch".into());
+            }
+            Some((receiver, epoch))
+        } else {
+            None
+        };
+        let mut output =
+            BytesMut::with_capacity(52 + self.source.len() + recovery.map_or(0, |_| 24));
         output.put_u8(2);
-        output.put_u8(self.operation as u8);
+        output.put_u8(match self.operation {
+            Operation::Open => 0,
+            Operation::Commit => 1,
+            Operation::Close => 2,
+            Operation::Recover { .. } => 3,
+        });
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
         output.extend_from_slice(&self.ticket);
         output.put_u16_le(length);
         output.extend_from_slice(self.source.as_bytes());
+        if let Some((receiver, epoch)) = recovery {
+            output.extend_from_slice(&receiver);
+            output.put_u64_le(epoch);
+        }
         Ok(output.freeze())
     }
 
@@ -98,7 +119,8 @@ impl Control {
             return Err("invalid ordered control header".into());
         }
         let length = u16::from_le_bytes(input[50..52].try_into().unwrap()) as usize;
-        if length > 1024 || input.len() != 52 + length {
+        let recovery_length = if input[1] == 3 { 24 } else { 0 };
+        if length > 1024 || input.len() != 52 + length + recovery_length {
             return Err("invalid ordered control length".into());
         }
         let value = Self {
@@ -106,9 +128,13 @@ impl Control {
                 0 => Operation::Open,
                 1 => Operation::Commit,
                 2 => Operation::Close,
+                3 => Operation::Recover {
+                    receiver: input[52 + length..68 + length].try_into().unwrap(),
+                    epoch: u64::from_le_bytes(input[68 + length..].try_into().unwrap()),
+                },
                 _ => return Err("unknown ordered control operation".into()),
             },
-            source: std::str::from_utf8(&input[52..])
+            source: std::str::from_utf8(&input[52..52 + length])
                 .map_err(|_| "invalid ordered source UTF-8")?
                 .into(),
             incarnation: input[2..18].try_into().unwrap(),
@@ -122,18 +148,21 @@ impl Control {
 
 impl Receipt {
     pub fn encode(&self) -> Bytes {
-        let mut output = BytesMut::with_capacity(46);
+        let mut output = BytesMut::with_capacity(46 + self.epoch.map_or(0, |_| 8));
         output.put_u8(2);
         output.put_u8(u8::from(self.active));
         output.extend_from_slice(&self.ticket);
         output.put_u64_le(self.generation);
         output.put_u32_le(self.lease_ms);
         output.extend_from_slice(&self.receiver);
+        if let Some(epoch) = self.epoch {
+            output.put_u64_le(epoch);
+        }
         output.freeze()
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, String> {
-        if input.len() != 46 || input[0] != 2 || input[1] > 1 {
+        if !matches!(input.len(), 46 | 54) || input[0] != 2 || input[1] > 1 {
             return Err("invalid ordered receipt header".into());
         }
         let value = Self {
@@ -142,8 +171,13 @@ impl Receipt {
             generation: u64::from_le_bytes(input[18..26].try_into().unwrap()),
             lease_ms: u32::from_le_bytes(input[26..30].try_into().unwrap()),
             receiver: input[30..46].try_into().unwrap(),
+            epoch: (input.len() == 54)
+                .then(|| u64::from_le_bytes(input[46..54].try_into().unwrap())),
         };
         nonzero(value.receiver)?;
+        if value.epoch == Some(0) {
+            return Err("zero ordered receipt epoch".into());
+        }
         nonzero(value.ticket)?;
         if value.generation == 0 || !(1..=LEASE_MS).contains(&value.lease_ms) {
             return Err("invalid ordered receipt generation or deadline".into());
@@ -255,7 +289,15 @@ mod tests {
 
     #[test]
     fn identity_control_and_receipts_are_versioned_and_exact() {
-        for operation in [Operation::Open, Operation::Commit, Operation::Close] {
+        for operation in [
+            Operation::Open,
+            Operation::Commit,
+            Operation::Close,
+            Operation::Recover {
+                receiver: [4; 16],
+                epoch: 1,
+            },
+        ] {
             let value = Control {
                 operation,
                 source: "origin".into(),
@@ -279,6 +321,7 @@ mod tests {
         let value = Receipt {
             active: true,
             receiver: [4; 16],
+            epoch: None,
             ticket: [3; 16],
             generation: 7,
             lease_ms: LEASE_MS,
@@ -301,6 +344,20 @@ mod tests {
         let mut invalid = value.encode().to_vec();
         invalid[1] = 2;
         assert!(Receipt::decode(&invalid).is_err());
+        let extended = Receipt {
+            epoch: Some(1),
+            ..value
+        };
+        assert_eq!(extended.encode().len(), 54);
+        assert_eq!(Receipt::decode(&extended.encode()).unwrap(), extended);
+        for end in 47..54 {
+            assert!(Receipt::decode(&extended.encode()[..end]).is_err());
+        }
+        let invalid = Receipt {
+            epoch: Some(0),
+            ..value
+        };
+        assert!(Receipt::decode(&invalid.encode()).is_err());
     }
 
     #[test]

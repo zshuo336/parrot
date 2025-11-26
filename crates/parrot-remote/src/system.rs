@@ -84,6 +84,8 @@ pub struct RemoteConfig {
     pub knobs: Option<crate::transport::RuntimeKnobs>,
     /// Authenticated relays permitted to preserve third-party ordered origins.
     pub ordered_relays: std::collections::BTreeSet<String>,
+    /// Opt-in local-filesystem receiver ownership; opened and synced by `new`.
+    pub ordered_receiver_state: Option<parrot_config::OrderedReceiverState>,
     pub swim: crate::swim::SwimConfig,
 }
 
@@ -139,6 +141,7 @@ impl RemoteConfig {
             direct_addr: None,
             knobs: None,
             ordered_relays: Default::default(),
+            ordered_receiver_state: None,
             swim: Default::default(),
         }
     }
@@ -178,6 +181,16 @@ impl RemoteConfig {
         self.ordered_relays = nodes.into_iter().collect();
         self
     }
+    /// Enable cooperative restart recovery in one stable local state directory.
+    /// Configure before accepting sessions; copying a live directory/volume or
+    /// using distributed filesystem locks cannot certify old worker retirement.
+    pub fn with_ordered_receiver_state(
+        mut self,
+        state: parrot_config::OrderedReceiverState,
+    ) -> Self {
+        self.ordered_receiver_state = Some(state);
+        self
+    }
 
     /// 声明可直拨地址（方案 A：spoke 有 listen 端口时设置——hub 会把它
     /// 以 ROUTE_HINT 注入给通信对端，促成 spoke 两两直连）。
@@ -207,6 +220,7 @@ impl RemoteConfig {
             direct_addr: None,
             knobs: None,
             ordered_relays: Default::default(),
+            ordered_receiver_state: None,
             swim: Default::default(),
         }
     }
@@ -233,6 +247,7 @@ impl RemoteConfig {
             direct_addr: None,
             knobs: None,
             ordered_relays: Default::default(),
+            ordered_receiver_state: None,
             swim: Default::default(),
         }
     }
@@ -379,6 +394,7 @@ impl RemoteConfig {
         cfg.topology.relay_fallback = r.topology.relay_fallback;
         cfg.extra_caps = r.remote.extra_caps;
         cfg.ordered_relays = r.remote.reorder.ordered_relays.iter().cloned().collect();
+        cfg.ordered_receiver_state = r.remote.reorder.receiver_state.clone();
         cfg.knobs = Some(crate::transport::RuntimeKnobs {
             connection_capacity: r.remote.transport.connection_capacity,
             handshake_capacity: r.remote.transport.handshake_capacity,
@@ -482,7 +498,7 @@ impl RemoteConfig {
                 | if self.scheme == "mem"
                     || !matches!(&self.security, crate::security::RemoteSecurity::Local)
                 {
-                    crate::handshake::caps::ORDERED_TELL
+                    crate::handshake::caps::ORDERED_TELL | crate::handshake::caps::ORDERED_RECOVERY
                 } else {
                     0
                 }
@@ -514,6 +530,9 @@ impl RemoteConfig {
     }
 
     fn validate(&self) -> Result<(), RemoteError> {
+        if let Some(state) = &self.ordered_receiver_state {
+            state.validate().map_err(RemoteError::Transport)?;
+        }
         if self.ordered_relays.len() > 4096
             || self
                 .ordered_relays
@@ -795,6 +814,12 @@ impl RemoteActorSystem {
             config.knobs = Some(knobs);
         }
         config.validate()?;
+        let receiver_owner = config
+            .ordered_receiver_state
+            .as_ref()
+            .map(|state| crate::ordered::recovery::ReceiverOwner::open(state, &config.node_id))
+            .transpose()
+            .map_err(RemoteError::Transport)?;
         let callbacks = Arc::new(CallbackRegistry::new(config.callback_capacity));
         let ingress = Arc::new(
             Ingress::with_ask_limits(
@@ -813,6 +838,9 @@ impl RemoteActorSystem {
         ingress
             .set_ordered_relays(config.ordered_relays.clone())
             .map_err(RemoteError::Transport)?;
+        if let Some(owner) = receiver_owner {
+            ingress.set_ordered_receiver_owner(owner);
+        }
         // 配置切面：重排旋钮下发（None=默认 250ms/1024，等价迁移前行为）
         if let Some(k) = &config.knobs {
             ingress.set_reorder_knobs(

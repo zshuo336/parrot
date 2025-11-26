@@ -2393,6 +2393,15 @@ impl Ingress {
                 } else {
                     let mut out = frame.clone();
                     out.header.correlation_id = original_cid;
+                    if out.header.frame_type == frame_type::REPLY
+                        && out.type_key == crate::ordered::RECEIPT_KEY
+                        && !back.supports_ordered_recovery()
+                    {
+                        if let Ok(mut receipt) = crate::ordered::Receipt::decode(&out.payload) {
+                            receipt.epoch = None;
+                            out.payload = receipt.encode();
+                        }
+                    }
                     back.send_reply(out);
                 }
                 tracing::debug!(cid, original_cid, expired, "relayed reply finalized");
@@ -4259,6 +4268,47 @@ mod tests {
             ErrCode::Timeout
         );
         assert!(ingress.relay_table.is_empty());
+    }
+
+    #[test]
+    fn ordered_receipt_relay_keeps_v2_compatible_across_a_legacy_return_hop() {
+        use crate::{handshake::caps, ordered::Receipt};
+        for recovery in [false, true] {
+            let ingress = Ingress::new(Arc::new(TestLookup), Arc::new(CallbackRegistry::default()));
+            let (tx, mut replies) = tokio::sync::mpsc::channel(4);
+            let source = FrameSender::capability_test_sender(
+                tx,
+                "source",
+                caps::BIN | caps::ORDERED_TELL | if recovery { caps::ORDERED_RECOVERY } else { 0 },
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            let target = FrameSender::new(tx, "target");
+            let receipt = Receipt {
+                active: false,
+                receiver: [4; 16],
+                ticket: [3; 16],
+                generation: 7,
+                lease_ms: crate::ordered::LEASE_MS,
+                epoch: Some(2),
+            };
+            let frame = Frame::reply(1, "", crate::ordered::RECEIPT_KEY, receipt.encode());
+            assert!(ingress.relay_table.insert(1, 101, source, &target));
+            assert!(ingress.relay_reply(&frame, &target));
+            let forwarded = replies.try_recv().unwrap();
+            assert_eq!(forwarded.header.correlation_id, 101);
+            assert_eq!(&forwarded.payload[..46], &frame.payload[..46]);
+            assert_eq!(
+                forwarded.payload.len(),
+                if recovery { 54 } else { 46 },
+                "unnegotiated receiver epoch leaked across a legacy relay hop"
+            );
+            assert_eq!(
+                Receipt::decode(&forwarded.payload).unwrap().epoch,
+                recovery.then_some(2)
+            );
+            assert_eq!(frame.payload.len(), 54);
+            assert!(ingress.relay_table.is_empty());
+        }
     }
 
     #[test]

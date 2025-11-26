@@ -147,21 +147,19 @@ impl Outbound {
                     stream: state.stream,
                     ticket: grant.receipt.ticket,
                 };
-                let retired = request(
-                    &grant.sender,
+                retire(
+                    grant,
+                    sender,
                     callbacks,
-                    destination,
-                    &frame.path,
-                    frame.header.hop_limit,
+                    Route {
+                        destination,
+                        path: &frame.path,
+                        hops: frame.header.hop_limit,
+                    },
                     &control,
                     Instant::now() + Duration::from_secs(5),
                 )
-                .await
-                .map_err(|(code, detail)| code.to_actor_error(detail))?;
-                if !grant.retired_by(&retired) {
-                    return Err(ErrCode::ProtocolViolation
-                        .to_actor_error("ordered sequence retirement identity differs".into()));
-                }
+                .await?;
             }
             state.stream = identity();
             state.grant = None;
@@ -213,21 +211,19 @@ impl Outbound {
                     stream: state.stream,
                     ticket: previous.receipt.ticket,
                 };
-                let retired = request(
-                    &previous.sender,
+                retire(
+                    previous,
+                    sender,
                     callbacks,
-                    destination,
-                    &frame.path,
-                    frame.header.hop_limit,
+                    Route {
+                        destination,
+                        path: &frame.path,
+                        hops: frame.header.hop_limit,
+                    },
                     &closing,
                     deadline,
                 )
-                .await
-                .map_err(|(code, detail)| code.to_actor_error(detail))?;
-                if !previous.retired_by(&retired) {
-                    return Err(ErrCode::ProtocolViolation
-                        .to_actor_error("ordered predecessor retirement identity differs".into()));
-                }
+                .await?;
             }
             if !receipt.active {
                 if state.grant.as_ref().is_none_or(|grant| {
@@ -260,6 +256,7 @@ impl Outbound {
                     || committed.ticket != receipt.ticket
                     || committed.generation != receipt.generation
                     || committed.receiver != receipt.receiver
+                    || committed.epoch != receipt.epoch
                 {
                     return Err(ErrCode::ProtocolViolation
                         .to_actor_error("ordered commit receipt differs from challenge".into()));
@@ -343,28 +340,19 @@ impl Outbound {
                         stream: state.stream,
                         ticket: grant.receipt.ticket,
                     };
-                    let receipt = request(
-                        if grant.sender.is_closed() {
-                            sender
-                        } else {
-                            &grant.sender
-                        },
+                    retire(
+                        grant,
+                        sender,
                         callbacks,
-                        destination,
-                        path,
-                        crate::frame::DEFAULT_HOP_LIMIT,
+                        Route {
+                            destination,
+                            path,
+                            hops: crate::frame::DEFAULT_HOP_LIMIT,
+                        },
                         &control,
                         deadline,
                     )
-                    .await;
-                    match receipt {
-                        Ok(receipt) if grant.retired_by(&receipt) => {}
-                        Err((code, detail)) => return Err(code.to_actor_error(detail)),
-                        _ => {
-                            return Err(ErrCode::ProtocolViolation
-                                .to_actor_error("invalid ordered close receipt".into()))
-                        }
-                    }
+                    .await?;
                 }
                 state.closed = true;
                 let mut lanes = self.lanes.lock().unwrap();
@@ -381,6 +369,74 @@ impl Outbound {
         })
         .await
     }
+}
+
+struct Route<'a> {
+    destination: &'a str,
+    path: &'a str,
+    hops: u8,
+}
+
+async fn retire(
+    grant: &Grant,
+    current: &FrameSender,
+    callbacks: &CallbackRegistry,
+    route: Route<'_>,
+    control: &Control,
+    deadline: Instant,
+) -> ActorResult<()> {
+    if let Some(epoch) = grant
+        .receipt
+        .epoch
+        .filter(|_| current.supports_ordered_recovery())
+    {
+        let mut recovery = control.clone();
+        recovery.operation = Operation::Recover {
+            receiver: grant.receipt.receiver,
+            epoch,
+        };
+        match request(
+            current,
+            callbacks,
+            route.destination,
+            route.path,
+            route.hops,
+            &recovery,
+            deadline,
+        )
+        .await
+        {
+            Ok(receipt) if grant.retired_by(&receipt) => return Ok(()),
+            Ok(_) => {
+                return Err(ErrCode::ProtocolViolation
+                    .to_actor_error("ordered recovery identity differs".into()))
+            }
+            Err((ErrCode::NotRemotable | ErrCode::Forbidden, _)) => {}
+            Err((code, detail)) => return Err(code.to_actor_error(detail)),
+        }
+    }
+    let sender = if grant.sender.is_closed() {
+        current
+    } else {
+        &grant.sender
+    };
+    let receipt = request(
+        sender,
+        callbacks,
+        route.destination,
+        route.path,
+        route.hops,
+        control,
+        deadline,
+    )
+    .await
+    .map_err(|(code, detail)| code.to_actor_error(detail))?;
+    if !grant.retired_by(&receipt) {
+        return Err(
+            ErrCode::ProtocolViolation.to_actor_error("ordered retirement identity differs".into())
+        );
+    }
+    Ok(())
 }
 
 async fn request(
@@ -410,8 +466,13 @@ async fn request(
             biased;
             _ = sender.closed() => Err((ErrCode::ConnectionLost, "ordered control connection closed".into())),
             reply = receiver => match reply {
-                Ok(ReplyPayload::Ok(bytes, key)) if key == RECEIPT_KEY => Receipt::decode(&bytes)
-                    .map_err(|detail| (ErrCode::ProtocolViolation, detail)),
+                Ok(ReplyPayload::Ok(bytes, key)) if key == RECEIPT_KEY => {
+                    let receipt = Receipt::decode(&bytes).map_err(|detail| (ErrCode::ProtocolViolation, detail))?;
+                    if receipt.epoch.is_some() && !sender.supports_ordered_recovery() {
+                        return Err((ErrCode::ProtocolViolation, "unnegotiated ordered recovery receipt".into()));
+                    }
+                    Ok(receipt)
+                },
                 Ok(ReplyPayload::Err(code, detail)) => Err((code, detail)),
                 _ => Err((ErrCode::ProtocolViolation, "invalid ordered control response".into())),
             },

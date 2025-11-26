@@ -6,6 +6,47 @@ fn default_node_reorder_limits_are_finite() {
     assert_eq!(resolved.remote.reorder.stream_capacity, 256);
     assert_eq!(resolved.remote.reorder.frame_capacity, 4096);
     assert_eq!(resolved.remote.reorder.byte_capacity, 64 * 1024 * 1024);
+    assert!(resolved.remote.reorder.receiver_state.is_none());
+}
+
+#[test]
+fn receiver_state_binding_merges_atomically_and_roundtrips() {
+    let source = "[remote.reorder.receiver_state]\ndirectory='/var/lib/parrot/receiver-a'\nrealm='cluster-a'\n";
+    let fallback: ParrotConfig = toml::from_str(source).unwrap();
+    let mut override_config = ParrotConfig::builder();
+    override_config.remote.reorder.receiver_state = Some(parrot_config::OrderedReceiverState {
+        directory: "/var/lib/parrot/receiver-b".into(),
+        realm: "cluster-b".into(),
+    });
+    let config = override_config.with_fallback(fallback);
+    let copied: ParrotConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        copied.build().unwrap().remote.reorder.receiver_state,
+        config.remote.reorder.receiver_state
+    );
+    for invalid in [
+        "directory='relative'\nrealm='cluster'",
+        "directory='/absolute'\nrealm=''",
+        "directory='/absolute'\nrealm='has/slash'",
+    ] {
+        let config: ParrotConfig =
+            toml::from_str(&format!("[remote.reorder.receiver_state]\n{invalid}\n")).unwrap();
+        assert!(config
+            .build()
+            .unwrap_err()
+            .to_string()
+            .contains("remote.reorder.receiver_state"));
+    }
+    for invalid in [
+        "directory='/absolute'",
+        "realm='cluster'",
+        "directory='/absolute'\nrealm='cluster'\nunknown=1",
+    ] {
+        assert!(toml::from_str::<ParrotConfig>(&format!(
+            "[remote.reorder.receiver_state]\n{invalid}\n"
+        ))
+        .is_err());
+    }
 }
 
 #[test]

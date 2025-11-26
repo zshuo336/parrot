@@ -212,6 +212,24 @@ pub struct ReorderSection {
     pub frame_capacity: Option<usize>,
     pub byte_capacity: Option<usize>,
     pub ordered_relays: Option<Vec<String>>,
+    pub receiver_state: Option<OrderedReceiverState>,
+}
+
+/// Cooperative, stable local directory for ordered receiver restart ownership.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderedReceiverState {
+    pub directory: std::path::PathBuf,
+    pub realm: String,
+}
+impl OrderedReceiverState {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.directory.is_absolute() {
+            return Err("ordered receiver state directory must be absolute".into());
+        }
+        endpoint::validate_node_id(&self.realm)
+            .map_err(|e| format!("invalid ordered receiver realm: {e}"))
+    }
 }
 
 /// `[remote.codec]` 编解码协商。
@@ -514,6 +532,7 @@ pub struct ReorderResolved {
     pub frame_capacity: usize,
     pub byte_capacity: usize,
     pub ordered_relays: Vec<String>,
+    pub receiver_state: Option<OrderedReceiverState>,
 }
 
 // ============================================================================
@@ -589,7 +608,7 @@ impl ParrotConfig {
             max_context_tasks, default_ask_timeout_ms, shutdown_timeout_ms);
         merge!(self.remote.node, fallback.remote.node; node_id, bind, topology_role, direct_addr, seeds, scheme);
         merge!(self.remote.transport, fallback.remote.transport; connection_capacity, handshake_capacity, heartbeat_interval_ms, heartbeat_max_loss, outbound_queue, inbound_ask_capacity, inbound_ask_bytes, inbound_dispatch_capacity, inbound_dispatch_per_connection, inbound_dispatch_bytes, default_hop_limit);
-        merge!(self.remote.reorder, fallback.remote.reorder; gap_timeout_ms, buffer_cap, stream_capacity, frame_capacity, byte_capacity, ordered_relays);
+        merge!(self.remote.reorder, fallback.remote.reorder; gap_timeout_ms, buffer_cap, stream_capacity, frame_capacity, byte_capacity, ordered_relays, receiver_state);
         merge!(self.remote.codec, fallback.remote.codec; extra_caps);
         merge!(self.remote.security, fallback.remote.security; mode, cert_path, key_path, ca_path, admin_nodes);
         merge!(self.remote.receptionist, fallback.remote.receptionist; default_deny, roles, relays, max_subscriptions, max_subscription_bytes, max_registrations, max_registration_bytes);
@@ -707,6 +726,12 @@ impl ParrotConfig {
                     reason: "must contain at most 4096 valid relay node IDs".into(),
                 });
             }
+        }
+        if let Some(state) = &self.remote.reorder.receiver_state {
+            state.validate().map_err(|reason| ConfigError::Invalid {
+                key: "remote.reorder.receiver_state".into(),
+                reason,
+            })?;
         }
         if let Some(v) = tr.heartbeat_interval_ms {
             if v == 0 {
@@ -930,6 +955,7 @@ impl ParrotConfig {
                         .ordered_relays
                         .clone()
                         .unwrap_or_default(),
+                    receiver_state: self.remote.reorder.receiver_state.clone(),
                 },
                 extra_caps: self.remote.codec.extra_caps.unwrap_or(0),
             },
@@ -1140,6 +1166,14 @@ impl ParrotConfig {
         m.insert(
             "remote.reorder.ordered_relays",
             "可为有序TELL原始来源背书的已认证中继节点（默认空）",
+        );
+        m.insert(
+            "remote.reorder.receiver_state.directory",
+            "可选接收实例恢复目录，须为稳定本机绝对路径",
+        );
+        m.insert(
+            "remote.reorder.receiver_state.realm",
+            "恢复目录绑定的独立集群作用域，须与node身份共同保持",
         );
         m.insert(
             "remote.codec.extra_caps",
@@ -1591,6 +1625,9 @@ stream_capacity = 17
 frame_capacity = 257
 byte_capacity = 262144
 ordered_relays = ["hub-1", "relay-1"]
+[remote.reorder.receiver_state]
+directory = "/var/lib/parrot/ordered-receiver"
+realm = "contract-cluster"
 
 [remote.codec]
 extra_caps = 2

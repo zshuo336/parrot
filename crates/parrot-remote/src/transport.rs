@@ -64,6 +64,18 @@ impl ConnectionIdentity {
 
 impl FrameSender {
     #[cfg(test)]
+    pub(crate) fn capability_test_sender(
+        tx: mpsc::Sender<Frame>,
+        node: &str,
+        capabilities: u32,
+    ) -> Self {
+        let mut sender = Self::new(tx, node);
+        sender.peer_capabilities = capabilities;
+        sender.negotiated_capabilities = capabilities;
+        sender
+    }
+
+    #[cfg(test)]
     pub(crate) fn segmented_test_sender(tx: mpsc::Sender<Frame>, max_frame_len: u32) -> Self {
         let mut sender = Self::new(tx, "segmented-test-peer");
         sender.negotiated_capabilities = crate::handshake::caps::RECEPTIONIST_SEGMENTS;
@@ -159,6 +171,10 @@ impl FrameSender {
     pub fn supports_ordered_tell(&self) -> bool {
         self.negotiated_capabilities & crate::handshake::caps::ORDERED_TELL != 0
     }
+    pub fn supports_ordered_recovery(&self) -> bool {
+        self.supports_ordered_tell()
+            && self.negotiated_capabilities & crate::handshake::caps::ORDERED_RECOVERY != 0
+    }
 
     /// Admin parents are separately negotiated so business-only peers keep
     /// receiving their original SYSTEM_EVENT payload and flags.
@@ -188,6 +204,14 @@ impl FrameSender {
     }
 
     fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+        if frame.type_key == crate::ordered::CONTROL_KEY
+            && frame.borrowed_ask_payload()?.starts_with(&[2, 3])
+            && !self.supports_ordered_recovery()
+        {
+            return Err(RemoteError::Transport(
+                "ordered recovery was not negotiated on this link".into(),
+            ));
+        }
         if matches!(
             frame.type_key.as_str(),
             crate::ordered::CONTROL_KEY | crate::ordered::DATA_KEY

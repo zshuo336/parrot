@@ -34,6 +34,8 @@ struct Pending {
 
 struct Lease {
     receiver: Identity,
+    epoch: Option<u64>,
+    _owner: Option<Arc<ordered::recovery::ReceiverOwner>>,
     source: String,
     incarnation: Identity,
     stream: Identity,
@@ -55,6 +57,7 @@ impl Lease {
         Receipt {
             active,
             receiver: self.receiver,
+            epoch: self.epoch,
             ticket: self.ticket,
             generation: self.generation,
             lease_ms: ordered::LEASE_MS,
@@ -114,6 +117,7 @@ struct Source {
 
 pub(super) struct Sessions {
     receiver: Identity,
+    owner: Option<Arc<ordered::recovery::ReceiverOwner>>,
     sources: HashMap<String, Source>,
     capacity: usize,
 }
@@ -121,6 +125,7 @@ impl Sessions {
     pub fn new(capacity: usize) -> Self {
         Self {
             receiver: ordered::identity(),
+            owner: None,
             sources: HashMap::new(),
             capacity,
         }
@@ -216,6 +221,13 @@ impl Drop for Registration {
 }
 
 impl Ingress {
+    pub(crate) fn set_ordered_receiver_owner(&self, owner: Arc<ordered::recovery::ReceiverOwner>) {
+        let mut sessions = self.ordered.lock().unwrap();
+        assert!(sessions.sources.is_empty() && sessions.owner.is_none());
+        sessions.receiver = owner.receiver();
+        sessions.owner = Some(owner);
+    }
+
     /// Grant only authenticated relays permission to preserve an ordered origin.
     pub fn set_ordered_relays(
         &self,
@@ -260,9 +272,9 @@ impl Ingress {
     }
 
     pub(super) fn close_ordered(&self) {
-        let retired = {
+        let (retired, _owner) = {
             let mut sessions = self.ordered.lock().unwrap();
-            std::mem::take(&mut sessions.sources)
+            (std::mem::take(&mut sessions.sources), sessions.owner.take())
         };
         for source in retired.into_values() {
             for lease in source.active.into_iter().chain(source.retiring).chain(
@@ -283,6 +295,21 @@ impl Ingress {
                 .map_err(|_| ErrCode::ProtocolViolation)?;
             let control = Control::decode(&payload).map_err(|_| ErrCode::ProtocolViolation)?;
             self.ordered_origin(&control.source, &frame, back)?;
+            if self
+                .ordered
+                .lock()
+                .unwrap()
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !owner.valid_process())
+            {
+                return Err(ErrCode::Stopped);
+            }
+            if matches!(control.operation, Operation::Recover { .. })
+                && !back.supports_ordered_recovery()
+            {
+                return Err(ErrCode::NotRemotable);
+            }
             if self.is_remote_target(&frame.path) {
                 self.try_relay_request(&frame, back, frame.header.correlation_id)
                     .await;
@@ -309,16 +336,39 @@ impl Ingress {
                 Operation::Open => self.open_ordered(control).await.map(Some),
                 Operation::Commit => self.commit_ordered(control).await.map(Some),
                 Operation::Close => self.close_ordered_lease(control).await.map(Some),
+                Operation::Recover { receiver, epoch } => {
+                    let sessions = self.ordered.lock().unwrap();
+                    if self.reorder_closed.load(Ordering::Acquire) {
+                        return Err(ErrCode::Stopped);
+                    }
+                    let owner = sessions.owner.as_ref().ok_or(ErrCode::NotRemotable)?;
+                    if !owner.proves_retired(receiver, epoch) {
+                        return Err(ErrCode::Forbidden);
+                    }
+                    Ok(Some(Receipt {
+                        active: false,
+                        receiver,
+                        ticket: control.ticket,
+                        generation: 1,
+                        lease_ms: ordered::LEASE_MS,
+                        epoch: Some(epoch),
+                    }))
+                }
             }
         }
         .await;
         let response = match result {
-            Ok(Some(receipt)) => Frame::reply(
-                frame.header.correlation_id,
-                "",
-                ordered::RECEIPT_KEY,
-                receipt.encode(),
-            ),
+            Ok(Some(mut receipt)) => {
+                if !back.supports_ordered_recovery() {
+                    receipt.epoch = None;
+                }
+                Frame::reply(
+                    frame.header.correlation_id,
+                    "",
+                    ordered::RECEIPT_KEY,
+                    receipt.encode(),
+                )
+            }
             Ok(None) => return,
             Err(code) => Frame::reply_err(
                 frame.header.correlation_id,
@@ -338,6 +388,7 @@ impl Ingress {
             }
             sessions.prune_challenges();
             let receiver = sessions.receiver;
+            let epoch = sessions.owner.as_ref().map(|owner| owner.epoch());
             if !sessions.sources.contains_key(&control.source)
                 && sessions.sources.len() >= sessions.capacity
             {
@@ -369,6 +420,7 @@ impl Ingress {
                     return Ok(Receipt {
                         active: false,
                         receiver,
+                        epoch,
                         ticket: challenge.control.ticket,
                         generation: challenge.generation,
                         lease_ms: ordered::LEASE_MS,
@@ -382,6 +434,7 @@ impl Ingress {
                 let receipt = Receipt {
                     active: false,
                     receiver,
+                    epoch,
                     ticket: control.ticket,
                     generation: source.generation,
                     lease_ms: ordered::LEASE_MS,
@@ -406,6 +459,7 @@ impl Ingress {
                 return Err(ErrCode::Stopped);
             }
             let receiver = sessions.receiver;
+            let owner = sessions.owner.clone();
             let source = sessions
                 .sources
                 .get_mut(&control.source)
@@ -438,6 +492,8 @@ impl Ingress {
                 let (tx, rx) = mpsc::channel(256);
                 let lease = Arc::new(Lease {
                     receiver,
+                    epoch: owner.as_ref().map(|owner| owner.epoch()),
+                    _owner: owner,
                     source: control.source.clone(),
                     incarnation: control.incarnation,
                     stream: control.stream,
@@ -506,9 +562,11 @@ impl Ingress {
                 return Err(ErrCode::Stopped);
             }
             let receiver = sessions.receiver;
+            let epoch = sessions.owner.as_ref().map(|owner| owner.epoch());
             let absent = |generation| Receipt {
                 active: false,
                 receiver,
+                epoch,
                 ticket: control.ticket,
                 generation,
                 lease_ms: ordered::LEASE_MS,
@@ -621,6 +679,14 @@ impl Ingress {
         }
         let lease = {
             let sessions = self.ordered.lock().unwrap();
+            if sessions
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !owner.valid_process())
+            {
+                DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             sessions
                 .sources
                 .get(&data.source)
