@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use parrot_api::address::ActorPath;
 use parrot_api::types::BoxedMessage;
 
+use crate::owned_payload::notification;
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::processor::ProcessorInterface;
@@ -164,7 +165,7 @@ impl CloseState {
             status.error = error;
             status.complete = true;
         }
-        self.complete.notify_waiters();
+        notification::all(&self.complete);
     }
 
     pub(crate) async fn wait(&self) {
@@ -182,7 +183,7 @@ impl CloseState {
                 }
                 return;
             }
-            notified.await;
+            notification::observe(notified).await;
         }
     }
 }

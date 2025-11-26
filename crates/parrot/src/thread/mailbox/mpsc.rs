@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Notify;
 
+use crate::owned_payload::notification;
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
@@ -124,7 +125,7 @@ impl MpscMailbox {
     /// Signal work availability + wake hook (shared by all push paths).
     fn signal_ready_and_wake(&self) {
         self.is_ready.store(true, Ordering::SeqCst);
-        self.notify.notify_one();
+        notification::one(&self.notify);
         self.fire_wake_hook();
     }
     fn normal_len(&self) -> usize {
@@ -233,7 +234,7 @@ impl MpscMailbox {
                 }
                 return super::finish_push(result, item, evicted).await;
             }
-            available.await;
+            notification::observe(available).await;
         }
     }
 }
@@ -367,7 +368,7 @@ impl Mailbox for MpscMailbox {
                 .or_else(|| self.pop_normal())
         };
         if item.is_some() {
-            self.capacity_notify.notify_waiters();
+            notification::all(&self.capacity_notify);
         }
         item
     }
@@ -383,7 +384,7 @@ impl Mailbox for MpscMailbox {
     async fn signal_ready(&self) {
         // Set the ready flag and notify any waiting processors
         self.is_ready.store(true, Ordering::SeqCst);
-        self.notify.notify_one();
+        notification::one(&self.notify);
     }
 
     fn path(&self) -> &ActorPath {
@@ -400,63 +401,67 @@ impl Mailbox for MpscMailbox {
 
     fn seal(&self) {
         self.is_closed.store(true, Ordering::SeqCst);
-        self.capacity_notify.notify_waiters();
-        self.notify.notify_waiters();
+        notification::all(&self.capacity_notify);
+        notification::all(&self.notify);
     }
 
     async fn close(&self) {
-        self.seal();
-        let mut reservation = None;
-        let extracted = loop {
-            let attempt = {
-                let _gate = self.enqueue_gate.lock().unwrap();
-                let mut receiver = self.receiver.lock().unwrap();
-                let mut high = self.high_lane.lock().unwrap();
-                let has_values =
-                    receiver.as_ref().is_some_and(|queue| !queue.is_empty()) || !high.is_empty();
-                match self.close_state.claim(has_values, reservation.is_some()) {
-                    super::CloseAttempt::Owned(()) => {
-                        super::CloseAttempt::Owned((receiver.take(), std::mem::take(&mut *high)))
+        notification::observe(async {
+            self.seal();
+            let mut reservation = None;
+            let extracted = loop {
+                let attempt = {
+                    let _gate = self.enqueue_gate.lock().unwrap();
+                    let mut receiver = self.receiver.lock().unwrap();
+                    let mut high = self.high_lane.lock().unwrap();
+                    let has_values = receiver.as_ref().is_some_and(|queue| !queue.is_empty())
+                        || !high.is_empty();
+                    match self.close_state.claim(has_values, reservation.is_some()) {
+                        super::CloseAttempt::Owned(()) => super::CloseAttempt::Owned((
+                            receiver.take(),
+                            std::mem::take(&mut *high),
+                        )),
+                        super::CloseAttempt::Reservation => super::CloseAttempt::Reservation,
+                        super::CloseAttempt::Observing => super::CloseAttempt::Observing,
                     }
-                    super::CloseAttempt::Reservation => super::CloseAttempt::Reservation,
-                    super::CloseAttempt::Observing => super::CloseAttempt::Observing,
+                };
+                match attempt {
+                    super::CloseAttempt::Owned(values) => break Some(values),
+                    super::CloseAttempt::Observing => break None,
+                    super::CloseAttempt::Reservation => {
+                        reservation = self.close_state.reserve().await;
+                        if reservation.is_none() {
+                            break None;
+                        }
+                    }
                 }
             };
-            match attempt {
-                super::CloseAttempt::Owned(values) => break Some(values),
-                super::CloseAttempt::Observing => break None,
-                super::CloseAttempt::Reservation => {
-                    reservation = self.close_state.reserve().await;
-                    if reservation.is_none() {
-                        break None;
-                    }
-                }
-            }
-        };
-        let Some((receiver, high)) = extracted else {
-            drop(reservation);
+            let Some((receiver, high)) = extracted else {
+                drop(reservation);
+                self.close_state.wait().await;
+                return;
+            };
+            let notifications = receiver.as_ref().map(Receiver::disconnect_deferred);
+            // Flume keeps queued values in the shared channel even after the last
+            // receiver disconnects. Explicitly take them so they are disposed by
+            // this cleanup operation, rather than by a later sender/mailbox drop.
+            let normal = receiver
+                .as_ref()
+                .map(|receiver| receiver.drain().collect::<Vec<_>>())
+                .unwrap_or_default();
+            drop(receiver);
+            // Only the claimed owner executes disconnect callbacks. Concurrent
+            // close callers must also wait for those callbacks before completion.
+            super::retire_on_drop(notifications, "disconnect notification");
+            // User destructors must never run while holding mailbox bookkeeping locks.
+            let drained = normal
+                .into_iter()
+                .chain(high.into_iter().map(|(_, item)| item))
+                .collect();
+            self.close_state.start_drain(drained, reservation);
             self.close_state.wait().await;
-            return;
-        };
-        let notifications = receiver.as_ref().map(Receiver::disconnect_deferred);
-        // Flume keeps queued values in the shared channel even after the last
-        // receiver disconnects. Explicitly take them so they are disposed by
-        // this cleanup operation, rather than by a later sender/mailbox drop.
-        let normal = receiver
-            .as_ref()
-            .map(|receiver| receiver.drain().collect::<Vec<_>>())
-            .unwrap_or_default();
-        drop(receiver);
-        // Only the claimed owner executes disconnect callbacks. Concurrent
-        // close callers must also wait for those callbacks before completion.
-        super::retire_on_drop(notifications, "disconnect notification");
-        // User destructors must never run while holding mailbox bookkeeping locks.
-        let drained = normal
-            .into_iter()
-            .chain(high.into_iter().map(|(_, item)| item))
-            .collect();
-        self.close_state.start_drain(drained, reservation);
-        self.close_state.wait().await;
+        })
+        .await;
     }
 
     async fn is_closed(&self) -> bool {

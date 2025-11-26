@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 
+use crate::owned_payload::notification;
 use crate::thread::mailbox::Mailbox;
 use parrot_api::runtime::LoadBalancingStrategy;
 
@@ -290,7 +291,7 @@ impl SchedulingQueue {
         let admission = state.admission(lane, worker);
         state.append(Entry { mailbox, admission });
         drop(state);
-        self.notify.notify_one();
+        notification::one(&self.notify);
         Ok(())
     }
     pub(crate) fn register(&self, mailbox: &ReadyMailbox) -> bool {
@@ -350,7 +351,7 @@ impl SchedulingQueue {
             }
         }
         drop(state);
-        self.notify.notify_one();
+        notification::one(&self.notify);
         true
     }
     pub(crate) fn unregister(&self, mailbox: &ReadyMailbox) {
@@ -391,7 +392,7 @@ impl SchedulingQueue {
         state.refill(self.max_capacity);
         drop(state);
         drop(removed);
-        self.notify.notify_one();
+        notification::one(&self.notify);
     }
     /// Atomically close admission and transfer ready ownership without invoking
     /// user mailbox methods or destructors under the queue lock.
@@ -418,7 +419,7 @@ impl SchedulingQueue {
                 mailboxes.push(mailbox);
             }
         }
-        self.notify.notify_waiters();
+        notification::all(&self.notify);
         mailboxes
     }
     #[cfg(test)]
@@ -465,7 +466,7 @@ impl SchedulingQueue {
             if let Some(mailbox) = self.try_pop() {
                 return mailbox;
             }
-            notified.await;
+            notification::observe(notified).await;
         }
     }
     pub fn len(&self) -> usize {

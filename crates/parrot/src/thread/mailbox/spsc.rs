@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, Notify};
 
+use crate::owned_payload::notification;
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
@@ -24,7 +25,7 @@ pub struct SpscMailbox {
     /// The sending half of the channel
     sender: Sender<BoxedMessage>,
     /// The receiving half of the channel, wrapped in a Mutex for interior mutability
-    receiver: Mutex<Receiver<BoxedMessage>>,
+    receiver: Mutex<Option<Receiver<BoxedMessage>>>,
     /// Path of the actor this mailbox belongs to
     path: ActorPath,
     /// Capacity of the mailbox
@@ -64,7 +65,7 @@ impl SpscMailbox {
 
         Self {
             sender,
-            receiver: Mutex::new(receiver),
+            receiver: Mutex::new(Some(receiver)),
             path,
             capacity,
             notify,
@@ -98,11 +99,17 @@ impl SpscMailbox {
 impl Drop for SpscMailbox {
     fn drop(&mut self) {
         self.is_closed.store(true, Ordering::SeqCst);
-        let receiver = self.receiver.get_mut();
-        receiver.close();
+        let receiver = self.receiver.get_mut().take();
         let mut drained = Vec::new();
-        while let Ok(message) = receiver.try_recv() {
-            drained.push(message);
+        if let Some(mut receiver) = receiver {
+            notification::call(|| receiver.close());
+            loop {
+                let (result, wakes) = receiver.try_recv_deferred();
+                super::retire_on_drop(wakes, "capacity notification");
+                let Ok(message) = result else { break };
+                drained.push(message);
+            }
+            super::retire_on_drop(receiver, "receiver");
         }
         for message in drained {
             super::retire_on_drop(message, "message");
@@ -132,6 +139,7 @@ impl Mailbox for SpscMailbox {
         use tokio::sync::mpsc::error::TrySendError;
         let mut msg = Some(super::Input::unbound(msg));
         let mut evicted = None;
+        let mut replacement_wakes = None;
         let result = async {
             let closed = self.closed_notify.notified();
             tokio::pin!(closed);
@@ -140,21 +148,27 @@ impl Mailbox for SpscMailbox {
                 return Err(MailboxError::Closed);
             }
             if matches!(strategy, BackpressureStrategy::Block) {
-                let permit = tokio::select! {
-                    biased;
-                    _ = closed => return Err(MailboxError::Closed),
-                    permit = self.sender.reserve() => permit.map_err(|_| MailboxError::Closed)?,
+                let permit = match self.sender.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(TrySendError::Closed(())) => return Err(MailboxError::Closed),
+                    Err(TrySendError::Full(())) => notification::observe(async {
+                        tokio::select! {
+                            biased;
+                            _ = closed => Err(MailboxError::Closed),
+                            permit = self.sender.reserve() => permit.map_err(|_| MailboxError::Closed),
+                        }
+                    }).await?,
                 };
                 // Commit under the same receiver lock as close/drain. A pending
                 // reservation must not publish after close has already returned.
-                let receiver = self.receiver.lock().await;
+                let receiver = notification::lock(&self.receiver).await;
                 if self.closed() {
                     return Err(MailboxError::Closed);
                 }
                 permit.send(msg.take().unwrap().take());
                 drop(receiver);
             } else {
-                let mut receiver = self.receiver.lock().await;
+                let mut receiver = notification::lock(&self.receiver).await;
                 if self.closed() {
                     return Err(MailboxError::Closed);
                 }
@@ -162,8 +176,23 @@ impl Mailbox for SpscMailbox {
                     Err(TrySendError::Full(msg))
                         if matches!(strategy, BackpressureStrategy::DropOldest) =>
                     {
-                        evicted = receiver.try_recv().ok().map(super::Input::unbound);
-                        self.sender.try_send(msg)
+                        if let Some(receiver) = receiver.as_mut() {
+                            let (value, wakes) = receiver.try_recv_deferred();
+                            if let Ok(value) = value {
+                                evicted = Some(super::Input::unbound(value));
+                                match wakes.replace(msg) {
+                                    Ok(wakes) => {
+                                        replacement_wakes = Some(wakes);
+                                        Ok(())
+                                    }
+                                    Err(tokio::sync::mpsc::error::SendError(msg)) => Err(TrySendError::Closed(msg)),
+                                }
+                            } else {
+                                Err(TrySendError::Full(msg))
+                            }
+                        } else {
+                            Err(TrySendError::Closed(msg))
+                        }
                     }
                     other => other,
                 };
@@ -195,8 +224,9 @@ impl Mailbox for SpscMailbox {
             Ok(())
         }
         .await;
+        super::retire_on_drop(replacement_wakes, "replacement notification");
         if result.is_ok() {
-            self.notify.notify_one();
+            notification::one(&self.notify);
             self.fire_wake_hook();
         }
         super::finish_push(result, msg, evicted).await
@@ -204,21 +234,25 @@ impl Mailbox for SpscMailbox {
 
     async fn pop(&self) -> Option<BoxedMessage> {
         // Get exclusive access to the receiver
-        let mut receiver = self.receiver.lock().await;
-
-        // Try to receive a message without blocking: the `Mailbox` contract
-        // requires `pop` to return `None` immediately when empty. Waiting for
-        // new messages is the scheduling queue's responsibility (`Notify`).
-        receiver.try_recv().ok()
+        let (result, wakes) = {
+            let mut receiver = notification::lock(&self.receiver).await;
+            let receiver = receiver.as_mut()?;
+            receiver.try_recv_deferred()
+        };
+        super::retire_on_drop(wakes, "capacity notification");
+        result.ok()
     }
 
     async fn is_empty(&self) -> bool {
-        self.receiver.lock().await.is_empty()
+        notification::lock(&self.receiver)
+            .await
+            .as_ref()
+            .is_none_or(Receiver::is_empty)
     }
 
     async fn signal_ready(&self) {
         // Notify any waiting consumers
-        self.notify.notify_one();
+        notification::one(&self.notify);
     }
 
     fn path(&self) -> &ActorPath {
@@ -230,54 +264,68 @@ impl Mailbox for SpscMailbox {
     }
 
     async fn len(&self) -> usize {
-        self.receiver.lock().await.len()
+        notification::lock(&self.receiver)
+            .await
+            .as_ref()
+            .map_or(0, Receiver::len)
     }
 
     fn seal(&self) {
         self.is_closed.store(true, Ordering::SeqCst);
-        self.closed_notify.notify_waiters();
-        self.notify.notify_waiters();
+        notification::all(&self.closed_notify);
+        notification::all(&self.notify);
     }
 
     async fn close(&self) {
-        self.seal();
-        let mut reservation = None;
-        let drained = loop {
-            let attempt = {
-                let mut receiver = self.receiver.lock().await;
-                receiver.close();
-                match self
-                    .close_state
-                    .claim(!receiver.is_empty(), reservation.is_some())
-                {
-                    super::CloseAttempt::Owned(()) => {
-                        let mut drained = Vec::new();
-                        while let Ok(message) = receiver.try_recv() {
-                            drained.push(message);
+        notification::observe(async {
+            self.seal();
+            let mut reservation = None;
+            let drained = loop {
+                let attempt = {
+                    let mut receiver = notification::lock(&self.receiver).await;
+                    match self.close_state.claim(
+                        receiver
+                            .as_ref()
+                            .is_some_and(|receiver| !receiver.is_empty()),
+                        reservation.is_some(),
+                    ) {
+                        super::CloseAttempt::Owned(()) => {
+                            super::CloseAttempt::Owned(receiver.take())
                         }
-                        super::CloseAttempt::Owned(drained)
+                        super::CloseAttempt::Reservation => super::CloseAttempt::Reservation,
+                        super::CloseAttempt::Observing => super::CloseAttempt::Observing,
                     }
-                    super::CloseAttempt::Reservation => super::CloseAttempt::Reservation,
-                    super::CloseAttempt::Observing => super::CloseAttempt::Observing,
+                };
+                match attempt {
+                    super::CloseAttempt::Owned(values) => break Some(values),
+                    super::CloseAttempt::Observing => break None,
+                    super::CloseAttempt::Reservation => {
+                        reservation = self.close_state.reserve().await;
+                        if reservation.is_none() {
+                            break None;
+                        }
+                    }
                 }
             };
-            match attempt {
-                super::CloseAttempt::Owned(values) => break Some(values),
-                super::CloseAttempt::Observing => break None,
-                super::CloseAttempt::Reservation => {
-                    reservation = self.close_state.reserve().await;
-                    if reservation.is_none() {
-                        break None;
+            if let Some(receiver) = drained {
+                let mut values = Vec::new();
+                if let Some(mut receiver) = receiver {
+                    notification::call(|| receiver.close());
+                    loop {
+                        let (result, wakes) = receiver.try_recv_deferred();
+                        super::retire_on_drop(wakes, "capacity notification");
+                        let Ok(message) = result else { break };
+                        values.push(message);
                     }
+                    super::retire_on_drop(receiver, "receiver");
                 }
+                self.close_state.start_drain(values, reservation);
+            } else {
+                drop(reservation);
             }
-        };
-        if let Some(drained) = drained {
-            self.close_state.start_drain(drained, reservation);
-        } else {
-            drop(reservation);
-        }
-        self.close_state.wait().await;
+            self.close_state.wait().await;
+        })
+        .await;
     }
 
     /// associate a processor with this mailbox

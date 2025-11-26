@@ -9,6 +9,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 type Receipt = watch::Receiver<Option<Result<(), String>>>;
 
+pub(crate) mod notification;
+
 /// A cleanup executor has two different resources: workers that are actively
 /// dropping values, and owners waiting for one of those workers. The latter
 /// must have a finite bound as well; otherwise a saturated executor can retain

@@ -11,6 +11,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, Notify};
 
+use crate::owned_payload::notification;
 use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
@@ -91,7 +92,7 @@ impl SpscRingbufMailbox {
     }
 
     fn notify_ready(&self) {
-        self.notify.notify_one();
+        notification::one(&self.notify);
         self.fire_wake_hook();
     }
 }
@@ -139,7 +140,7 @@ impl Mailbox for SpscRingbufMailbox {
                 if self.closed() {
                     return Err(MailboxError::Closed);
                 }
-                let mut producer = self.producer.lock().await;
+                let mut producer = notification::lock(&self.producer).await;
                 // Close also owns this lock, so no producer can publish after drain.
                 if self.closed() {
                     return Err(MailboxError::Closed);
@@ -157,16 +158,14 @@ impl Mailbox for SpscRingbufMailbox {
                             });
                         }
                         BackpressureStrategy::DropOldest => {
-                            evicted = self
-                                .consumer
-                                .lock()
+                            evicted = notification::lock(&self.consumer)
                                 .await
                                 .try_pop()
                                 .map(super::Input::unbound);
                         }
                         BackpressureStrategy::Block => {
                             drop(producer);
-                            available.await;
+                            notification::observe(available).await;
                             continue;
                         }
                     }
@@ -187,15 +186,15 @@ impl Mailbox for SpscRingbufMailbox {
     }
 
     async fn pop(&self) -> Option<BoxedMessage> {
-        let item = self.consumer.lock().await.try_pop();
+        let item = notification::lock(&self.consumer).await.try_pop();
         if item.is_some() {
-            self.capacity_notify.notify_waiters();
+            notification::all(&self.capacity_notify);
         }
         item
     }
 
     async fn is_empty(&self) -> bool {
-        self.consumer.lock().await.is_empty()
+        notification::lock(&self.consumer).await.is_empty()
     }
 
     async fn signal_ready(&self) {
@@ -211,54 +210,57 @@ impl Mailbox for SpscRingbufMailbox {
     }
 
     async fn len(&self) -> usize {
-        self.consumer.lock().await.occupied_len()
+        notification::lock(&self.consumer).await.occupied_len()
     }
 
     fn seal(&self) {
         self.is_closed.store(true, Ordering::SeqCst);
-        self.capacity_notify.notify_waiters();
-        self.notify.notify_waiters();
+        notification::all(&self.capacity_notify);
+        notification::all(&self.notify);
     }
 
     async fn close(&self) {
-        self.seal();
-        let mut reservation = None;
-        let drained = loop {
-            let attempt = {
-                let _producer = self.producer.lock().await;
-                let mut consumer = self.consumer.lock().await;
-                match self
-                    .close_state
-                    .claim(!consumer.is_empty(), reservation.is_some())
-                {
-                    super::CloseAttempt::Owned(()) => {
-                        let mut drained = Vec::new();
-                        while let Some(message) = consumer.try_pop() {
-                            drained.push(message);
+        notification::observe(async {
+            self.seal();
+            let mut reservation = None;
+            let drained = loop {
+                let attempt = {
+                    let _producer = notification::lock(&self.producer).await;
+                    let mut consumer = notification::lock(&self.consumer).await;
+                    match self
+                        .close_state
+                        .claim(!consumer.is_empty(), reservation.is_some())
+                    {
+                        super::CloseAttempt::Owned(()) => {
+                            let mut drained = Vec::new();
+                            while let Some(message) = consumer.try_pop() {
+                                drained.push(message);
+                            }
+                            super::CloseAttempt::Owned(drained)
                         }
-                        super::CloseAttempt::Owned(drained)
+                        super::CloseAttempt::Reservation => super::CloseAttempt::Reservation,
+                        super::CloseAttempt::Observing => super::CloseAttempt::Observing,
                     }
-                    super::CloseAttempt::Reservation => super::CloseAttempt::Reservation,
-                    super::CloseAttempt::Observing => super::CloseAttempt::Observing,
+                };
+                match attempt {
+                    super::CloseAttempt::Owned(values) => break Some(values),
+                    super::CloseAttempt::Observing => break None,
+                    super::CloseAttempt::Reservation => {
+                        reservation = self.close_state.reserve().await;
+                        if reservation.is_none() {
+                            break None;
+                        }
+                    }
                 }
             };
-            match attempt {
-                super::CloseAttempt::Owned(values) => break Some(values),
-                super::CloseAttempt::Observing => break None,
-                super::CloseAttempt::Reservation => {
-                    reservation = self.close_state.reserve().await;
-                    if reservation.is_none() {
-                        break None;
-                    }
-                }
+            if let Some(drained) = drained {
+                self.close_state.start_drain(drained, reservation);
+            } else {
+                drop(reservation);
             }
-        };
-        if let Some(drained) = drained {
-            self.close_state.start_drain(drained, reservation);
-        } else {
-            drop(reservation);
-        }
-        self.close_state.wait().await;
+            self.close_state.wait().await;
+        })
+        .await;
     }
 
     async fn is_closed(&self) -> bool {

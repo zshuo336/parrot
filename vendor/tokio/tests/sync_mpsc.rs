@@ -1839,4 +1839,120 @@ fn release_waker_on_rx_drop() {
     );
 }
 
+mod parrot_deferred_receive {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    struct Payload(Arc<AtomicUsize>);
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("deferred receive wake payload disposal");
+        }
+    }
+    struct Observer(Arc<AtomicUsize>);
+    impl Wake for Observer {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any(Payload(self.0.clone()));
+        }
+    }
+
+    #[test]
+    fn capacity_is_reserved_until_the_deferred_receive_guard_is_released() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(17).unwrap();
+        let mut waiting = tokio_test::task::spawn(tx.reserve());
+        assert_pending!(waiting.poll());
+        let (result, wakes) = rx.try_recv_deferred();
+        assert_eq!(result.unwrap(), 17);
+        assert_eq!(tx.capacity(), 0);
+        assert!(!waiting.is_woken());
+        is_debug(&wakes);
+        drop(wakes);
+        assert!(waiting.is_woken());
+        drop(assert_ready_ok!(waiting.poll()));
+        assert_eq!(tx.capacity(), 1);
+        let (empty, inert) = rx.try_recv_deferred();
+        assert!(matches!(empty, Err(TryRecvError::Empty)));
+        drop(inert);
+        rx.close();
+        let (closed, inert) = rx.try_recv_deferred();
+        assert!(matches!(closed, Err(TryRecvError::Disconnected)));
+        drop(inert);
+    }
+
+    #[test]
+    fn replacement_reuses_the_owned_slot_without_waking_a_capacity_waiter() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let mut waiting = tokio_test::task::spawn(tx.reserve());
+        assert_pending!(waiting.poll());
+        let (old, slot) = rx.try_recv_deferred();
+        assert_eq!(old.unwrap(), 1);
+        drop(slot.replace(2).unwrap());
+        assert!(!waiting.is_woken());
+        assert_eq!(tx.capacity(), 0);
+        assert_eq!(rx.try_recv().unwrap(), 2);
+        drop(assert_ready_ok!(waiting.poll()));
+        assert_eq!(tx.capacity(), 1);
+        let (_, inert) = rx.try_recv_deferred();
+        assert_eq!(inert.replace(3).unwrap_err().0, 3);
+        tx.try_send(4).unwrap();
+        let (_, slot) = rx.try_recv_deferred();
+        rx.close();
+        assert_eq!(slot.replace(5).unwrap_err().0, 5);
+        assert_eq!(tx.capacity(), 1);
+    }
+
+    #[test]
+    fn close_notifies_closed_observers_even_when_capacity_notification_panics() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(Observer(drops.clone())));
+        let mut waiting = Box::pin(tx.reserve());
+        assert_pending!(waiting.as_mut().poll(&mut Context::from_waker(&waker)));
+        let mut closing = tokio_test::task::spawn(tx.closed());
+        assert_pending!(closing.poll());
+        let outcome = panic::catch_unwind(panic::AssertUnwindSafe(|| rx.close()));
+        let payload = outcome.expect_err("the underlying channel retains its first wake panic");
+        assert!(
+            closing.is_woken(),
+            "the independent closed group was skipped"
+        );
+        assert_ready!(closing.poll());
+        if let Err(secondary) = panic::catch_unwind(panic::AssertUnwindSafe(|| drop(payload))) {
+            std::mem::forget(secondary);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(rx.try_recv().unwrap(), 1);
+    }
+
+    #[test]
+    fn deferred_capacity_return_during_unwind_preserves_the_original_panic() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(Observer(drops.clone())));
+        let mut waiting = Box::pin(tx.reserve());
+        assert_pending!(waiting.as_mut().poll(&mut Context::from_waker(&waker)));
+        let (value, wakes) = rx.try_recv_deferred();
+        assert_eq!(value.unwrap(), 1);
+        let outcome = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _wakes = wakes;
+            panic!("original unrelated unwind");
+        }));
+        let payload = outcome.unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"original unrelated unwind")
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(waiting);
+        assert_eq!(tx.capacity(), 1);
+    }
+}
+
 fn is_debug<T: fmt::Debug>(_: &T) {}

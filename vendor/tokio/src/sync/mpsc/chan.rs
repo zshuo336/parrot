@@ -7,6 +7,7 @@ use crate::sync::mpsc::error::TryRecvError;
 use crate::sync::mpsc::{bounded, list, unbounded};
 use crate::sync::notify::Notify;
 use crate::util::cacheline::CachePadded;
+use crate::util::WakePanic;
 
 use std::fmt;
 use std::panic;
@@ -260,6 +261,33 @@ impl<T, S> Drop for Tx<T, S> {
 
 // ===== impl Rx =====
 
+pub(super) struct DeferredRecvPermit<T, S: Semaphore> {
+    inner: Option<Arc<Chan<T, S>>>,
+}
+
+impl<T, S: Semaphore> DeferredRecvPermit<T, S> {
+    pub(super) fn replace(mut self, value: T) -> Result<Option<std::task::Waker>, T> {
+        let inner = self.inner.as_ref().expect("live receive reservation");
+        if inner.semaphore.is_closed() {
+            return Err(value);
+        }
+        let inner = self.inner.take().unwrap();
+        inner.tx.push(value);
+        Ok(inner.rx_waker.take_waker())
+    }
+}
+
+impl<T, S: Semaphore> Drop for DeferredRecvPermit<T, S> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let mut panics = WakePanic::default();
+            panics.capture(|| inner.semaphore.add_permit());
+            panics.capture(|| drop(inner));
+            panics.resume();
+        }
+    }
+}
+
 impl<T, S: Semaphore> Rx<T, S> {
     fn new(chan: Arc<Chan<T, S>>) -> Rx<T, S> {
         Rx { inner: chan }
@@ -276,8 +304,10 @@ impl<T, S: Semaphore> Rx<T, S> {
             rx_fields.rx_closed = true;
         });
 
-        self.inner.semaphore.close();
-        self.inner.notify_rx_closed.notify_waiters();
+        let mut panics = WakePanic::default();
+        panics.capture(|| self.inner.semaphore.close());
+        panics.capture(|| self.inner.notify_rx_closed.notify_waiters());
+        panics.resume();
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -444,6 +474,20 @@ impl<T, S: Semaphore> Rx<T, S> {
 
     /// Try to receive the next value.
     pub(crate) fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        self.try_recv_inner(true)
+    }
+
+    pub(super) fn try_recv_deferred(
+        &mut self,
+    ) -> (Result<T, TryRecvError>, Option<DeferredRecvPermit<T, S>>) {
+        let result = self.try_recv_inner(false);
+        let permit = result.is_ok().then(|| DeferredRecvPermit {
+            inner: Some(self.inner.clone()),
+        });
+        (result, permit)
+    }
+
+    fn try_recv_inner(&mut self, release_permit: bool) -> Result<T, TryRecvError> {
         use super::list::TryPopResult;
 
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
@@ -453,7 +497,9 @@ impl<T, S: Semaphore> Rx<T, S> {
                 () => {
                     match rx_fields.list.try_pop(&self.inner.tx) {
                         TryPopResult::Ok(value) => {
-                            self.inner.semaphore.add_permit();
+                            if release_permit {
+                                self.inner.semaphore.add_permit();
+                            }
                             return Ok(value);
                         }
                         TryPopResult::Closed => return Err(TryRecvError::Disconnected),

@@ -50,6 +50,64 @@ impl Drop for DeferredSendWakes {
     }
 }
 
+/// Capacity notification reserved by [`Receiver::try_recv_deferred`].
+///
+/// The value has been removed in FIFO order, but its channel capacity remains
+/// reserved until this guard is dropped. Release application locks first: its
+/// destructor can invoke waiting senders' wakers, like dropping a send permit.
+#[must_use = "release application locks before returning channel capacity"]
+pub struct DeferredRecvWakes<T> {
+    permit: Option<chan::DeferredRecvPermit<T, Semaphore>>,
+}
+
+impl<T> fmt::Debug for DeferredRecvWakes<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeferredRecvWakes")
+            .field("reserved", &self.permit.is_some())
+            .finish()
+    }
+}
+
+impl<T> DeferredRecvWakes<T> {
+    /// Reuses this successful receive's reserved capacity for a replacement.
+    ///
+    /// No sender waiter can claim the slot between removal and replacement.
+    /// The new value is appended in FIFO order, and its receiver notification
+    /// is returned for delivery outside application locks. An inert guard or
+    /// an already closed channel returns ownership of the value as an error.
+    pub fn replace(mut self, value: T) -> Result<DeferredSendWakes, SendError<T>> {
+        let Some(permit) = self.permit.take() else {
+            return Err(SendError(value));
+        };
+        permit
+            .replace(value)
+            .map(|waker| DeferredSendWakes { waker })
+            .map_err(SendError)
+    }
+}
+
+impl<T> Drop for DeferredRecvWakes<T> {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            if std::thread::panicking() {
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(permit);
+                })) {
+                    if let Err(secondary) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            drop(payload);
+                        }))
+                    {
+                        std::mem::forget(secondary);
+                    }
+                }
+            } else {
+                drop(permit);
+            }
+        }
+    }
+}
+
 /// A sender that does not prevent the channel from being closed.
 ///
 /// If all [`Sender`] instances of a channel were dropped and only `WeakSender`
@@ -390,6 +448,17 @@ impl<T> Receiver<T> {
     /// ```
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         self.chan.try_recv()
+    }
+
+    /// Removes one value without invoking capacity waiters before returning it.
+    ///
+    /// The result has the same empty/disconnected and FIFO semantics as
+    /// [`try_recv`](Self::try_recv). Drop the returned guard outside application
+    /// locks to return capacity and notify senders. Failed receives reserve no
+    /// capacity and return an inert guard.
+    pub fn try_recv_deferred(&mut self) -> (Result<T, TryRecvError>, DeferredRecvWakes<T>) {
+        let (result, permit) = self.chan.try_recv_deferred();
+        (result, DeferredRecvWakes { permit })
     }
 
     /// Blocking receive to call outside of asynchronous contexts.
