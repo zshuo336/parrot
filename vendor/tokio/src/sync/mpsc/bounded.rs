@@ -75,36 +75,104 @@ impl<T> DeferredRecvWakes<T> {
     /// The new value is appended in FIFO order, and its receiver notification
     /// is returned for delivery outside application locks. An inert guard or
     /// an already closed channel returns ownership of the value as an error.
-    pub fn replace(mut self, value: T) -> Result<DeferredSendWakes, SendError<T>> {
-        let Some(permit) = self.permit.take() else {
-            return Err(SendError(value));
+    /// On failure, returning unused capacity can invoke sender wakers before
+    /// this method returns. Use [`Self::replace_deferred`] while holding locks.
+    pub fn replace(self, value: T) -> Result<DeferredReplacementWakes<T>, SendError<T>> {
+        let (result, wakes) = self.replace_deferred(value);
+        match result {
+            Ok(()) => Ok(wakes),
+            Err(error) => {
+                drop(wakes);
+                Err(error)
+            }
+        }
+    }
+
+    /// Replaces a value while deferring notifications on both success and failure.
+    ///
+    /// A rejected replacement is returned unchanged. Its capacity release and
+    /// any final closed-receiver wake belong to the returned notification guard,
+    /// which must be dropped outside application locks even on error.
+    pub fn replace_deferred(
+        mut self,
+        value: T,
+    ) -> (Result<(), SendError<T>>, DeferredReplacementWakes<T>) {
+        let mut wakes = DeferredReplacementWakes {
+            sender: None,
+            waker: None,
+            capacity: self.permit.take(),
         };
-        permit
-            .replace(value)
-            .map(|waker| DeferredSendWakes { waker })
-            .map_err(SendError)
+        let result = match wakes.capacity.as_mut() {
+            Some(permit) => match permit.replace(value) {
+                Ok((sender, waker)) => {
+                    wakes.sender = Some(sender);
+                    wakes.waker = waker;
+                    Ok(())
+                }
+                Err(value) => Err(SendError(value)),
+            },
+            None => Err(SendError(value)),
+        };
+        (result, wakes)
     }
 }
 
 impl<T> Drop for DeferredRecvWakes<T> {
     fn drop(&mut self) {
         if let Some(permit) = self.permit.take() {
-            if std::thread::panicking() {
-                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drop(permit);
-                })) {
-                    if let Err(secondary) =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            drop(payload);
-                        }))
-                    {
-                        std::mem::forget(secondary);
-                    }
+            finish_deferred(|| drop(permit));
+        }
+    }
+}
+
+/// Receiver notifications reserved by [`DeferredRecvWakes::replace`].
+///
+/// This guard keeps the send half open until the replacement's notification
+/// can run outside application locks. Dropping it also delivers a possible
+/// last-sender close notification. It does not reserve additional capacity.
+#[must_use = "release application locks before delivering replacement and close notifications"]
+pub struct DeferredReplacementWakes<T> {
+    sender: Option<chan::Tx<T, Semaphore>>,
+    waker: Option<Waker>,
+    capacity: Option<chan::DeferredRecvPermit<T, Semaphore>>,
+}
+
+impl<T> fmt::Debug for DeferredReplacementWakes<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeferredReplacementWakes").finish()
+    }
+}
+
+impl<T> Drop for DeferredReplacementWakes<T> {
+    fn drop(&mut self) {
+        let sender = self.sender.take();
+        let waker = self.waker.take();
+        let capacity = self.capacity.take();
+        finish_deferred(|| {
+            let mut panics = crate::util::WakePanic::default();
+            panics.capture(|| drop(capacity));
+            panics.capture(|| {
+                if let Some(waker) = waker {
+                    waker.wake();
                 }
-            } else {
-                drop(permit);
+            });
+            panics.capture(|| drop(sender));
+            panics.resume();
+        });
+    }
+}
+
+fn finish_deferred(action: impl FnOnce()) {
+    if std::thread::panicking() {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
+            if let Err(secondary) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+            {
+                std::mem::forget(secondary);
             }
         }
+    } else {
+        action();
     }
 }
 

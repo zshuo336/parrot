@@ -1907,6 +1907,111 @@ mod parrot_deferred_receive {
     }
 
     #[test]
+    fn deferred_replacement_cannot_reopen_the_last_sender_closed_channel() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let (value, slot) = rx.try_recv_deferred();
+        assert_eq!(value.unwrap(), 1);
+        drop(tx);
+        assert!(rx.is_closed());
+        let result = slot.replace(2);
+        assert!(
+            result.is_err(),
+            "replacement was accepted after the last sender closed the list"
+        );
+        assert_eq!(result.unwrap_err().0, 2);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn receive_after_last_sender_drop_tolerates_outstanding_receive_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let (value, slot) = rx.try_recv_deferred();
+        assert_eq!(value.unwrap(), 1);
+        drop(tx);
+        let mut recv = tokio_test::task::spawn(rx.recv());
+        assert_eq!(assert_ready!(recv.poll()), None);
+        drop(recv);
+        drop(slot);
+        assert_eq!(rx.capacity(), 1);
+    }
+
+    #[test]
+    fn releasing_deferred_receive_capacity_wakes_a_closed_receiver() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let (value, slot) = rx.try_recv_deferred();
+        assert_eq!(value.unwrap(), 1);
+        rx.close();
+        let mut recv = tokio_test::task::spawn(rx.recv());
+        assert_pending!(recv.poll());
+        drop(slot);
+        assert!(
+            recv.is_woken(),
+            "closed receiver was stranded after its final slot returned"
+        );
+        assert_eq!(assert_ready!(recv.poll()), None);
+        drop(recv);
+        assert_eq!(tx.capacity(), 1);
+    }
+
+    #[test]
+    fn rejected_replacement_defers_capacity_return_until_after_application_unlock() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let (_, slot) = rx.try_recv_deferred();
+        rx.close();
+        let mut recv = tokio_test::task::spawn(rx.recv());
+        assert_pending!(recv.poll());
+        let (result, wakes) = slot.replace_deferred(2);
+        assert_eq!(result.unwrap_err().0, 2);
+        assert_eq!(tx.capacity(), 0);
+        assert!(
+            !recv.is_woken(),
+            "failure notified before the returned guard was released"
+        );
+        drop(wakes);
+        assert!(recv.is_woken());
+        assert_eq!(assert_ready!(recv.poll()), None);
+    }
+
+    #[test]
+    fn replacement_guard_defers_last_sender_close_and_preserves_the_value() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let (_, slot) = rx.try_recv_deferred();
+        let wakes = slot.replace(2).unwrap();
+        drop(tx);
+        assert!(
+            !rx.is_closed(),
+            "the deferred sender lease was released too early"
+        );
+        assert_eq!(rx.try_recv().unwrap(), 2);
+        let mut recv = tokio_test::task::spawn(rx.recv());
+        assert_pending!(recv.poll());
+        drop(wakes);
+        assert!(recv.is_woken());
+        assert_eq!(assert_ready!(recv.poll()), None);
+    }
+
+    #[test]
+    fn receive_many_after_sender_drop_tolerates_outstanding_receive_capacity() {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        let (_, slot) = rx.try_recv_deferred();
+        drop(tx);
+        let mut values = Vec::new();
+        let mut recv = tokio_test::task::spawn(rx.recv_many(&mut values, 2));
+        assert_eq!(assert_ready!(recv.poll()), 1);
+        drop(recv);
+        assert_eq!(values, [2]);
+        drop(slot);
+        assert_eq!(rx.capacity(), 2);
+    }
+
+    #[test]
     fn close_notifies_closed_observers_even_when_capacity_notification_panics() {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(1).unwrap();

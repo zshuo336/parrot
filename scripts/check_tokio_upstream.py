@@ -15,7 +15,7 @@ import time
 import uuid
 
 SUITES = {'io_async_fd': {'Linux': 27, 'Darwin': 24},
-          'sync_mpsc': {'Linux': 111, 'Darwin': 111},
+          'sync_mpsc': {'Linux': 117, 'Darwin': 117},
           'sync_oneshot': {'Linux': 22, 'Darwin': 22},
           'sync_notify': {'Linux': 19, 'Darwin': 19},
           'sync_watch': {'Linux': 22, 'Darwin': 22},

@@ -180,11 +180,10 @@ impl Mailbox for SpscMailbox {
                             let (value, wakes) = receiver.try_recv_deferred();
                             if let Ok(value) = value {
                                 evicted = Some(super::Input::unbound(value));
-                                match wakes.replace(msg) {
-                                    Ok(wakes) => {
-                                        replacement_wakes = Some(wakes);
-                                        Ok(())
-                                    }
+                                let (result, wakes) = wakes.replace_deferred(msg);
+                                replacement_wakes = Some(wakes);
+                                match result {
+                                    Ok(()) => Ok(()),
                                     Err(tokio::sync::mpsc::error::SendError(msg)) => Err(TrySendError::Closed(msg)),
                                 }
                             } else {

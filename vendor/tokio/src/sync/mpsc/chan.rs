@@ -71,6 +71,9 @@ pub(super) struct Chan<T, S> {
     /// Tracks the number of outstanding weak sender handles.
     tx_weak_count: AtomicUsize,
 
+    /// Removed values whose capacity is still owned by a deferred receive guard.
+    deferred_receives: AtomicUsize,
+
     /// Only accessed by `Rx` handle.
     rx_fields: UnsafeCell<RxFields<T>>,
 }
@@ -139,6 +142,7 @@ fn channel_from_list<T, S: Semaphore>(
         rx_waker: CachePadded::new(AtomicWaker::new()),
         tx_count: AtomicUsize::new(1),
         tx_weak_count: AtomicUsize::new(0),
+        deferred_receives: AtomicUsize::new(0),
         rx_fields: UnsafeCell::new(RxFields {
             list: rx,
             rx_closed: false,
@@ -266,14 +270,20 @@ pub(super) struct DeferredRecvPermit<T, S: Semaphore> {
 }
 
 impl<T, S: Semaphore> DeferredRecvPermit<T, S> {
-    pub(super) fn replace(mut self, value: T) -> Result<Option<std::task::Waker>, T> {
+    pub(super) fn replace(&mut self, value: T) -> Result<(Tx<T, S>, Option<std::task::Waker>), T> {
         let inner = self.inner.as_ref().expect("live receive reservation");
         if inner.semaphore.is_closed() {
             return Err(value);
         }
+        // Upgrade atomically with the last sender's close. Merely owning an
+        // Arc does not keep the list's send half open for a replacement.
+        let Some(sender) = Tx::upgrade(inner.clone()) else {
+            return Err(value);
+        };
         let inner = self.inner.take().unwrap();
-        inner.tx.push(value);
-        Ok(inner.rx_waker.take_waker())
+        let waker = sender.send_deferred(value);
+        inner.deferred_receives.fetch_sub(1, Release);
+        Ok((sender, waker))
     }
 }
 
@@ -282,6 +292,12 @@ impl<T, S: Semaphore> Drop for DeferredRecvPermit<T, S> {
         if let Some(inner) = self.inner.take() {
             let mut panics = WakePanic::default();
             panics.capture(|| inner.semaphore.add_permit());
+            inner.deferred_receives.fetch_sub(1, Release);
+            panics.capture(|| {
+                if inner.semaphore.is_closed() && inner.semaphore.is_idle() {
+                    inner.rx_waker.wake();
+                }
+            });
             panics.capture(|| drop(inner));
             panics.resume();
         }
@@ -362,7 +378,10 @@ impl<T, S: Semaphore> Rx<T, S> {
                             // dropped. Dropping a tx handle releases memory,
                             // which ensures that if dropping the tx handle is
                             // visible, then all messages sent are also visible.
-                            debug_assert!(self.inner.semaphore.is_idle());
+                            debug_assert!(
+                                self.inner.deferred_receives.load(Acquire) != 0
+                                    || self.inner.semaphore.is_idle()
+                            );
                             coop.made_progress();
                             return Ready(None);
                         }
@@ -434,7 +453,10 @@ impl<T, S: Semaphore> Rx<T, S> {
                                 // dropped. Dropping a tx handle releases memory,
                                 // which ensures that if dropping the tx handle is
                                 // visible, then all messages sent are also visible.
-                                debug_assert!(self.inner.semaphore.is_idle());
+                                debug_assert!(
+                                    self.inner.deferred_receives.load(Acquire) != 0
+                                        || self.inner.semaphore.is_idle()
+                                );
                                 coop.made_progress();
                                 return Ready(number_added);
                             }
@@ -481,8 +503,11 @@ impl<T, S: Semaphore> Rx<T, S> {
         &mut self,
     ) -> (Result<T, TryRecvError>, Option<DeferredRecvPermit<T, S>>) {
         let result = self.try_recv_inner(false);
-        let permit = result.is_ok().then(|| DeferredRecvPermit {
-            inner: Some(self.inner.clone()),
+        let permit = result.is_ok().then(|| {
+            self.inner.deferred_receives.fetch_add(1, Relaxed);
+            DeferredRecvPermit {
+                inner: Some(self.inner.clone()),
+            }
         });
         (result, permit)
     }

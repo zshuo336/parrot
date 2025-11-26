@@ -118,8 +118,8 @@ pub(super) mod block;
 
 mod bounded;
 pub use self::bounded::{
-    channel, DeferredRecvWakes, DeferredSendWakes, OwnedPermit, Permit, PermitIterator, Receiver,
-    Sender, WeakSender,
+    channel, DeferredRecvWakes, DeferredReplacementWakes, DeferredSendWakes, OwnedPermit, Permit,
+    PermitIterator, Receiver, Sender, WeakSender,
 };
 
 mod chan;
