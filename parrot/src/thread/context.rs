@@ -8,15 +8,16 @@ use tokio::runtime::Handle;
 
 use parrot_api::actor::Actor;
 use parrot_api::address::{ActorPath, ActorRef};
-use parrot_api::context::{ActorContext, ActorSpawner, ScheduledTask};
+use parrot_api::context::{ActorContext, ActorSpawner, ScheduledTask, ReadOnlyChildrenVec};
 use parrot_api::errors::ActorError;
 use parrot_api::stream::StreamRegistry;
 use parrot_api::supervisor::SupervisorStrategyType;
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
-
+use parrot_api::message::CloneableMessage;
 use crate::thread::address::ThreadActorRef;
 use crate::thread::config::{BackpressureStrategy, SupervisorStrategy};
 use crate::logging;
+use std::sync::RwLock;
 
 /// Weak reference to the actor system to avoid circular references
 pub type WeakSystemRef = Weak<dyn SystemRef + Send + Sync>;
@@ -51,9 +52,9 @@ pub struct ThreadContext<A: Actor + Send + Sync + 'static> {
     
     /// Reference to parent actor
     parent_ref: Option<BoxedActorRef>,
-    
+
     /// References to child actors
-    children_refs: HashMap<String, BoxedActorRef>,
+    children_refs: Option<Arc<RwLock<HashMap<String, BoxedActorRef>>>>,
     
     /// Actor's path
     path: ActorPath,
@@ -95,7 +96,7 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
             runtime_handle,
             self_ref: None,
             parent_ref,
-            children_refs: HashMap::new(),
+            children_refs: None,
             path,
             supervisor_strategy,
             receive_timeout: None,
@@ -117,6 +118,11 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     pub fn get_self_ref(&self) -> BoxedActorRef {
         self.self_ref.as_ref().expect("Self reference not set").clone_boxed()
     }
+
+
+    fn set_parent(&mut self, parent: BoxedActorRef) {
+        self.parent_ref = Some(parent);
+    }
     
     /// Upgrades the weak system reference to a strong reference if available.
     fn system(&self) -> Option<Arc<dyn SystemRef + Send + Sync>> {
@@ -126,12 +132,30 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     /// Adds a child actor reference.
     pub fn add_child(&mut self, child_ref: BoxedActorRef) {
         let path_str = child_ref.path();
-        self.children_refs.insert(path_str, child_ref);
+        if self.children_refs.is_none() {
+            self.children_refs = Some(Arc::new(RwLock::new(HashMap::new())));
+        }
+        self.children_refs.as_mut().unwrap().write().unwrap().insert(path_str, child_ref);
     }
     
     /// Removes a child actor reference.
-    pub fn remove_child(&mut self, path: &ActorPath) -> Option<BoxedActorRef> {
-        self.children_refs.remove(path.path())
+    pub fn remove_child_by_path(&mut self, path: &ActorPath) -> Option<BoxedActorRef> {
+        self.children_refs.as_mut().unwrap().write().unwrap().remove(path.path())
+    }
+
+    /// Removes a child actor reference.
+    pub fn remove_child_by_ref(&mut self, child: &BoxedActorRef) -> Option<BoxedActorRef> {
+        self.children_refs.as_mut().unwrap().write().unwrap().remove(&child.path())
+    }
+
+    /// Returns the children references.
+    pub fn children(&self) -> Option<ReadOnlyChildrenVec> {
+        self.children_refs.as_ref().map(|children| {
+            let boxed_children = children.read().unwrap().values()
+                .map(|r| r.clone_boxed())
+                .collect::<Vec<_>>();
+            ReadOnlyChildrenVec::new(Arc::new(RwLock::new(boxed_children)))
+        })
     }
 
     /// Sets the backpressure strategy.
@@ -150,16 +174,27 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         self.get_self_ref()
     }
     
+    fn set_parent(&mut self, parent: BoxedActorRef) {
+        self.set_parent(parent);
+    }
+
     fn stop<'a>(&'a mut self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             if let Some(self_ref) = &self.self_ref {
                 self_ref.stop().await?;
                 
                 // Stop all children
-                for (_, child) in &self.children_refs {
-                    let result = child.stop().await;
-                    if let Err(e) = result {
-                        logging::error!("Failed to stop child actor-{}: {}", child.path(), e);
+                if let Some(children) = &self.children_refs {
+                    let children_to_stop: Vec<_> = children.read().unwrap()
+                        .values()
+                        .map(|r| r.clone_boxed())
+                        .collect();
+                    
+                    for child in children_to_stop {
+                        let result = child.stop().await;
+                        if let Err(e) = result {
+                            logging::error!("Failed to stop child actor-{}: {}", child.path(), e);
+                        }
                     }
                 }
                 
@@ -177,6 +212,7 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         })
     }
     
+    /// todo: implement complete ask
     fn ask<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         let timeout_duration = self.receive_timeout.unwrap_or_else(|| {
             self.system()
@@ -213,30 +249,19 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
         })
     }
     
-    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'a, ActorResult<()>> {
-        use crate::thread::message::BoxedMessageExt;
+    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: CloneableMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'a, ActorResult<()>> {
         let runtime = self.runtime_handle.clone();
         
         Box::pin(async move {
             let target_clone = target.clone_boxed();
-            
-            // Try to create a cloneable version of the message
-            // If the message cannot be cloned, we'll create special "tick" messages instead
-            let cloneable_msg = msg.try_clone();
             
             runtime.spawn(async move {
                 // Initial delay
                 tokio::time::sleep(initial_delay).await;
                 
                 // Send first message
-                if let Some(first_msg) = cloneable_msg.as_ref().map(|m| m.try_clone()).flatten() {
-                    let _ = target_clone.send(first_msg).await;
-                } else {
-                    // If message isn't cloneable, send a placeholder "tick" message
-                    let tick_msg = Box::new("periodic_tick") as BoxedMessage;
-                    let _ = target_clone.send(tick_msg).await;
-                }
-                
+                let _ = target_clone.send(msg.clone().into_boxed()).await;
+
                 // Set up periodic interval
                 let mut interval_timer = tokio::time::interval(interval);
                 
@@ -244,17 +269,7 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
                     interval_timer.tick().await;
                     
                     let target_copy = target_clone.clone_boxed();
-                    
-                    // Create message for each send
-                    let periodic_msg = if let Some(cloneable) = cloneable_msg.as_ref().map(|m| m.try_clone()).flatten() {
-                        // Use cloned message if available
-                        cloneable
-                    } else {
-                        // Otherwise use placeholder
-                        Box::new("periodic_tick") as BoxedMessage
-                    };
-                    
-                    if let Err(_) = target_copy.send(periodic_msg).await {
+                    if let Err(_) = target_copy.send(msg.clone().into_boxed()).await {
                         // Target is likely dead, stop sending
                         break;
                     }
@@ -278,11 +293,17 @@ impl<A: Actor + Send + Sync + 'static> ActorContext for ThreadContext<A> {
     fn parent(&self) -> Option<BoxedActorRef> {
         self.parent_ref.as_ref().map(|r| r.clone_boxed())
     }
+
+    fn add_child(&mut self, child: BoxedActorRef) {
+        self.add_child(child);
+    }
+
+    fn remove_child(&mut self, child: BoxedActorRef) {
+        self.remove_child_by_ref(&child);
+    }
     
-    fn children(&self) -> Vec<BoxedActorRef> {
-        self.children_refs.values()
-            .map(|r| r.clone_boxed())
-            .collect()
+    fn children(&self) -> Option<ReadOnlyChildrenVec> {
+        self.children()
     }
     
     fn set_receive_timeout(&mut self, timeout: Option<Duration>) {

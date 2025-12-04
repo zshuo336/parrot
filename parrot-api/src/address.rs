@@ -173,6 +173,22 @@ pub trait ActorRef: Send + Sync + Debug {
 
     /// Returns a reference to the actor as a `dyn Any`
     fn as_any(&self) -> &dyn Any;
+
+    /// Compares two actor references for equality
+    ///
+    /// ## Returns
+    /// - `true`: References point to same actor
+    /// - `false`: References point to different actors
+    fn eq(&self, other: &dyn ActorRef) -> bool {
+        self.path() == other.path()
+    }
+
+
+    fn eq_path(&self, path: &str) -> bool {
+        self.path() == path
+    }
+
+
 }
 
 /// Extension trait providing type-safe message passing operations.

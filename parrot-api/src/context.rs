@@ -29,10 +29,12 @@ use crate::actor::Actor;
 use crate::errors::ActorError;
 use crate::address::{ActorPath, ActorRef};
 use crate::types::{BoxedActorRef, BoxedMessage, ActorResult, BoxedFuture};
-use crate::message::{Message, MessageEnvelope};
+use crate::message::{Message, MessageEnvelope, CloneableMessage};
 use crate::supervisor::SupervisorStrategyType;
 use crate::stream::StreamRegistry;
 use crate::supervisor::SupervisorStrategy;
+use std::sync::{RwLock, RwLockReadGuard};
+use std::ops::Deref;
 
 /// # Actor Spawner
 ///
@@ -136,6 +138,42 @@ pub trait ActorFactory: Send + 'static {
     async fn create_actor(&self) -> ActorResult<(Self::ActorType, <Self::ActorType as Actor>::Config)>;
 }
 
+// A wrapper type that holds a read lock
+pub struct ChildrenGuard<'a>(RwLockReadGuard<'a, Vec<BoxedActorRef>>);
+
+impl<'a> Deref for ChildrenGuard<'a> {
+    type Target = [BoxedActorRef];
+    
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct ReadOnlyChildrenVec(Arc<RwLock<Vec<BoxedActorRef>>>);
+
+impl ReadOnlyChildrenVec {
+    pub fn new(children: Arc<RwLock<Vec<BoxedActorRef>>>) -> Self {
+        Self(children)
+    }
+
+    // return a guard with read lock, can access internal data safely
+    // let children = vec.read_all();
+    // for child in children.iter() {
+    //     // use child
+    // }
+    pub fn read_all(&self) -> ChildrenGuard<'_> {
+        ChildrenGuard(self.0.read().unwrap())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.read().unwrap().len()
+    }
+
+    pub fn get(&self, index: usize) -> Option<BoxedActorRef> {
+        self.0.read().unwrap().get(index).map(|actor_ref| actor_ref.clone_boxed())
+    }
+}
+
 /// # Actor Context
 ///
 /// ## Overview
@@ -207,13 +245,13 @@ pub trait ActorContext: Send + Sync {
     ///
     /// # Parameters
     /// * `target` - Recipient actor reference
-    /// * `msg` - Message to send
+    /// * `msg` - Message to send, must be CloneableMessage
     /// * `initial_delay` - Delay before first message
     /// * `interval` - Time between messages
     ///
     /// # Returns
     /// Future completing when schedule is set
-    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: BoxedMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'a, ActorResult<()>>;
+    fn schedule_periodic<'a>(&'a self, target: BoxedActorRef, msg: CloneableMessage, initial_delay: Duration, interval: Duration) -> BoxedFuture<'a, ActorResult<()>>;
 
     /// Registers for termination notification of another actor.
     ///
@@ -237,10 +275,16 @@ pub trait ActorContext: Send + Sync {
     fn set_parent(&mut self, parent: BoxedActorRef);
 
     /// Returns reference to parent actor if it exists.
-    fn parent(&self) -> Option<BoxedActorRef>;
-    
+    fn parent(&self) -> Option<BoxedActorRef>;    
+
+    /// Adds a child actor to the context.
+    fn add_child(&mut self, child: BoxedActorRef);
+
+    /// Removes a child actor from the context.
+    fn remove_child(&mut self, child: BoxedActorRef);
+
     /// Returns references to all child actors.
-    fn children(&self) -> Option<Arc<Vec<BoxedActorRef>>>;
+    fn children(&self) -> Option<ReadOnlyChildrenVec>;
     
     /// Sets timeout for receiving messages.
     ///

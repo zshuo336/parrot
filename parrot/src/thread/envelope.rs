@@ -43,14 +43,14 @@ pub enum ControlMessage {
 
 // Note: BoxedMessage already implements Debug, and Box<dyn ReplyChannel> will require ReplyChannel: Debug 
 
-// 实现AskEnvelope的方法，用于发送回复
+// send reply
 impl AskEnvelope {
-    /// 发送成功回复
+    /// send success reply
     pub async fn reply_success(self, response: BoxedMessage) {
         self.reply.send_reply(Ok(response)).await;
     }
 
-    /// 发送错误回复
+    /// send error reply
     pub async fn reply_error(self, error: ActorError) {
         self.reply.send_reply(Err(error)).await;
     }

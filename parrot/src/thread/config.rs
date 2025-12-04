@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-// --- Configuration Enums (Copied from docs/threadactor/configuration.md) ---
+pub const DEFAULT_DEDICATED_THREAD_MAILBOX_CAPACITY: usize = 102400;
+
+// --- Configuration Enums ---
 
 /// Determines how an actor's message processing is scheduled onto threads.
 #[derive(Clone, Debug)]

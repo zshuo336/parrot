@@ -13,6 +13,7 @@ use crate::thread::mailbox::Mailbox;
 use crate::thread::reply::ThreadReplyChannel;
 use crate::thread::envelope::AskEnvelope;
 use crate::thread::config::BackpressureStrategy;
+use std::any::Any;
 
 /// Type alias for weak reference to a Mailbox
 pub type WeakMailboxRef = Weak<dyn Mailbox + Send + Sync>;
@@ -64,8 +65,8 @@ impl ThreadActorRef {
         self.mailbox.upgrade()
             .ok_or_else(|| {
                 let err: ActorError = AnyhowError::msg(format!(
-                    "Actor reference is dead (target: {})",
-                    self.path.path
+                    "Actor reference is dead (target: {:?})",
+                    self.path
                 )).into();
                 err
             })
@@ -89,13 +90,42 @@ impl ThreadActorRef {
         
         mailbox.push(msg, strategy).await.map_err(|e| {
             let err: ActorError = AnyhowError::msg(format!(
-                "Mailbox error for actor {}: {}",
-                self.path.path, e
+                "Mailbox error for actor {:?}: {}",
+                self.path, e
             )).into();
             err
         })?;
         
         Ok(Box::new(()))
+    }
+
+    pub async fn send_with_timeout(
+        &self,
+        msg: BoxedMessage,
+        timeout_duration: Duration,
+    ) -> ActorResult<BoxedMessage> {
+        let mailbox = self.mailbox()?;
+        
+        // Use timeout to wrap the mailbox push operation
+        match timeout(timeout_duration, mailbox.push(msg, self.default_strategy.clone())).await {
+            Ok(result) => {
+                result.map_err(|e| {
+                    let err: ActorError = AnyhowError::msg(format!(
+                        "Mailbox error for actor {:?}: {}",
+                        self.path, e
+                    )).into();
+                    err
+                })?;
+                Ok(Box::new(()))
+            },
+            Err(_) => {
+                let err: ActorError = AnyhowError::msg(format!(
+                    "Send timed out after {:?} for actor {}",
+                    timeout_duration, self.path
+                )).into();
+                Err(err)
+            }
+        }
     }
 
     /// Sends a message to the actor and expects a reply, with custom strategy and timeout.
@@ -128,8 +158,8 @@ impl ThreadActorRef {
         let mailbox = self.mailbox()?;
         mailbox.push(Box::new(envelope), strategy).await.map_err(|e| {
             let err: ActorError = AnyhowError::msg(format!(
-                "Mailbox error for actor {}: {}",
-                self.path.path, e
+                "Mailbox error for actor {:?}: {}",
+                self.path, e
             )).into();
             err
         })?;
@@ -141,8 +171,8 @@ impl ThreadActorRef {
                     Ok(reply) => reply,
                     Err(_) => {
                         let err: ActorError = AnyhowError::msg(format!(
-                            "Reply channel closed for ask to {}",
-                            self.path.path
+                            "Reply channel closed for ask to {:?}",
+                            self.path
                         )).into();
                         Err(err)
                     },
@@ -150,8 +180,8 @@ impl ThreadActorRef {
             },
             Err(_) => {
                 let err: ActorError = AnyhowError::msg(format!(
-                    "Request to actor {} timed out after {}ms",
-                    self.path.path, timeout_duration.as_millis()
+                    "Request to actor {:?} timed out after {}ms",
+                    self.path, timeout_duration.as_millis()
                 )).into();
                 Err(err)
             },
@@ -189,6 +219,18 @@ impl ActorRef for ThreadActorRef {
         })
     }
     
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        if let Some(duration) = timeout_duration {
+            Box::pin(async move {
+                self.send_with_timeout(msg, duration).await
+            })
+        } else {
+            Box::pin(async move {
+                self.send_with_strategy(msg, self.default_strategy.clone()).await
+            })
+        }
+    }
+
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             // Get mailbox reference
@@ -219,6 +261,10 @@ impl ActorRef for ThreadActorRef {
             default_strategy: self.default_strategy.clone(),
             default_timeout: self.default_timeout,
         })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -252,6 +298,10 @@ mod tests {
                 Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
             }
             
+            fn send_with_timeout<'a>(&'a self, _msg: BoxedMessage, _timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+                Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
+            }
+
             fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
                 Box::pin(async { Ok(()) })
             }
@@ -266,6 +316,10 @@ mod tests {
             
             fn clone_boxed(&self) -> BoxedActorRef {
                 Box::new(Self)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
             }
         }
         

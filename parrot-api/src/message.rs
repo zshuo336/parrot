@@ -51,6 +51,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use crate::address::ActorRef;
 use crate::types::{BoxedMessage, SharedMessage};
+use std::any::TypeId;
 /// Message ID type
 pub type MessageId = Uuid;
 
@@ -286,6 +287,129 @@ pub trait Message: Send + 'static {
 
 }
 
+// create a trait for cloneable message
+pub trait CloneableMessageTrait: Send {
+    fn clone_message(&self) -> Box<dyn CloneableMessageTrait>;
+    fn into_boxed_message(self: Box<Self>) -> BoxedMessage;
+}
+
+// implement CloneableMessageTrait for any type that implements Message
+impl<T: Message + Clone + 'static> CloneableMessageTrait for T {
+    fn clone_message(&self) -> Box<dyn CloneableMessageTrait> {
+        Box::new(self.clone())
+    }
+    fn into_boxed_message(self: Box<Self>) -> BoxedMessage {
+        // we need to convert Box<dyn CloneableMessageTrait> to BoxedMessage
+        // directly return self, avoid extra nesting
+        self
+    }
+}
+
+// create wrapper struct for CloneableMessageTrait
+pub struct CloneableMessage {
+    message: Box<dyn CloneableMessageTrait>,
+}
+
+// implement Clone for CloneableMessage
+impl Clone for CloneableMessage {
+    fn clone(&self) -> Self {
+        CloneableMessage {
+            message: self.message.clone_message(),
+        }
+    }
+}
+
+/// create a CloneableMessage from a concrete type
+/// let msg = MyMessage { /* ... */ };
+/// let cloneable = CloneableMessage::from_message(msg);
+/// let cloned = cloneable.clone();  // now we can clone
+/// let boxed: BoxedMessage = cloneable.into_boxed();
+///
+/// try to create a CloneableMessage from a BoxedMessage
+/// let boxed_msg: BoxedMessage = /* ... */;
+/// if let Some(cloneable) = CloneableMessage::try_from_boxed(&boxed_msg) {
+///     // the message can be cloned
+///     let cloned = cloneable.clone();
+///     // ...
+/// }
+impl CloneableMessage {
+    /// convert a type that implements Message + Clone to CloneableMessage
+    pub fn from_message<T>(message: T) -> Self 
+    where 
+        T: Message + Clone + 'static
+    {
+        CloneableMessage {
+            message: Box::new(message) as Box<dyn CloneableMessageTrait>
+        }
+    }
+    
+    /// get the inner message
+    pub fn into_boxed(self) -> BoxedMessage {
+        self.message.into_boxed_message()
+    }
+
+    // create a CloneableMessage from any cloneable type
+    pub fn from_cloneable<T>(value: T) -> Self 
+    where 
+        T: Clone + Send + 'static
+    {
+        // create a special wrapper type
+        struct CloneableValue<T: Clone + Send + 'static>(T);
+        
+        impl<T: Clone + Send + 'static> CloneableMessageTrait for CloneableValue<T> {
+            fn clone_message(&self) -> Box<dyn CloneableMessageTrait> {
+                Box::new(CloneableValue(self.0.clone()))
+            }
+            fn into_boxed_message(self: Box<Self>) -> BoxedMessage {
+                Box::new(self.0) as BoxedMessage
+            }
+        }
+        
+        CloneableMessage {
+            message: Box::new(CloneableValue(value))
+        }
+    }
+    
+    // Enhanced try_from_boxed method to support more types
+    pub fn try_from_boxed(boxed: &BoxedMessage) -> Option<Self> {
+        // 1. First try common types directly for efficiency
+        if let Some(s) = boxed.as_ref().downcast_ref::<String>() {
+            return Some(Self::from_cloneable(s.clone()));
+        } else if let Some(i) = boxed.as_ref().downcast_ref::<i32>() {
+            return Some(Self::from_cloneable(*i));
+        } else if let Some(i) = boxed.as_ref().downcast_ref::<i64>() {
+            return Some(Self::from_cloneable(*i));
+        } else if let Some(u) = boxed.as_ref().downcast_ref::<u32>() {
+            return Some(Self::from_cloneable(*u));
+        } else if let Some(u) = boxed.as_ref().downcast_ref::<u64>() {
+            return Some(Self::from_cloneable(*u));
+        } else if let Some(b) = boxed.as_ref().downcast_ref::<bool>() {
+            return Some(Self::from_cloneable(*b));
+        } else if let Some(_) = boxed.as_ref().downcast_ref::<()>() {
+            return Some(Self::from_cloneable(()));
+        } else if let Some(f) = boxed.as_ref().downcast_ref::<f32>() {
+            return Some(Self::from_cloneable(*f));
+        } else if let Some(f) = boxed.as_ref().downcast_ref::<f64>() {
+            return Some(Self::from_cloneable(*f));
+        } else if let Some(c) = boxed.as_ref().downcast_ref::<char>() {
+            return Some(Self::from_cloneable(*c));
+        }
+        
+        // 2. Try custom message types
+        
+        // For TestMessage type (explicit handling for test purposes)
+        if std::any::type_name_of_val(boxed.as_ref()).contains("TestMessage") {
+            // We can't directly clone custom types without knowing their type
+            // In a real implementation, we would need a registry or trait-based solution
+            // For now, we'll return None to indicate that custom types aren't supported yet
+            return None;
+        }
+        
+        // Final fallback - we can't reliably clone unknown types
+        None
+    }
+}
+
 /// Trait combining Any and Message functionalities, but making it object safe
 /// by erasing the associated types with runtime type checks.
 pub trait AnyMessage: Any + Send {
@@ -359,6 +483,20 @@ impl<T: Any + Message + Send> AnyMessage for T {
         <T as Message>::message_options(self)
     }
 }
+
+/// Trait for cloning BoxedMessage
+pub trait BoxedMessageClone: Any + Send {
+    fn clone_box(&self) -> Box<dyn Any + Send>;
+}
+
+/// Implement BoxedMessageClone for any type that implements Clone
+impl<T: 'static + Clone + Send> BoxedMessageClone for T {
+    fn clone_box(&self) -> Box<dyn Any + Send> {
+        Box::new(self.clone())
+    }
+}
+
+
 
 /// Message options for controlling delivery and processing
 #[derive(Debug)]

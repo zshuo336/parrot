@@ -781,12 +781,12 @@ mod tests {
 #[derive(Debug)]
 pub struct WatchRequest {
     /// 观察者的路径
-    pub watcher_path: String,
+    pub watcher_path: ActorPath,
 }
 
 /// 请求停止监视一个actor
 #[derive(Debug)]
 pub struct UnwatchRequest {
     /// 观察者的路径
-    pub watcher_path: String,
+    pub watcher_path: ActorPath,
 } 

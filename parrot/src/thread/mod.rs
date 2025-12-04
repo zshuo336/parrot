@@ -19,7 +19,7 @@ pub use config::{ThreadActorSystemConfig, ThreadActorConfig, SchedulingMode, Bac
 pub use error::{MailboxError, AskError, SpawnError, SystemError, SupervisorError};
 pub use address::{ThreadActorRef, WeakMailboxRef, StrongMailboxRef};
 pub use context::{ThreadContext, SystemRef, WeakSystemRef};
-pub use message::{BoxedMessageExt, CloneableMessage, make_cloneable, wrap_as_cloneable};
+pub use message::{CloneableMessage, make_cloneable};
 pub use scheduler::queue::SchedulingQueue;
 pub use scheduler::shared::SharedThreadPool;
 pub use system::ThreadActorSystem;

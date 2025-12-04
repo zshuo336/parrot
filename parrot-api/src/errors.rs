@@ -90,6 +90,18 @@ pub enum ActorError {
     #[error("Timeout")]
     Timeout,
     
+    /// Process message error.
+    ///
+    /// This error occurs when a message is processed with an error.
+    #[error("Process message error: {0}")]
+    ProcessMessageError(String),
+
+    /// Reply channel error.
+    ///
+    /// This error occurs when a reply channel fails to send a message.
+    #[error("Reply channel error: {0}")]
+    ReplyChannelError(String),
+
     /// Catch-all for other errors.
     ///
     /// This variant wraps any other error types that may occur

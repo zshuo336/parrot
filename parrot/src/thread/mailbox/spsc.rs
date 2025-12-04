@@ -11,51 +11,6 @@ use crate::thread::config::BackpressureStrategy;
 use crate::thread::error::MailboxError;
 use crate::thread::mailbox::Mailbox;
 
-/// Mock implementation of ActorRef for testing
-#[derive(Debug)]
-struct MockActorRef {
-    path_value: String,
-}
-
-impl MockActorRef {
-    fn new(path: &str) -> Self {
-        Self {
-            path_value: path.to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl ActorRef for MockActorRef {
-    fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
-        Box::pin(async move {
-            Ok(msg)
-        })
-    }
-    
-    fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move {
-            Ok(())
-        })
-    }
-    
-    fn path(&self) -> String {
-        self.path_value.clone()
-    }
-    
-    fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
-        Box::pin(async move {
-            true
-        })
-    }
-    
-    fn clone_boxed(&self) -> BoxedActorRef {
-        Box::new(Self {
-            path_value: self.path_value.clone(),
-        })
-    }
-}
-
 /// A single-producer, single-consumer mailbox implementation using tokio channels.
 /// 
 /// This mailbox is optimized for the single-producer case, which is the common case
@@ -303,6 +258,63 @@ impl Mailbox for SpscMailbox {
 mod tests {
     use super::*;
     use tokio::test;
+    use std::any::Any;
+    use std::time::Duration;
+
+    /// Mock implementation of ActorRef for testing
+    #[derive(Debug)]
+    struct MockActorRef {
+        path_value: String,
+    }
+
+    impl MockActorRef {
+        fn new(path: &str) -> Self {
+            Self {
+                path_value: path.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ActorRef for MockActorRef {
+        fn send<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                Ok(msg)
+            })
+        }
+
+        fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout_duration: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                Ok(msg)
+            })
+        }
+        
+        fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async move {
+                Ok(())
+            })
+        }
+        
+        fn path(&self) -> String {
+            self.path_value.clone()
+        }
+        
+        fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
+            Box::pin(async move {
+                true
+            })
+        }
+        
+        fn clone_boxed(&self) -> BoxedActorRef {
+            Box::new(Self {
+                path_value: self.path_value.clone(),
+            })
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
     
     // Helper to create a test ActorPath
     fn create_test_actor_path(path_str: &str) -> ActorPath {
