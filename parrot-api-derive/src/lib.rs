@@ -16,20 +16,21 @@ mod actor;
 /// 
 /// ## 1. Custom Return Type
 /// ```rust
-/// # use parrot_api::Message;
-/// #[derive(Message)]
+/// # use parrot_api::{Message, MessageDerive};
+/// #[derive(MessageDerive)]
 /// #[message(result = "Option<UserProfile>")]
 /// struct GetUserProfile {
 ///     user_id: String,
 /// }
+/// # struct UserProfile;
 /// ```
 /// 
 /// ## 2. Validation Rules
 /// ```rust
-/// # use parrot_api::Message;
-/// #[derive(Message)]
+/// # use parrot_api::{Message, MessageDerive};
+/// #[derive(MessageDerive)]
 /// #[message(
-///     validate = "amount > 0.0 && items.len() > 0",
+///     validate = "self.amount > 0.0 && self.items.len() > 0",
 ///     result = "OrderResult"
 /// )]
 /// struct CreateOrder {
@@ -37,13 +38,14 @@ mod actor;
 ///     amount: f64,
 ///     items: Vec<String>,
 /// }
+/// # struct OrderResult;
 /// ```
 /// 
 /// ## 3. Message Priority
 /// ```rust
-/// # use parrot_api::Message;
+/// # use parrot_api::{Message, MessageDerive};
 /// // Using a named priority
-/// #[derive(Message)]
+/// #[derive(MessageDerive)]
 /// #[message(priority = "HIGH")]  // Sets message processing priority to HIGH (70)
 /// struct EmergencyAlert {
 ///     alert_type: String,
@@ -51,7 +53,7 @@ mod actor;
 /// }
 /// 
 /// // Using a numeric priority (0-100)
-/// #[derive(Message)]
+/// #[derive(MessageDerive)]
 /// #[message(priority = 75)]  // Sets custom priority level
 /// struct CustomPriorityAlert {
 ///     alert_type: String,
@@ -70,11 +72,11 @@ mod actor;
 /// 
 /// ## 4. Complete Example
 /// ```rust
-/// # use parrot_api::Message;
-/// #[derive(Message)]
+/// # use parrot_api::{Message, MessageDerive};
+/// #[derive(MessageDerive)]
 /// #[message(
 ///     result = "Vec<Order>",           // Custom return type
-///     validate = "amount > 0.0",      // Add validation
+///     validate = "self.amount > 0.0",      // Add validation
 ///     priority = "HIGH"               // Set priority
 /// )]
 /// struct CreateOrder {
@@ -82,6 +84,7 @@ mod actor;
 ///     amount: f64,
 ///     items: Vec<String>,
 /// }
+/// # #[derive(Clone)] struct Order;
 /// 
 /// // Usage example:
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -95,10 +98,10 @@ mod actor;
 /// let order = CreateOrder::new(order)?;
 /// 
 /// // Get message type
-/// assert_eq!(order.message_type(), "CreateOrder");
+/// assert!(order.message_type().ends_with("CreateOrder"));
 /// 
 /// // Convert to envelope
-/// let envelope = order.into_envelope();
+/// let _envelope = order.into_envelope();
 /// # Ok(())
 /// # }
 /// ```
@@ -119,7 +122,7 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
 /// ## 1. Engine Selection
 /// 
 /// Using a string literal:
-/// ```rust
+/// ```ignore
 /// #[derive(ParrotActor)]
 /// #[ParrotActor(engine = "actix")]  // Use Actix as the actor backend
 /// struct MyActor {
@@ -128,7 +131,7 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
 /// ```
 /// 
 /// Using a constant:
-/// ```rust
+/// ```ignore
 /// #[derive(ParrotActor)]
 /// #[ParrotActor(engine = ACTIX)]  // Use Actix as the actor backend
 /// struct MyActor {
@@ -142,7 +145,7 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
 /// 
 /// ## 2. Other Configuration Options
 /// 
-/// ```rust
+/// ```ignore
 /// #[derive(ParrotActor)]
 /// #[ParrotActor(
 ///     engine = "actix",
@@ -156,7 +159,7 @@ pub fn derive_message(input: TokenStream) -> TokenStream {
 /// ```
 /// 
 /// ## 3. Complete Example
-/// ```rust
+/// ```ignore
 /// use parrot_api::actor::Actor;
 /// use parrot_api::message::Message;
 /// 

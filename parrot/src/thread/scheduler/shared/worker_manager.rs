@@ -1,101 +1,99 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
-
-use anyhow::anyhow;
-use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::queue::SchedulingQueue;
-use crate::thread::config::ThreadActorConfig;
-use crate::thread::error::SystemError;
-use crate::thread::processor::ActorProcessorManager;
 
 /// Manager for worker threads in the shared thread pool
 ///
 /// WorkerManager is responsible for:
-/// - Tracking active mailboxes and their processors
-/// - Starting and stopping actor processors
-/// - Scheduling mailboxes to be processed
-#[derive(Debug)]
+/// - Tracking scheduled actor paths
+/// - Tracking worker status slots for metrics
+/// - Pushing ready mailboxes into the scheduling queue
+#[derive(Debug, Default)]
 pub struct WorkerManager {
-    /// Map of active actor paths to their processors
-    processors: Mutex<HashMap<String, Arc<ActorProcessorManager>>>,
-    
+    /// Map of scheduled actor paths
+    scheduled: Mutex<HashMap<String, ()>>,
+
+    /// Worker status slots (one per worker, for metrics)
+    worker_statuses: Mutex<Vec<Arc<AtomicUsize>>>,
+
     /// Queue for scheduling mailboxes
-    scheduling_queue: Arc<SchedulingQueue>,
-    
-    /// Runtime handle for async operations
-    runtime_handle: Handle,
-    
-    /// Maximum messages to process per batch
-    max_messages_per_batch: usize,
+    scheduling_queue: Option<Arc<SchedulingQueue>>,
 }
 
 impl WorkerManager {
     /// Create a new worker manager
     ///
     /// # Arguments
-    /// * `runtime_handle` - Tokio runtime handle for async operations
     /// * `scheduling_queue` - Shared queue for mailboxes
-    /// * `max_messages_per_batch` - Maximum messages to process per batch
-    pub fn new(
-        runtime_handle: Handle,
-        scheduling_queue: Arc<SchedulingQueue>,
-        max_messages_per_batch: usize,
-    ) -> Self {
+    pub fn new(scheduling_queue: Arc<SchedulingQueue>) -> Self {
         Self {
-            processors: Mutex::new(HashMap::new()),
-            scheduling_queue,
-            runtime_handle,
-            max_messages_per_batch,
+            scheduled: Mutex::new(HashMap::new()),
+            worker_statuses: Mutex::new(Vec::new()),
+            scheduling_queue: Some(scheduling_queue),
         }
     }
-    
+
     /// Schedule a mailbox for processing
     ///
     /// # Arguments
     /// * `path` - Actor path
     /// * `mailbox` - Actor mailbox
-    /// * `config` - Optional actor configuration
-    pub async fn schedule_mailbox(
+    pub fn schedule_mailbox(
         &self,
         path: String,
         mailbox: Arc<dyn Mailbox>,
-        _config: Option<ThreadActorConfig>,
-    ) -> Result<(), SystemError> {
-        // Schedule for processing
-        self.scheduling_queue.push(mailbox);
-        
-        Ok(())
-    }
-    
-    /// Stop an actor processor
-    ///
-    /// # Arguments
-    /// * `path` - Actor path to stop
-    pub async fn stop_processor(&self, path: &str) -> Result<(), SystemError> {
-        let mut processors = self.processors.lock().unwrap();
-        if processors.remove(path).is_none() {
-            return Err(SystemError::ActorNotFound(path.to_string()));
+    ) -> Result<(), crate::thread::error::SystemError> {
+        let queue = self
+            .scheduling_queue
+            .as_ref()
+            .expect("WorkerManager built without scheduling queue");
+        {
+            let mut scheduled = self.scheduled.lock().unwrap();
+            scheduled.insert(path, ());
         }
-        
+        queue.push(mailbox);
         Ok(())
     }
-    
+
+    /// Stop tracking an actor
+    pub fn stop_processor(&self, path: &str) -> Result<(), crate::thread::error::SystemError> {
+        let mut scheduled = self.scheduled.lock().unwrap();
+        if scheduled.remove(path).is_none() {
+            return Err(crate::thread::error::SystemError::ActorNotFound(path.to_string()));
+        }
+        Ok(())
+    }
+
     /// Check if an actor is scheduled
-    ///
-    /// # Arguments
-    /// * `path` - Actor path to check
     pub fn is_scheduled(&self, path: &str) -> bool {
-        let processors = self.processors.lock().unwrap();
-        processors.contains_key(path)
+        self.scheduled.lock().unwrap().contains_key(path)
     }
-    
-    /// Get the current number of active processors
+
+    /// Get the current number of tracked actors
     pub fn processor_count(&self) -> usize {
-        let processors = self.processors.lock().unwrap();
-        processors.len()
+        self.scheduled.lock().unwrap().len()
     }
-} 
+
+    /// Register a worker status slot for metrics
+    pub fn track_worker(&self, status: Arc<AtomicUsize>) {
+        self.worker_statuses.lock().unwrap().push(status);
+    }
+
+    /// Number of tracked worker slots
+    pub fn tracked_worker_count(&self) -> usize {
+        self.worker_statuses.lock().unwrap().len()
+    }
+
+    /// Number of workers currently idle (by status code 0)
+    pub fn idle_worker_count(&self) -> usize {
+        self.worker_statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.load(Ordering::Relaxed) == 0)
+            .count()
+    }
+}

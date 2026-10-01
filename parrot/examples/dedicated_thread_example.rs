@@ -1,31 +1,29 @@
-use std::sync::{Arc, Weak};
+//! Example: running a compute-heavy actor on a dedicated OS thread.
+//!
+//! Demonstrates the `DedicatedThreadScheduler`: one OS thread per actor,
+//! each with its own single-threaded Tokio runtime.
+
+use std::sync::Arc;
 use std::time::Duration;
-use std::error::Error;
 
 use async_trait::async_trait;
-use tokio::runtime::Runtime;
 
-use parrot_api::types::BoxedMessage;
+use parrot_api::actor::{Actor, ActorState, EmptyConfig};
 use parrot_api::address::ActorPath;
-use parrot::thread::mailbox::{SimpleMailbox, Mailbox};
-use parrot::thread::config::{ThreadActorConfig, SchedulingMode, BackpressureStrategy};
-use parrot::thread::scheduler::dedicated::{DedicatedThreadPool, SystemRef};
-use parrot::system::actor::ThreadActor;
+use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
+use parrot::thread::actor::ThreadActor;
+use parrot::thread::address::ThreadActorRef;
+use parrot::thread::config::{BackpressureStrategy, SchedulingMode, ThreadActorConfig};
+use parrot::thread::context::ThreadContext;
+use parrot::thread::mailbox::mpsc::MpscMailbox;
+use parrot::thread::mailbox::Mailbox;
+use parrot::thread::processor::ActorProcessor;
+use parrot::thread::scheduler::dedicated_thread::{
+    DedicatedThreadConfig, DedicatedThreadScheduler, TypedThreadSchedulerExt,
+};
+use std::any::Any;
 
-// 简单的系统引用实现
-struct ExampleSystemRef;
-
-impl SystemRef for ExampleSystemRef {
-    fn find_actor(&self, _path: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        None
-    }
-    
-    fn handle_worker_panic(&self, error: String, mailbox_path: String) {
-        eprintln!("Worker panic in {}: {}", mailbox_path, error);
-    }
-}
-
-// 计算密集型actor示例
+/// A compute-heavy actor that folds numbers.
 struct ComputeActor {
     counter: u64,
 }
@@ -34,109 +32,95 @@ impl ComputeActor {
     fn new() -> Self {
         Self { counter: 0 }
     }
-    
-    // 模拟计算密集型工作
-    fn do_heavy_computation(&mut self, iterations: u64) -> u64 {
-        let mut result = 0;
-        for i in 0..iterations {
-            result = result.wrapping_add(i.wrapping_mul(self.counter));
-            if i % 1000 == 0 {
-                // 模拟复杂计算
-                std::thread::sleep(Duration::from_micros(1));
+}
+
+impl Actor for ComputeActor {
+    type Config = EmptyConfig;
+    type Context = ThreadContext<Self>;
+
+    fn init<'a>(&'a mut self, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn receive_message<'a>(&'a mut self, msg: BoxedMessage, _ctx: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            if let Some(n) = msg.downcast_ref::<u64>() {
+                self.counter = self.counter.wrapping_add(*n);
+                return Ok(Box::new(self.counter) as BoxedMessage);
+            }
+            Ok(msg)
+        })
+    }
+
+    fn receive_message_with_engine<'a>(&'a mut self, _msg: BoxedMessage, _ctx: &'a mut Self::Context, _engine_ctx: std::ptr::NonNull<dyn Any>) -> Option<ActorResult<BoxedMessage>> {
+        None
+    }
+
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() {
+    // 1. Create the dedicated-thread scheduler.
+    let scheduler = DedicatedThreadScheduler::new(Some(DedicatedThreadConfig {
+        max_threads: 4,
+        idle_sleep_duration: Duration::from_millis(5),
+        ..Default::default()
+    }));
+
+    // 2. Build the actor stack: mailbox + processor.
+    let path_str = "user/compute-1";
+    let actor_path = ActorPath::placeholder(path_str);
+    let mailbox = Arc::new(MpscMailbox::new(1024, actor_path.clone()));
+
+    let context = ThreadContext::<ComputeActor>::new_for_test(path_str);
+    let processor = Arc::new(ActorProcessor::<ComputeActor>::new(
+        ThreadActor::new_for_test(ComputeActor::new()),
+        context,
+        path_str.to_string(),
+        ThreadActorConfig::default(),
+    ));
+    mailbox.set_processor(processor.clone() as Arc<dyn parrot::thread::processor::ProcessorInterface>);
+
+    // 3. Schedule the actor on a dedicated OS thread.
+    scheduler
+        .schedule_typed_by_processor::<ComputeActor>(
+            path_str,
+            mailbox.clone(),
+            processor,
+            ThreadActorConfig {
+                scheduling_mode: Some(SchedulingMode::DedicatedThread),
+                ..Default::default()
+            },
+        )
+        .expect("failed to schedule dedicated actor");
+
+    // 4. Create an actor ref and send work.
+    let actor_ref = ThreadActorRef::<ComputeActor>::new(
+        actor_path,
+        Arc::downgrade(&mailbox) as parrot::thread::mailbox::WeakMailboxRef,
+        BackpressureStrategy::Block,
+        Duration::from_secs(2),
+        None,
+    );
+
+    for value in [100u64, 250, 33] {
+        let result = actor_ref.ask(Box::new(value) as BoxedMessage).await;
+        match result {
+            Ok(reply) => {
+                let total = reply.downcast_ref::<u64>().copied().unwrap_or(0);
+                println!("after adding {value}: total = {total}");
+            }
+            Err(e) => {
+                eprintln!("ask failed: {e}");
+                break;
             }
         }
-        self.counter += 1;
-        result
     }
-}
 
-// Actor实现
-#[async_trait]
-impl ThreadActor for ComputeActor {
-    async fn receive(&mut self, message: BoxedMessage) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if let Some(iterations) = message.downcast_ref::<u64>() {
-            let result = self.do_heavy_computation(*iterations);
-            println!("Computed result: {} after {} iterations", result, iterations);
-        } else {
-            println!("Received unknown message");
-        }
-        Ok(())
-    }
+    // 5. Shut the scheduler down.
+    scheduler.shutdown().await.expect("shutdown failed");
+    println!("dedicated-thread example finished");
 }
-
-fn main() -> Result<(), Box<dyn Error>> {
-    // 创建tokio运行时
-    let runtime = Runtime::new()?;
-    let handle = runtime.handle().clone();
-    
-    // 创建系统引用
-    let system_ref = Arc::new(ExampleSystemRef);
-    let system_weak = Arc::downgrade(&system_ref) as Weak<dyn SystemRef + Send + Sync>;
-    
-    // 创建专用线程池，最多允许3个线程
-    let pool = DedicatedThreadPool::new(
-        handle.clone(),
-        Some(system_weak),
-        3,
-    );
-    
-    // 创建几个计算密集型actor
-    let actor1 = Arc::new(ComputeActor::new());
-    let actor2 = Arc::new(ComputeActor::new());
-    
-    // 创建对应的mailbox
-    let mailbox1 = SimpleMailbox::new("compute/actor1", 100);
-    let mailbox2 = SimpleMailbox::new("compute/actor2", 100);
-    
-    // 配置为专用线程
-    let config = ThreadActorConfig {
-        scheduling_mode: Some(SchedulingMode::DedicatedThread),
-        ..Default::default()
-    };
-    
-    // 在各自的专用线程上调度这些actor
-    println!("Scheduling actor1 on dedicated thread");
-    pool.schedule(mailbox1.clone(), Some(&config))?;
-    
-    println!("Scheduling actor2 on dedicated thread");
-    pool.schedule(mailbox2.clone(), Some(&config))?;
-    
-    // 向这些actor发送计算任务
-    println!("Sending computation tasks to actors");
-    runtime.block_on(async {
-        let msg1: BoxedMessage = Box::new(1_000_000u64);
-        let msg2: BoxedMessage = Box::new(2_000_000u64);
-        
-        mailbox1.push(msg1, BackpressureStrategy::Block).await?;
-        mailbox2.push(msg2, BackpressureStrategy::Block).await?;
-        
-        // 给一些时间让任务完成
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        
-        // 发送更多任务
-        let msg3: BoxedMessage = Box::new(500_000u64);
-        let msg4: BoxedMessage = Box::new(1_500_000u64);
-        
-        mailbox1.push(msg3, BackpressureStrategy::Block).await?;
-        mailbox2.push(msg4, BackpressureStrategy::Block).await?;
-        
-        // 等待所有任务完成
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        
-        // 取消调度actor1
-        println!("Descheduling actor1");
-        pool.deschedule(&mailbox1.path(), true, Some(1000))?;
-        
-        // 再等待一段时间
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        
-        // 关闭线程池
-        println!("Shutting down the pool");
-        pool.shutdown(1000).await?;
-        
-        Result::<(), Box<dyn Error + Send + Sync>>::Ok(())
-    })?;
-    
-    println!("All tasks completed successfully");
-    Ok(())
-} 

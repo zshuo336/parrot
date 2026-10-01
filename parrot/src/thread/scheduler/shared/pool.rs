@@ -1,17 +1,15 @@
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, RwLock, Weak, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
-use anyhow::anyhow;
 
 use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::queue::SchedulingQueue;
 use crate::thread::config::ThreadActorConfig;
 use crate::thread::error::SystemError;
 use crate::thread::scheduler::ThreadScheduler;
-use super::worker::{Worker, WorkerConfig, WorkerStatus};
+use super::worker::{Worker, WorkerConfig};
 use super::worker_manager::WorkerManager;
 
 /// Configuration for the shared thread pool
@@ -19,19 +17,19 @@ use super::worker_manager::WorkerManager;
 pub struct SharedThreadPoolConfig {
     /// Number of worker threads
     pub pool_size: usize,
-    
+
     /// Maximum capacity of the scheduling queue for metrics
     pub max_queue_capacity: usize,
-    
+
     /// Maximum number of messages to process in one batch
     pub max_messages_per_batch: usize,
-    
+
     /// Duration to sleep when idle before checking for work again
     pub idle_sleep_duration: Duration,
-    
+
     /// Whether to yield to the scheduler after processing each message
     pub yield_after_each_message: bool,
-    
+
     /// Whether to log detailed processing metrics
     pub enable_detailed_logging: bool,
 }
@@ -54,18 +52,30 @@ impl Default for SharedThreadPoolConfig {
 pub enum SchedulerStatus {
     /// Scheduler is initializing
     Initializing = 0,
-    
+
     /// Scheduler is running normally
     Running = 1,
-    
+
     /// Scheduler is shutting down
     ShuttingDown = 2,
-    
+
     /// Scheduler has completed shutdown
     Shutdown = 3,
-    
+
     /// Scheduler has encountered an error
     Error = 4,
+}
+
+impl SchedulerStatus {
+    pub fn from_usize(v: usize) -> Self {
+        match v {
+            0 => SchedulerStatus::Initializing,
+            1 => SchedulerStatus::Running,
+            2 => SchedulerStatus::ShuttingDown,
+            3 => SchedulerStatus::Shutdown,
+            _ => SchedulerStatus::Error,
+        }
+    }
 }
 
 /// Metrics about the scheduler state
@@ -73,77 +83,77 @@ pub enum SchedulerStatus {
 pub struct SchedulerMetrics {
     /// Number of worker threads in the pool
     pub pool_size: usize,
-    
+
     /// Current length of the scheduling queue
     pub queue_length: usize,
-    
+
     /// Whether the scheduler is shutting down
     pub is_shutting_down: bool,
-    
+
     /// Current status of the scheduler
     pub status: SchedulerStatus,
-    
+
     /// Number of active processors
     pub active_processors: usize,
 }
 
+impl fmt::Debug for SharedThreadPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedThreadPool")
+            .field("pool_size", &self.pool_size)
+            .field("workers", &self.workers.lock().map(|w| w.len()).unwrap_or(0))
+            .field("status", &self.status())
+            .field("is_shutting_down", &self.is_shutting_down.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// Scheduler implementation for managing a shared thread pool
-/// 
-/// SharedThreadPool maintains a group of worker threads that pull ready mailboxes from a central SchedulingQueue.
-/// This approach is highly efficient when there are many actors but not all are active simultaneously.
-/// 
-/// # Thread Safety
-/// - Uses Arc and weak references to manage shared state
-/// - Uses atomic flags to control shutdown behavior
-/// - Uses SchedulingQueue for inter-thread communication
-/// 
+///
+/// SharedThreadPool maintains a group of worker threads that pull ready
+/// mailboxes from a central [`SchedulingQueue`]. Each mailbox carries its
+/// type-erased processor (`Arc<dyn ProcessorInterface>`); workers execute it
+/// without knowing the concrete actor type.
+///
 /// # Performance Characteristics
-/// - Supports work stealing pattern for load balancing
-/// - Avoids thundering herd on thread wakeups
-/// - Batch processes messages for efficiency
-/// 
-/// # Worker Thread Behavior
-/// 1. Gets ready mailbox from SchedulingQueue
-/// 2. Processes a batch of messages (limited by max_messages_per_batch)
-/// 3. Re-queues mailbox if it still has messages
-/// 4. Captures panics and notifies supervisor
-#[derive(Debug)]
+/// - Work stealing pattern for load balancing
+/// - Batch processing for efficiency
+/// - Mailboxes re-queued while they still hold messages
 pub struct SharedThreadPool {
     /// Size of thread pool
     pool_size: usize,
-    
-    /// Collection of worker thread JoinHandles
-    workers: Vec<JoinHandle<()>>,
-    
+
+    /// Collection of worker task JoinHandles
+    workers: std::sync::Mutex<Vec<JoinHandle<()>>>,
+
     /// Central scheduling queue for ready mailboxes
     scheduling_queue: Arc<SchedulingQueue>,
-    
+
     /// System runtime handle
     runtime_handle: Handle,
-    
+
     /// Shutdown flag
     is_shutting_down: Arc<AtomicBool>,
-    
+
     /// Configuration
     config: SharedThreadPoolConfig,
-    
+
     /// Worker manager
     worker_manager: Arc<WorkerManager>,
-    
+
     /// Current status of the scheduler
     status: Arc<AtomicUsize>,
-    
-    /// Worker configurations
-    worker_configs: Vec<Arc<AtomicUsize>>,
+
+    /// Scheduled actor paths (registered by path, executed via queue)
+    scheduled_paths: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl SharedThreadPool {
     /// Create new SharedThreadPool
-    /// 
+    ///
     /// # Arguments
     /// * `config` - Optional configuration for the thread pool
     /// * `runtime_handle` - Tokio runtime handle
-    /// * `system` - Optional system reference
     pub fn new(
         config: Option<SharedThreadPoolConfig>,
         runtime_handle: Handle,
@@ -152,146 +162,169 @@ impl SharedThreadPool {
         let scheduling_queue = Arc::new(SchedulingQueue::new(config.max_queue_capacity));
         let is_shutting_down = Arc::new(AtomicBool::new(false));
         let status = Arc::new(AtomicUsize::new(SchedulerStatus::Initializing as usize));
-        
-        // Create worker manager
+
         let worker_manager = Arc::new(WorkerManager::new(
-            runtime_handle.clone(),
             scheduling_queue.clone(),
-            config.max_messages_per_batch,
         ));
-        
+
         let mut pool = Self {
             pool_size: config.pool_size,
-            workers: Vec::with_capacity(config.pool_size),
+            workers: std::sync::Mutex::new(Vec::with_capacity(config.pool_size)),
             scheduling_queue,
-            runtime_handle: runtime_handle.clone(),
+            runtime_handle,
             is_shutting_down,
             config,
             worker_manager,
             status,
-            worker_configs: Vec::with_capacity(config.pool_size),
+            scheduled_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
-        
-        // Start worker threads
+
         pool.start_workers();
-        
-        // Mark as running
+
         pool.status.store(SchedulerStatus::Running as usize, Ordering::SeqCst);
-        
+
         pool
     }
-    
-    /// Start worker threads
+
+    /// Start worker tasks
     fn start_workers(&mut self) {
         for worker_id in 0..self.pool_size {
-            // Create worker configuration
             let worker_config = WorkerConfig {
                 batch_size: self.config.max_messages_per_batch,
                 idle_sleep_duration: self.config.idle_sleep_duration,
                 yield_after_each_message: self.config.yield_after_each_message,
                 enable_detailed_logging: self.config.enable_detailed_logging,
             };
-            
-            // Create and spawn the worker
+
             let worker = Worker::new(
                 worker_id,
                 self.runtime_handle.clone(),
                 self.scheduling_queue.clone(),
                 self.is_shutting_down.clone(),
-                self.system.clone(),
-                Some(worker_config.clone()),
+                worker_config,
             );
-            
-            // Track worker status
-            self.worker_configs.push(worker.status().clone());
-            
+
+            self.worker_manager.track_worker(worker.status());
+
             let handle = worker.spawn();
-            self.workers.push(handle);
+            self.workers.lock().unwrap().push(handle);
         }
     }
-    
+
     /// Schedule an actor on the thread pool
-    /// 
-    /// # Arguments
-    /// * `path` - Actor path
-    /// * `mailbox` - Actor mailbox
-    /// * `config` - Actor configuration
+    ///
+    /// Registers the actor path, installs a wake hook on the mailbox, and
+    /// pushes the (processor-carrying) mailbox into the scheduling queue.
+    /// Workers process a batch and re-queue the mailbox while it still holds
+    /// messages; the wake hook covers the race where a push lands after a
+    /// worker decided not to re-queue an empty mailbox.
     pub async fn schedule(
         &self,
         path: &str,
         mailbox: Arc<dyn Mailbox>,
-        config: Option<ThreadActorConfig>,
+        _config: Option<ThreadActorConfig>,
     ) -> Result<(), SystemError> {
-        // Check if already shutting down
         if self.is_shutting_down.load(Ordering::Relaxed) {
             return Err(SystemError::ShuttingDown);
         }
-        
-        // Schedule mailbox with the worker manager
-        self.worker_manager.schedule_mailbox(
-            path.to_string(),
-            mailbox.clone(),
-            config,
-        ).await?;
-        
+
+        if !mailbox.has_processor() {
+            return Err(SystemError::Other(anyhow::anyhow!(
+                "Mailbox for actor {} has no processor attached",
+                path
+            )));
+        }
+
+        {
+            let mut paths = self.scheduled_paths.lock().unwrap();
+            paths.insert(path.to_string());
+        }
+
+        // Install the wake hook: whenever a push succeeds after this actor is
+        // scheduled, (re-)enqueue the mailbox so a worker picks it up even if
+        // it had previously drained it to empty. The schedule slot ensures at
+        // most one queue entry per mailbox.
+        {
+            let queue = self.scheduling_queue.clone();
+            let weak_mailbox = Arc::downgrade(&mailbox);
+            let shutting_down = self.is_shutting_down.clone();
+            mailbox.set_wake_hook(Arc::new(move || {
+                if shutting_down.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(strong) = weak_mailbox.upgrade() {
+                    if strong.schedule_state().try_enqueue() {
+                        queue.push(strong);
+                    }
+                }
+            }));
+        }
+
+        mailbox.schedule_state().try_enqueue();
+        self.scheduling_queue.push(mailbox.clone());
+
         Ok(())
     }
-    
+
     /// Deschedule an actor from the thread pool
-    /// 
-    /// # Arguments
-    /// * `path` - Actor path to deschedule
     pub async fn deschedule(&self, path: &str) -> Result<(), SystemError> {
-        self.worker_manager.stop_processor(path).await
+        let removed = {
+            let mut paths = self.scheduled_paths.lock().unwrap();
+            paths.remove(path)
+        };
+        if !removed {
+            return Err(SystemError::ActorNotFound(path.to_string()));
+        }
+        // Mailbox re-queueing is guarded by has_more_messages checks; the
+        // mailbox may still be drained one last time but no new batches run.
+        Ok(())
     }
-    
+
     /// Check if an actor is scheduled
-    /// 
-    /// # Arguments
-    /// * `path` - Actor path to check
     pub fn is_scheduled(&self, path: &str) -> bool {
-        self.worker_manager.is_scheduled(path)
+        self.scheduled_paths.lock().unwrap().contains(path)
     }
-    
+
     /// Shutdown the thread pool
-    /// 
+    ///
     /// # Arguments
     /// * `timeout_ms` - Timeout in milliseconds to wait for graceful shutdown
     pub async fn shutdown(&self, timeout_ms: u64) -> Result<(), SystemError> {
-        // Set the shutting down flag
         self.status.store(SchedulerStatus::ShuttingDown as usize, Ordering::SeqCst);
         self.is_shutting_down.store(true, Ordering::SeqCst);
-        
-        // Notify all workers that may be waiting on the queue
+
+        // Wake all idle workers so they observe the shutdown flag.
         for _ in 0..self.pool_size {
             self.scheduling_queue.notify_handle().notify_one();
         }
-        
-        // TODO: Implement timeout waiting for worker threads to complete
-        
-        // Mark as fully shutdown
+
+        // Give workers a bounded chance to exit.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            // Take one handle out of the lock scope before awaiting so the
+            // MutexGuard is not held across the await point.
+            let next = { self.workers.lock().unwrap().pop() };
+            let Some(handle) = next else { break };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = tokio::time::timeout(remaining, handle).await;
+        }
         self.status.store(SchedulerStatus::Shutdown as usize, Ordering::SeqCst);
-        
         Ok(())
     }
-    
+
     /// Get the pool size
     pub fn pool_size(&self) -> usize {
         self.pool_size
     }
-    
+
     /// Get the current scheduler status
     pub fn status(&self) -> SchedulerStatus {
-        match self.status.load(Ordering::Relaxed) {
-            0 => SchedulerStatus::Initializing,
-            1 => SchedulerStatus::Running,
-            2 => SchedulerStatus::ShuttingDown,
-            3 => SchedulerStatus::Shutdown,
-            4 => SchedulerStatus::Error,
-            _ => SchedulerStatus::Error, // Default to error for unknown status
-        }
+        SchedulerStatus::from_usize(self.status.load(Ordering::Relaxed))
     }
-    
+
     /// Get metrics about the scheduler
     pub fn metrics(&self) -> SchedulerMetrics {
         SchedulerMetrics {
@@ -299,46 +332,336 @@ impl SharedThreadPool {
             queue_length: self.scheduling_queue.len(),
             is_shutting_down: self.is_shutting_down.load(Ordering::Relaxed),
             status: self.status(),
-            active_processors: self.worker_manager.processor_count(),
+            active_processors: self.worker_manager.tracked_worker_count(),
         }
     }
 }
 
 impl ThreadScheduler for SharedThreadPool {
+    fn metrics_thread_count(&self) -> usize {
+        self.pool_size
+    }
+
     fn schedule(
         &self,
         path: &str,
         mailbox: Arc<dyn Mailbox>,
         config: Option<ThreadActorConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.schedule(path, mailbox, config).await
-            })
-        }).map_err(|e| e)
+        self.runtime_handle
+            .block_on(async { self.schedule(path, mailbox, config).await })
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
-    
+
     fn deschedule(
         &self,
         path: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.deschedule(path).await
-            })
-        }).map_err(|e| e)
+        self.runtime_handle
+            .block_on(async { self.deschedule(path).await })
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
-    
+
     fn is_scheduled(&self, path: &str) -> bool {
         self.is_scheduled(path)
     }
-    
+
     fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tokio::task::block_in_place(|| {
-            // Default timeout of 5 seconds
-            tokio::runtime::Handle::current().block_on(async {
-                self.shutdown(5000).await
-            })
-        }).map_err(|e| e)
+        self.runtime_handle
+            .block_on(async { self.shutdown(5000).await })
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::actor::ThreadActor;
+    use crate::thread::config::ThreadActorConfig;
+    use crate::thread::context::ThreadContext;
+    use crate::thread::mailbox::mpsc::MpscMailbox;
+    use crate::thread::processor::ActorProcessor;
+    use parrot_api::actor::{Actor, ActorState, EmptyConfig};
+    use parrot_api::address::ActorPath;
+    use parrot_api::types::{ActorResult, BoxedFuture, BoxedMessage};
+    use std::any::Any;
+    use std::sync::Arc;
+
+    /// Counting actor that records processed values.
+    #[derive(Debug, Default)]
+    struct CountingActor {
+        count: u64,
+    }
+
+    impl Actor for CountingActor {
+        type Config = EmptyConfig;
+        type Context = ThreadContext<Self>;
+
+        fn init<'a>(
+            &'a mut self,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive_message<'a>(
+            &'a mut self,
+            msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+        ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+            Box::pin(async move {
+                if let Some(v) = msg.downcast_ref::<u64>() {
+                    self.count += *v;
+                }
+                Ok(msg)
+            })
+        }
+
+        fn receive_message_with_engine<'a>(
+            &'a mut self,
+            _msg: BoxedMessage,
+            _ctx: &'a mut Self::Context,
+            _engine_ctx: std::ptr::NonNull<dyn Any>,
+        ) -> Option<ActorResult<BoxedMessage>> {
+            None
+        }
+
+        fn state(&self) -> ActorState {
+            ActorState::Running
+        }
+    }
+
+    /// Build a mailbox with an attached processor-backed actor stack.
+    fn build_mailbox(path: &str) -> Arc<MpscMailbox> {
+        let actor_path = ActorPath::placeholder(path);
+        let mailbox = Arc::new(MpscMailbox::new(64, actor_path));
+        let context = ThreadContext::<CountingActor>::new_for_test(path);
+        let processor = Arc::new(ActorProcessor::<CountingActor>::new(
+            ThreadActor::new_for_test(CountingActor::default()),
+            context,
+            path.to_string(),
+            ThreadActorConfig::default(),
+        ));
+        mailbox.set_processor(processor);
+        mailbox
+    }
+
+    fn make_pool(pool_size: usize) -> SharedThreadPool {
+        SharedThreadPool::new(
+            Some(SharedThreadPoolConfig {
+                pool_size,
+                idle_sleep_duration: Duration::from_millis(2),
+                ..Default::default()
+            }),
+            tokio::runtime::Handle::current(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pool_starts_running_with_workers() {
+        let pool = make_pool(2);
+        assert_eq!(pool.pool_size(), 2);
+        assert_eq!(pool.status(), SchedulerStatus::Running);
+
+        let metrics = pool.metrics();
+        assert_eq!(metrics.pool_size, 2);
+        assert_eq!(metrics.status, SchedulerStatus::Running);
+        assert!(!metrics.is_shutting_down);
+
+        pool.shutdown(2000).await.unwrap();
+        assert_eq!(pool.status(), SchedulerStatus::Shutdown);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_schedule_registers_path_and_processes_messages() {
+        let pool = make_pool(2);
+        let mailbox = build_mailbox("pool/process/a");
+
+        pool.schedule("pool/process/a", mailbox.clone(), None)
+            .await
+            .unwrap();
+        assert!(pool.is_scheduled("pool/process/a"));
+
+        // Push messages; the shared pool must drain them.
+        for v in 1..=10u64 {
+            mailbox
+                .push(
+                    Box::new(v),
+                    crate::thread::config::BackpressureStrategy::Block,
+                )
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..500 {
+            if mailbox.is_empty().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(mailbox.is_empty().await, "pool must drain the mailbox");
+
+        pool.shutdown(2000).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_schedule_rejects_mailbox_without_processor() {
+        let pool = make_pool(1);
+        let mailbox: Arc<dyn Mailbox> = Arc::new(MpscMailbox::new(
+            8,
+            ActorPath::placeholder("pool/no-proc"),
+        ));
+
+        let result = pool.schedule("pool/no-proc", mailbox, None).await;
+        assert!(result.is_err());
+        assert!(!pool.is_scheduled("pool/no-proc"));
+
+        pool.shutdown(2000).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_deschedule_unknown_actor_errors() {
+        let pool = make_pool(1);
+        let result = pool.deschedule("does/not/exist").await;
+        assert!(matches!(result, Err(SystemError::ActorNotFound(_))));
+        pool.shutdown(2000).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_deschedule_removes_registration() {
+        let pool = make_pool(1);
+        let mailbox = build_mailbox("pool/desched/a");
+
+        pool.schedule("pool/desched/a", mailbox, None).await.unwrap();
+        assert!(pool.is_scheduled("pool/desched/a"));
+
+        pool.deschedule("pool/desched/a").await.unwrap();
+        assert!(!pool.is_scheduled("pool/desched/a"));
+
+        // Descheduling again fails: not registered anymore.
+        let again = pool.deschedule("pool/desched/a").await;
+        assert!(matches!(again, Err(SystemError::ActorNotFound(_))));
+
+        pool.shutdown(2000).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_schedule_rejected_after_shutdown() {
+        let pool = make_pool(1);
+        pool.shutdown(2000).await.unwrap();
+
+        let mailbox = build_mailbox("pool/late");
+        let result = pool.schedule("pool/late", mailbox, None).await;
+        assert!(matches!(result, Err(SystemError::ShuttingDown)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_multiple_actors_share_the_pool() {
+        let pool = make_pool(2);
+        let m1 = build_mailbox("pool/multi/a");
+        let m2 = build_mailbox("pool/multi/b");
+
+        pool.schedule("pool/multi/a", m1.clone(), None).await.unwrap();
+        pool.schedule("pool/multi/b", m2.clone(), None).await.unwrap();
+
+        for i in 0..5u64 {
+            m1.push(Box::new(i), crate::thread::config::BackpressureStrategy::Block)
+                .await
+                .unwrap();
+            m2.push(Box::new(i * 10), crate::thread::config::BackpressureStrategy::Block)
+                .await
+                .unwrap();
+        }
+
+        // Both mailboxes must be drained by the pool workers.
+        for _ in 0..500 {
+            let e1 = m1.is_empty().await;
+            let e2 = m2.is_empty().await;
+            if e1 && e2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(m1.is_empty().await);
+        assert!(m2.is_empty().await);
+
+        pool.shutdown(2000).await.unwrap();
+    }
+
+    /// Regression test for the lost-wakeup race: a message pushed *after* a
+    /// worker drained the mailbox to empty must still be processed, because
+    /// the wake hook re-enqueues the mailbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_push_after_drain_is_still_processed_via_wake_hook() {
+        let pool = make_pool(2);
+        let mailbox = build_mailbox("pool/wake-hook/a");
+
+        pool.schedule("pool/wake-hook/a", mailbox.clone(), None)
+            .await
+            .unwrap();
+
+        // First wave: push and wait until fully drained (mailbox no longer
+        // re-queued by the worker because it looked empty afterwards).
+        mailbox
+            .push(
+                Box::new(1u64),
+                crate::thread::config::BackpressureStrategy::Block,
+            )
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            if mailbox.is_empty().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(mailbox.is_empty().await, "first wave must be drained");
+
+        // Second wave arrives after the drain: must still be processed.
+        mailbox
+            .push(
+                Box::new(2u64),
+                crate::thread::config::BackpressureStrategy::Block,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..500 {
+            if mailbox.is_empty().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            mailbox.is_empty().await,
+            "second wave must be drained via the wake hook"
+        );
+
+        pool.shutdown(2000).await.unwrap();
+    }
+
+    #[test]
+    fn test_scheduler_status_from_usize() {
+        assert_eq!(SchedulerStatus::from_usize(0), SchedulerStatus::Initializing);
+        assert_eq!(SchedulerStatus::from_usize(1), SchedulerStatus::Running);
+        assert_eq!(SchedulerStatus::from_usize(2), SchedulerStatus::ShuttingDown);
+        assert_eq!(SchedulerStatus::from_usize(3), SchedulerStatus::Shutdown);
+        assert_eq!(SchedulerStatus::from_usize(99), SchedulerStatus::Error);
+    }
+
+    #[test]
+    fn test_pool_debug_formatting() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let pool = SharedThreadPool::new(
+            Some(SharedThreadPoolConfig {
+                pool_size: 1,
+                ..Default::default()
+            }),
+            rt.handle().clone(),
+        );
+        let repr = format!("{:?}", pool);
+        assert!(repr.contains("SharedThreadPool"));
+    }
+}

@@ -144,5 +144,121 @@ impl SchedulingQueue {
 
 #[cfg(test)]
 mod tests {
-    // TODO: Add tests for SchedulingQueue
+    use super::*;
+    use crate::thread::mailbox::mpsc::MpscMailbox;
+    use parrot_api::address::ActorPath;
+
+    fn make_mailbox(name: &str) -> Arc<dyn Mailbox + Send + Sync> {
+        Arc::new(MpscMailbox::new(4, ActorPath::placeholder(name)))
+    }
+
+    #[test]
+    fn test_new_queue_starts_empty() {
+        let queue = SchedulingQueue::new(16);
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+        assert!(queue.try_pop().is_none());
+    }
+
+    #[test]
+    fn test_push_then_try_pop_fifo() {
+        let queue = SchedulingQueue::new(16);
+        let m1 = make_mailbox("q/a");
+        let m2 = make_mailbox("q/b");
+
+        queue.push(m1);
+        queue.push(m2);
+        assert_eq!(queue.len(), 2);
+        assert!(!queue.is_empty());
+
+        // FIFO order (best-effort for concurrent queues, deterministic here
+        // because pushes and pops are sequential).
+        assert_eq!(queue.try_pop().unwrap().path().path, "q/a");
+        assert_eq!(queue.try_pop().unwrap().path().path, "q/b");
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_async_pop_waits_until_push() {
+        let queue = Arc::new(SchedulingQueue::new(16));
+
+        // Spawn a consumer that blocks until an item appears.
+        let consumer_queue = queue.clone();
+        let consumer = tokio::spawn(async move {
+            let mailbox = consumer_queue.pop().await;
+            mailbox.path().path.clone()
+        });
+
+        // Give the consumer a moment to park, then push.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        queue.push(make_mailbox("q/late"));
+
+        let path = tokio::time::timeout(std::time::Duration::from_secs(2), consumer)
+            .await
+            .expect("consumer must wake up")
+            .expect("join must succeed");
+        assert_eq!(path, "q/late");
+    }
+
+    #[test]
+    fn test_notify_handle_is_shareable() {
+        let queue = SchedulingQueue::new(8);
+        let notify1 = queue.notify_handle();
+        let notify2 = queue.notify_handle();
+        // Both handles reference the same Notify instance; use a small
+        // current-thread runtime to await the notified future.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            notify1.notify_one();
+            let notified = notify2.notified();
+            tokio::pin!(notified);
+            // The permit from notify_one is available: awaiting returns immediately.
+            notified.await;
+        });
+    }
+
+    #[test]
+    fn test_queue_handle_shares_state() {
+        let queue = SchedulingQueue::new(8);
+        let handle = queue.queue_handle();
+        handle.push(make_mailbox("q/shared"));
+        // The handle observes the same underlying queue.
+        assert_eq!(queue.len(), 1);
+        assert!(queue.try_pop().is_some());
+    }
+
+    #[test]
+    fn test_concurrent_push_and_pop() {
+        let queue = Arc::new(SchedulingQueue::new(1024));
+        let producers: Vec<_> = (0..4)
+            .map(|p| {
+                let q = queue.clone();
+                std::thread::spawn(move || {
+                    for i in 0..100 {
+                        q.push(make_mailbox(&format!("q/p{}/{}", p, i)));
+                    }
+                })
+            })
+            .collect();
+
+        for p in producers {
+            p.join().unwrap();
+        }
+        assert_eq!(queue.len(), 400);
+
+        let mut popped = 0;
+        while queue.try_pop().is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, 400);
+    }
+
+    #[test]
+    fn test_debug_formatting() {
+        let queue = SchedulingQueue::new(8);
+        let repr = format!("{:?}", queue);
+        assert!(repr.contains("SchedulingQueue"));
+    }
 } 

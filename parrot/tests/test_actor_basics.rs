@@ -41,27 +41,37 @@ impl ActorRef for MockActorRef {
             Ok(msg)
         })
     }
-    
+
+    fn send_with_timeout<'a>(&'a self, msg: BoxedMessage, _timeout: Option<Duration>) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move {
+            Ok(msg)
+        })
+    }
+
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move {
             Ok(())
         })
     }
-    
+
     fn path(&self) -> String {
         self.path_value.clone()
     }
-    
+
     fn is_alive<'a>(&'a self) -> BoxedFuture<'a, bool> {
         Box::pin(async move {
             true
         })
     }
-    
+
     fn clone_boxed(&self) -> BoxedActorRef {
         Box::new(Self {
             path_value: self.path_value.clone(),
         })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -174,116 +184,109 @@ impl Actor for BasicTestActor {
     }
 }
 
-// Run basic actor tests
-fn main() {
-    actix::System::new().block_on(async {
-        // Run all tests and report results
-        let results = run_all_tests().await;
-        
-        match results {
-            Ok(_) => println!("All tests passed!"),
-            Err(e) => {
-                eprintln!("Test failure: {}", e);
-                std::process::exit(1);
-            }
-        }
-    });
-}
 
-async fn run_all_tests() -> Result<()> {
-    test_basic_actor_creation().await?;
-    test_actor_message_handling().await?;
-    test_actor_counter().await?;
-    test_actor_get_by_path().await?;
-    
-    Ok(())
-}
 
 // Using fn instead of #[test] because async functions can't be used directly as tests
-async fn test_basic_actor_creation() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create a basic test actor
-        let test_actor = BasicTestActor::new("TestActor1".to_string());
-        let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
+#[test]
+fn test_basic_actor_creation() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create a basic test actor
+            let test_actor = BasicTestActor::new("TestActor1".to_string());
+            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
         
-        // Check that we can get a valid reference - test that the actor has a path
-        let actor_path = actor_ref.path();
-        assert!(!actor_path.is_empty(), "Actor reference should have a valid path");
+            // Check that we can get a valid reference - test that the actor has a path
+            let actor_path = actor_ref.path();
+            assert!(!actor_path.is_empty(), "Actor reference should have a valid path");
         
-        Ok(((), system))
-    }).await
+            Ok(((), system))
+        }).await
+    })
 }
 
-async fn test_actor_message_handling() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create a basic test actor
-        let test_actor = BasicTestActor::new("MessageHandler".to_string());
-        let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
+#[test]
+fn test_actor_message_handling() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create a basic test actor
+            let test_actor = BasicTestActor::new("MessageHandler".to_string());
+            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
         
-        // Send a test message
-        let msg = TestMessage("Hello Actor!".to_string());
-        let response = actor_ref.ask(msg).await?;
+            // Send a test message
+            let msg = TestMessage("Hello Actor!".to_string());
+            let response = actor_ref.ask(msg).await?;
         
-        // Verify response
-        assert_eq!(
-            response, 
-            "MessageHandler received: Hello Actor!",
-            "Actor should process messages and return correct responses"
-        );
-        
-        Ok(((), system))
-    }).await
-}
-
-async fn test_actor_counter() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create a counter test actor
-        let test_actor = BasicTestActor::new("Counter".to_string());
-        let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
-        
-        // Test initial counter value
-        let initial = actor_ref.ask(IncrementCounter(0)).await?;
-        assert_eq!(initial, 0, "Initial counter should be 0");
-        
-        // Increment counter multiple times
-        let val1 = actor_ref.ask(IncrementCounter(5)).await?;
-        assert_eq!(val1, 5, "Counter should be 5 after incrementing by 5");
-        
-        let val2 = actor_ref.ask(IncrementCounter(10)).await?;
-        assert_eq!(val2, 15, "Counter should be 15 after incrementing by 10");
-        
-        Ok(((), system))
-    }).await
-}
-
-async fn test_actor_get_by_path() -> Result<()> {
-    with_test_system(|system| async move {
-        // Create a test actor
-        let test_actor = BasicTestActor::new("PathTest".to_string());
-        let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
-        
-        // Get actor path
-        let actor_path_str = actor_ref.path();
-        
-        // Create a mock actor reference for the target
-        let mock_ref = MockActorRef::new(&actor_path_str);
-        
-        // Try to get actor by path - use ActorPath struct
-        if let Some(retrieved_ref) = system.internal_get_actor(&ActorPath {
-            path: actor_path_str.clone(),
-            target: Arc::new(mock_ref) as WeakActorTarget,
-        }).await {
-            // Send message to verify it's the same actor
-            let response = retrieved_ref.ask(TestMessage("Via Path".to_string())).await?;
+            // Verify response
             assert_eq!(
-                response,
-                "PathTest received: Via Path", 
-                "Should get the same actor through path reference"
+                response, 
+                "MessageHandler received: Hello Actor!",
+                "Actor should process messages and return correct responses"
             );
-        } else {
-            anyhow::bail!("Failed to retrieve actor by path");
-        }
         
-        Ok(((), system))
-    }).await
-} 
+            Ok(((), system))
+        }).await
+    })
+}
+
+#[test]
+fn test_actor_counter() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create a counter test actor
+            let test_actor = BasicTestActor::new("Counter".to_string());
+            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
+        
+            // Test initial counter value
+            let initial = actor_ref.ask(IncrementCounter(0)).await?;
+            assert_eq!(initial, 0, "Initial counter should be 0");
+        
+            // Increment counter multiple times
+            let val1 = actor_ref.ask(IncrementCounter(5)).await?;
+            assert_eq!(val1, 5, "Counter should be 5 after incrementing by 5");
+        
+            let val2 = actor_ref.ask(IncrementCounter(10)).await?;
+            assert_eq!(val2, 15, "Counter should be 15 after incrementing by 10");
+        
+            Ok(((), system))
+        }).await
+    })
+}
+
+#[test]
+fn test_actor_get_by_path() -> Result<()> {
+    // Actix actors require an actix::System context.
+    actix::System::new().block_on(async move {
+        with_test_system(|system| async move {
+            // Create a test actor
+            let test_actor = BasicTestActor::new("PathTest".to_string());
+            let actor_ref = system.spawn_root_actix(test_actor, EmptyConfig::default()).await?;
+        
+            // Get actor path
+            let actor_path_str = actor_ref.path();
+        
+            // Create a mock actor reference for the target
+            let mock_ref = MockActorRef::new(&actor_path_str);
+        
+            // Try to get actor by path - use ActorPath struct
+            if let Some(retrieved_ref) = system.internal_get_actor(&ActorPath {
+                path: actor_path_str.clone(),
+                target: Arc::new(mock_ref) as WeakActorTarget,
+            }).await {
+                // Send message to verify it's the same actor
+                let response = retrieved_ref.ask(TestMessage("Via Path".to_string())).await?;
+                assert_eq!(
+                    response,
+                    "PathTest received: Via Path", 
+                    "Should get the same actor through path reference"
+                );
+            } else {
+                anyhow::bail!("Failed to retrieve actor by path");
+            }
+        
+            Ok(((), system))
+        }).await
+    })
+}

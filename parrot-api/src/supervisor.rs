@@ -24,11 +24,7 @@
 //! ## Usage Example
 //!
 //! ```rust
-//! use parrot_api::supervisor::{
-//!     SupervisorStrategy,
-//!     OneForOneStrategy,
-//!     DefaultSupervisorStrategyFactory,
-//! };
+//! use parrot_api::supervisor::DefaultSupervisorStrategyFactory;
 //! use std::time::Duration;
 //!
 //! // Create a one-for-one strategy
@@ -36,11 +32,10 @@
 //!     3,  // max restarts
 //!     Duration::from_secs(60)  // within time window
 //! );
-//!
-//! // Use in an actor system
-//! let system = ActorSystem::new()
-//!     .with_supervisor_strategy(strategy);
 //! ```
+//!
+//! Note: registering the strategy with an actor system is
+//! implementation-specific; refer to the concrete system's builder API.
 
 use std::time::Duration;
 use std::fmt::Debug;
@@ -113,9 +108,12 @@ impl BasicDecisionFn {
     /// # Examples
     ///
     /// ```rust
-    /// let decider = BasicDecisionFn::new(|error| {
+    /// use parrot_api::supervisor::{BasicDecisionFn, SupervisionDecision};
+    /// use parrot_api::errors::ActorError;
+    ///
+    /// let decider = BasicDecisionFn::new(|error: &ActorError| {
     ///     match error {
-    ///         ActorError::Timeout(_) => SupervisionDecision::Restart,
+    ///         ActorError::Timeout => SupervisionDecision::Restart,
     ///         _ => SupervisionDecision::Stop,
     ///     }
     /// });
@@ -303,6 +301,9 @@ impl DefaultSupervisorStrategyFactory {
     /// # Examples
     ///
     /// ```rust
+    /// use parrot_api::supervisor::DefaultSupervisorStrategyFactory;
+    /// use std::time::Duration;
+    ///
     /// let strategy = DefaultSupervisorStrategyFactory::one_for_one(
     ///     3,
     ///     Duration::from_secs(60)
@@ -325,6 +326,9 @@ impl DefaultSupervisorStrategyFactory {
     /// # Examples
     ///
     /// ```rust
+    /// use parrot_api::supervisor::DefaultSupervisorStrategyFactory;
+    /// use std::time::Duration;
+    ///
     /// let strategy = DefaultSupervisorStrategyFactory::one_for_all(
     ///     3,
     ///     Duration::from_secs(60)

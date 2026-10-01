@@ -22,7 +22,7 @@
 //! ## Usage Example
 //!
 //! ```rust
-//! use parrot_api::system::{ActorSystem, ActorSystemConfig, SystemTimeouts};
+//! use parrot_api::system::{ActorSystemConfig, SystemTimeouts};
 //! use std::time::Duration;
 //!
 //! // Configure the system
@@ -36,11 +36,9 @@
 //!     ..Default::default()
 //! };
 //!
-//! // Start the system
-//! let system = MyActorSystem::start(config).await?;
-//!
-//! // Create actors
-//! let actor = system.spawn_root_typed(MyActor::new(), actor_config).await?;
+//! // Start the system with a concrete implementation (see engine crates):
+//! // let system = MyActorSystem::start(config).await?;
+//! # let _ = config;
 //! ```
 
 use std::time::Duration;
