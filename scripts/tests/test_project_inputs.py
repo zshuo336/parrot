@@ -2,11 +2,14 @@
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'project_inputs.py'
@@ -187,6 +190,87 @@ class ProjectInputs(unittest.TestCase):
         self.write('Cargo.toml', 'changed\n')
         self.assertNotEqual(self.export().returncode, 0)
         self.assertEqual((self.bundle / 'manifest.json').read_bytes(), manifest)
+
+    def archive(self, output=None, includes=()):
+        args = ['archive', '--bundle', self.bundle, '--output', output or self.base / 'inputs.tar.gz']
+        for name in includes:
+            args.extend(['--include', name])
+        return self.run_script(*args)
+
+    def test_portable_archive_preserves_manifest_bytes_modes_and_explicit_helpers(self):
+        self.write('vendor/.__require_full.rs', '// real source, not metadata\n')
+        script = self.write('scripts/run.sh', '#!/bin/sh\nexit 0\n')
+        script.chmod(0o755)
+        self.write('long/' + 'part/' * 30 + '\u6d4b\u8bd5.txt', 'long portable path\n')
+        manifest = self.exported()
+        self.write('verify.sh', '#!/bin/sh\nexit 0\n', directory=self.bundle).chmod(0o755)
+        self.write('unselected/private.txt', 'not selected\n', directory=self.bundle)
+        result = self.archive(includes=['verify.sh'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unpacked = self.base / 'unpacked'
+        unpacked.mkdir()
+        with tarfile.open(self.base / 'inputs.tar.gz') as archive:
+            self.assertEqual(set(archive.getnames()),
+                             {'source/' + name for name in manifest['files']} | {'manifest.json', 'verify.sh'})
+            for member in archive:
+                self.assertTrue(member.isfile())
+                self.assertEqual(member.uid, 0)
+                self.assertEqual(member.gid, 0)
+                self.assertEqual(member.mtime, 0)
+                self.assertTrue(set(member.pax_headers) <= {'path'})
+                path = unpacked / member.name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(archive.extractfile(member).read())
+                path.chmod(member.mode)
+        verified = self.run_script('verify', '--root', unpacked / 'source',
+                                   '--manifest', unpacked / 'manifest.json', '--exact')
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertTrue((unpacked / 'verify.sh').stat().st_mode & 0o111)
+        second = self.base / 'second.tar.gz'
+        self.assertEqual(self.archive(second, includes=['verify.sh']).returncode, 0)
+        self.assertEqual((self.base / 'inputs.tar.gz').read_bytes(), second.read_bytes())
+
+    def test_archive_rejects_tampered_source_extras_and_existing_output(self):
+        self.exported()
+        original = (self.bundle / 'source/Cargo.toml').read_bytes()
+        (self.bundle / 'source/Cargo.toml').write_bytes(b'x' * len(original))
+        self.assertNotEqual(self.archive().returncode, 0)
+        (self.bundle / 'source/Cargo.toml').write_bytes(original)
+        extra = self.write('._Cargo.toml', 'metadata not in manifest', directory=self.bundle / 'source')
+        result = self.archive()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('input set mismatch', result.stderr)
+        extra.unlink()
+        self.assertEqual(self.archive().returncode, 0)
+        saved = (self.base / 'inputs.tar.gz').read_bytes()
+        self.assertNotEqual(self.archive().returncode, 0)
+        self.assertEqual((self.base / 'inputs.tar.gz').read_bytes(), saved)
+
+    def test_archive_rejects_escaping_duplicate_reserved_and_symlink_helpers(self):
+        self.exported()
+        self.write('verify.sh', 'helper', directory=self.bundle)
+        (self.bundle / 'linked.sh').symlink_to(self.bundle / 'verify.sh')
+        for names in [['../outside'], ['manifest.json'], ['source/Cargo.toml'],
+                      ['verify.sh', 'verify.sh'], ['linked.sh'], ['.git/config']]:
+            with self.subTest(names=names):
+                result = self.archive(includes=names)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assertFalse((self.base / 'inputs.tar.gz').exists())
+
+    def test_archive_checks_archived_bytes_and_removes_partial_output_after_mutation(self):
+        self.exported()
+        implementation = runpy.run_path(str(SCRIPT))['archive']
+        original = tarfile.TarFile.addfile
+        def change_during_pack(archive, header, fileobj=None):
+            if header.name == 'source/Cargo.toml':
+                path = self.bundle / header.name
+                path.write_bytes(b'x' * path.stat().st_size)
+            return original(archive, header, fileobj)
+        with mock.patch.object(tarfile.TarFile, 'addfile', change_during_pack):
+            with self.assertRaisesRegex(ValueError, 'archive input identity mismatch: source/Cargo.toml'):
+                implementation(self.bundle, self.base / 'inputs.tar.gz', [])
+        self.assertFalse((self.base / 'inputs.tar.gz').exists())
 
     def test_same_length_content_tampering_is_detected(self):
         self.exported()

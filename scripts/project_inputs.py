@@ -6,6 +6,7 @@ untracked files, except historical docs/review evidence. It is not a proof of
 complete build/runtime dependency closure: validate the exported tree separately.
 """
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 
 
 EXCLUSIONS = ('docs/review',)
@@ -194,6 +196,60 @@ def export(root, output):
     return manifest
 
 
+def archive(bundle, output, includes):
+    bundle, output = Path(bundle).resolve(), Path(output).absolute()
+    manifest_path = regular_file(bundle, 'manifest.json')
+    manifest = load_manifest(manifest_path)
+    verify(bundle / 'source', manifest, exact=True)
+    entries = {'source/' + name: expected for name, expected in manifest['files'].items()}
+    entries['manifest.json'] = identity(manifest_path)
+    for name in includes:
+        valid_name(name)
+        if name in entries or name == 'source' or name.startswith('source/'):
+            raise InputError('duplicate or reserved archive include: ' + name)
+        entries[name] = identity(regular_file(bundle, name))
+    # Construct headers explicitly: platform xattrs and AppleDouble metadata
+    # are not validation inputs, while real manifest paths beginning ._ are.
+    with output.open('xb') as destination:
+        try:
+            with gzip.GzipFile(filename='', mode='wb', fileobj=destination, mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode='w|', format=tarfile.PAX_FORMAT) as packed:
+                    for name, expected in sorted(entries.items()):
+                        path = regular_file(bundle, name)
+                        header = tarfile.TarInfo(name)
+                        header.size = expected['bytes']
+                        header.mode = 0o755 if expected['executable'] else 0o644
+                        with path.open('rb') as source:
+                            packed.addfile(header, source)
+            destination.flush()
+            # Check the actual archived bytes in one streaming pass, rather
+            # than attributing the current directory's identity to the archive.
+            seen = set()
+            with tarfile.open(output, 'r|gz') as packed:
+                for member in packed:
+                    if not member.isfile() or member.name in seen or member.name not in entries:
+                        raise InputError('unexpected or duplicate archive member: ' + member.name)
+                    seen.add(member.name)
+                    sha = hashlib.sha256()
+                    with packed.extractfile(member) as source:
+                        for block in iter(lambda: source.read(1024 * 1024), b''):
+                            sha.update(block)
+                    actual = {'sha256': sha.hexdigest(), 'bytes': member.size,
+                              'executable': bool(member.mode & 0o111)}
+                    if actual != entries[member.name]:
+                        raise InputError('archive input identity mismatch: ' + member.name)
+            if seen != set(entries):
+                raise InputError('archive input set mismatch')
+            verify(bundle / 'source', manifest, exact=True)
+            if any(identity(regular_file(bundle, name)) != expected
+                   for name, expected in entries.items() if not name.startswith('source/')):
+                raise InputError('archive metadata or helper changed during packing')
+        except BaseException:
+            output.unlink()
+            raise
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest='action', required=True)
@@ -206,16 +262,23 @@ def main():
     mode = check.add_mutually_exclusive_group()
     mode.add_argument('--selection', action='store_true', help='also rediscover current Git inputs')
     mode.add_argument('--exact', action='store_true', help='also reject all extra files in exported tree')
+    pack = actions.add_parser('archive', help='create a verified portable archive from an export')
+    pack.add_argument('--bundle', type=Path, required=True)
+    pack.add_argument('--output', type=Path, required=True)
+    pack.add_argument('--include', action='append', default=[],
+                      help='explicit bundle-relative helper file; may be repeated')
     args = parser.parse_args()
     try:
         if args.action == 'export':
             manifest = export(args.root, args.output)
+        elif args.action == 'archive':
+            manifest = archive(args.bundle, args.output, args.include)
         else:
             manifest = load_manifest(args.manifest)
             verify(args.root, manifest, selection=args.selection, exact=args.exact)
         print(json.dumps({'status': 'ok', 'files': len(manifest['files']),
                           'action': args.action}))
-    except (ValueError, OSError, subprocess.CalledProcessError, UnicodeError) as error:
+    except (ValueError, OSError, subprocess.CalledProcessError, UnicodeError, tarfile.TarError) as error:
         print(str(error), file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError) and error.stderr:
             print(os.fsdecode(error.stderr), file=sys.stderr, end='')
