@@ -18,7 +18,7 @@ STAGES = (
 )
 CONFIGURATIONS = ('debug-default', 'debug-legacy', 'release-default', 'release-legacy')
 BINARIES = {
-    'library': 1509,
+    'library': 1515,
     'test_thread_actor_configuration': 23,
     'test_native_instance_inputs': 22,
     'test_thread_initialization_trace': 3,
@@ -45,6 +45,17 @@ BINARIES = {
     'test_actix_factory_creation_identity': 8,
     'test_local_factory': 23,
     'test_local_factory_children': 12,
+    'test_actix_local_typed': 24,
+    'test_actix_typed_children': 26,
+    'test_actix_typed_lifecycle': 19,
+    'test_m4_typed_actix': 5,
+    'test_derived_local_runtime': 6,
+    'test_neutral_local': 14,
+    'test_neutral_local_children': 13,
+    'test_neutral_local_creation_identity': 10,
+    'test_local_children': 14,
+    'test_local_stream_init_identity': 16,
+    'test_local_stream_retirement': 4,
 }
 RUNNING = re.compile(r'^\s+Running (unittests src/lib\.rs|tests/([^ ]+)\.rs) \(([^)]+)\)$')
 RESULT = re.compile(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;')

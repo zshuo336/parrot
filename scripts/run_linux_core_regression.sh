@@ -47,7 +47,13 @@ tests=(--lib --test test_thread_actor_configuration --test test_native_instance_
     --test test_typed_factory_creation_identity --test test_native_factory_inputs
     --test test_actix_root_factory_contract --test test_actix_child_factory_contract
     --test test_actix_typed_factory --test test_actix_factory_creation_identity
-    --test test_local_factory --test test_local_factory_children)
+    --test test_local_factory --test test_local_factory_children
+    --test test_actix_local_typed --test test_actix_typed_children
+    --test test_actix_typed_lifecycle --test test_m4_typed_actix
+    --test test_derived_local_runtime --test test_neutral_local
+    --test test_neutral_local_children --test test_neutral_local_creation_identity
+    --test test_local_children --test test_local_stream_init_identity
+    --test test_local_stream_retirement)
 for profile in debug release; do
     flags=()
     if [[ "$profile" == release ]]; then flags+=(--release); fi

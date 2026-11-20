@@ -467,6 +467,9 @@ impl ActixActorSystem {
                 self.policy_slots.clone(),
             );
             ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
+            if factory.is_some() {
+                control.begin_construction(tokio::time::Instant::now() + control.creation_timeout);
+            }
             let own = Arc::new(std::sync::OnceLock::new());
             let weak_stop = Arc::downgrade(&control);
             let weak_escalated = Arc::downgrade(&control);

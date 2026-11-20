@@ -1389,6 +1389,31 @@ async fn death_notification_identifies_local_generation_after_retirement() {
 
 #[actix::test]
 async fn stopped_queued_owner_does_not_run_constructor() {
+    struct BusyOwner(Arc<Gate>);
+    impl LocalTypedDispatch for BusyOwner {
+        type Msg = Add;
+        type Reply = u64;
+        fn dispatch<'a>(
+            &'a mut self,
+            message: Add,
+            _: &'a TypedContext,
+        ) -> LocalBoxedFuture<'a, ActorResult<u64>> {
+            Box::pin(async move {
+                if message.0 == 1 {
+                    self.0.block();
+                }
+                Ok(message.0)
+            })
+        }
+    }
+    impl ParrotMsgVariant<LocalProtocol<BusyOwner>> for Add {
+        fn inject(message: Self) -> Add {
+            message
+        }
+        fn extract(reply: u64) -> ActorResult<u64> {
+            Ok(reply)
+        }
+    }
     let system = Arc::new(
         ActixActorSystem::with_settings(ActixSystemSettings {
             arbiter_count: 1,
@@ -1402,15 +1427,17 @@ async fn stopped_queued_owner_does_not_run_constructor() {
     let factory_gate = gate.clone();
     let _release = Release(gate.clone());
     let blocker = system
-        .spawn_local_typed::<LocalCounter, Add, _>(
-            move || {
-                factory_gate.block();
-                LocalCounter::new(Events::default())
-            },
+        .spawn_local_typed::<BusyOwner, Add, _>(
+            move || BusyOwner(factory_gate.clone()),
             "/local/blocker",
         )
         .await
         .unwrap();
+    assert_eq!(blocker.ask(Add(0)).await.unwrap(), 0);
+    // Hold an already initialized owner: an overdue constructor must not be
+    // expected to become usable after the independent creation deadline.
+    let mut busy = Box::pin(blocker.ask(Add(1)));
+    assert!(futures::poll!(&mut busy).is_pending());
     tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
         .await
         .unwrap();
@@ -1437,6 +1464,7 @@ async fn stopped_queued_owner_does_not_run_constructor() {
         Err(ActorError::TimeoutDetail(_))
     ));
     gate.release();
+    assert_eq!(busy.await.unwrap(), 1);
     assert_eq!(blocker.ask(Add(0)).await.unwrap(), 0);
     count_reaches(&drops, 1).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);

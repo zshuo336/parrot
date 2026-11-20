@@ -1497,6 +1497,10 @@ impl ActixActorSystem {
 mod creation_deadline_contracts;
 
 #[cfg(test)]
+#[path = "system/queued_construction_contracts.rs"]
+mod queued_construction_contracts;
+
+#[cfg(test)]
 mod lookup_retirement_tests {
     use super::*;
     struct LookupRef {
