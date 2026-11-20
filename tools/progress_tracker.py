@@ -326,7 +326,7 @@ def export(root, output):
 
 def make_server(root, port=None, strict_port=False):
     root = Path(root).resolve()
-    config, _, documents = settings(root)
+    config, _, _ = settings(root)
     load_state(root)
 
     class Handler(BaseHTTPRequestHandler):
@@ -345,8 +345,11 @@ def make_server(root, port=None, strict_port=False):
                 elif route == "/api/status":
                     body = json.dumps(load_state(root), ensure_ascii=False).encode("utf-8")
                     kind = "application/json; charset=utf-8"
-                elif route.startswith("/documents/") and route[11:] in documents:
+                elif route.startswith("/documents/"):
                     _, _, live_documents = settings(root)
+                    if route[11:] not in live_documents:
+                        self.send_error(404)
+                        return
                     body = read_text(live_documents[route[11:]]).encode("utf-8")
                     kind = "text/plain; charset=utf-8"
                 else:

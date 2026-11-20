@@ -1,0 +1,73 @@
+"""Live document allowlist changes must work without recreating the HTTP server."""
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import threading
+import unittest
+from urllib.error import HTTPError
+from urllib.request import urlopen
+
+SPEC = importlib.util.spec_from_file_location('progress_tracker', Path(__file__).resolve().parents[1] / 'progress_tracker.py')
+tracker = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(tracker)
+
+
+class LiveDocumentsTest(unittest.TestCase):
+    def test_added_changed_and_removed_document_uses_current_allowlist(self):
+        with tempfile.TemporaryDirectory(prefix='parrot-tracker-http-') as directory:
+            root = Path(directory)
+            (root / 'docs/progress').mkdir(parents=True)
+            task = '### T00-01 HTTP\n状态：进行中\n剩余人日：1-1\n依赖：无\n已做：启动服务\n待做：验证文档\n验收：实时白名单\n证据：无\n'
+            (root / 'docs/TASKS.md').write_text(task, encoding='utf-8')
+            (root / 'docs/EXECUTION-PLAN.md').write_text(task, encoding='utf-8')
+            config = {
+                'schema_version': 1, 'project_name': 'HTTP test', 'scope': 'documents',
+                'port': 0, 'repositories': {'main': '.'}, 'phases': {'T00': 'HTTP'},
+                'documents': {'tasks': {'name': 'tasks', 'repository': 'main', 'path': 'docs/TASKS.md'}},
+            }
+            config_path = root / 'docs/progress/config.json'
+            def save_config():
+                config_path.write_text(json.dumps(config), encoding='utf-8')
+            save_config()
+            (root / 'docs/progress/scope.json').write_text(json.dumps({
+                'schema_version': 1, 'revision': 'http-1', 'active_task_ids': ['T00-01'], 'removed_tasks': [],
+            }), encoding='utf-8')
+            (root / 'docs/progress/current.json').write_text(json.dumps({
+                'schema_version': 1, 'updated': '2026-11-21', 'scope_change': 'HTTP test',
+                'headline': 'HTTP test', 'current_task_id': 'T00-01', 'current_detail': 'HTTP test',
+                'boundary': 'HTTP only', 'queue': ['T00-01'], 'delivery_groups': [], 'batches': [], 'limits': [],
+            }), encoding='utf-8')
+            (root / 'docs/late.md').write_text('first document', encoding='utf-8')
+            (root / 'docs/replacement.md').write_text('replacement document', encoding='utf-8')
+            with tracker.make_server(root, port=0) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                url = 'http://127.0.0.1:' + str(server.server_port) + '/documents/late'
+                try:
+                    self.assert_not_found(url)
+                    config['documents']['late'] = {'name': 'late', 'repository': 'main', 'path': 'docs/late.md'}
+                    save_config()
+                    with urlopen(url, timeout=5) as response:
+                        self.assertEqual(response.read(), b'first document')
+                    config['documents']['late']['path'] = 'docs/replacement.md'
+                    save_config()
+                    with urlopen(url, timeout=5) as response:
+                        self.assertEqual(response.read(), b'replacement document')
+                    del config['documents']['late']
+                    save_config()
+                    self.assert_not_found(url)
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=5)
+                    self.assertFalse(thread.is_alive())
+
+    def assert_not_found(self, url):
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(url, timeout=5)
+        self.assertEqual(caught.exception.code, 404)
+        caught.exception.close()
+
+
+if __name__ == '__main__':
+    unittest.main()
