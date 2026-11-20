@@ -13,6 +13,7 @@ pub(crate) struct OwnedFactory<A: Send + 'static> {
     runtime: tokio::runtime::Handle,
 }
 impl<A: Send + 'static> OwnedFactory<A> {
+    #[cfg(test)]
     pub(crate) fn new(
         factory: impl Fn() -> A + Send + Sync + 'static,
         workers: Arc<tokio::sync::Semaphore>,
@@ -21,6 +22,18 @@ impl<A: Send + 'static> OwnedFactory<A> {
     ) -> Self {
         Self {
             factory: Factory::new(factory, workers, cleanup),
+            runtime,
+        }
+    }
+    pub(crate) fn with_admission(
+        factory: impl Fn() -> A + Send + Sync + 'static,
+        workers: Arc<tokio::sync::Semaphore>,
+        cleanup: Arc<tokio::sync::Semaphore>,
+        runtime: tokio::runtime::Handle,
+        admission: Arc<super::admission::Admission>,
+    ) -> Self {
+        Self {
+            factory: Factory::with_admission(factory, workers, cleanup, admission),
             runtime,
         }
     }

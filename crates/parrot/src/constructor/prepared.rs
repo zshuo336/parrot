@@ -283,20 +283,7 @@ impl<A: Send + 'static> Factory<A> {
     ) -> impl std::future::Future<Output = Result<Prepared<A>, ConstructionError<E>>> + Send + '_
     {
         parrot_api::trace::capture(async move {
-            let cleanup_reservation = if crate::owned_payload::DisposalScope::active() {
-                self.admission.clone().try_acquire_owned().map_err(|_| {
-                    ConstructionError::WorkerFailed(
-                        "cleanup capacity unavailable during reentrant preparation".into(),
-                    )
-                })?
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = control.cancelled() => return Err(ConstructionError::Cancelled),
-                    permit = self.admission.clone().acquire_owned() => permit
-                        .map_err(|error| ConstructionError::WorkerFailed(error.to_string()))?,
-                }
-            };
+            let cleanup_reservation = self.admission.acquire(&control).await?;
             let invocation = {
                 let mut state = self.state.lock().unwrap();
                 if state.disposal.is_some() {

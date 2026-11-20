@@ -16,7 +16,7 @@ struct CaptureDisposal<A> {
     function: Option<Arc<dyn Fn() -> A + Send + Sync>>,
     failure: Option<String>,
     finished: Option<Finished>,
-    cleanup: Option<tokio::sync::OwnedSemaphorePermit>,
+    cleanup: Option<Arc<OwnedSemaphorePermit>>,
     _pending: Option<crate::owned_payload::PendingCleanupPermit>,
     creation_reservation: Option<Arc<OwnedSemaphorePermit>>,
 }
@@ -24,7 +24,7 @@ impl<A> CaptureDisposal<A> {
     fn take(
         state: &mut FactoryState<A>,
         finished: Option<Finished>,
-        cleanup: Option<tokio::sync::OwnedSemaphorePermit>,
+        cleanup: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Self {
         Self {
             context: state.capture_context.take(),

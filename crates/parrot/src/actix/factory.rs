@@ -602,10 +602,11 @@ impl ActixActorSystem {
             } else {
                 strategy
             };
-            let factory = Factory::new(
+            let factory = Factory::with_admission(
                 factory.take(),
                 self.constructor_slots.clone(),
                 self.cleanup_slots.clone(),
+                self.factory_admission.clone(),
             );
             let mut lifetime = ChildLifetime::with_policy(
                 Weak::new(),
@@ -1013,10 +1014,11 @@ where
         strategy: Option<SupervisorStrategyType>,
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
         Box::pin(async move {
-            let factory = Factory::new(
+            let factory = Factory::with_admission(
                 self.0,
                 system.constructor_slots.clone(),
                 system.cleanup_slots.clone(),
+                system.factory_admission.clone(),
             );
             let mut ticket = None;
             let mut strategy = Some(strategy);

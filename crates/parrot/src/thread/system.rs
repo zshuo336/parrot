@@ -468,6 +468,7 @@ pub struct ThreadActorSystem {
     pub(crate) typed_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) cleanup_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) factory_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) factory_admission: Arc<crate::constructor::admission::Admission>,
     pub(crate) instance_admission: Arc<tokio::sync::Semaphore>,
 
     /// Runtime handle for spawning async tasks
@@ -654,6 +655,9 @@ impl ThreadActorSystem {
             typed_slots: Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1))),
             cleanup_slots: Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1))),
             factory_slots: Arc::new(tokio::sync::Semaphore::new(config.shared_pool_size.max(1))),
+            factory_admission: crate::constructor::admission::Admission::new(
+                crate::constructor::admission::SYSTEM_CAPACITY,
+            ),
             instance_admission: Arc::new(tokio::sync::Semaphore::new(
                 Self::MAX_PENDING_INSTANCE_CREATIONS,
             )),

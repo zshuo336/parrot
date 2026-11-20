@@ -318,11 +318,12 @@ impl ActixActorSystem {
         M: ParrotMsgVariant<A>,
         F: Fn() -> A + Send + Sync + 'static,
     {
-        let factory = crate::constructor::owned::OwnedFactory::new(
+        let factory = crate::constructor::owned::OwnedFactory::with_admission(
             factory,
             self.constructor_slots.clone(),
             self.cleanup_slots.clone(),
             self.runtime.clone(),
+            self.factory_admission.clone(),
         );
         let policy =
             crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots);
@@ -374,11 +375,12 @@ impl ActixActorSystem {
         M: ParrotMsgVariant<A>,
         F: Fn() -> A + Send + Sync + 'static,
     {
-        let factory = crate::constructor::owned::OwnedFactory::new(
+        let factory = crate::constructor::owned::OwnedFactory::with_admission(
             factory.take(),
             self.constructor_slots.clone(),
             self.cleanup_slots.clone(),
             self.runtime.clone(),
+            self.factory_admission.clone(),
         );
         self.spawn_typed_owned_source(None, Some(factory), path, policy, Some(parent), None)
             .await

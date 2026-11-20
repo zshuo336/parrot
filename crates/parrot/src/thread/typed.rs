@@ -659,11 +659,12 @@ impl ThreadActorSystem {
         M: ParrotMsgVariant<A>,
         F: Fn() -> A + Send + Sync + 'static,
     {
-        let factory = factory::OwnedFactory::new(
+        let factory = factory::OwnedFactory::with_admission(
             factory,
             self.factory_slots.clone(),
             self.cleanup_slots.clone(),
             self.retirement_runtime().clone(),
+            self.factory_admission.clone(),
         );
         let policy = crate::owned_payload::OwnedPayload::new(
             None,
@@ -733,11 +734,12 @@ impl ThreadActorSystem {
         };
         let factory = factory.with_reservation(&reservation);
         let policy = policy.with_reservation(&reservation);
-        let factory = crate::constructor::owned::OwnedFactory::new(
+        let factory = crate::constructor::owned::OwnedFactory::with_admission(
             factory.take(),
             self.factory_slots.clone(),
             self.cleanup_slots.clone(),
             self.retirement_runtime().clone(),
+            self.factory_admission.clone(),
         );
         factory.factory.reserve_creation(&reservation);
         self.spawn_typed_owned_source(

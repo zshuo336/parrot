@@ -7,6 +7,10 @@ use std::{
 };
 use tokio::{sync::watch, time::Instant};
 use uuid::Uuid;
+
+// A maximum-sized native cohort must fit a complete invocation reservation.
+const _: () = assert!(crate::constructor::admission::SYSTEM_CAPACITY >= super::MAX_CHILDREN);
+
 #[cfg(test)]
 #[path = "recovery_budget_contracts.rs"]
 mod budget_contracts;
@@ -34,6 +38,7 @@ struct State {
     error: Option<String>,
     cancelled: bool,
     creation_deadline: Option<Instant>,
+    constructing: HashSet<Uuid>,
 }
 type Release = Box<dyn FnOnce(bool) + Send + 'static>;
 pub(crate) struct Recovery {
@@ -45,6 +50,7 @@ pub(crate) struct Recovery {
     progress: watch::Sender<Progress>,
     release: Mutex<Option<Release>>,
     publications: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    admission: Arc<crate::constructor::admission::Batch>,
 }
 impl std::fmt::Debug for Recovery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -62,6 +68,7 @@ impl Recovery {
     ) -> Arc<Self> {
         let next: HashMap<_, _> = ids.into_iter().map(|id| (id, 0)).collect();
         assert!(!next.is_empty(), "a recovery epoch requires members");
+        let admission = crate::constructor::admission::Batch::new(next.len());
         Arc::new(Self {
             id,
             deadline,
@@ -75,10 +82,12 @@ impl Recovery {
                 error: None,
                 cancelled: false,
                 creation_deadline: None,
+                constructing: HashSet::new(),
             }),
             progress: watch::channel(Progress::Phase(0)).0,
             release: Mutex::new(Some(release)),
             publications: Mutex::default(),
+            admission,
         })
     }
     pub(crate) fn on_activation(&self, publish: Box<dyn FnOnce() + Send>) {
@@ -100,6 +109,9 @@ impl Recovery {
             if state.committed || state.phase != 1 || state.next.get(&member) != Some(&1) {
                 return Err("cohort construction admitted outside preparation".into());
             }
+            if !state.constructing.insert(member) {
+                return Err("cohort member already admitted construction".into());
+            }
             state.creation_deadline = Some(
                 state
                     .creation_deadline
@@ -107,7 +119,9 @@ impl Recovery {
             );
         }
         self.progress.send_modify(|_| {});
-        Ok(self.control.bounded(deadline))
+        Ok(self
+            .control
+            .for_recovery_member(deadline, self.admission.clone()))
     }
     fn deadline(&self) -> Instant {
         self.state
@@ -117,6 +131,7 @@ impl Recovery {
             .unwrap_or(self.deadline)
     }
     fn release(&self, committed: bool) {
+        self.admission.release();
         let release = self.release.lock().unwrap().take();
         // Engine/topology callbacks run outside the epoch lock.
         if let Some(release) = release {

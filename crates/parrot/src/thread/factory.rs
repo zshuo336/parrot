@@ -150,10 +150,11 @@ impl ThreadActorSystem {
             let factory = factory.with_reservation(&reservation);
             let config = config.with_reservation(&reservation);
             let cohort = cohort.or_else(|| self.root_cohorts.guardian());
-            let factory = Factory::new(
+            let factory = Factory::with_admission(
                 factory.take(),
                 self.factory_slots.clone(),
                 self.cleanup_slots.clone(),
+                self.factory_admission.clone(),
             );
             factory.reserve_creation(&reservation);
             // Keep one protected copy until synchronous admission has returned.
@@ -526,10 +527,11 @@ where
         reservation: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
         Box::pin(async move {
-            let factory = Factory::new(
+            let factory = Factory::with_admission(
                 self.0,
                 system.factory_slots.clone(),
                 system.cleanup_slots.clone(),
+                system.factory_admission.clone(),
             );
             factory.reserve_creation(&reservation);
             let deadline = tokio::time::Instant::now() + system.creation_timeout();

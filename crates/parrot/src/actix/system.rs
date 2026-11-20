@@ -266,6 +266,7 @@ pub struct ActixActorSystem {
     started: Instant,
     pub(super) policy_slots: Arc<tokio::sync::Semaphore>,
     pub(super) constructor_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) factory_admission: Arc<crate::constructor::admission::Admission>,
     pub(super) cleanup_slots: Arc<tokio::sync::Semaphore>,
     pub(super) notification_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -300,6 +301,7 @@ pub(crate) struct WeakSystem {
     started: Instant,
     pub(super) policy_slots: Arc<tokio::sync::Semaphore>,
     pub(super) constructor_slots: Arc<tokio::sync::Semaphore>,
+    pub(super) factory_admission: Arc<crate::constructor::admission::Admission>,
     pub(super) cleanup_slots: Arc<tokio::sync::Semaphore>,
     pub(super) notification_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -343,6 +345,7 @@ impl WeakSystem {
             started: self.started,
             policy_slots: self.policy_slots.clone(),
             constructor_slots: self.constructor_slots.clone(),
+            factory_admission: self.factory_admission.clone(),
             cleanup_slots: self.cleanup_slots.clone(),
             notification_slots: self.notification_slots.clone(),
         })
@@ -637,6 +640,9 @@ impl ActixActorSystem {
             started: Instant::now(),
             policy_slots: Arc::new(tokio::sync::Semaphore::new(arbiters.size())),
             constructor_slots: Arc::new(tokio::sync::Semaphore::new(arbiters.size())),
+            factory_admission: crate::constructor::admission::Admission::new(
+                crate::constructor::admission::SYSTEM_CAPACITY,
+            ),
             cleanup_slots: Arc::new(tokio::sync::Semaphore::new(arbiters.size())),
             notification_slots: Arc::new(tokio::sync::Semaphore::new(1024)),
         })
@@ -710,6 +716,7 @@ impl ActixActorSystem {
             started: self.started,
             policy_slots: self.policy_slots.clone(),
             constructor_slots: self.constructor_slots.clone(),
+            factory_admission: self.factory_admission.clone(),
             cleanup_slots: self.cleanup_slots.clone(),
             notification_slots: self.notification_slots.clone(),
         }

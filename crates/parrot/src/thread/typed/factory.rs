@@ -68,11 +68,12 @@ impl ThreadActorSystem {
     {
         self.spawn_typed_source(
             None,
-            Some(OwnedFactory::new(
+            Some(OwnedFactory::with_admission(
                 factory,
                 self.factory_slots.clone(),
                 self.cleanup_slots.clone(),
                 self.retirement_runtime().clone(),
+                self.factory_admission.clone(),
             )),
             path,
             SupervisorStrategyType::OneForOne(strategy),

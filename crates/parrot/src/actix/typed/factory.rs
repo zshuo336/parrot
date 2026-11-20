@@ -55,11 +55,12 @@ impl ActixActorSystem {
     {
         self.spawn_typed_source(
             None,
-            Some(OwnedFactory::new(
+            Some(OwnedFactory::with_admission(
                 factory,
                 self.constructor_slots.clone(),
                 self.cleanup_slots.clone(),
                 self.runtime.clone(),
+                self.factory_admission.clone(),
             )),
             path,
             SupervisorStrategyType::OneForOne(strategy),

@@ -1,4 +1,5 @@
 //! Engine-neutral bounded constructors and cancellation-safe capture retirement.
+pub(crate) mod admission;
 #[cfg(test)]
 mod budget_contracts;
 #[cfg(test)]
@@ -30,6 +31,7 @@ pub(crate) struct ConstructionControl {
     cancelled: AtomicBool,
     deadline: Option<tokio::time::Instant>,
     parent: Option<Arc<ConstructionControl>>,
+    admission: Option<Arc<admission::Member>>,
     notify: tokio::sync::Notify,
 }
 impl ConstructionControl {
@@ -49,8 +51,22 @@ impl ConstructionControl {
                     .map_or(deadline, |parent| parent.min(deadline)),
             ),
             parent: Some(self.clone()),
+            admission: self.admission.clone(),
             ..Self::default()
         })
+    }
+    pub(crate) fn for_recovery_member(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        batch: Arc<admission::Batch>,
+    ) -> Arc<Self> {
+        let mut control = Self::with_deadline(
+            self.deadline
+                .map_or(deadline, |parent| parent.min(deadline)),
+        );
+        control.parent = Some(self.clone());
+        control.admission = Some(admission::Member::new(batch));
+        Arc::new(control)
     }
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
@@ -105,14 +121,14 @@ pub(crate) struct Factory<A> {
     state: Arc<Mutex<FactoryState<A>>>,
     changed: Arc<tokio::sync::Notify>,
     workers: Arc<Semaphore>,
-    admission: Arc<Semaphore>,
+    admission: Arc<admission::Admission>,
     cleanup: Arc<Semaphore>,
 }
 struct Invocation<A> {
     function: Option<Arc<dyn Fn() -> A + Send + Sync>>,
     state: Arc<Mutex<FactoryState<A>>>,
     changed: Arc<tokio::sync::Notify>,
-    cleanup: Option<OwnedSemaphorePermit>,
+    cleanup: Option<Arc<OwnedSemaphorePermit>>,
 }
 impl<A> Invocation<A> {
     fn record_failure(&self, error: &str) {
@@ -129,16 +145,27 @@ impl<A> Drop for Invocation<A> {
     }
 }
 impl<A: Send + 'static> Factory<A> {
+    #[cfg(test)]
     pub(crate) fn new(
         function: impl Fn() -> A + Send + Sync + 'static,
         workers: Arc<Semaphore>,
         cleanup: Arc<Semaphore>,
     ) -> Arc<Self> {
-        // Keep one staging lease in addition to the normal construction
-        // workers. Prepared outputs release a worker before publication, so
-        // the extra lease preserves the existing one-worker staging contract
-        // while still bounding retained invocation owners.
+        // Standalone fixtures use a small local budget; engines pass their shared budget.
         let admission_capacity = workers.available_permits().saturating_add(1).max(1);
+        Self::with_admission(
+            function,
+            workers,
+            cleanup,
+            admission::Admission::new(admission_capacity),
+        )
+    }
+    pub(crate) fn with_admission(
+        function: impl Fn() -> A + Send + Sync + 'static,
+        workers: Arc<Semaphore>,
+        cleanup: Arc<Semaphore>,
+        admission: Arc<admission::Admission>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Arc::new(Mutex::new(FactoryState {
                 capture_context: parrot_api::trace::TraceContext::current(),
@@ -152,7 +179,7 @@ impl<A: Send + 'static> Factory<A> {
             })),
             changed: Arc::default(),
             workers,
-            admission: Arc::new(Semaphore::new(admission_capacity)),
+            admission,
             cleanup,
         })
     }
@@ -170,23 +197,7 @@ impl<A: Send + 'static> Factory<A> {
         publish: impl FnOnce(A) -> Result<T, E> + Send + 'static,
     ) -> impl std::future::Future<Output = Result<T, ConstructionError<E>>> + Send + '_ {
         parrot_api::trace::capture(async move {
-            // Reserve invocation ownership before publishing an active
-            // invocation. Reentrant cleanup cannot wait for a permit it
-            // already owns.
-            let cleanup = if crate::owned_payload::DisposalScope::active() {
-                self.admission.clone().try_acquire_owned().map_err(|_| {
-                    ConstructionError::WorkerFailed(
-                        "cleanup capacity unavailable during reentrant construction".into(),
-                    )
-                })?
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = control.cancelled() => return Err(ConstructionError::Cancelled),
-                    permit = self.admission.clone().acquire_owned() => permit
-                        .map_err(|error| ConstructionError::WorkerFailed(error.to_string()))?,
-                }
-            };
+            let cleanup = self.admission.acquire(&control).await?;
             let invocation = {
                 let mut state = self.state.lock().unwrap();
                 if state.disposal.is_some() {
