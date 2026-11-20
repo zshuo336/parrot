@@ -6,7 +6,22 @@ enum Export {
     WrongType,
     WrongTypeDropPanic,
     InvalidCapacity,
+    InvalidEnginePolicy,
     Default,
+}
+
+#[derive(Debug)]
+struct ExportedPolicy(Arc<Counts>);
+impl MessageAdmission for ExportedPolicy {
+    fn prepare(&self, message: BoxedMessage) -> Result<BoxedMessage, MailboxError> {
+        Ok(message)
+    }
+}
+impl Drop for ExportedPolicy {
+    fn drop(&mut self) {
+        self.0.disposed.fetch_add(1, Ordering::SeqCst);
+        panic!("exported policy disposal panic");
+    }
 }
 
 struct Configuration {
@@ -41,6 +56,11 @@ impl ActorConfig for Configuration {
                 mailbox_capacity: Some(0),
                 ..Default::default()
             })),
+            Export::InvalidEnginePolicy => Some(Box::new(ThreadActorConfig {
+                mailbox_capacity: Some(0),
+                message_admission: Some(Arc::new(ExportedPolicy(self.input.counts.clone()))),
+                ..Default::default()
+            })),
             Export::Default => None,
         }
     }
@@ -73,6 +93,7 @@ async fn conversion_failures_retire_inputs_without_initialization() {
         Export::WrongType,
         Export::WrongTypeDropPanic,
         Export::InvalidCapacity,
+        Export::InvalidEnginePolicy,
     ] {
         let system = system();
         let counts = Arc::new(Counts::default());
@@ -100,7 +121,7 @@ async fn conversion_failures_retire_inputs_without_initialization() {
                 matches!(result, Err(SpawnError::InvalidConfig(_))),
                 "{result:?}"
             ),
-            Export::WrongTypeDropPanic => assert!(
+            Export::WrongTypeDropPanic | Export::InvalidEnginePolicy => assert!(
                 matches!(result, Err(SpawnError::DisposalFailed(_))),
                 "{result:?}"
             ),
@@ -110,7 +131,10 @@ async fn conversion_failures_retire_inputs_without_initialization() {
         assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
         assert_eq!(
             counts.disposed.load(Ordering::SeqCst),
-            if matches!(export, Export::WrongTypeDropPanic) {
+            if matches!(
+                export,
+                Export::WrongTypeDropPanic | Export::InvalidEnginePolicy
+            ) {
                 3
             } else {
                 2
@@ -133,6 +157,35 @@ async fn conversion_failures_retire_inputs_without_initialization() {
         bounded(healthy.stop()).await.unwrap();
         bounded(system.shutdown_internal()).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn configuration_disposal_keeps_first_error_when_exported_policy_also_panics() {
+    let system = system();
+    let counts = Arc::new(Counts::default());
+    let result = bounded(
+        AssertUnwindSafe(system.spawn_root_typed_thread(
+            Configured(input(&counts, false)),
+            Configuration {
+                input: input(&counts, true),
+                export: Export::InvalidEnginePolicy,
+                calls: Arc::default(),
+                gate: None,
+            },
+        ))
+        .catch_unwind(),
+    )
+    .await
+    .expect("disposal failure unwound caller");
+    assert!(
+        matches!(result, Err(SpawnError::DisposalFailed(ref message))
+        if message.contains("actor override input disposal panic") && !message.contains("exported policy disposal panic")),
+        "{result:?}"
+    );
+    assert_eq!(counts.disposed.load(Ordering::SeqCst), 3);
+    assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
+    assert_eq!(system.actor_count(), 0);
+    bounded(system.shutdown_internal()).await.unwrap();
 }
 
 #[tokio::test]
@@ -165,6 +218,42 @@ async fn unpolled_and_closed_creation_never_calls_the_conversion_hook() {
     assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn explicit_engine_configuration_does_not_call_the_export_hook() {
+    let system = system();
+    let counts = Arc::new(Counts::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reference = bounded(system.spawn_typed_with_config(
+        Configured(input(&counts, false)),
+        Configuration {
+            input: input(&counts, false),
+            export: Export::Panic,
+            calls: calls.clone(),
+            gate: None,
+        },
+        ThreadActorConfig {
+            mailbox_capacity: Some(7),
+            ..Default::default()
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        system
+            .get_mailbox(reference.actor_path())
+            .unwrap()
+            .capacity(),
+        7
+    );
+    let reply = bounded(reference.send(Box::new(53_u64))).await.unwrap();
+    assert_eq!(*reply.downcast::<u64>().unwrap(), 53);
+    bounded(reference.stop()).await.unwrap();
+    bounded(system.shutdown_internal()).await.unwrap();
+    assert_eq!(counts.disposed.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.initialized.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cancelled_blocking_conversion_retires_late_inputs_without_publication() {
     let system = system();
@@ -190,12 +279,12 @@ async fn cancelled_blocking_conversion_retires_late_inputs_without_publication()
     bounded(gate.entered.notified()).await;
     // Reaching this assertion on a current-thread runtime proves the callback
     // did not block the async driver, even while synchronous user code waits.
-    assert_eq!(system.actor_count(), 0);
+    assert_eq!(system.actor_count(), 1);
     waiter.abort();
     assert!(bounded(waiter).await.unwrap_err().is_cancelled());
     drop(release);
     bounded(async {
-        while counts.disposed.load(Ordering::SeqCst) != 2 {
+        while counts.disposed.load(Ordering::SeqCst) != 2 || system.actor_count() != 0 {
             tokio::task::yield_now().await;
         }
     })

@@ -1,6 +1,6 @@
 //! Instance creation owns configuration retirement before publishing runnable state.
 use super::{
-    address::ThreadActorRef,
+    address::{DeferredSendDefaults, ThreadActorRef},
     config::ThreadActorConfig,
     context::ThreadContext,
     death_watch::ThreadWatches,
@@ -9,13 +9,45 @@ use super::{
     system::{ActorRegistryEntry, StopOutcome, ThreadActorSystem},
 };
 use crate::constructor::ConstructionControl;
-use crate::owned_payload::OwnedPayload;
-use parrot_api::{actor::Actor, address::ActorRef};
+use crate::owned_payload::{OwnedPayload, PublicationInput};
+use parrot_api::{
+    actor::{Actor, ActorConfig},
+    address::ActorRef,
+};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{oneshot, watch};
 
 #[cfg(test)]
 mod admission_contracts;
+#[cfg(test)]
+mod export_contracts;
+
+fn export_engine_config<C: ActorConfig>(
+    config: PublicationInput<Option<C>>,
+) -> Result<ThreadActorConfig, SpawnError> {
+    let exported = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match config.value().as_ref().expect("configuration export input").engine_config() {
+            None => Ok(PublicationInput::new(ThreadActorConfig::default())),
+            Some(exported) => match exported.downcast::<ThreadActorConfig>() {
+                Ok(engine) => Ok(PublicationInput::new(*engine)),
+                Err(other) => {
+                    crate::owned_payload::retire_synchronously(other)
+                        .map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
+                    Err(SpawnError::InvalidConfig(
+                        "ActorConfig::engine_config must export ThreadActorConfig for the Thread engine".into(),
+                    ))
+                }
+            },
+        }
+    })).unwrap_or_else(|panic| Err(SpawnError::InitializationFailed(format!(
+        "actor engine configuration panicked: {}", crate::owned_payload::panic_message(panic),
+    ))));
+    // The engine override is also protected if business configuration retirement fails.
+    let disposal = config
+        .retire()
+        .map_err(|error| SpawnError::DisposalFailed(error.to_string()));
+    disposal.and(exported).map(|mut engine| engine.take())
+}
 
 /// Call-time rejection from [`ThreadActorSystem::try_spawn_typed_with_config`].
 /// All inputs remain caller-owned; rejecting a request submits no cleanup task.
@@ -114,13 +146,25 @@ impl Drop for CancelInstance {
     }
 }
 
-async fn retire_inputs<A: Send + 'static>(
+async fn retire_inputs<A: Actor + Send + 'static>(
     actor: OwnedPayload<A>,
+    config: Option<OwnedPayload<Option<A::Config>>>,
     parent: OwnedPayload<Option<parrot_api::types::BoxedActorRef>>,
     engine: OwnedPayload<ThreadActorConfig>,
 ) -> Result<(), SpawnError> {
-    let (actor, parent, engine) = tokio::join!(actor.retire(), parent.retire(), engine.retire());
+    let (actor, config, parent, engine) = tokio::join!(
+        actor.retire(),
+        async {
+            match config {
+                Some(config) => config.retire().await,
+                None => Ok(()),
+            }
+        },
+        parent.retire(),
+        engine.retire()
+    );
     actor
+        .and(config)
         .and(parent)
         .and(engine)
         .map_err(|e| SpawnError::DisposalFailed(e.to_string()))
@@ -193,6 +237,7 @@ impl ThreadActorSystem {
             parent,
             None,
             Some(reservation),
+            false,
         )))
     }
     /// Both admission paths use the same bounded blocking publication owner.
@@ -206,6 +251,8 @@ impl ThreadActorSystem {
         name: String,
         publication_reply: Arc<CreationReply>,
         permit: tokio::sync::OwnedSemaphorePermit,
+        config: Option<OwnedPayload<Option<A::Config>>>,
+        defaults: Option<DeferredSendDefaults>,
     ) -> tokio::task::JoinHandle<Result<(), SpawnError>>
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
@@ -214,20 +261,62 @@ impl ThreadActorSystem {
         let trace = parrot_api::trace::TraceContext::current();
         self.retirement_runtime().spawn_blocking(move || {
             parrot_api::trace::in_scope(trace, || {
-                let result = {
-                    let _permit = permit;
-                    system.spawn_at_internal(
-                        actor.take(),
-                        &name,
-                        parent.take(),
-                        engine.take(),
-                        None,
-                        Some(super::factory::Replacement::Instance(&publication)),
-                        publication.lifetime.clone(),
-                        None,
-                    )
-                }
-                .map(|_| ());
+                let _permit = permit;
+                let mut actor = PublicationInput::new(actor.take());
+                let mut parent = PublicationInput::new(parent.take());
+                let mut engine = PublicationInput::new(engine.take());
+                let mut config = config.map(|config| PublicationInput::new(config.take()));
+                let result = (|| {
+                    if publication.control.is_cancelled() {
+                        return Err(SpawnError::Cancelled);
+                    }
+                    if let Some(config) = config.take() {
+                        let resolved = export_engine_config(config)?;
+                        let previous = std::mem::replace(engine.value_mut(), resolved);
+                        crate::owned_payload::retire_synchronously(previous)
+                            .map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
+                        if publication.control.is_cancelled() {
+                            return Err(SpawnError::Cancelled);
+                        }
+                        if let Some(defaults) = &defaults {
+                            let _ =
+                                defaults.set((
+                                    engine.value().backpressure_strategy.clone().unwrap_or_else(
+                                        || system.config().default_backpressure_strategy.clone(),
+                                    ),
+                                    engine
+                                        .value()
+                                        .ask_timeout
+                                        .unwrap_or(system.config().default_ask_timeout),
+                                ));
+                        }
+                    }
+                    system
+                        .spawn_at_internal(
+                            actor.take(),
+                            &name,
+                            parent.take(),
+                            engine.take(),
+                            None,
+                            Some(super::factory::Replacement::Instance(&publication)),
+                            publication.lifetime.clone(),
+                            None,
+                        )
+                        .map(|_| ())
+                })();
+                let config_disposal = config.map_or(Ok(()), PublicationInput::retire);
+                let actor_disposal = actor.retire();
+                let parent_disposal = parent.retire();
+                let engine_disposal = engine.retire();
+                let disposal = config_disposal
+                    .and(actor_disposal)
+                    .and(parent_disposal)
+                    .and(engine_disposal)
+                    .map_err(|error| SpawnError::DisposalFailed(error.to_string()));
+                let result = match result {
+                    Err(error @ SpawnError::DisposalFailed(_)) => Err(error),
+                    result => disposal.and(result),
+                };
                 if result.is_ok()
                     && let Some(sender) = publication_reply.take_success(&publication.control)
                 {
@@ -251,6 +340,27 @@ impl ThreadActorSystem {
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
         self.spawn_owned_instance_at(actor, config, engine, None)
+    }
+
+    pub(crate) fn spawn_owned_instance_from_config<A>(
+        self: &Arc<Self>,
+        actor: A,
+        config: A::Config,
+    ) -> impl std::future::Future<Output = Result<ThreadActorRef<A>, SpawnError>> + Send + '_
+    where
+        A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
+    {
+        let runtime = self.retirement_runtime();
+        self.spawn_owned_instance_inputs(
+            OwnedPayload::new(actor, runtime, &self.cleanup_slots),
+            OwnedPayload::new(Some(config), runtime, &self.cleanup_slots),
+            OwnedPayload::new(ThreadActorConfig::default(), runtime, &self.cleanup_slots),
+            None,
+            OwnedPayload::new(None, runtime, &self.cleanup_slots),
+            None,
+            None,
+            true,
+        )
     }
 
     pub(crate) fn spawn_owned_instance_at<A>(
@@ -319,7 +429,7 @@ impl ThreadActorSystem {
         let config = OwnedPayload::new(config, self.retirement_runtime(), &self.cleanup_slots);
         let engine = OwnedPayload::new(engine, self.retirement_runtime(), &self.cleanup_slots);
         let parent = OwnedPayload::new(parent, self.retirement_runtime(), &self.cleanup_slots);
-        self.spawn_owned_instance_inputs(actor, config, engine, path, parent, cohort, None)
+        self.spawn_owned_instance_inputs(actor, config, engine, path, parent, cohort, None, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -332,6 +442,7 @@ impl ThreadActorSystem {
         parent: OwnedPayload<Option<parrot_api::types::BoxedActorRef>>,
         cohort: Option<&'a crate::root_cohort::RootCohort>,
         reservation: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+        export_engine: bool,
     ) -> impl std::future::Future<Output = Result<ThreadActorRef<A>, SpawnError>> + Send + 'a
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
@@ -345,10 +456,11 @@ impl ThreadActorSystem {
                     .flatten()
             });
             let path = path.unwrap_or_else(|| format!("/user/{}", uuid::Uuid::new_v4().simple()));
+            let defaults = export_engine.then(|| Arc::new(std::sync::OnceLock::new()));
             let admit = |lifetime: Arc<crate::children::ChildLifetime>| {
                 let address = Arc::new(Mutex::new(Weak::<MpscMailbox>::new() as WeakMailboxRef));
                 let watches = ThreadWatches::dynamic(&address);
-                let reference = ThreadActorRef::<A>::registered(
+                let mut reference = ThreadActorRef::<A>::registered(
                     path.clone(),
                     address.clone(),
                     Default::default(),
@@ -365,6 +477,9 @@ impl ThreadActorSystem {
                 )
                 .with_death_watch(watches.common.clone())
                 .with_retirement(&lifetime);
+                if let Some(defaults) = &defaults {
+                    reference = reference.with_deferred_defaults(defaults.clone());
+                }
                 let deadline = tokio::time::Instant::now() + self.creation_timeout();
                 let pending = Arc::new(PendingInstance {
                     _admission: reservation.clone(),
@@ -453,7 +568,10 @@ impl ThreadActorSystem {
                     return Err(error);
                 }
             };
-            let deadline = tokio::time::Instant::now() + self.creation_timeout();
+            let deadline = pending
+                .control
+                .deadline()
+                .expect("admitted instance deadline");
             let timeout = self.config().shutdown_timeout;
             let weak = Arc::downgrade(self);
             let registry = self.registry.clone();
@@ -467,7 +585,7 @@ impl ThreadActorSystem {
             let mut inputs = Some((actor, config, parent, engine));
             // No user destructor can run here. Reserve capacity without waiting;
             // all fallbacks retain their independently scheduled cleanup owner.
-            let submitted = if !std::mem::needs_drop::<Option<A::Config>>()
+            let submitted = if (export_engine || !std::mem::needs_drop::<Option<A::Config>>())
                 && !pending.control.is_cancelled()
             {
                 self.factory_slots
@@ -476,7 +594,12 @@ impl ThreadActorSystem {
                     .ok()
                     .map(|permit| {
                         let (actor, config, parent, engine) = inputs.take().unwrap();
-                        drop(config);
+                        let config = if export_engine {
+                            Some(config)
+                        } else {
+                            drop(config);
+                            None
+                        };
                         self.submit_instance_publication(
                             actor,
                             parent,
@@ -485,6 +608,8 @@ impl ThreadActorSystem {
                             path.clone(),
                             reply.clone(),
                             permit,
+                            config,
+                            defaults.clone(),
                         )
                     })
             } else {
@@ -496,14 +621,18 @@ impl ThreadActorSystem {
                     submitted.await.map_err(|e| SpawnError::DisposalFailed(crate::owned_payload::join_error(e))).and_then(|result| result)
                 } else {
                 let (actor, config, parent, engine) = inputs.take().expect("deferred publication inputs");
-                let config_result = config.retire().await.map_err(|e| SpawnError::DisposalFailed(e.to_string()));
+                let (config, config_result) = if export_engine {
+                    (Some(config), Ok(()))
+                } else {
+                    (None, config.retire().await.map_err(|e| SpawnError::DisposalFailed(e.to_string())))
+                };
                 if let Err(error) = config_result {
                     // The configuration failed first; cleanup must finish but must
                     // not replace that failure with a later destructor panic.
-                    let _ = retire_inputs(actor, parent, engine).await;
+                    let _ = retire_inputs(actor, config, parent, engine).await;
                     Err(error)
                 } else if pending.control.is_cancelled() {
-                    retire_inputs(actor, parent, engine).await.and(Err(SpawnError::Cancelled))
+                    retire_inputs(actor, config, parent, engine).await.and(Err(SpawnError::Cancelled))
                 } else if let Some(system) = weak.upgrade() {
                     let publication = pending.clone();
                     let name = path.clone();
@@ -515,13 +644,13 @@ impl ThreadActorSystem {
                         permit = system.factory_slots.clone().acquire_owned() => permit.ok(),
                     };
                     if let Some(permit) = permit {
-                        system.submit_instance_publication(actor, parent, engine, publication, name, reply.clone(), permit)
+                        system.submit_instance_publication(actor, parent, engine, publication, name, reply.clone(), permit, config, defaults)
                             .await.map_err(|e| SpawnError::DisposalFailed(crate::owned_payload::join_error(e))).and_then(|result| result)
                     } else {
-                        retire_inputs(actor, parent, engine).await.and(Err(SpawnError::Cancelled))
+                        retire_inputs(actor, config, parent, engine).await.and(Err(SpawnError::Cancelled))
                     }
                 } else {
-                    retire_inputs(actor, parent, engine).await.and(Err(SpawnError::SystemShutdown))
+                    retire_inputs(actor, config, parent, engine).await.and(Err(SpawnError::SystemShutdown))
                 }
                 };
                 if result.is_ok() {
@@ -579,8 +708,8 @@ impl ThreadActorSystem {
                 _ = tokio::time::sleep_until(deadline) => {
                     if let Some(sender) = reply.take_failure() {
                         pending.control.cancel();
-                        pending.finished.send_replace(Some(StopOutcome::TimedOut("instance configuration retirement exceeded creation deadline".into())));
-                        let _ = sender.send(Err(SpawnError::Timeout("instance configuration retirement exceeded creation deadline".into())));
+                        pending.finished.send_replace(Some(StopOutcome::TimedOut("instance creation exceeded deadline".into())));
+                        let _ = sender.send(Err(SpawnError::Timeout("instance creation exceeded deadline".into())));
                     }
                     work.await
                 }

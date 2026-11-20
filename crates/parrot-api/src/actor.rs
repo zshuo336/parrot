@@ -95,6 +95,10 @@ pub trait ActorConfig: Send + 'static {
     /// other types. Returning `None` keeps that entry's normal defaults.
     /// Explicit engine configuration entries and other engines do not call
     /// this hook. It does not inject business settings into [`Actor::init`].
+    /// The Thread entry runs it on a bounded blocking worker after pending
+    /// admission. Creation timeout or caller cancellation prevents late
+    /// publication; synchronous user code must return before its inputs can
+    /// finish retiring. Shutdown retains that retirement owner.
     /// Existing implementations inherit this default.
     fn engine_config(&self) -> Option<Box<dyn Any + Send>> {
         None

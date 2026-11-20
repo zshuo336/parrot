@@ -20,6 +20,8 @@ use crate::thread::scheduler::ThreadScheduler;
 
 pub(crate) type StopRequest = Arc<tokio::sync::OnceCell<crate::thread::system::StopCompletion>>;
 
+pub(crate) type DeferredSendDefaults = Arc<std::sync::OnceLock<(BackpressureStrategy, Duration)>>;
+
 /// A typed reference to an actor running on the thread engine.
 ///
 /// Holds only a *weak* reference to the actor's mailbox so the reference
@@ -61,6 +63,9 @@ where
     /// Default timeout for asks
     default_timeout: Duration,
 
+    /// Configuration exported after pending admission is shared by all early views.
+    deferred_defaults: Option<DeferredSendDefaults>,
+
     /// Optional typed scheduler handle (kept for engine-specific operations)
     scheduler: Option<Arc<dyn ThreadScheduler>>,
 
@@ -93,6 +98,7 @@ where
             retirement: None,
             default_strategy,
             default_timeout,
+            deferred_defaults: None,
             scheduler,
             _marker: PhantomData,
         }
@@ -124,6 +130,7 @@ where
             retirement: None,
             default_strategy,
             default_timeout,
+            deferred_defaults: None,
             scheduler: None,
             _marker: PhantomData,
         }
@@ -136,6 +143,11 @@ where
 
     pub(crate) fn with_retirement(mut self, lifetime: &crate::children::ChildLifetime) -> Self {
         self.retirement = Some(lifetime.retirement_receipt());
+        self
+    }
+
+    pub(crate) fn with_deferred_defaults(mut self, defaults: DeferredSendDefaults) -> Self {
+        self.deferred_defaults = Some(defaults);
         self
     }
 
@@ -155,12 +167,18 @@ where
 
     /// Get the default ask timeout.
     pub fn default_timeout(&self) -> Duration {
-        self.default_timeout
+        self.deferred_defaults
+            .as_ref()
+            .and_then(|defaults| defaults.get())
+            .map_or(self.default_timeout, |(_, timeout)| *timeout)
     }
 
     /// Get the default backpressure strategy.
     pub fn default_strategy(&self) -> &BackpressureStrategy {
-        &self.default_strategy
+        self.deferred_defaults
+            .as_ref()
+            .and_then(|defaults| defaults.get())
+            .map_or(&self.default_strategy, |(strategy, _)| strategy)
     }
 
     /// Share the logical address across supervised generations.
@@ -263,7 +281,7 @@ where
         &self,
         msg: BoxedMessage,
     ) -> impl std::future::Future<Output = ActorResult<()>> + '_ {
-        self.send_with_strategy(msg, self.default_strategy.clone())
+        self.send_with_strategy(msg, self.default_strategy().clone())
     }
 
     /// Ask with explicit strategy and timeout (request-response semantics).
@@ -305,7 +323,7 @@ where
             let (envelope, reply_rx) = AskEnvelope::with_boxed_options(msg.take(), options);
             let exchange = async {
                 mailbox
-                    .push_ask(envelope, self.default_strategy.clone())
+                    .push_ask(envelope, self.default_strategy().clone())
                     .await
                     .map_err(|error| self.enqueue_error(error, "ask"))?;
                 reply_rx.await.map_err(|_| {
@@ -342,7 +360,7 @@ where
             self.ask_envelope_with_timeout(
                 envelope,
                 reply_rx,
-                self.default_strategy.clone(),
+                self.default_strategy().clone(),
                 timeout_duration,
             )
             .await
@@ -386,7 +404,11 @@ where
         &self,
         msg: BoxedMessage,
     ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + '_ {
-        self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), self.default_timeout)
+        self.ask_with_strategy_and_timeout(
+            msg,
+            self.default_strategy().clone(),
+            self.default_timeout(),
+        )
     }
 
     /// Unbounded ask: enqueue the AskEnvelope and await the reply channel
@@ -425,7 +447,7 @@ where
         msg: BoxedMessage,
         timeout_duration: Duration,
     ) -> impl std::future::Future<Output = ActorResult<BoxedMessage>> + '_ {
-        self.ask_with_strategy_and_timeout(msg, self.default_strategy.clone(), timeout_duration)
+        self.ask_with_strategy_and_timeout(msg, self.default_strategy().clone(), timeout_duration)
     }
 }
 
@@ -457,7 +479,7 @@ where
         // ask. No implicit engine default timeout — callers who need a
         // bound use send_with_timeout(Some(d)); fire-and-forget uses
         // `deliver`.
-        Box::pin(self.ask_unbounded(msg, self.default_strategy.clone()))
+        Box::pin(self.ask_unbounded(msg, self.default_strategy().clone()))
     }
 
     fn send_with_timeout<'a>(
@@ -468,12 +490,12 @@ where
         match timeout_duration {
             Some(duration) => Box::pin(self.ask_with_strategy_and_timeout(
                 msg,
-                self.default_strategy.clone(),
+                self.default_strategy().clone(),
                 duration,
             )),
             None => {
                 // Aligned with `send`: unbounded ask.
-                Box::pin(self.ask_unbounded(msg, self.default_strategy.clone()))
+                Box::pin(self.ask_unbounded(msg, self.default_strategy().clone()))
             }
         }
     }
@@ -487,7 +509,7 @@ where
     }
 
     fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(self.send_with_strategy(msg, self.default_strategy.clone()))
+        Box::pin(self.send_with_strategy(msg, self.default_strategy().clone()))
     }
 
     fn deliver_with_options<'a>(
@@ -507,7 +529,7 @@ where
                 mailbox
                     .push_with_priority(
                         msg,
-                        self.default_strategy.clone(),
+                        self.default_strategy().clone(),
                         options.priority.value() >= 70,
                     )
                     .await
@@ -597,6 +619,7 @@ where
             retirement: self.retirement.clone(),
             default_strategy: self.default_strategy.clone(),
             default_timeout: self.default_timeout,
+            deferred_defaults: self.deferred_defaults.clone(),
             scheduler: self.scheduler.clone(),
             _marker: PhantomData,
         }

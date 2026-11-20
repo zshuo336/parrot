@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
-use parrot_api::actor::{Actor, ActorConfig, ActorState};
+use parrot_api::actor::{Actor, ActorState};
 use parrot_api::address::{ActorPath, ActorRef};
 use parrot_api::context::ActorContext;
 use parrot_api::errors::ActorError;
@@ -954,7 +954,7 @@ impl ThreadActorSystem {
     /// Spawn a typed root actor on this system (returns a typed ThreadActorRef).
     ///
     /// This is the engine-specific entry point with the required context bound.
-    /// An [`ActorConfig`] may optionally export a [`ThreadActorConfig`] through
+    /// An [`ActorConfig`](parrot_api::actor::ActorConfig) may optionally export a [`ThreadActorConfig`] through
     /// `engine_config`; otherwise the system defaults are used. The business
     /// configuration is still owned and retired as a creation input.
     pub fn spawn_root_typed_thread<A>(
@@ -965,68 +965,7 @@ impl ThreadActorSystem {
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
-        let actor = crate::owned_payload::OwnedPayload::new(
-            actor,
-            self.retirement_runtime(),
-            &self.cleanup_slots,
-        );
-        let config = crate::owned_payload::OwnedPayload::new(
-            config,
-            self.retirement_runtime(),
-            &self.cleanup_slots,
-        );
-        parrot_api::trace::capture(async move {
-            if self.is_shutting_down() {
-                let (actor, config) = tokio::join!(actor.retire(), config.retire());
-                actor
-                    .and(config)
-                    .map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
-                return Err(SpawnError::SystemShutdown);
-            }
-            let permit = self
-                .factory_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("private factory slots remain open");
-            let trace = parrot_api::trace::TraceContext::current();
-            let (config, exported) = self.retirement_runtime().spawn_blocking(move || {
-                let _permit = permit;
-                parrot_api::trace::in_scope(trace, || {
-                    let exported = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        match config.value().engine_config() {
-                            None => Ok(ThreadActorConfig::default()),
-                            Some(exported) => match exported.downcast::<ThreadActorConfig>() {
-                                Ok(engine) => Ok(*engine),
-                                Err(other) => {
-                                    crate::owned_payload::PublicationInput::new(other).retire()
-                                        .map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
-                                    Err(SpawnError::InvalidConfig(
-                                        "ActorConfig::engine_config must export ThreadActorConfig for the Thread engine".into(),
-                                    ))
-                                }
-                            },
-                        }
-                    })).unwrap_or_else(|panic| Err(SpawnError::InitializationFailed(
-                        format!("actor engine configuration panicked: {}", crate::owned_payload::panic_message(panic)),
-                    ))).map(|engine| config.protect(engine));
-                    (config, exported)
-                })
-            }).await.map_err(|error| SpawnError::SchedulerError(crate::owned_payload::join_error(error)))?;
-            match exported {
-                Ok(engine) => {
-                    self.spawn_owned_instance(actor.take(), config.take(), engine.take())
-                        .await
-                }
-                Err(error) => {
-                    let (actor, config) = tokio::join!(actor.retire(), config.retire());
-                    actor
-                        .and(config)
-                        .map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
-                    Err(error)
-                }
-            }
-        })
+        self.spawn_owned_instance_from_config(actor, config)
     }
 
     /// Spawn an instance after owning and retiring its creation configuration.
