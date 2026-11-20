@@ -341,6 +341,18 @@ fn queued(supervision: bool, recursive: bool) {
         drop(waiter);
     }
     no_unwind(|| drop(runtime));
+    // Dropping a current-thread runtime aborts the async owner, but a
+    // cleanup value may already be queued on Tokio's blocking executor. The
+    // contract is eventual, exactly-once disposal; observing counters in the
+    // same instant races that executor and makes this regression flaky under
+    // the full library suite.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while (counts.drops.load(Ordering::SeqCst) != 1
+        || counts.payloads.load(Ordering::SeqCst) != usize::from(recursive))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(counts.drops.load(Ordering::SeqCst), 1);
     assert_eq!(
         counts.payloads.load(Ordering::SeqCst),
