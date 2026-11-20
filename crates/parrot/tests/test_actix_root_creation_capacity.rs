@@ -6,13 +6,13 @@ use parrot_api::{
 };
 use std::{
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     task::Poll,
     time::Duration,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 #[derive(Default)]
 struct Counts {
@@ -122,4 +122,113 @@ async fn production_root_limit_bounds_initializing_instances_before_publication(
     assert_eq!(counts.actors.load(Ordering::SeqCst), 1025);
     assert_eq!(counts.configs.load(Ordering::SeqCst), 1025);
     assert_eq!(counts.initialized.load(Ordering::SeqCst), 1025);
+}
+
+#[derive(Default)]
+struct DisposalGate {
+    entered: Notify,
+    open: Mutex<bool>,
+    changed: Condvar,
+    disposed: AtomicUsize,
+}
+impl DisposalGate {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+struct PolicyCapture(Arc<DisposalGate>);
+impl Drop for PolicyCapture {
+    fn drop(&mut self) {
+        self.0.entered.notify_one();
+        let (open, _) = self
+            .0
+            .changed
+            .wait_timeout_while(
+                self.0.open.lock().unwrap(),
+                Duration::from_secs(10),
+                |open| !*open,
+            )
+            .unwrap();
+        assert!(*open, "test must release the policy destructor");
+        self.0.disposed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+struct ReleasePolicy(Arc<DisposalGate>);
+impl Drop for ReleasePolicy {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[actix::test]
+async fn ignored_guardian_policy_cannot_extend_root_creation_deadline() {
+    use parrot_api::{
+        errors::ActorError,
+        supervisor::{
+            BasicDecisionFn, OneForOneStrategy, SupervisionDecision, SupervisorStrategyType,
+        },
+        system::{GuardianConfig, SystemError},
+    };
+    let system = ActixActorSystem::with_guardian(
+        ActixSystemSettings {
+            arbiter_count: 2,
+            shutdown_timeout: Duration::from_millis(150),
+            ..Default::default()
+        },
+        GuardianConfig::default(),
+    )
+    .await
+    .unwrap();
+    let counts = Arc::new(Counts::default());
+    let gate = Arc::new(DisposalGate::default());
+    let release = ReleasePolicy(gate.clone());
+    let capture = PolicyCapture(gate.clone());
+    let strategy = SupervisorStrategyType::OneForOne(OneForOneStrategy {
+        max_restarts: 0,
+        within: Duration::from_secs(1),
+        decider: BasicDecisionFn::new(move |_| {
+            let _ = &capture;
+            SupervisionDecision::Stop
+        }),
+    });
+    let mut creation = Box::pin(system.spawn_root_typed_with_strategy(
+        Probe {
+            counts: counts.clone(),
+            init: Arc::new(Semaphore::new(0)),
+        },
+        Config(counts.clone()),
+        strategy,
+    ));
+    assert!(futures::poll!(&mut creation).is_pending());
+    tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_millis(800), &mut creation).await;
+    let returned_timeout = matches!(
+        result,
+        Ok(Err(SystemError::ActorError(ActorError::TimeoutDetail(_))))
+    );
+    let registered_before_release = system.status().active_actors;
+    drop(creation);
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while counts.actors.load(Ordering::SeqCst) != 1
+            || counts.configs.load(Ordering::SeqCst) != 1
+            || gate.disposed.load(Ordering::SeqCst) != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let registered_after_release = system.status().active_actors;
+    system.clone().shutdown().await.unwrap();
+    assert!(
+        returned_timeout,
+        "ignored policy destructor extended the public creation deadline"
+    );
+    assert_eq!(registered_before_release, 0);
+    assert_eq!(registered_after_release, 0);
+    assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
 }
