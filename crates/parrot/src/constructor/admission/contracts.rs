@@ -504,3 +504,109 @@ async fn full_system_sized_group_prepares_with_one_worker_and_releases_on_commit
     assert_eq!(admission.available_permits(), SYSTEM_CAPACITY);
     factory.retire().await.unwrap();
 }
+
+struct LocalEcho {
+    value: std::rc::Rc<usize>,
+    owner: std::thread::ThreadId,
+}
+impl parrot_api::local_typed::LocalTypedDispatch for LocalEcho {
+    type Msg = Request;
+    type Reply = usize;
+    fn dispatch<'a>(
+        &'a mut self,
+        _: Request,
+        _: &'a parrot_api::typed_context::TypedContext,
+    ) -> parrot_api::local_typed::LocalBoxedFuture<'a, parrot_api::types::ActorResult<usize>> {
+        assert_eq!(std::thread::current().id(), self.owner);
+        Box::pin(async move { Ok(*self.value) })
+    }
+}
+impl Drop for LocalEcho {
+    fn drop(&mut self) {
+        assert_eq!(std::thread::current().id(), self.owner);
+    }
+}
+impl parrot_api::typed::ParrotMsgVariant<parrot_api::local_typed::LocalProtocol<LocalEcho>>
+    for Request
+{
+    fn inject(message: Self) -> Self {
+        message
+    }
+    fn extract(reply: usize) -> parrot_api::types::ActorResult<usize> {
+        Ok(reply)
+    }
+}
+
+async fn local_root_shares_native_budget(repeatable: bool) {
+    let admission = Admission::new(1);
+    let mut system =
+        crate::actix::ActixActorSystem::with_settings(crate::actix::ActixSystemSettings {
+            arbiter_count: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    system.factory_admission = admission.clone();
+    let system = Arc::new(system);
+    let native_calls = Arc::new(AtomicUsize::new(0));
+    let workers = Arc::new(Semaphore::new(1));
+    let native = factory(&workers, &admission, &native_calls);
+    let held = native.prepare::<()>(Arc::default()).await.unwrap();
+    assert_eq!(admission.available_permits(), 0);
+    // A staged native output retains invocation capacity after its worker left.
+    assert_eq!(workers.available_permits(), 1);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let constructor = move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        LocalEcho {
+            value: std::rc::Rc::new(42),
+            owner: std::thread::current().id(),
+        }
+    };
+    let local = if repeatable {
+        system
+            .spawn_local_typed_factory::<_, Request, _>(constructor, "/shared-local")
+            .await
+    } else {
+        system
+            .spawn_local_typed::<_, Request, _>(constructor, "/shared-local")
+            .await
+    }
+    .unwrap();
+    let premature = tokio::time::timeout(Duration::from_millis(100), local.ask(Request)).await;
+    let premature_calls = calls.load(Ordering::SeqCst);
+    held.discard().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(WAIT, local.ask(Request))
+            .await
+            .unwrap()
+            .unwrap(),
+        42
+    );
+    local.stop().await.unwrap();
+    native.retire().await.unwrap();
+    Arc::try_unwrap(system)
+        .ok()
+        .expect("final system owner")
+        .shutdown()
+        .await
+        .unwrap();
+    assert!(
+        premature.is_err(),
+        "Local root bypassed native invocation budget"
+    );
+    assert_eq!(premature_calls, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(admission.available_permits(), 1);
+}
+
+#[actix::test]
+async fn local_factory_root_shares_native_invocation_budget() {
+    local_root_shares_native_budget(true).await;
+}
+
+#[actix::test]
+async fn local_one_shot_root_shares_native_invocation_budget() {
+    local_root_shares_native_budget(false).await;
+}

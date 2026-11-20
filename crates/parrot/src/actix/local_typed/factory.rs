@@ -8,6 +8,9 @@ use parrot_api::supervisor::{
 };
 use std::time::Duration;
 
+#[cfg(test)]
+mod contracts;
+
 impl ActixActorSystem {
     /// Admit a repeatable Local root, with three restarts per 60 seconds.
     /// The constructor is Send but need not be Sync: all calls and all non-Send
@@ -60,21 +63,46 @@ impl ActixActorSystem {
     }
 }
 
-// Acquire bounded constructor capacity without moving its output to a worker.
+pub(super) struct Prepared<A> {
+    pub(super) actor: A,
+    pub(super) invocation: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+// Acquire invocation ownership before worker capacity without moving the output.
 // Once the synchronous call starts, the independent monitor may time out but
 // this arbiter still owns the late result. The caller installs it in TypedInputs
 // before checking deadlines, so all exit paths isolate its actual destructor.
-async fn prepare<A, F>(
+pub(super) async fn prepare<A, F>(
     factory: &OwnedPayload<F>,
     control: &Arc<ActorControl>,
     slots: Arc<tokio::sync::Semaphore>,
+    admission: &crate::constructor::admission::Admission,
     deadline: tokio::time::Instant,
     group: Option<&crate::constructor::ConstructionControl>,
-) -> ActorResult<Option<A>>
+) -> ActorResult<Option<Prepared<A>>>
 where
     A: LocalTypedDispatch,
     F: Fn() -> A + Send + 'static,
 {
+    let single = crate::constructor::ConstructionControl::with_deadline(deadline);
+    let construction = group.unwrap_or(&single);
+    let invocation = tokio::select! {
+        biased;
+        _ = control.channel.closed() => return Ok(None),
+        _ = tokio::time::sleep_until(deadline) => {
+            control.begin_cleanup(deadline);
+            return Err(control.enforce_deadline());
+        },
+        permit = admission.acquire::<()>(construction) => match permit {
+            Ok(permit) => permit,
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                control.begin_cleanup(deadline);
+                return Err(control.enforce_deadline());
+            },
+            Err(crate::constructor::ConstructionError::Cancelled) => return Err(ActorError::Stopped),
+            Err(error) => return Err(ActorError::InternalError(format!("Local construction admission failed: {error:?}"))),
+        },
+    };
     let permit = tokio::select! {
         biased;
         _ = control.channel.closed() => return Ok(None),
@@ -98,7 +126,7 @@ where
         return Err(control.enforce_deadline());
     }
     let actor = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory.value()()))
-        .map(Some)
+        .map(|actor| Some(Prepared { actor, invocation }))
         .map_err(|payload| ActorError::InitializationError(panic_message(payload)));
     drop(permit);
     actor
@@ -122,9 +150,9 @@ where
         biased;
         _ = control.channel.closed() => return Ok(false),
         group = control.group_recovery() => return rebuild_group(inputs, factory, group, runtime).await,
-        actor = prepare(factory, &control, inputs.constructor_slots.clone(), deadline, None) => actor?,
+        actor = prepare(factory, &control, inputs.constructor_slots.clone(), &inputs.factory_admission, deadline, None) => actor?,
     };
-    inputs.actor = actor;
+    inputs.install(actor);
     // A cohort may be assigned while the synchronous constructor was blocked.
     // That old output must retire with all other old generations before init.
     if let Some(group) = control.lifetime.recovery() {
@@ -133,7 +161,11 @@ where
     if inputs.actor.is_none() {
         return Ok(false);
     }
-    control.construction_complete(deadline)
+    let published = control.construction_complete(deadline)?;
+    if published {
+        inputs.invocation.take();
+    }
+    Ok(published)
 }
 struct AbortGroup(Arc<crate::children::recovery::Recovery>);
 impl Drop for AbortGroup {
@@ -179,12 +211,13 @@ where
                 factory,
                 &control,
                 inputs.constructor_slots.clone(),
+                &inputs.factory_admission,
                 deadline,
                 Some(&construction),
             ),
         )
         .await;
-        inputs.actor = match prepared {
+        let prepared = match prepared {
             Ok(actor) => actor,
             Err(ActorError::Stopped) if group.was_cancelled() => return Ok(false),
             Err(ActorError::Stopped) if group.failure_reason().is_some() => {
@@ -192,6 +225,7 @@ where
             }
             Err(error) => return Err(error),
         };
+        inputs.install(prepared);
         if inputs.actor.is_none() {
             return Ok(false);
         }
@@ -227,7 +261,11 @@ where
                 Err(ActorError::InternalError(error))
             };
         }
-        control.construction_complete(deadline)
+        let published = control.construction_complete(deadline)?;
+        if published {
+            inputs.invocation.take();
+        }
+        Ok(published)
     };
     tokio::pin!(work);
     tokio::select! {
@@ -250,9 +288,12 @@ async fn retire_generation<A: LocalTypedDispatch>(
         let first = inputs.cleanup_error.get_or_insert(receipt).clone();
         return Err(first.into_error());
     }
-    if let Some(actor) = inputs.actor.take()
-        && let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(actor)))
-    {
+    let retired = inputs
+        .actor
+        .take()
+        .map(|actor| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(actor))));
+    inputs.invocation.take();
+    if let Some(Err(panic)) = retired {
         let message = panic_message(panic);
         let first = inputs
             .cleanup_error

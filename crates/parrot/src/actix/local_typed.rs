@@ -44,10 +44,19 @@ struct TypedInputs<A: LocalTypedDispatch> {
     dispatch_cancel_failed: bool,
     control: Arc<ActorControl>,
     constructor_slots: Arc<tokio::sync::Semaphore>,
+    factory_admission: Arc<crate::constructor::admission::Admission>,
+    invocation: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     policy_slots: Arc<tokio::sync::Semaphore>,
     finished: Option<tokio::sync::oneshot::Sender<Outcome>>,
 }
 impl<A: LocalTypedDispatch> TypedInputs<A> {
+    fn install(&mut self, prepared: Option<factory::Prepared<A>>) {
+        if let Some(prepared) = prepared {
+            self.actor = Some(prepared.actor);
+            self.invocation = Some(prepared.invocation);
+        }
+    }
+
     fn retire_streams(&mut self) -> ActorResult<()> {
         let streams = std::mem::take(&mut self.local_streams);
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(streams))) {
@@ -92,6 +101,7 @@ impl<A: LocalTypedDispatch> TypedInputs<A> {
                 cleanup = Err(ActorError::Panic(message));
             }
         }
+        self.invocation.take();
         let outcome = Outcome::from_result(cleanup);
         if let Some(finished) = self.finished.take() {
             let _ = finished.send(outcome.clone());
@@ -603,6 +613,7 @@ struct Queued<A: LocalTypedDispatch> {
     creation_context: Option<parrot_api::trace::TraceContext>,
     control: Arc<ActorControl>,
     constructor_slots: Arc<tokio::sync::Semaphore>,
+    factory_admission: Arc<crate::constructor::admission::Admission>,
     policy_slots: Arc<tokio::sync::Semaphore>,
     finished: Option<tokio::sync::oneshot::Sender<Outcome>>,
 }
@@ -617,6 +628,8 @@ impl<A: LocalTypedDispatch> Queued<A> {
             dispatch_cancel_failed: false,
             control: self.control.clone(),
             constructor_slots: self.constructor_slots.clone(),
+            factory_admission: self.factory_admission.clone(),
+            invocation: None,
             policy_slots: self.policy_slots.clone(),
             finished: self.finished.take(),
         }
@@ -669,34 +682,41 @@ where
         exit.cleanup = exit.cleanup.and(factory.retire().await);
         return exit;
     }
-    let constructed = if control.channel.is_sealed() {
-        Ok(None)
-    } else {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            parrot_api::trace::in_scope(inputs.creation_context.clone(), || factory.value()())
-        }))
-        .map(Some)
-        .map_err(|payload| ActorError::Panic(panic_message(payload)))
-    };
+    let deadline =
+        control.begin_construction(tokio::time::Instant::now() + control.creation_timeout);
+    let constructed = parrot_api::trace::scope(
+        inputs.creation_context.clone(),
+        factory::prepare(
+            &factory,
+            &control,
+            inputs.constructor_slots.clone(),
+            &inputs.factory_admission,
+            deadline,
+            None,
+        ),
+    )
+    .await;
     let construction = match constructed {
-        Ok(actor) => {
-            inputs.actor = actor;
-            Ok(())
+        Ok(prepared) => {
+            inputs.install(prepared);
+            control.construction_complete(deadline)
         }
+        Err(ActorError::InitializationError(message)) => Err(ActorError::Panic(message)),
         Err(error) => Err(error),
     };
     // The Send constructor's captures have their own cleanup owner, independent
     // of the local result. A capture Drop failure cannot publish a live actor.
     let capture_cleanup = factory.retire().await;
-    if construction.is_ok()
+    if construction.as_ref().is_ok_and(|published| *published)
         && capture_cleanup.is_ok()
         && inputs.actor.is_some()
         && !control.channel.is_sealed()
     {
+        inputs.invocation.take();
         return run_actor(inputs, control, runtime).await;
     }
     let cleanup = inputs.retire();
-    let outcome = construction.and(capture_cleanup);
+    let outcome = construction.map(|_| ()).and(capture_cleanup);
     if outcome.is_err() {
         control
             .supervision_failed
@@ -946,6 +966,7 @@ impl ActixActorSystem {
                 creation_context: creation_context.clone(),
                 control: control.clone(),
                 constructor_slots: self.constructor_slots.clone(),
+                factory_admission: self.factory_admission.clone(),
                 policy_slots: self.policy_slots.clone(),
                 finished: Some(retired_tx),
             };

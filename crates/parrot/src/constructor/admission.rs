@@ -62,7 +62,7 @@ impl Admission {
         }
     }
 
-    pub(super) async fn acquire<E>(
+    pub(crate) async fn acquire<E>(
         &self,
         control: &ConstructionControl,
     ) -> Result<Arc<OwnedSemaphorePermit>, ConstructionError<E>> {
