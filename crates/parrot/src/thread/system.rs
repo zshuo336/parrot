@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
-use parrot_api::actor::{Actor, ActorState};
+use parrot_api::actor::{Actor, ActorConfig, ActorState};
 use parrot_api::address::{ActorPath, ActorRef};
 use parrot_api::context::ActorContext;
 use parrot_api::errors::ActorError;
@@ -954,6 +954,9 @@ impl ThreadActorSystem {
     /// Spawn a typed root actor on this system (returns a typed ThreadActorRef).
     ///
     /// This is the engine-specific entry point with the required context bound.
+    /// An [`ActorConfig`] may optionally export a [`ThreadActorConfig`] through
+    /// `engine_config`; otherwise the system defaults are used. The business
+    /// configuration is still owned and retired as a creation input.
     pub fn spawn_root_typed_thread<A>(
         self: &Arc<Self>,
         actor: A,
@@ -962,7 +965,26 @@ impl ThreadActorSystem {
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
-        self.spawn_owned_instance(actor, config, ThreadActorConfig::default())
+        let actor = crate::owned_payload::OwnedPayload::new(
+            actor,
+            self.retirement_runtime(),
+            &self.cleanup_slots,
+        );
+        let config = crate::owned_payload::OwnedPayload::new(
+            config,
+            self.retirement_runtime(),
+            &self.cleanup_slots,
+        );
+        async move {
+            let thread_config = config
+                .value()
+                .engine_config()
+                .and_then(|config| config.downcast::<ThreadActorConfig>().ok())
+                .map(|config| *config)
+                .unwrap_or_default();
+            self.spawn_owned_instance(actor.take(), config.take(), thread_config)
+                .await
+        }
     }
 
     /// Spawn an instance after owning and retiring its creation configuration.

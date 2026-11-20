@@ -84,6 +84,36 @@ impl Actor for Probe {
         Box::pin(async { Ok(message) })
     }
 }
+
+#[derive(Clone, Debug)]
+struct EngineConfiguredInput {
+    thread: ThreadActorConfig,
+    calls: Arc<AtomicUsize>,
+}
+impl ActorConfig for EngineConfiguredInput {
+    fn engine_config(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Some(Box::new(self.thread.clone()))
+    }
+}
+
+struct EngineConfiguredProbe;
+impl Actor for EngineConfiguredProbe {
+    type Config = EngineConfiguredInput;
+    type Context = ThreadContext<Self>;
+
+    fn state(&self) -> ActorState {
+        ActorState::Running
+    }
+
+    fn receive_message<'a>(
+        &'a mut self,
+        message: BoxedMessage,
+        _: &'a mut Self::Context,
+    ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
+        Box::pin(async move { Ok(message) })
+    }
+}
 fn input(counts: &Arc<Counts>, panic: bool) -> Input {
     Input {
         counts: counts.clone(),
@@ -373,6 +403,29 @@ async fn configured_instance_rejection_joins_all_inputs_and_preserves_disposal_e
         }
         assert_eq!(system.actor_count(), 0);
     }
+}
+
+#[tokio::test]
+async fn actor_config_can_export_thread_engine_configuration() {
+    let system = system();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let config = EngineConfiguredInput {
+        thread: ThreadActorConfig {
+            mailbox_capacity: Some(7),
+            ..Default::default()
+        },
+        calls: calls.clone(),
+    };
+    let creation = system.spawn_root_typed_thread(EngineConfiguredProbe, config);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "conversion must be lazy");
+    let reference = bounded(creation)
+        .await
+        .expect("configured actor should start");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let path = reference.path();
+    assert_eq!(system.get_mailbox(&path).unwrap().capacity(), 7);
+    bounded(reference.stop()).await.unwrap();
+    bounded(system.shutdown_internal()).await.unwrap();
 }
 
 #[tokio::test]

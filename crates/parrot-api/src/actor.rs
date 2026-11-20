@@ -88,7 +88,16 @@ pub struct EmptyConfig;
 /// runtime. They therefore only need to be `Send`; requiring `Sync` made the
 /// public type-erased spawn API impossible to implement for its own
 /// `Box<dyn Any + Send>` contract.
-pub trait ActorConfig: Send + 'static {}
+pub trait ActorConfig: Send + 'static {
+    /// Optionally expose an engine-specific configuration without coupling the
+    /// public API crate to a concrete engine. A built-in engine may downcast
+    /// the returned value to its own configuration type; returning `None`
+    /// keeps the engine's normal defaults. Existing implementations inherit
+    /// this default and remain source-compatible.
+    fn engine_config(&self) -> Option<Box<dyn Any + Send>> {
+        None
+    }
+}
 
 /// Implement ActorConfig for the EmptyConfig type
 impl ActorConfig for EmptyConfig {}
