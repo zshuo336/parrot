@@ -11,6 +11,10 @@
 //! 生命周期仍由各自引擎负责，不能由共用通道推断完全等价）；本文件负责 thread 引擎接线：
 //! 系统持有注册与清理；用户 poll 在有界阻塞池许可下隔离执行。
 
+#[cfg(test)]
+mod admission_contracts;
+#[cfg(test)]
+mod admission_lifecycle_contracts;
 mod factory;
 
 pub use parrot_api::typed_channel::{DEFAULT_ASK_TIMEOUT, TypedActorRef, TypedEnvelope};
@@ -36,6 +40,72 @@ use parrot_api::{
 };
 use std::sync::Mutex;
 use std::time::Duration;
+
+/// Original static child inputs returned when shared instance capacity is full
+/// or closed. Their ownership and disposal remain with the caller.
+pub struct TypedInstanceAdmissionInputs<A: ParrotTypedDispatch> {
+    pub actor: A,
+    pub strategy: Option<parrot_api::supervisor::SupervisorStrategyType>,
+}
+
+/// Recoverable static child rejection carried by [`ActorError::Other`].
+/// Downcast the error and call [`Self::into_inputs`] to retry in a live context.
+/// Formatting this error does not inspect user inputs; actors need only be Send.
+pub struct TypedInstanceAdmissionError<A: ParrotTypedDispatch> {
+    pub reason: super::instance::InstanceAdmissionFailure,
+    inputs: Mutex<TypedInstanceAdmissionInputs<A>>,
+}
+impl<A: ParrotTypedDispatch> TypedInstanceAdmissionError<A> {
+    pub fn into_inputs(self) -> TypedInstanceAdmissionInputs<A> {
+        self.inputs
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+impl<A: ParrotTypedDispatch> std::fmt::Display for TypedInstanceAdmissionError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+impl<A: ParrotTypedDispatch> std::fmt::Debug for TypedInstanceAdmissionError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedInstanceAdmissionError")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+impl<A: ParrotTypedDispatch> std::error::Error for TypedInstanceAdmissionError<A> {}
+
+async fn retire_source<A: ParrotTypedDispatch>(
+    actor: Option<crate::owned_payload::OwnedPayload<A>>,
+    factory: Option<factory::OwnedFactory<A>>,
+    policy: Option<
+        crate::owned_payload::OwnedPayload<Option<parrot_api::supervisor::SupervisorStrategyType>>,
+    >,
+) -> ActorResult<()> {
+    // Separate unwind boundaries preserve every receipt after double failure.
+    let (actor, factory, policy) = tokio::join!(
+        async {
+            match actor {
+                Some(actor) => actor.retire().await,
+                None => Ok(()),
+            }
+        },
+        async {
+            match factory {
+                Some(factory) => factory.retire().await,
+                None => Ok(()),
+            }
+        },
+        async {
+            match policy {
+                Some(policy) => policy.retire().await,
+                None => Ok(()),
+            }
+        },
+    );
+    actor.and(factory).and(policy)
+}
 
 pub(crate) struct TypedRegistration {
     pub actor_ref: Arc<dyn ActorRef>,
@@ -65,6 +135,7 @@ pub(crate) struct TypedControl {
     message_timeout: Duration,
     creation_limit: Duration,
     initialization_deadline: Mutex<Option<tokio::time::Instant>>,
+    instance_reservation: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
     policy_slots: Arc<tokio::sync::Semaphore>,
     death_watch: parrot_api::death_watch::DeathWatch,
     pub(crate) legacy_watch: parrot_api::death_watch::DeathWatch,
@@ -75,6 +146,11 @@ impl TypedControl {
     }
     fn finish_initialization(&self) {
         self.initialization_deadline.lock().unwrap().take();
+        self.release_instance_admission();
+    }
+    fn release_instance_admission(&self) {
+        let reservation = self.instance_reservation.lock().unwrap().take();
+        drop(reservation);
     }
     #[cfg(test)]
     pub(crate) fn escalation_hook(&self) -> crate::children::Escalate {
@@ -494,6 +570,10 @@ impl ThreadActorSystem {
     /// Inputs acquire cleanup ownership when this method is called. Dropping
     /// the returned future before polling retires them without invoking actor
     /// construction or initialization; registration still starts on first poll.
+    /// At first poll, native instances wait for shared creation capacity before
+    /// registering. The creation deadline includes this wait. A returned reference
+    /// can still be initializing; capacity returns after successful initialization
+    /// or actual retirement, not merely reference publication.
     pub fn spawn_typed<'a, A, M>(
         self: &'a Arc<Self>,
         actor: A,
@@ -684,6 +764,70 @@ impl ThreadActorSystem {
         M: ParrotMsgVariant<A>,
     {
         let creation_context = parrot_api::trace::TraceContext::current();
+        let started = tokio::time::Instant::now();
+        let initialization_deadline = (!self.operation_timeouts.actor_creation.is_zero())
+            .then(|| started + self.operation_timeouts.actor_creation);
+        let (payload, reservation) = if let Some(payload) = payload {
+            let reservation = if parent.is_some() {
+                use super::instance::InstanceAdmissionFailure;
+                let admitted = if self.is_shutting_down() {
+                    Err(InstanceAdmissionFailure::ShuttingDown)
+                } else {
+                    self.instance_admission
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|error| match error {
+                            tokio::sync::TryAcquireError::Closed => {
+                                InstanceAdmissionFailure::ShuttingDown
+                            }
+                            tokio::sync::TryAcquireError::NoPermits => {
+                                InstanceAdmissionFailure::Full
+                            }
+                        })
+                };
+                match admitted {
+                    Ok(permit) => Arc::new(permit),
+                    Err(reason) => {
+                        return Err(ActorError::Other(anyhow::Error::new(
+                            TypedInstanceAdmissionError {
+                                reason,
+                                inputs: Mutex::new(TypedInstanceAdmissionInputs {
+                                    actor: payload.take(),
+                                    strategy: policy.take(),
+                                }),
+                            },
+                        )));
+                    }
+                }
+            } else {
+                let admitted = if self.is_shutting_down() {
+                    Err(ActorError::Stopped)
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(started + self.creation_timeout()) => Err(ActorError::TimeoutDetail("static instance admission exceeded creation deadline".into())),
+                        permit = self.instance_admission.clone().acquire_owned() => permit.map_err(|_| ActorError::Stopped),
+                    }
+                };
+                match admitted {
+                    Ok(permit) => Arc::new(permit),
+                    Err(error) => {
+                        retire_source(Some(payload), factory, Some(policy)).await?;
+                        return Err(error);
+                    }
+                }
+            };
+            (
+                Some(payload.with_reservation(&reservation)),
+                Some(reservation),
+            )
+        } else {
+            (None, None)
+        };
+        let policy = match &reservation {
+            Some(reservation) => policy.with_reservation(reservation),
+            None => policy,
+        };
         let cohort = cohort.or_else(|| {
             parent
                 .is_none()
@@ -691,7 +835,10 @@ impl ThreadActorSystem {
                 .flatten()
         });
         let policy = if cohort.is_some() {
-            policy.retire().await?;
+            if let Err(error) = policy.retire().await {
+                retire_source(payload, factory, None).await?;
+                return Err(error);
+            }
             crate::owned_payload::OwnedPayload::new(
                 None,
                 self.retirement_runtime(),
@@ -769,11 +916,14 @@ impl ThreadActorSystem {
                     creation_timeout: self.creation_timeout(),
                     message_timeout: self.operation_timeouts.message_handling,
                     creation_limit: self.operation_timeouts.actor_creation,
-                    initialization_deadline: Mutex::new(
+                    initialization_deadline: Mutex::new(if payload.is_some() {
+                        initialization_deadline
+                    } else {
                         (!self.operation_timeouts.actor_creation.is_zero()).then(|| {
                             tokio::time::Instant::now() + self.operation_timeouts.actor_creation
-                        }),
-                    ),
+                        })
+                    }),
+                    instance_reservation: Mutex::new(reservation.clone()),
                     policy_slots: self.cleanup_slots.clone(),
                     death_watch: parrot_api::death_watch::DeathWatch::new(1024),
                     legacy_watch: parrot_api::death_watch::DeathWatch::new(1024),
@@ -853,18 +1003,19 @@ impl ThreadActorSystem {
                 );
                 let unpublished_inputs = inputs.receipt();
                 let execution_runtime = self.runtime_handle.clone();
+                let retirement_runtime = self.retirement_runtime().clone();
                 self.retirement_runtime().spawn(async move {
                 let task_control = control.clone();
                 let execution = execution_runtime.spawn(async move {
                     let permit = slots.clone().acquire_owned().await?;
-                    crate::thread::scheduler::shared::poll_isolated(
+                    crate::thread::scheduler::shared::poll_isolated_with_retirement(
                         async move {
                             let mut inputs = inputs.take();
                             inputs.actor = payload.map(|value| value.take());
                             let strategy = policy.take();
                             task_control.lifetime.set_strategy(strategy);
                             run_typed_actor(inputs, task_control, batch_size, runtime).await
-                        }, permit, slots, Arc::new(tokio::sync::Notify::new())
+                        }, permit, slots, Arc::new(tokio::sync::Notify::new()), retirement_runtime
                     ).await
                 });
                 let (execution, mut timed_out) = control.join_until_expired(execution, || {
@@ -949,6 +1100,7 @@ impl ThreadActorSystem {
                 }
                 retired.send_replace(Some(outcome));
                 notification.await;
+                control.release_instance_admission();
             });
             }
             Ok(actor_ref)
@@ -986,23 +1138,7 @@ impl ThreadActorSystem {
         match admission {
             Ok(reference) => Ok(reference),
             Err(error) => {
-                // Each arbitrary destructor needs its own unwind boundary.
-                // A tuple drop would abort on actor + policy double panic.
-                let actor = async {
-                    match payload {
-                        Some(payload) => payload.retire().await,
-                        None => Ok(()),
-                    }
-                };
-                let factory = async {
-                    match factory {
-                        Some(factory) => factory.retire().await,
-                        None => Ok(()),
-                    }
-                };
-                let policy = policy.expect("rejected policy remains owned").retire();
-                let (actor, factory, policy) = tokio::join!(actor, factory, policy);
-                actor.and(factory).and(policy)?;
+                retire_source(payload, factory, policy).await?;
                 Err(error)
             }
         }

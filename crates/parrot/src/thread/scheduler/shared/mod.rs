@@ -28,5 +28,6 @@ pub use pool::SharedThreadPool;
 pub use pool::SharedThreadPoolConfig;
 pub use pool::{SchedulerMetrics, SchedulerStatus};
 pub(crate) use worker::poll_isolated;
+pub(crate) use worker::poll_isolated_with_retirement;
 pub use worker::{Worker, WorkerConfig, WorkerStatus};
 pub use worker_manager::WorkerManager;

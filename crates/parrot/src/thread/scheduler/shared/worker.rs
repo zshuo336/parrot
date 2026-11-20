@@ -709,10 +709,10 @@ impl<F> IsolatedFuture<F>
 where
     F: Future + Send + 'static,
 {
-    fn new(future: F, cleanup_slots: Arc<Semaphore>) -> Self {
+    fn new(future: F, cleanup_slots: Arc<Semaphore>, runtime: tokio::runtime::Handle) -> Self {
         Self {
             future: Some(Box::pin(future)),
-            runtime: tokio::runtime::Handle::current(),
+            runtime,
             cleanup_slots,
         }
     }
@@ -763,7 +763,30 @@ where
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let mut future = IsolatedFuture::new(future, slots.clone());
+    poll_isolated_with_retirement(
+        future,
+        first_permit,
+        slots,
+        poll_finished,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+}
+
+/// Keep cancelled user captures on the lifecycle owner's cleanup executor when
+/// execution belongs to a runtime that can exit before their destructors finish.
+pub(crate) async fn poll_isolated_with_retirement<F, T>(
+    future: F,
+    first_permit: OwnedSemaphorePermit,
+    slots: Arc<Semaphore>,
+    poll_finished: Arc<Notify>,
+    retirement_runtime: tokio::runtime::Handle,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut future = IsolatedFuture::new(future, slots.clone(), retirement_runtime);
     let wake = Arc::new(PollWake(Notify::new()));
     let mut permit = Some(first_permit);
     loop {
@@ -1026,7 +1049,11 @@ mod tests {
                     let _guard = guard;
                     futures::future::pending::<()>().await;
                 };
-                drop(IsolatedFuture::new(future, slots.clone()));
+                drop(IsolatedFuture::new(
+                    future,
+                    slots.clone(),
+                    tokio::runtime::Handle::current(),
+                ));
             }
             tokio::task::yield_now().await;
             assert!(

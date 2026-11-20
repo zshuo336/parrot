@@ -44,7 +44,9 @@ pub use reply::ReplyReceiver;
 pub use scheduler::queue::SchedulingQueue;
 pub use scheduler::shared::SharedThreadPool;
 pub use system::ThreadActorSystem;
-pub use typed::{SingleDispatch, TypedActorRef};
+pub use typed::{
+    SingleDispatch, TypedActorRef, TypedInstanceAdmissionError, TypedInstanceAdmissionInputs,
+};
 
 /// M1 derive-decouple: thread 引擎的中立 Context 面。
 ///
