@@ -18,6 +18,7 @@ struct CaptureDisposal<A> {
     finished: Option<Finished>,
     cleanup: Option<tokio::sync::OwnedSemaphorePermit>,
     _pending: Option<crate::owned_payload::PendingCleanupPermit>,
+    creation_reservation: Option<Arc<OwnedSemaphorePermit>>,
 }
 impl<A> CaptureDisposal<A> {
     fn take(
@@ -32,6 +33,7 @@ impl<A> CaptureDisposal<A> {
             finished,
             cleanup,
             _pending: state.retirement_pending.take(),
+            creation_reservation: state.creation_reservation.take(),
         }
     }
     fn retire(&mut self) -> Result<(), String> {
@@ -49,6 +51,7 @@ impl<A> CaptureDisposal<A> {
             // An earlier unpublished-output failure must not be hidden by either
             // successful capture retirement or a later capture failure.
             let result = self.failure.take().map_or(captures, Err);
+            drop(self.creation_reservation.take());
             if let Some(finished) = self.finished.take() {
                 finished.send_replace(Some(result.clone()));
             }
@@ -71,6 +74,7 @@ impl<A> Drop for FactoryState<A> {
             finished: self.fallback.take(),
             cleanup: None,
             _pending: self.retirement_pending.take(),
+            creation_reservation: self.creation_reservation.take(),
         });
     }
 }

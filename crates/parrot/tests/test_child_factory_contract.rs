@@ -155,8 +155,17 @@ impl Actor for Parent {
             if msg.is::<FillCapacity>() {
                 use futures::StreamExt;
                 let request = *msg.downcast::<FillCapacity>().unwrap();
+                // A ready child occupies parent capacity without retaining a
+                // creation reservation. This isolates the parent's 1024 limit
+                // from the independent system-wide pending creation limit.
+                let live_drops = Arc::new(AtomicUsize::new(0));
+                let observed_drops = live_drops.clone();
+                let live = ctx
+                    .spawn_factory(move || Leaf(observed_drops.clone()))
+                    .await?;
+                live.send(Box::new(())).await?;
                 let mut pending = futures::stream::FuturesUnordered::new();
-                for _ in 0..=1024 {
+                for _ in 0..1024 {
                     let gate = request.gate.clone();
                     let counts = request.counts.clone();
                     let calls = request.calls.clone();
@@ -175,6 +184,8 @@ impl Actor for Parent {
                 request.ready.send(ctx.children().unwrap().len()).unwrap();
                 request.cancel.notified().await;
                 drop(pending);
+                live.stop().await?;
+                assert_eq!(live_drops.load(Ordering::SeqCst), 1);
                 return Ok(Box::new(()) as BoxedMessage);
             }
             if msg.is::<Children>() {

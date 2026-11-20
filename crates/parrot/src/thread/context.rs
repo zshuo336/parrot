@@ -825,6 +825,20 @@ impl<A: Actor + Send + Sync + 'static> ActorSpawner for ThreadContext<A> {
                 factory.and(strategy)?;
                 return Err(error);
             }
+            let reservation = match system
+                .as_ref()
+                .expect("checked live system")
+                .try_factory_creation()
+            {
+                Ok(reservation) => reservation,
+                Err(reason) => {
+                    return Err(ActorError::Other(anyhow::Error::new(
+                        super::FactoryAdmissionError::new(reason, factory.take(), strategy.take()),
+                    )));
+                }
+            };
+            let factory = factory.with_reservation(&reservation);
+            let strategy = strategy.with_reservation(&reservation);
             let factory = factory
                 .take()
                 .downcast::<crate::thread::factory::ErasedChildFactory>()
@@ -835,6 +849,7 @@ impl<A: Actor + Send + Sync + 'static> ActorSpawner for ThreadContext<A> {
                     self.path.target.clone_boxed(),
                     self.owned_children.clone(),
                     strategy.take(),
+                    reservation,
                 )
                 .await
         })

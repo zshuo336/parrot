@@ -476,7 +476,6 @@ pub(super) async fn run<A: ParrotTypedDispatch>(
                 Step::Escalated(error)=>{let deadline=control.deadline();match restart(&mut inputs,error.clone(),deadline,&runtime).await? { Restart::Ready=>continue 'generation, Restart::Stopped=>return Ok(()), Restart::Declined=>return Err(actor_error(&error)), }},
                 Step::Ready(outcome)=>{initialization_context=outcome.context;outcome.result.unwrap_or_else(|message|Err(ActorError::Panic(message)))},
             };
-            control.finish_initialization();
             if let Err(error) = initialized {
                 let error = crate::error_receipt::ActorReceipt::from_error(error);
                 let deadline = tokio::time::Instant::now() + control.timeout;
@@ -492,6 +491,8 @@ pub(super) async fn run<A: ParrotTypedDispatch>(
                 }
                 return Err(actor_error(&error));
             }
+            inputs.factory.as_ref().expect("factory source").release_creation();
+            control.finish_initialization();
             drop(initialization_context);
             loop {
                 let message=match control.wait_typed_stage(inputs.receiver.as_ref().expect("typed mailbox").recv_async(), &runtime).await {

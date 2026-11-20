@@ -37,6 +37,8 @@ pub use config::{
 pub use context::{ThreadContext, WeakSystemRef};
 pub use error::{AskError, MailboxError, SpawnError, SupervisorError, SystemError};
 pub use instance::{InstanceAdmissionError, InstanceAdmissionFailure};
+mod factory_admission;
+pub use factory_admission::{FactoryAdmissionError, FactoryAdmissionInputs};
 pub use mailbox::WeakMailboxRef;
 pub use message::{CloneableMessage, make_cloneable};
 pub use processor::{ActorProcessor, ActorProcessorManager, ProcessorInterface};

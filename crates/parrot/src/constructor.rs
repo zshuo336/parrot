@@ -99,6 +99,7 @@ struct FactoryState<A> {
     retirement_failure: Option<String>,
     fallback: Option<watch::Sender<Option<Result<(), String>>>>,
     retirement_pending: Option<crate::owned_payload::PendingCleanupPermit>,
+    creation_reservation: Option<Arc<OwnedSemaphorePermit>>,
 }
 pub(crate) struct Factory<A> {
     state: Arc<Mutex<FactoryState<A>>>,
@@ -147,12 +148,20 @@ impl<A: Send + 'static> Factory<A> {
                 retirement_failure: None,
                 fallback: None,
                 retirement_pending: None,
+                creation_reservation: None,
             })),
             changed: Arc::default(),
             workers,
             admission: Arc::new(Semaphore::new(admission_capacity)),
             cleanup,
         })
+    }
+    pub(crate) fn reserve_creation(&self, reservation: &Arc<OwnedSemaphorePermit>) {
+        self.state.lock().unwrap().creation_reservation = Some(reservation.clone());
+    }
+    pub(crate) fn release_creation(&self) {
+        let reservation = self.state.lock().unwrap().creation_reservation.take();
+        drop(reservation);
     }
     /// The caller is a retained lifecycle owner, not the user's cancellable waiter.
     pub(crate) fn construct<T: Send + 'static, E: Send + 'static>(

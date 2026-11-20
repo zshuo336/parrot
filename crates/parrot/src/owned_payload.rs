@@ -254,7 +254,7 @@ impl<T: Send + 'static> OwnedPayload<T> {
             finished: std::sync::OnceLock::new(),
         }
     }
-    /// Only the fixed-size instance input bundle shares this reservation.
+    /// Only the fixed-size creation input bundle shares this reservation.
     /// Disposal retains it independently of the submitting future or waiter.
     pub(crate) fn with_reservation(
         mut self,

@@ -171,12 +171,13 @@ async fn retire_inputs<A: Actor + Send + 'static>(
 }
 
 impl ThreadActorSystem {
-    /// Maximum admitted native dynamic and static instance creation
+    /// Maximum admitted native dynamic and static initial creation
     /// bundles per system. Ordinary entries wait at first poll;
     /// [`Self::try_spawn_typed_with_config`] also reserves capacity for its
     /// unpolled inputs. Native children try admission at first poll. Static
     /// instances retain it through initialization; cleaning inputs retain it
-    /// through disposal. Factory entries have separate admission contracts.
+    /// through disposal. Native root and child factories share this capacity
+    /// for their initial creation; reconstruction has its invocation budget.
     pub const MAX_PENDING_INSTANCE_CREATIONS: usize = 1024;
 
     /// Reserve one creation bundle before accepting actor/config ownership.

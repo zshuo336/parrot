@@ -643,6 +643,7 @@ impl ThreadActorSystem {
             policy,
             None,
             Some(cohort),
+            None,
         ))
     }
 
@@ -676,6 +677,7 @@ impl ThreadActorSystem {
             policy,
             None,
             Some(cohort),
+            None,
         ))
     }
 
@@ -703,7 +705,7 @@ impl ThreadActorSystem {
             &self.cleanup_slots,
         );
         parrot_api::trace::capture(
-            self.spawn_typed_owned_source(payload, factory, path, policy, None, None),
+            self.spawn_typed_owned_source(payload, factory, path, policy, None, None, None),
         )
     }
 
@@ -721,14 +723,33 @@ impl ThreadActorSystem {
         M: ParrotMsgVariant<A>,
         F: Fn() -> A + Send + Sync + 'static,
     {
+        let reservation = match self.try_factory_creation() {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                return Err(ActorError::Other(anyhow::Error::new(
+                    super::FactoryAdmissionError::new(reason, factory.take(), policy.take()),
+                )));
+            }
+        };
+        let factory = factory.with_reservation(&reservation);
+        let policy = policy.with_reservation(&reservation);
         let factory = crate::constructor::owned::OwnedFactory::new(
             factory.take(),
             self.factory_slots.clone(),
             self.cleanup_slots.clone(),
             self.retirement_runtime().clone(),
         );
-        self.spawn_typed_owned_source(None, Some(factory), path, policy, Some(parent), None)
-            .await
+        factory.factory.reserve_creation(&reservation);
+        self.spawn_typed_owned_source(
+            None,
+            Some(factory),
+            path,
+            policy,
+            Some(parent),
+            None,
+            Some(reservation),
+        )
+        .await
     }
 
     pub(crate) async fn spawn_typed_child_source<A, M>(
@@ -744,10 +765,11 @@ impl ThreadActorSystem {
         A: ParrotTypedDispatch,
         M: ParrotMsgVariant<A>,
     {
-        self.spawn_typed_owned_source(Some(actor), None, path, policy, Some(parent), None)
+        self.spawn_typed_owned_source(Some(actor), None, path, policy, Some(parent), None, None)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_typed_owned_source<A, M>(
         self: &Arc<Self>,
         payload: Option<crate::owned_payload::OwnedPayload<A>>,
@@ -758,6 +780,7 @@ impl ThreadActorSystem {
         >,
         parent: Option<&crate::typed_context::ManagedContext>,
         cohort: Option<&crate::root_cohort::RootCohort>,
+        factory_reservation: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> ActorResult<TypedActorRef<A, M>>
     where
         A: ParrotTypedDispatch,
@@ -821,6 +844,23 @@ impl ThreadActorSystem {
                 Some(payload.with_reservation(&reservation)),
                 Some(reservation),
             )
+        } else if let Some(source) = &factory {
+            let reservation = match factory_reservation {
+                Some(reservation) => reservation,
+                None => match self
+                    .wait_factory_creation(started + self.creation_timeout())
+                    .await
+                {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        let error = ActorError::from(error);
+                        retire_source(payload, factory, Some(policy)).await?;
+                        return Err(error);
+                    }
+                },
+            };
+            source.factory.reserve_creation(&reservation);
+            (None, Some(reservation))
         } else {
             (None, None)
         };

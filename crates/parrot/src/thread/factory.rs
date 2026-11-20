@@ -2,6 +2,9 @@
 #[cfg(test)]
 #[path = "factory_admission_trace_tests.rs"]
 mod admission_trace_contracts;
+#[cfg(test)]
+#[path = "factory_shared_admission_contracts.rs"]
+mod shared_admission_contracts;
 use super::{
     address::ThreadActorRef,
     config::ThreadActorConfig,
@@ -57,6 +60,7 @@ pub(crate) struct PendingFactory {
     pub finished: watch::Sender<Option<StopOutcome>>,
     pub retired: watch::Sender<Option<StopOutcome>>,
     pub lifetime: Arc<crate::children::ChildLifetime>,
+    creation_reservation: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
 }
 pub(crate) enum Replacement<'a> {
     Generation(&'a Arc<dyn Mailbox>, Option<tokio::time::Instant>),
@@ -132,12 +136,26 @@ impl ThreadActorSystem {
             &self.cleanup_slots,
         );
         parrot_api::trace::capture(async move {
+            let deadline = tokio::time::Instant::now() + self.creation_timeout();
+            let reservation = match self.wait_factory_creation(deadline).await {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    let (factory, config) = tokio::join!(factory.retire(), config.retire());
+                    factory
+                        .and(config)
+                        .map_err(|error| SpawnError::DisposalFailed(error.to_string()))?;
+                    return Err(error);
+                }
+            };
+            let factory = factory.with_reservation(&reservation);
+            let config = config.with_reservation(&reservation);
             let cohort = cohort.or_else(|| self.root_cohorts.guardian());
             let factory = Factory::new(
                 factory.take(),
                 self.factory_slots.clone(),
                 self.cleanup_slots.clone(),
             );
+            factory.reserve_creation(&reservation);
             // Keep one protected copy until synchronous admission has returned.
             // Rejected temporary config clones cannot run the final user Drop.
             let mut lifetime = crate::children::ChildLifetime::new(Weak::new());
@@ -150,6 +168,8 @@ impl ThreadActorSystem {
                     config.value().clone(),
                     None,
                     lifetime.clone(),
+                    deadline,
+                    reservation.clone(),
                 )
             };
             let result = if let Some(cohort) = cohort {
@@ -214,6 +234,7 @@ impl ThreadActorSystem {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_owned_factory<A>(
         self: &Arc<Self>,
         factory: Arc<Factory<A>>,
@@ -221,6 +242,8 @@ impl ThreadActorSystem {
         mut config: ThreadActorConfig,
         parent: Option<BoxedActorRef>,
         lifetime: Arc<crate::children::ChildLifetime>,
+        deadline: tokio::time::Instant,
+        reservation: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<FactoryTicket<A>, SpawnError>
     where
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
@@ -310,7 +333,6 @@ impl ThreadActorSystem {
         .with_death_watch(watches.common.clone())
         .with_retirement(&lifetime);
         let timeout = self.config().shutdown_timeout;
-        let deadline = tokio::time::Instant::now() + self.creation_timeout();
         let pending = Arc::new(PendingFactory {
             reference: Arc::from(reference.clone_boxed()),
             supervision: supervision.clone(),
@@ -318,6 +340,7 @@ impl ThreadActorSystem {
             finished: watch::channel(None).0,
             retired: watch::channel(None).0,
             lifetime,
+            creation_reservation: Mutex::new(Some(reservation)),
         });
         let admitted = {
             let mut registry = self.registry.write().unwrap();
@@ -382,7 +405,10 @@ impl ThreadActorSystem {
                         None => Err(SpawnError::SystemShutdown),
                     };
                 }
-                if result.is_ok() { return (result, None); }
+                if result.is_ok() {
+                    factory.release_creation();
+                    return (result, None);
+                }
                 let policy = pending.lifetime.dispose_policy().await.map_err(SystemError::policy_disposal);
                 let disposal = factory.dispose().await.and(policy).map_err(crate::error_receipt::SystemReceipt::new);
                 let retirement = match (&result, &disposal) {
@@ -445,6 +471,7 @@ impl ThreadActorSystem {
             }
             if let Some(send) = send { let _ = send.send(result); }
             if let Some(notification) = notification { notification.await; }
+            pending.creation_reservation.lock().unwrap().take();
         }));
         Ok(FactoryTicket {
             reference,
@@ -481,6 +508,7 @@ trait ChildFactory: Send {
         parent: BoxedActorRef,
         scope: Arc<crate::children::ChildScope>,
         strategy: Option<parrot_api::supervisor::SupervisorStrategyType>,
+        reservation: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>>;
 }
 pub(crate) struct ErasedChildFactory(Box<dyn ChildFactory>);
@@ -495,6 +523,7 @@ where
         parent: BoxedActorRef,
         scope: Arc<crate::children::ChildScope>,
         strategy: Option<parrot_api::supervisor::SupervisorStrategyType>,
+        reservation: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
         Box::pin(async move {
             let factory = Factory::new(
@@ -502,6 +531,8 @@ where
                 system.factory_slots.clone(),
                 system.cleanup_slots.clone(),
             );
+            factory.reserve_creation(&reservation);
+            let deadline = tokio::time::Instant::now() + system.creation_timeout();
             let path = format!(
                 "{}/{}",
                 parent.path().trim_end_matches('/'),
@@ -523,6 +554,8 @@ where
                         },
                         Some(parent),
                         lifetime.clone(),
+                        deadline,
+                        reservation.clone(),
                     )
                     .map_err(parrot_api::errors::ActorError::from)?;
                 let child = pending.reference.clone_boxed();
@@ -593,8 +626,9 @@ impl ErasedChildFactory {
         parent: BoxedActorRef,
         scope: Arc<crate::children::ChildScope>,
         strategy: Option<parrot_api::supervisor::SupervisorStrategyType>,
+        reservation: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> BoxedFuture<'static, ActorResult<BoxedActorRef>> {
-        self.0.spawn(system, parent, scope, strategy)
+        self.0.spawn(system, parent, scope, strategy, reservation)
     }
 }
 
