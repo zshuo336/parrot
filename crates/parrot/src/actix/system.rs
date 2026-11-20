@@ -27,6 +27,13 @@ use uuid::Uuid;
 #[path = "system_shutdown.rs"]
 mod shutdown;
 
+#[path = "system/root_instance.rs"]
+mod root_instance;
+
+#[cfg(test)]
+#[path = "system/root_instance_contracts.rs"]
+mod root_instance_contracts;
+
 struct ArbiterOwners {
     workers: Vec<ArbiterHandle>,
     threads: Vec<std::thread::ThreadId>,
@@ -267,6 +274,7 @@ pub struct ActixActorSystem {
     pub(super) policy_slots: Arc<tokio::sync::Semaphore>,
     pub(super) constructor_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) factory_admission: Arc<crate::constructor::admission::Admission>,
+    pub(super) instance_admission: Arc<tokio::sync::Semaphore>,
     pub(super) cleanup_slots: Arc<tokio::sync::Semaphore>,
     pub(super) notification_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -302,6 +310,7 @@ pub(crate) struct WeakSystem {
     pub(super) policy_slots: Arc<tokio::sync::Semaphore>,
     pub(super) constructor_slots: Arc<tokio::sync::Semaphore>,
     pub(super) factory_admission: Arc<crate::constructor::admission::Admission>,
+    pub(super) instance_admission: Arc<tokio::sync::Semaphore>,
     pub(super) cleanup_slots: Arc<tokio::sync::Semaphore>,
     pub(super) notification_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -346,6 +355,7 @@ impl WeakSystem {
             policy_slots: self.policy_slots.clone(),
             constructor_slots: self.constructor_slots.clone(),
             factory_admission: self.factory_admission.clone(),
+            instance_admission: self.instance_admission.clone(),
             cleanup_slots: self.cleanup_slots.clone(),
             notification_slots: self.notification_slots.clone(),
         })
@@ -500,21 +510,16 @@ impl parrot_api::engine::AsyncEngineRuntime for ActixActorSystem {
                 actor.and(config).map_err(SystemError::ActorError)?;
                 return Err(error);
             }
-            match self.spawn_managed_at(
+            self.spawn_root_instance(
                 BoxedActixActor {
                     inner: actor.take(),
                 },
                 config.take(),
                 None,
-                None,
                 options.path,
-            ) {
-                Ok(ticket) => ticket.wait().await.map_err(SystemError::ActorError),
-                Err(rejected) => {
-                    rejected.retired.await.map_err(SystemError::ActorError)?;
-                    Err(rejected.error)
-                }
-            }
+                None,
+            )
+            .await
         }))
     }
 
@@ -643,6 +648,9 @@ impl ActixActorSystem {
             factory_admission: crate::constructor::admission::Admission::new(
                 crate::constructor::admission::SYSTEM_CAPACITY,
             ),
+            instance_admission: Arc::new(tokio::sync::Semaphore::new(
+                Self::MAX_PENDING_INSTANCE_CREATIONS,
+            )),
             cleanup_slots: Arc::new(tokio::sync::Semaphore::new(arbiters.size())),
             notification_slots: Arc::new(tokio::sync::Semaphore::new(1024)),
         })
@@ -717,6 +725,7 @@ impl ActixActorSystem {
             policy_slots: self.policy_slots.clone(),
             constructor_slots: self.constructor_slots.clone(),
             factory_admission: self.factory_admission.clone(),
+            instance_admission: self.instance_admission.clone(),
             cleanup_slots: self.cleanup_slots.clone(),
             notification_slots: self.notification_slots.clone(),
         }
@@ -733,17 +742,7 @@ impl ActixActorSystem {
             + Unpin
             + 'static,
     {
-        let actor = OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots);
-        let config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
-        async move {
-            match self.spawn_managed(actor.take(), config.take(), None, None) {
-                Ok(ticket) => ticket.wait().await.map_err(SystemError::ActorError),
-                Err(rejected) => {
-                    rejected.retired.await.map_err(SystemError::ActorError)?;
-                    Err(rejected.error)
-                }
-            }
-        }
+        self.spawn_root_instance(actor, config, None, None, None)
     }
 
     /// Spawn an instance with an explicit failure policy. Resume retains this
@@ -760,43 +759,7 @@ impl ActixActorSystem {
             + Unpin
             + 'static,
     {
-        let actor = OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots);
-        let config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
-        let strategy = OwnedPayload::new(strategy, &self.runtime, &self.cleanup_slots);
-        async move {
-            if self.root_cohorts.guardian().is_some() {
-                strategy.retire().await.map_err(SystemError::ActorError)?;
-                return match self.spawn_managed(actor.take(), config.take(), None, None) {
-                    Ok(ticket) => ticket.wait().await.map_err(SystemError::ActorError),
-                    Err(rejected) => {
-                        rejected.retired.await.map_err(SystemError::ActorError)?;
-                        Err(rejected.error)
-                    }
-                };
-            }
-            let lifetime = crate::children::ChildLifetime::with_policy(
-                std::sync::Weak::new(),
-                Some(strategy.take()),
-                self.policy_slots.clone(),
-            );
-            match self.spawn_managed(actor.take(), config.take(), None, Some(lifetime.clone())) {
-                Ok(ticket) => ticket.wait().await.map_err(SystemError::ActorError),
-                Err(rejected) => {
-                    // A cancelled admission waiter must not detach capture disposal.
-                    self.runtime
-                        .spawn(async move {
-                            let (inputs, policy) =
-                                tokio::join!(rejected.retired, lifetime.dispose_policy());
-                            inputs.and(policy).map_err(SystemError::ActorError)?;
-                            Err(rejected.error)
-                        })
-                        .await
-                        .map_err(|error| {
-                            SystemError::ActorError(ActorError::InternalError(error.to_string()))
-                        })?
-                }
-            }
-        }
+        self.spawn_root_instance(actor, config, Some(strategy), None, None)
     }
 
     /// Admit a dynamic instance at an exact root path in a supervision group.
@@ -813,73 +776,14 @@ impl ActixActorSystem {
             + Unpin
             + 'static,
     {
-        let mut actor = Some(OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots));
-        let mut config = Some(OwnedPayload::new(
-            config,
-            &self.runtime,
-            &self.cleanup_slots,
-        ));
+        let creation =
+            self.spawn_root_instance(actor, config, None, Some(path.to_owned()), Some(cohort));
         parrot_api::trace::capture(async move {
-            let mut ticket = None;
-            let mut rejection = None;
-            let admitted = cohort.validate(&self.root_cohorts).and_then(|()| {
-                cohort.scope.spawn(|lifetime| {
-                    let pending = self
-                        .spawn_managed_at(
-                            actor.take().unwrap().take(),
-                            config.take().unwrap().take(),
-                            None,
-                            Some(lifetime.clone()),
-                            Some(path.to_owned()),
-                        )
-                        .map_err(|rejected| {
-                            rejection = Some(rejected);
-                            ActorError::Stopped
-                        })?;
-                    let reference = pending.actor_ref.clone_boxed();
-                    let control = pending.control.clone();
-                    ticket = Some(pending);
-                    Ok((
-                        reference,
-                        Arc::new(move || {
-                            control.request_stop(tokio::time::Instant::now() + control.timeout);
-                            let lifetime = lifetime.clone();
-                            Box::pin(async move { lifetime.wait().await })
-                        }),
-                    ))
-                })
-            });
-            if let Err(error) = admitted {
-                let actor = async {
-                    match actor {
-                        Some(actor) => actor.retire().await,
-                        None => Ok(()),
-                    }
-                };
-                let config = async {
-                    match config {
-                        Some(config) => config.retire().await,
-                        None => Ok(()),
-                    }
-                };
-                let rejected = async {
-                    match rejection {
-                        Some(rejected) => {
-                            rejected
-                                .retired
-                                .await
-                                .and(Err(ActorError::InitializationError(
-                                    rejected.error.to_string(),
-                                )))
-                        }
-                        None => Ok(()),
-                    }
-                };
-                let (actor, config, rejected) = tokio::join!(actor, config, rejected);
-                actor.and(config).and(rejected)?;
-                return Err(error);
-            }
-            ticket.expect("admitted root instance").wait().await
+            creation.await.map_err(|error| match error {
+                SystemError::ActorError(error) => error,
+                SystemError::ShuttingDown => ActorError::Stopped,
+                error => ActorError::InitializationError(error.to_string()),
+            })
         })
     }
 
@@ -913,8 +817,30 @@ impl ActixActorSystem {
             + Unpin
             + 'static,
     {
-        let actor = OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots);
-        let config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
+        self.spawn_managed_with_creation(actor, config, parent, lifetime, path, None)
+    }
+
+    fn spawn_managed_with_creation<A>(
+        &self,
+        actor: A,
+        config: A::Config,
+        parent: Option<BoxedActorRef>,
+        lifetime: Option<Arc<crate::children::ChildLifetime>>,
+        path: Option<String>,
+        creation: Option<root_instance::Creation>,
+    ) -> Result<InstanceTicket, RejectedSpawn>
+    where
+        A: ParrotActor<Context = ActixContext<ActixActor<A>>>
+            + parrot_api::actor::ActixEngineExt<Context = ActixContext<ActixActor<A>>>
+            + Unpin
+            + 'static,
+    {
+        let mut actor = OwnedPayload::new(actor, &self.runtime, &self.cleanup_slots);
+        let mut config = OwnedPayload::new(config, &self.runtime, &self.cleanup_slots);
+        if let Some(creation) = &creation {
+            actor = actor.with_reservation(&creation.permit);
+            config = config.with_reservation(&creation.permit);
+        }
         if parent.is_none()
             && lifetime.is_none()
             && let Some(guardian) = self.root_cohorts.guardian()
@@ -925,12 +851,13 @@ impl ActixActorSystem {
             let mut rejection = None;
             let admitted = guardian.scope.spawn(|lifetime| {
                 let pending = self
-                    .spawn_managed_at(
+                    .spawn_managed_with_creation(
                         actor.take().unwrap().take(),
                         config.take().unwrap().take(),
                         None,
                         Some(lifetime.clone()),
                         path,
+                        creation,
                     )
                     .map_err(|rejected| {
                         rejection = Some(rejected);
@@ -1029,6 +956,10 @@ impl ActixActorSystem {
             self.policy_slots.clone(),
         );
         ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
+        if let Some(creation) = &creation {
+            control.reserve_creation(creation.permit.clone());
+            control.bound_initialization(Some(creation.deadline));
+        }
         let (ready, gate) = tokio::sync::watch::channel(None);
         Arc::get_mut(&mut control)
             .expect("unpublished instance control")
@@ -1051,7 +982,10 @@ impl ActixActorSystem {
         let actor_ref =
             Box::new(ActixActorRef::new(addr, path.clone()).with_control(control.clone()))
                 as BoxedActorRef;
-        let actor_base = OwnedPayload::new(actor_base, &self.runtime, &self.cleanup_slots);
+        let mut actor_base = OwnedPayload::new(actor_base, &self.runtime, &self.cleanup_slots);
+        if let Some(creation) = &creation {
+            actor_base = actor_base.with_reservation(&creation.permit);
+        }
         let unpublished_retirement = actor_base.receipt();
         let holder = Arc::new(Mutex::new(Some(actor_base)));
         let dispatched = holder.clone();
@@ -1126,7 +1060,10 @@ impl ActixActorSystem {
         let pending = control.clone();
         let reply = created.clone();
         let published = actor_ref.clone_boxed();
-        let deadline = tokio::time::Instant::now() + control.creation_timeout;
+        let deadline = creation.map_or_else(
+            || tokio::time::Instant::now() + control.creation_timeout,
+            |creation| creation.deadline,
+        );
         self.runtime.spawn(async move {
             if activation.await.is_err() { pending.request_stop(deadline); }
             let retirement = config.retire();
@@ -1285,6 +1222,7 @@ impl ActixActorSystem {
                     (cleanup.await, true)
                 }
             };
+            control.release_creation();
             match execution {
                 Some((status, reason, retirement)) => {
                     let outcome = status.clone().result();
@@ -1406,6 +1344,7 @@ impl ActixActorSystem {
     }
 
     fn begin_shutdown(&self) -> tokio::sync::watch::Receiver<Option<Outcome>> {
+        self.instance_admission.close();
         self.root_cohorts.close();
         let (completion, start) = {
             let mut registry = self.registry.write().unwrap();

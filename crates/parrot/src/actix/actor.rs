@@ -346,9 +346,9 @@ where
                 .map(|(inner, actor_ctx, result), actor, ctx| {
                     actor.inner = Some(inner);
                     actor.ctx = Some(actor_ctx);
-                    actor.control.finish_initialization();
                     match result {
                         Ok(true) => {
+                            actor.control.finish_initialization();
                             actor.initialized = true;
                             actor.state = ActorState::Running;
                             actor.ctx.as_ref().unwrap().idle.activate();

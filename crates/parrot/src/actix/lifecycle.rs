@@ -113,6 +113,7 @@ pub(crate) struct ActorControl {
     pub(crate) message_timeout: Duration,
     creation_limit: Duration,
     initialization_deadline: Mutex<Option<Instant>>,
+    creation_reservation: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
     pub death_watch: parrot_api::death_watch::DeathWatch,
 }
 
@@ -157,6 +158,14 @@ impl ActorControl {
     }
     pub(crate) fn finish_initialization(&self) {
         self.initialization_deadline.lock().unwrap().take();
+        self.release_creation();
+    }
+    pub(super) fn reserve_creation(&self, permit: Arc<tokio::sync::OwnedSemaphorePermit>) {
+        *self.creation_reservation.lock().unwrap() = Some(permit);
+    }
+    pub(super) fn release_creation(&self) {
+        let permit = self.creation_reservation.lock().unwrap().take();
+        drop(permit);
     }
     pub(crate) fn reconstruction_deadline(&self, recovery: Instant) -> Instant {
         if self.creation_limit.is_zero() {
@@ -240,6 +249,7 @@ impl ActorControl {
                 message_timeout: Duration::ZERO,
                 creation_limit: Duration::ZERO,
                 initialization_deadline: Mutex::new(None),
+                creation_reservation: Mutex::new(None),
                 death_watch: parrot_api::death_watch::DeathWatch::new(MAX_DEATH_WATCHERS),
             }),
             finished,
