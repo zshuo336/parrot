@@ -1,6 +1,8 @@
 //! Local actor construction and execution on a registered Actix owner thread.
 // Root and parent-owned child construction share one owner-thread boundary.
 // Repeatable constructors never move their non-Send outputs off that owner.
+#[cfg(test)]
+mod construction_contracts;
 mod factory;
 
 pub(crate) struct LocalParent<'a> {
@@ -699,7 +701,7 @@ where
     let construction = match constructed {
         Ok(prepared) => {
             inputs.install(prepared);
-            control.construction_complete(deadline)
+            Ok(())
         }
         Err(ActorError::InitializationError(message)) => Err(ActorError::Panic(message)),
         Err(error) => Err(error),
@@ -707,6 +709,14 @@ where
     // The Send constructor's captures have their own cleanup owner, independent
     // of the local result. A capture Drop failure cannot publish a live actor.
     let capture_cleanup = factory.retire().await;
+    // Keep the original deadline active through the real capture destructor.
+    let construction = construction.and_then(|()| {
+        if capture_cleanup.is_ok() {
+            control.construction_complete(deadline)
+        } else {
+            Ok(false)
+        }
+    });
     if construction.as_ref().is_ok_and(|published| *published)
         && capture_cleanup.is_ok()
         && inputs.actor.is_some()

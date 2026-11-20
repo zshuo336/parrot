@@ -18,7 +18,7 @@ STAGES = (
 )
 CONFIGURATIONS = ('debug-default', 'debug-legacy', 'release-default', 'release-legacy')
 BINARIES = {
-    'library': 1508,
+    'library': 1509,
     'test_thread_actor_configuration': 23,
     'test_native_instance_inputs': 22,
     'test_thread_initialization_trace': 3,
