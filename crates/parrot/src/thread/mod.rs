@@ -29,6 +29,7 @@ pub mod typed;
 // Re-export key types for easier usage
 pub use actor::ThreadActor;
 pub use address::ThreadActorRef;
+pub use child_instance::{ChildInstanceAdmissionError, ChildInstanceAdmissionInputs};
 pub use config::{
     BackpressureStrategy, SchedulingMode, SupervisorStrategy, ThreadActorConfig,
     ThreadActorSystemConfig,

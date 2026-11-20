@@ -204,6 +204,7 @@ async fn check(publish: bool, recursive: bool, unobserved: bool, known: u8, poli
         Box::new(EmptyConfig),
         strategy,
         parent.clone_boxed(),
+        parent.path(),
         &scope,
     ));
     if unobserved {
@@ -356,6 +357,7 @@ async fn delayed_error(cancel: bool) {
                 Box::new(EmptyConfig),
                 None,
                 ancestor.clone_boxed(),
+                ancestor.path(),
                 &children,
             )
             .await

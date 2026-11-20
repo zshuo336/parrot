@@ -251,10 +251,11 @@ async fn expires(mode: SchedulingMode, stage: u8) {
     };
     let owner = system.clone();
     let ancestor = parent.clone_boxed();
+    let ancestor_path = parent.path();
     let children = scope.clone();
     let mut caller = tokio::spawn(async move {
         owner
-            .spawn_child_erased(actor, config, None, ancestor, &children)
+            .spawn_child_erased(actor, config, None, ancestor, ancestor_path, &children)
             .await
     });
     if stage != 2 {
@@ -299,10 +300,11 @@ async fn longer(mode: SchedulingMode) {
     let (actor, config) = inputs(&state, Some((entered, held)), None);
     let owner = system.clone();
     let ancestor = parent.clone_boxed();
+    let ancestor_path = parent.path();
     let children = scope.clone();
     let caller = tokio::spawn(async move {
         owner
-            .spawn_child_erased(actor, config, None, ancestor, &children)
+            .spawn_child_erased(actor, config, None, ancestor, ancestor_path, &children)
             .await
     });
     tokio::time::timeout(WAIT, observed).await.unwrap().unwrap();
@@ -342,10 +344,11 @@ async fn shared_init(mode: SchedulingMode) {
     let (actor, config) = inputs(&state, None, Some((entered, held)));
     let owner = system.clone();
     let ancestor = parent.clone_boxed();
+    let ancestor_path = parent.path();
     let children = scope.clone();
     let caller = tokio::spawn(async move {
         owner
-            .spawn_child_erased(actor, config, None, ancestor, &children)
+            .spawn_child_erased(actor, config, None, ancestor, ancestor_path, &children)
             .await
     });
     tokio::time::timeout(WAIT, observed).await.unwrap().unwrap();
@@ -397,10 +400,11 @@ fn queued_callback(mode: SchedulingMode, publication: bool) {
             let slots = system.factory_slots.available_permits();
             let owner = system.clone();
             let ancestor = parent.clone_boxed();
+            let ancestor_path = parent.path();
             let children = scope.clone();
             let start = async move {
                 owner
-                    .spawn_child_erased(actor, config, None, ancestor, &children)
+                    .spawn_child_erased(actor, config, None, ancestor, ancestor_path, &children)
                     .await
             };
             let (entered, observed) = oneshot::channel();

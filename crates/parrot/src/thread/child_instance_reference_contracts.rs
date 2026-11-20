@@ -177,6 +177,7 @@ async fn create(
             Box::new(EmptyConfig),
             None,
             parent.clone_boxed(),
+            parent.path(),
             scope,
         )
         .await

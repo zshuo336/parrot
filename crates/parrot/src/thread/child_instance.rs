@@ -1,5 +1,8 @@
 //! Child instance admission precedes validation, input retirement and publication.
 #[cfg(test)]
+#[path = "child_instance_admission_contracts.rs"]
+mod admission_contracts;
+#[cfg(test)]
 #[path = "child_instance_error_contracts.rs"]
 mod error_contracts;
 #[cfg(test)]
@@ -37,6 +40,46 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{oneshot, watch};
+
+/// Inputs returned without validation, registration or background cleanup when
+/// a Thread child request cannot reserve shared instance creation capacity.
+/// These values remain caller-owned, including their destruction and retries.
+pub struct ChildInstanceAdmissionInputs {
+    pub actor: BoxedMessage,
+    pub config: BoxedMessage,
+    pub strategy: Option<SupervisorStrategyType>,
+    pub parent: BoxedActorRef,
+}
+
+/// Recoverable child admission rejection carried by [`ActorError::Other`].
+/// Downcast its `anyhow::Error` to this type, then call `into_inputs` to retry.
+/// The limit covers accepted creation work, not caller-owned rejected inputs
+/// or unpolled context futures. This error never formats the supplied values.
+pub struct ChildInstanceAdmissionError {
+    pub reason: super::instance::InstanceAdmissionFailure,
+    // BoxedMessage is Send but need not be Sync; anyhow errors require both.
+    inputs: Mutex<ChildInstanceAdmissionInputs>,
+}
+impl ChildInstanceAdmissionError {
+    pub fn into_inputs(self) -> ChildInstanceAdmissionInputs {
+        self.inputs
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+impl std::fmt::Display for ChildInstanceAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+impl std::fmt::Debug for ChildInstanceAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildInstanceAdmissionError")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+impl std::error::Error for ChildInstanceAdmissionError {}
 
 // Only supplies the erased logical reference's marker; never scheduled.
 struct PendingChild;
@@ -132,18 +175,51 @@ impl ThreadActorSystem {
         config: BoxedMessage,
         strategy: Option<SupervisorStrategyType>,
         parent: BoxedActorRef,
+        parent_path: String,
         scope: &Arc<crate::children::ChildScope>,
     ) -> ActorResult<BoxedActorRef> {
-        let actor = OwnedPayload::new(actor, self.retirement_runtime(), &self.cleanup_slots);
-        let config = OwnedPayload::new(config, self.retirement_runtime(), &self.cleanup_slots);
-        let mut strategy = Some(OwnedPayload::new(
-            strategy,
-            self.retirement_runtime(),
-            &self.cleanup_slots,
-        ));
+        use super::instance::InstanceAdmissionFailure;
+        let reservation = if self.is_shutting_down() {
+            Err(InstanceAdmissionFailure::ShuttingDown)
+        } else {
+            self.instance_admission
+                .clone()
+                .try_acquire_owned()
+                .map(Arc::new)
+                .map_err(|error| match error {
+                    tokio::sync::TryAcquireError::Closed => InstanceAdmissionFailure::ShuttingDown,
+                    tokio::sync::TryAcquireError::NoPermits => InstanceAdmissionFailure::Full,
+                })
+        };
+        let reservation = match reservation {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                return Err(ActorError::Other(anyhow::Error::new(
+                    ChildInstanceAdmissionError {
+                        reason,
+                        inputs: Mutex::new(ChildInstanceAdmissionInputs {
+                            actor,
+                            config,
+                            strategy,
+                            parent,
+                        }),
+                    },
+                )));
+            }
+        };
+        let actor = OwnedPayload::new(actor, self.retirement_runtime(), &self.cleanup_slots)
+            .with_reservation(&reservation);
+        let config = OwnedPayload::new(config, self.retirement_runtime(), &self.cleanup_slots)
+            .with_reservation(&reservation);
+        let parent = OwnedPayload::new(parent, self.retirement_runtime(), &self.cleanup_slots)
+            .with_reservation(&reservation);
+        let mut strategy = Some(
+            OwnedPayload::new(strategy, self.retirement_runtime(), &self.cleanup_slots)
+                .with_reservation(&reservation),
+        );
         let path = format!(
             "{}/{}",
-            parent.path().trim_end_matches('/'),
+            parent_path.trim_end_matches('/'),
             uuid::Uuid::new_v4().simple()
         );
         let address = Arc::new(Mutex::new(Weak::<MpscMailbox>::new() as WeakMailboxRef));
@@ -164,7 +240,7 @@ impl ThreadActorSystem {
         let admitted = scope.spawn(|lifetime| {
             // No user callback/destructor executes under the topology lock.
             let entry = Arc::new(PendingInstance {
-                _admission: None,
+                _admission: Some(reservation.clone()),
                 stop_request: reference.stop_request(),
                 reference: Arc::from(reference.clone_boxed()),
                 address: address.clone(),
@@ -184,14 +260,20 @@ impl ThreadActorSystem {
             lifetime.set_strategy(strategy.take().expect("single admission").take());
             lifetime.hold_publication();
             let weak = Arc::downgrade(self);
-            let stopped = entry.clone();
+            // A live child's stop alias must not retain a creation reservation
+            // after publication. Retain only its cancellation and join handles.
+            let control = entry.control.clone();
+            let address = entry.address.clone();
+            let path = path.clone();
+            let lifetime = entry.lifetime.clone();
+            let retired = entry.retired.clone();
             let stop: crate::children::StopChild = Arc::new(move || {
-                stopped.control.cancel();
+                control.cancel();
                 if let Some(system) = weak.upgrade() {
-                    let _ = system.request_stop_ref(&stopped.reference.path(), &stopped.address);
+                    let _ = system.request_stop_ref(&path, &address);
                 }
-                let lifetime = stopped.lifetime.clone();
-                let retired = stopped.retired.subscribe();
+                let lifetime = lifetime.clone();
+                let retired = retired.subscribe();
                 Box::pin(async move {
                     let creation = super::system::await_stop(retired)
                         .await
@@ -204,13 +286,18 @@ impl ThreadActorSystem {
             Ok((reference.clone_boxed(), stop))
         });
         if let Err(error) = admitted {
-            let (actor, config, strategy) = tokio::join!(actor.retire(), config.retire(), async {
-                match strategy {
-                    Some(strategy) => strategy.retire().await,
-                    None => Ok(()),
-                }
-            });
-            actor.and(config).and(strategy)?;
+            let (actor, config, strategy, parent) = tokio::join!(
+                actor.retire(),
+                config.retire(),
+                async {
+                    match strategy {
+                        Some(strategy) => strategy.retire().await,
+                        None => Ok(()),
+                    }
+                },
+                parent.retire()
+            );
+            actor.and(config).and(strategy).and(parent)?;
             return Err(error);
         }
         let pending = pending.expect("accepted child has a lifecycle");
@@ -227,6 +314,7 @@ impl ThreadActorSystem {
             let mut child_notification: Option<BoxedFuture<'static, ()>> = None;
             let result = {
                 let work = async {
+                    let parent_retired = parent.receipt();
                     let result = async {
                     let validation_slots = system.factory_slots.clone();
                     let permit = tokio::select! {
@@ -314,7 +402,7 @@ impl ThreadActorSystem {
                                     .spawn_child_on(
                                         owner.clone(),
                                         ThreadActorConfig::default(),
-                                        parent,
+                                        parent.take(),
                                         ChildSpawnReceipt(publication.clone(), committed),
                                     )
                                     .map_err(CreationError::cause)?;
@@ -328,7 +416,8 @@ impl ThreadActorSystem {
                                 match registered {
                                     Ok(registered) => {
                                         publication.lifetime.publish_reference(registered);
-                                        Ok(OwnedPayload::new(reference.take(), owner.retirement_runtime(), &owner.cleanup_slots))
+                                        Ok(OwnedPayload::new(reference.take(), owner.retirement_runtime(), &owner.cleanup_slots)
+                                            .with_reservation(publication._admission.as_ref().expect("child creation reservation")))
                                     }
                                     Err(panic) => {
                                         let mut message = format!("child reference clone failed: {}", crate::owned_payload::panic_message(panic));
@@ -355,6 +444,9 @@ impl ThreadActorSystem {
                     }
                 }
                 .await;
+                    // Before transfer, parent reference destruction is creation
+                    // work too. Its actual receipt precedes lifetime completion.
+                    let result = parent_retired.await.map_err(failure).and(result);
                     // A custom bridge can publish successfully and then fail while
                     // retiring its own captures. Failure must still stop that live
                     // generation, never finish its lifetime as an unpublished input.
@@ -647,6 +739,7 @@ mod tests {
                 Box::new(DropProbe(config.clone())),
                 None,
                 parent.clone_boxed(),
+                parent.path(),
                 &scope,
             )
             .await;
@@ -682,6 +775,7 @@ mod tests {
                 Box::new(EmptyConfig),
                 None,
                 parent.clone_boxed(),
+                parent.path(),
                 &scope,
             )
             .await
@@ -734,6 +828,7 @@ mod tests {
                 Box::new(DropProbe(config.clone())),
                 Some(strategy),
                 parent.clone_boxed(),
+                parent.path(),
                 &scope,
             )
             .await;
@@ -755,6 +850,7 @@ mod tests {
             .unwrap();
         let owner = system.clone();
         let creator = parent.clone_boxed();
+        let creator_path = parent.path();
         let caller = tokio::spawn(async move {
             owner
                 .spawn_child_erased(
@@ -762,6 +858,7 @@ mod tests {
                     Box::new(EmptyConfig),
                     None,
                     creator,
+                    creator_path,
                     &scope,
                 )
                 .await
@@ -800,6 +897,7 @@ mod tests {
                 Box::new(EmptyConfig),
                 None,
                 parent.clone_boxed(),
+                parent.path(),
                 &scope,
             )
             .await;
@@ -830,10 +928,18 @@ mod tests {
         })));
         let owner = system.clone();
         let ancestor = parent.clone_boxed();
+        let ancestor_path = parent.path();
         let children = scope.clone();
         let caller = tokio::spawn(async move {
             owner
-                .spawn_child_erased(payload, Box::new(EmptyConfig), None, ancestor, &children)
+                .spawn_child_erased(
+                    payload,
+                    Box::new(EmptyConfig),
+                    None,
+                    ancestor,
+                    ancestor_path,
+                    &children,
+                )
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(3), observed)
@@ -912,6 +1018,7 @@ mod tests {
                 Box::new(EmptyConfig),
                 None,
                 parent.clone_boxed(),
+                parent.path(),
                 &scope,
             ),
         )

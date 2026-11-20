@@ -229,6 +229,7 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
                     config.take(),
                     strategy.take(),
                     self.path.target.clone_boxed(),
+                    self.path.path.clone(),
                     &self.owned_children,
                 )
                 .await
