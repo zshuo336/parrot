@@ -199,6 +199,285 @@ async fn recovered(system: &ThreadActorSystem, capacity: usize) {
     .expect("creation ownership did not recover");
 }
 
+fn legacy_creation<'a>(
+    system: &'a Arc<ThreadActorSystem>,
+    counts: &Counts,
+    entry: usize,
+    cohort: &'a crate::root_cohort::RootCohort,
+    actor_gate: Option<Arc<Gate>>,
+) -> BoxedFuture<'a, Result<ThreadActorRef<Instance>, SpawnError>> {
+    let (actor, config) = counts.inputs(actor_gate, None, false);
+    match entry {
+        0 => Box::pin(system.spawn_root_typed_thread(actor, config)),
+        1 => Box::pin(system.spawn_typed_with_config(actor, config, Default::default())),
+        2 => {
+            drop(config);
+            Box::pin(system.spawn_at(actor, "/legacy-instance", None, Default::default()))
+        }
+        3 => Box::pin(system.spawn_in_cohort(
+            actor,
+            config,
+            Default::default(),
+            "/legacy-cohort-instance".into(),
+            cohort,
+        )),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn legacy_entries_wait_for_shared_capacity_before_registry_or_cleanup_submission() {
+    for entry in 0..4 {
+        let system = system(1);
+        let cohort = system.root_cohort(Default::default()).await.unwrap();
+        let held_counts = Counts::default();
+        let (actor, config) = held_counts.inputs(None, None, false);
+        let held = system
+            .try_spawn_typed_with_config(actor, config, Default::default())
+            .unwrap();
+        let counts = Counts::default();
+        let mut creation = legacy_creation(&system, &counts, entry, &cohort, None);
+        let baseline_configs = counts.configs.load(Ordering::SeqCst);
+        assert!(futures::poll!(&mut creation).is_pending());
+        assert!(
+            system.registry.read().unwrap().is_empty(),
+            "legacy entry {entry} bypassed the shared creation capacity"
+        );
+        assert_eq!(counts.configs.load(Ordering::SeqCst), baseline_configs);
+        assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
+        drop(held);
+        let reference = tokio::time::timeout(Duration::from_secs(3), creation)
+            .await
+            .unwrap()
+            .unwrap();
+        recovered(&system, 1).await;
+        assert_eq!(
+            *reference
+                .ask(Box::new(57u64))
+                .await
+                .unwrap()
+                .downcast::<u64>()
+                .unwrap(),
+            57
+        );
+        system.shutdown_internal().await.unwrap();
+        assert_eq!(counts.actors.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.configs.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_legacy_entries_retain_shared_capacity_until_actual_actor_disposal() {
+    for entry in 0..4 {
+        let system = system(1);
+        let cohort = system.root_cohort(Default::default()).await.unwrap();
+        let workers = system
+            .factory_slots
+            .clone()
+            .acquire_many_owned(system.factory_slots.available_permits() as u32)
+            .await
+            .unwrap();
+        let gate = Arc::new(Gate::default());
+        let _release = Release(gate.clone());
+        let counts = Counts::default();
+        let mut creation = legacy_creation(&system, &counts, entry, &cohort, Some(gate.clone()));
+        assert!(futures::poll!(&mut creation).is_pending());
+        assert_eq!(system.registry.read().unwrap().len(), 1);
+        assert_eq!(system.instance_admission.available_permits(), 0);
+        drop(creation);
+        gate.entered().await;
+        assert_eq!(system.instance_admission.available_permits(), 0);
+        assert_eq!(counts.actors.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
+        gate.release();
+        recovered(&system, 1).await;
+        drop(workers);
+        assert_eq!(counts.actors.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.configs.load(Ordering::SeqCst), 1);
+        system.shutdown_internal().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn saturated_legacy_entries_expire_without_late_publication() {
+    for entry in 0..4 {
+        let system = system_with_creation_timeout(1, Duration::from_millis(40));
+        let cohort = system.root_cohort(Default::default()).await.unwrap();
+        let held_counts = Counts::default();
+        let (actor, config) = held_counts.inputs(None, None, false);
+        let held = system
+            .try_spawn_typed_with_config(actor, config, Default::default())
+            .unwrap();
+        let counts = Counts::default();
+        let creation = legacy_creation(&system, &counts, entry, &cohort, None);
+        let result = tokio::time::timeout(Duration::from_secs(3), creation)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(SpawnError::Timeout(_))),
+            "entry {entry}: {result:?}"
+        );
+        assert!(system.registry.read().unwrap().is_empty());
+        assert_eq!(counts.actors.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.configs.load(Ordering::SeqCst), 1);
+        drop(held);
+        recovered(&system, 1).await;
+        assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
+        system.shutdown_internal().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn shutdown_wakes_legacy_capacity_waiters_without_waiting_for_unpolled_inputs() {
+    let system = system(1);
+    let cohort = system.root_cohort(Default::default()).await.unwrap();
+    let held_counts = Counts::default();
+    let (actor, config) = held_counts.inputs(None, None, false);
+    let held = system
+        .try_spawn_typed_with_config(actor, config, Default::default())
+        .unwrap();
+    let counts = Counts::default();
+    let mut creation = legacy_creation(&system, &counts, 0, &cohort, None);
+    assert!(futures::poll!(&mut creation).is_pending());
+    system.shutdown_internal().await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(1), creation)
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(SpawnError::SystemShutdown)));
+    assert_eq!(counts.actors.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.configs.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
+    drop(held);
+    recovered(&system, 1).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_capacity_wait_does_not_reset_publication_deadline() {
+    let system = system_with_creation_timeout(1, Duration::from_secs(10));
+    let workers = system
+        .factory_slots
+        .clone()
+        .acquire_many_owned(system.factory_slots.available_permits() as u32)
+        .await
+        .unwrap();
+    let held = system
+        .instance_admission
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let counts = Counts::default();
+    let (actor, config) = counts.inputs(None, None, false);
+    let mut creation = Box::pin(system.spawn_root_typed_thread(actor, config));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    assert!(futures::poll!(&mut creation).is_pending());
+    tokio::time::advance(Duration::from_secs(4)).await;
+    drop(held);
+    assert!(futures::poll!(&mut creation).is_pending());
+    {
+        let registry = system.registry.read().unwrap();
+        let pending = match registry.values().next().unwrap() {
+            ActorRegistryEntry::Instance(pending) => pending,
+            _ => panic!("publication bypassed the occupied worker budget"),
+        };
+        assert_eq!(pending.control.deadline(), Some(deadline));
+    }
+    // The retirement runtime has its own clock; inspect the deadline handed to
+    // its owner, then cancel without pretending advance() drives that runtime.
+    tokio::time::resume();
+    drop(creation);
+    recovered(&system, 1).await;
+    assert_eq!(counts.actors.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.configs.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
+    drop(workers);
+    system.shutdown_internal().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_legacy_capacity_waiters_never_publish_and_keep_input_trace() {
+    for entry in 0..4 {
+        let system = system(1);
+        let cohort = system.root_cohort(Default::default()).await.unwrap();
+        let held = system
+            .instance_admission
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let gate = Arc::new(Gate::default());
+        let _release = Release(gate.clone());
+        let counts = Counts::default();
+        let trace = TraceContext::root();
+        let mut creation = trace
+            .in_scope(|| legacy_creation(&system, &counts, entry, &cohort, Some(gate.clone())));
+        assert!(futures::poll!(&mut creation).is_pending());
+        TraceContext::root().in_scope(|| drop(creation));
+        gate.entered().await;
+        assert!(system.registry.read().unwrap().is_empty());
+        assert_eq!(counts.actors.load(Ordering::SeqCst), 0);
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while counts.actors.load(Ordering::SeqCst) != 1
+                || counts.configs.load(Ordering::SeqCst) != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            counts
+                .contexts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|context| context.as_ref() == Some(&trace))
+        );
+        drop(held);
+        recovered(&system, 1).await;
+        assert!(system.registry.read().unwrap().is_empty());
+        assert_eq!(counts.initialized.load(Ordering::SeqCst), 0);
+        let (actor, config) = counts.inputs(None, None, false);
+        let reference = system.spawn_root_typed_thread(actor, config).await.unwrap();
+        assert_eq!(
+            *reference
+                .ask(Box::new(74u64))
+                .await
+                .unwrap()
+                .downcast::<u64>()
+                .unwrap(),
+            74
+        );
+        system.shutdown_internal().await.unwrap();
+        assert_eq!(counts.actors.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn legacy_admission_timeout_preserves_actual_disposal_failure() {
+    let system = system_with_creation_timeout(1, Duration::from_millis(40));
+    let held = system
+        .instance_admission
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let counts = Counts::default();
+    let (actor, config) = counts.inputs(None, None, true);
+    let result = system.spawn_root_typed_thread(actor, config).await;
+    assert!(
+        matches!(result, Err(SpawnError::DisposalFailed(ref message))
+        if message.contains("admitted actor destructor failed"))
+    );
+    assert!(system.registry.read().unwrap().is_empty());
+    assert_eq!(counts.actors.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.configs.load(Ordering::SeqCst), 1);
+    drop(held);
+    recovered(&system, 1).await;
+    system.shutdown_internal().await.unwrap();
+}
+
 #[test]
 fn unpolled_admission_is_bounded_and_rejection_returns_original_inputs_without_tasks() {
     crate::test_support::isolated(

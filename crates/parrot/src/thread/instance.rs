@@ -171,8 +171,11 @@ async fn retire_inputs<A: Actor + Send + 'static>(
 }
 
 impl ThreadActorSystem {
-    /// Maximum admitted dynamic instance creation bundles per system through
-    /// [`Self::try_spawn_typed_with_config`], including unpolled and cleaning inputs.
+    /// Maximum admitted native dynamic root/path/cohort instance creation
+    /// bundles per system. Ordinary entries wait at first poll;
+    /// [`Self::try_spawn_typed_with_config`] also reserves capacity for its
+    /// unpolled inputs. Cleaning inputs retain it. Erased children and static
+    /// typed/factory entries have separate admission contracts.
     pub const MAX_PENDING_INSTANCE_CREATIONS: usize = 1024;
 
     /// Reserve one creation bundle before accepting actor/config ownership.
@@ -182,9 +185,9 @@ impl ThreadActorSystem {
     /// Publication retains it until the creation owner finishes the handoff.
     /// Live actors use their normal actor/mailbox budgets after that handoff.
     ///
-    /// Legacy spawn methods retain their existing cleanup semantics and are not
-    /// included in this admission limit. Callers needing bounded pending input
-    /// ownership must use this fallible entry and apply backpressure on `Full`.
+    /// Ordinary instance entries wait for this same capacity inside the caller's
+    /// future, before registry admission or background work. Use this fallible
+    /// entry to bound even unpolled input ownership and apply backpressure on `Full`.
     #[allow(clippy::type_complexity, clippy::result_large_err)]
     pub fn try_spawn_typed_with_config<A>(
         self: &Arc<Self>,
@@ -448,6 +451,39 @@ impl ThreadActorSystem {
         A: Actor<Context = ThreadContext<A>> + Send + Sync + 'static,
     {
         parrot_api::trace::capture(async move {
+            let deadline = tokio::time::Instant::now() + self.creation_timeout();
+            let reservation = match reservation {
+                Some(reservation) => reservation,
+                None => {
+                    let admitted = if self.is_shutting_down() {
+                        Err(SpawnError::SystemShutdown)
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep_until(deadline) => Err(SpawnError::Timeout(
+                                "instance admission exceeded creation deadline".into(),
+                            )),
+                            permit = self.instance_admission.clone().acquire_owned() => {
+                                permit.map(Arc::new).map_err(|_| SpawnError::SystemShutdown)
+                            }
+                        }
+                    };
+                    match admitted {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            return retire_inputs(actor, Some(config), parent, engine)
+                                .await
+                                .and(Err(error));
+                        }
+                    }
+                }
+            };
+            // The caller may cancel during any retirement await. Every input
+            // must independently retain admission until its actual disposal.
+            let actor = actor.with_reservation(&reservation);
+            let config = config.with_reservation(&reservation);
+            let parent = parent.with_reservation(&reservation);
+            let engine = engine.with_reservation(&reservation);
             let cohort = cohort.or_else(|| {
                 parent
                     .value()
@@ -480,9 +516,8 @@ impl ThreadActorSystem {
                 if let Some(defaults) = &defaults {
                     reference = reference.with_deferred_defaults(defaults.clone());
                 }
-                let deadline = tokio::time::Instant::now() + self.creation_timeout();
                 let pending = Arc::new(PendingInstance {
-                    _admission: reservation.clone(),
+                    _admission: Some(reservation.clone()),
                     stop_request: reference.stop_request(),
                     reference: Arc::new(reference.clone()),
                     address,

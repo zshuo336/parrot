@@ -498,6 +498,7 @@ pub struct ThreadActorSystem {
 impl Drop for ThreadActorSystem {
     fn drop(&mut self) {
         self.is_shutting_down.store(true, Ordering::Release);
+        self.instance_admission.close();
         if self.shutdown_completion.lock().unwrap().is_none() {
             let work =
                 self.shutdown_resources(tokio::time::Instant::now() + self.config.shutdown_timeout);
@@ -1816,6 +1817,7 @@ impl ThreadActorSystem {
                 completion.clone()
             } else {
                 self.is_shutting_down.store(true, Ordering::SeqCst);
+                self.instance_admission.close();
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 let deadline = tokio::time::Instant::now() + self.config.shutdown_timeout;
                 let work = self.shutdown_resources(deadline);
