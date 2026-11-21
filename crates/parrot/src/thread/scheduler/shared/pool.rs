@@ -619,6 +619,20 @@ impl SharedThreadPool {
             paths.insert(path.to_string(), mailbox.clone());
         }
 
+        // Every admission after this point can race with shutdown. Keep the
+        // rollback in one place so a failed initial enqueue never leaves a
+        // path that claims to be scheduled after the queue is closed.
+        let rollback = || {
+            self.scheduling_queue.unregister(&mailbox);
+            let mut paths = self.scheduled_paths.lock().unwrap();
+            if paths
+                .get(path)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &mailbox))
+            {
+                paths.remove(path);
+            }
+        };
+
         // Install the wake hook: whenever a push succeeds after this actor is
         // scheduled, (re-)enqueue the mailbox so a worker picks it up even if
         // it had previously drained it to empty. The schedule slot ensures at
@@ -630,7 +644,7 @@ impl SharedThreadPool {
             // Elastic-scaling probe: every wake (message arrival under load)
             // feeds the burst-worker controller.
             let elastic = self.elastic_controller();
-            mailbox.set_wake_hook(Arc::new(move || {
+            let hook = Arc::new(move || {
                 if shutting_down.load(Ordering::Relaxed) {
                     return;
                 }
@@ -646,12 +660,35 @@ impl SharedThreadPool {
                     queue.enqueue_registered(strong, lane);
                     elastic.probe();
                 }
-            }));
+            });
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mailbox.set_wake_hook(hook);
+            })) {
+                rollback();
+                return Err(SystemError::Other(anyhow::anyhow!(
+                    "failed to install scheduler wake hook for {path}: {}",
+                    crate::owned_payload::panic_message(payload)
+                )));
+            }
         }
 
         if mailbox.schedule_state().try_enqueue() {
-            self.scheduling_queue
-                .enqueue_registered(mailbox, crate::thread::scheduler::queue::Lane::Normal);
+            let admitted = self.scheduling_queue.enqueue_registered(
+                mailbox.clone(),
+                crate::thread::scheduler::queue::Lane::Normal,
+            );
+            if !admitted {
+                rollback();
+                return Err(SystemError::ShuttingDown);
+            }
+        }
+
+        // Shutdown may have closed the queue immediately after the hook was
+        // installed. Do not report success for an admission with no live
+        // registration.
+        if self.is_shutting_down.load(Ordering::Acquire) {
+            rollback();
+            return Err(SystemError::ShuttingDown);
         }
 
         Ok(())

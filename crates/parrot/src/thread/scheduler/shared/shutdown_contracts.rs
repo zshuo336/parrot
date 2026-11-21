@@ -114,6 +114,47 @@ async fn cancelled_waiter_does_not_detach_owned_workers() {
     overlapping_waiters(true).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schedule_reports_shutdown_when_queue_closes_during_hook_install() {
+    let pool = pool();
+    let (release, held) = std::sync::mpsc::channel();
+    let gate = Arc::new(HookGate {
+        entered: Notify::new(),
+        release: std::sync::Mutex::new(held),
+    });
+    let mailbox = Arc::new(HostileMailbox {
+        inner: crate::thread::mailbox::mpsc::MpscMailbox::new(
+            1,
+            parrot_api::address::ActorPath::placeholder("/hook-shutdown-race"),
+        ),
+        pool: Arc::downgrade(&pool),
+        releases: Arc::default(),
+        disposed: Arc::default(),
+        release_panics: false,
+        drop_panics: false,
+        close_dependency: None,
+        hook_gate: Some(gate.clone()),
+    });
+    let owner = pool.clone();
+    let schedule = tokio::task::spawn_blocking(move || {
+        owner.schedule_now("/hook-shutdown-race", mailbox, None)
+    });
+    tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+        .await
+        .expect("schedule must enter hook installation");
+
+    // Let the real shutdown path close the queue and remove its registration
+    // while schedule_now is still inside the mailbox hook.
+    pool.shutdown(0).await.unwrap();
+    release.send(()).unwrap();
+    let result = schedule.await.unwrap();
+    assert!(
+        matches!(result, Err(SystemError::ShuttingDown)),
+        "{result:?}"
+    );
+    assert!(!pool.is_scheduled("/hook-shutdown-race"));
+}
+
 #[tokio::test]
 async fn elastic_probe_preserves_large_backlog_thresholds() {
     use crate::thread::mailbox::mpsc::MpscMailbox;
@@ -491,6 +532,12 @@ struct HostileMailbox {
     release_panics: bool,
     drop_panics: bool,
     close_dependency: Option<Arc<CloseDependency>>,
+    hook_gate: Option<Arc<HookGate>>,
+}
+#[derive(Debug)]
+struct HookGate {
+    entered: Notify,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 #[derive(Debug)]
 struct CloseDependency {
@@ -589,6 +636,14 @@ impl Mailbox for HostileMailbox {
         true
     }
     fn set_wake_hook(&self, hook: crate::thread::mailbox::WakeHook) {
+        if let Some(gate) = &self.hook_gate {
+            gate.entered.notify_one();
+            gate.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .expect("scheduler hook release");
+        }
         self.inner.set_wake_hook(hook);
     }
     fn fire_wake_hook(&self) {
@@ -629,6 +684,7 @@ async fn mailbox_release_and_destructor_failures_do_not_skip_other_resources() {
                 release_panics,
                 drop_panics,
                 close_dependency: None,
+                hook_gate: None,
             }),
             None,
         )
@@ -913,6 +969,7 @@ async fn grace_expiry_joins_workers_before_finishing_the_original_mailbox_close(
             release_panics: false,
             drop_panics: false,
             close_dependency: Some(dependency.clone()),
+            hook_gate: None,
         }),
         None,
     )
