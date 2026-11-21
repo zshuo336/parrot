@@ -97,6 +97,7 @@ pub struct ThreadContext<A: Actor + Send + Sync + 'static> {
 
     /// Executor for generation-owned tasks, independent of the original host.
     runtime_handle: Handle,
+    cleanup_slots: Arc<tokio::sync::Semaphore>,
     tasks: Arc<crate::context_tasks::ContextTasks>,
 
     /// Actor's own reference
@@ -153,17 +154,22 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
     ) -> Self {
         // Dedicated and sharded actors can outlive their original host. Their
         // admitted clocks, streams and registration scopes share that lifetime.
-        let runtime_handle = system
-            .upgrade()
+        let live_system = system.upgrade();
+        let runtime_handle = live_system
+            .as_ref()
             .map_or(runtime_handle, |system| system.retirement_runtime().clone());
-        let limit = system
-            .upgrade()
+        let cleanup_slots = live_system
+            .as_ref()
+            .map(|system| system.cleanup_slots.clone())
+            .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(1)));
+        let limit = live_system
+            .as_ref()
             .map_or(crate::context_tasks::DEFAULT_MAX_CONTEXT_TASKS, |system| {
                 system.config().max_context_tasks
             });
         let tasks = crate::context_tasks::ContextTasks::new(limit);
-        let slots = system
-            .upgrade()
+        let slots = live_system
+            .as_ref()
             .map(|s| s.typed_slots.clone())
             .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(1)));
         let stream_registry = crate::streams::OwnedStreams::new::<Self>(
@@ -177,12 +183,13 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
             tasks,
             system: system.clone(),
             runtime_handle,
+            cleanup_slots,
             self_ref: None,
             mailbox: None,
             parent_ref,
             owned_children: crate::children::ChildScope::new(
-                system
-                    .upgrade()
+                live_system
+                    .as_ref()
                     .map_or(Duration::from_secs(5), |s| s.config().shutdown_timeout),
                 slots,
             ),
@@ -203,16 +210,9 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         strategy: Option<SupervisorStrategyType>,
     ) -> BoxedFuture<'a, ActorResult<BoxedActorRef>> {
         let system = self.system();
-        let slots = system
-            .as_ref()
-            .map(|system| system.cleanup_slots.clone())
-            .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(1)));
-        let runtime = system
-            .as_ref()
-            .map_or(&self.runtime_handle, |system| system.retirement_runtime());
-        let actor = crate::owned_payload::OwnedPayload::new(actor, runtime, &slots);
-        let config = crate::owned_payload::OwnedPayload::new(config, runtime, &slots);
-        let strategy = crate::owned_payload::OwnedPayload::new(strategy, runtime, &slots);
+        let actor = self.own_schedule_input(actor);
+        let config = self.own_schedule_input(config);
+        let strategy = self.own_schedule_input(strategy);
         Box::pin(parrot_api::trace::capture(async move {
             if self.mailbox.is_none() || system.is_none() {
                 let (actor, config, strategy) =
@@ -260,14 +260,7 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
         &self,
         value: T,
     ) -> crate::owned_payload::OwnedPayload<T> {
-        match self.system() {
-            Some(system) => crate::owned_payload::OwnedPayload::new(
-                value,
-                system.retirement_runtime(),
-                &system.cleanup_slots,
-            ),
-            None => crate::owned_payload::OwnedPayload::unbound(value),
-        }
+        crate::owned_payload::OwnedPayload::new(value, &self.runtime_handle, &self.cleanup_slots)
     }
 
     fn spawn_context_task(&self, task: crate::context_tasks::OwnedTask) {

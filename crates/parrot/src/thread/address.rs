@@ -52,6 +52,8 @@ where
 
     /// Owning system for registered actor lifecycle operations.
     system: crate::thread::context::WeakSystemRef,
+    /// Retain input cleanup without keeping the system or mailbox alive.
+    input_executor: Option<(tokio::runtime::Handle, Arc<tokio::sync::Semaphore>)>,
     death_watch: Option<parrot_api::death_watch::DeathWatch>,
     registered: bool,
     stop_request: StopRequest,
@@ -92,6 +94,7 @@ where
             path: path.path,
             mailbox: Arc::new(Mutex::new(mailbox)),
             system: Weak::new(),
+            input_executor: None,
             death_watch: None,
             registered: false,
             stop_request: Default::default(),
@@ -105,6 +108,12 @@ where
     }
 
     pub(crate) fn with_system(mut self, system: crate::thread::context::WeakSystemRef) -> Self {
+        self.input_executor = system.upgrade().map(|system| {
+            (
+                system.retirement_runtime().clone(),
+                system.cleanup_slots.clone(),
+            )
+        });
         self.system = system;
         self.registered = true;
         self
@@ -120,10 +129,17 @@ where
         default_strategy: BackpressureStrategy,
         default_timeout: Duration,
     ) -> Self {
+        let input_executor = system.upgrade().map(|system| {
+            (
+                system.retirement_runtime().clone(),
+                system.cleanup_slots.clone(),
+            )
+        });
         Self {
             path,
             mailbox,
             system,
+            input_executor,
             death_watch: None,
             registered: true,
             stop_request,
@@ -210,12 +226,10 @@ where
     }
 
     fn own_input<T: Send + 'static>(&self, value: T) -> crate::owned_payload::OwnedPayload<T> {
-        match self.system.upgrade() {
-            Some(system) => crate::owned_payload::OwnedPayload::new(
-                value,
-                system.retirement_runtime(),
-                &system.cleanup_slots,
-            ),
+        match &self.input_executor {
+            Some((runtime, slots)) => {
+                crate::owned_payload::OwnedPayload::new(value, runtime, slots)
+            }
             None => crate::owned_payload::OwnedPayload::unbound(value),
         }
     }
@@ -613,6 +627,7 @@ where
             path: self.path.clone(),
             mailbox: self.mailbox.clone(),
             system: self.system.clone(),
+            input_executor: self.input_executor.clone(),
             death_watch: self.death_watch.clone(),
             registered: self.registered,
             stop_request: self.stop_request.clone(),
