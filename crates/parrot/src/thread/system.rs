@@ -1687,9 +1687,12 @@ impl ThreadActorSystem {
                         };
                         let (result, timed_out) =
                             super::stop_deadline::join_until(work, deadline, || {
-                                sender.send_replace(Some(StopOutcome::TimedOut(format!(
-                                    "actor {path} stop exceeded configured deadline"
-                                ))));
+                                crate::owned_payload::publish_watch(
+                                    &sender,
+                                    StopOutcome::TimedOut(format!(
+                                        "actor {path} stop exceeded configured deadline"
+                                    )),
+                                );
                             })
                             .await;
                         let result = result.map_err(crate::error_receipt::SystemReceipt::new);
@@ -1703,9 +1706,9 @@ impl ThreadActorSystem {
                             result.map_err(crate::error_receipt::SystemReceipt::into_error),
                         );
                         if !timed_out {
-                            sender.send_replace(Some(outcome.clone()));
+                            crate::owned_payload::publish_watch(&sender, outcome.clone());
                         }
-                        retired.send_replace(Some(outcome));
+                        crate::owned_payload::publish_watch(&retired, outcome);
                         notification.await;
                     }));
                 (receiver, retirement)
@@ -1832,13 +1835,19 @@ impl ThreadActorSystem {
                 self.retirement_runtime().spawn(async move {
                     let (result, timed_out) =
                         super::stop_deadline::join_until(work, deadline, || {
-                            sender.send_replace(Some(StopOutcome::TimedOut(
-                                "actor shutdown exceeded configured deadline".into(),
-                            )));
+                            crate::owned_payload::publish_watch(
+                                &sender,
+                                StopOutcome::TimedOut(
+                                    "actor shutdown exceeded configured deadline".into(),
+                                ),
+                            );
                         })
                         .await;
                     if !timed_out {
-                        sender.send_replace(Some(StopOutcome::from_result(result)));
+                        crate::owned_payload::publish_watch(
+                            &sender,
+                            StopOutcome::from_result(result),
+                        );
                     }
                 });
                 *state = Some(receiver.clone());
