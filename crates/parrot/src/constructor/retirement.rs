@@ -9,6 +9,16 @@ mod saturation_contracts;
 type Finished = watch::Sender<Option<Result<(), String>>>;
 type Receipt = watch::Receiver<Option<Result<(), String>>>;
 
+fn publish_finished(finished: &Finished, result: Result<(), String>) {
+    let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        finished.send_replace(Some(result));
+    }));
+    if let Err(payload) = notified {
+        let message = panic_message(payload);
+        tracing::warn!(error = %message, "Factory retirement receipt waker panicked");
+    }
+}
+
 // Moved out of FactoryState under its lock, then destroyed outside that lock.
 // Installed before waiting on capacity or scheduling blocking work.
 struct CaptureDisposal<A> {
@@ -53,7 +63,7 @@ impl<A> CaptureDisposal<A> {
             let result = self.failure.take().map_or(captures, Err);
             drop(self.creation_reservation.take());
             if let Some(finished) = self.finished.take() {
-                finished.send_replace(Some(result.clone()));
+                publish_finished(&finished, result.clone());
             }
             drop(self.cleanup.take());
             result

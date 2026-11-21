@@ -245,6 +245,56 @@ fn recursive_constructor_panic_keeps_construction_error_class() {
     );
 }
 #[test]
+fn retirement_receipt_waker_panic_does_not_unwind_capture_disposal() {
+    isolated(
+        "retirement_receipt_waker_panic_does_not_unwind_capture_disposal",
+        || {
+            struct WakePanic(AtomicUsize);
+            impl futures::task::ArcWake for WakePanic {
+                fn wake_by_ref(this: &Arc<Self>) {
+                    this.0.fetch_add(1, Ordering::SeqCst);
+                    panic!("factory retirement wake failure");
+                }
+            }
+
+            let r = runtime();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let capture = CountCapture(drops.clone());
+            let f = Factory::new(
+                move || {
+                    let _ = &capture;
+                },
+                Arc::new(Semaphore::new(1)),
+                Arc::new(Semaphore::new(1)),
+            );
+            let mut receipt = {
+                let _entered = r.enter();
+                f.retire()
+            };
+            let wake = Arc::new(WakePanic(AtomicUsize::new(0)));
+            let waker = futures::task::waker(wake.clone());
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(receipt.as_mut().poll(&mut context).is_pending());
+            r.block_on(async {
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    while drops.load(Ordering::SeqCst) == 0 || wake.0.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                receipt.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            drop(r);
+        },
+    );
+}
+#[test]
 fn recursive_capture_panic_keeps_stable_retirement_receipt() {
     isolated(
         "recursive_capture_panic_keeps_stable_retirement_receipt",
