@@ -462,6 +462,44 @@ fn helper_completion_waker_panic_preserves_join_receipt() {
     );
 }
 
+#[test]
+fn worker_completion_waker_panic_preserves_join_receipt() {
+    crate::test_support::isolated_with_timeout(
+        "actix::pool_retirement::helper_contracts::worker_completion_waker_panic_preserves_join_receipt",
+        WAIT,
+        || {
+            struct WakePanic(AtomicUsize);
+            impl futures::task::ArcWake for WakePanic {
+                fn wake_by_ref(this: &Arc<Self>) {
+                    this.0.fetch_add(1, Ordering::SeqCst);
+                    panic!("worker completion wake failure");
+                }
+            }
+
+            let fixture = actix::System::new().block_on(async { fixture() });
+            let wake = Arc::new(WakePanic(AtomicUsize::new(0)));
+            let waker = futures::task::waker(wake.clone());
+            let mut context = std::task::Context::from_waker(&waker);
+            let mut receipt = Box::pin(wait(fixture.retirement.finished.clone()));
+            assert!(receipt.as_mut().poll(&mut context).is_pending());
+            fixture.retirement.request();
+            fixture.gate.release();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fixture.retirement.join_blocking()
+            }));
+            assert!(result.is_ok(), "a worker receipt waker unwound retirement");
+            result.unwrap().unwrap();
+            assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                receipt.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert_eq!(fixture.helper_exited.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.retirement.owned_threads(1), 0);
+        },
+    );
+}
+
 fn observer_wait(
     receipt: watch::Receiver<Option<Exit>>,
 ) -> Result<Exit, tokio::time::error::Elapsed> {

@@ -227,7 +227,7 @@ impl Drop for RetireWorkers {
                 "Actix worker failed during shutdown ({failures} worker joins): {message}"
             ))
         });
-        self.finished.send_replace(Some(result));
+        HelperJoin::publish_finished(&self.finished, result);
     }
 }
 
