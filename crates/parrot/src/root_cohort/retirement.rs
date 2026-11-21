@@ -10,6 +10,37 @@ const CAPACITY: usize = 65536;
 type Job = Box<dyn FnOnce() + Send>;
 type Completion = watch::Receiver<Option<Result<(), ActorReceipt>>>;
 
+fn publish_finished(
+    finished: &watch::Sender<Option<Result<(), ActorReceipt>>>,
+    result: Result<(), ActorReceipt>,
+) {
+    let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        finished.send_replace(Some(result));
+    }));
+    if let Err(payload) = notified {
+        let message = crate::owned_payload::panic_message(payload);
+        tracing::warn!(error = %message, "Root retirement receipt waker panicked");
+    }
+}
+
+fn publish_abandoned(finished: &watch::Sender<Option<Result<(), ActorReceipt>>>) {
+    let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        finished.send_if_modified(|value| {
+            if value.is_some() {
+                return false;
+            }
+            *value = Some(Err(ActorReceipt::from_error(ActorError::InternalError(
+                "root retirement task ended without completing disposal".into(),
+            ))));
+            true
+        });
+    }));
+    if let Err(payload) = notified {
+        let message = crate::owned_payload::panic_message(payload);
+        tracing::warn!(error = %message, "Root retirement fallback receipt waker panicked");
+    }
+}
+
 struct Driver {
     runtime: Handle,
     stop: Option<oneshot::Sender<()>>,
@@ -141,15 +172,7 @@ pub(super) struct Retirement {
 struct Publish(watch::Sender<Option<Result<(), ActorReceipt>>>);
 impl Drop for Publish {
     fn drop(&mut self) {
-        self.0.send_if_modified(|value| {
-            if value.is_some() {
-                return false;
-            }
-            *value = Some(Err(ActorReceipt::from_error(ActorError::InternalError(
-                "root retirement task ended without completing disposal".into(),
-            ))));
-            true
-        });
+        publish_abandoned(&self.0);
     }
 }
 impl Retirement {
@@ -179,7 +202,7 @@ impl Retirement {
                     if let Some(owner) = owner.upgrade() {
                         owner.remove(&scope);
                     }
-                    publish.0.send_replace(Some(result));
+                    publish_finished(&publish.0, result);
                 }));
                 completion
             }

@@ -6,6 +6,30 @@ use std::sync::{
 
 const WAIT: Duration = Duration::from_secs(5);
 
+#[test]
+fn receipt_waker_panic_does_not_escape_root_publication() {
+    struct WakePanic(AtomicUsize);
+    impl futures::task::ArcWake for WakePanic {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+            panic!("root retirement receipt wake failure");
+        }
+    }
+
+    let (finished, receipt) = watch::channel(None);
+    let wake = Arc::new(WakePanic(AtomicUsize::new(0)));
+    let waker = futures::task::waker(wake.clone());
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut pending = Box::pin(wait(receipt));
+    assert!(pending.as_mut().poll(&mut context).is_pending());
+    publish_finished(&finished, Ok(()));
+    assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        pending.as_mut().poll(&mut context),
+        std::task::Poll::Ready(Ok(()))
+    ));
+}
+
 fn build() -> std::io::Result<Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
