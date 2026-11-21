@@ -209,6 +209,16 @@ pub(crate) fn join_error(error: tokio::task::JoinError) -> String {
     }
 }
 
+pub(crate) fn publish_watch<T>(sender: &watch::Sender<Option<T>>, value: T) {
+    let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sender.send_replace(Some(value));
+    }));
+    if let Err(payload) = notified {
+        let message = panic_message(payload);
+        tracing::warn!(error = %message, "Watch receipt waker panicked");
+    }
+}
+
 fn publish_finished(
     finished: &watch::Sender<Option<Result<(), String>>>,
     result: Result<(), String>,

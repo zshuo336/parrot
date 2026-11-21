@@ -569,7 +569,7 @@ where
                 .and(tasks)
                 .and(children),
         );
-        self.retired.send_replace(Some(outcome));
+        crate::owned_payload::publish_watch(&self.retired, outcome);
         crate::thread::system::await_stop(self.retired.subscribe()).await
     }
 
