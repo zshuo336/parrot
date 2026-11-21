@@ -157,7 +157,7 @@ impl Drop for Worker {
             rx.close();
             drop(rx);
         }
-        self.done.send_replace(true);
+        crate::owned_payload::publish_watch_value(&self.done, true);
     }
 }
 struct Session {
@@ -175,7 +175,7 @@ struct Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        self.cancel.send_replace(true);
+        crate::owned_payload::publish_watch_value(&self.cancel, true);
         if let Some(task) = self.task.get_mut().unwrap().take() {
             task.abort();
         }
@@ -260,7 +260,7 @@ impl MirrorHandle {
         self.0.closed.store(true, Ordering::Release);
         self.0.slots.close();
         self.0.bytes.close();
-        self.0.cancel.send_replace(true);
+        crate::owned_payload::publish_watch_value(&self.0.cancel, true);
     }
     /// Cancel and wait for this worker; does not stop the source or shadow actor.
     pub async fn shutdown(&self) {

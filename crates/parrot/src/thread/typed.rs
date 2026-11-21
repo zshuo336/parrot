@@ -384,7 +384,7 @@ impl<A: ParrotTypedDispatch> TypedInputs<A> {
             }
         }
         if let Some(retired) = self.retired.take() {
-            retired.send_replace(Some(result.clone()));
+            crate::owned_payload::publish_watch(&retired, result.clone());
         }
         result
     }
@@ -1062,7 +1062,12 @@ impl ThreadActorSystem {
                 });
                 let (execution, mut timed_out) = control.join_until_expired(execution, || {
                     control.request_stop(control.deadline());
-                    finished.send_replace(Some(StopOutcome::TimedOut(format!("typed actor {path} stop exceeded configured deadline"))));
+                    crate::owned_payload::publish_watch(
+                        &finished,
+                        StopOutcome::TimedOut(format!(
+                            "typed actor {path} stop exceeded configured deadline"
+                        )),
+                    );
                 }).await;
                 control.begin_cleanup(control.deadline());
                 let (result, mut reason, cleanup_failed, failure) = match execution {
@@ -1104,7 +1109,12 @@ impl ThreadActorSystem {
                     inputs.and(actor.and(input_policy).and(input_owner).and(factory).and(children).and(supervised).and(policy).map_err(|error| SystemError::Other(anyhow::Error::new(error))))
                 };
                 let (disposed, disposal_timed_out) = control.join_until_expired(disposal, || {
-                    finished.send_replace(Some(StopOutcome::TimedOut(format!("typed actor {path} policy disposal exceeded configured deadline"))));
+                    crate::owned_payload::publish_watch(
+                        &finished,
+                        StopOutcome::TimedOut(format!(
+                            "typed actor {path} policy disposal exceeded configured deadline"
+                        )),
+                    );
                 }).await;
                 timed_out |= disposal_timed_out;
                 let disposed = disposed.map_err(crate::error_receipt::SystemReceipt::new);
@@ -1131,7 +1141,9 @@ impl ThreadActorSystem {
                 }
                 let notification=control.lifetime.finish(retirement);
                 let outcome = StopOutcome::from_result(result.map_err(crate::error_receipt::SystemReceipt::into_error));
-                if !timed_out { finished.send_replace(Some(outcome.clone())); }
+                if !timed_out {
+                    crate::owned_payload::publish_watch(&finished, outcome.clone());
+                }
                 if let Some(reason) = reason {
                     control.death_watch.terminated(parrot_api::context::ActorTerminated {
                         generation: control.death_watch.id(), path, reason,
@@ -1140,7 +1152,7 @@ impl ThreadActorSystem {
                     // Executor cancellation is not proof of actor disposal.
                     control.death_watch.abandon();
                 }
-                retired.send_replace(Some(outcome));
+                crate::owned_payload::publish_watch(&retired, outcome);
                 notification.await;
                 control.release_instance_admission();
             });

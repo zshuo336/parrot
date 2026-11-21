@@ -449,7 +449,7 @@ where
                     )),
                 })?;
                 let cleanup = exit.cleanup;
-                generation.finished.send_replace(Some(Outcome::Stopped));
+                crate::owned_payload::publish_watch(&generation.finished, Outcome::Stopped);
                 generation.control.death_watch.abandon();
                 logical.state.lock().unwrap().current = None;
                 cleanup.map_err(|error| {
@@ -925,7 +925,12 @@ impl ActixActorSystem {
                         Err(_) => {
                             let error = ActorError::InternalError("Actix factory generation execution was cancelled".into());
                             control.death_watch.abandon();
-                            finished.send_replace(Some(Outcome::Failed(crate::error_receipt::ActorReceipt::new(Arc::new(error)))));
+                            crate::owned_payload::publish_watch(
+                                &finished,
+                                Outcome::Failed(crate::error_receipt::ActorReceipt::new(
+                                    Arc::new(error),
+                                )),
+                            );
                             let error = crate::error_receipt::ActorReceipt::from_error(ActorError::InternalError("Actix factory generation execution was cancelled".into()));
                             retirement = Err(error.clone());
                             break (Outcome::Failed(error), None);
@@ -938,7 +943,7 @@ impl ActixActorSystem {
                         Err(error) => { let error = crate::error_receipt::ActorReceipt::from_error(error); retirement = Err(error.clone()); Outcome::Failed(error) },
                         Ok(()) => failure.as_ref().map_or(Outcome::Stopped, |error| Outcome::Failed(error.clone())),
                     };
-                    finished.send_replace(Some(native_status.clone()));
+                    crate::owned_payload::publish_watch(&finished, native_status.clone());
                     // Native references are generation bound. Slow generation
                     // observers cannot consume the logical recovery deadline.
                     let native_reason = match (&native_status, escalated.as_ref()) {
@@ -1042,12 +1047,14 @@ impl ActixActorSystem {
                 result = &mut work => result,
                 _ = owner.control.expired() => {
                     let timeout = Outcome::Timeout(format!("Actix factory {} exceeded configured deadline", owner.path));
-                    finished.send_replace(Some(timeout.clone()));
+                    crate::owned_payload::publish_watch(&finished, timeout.clone());
                     reply(&send, Err(timeout.result().unwrap_err()));
                     work.await
                 }
             };
-            if finished.borrow().is_none() { finished.send_replace(Some(status.clone())); }
+            if finished.borrow().is_none() {
+                crate::owned_payload::publish_watch(&finished, status.clone());
+            }
             reply(&send, Err(status.clone().result().err().unwrap_or(ActorError::Stopped)));
             let observed = owner.control.death_watch.clone();
             let event = ActorTerminated { generation: observed.id(), path: owner.path.clone(), reason: reason.unwrap_or_else(|| super::lifecycle::death_reason_from_result(&status.result(), false)) };

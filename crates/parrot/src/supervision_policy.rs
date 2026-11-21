@@ -255,8 +255,7 @@ struct Disposal {
 }
 impl Drop for Disposal {
     fn drop(&mut self) {
-        self.finished
-            .send_replace(Some(retire_strategy(self.strategy.take())));
+        crate::owned_payload::publish_watch(&self.finished, retire_strategy(self.strategy.take()));
     }
 }
 

@@ -325,10 +325,11 @@ impl ThreadActorSystem {
                 if result.is_ok()
                     && let Some(sender) = publication_reply.take_success(&publication.control)
                 {
-                    publication.retired.send_replace(Some(StopOutcome::Stopped));
-                    publication
-                        .finished
-                        .send_replace(Some(StopOutcome::Stopped));
+                    crate::owned_payload::publish_watch(&publication.retired, StopOutcome::Stopped);
+                    crate::owned_payload::publish_watch(
+                        &publication.finished,
+                        StopOutcome::Stopped,
+                    );
                     let _ = sender.send(Ok(()));
                 }
                 result

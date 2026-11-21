@@ -908,10 +908,10 @@ impl ChildLifetime {
         drop(displaced);
     }
     pub(crate) fn hold_publication(&self) {
-        self.publication.send_replace(None);
+        crate::owned_payload::publish_watch_value(&self.publication, None);
     }
     pub(crate) fn release_publication(&self, result: Result<(), ActorReceipt>) {
-        self.publication.send_replace(Some(result));
+        crate::owned_payload::publish_watch(&self.publication, result);
     }
     pub(crate) fn finish(
         self: &Arc<Self>,
@@ -961,13 +961,13 @@ impl ChildLifetime {
             recovery.abort("member terminated during cohort recovery");
             recovery.retired_after_abort(self.id);
         }
-        self.done.send_replace(Some(result));
+        crate::owned_payload::publish_watch(&self.done, result);
         let notification = self.notification.clone();
         Box::pin(async move {
             if let (Some(parent), Some(child)) = (parent, child) {
                 parent.notify(child).await;
             }
-            notification.send_replace(Some(()));
+            crate::owned_payload::publish_watch(&notification, ());
         })
     }
 }

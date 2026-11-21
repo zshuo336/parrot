@@ -171,6 +171,46 @@ fn publication_receipt_waker_panic_does_not_unwind_disposal() {
 }
 
 #[test]
+fn direct_watch_publication_waker_panic_preserves_terminal_value() {
+    isolated(
+        "owned_payload::publication_contracts::direct_watch_publication_waker_panic_preserves_terminal_value",
+        || {
+            struct WakePanic(AtomicUsize);
+            impl futures::task::ArcWake for WakePanic {
+                fn wake_by_ref(this: &Arc<Self>) {
+                    this.0.fetch_add(1, Ordering::SeqCst);
+                    panic!("direct watch receipt wake failure");
+                }
+            }
+
+            let (sender, receiver) = watch::channel(None);
+            let wake = Arc::new(WakePanic(AtomicUsize::new(0)));
+            let waker = futures::task::waker(wake.clone());
+            let mut pending = Box::pin(async move {
+                let mut receiver = receiver;
+                receiver
+                    .wait_for(|value| value.is_some())
+                    .await
+                    .expect("watch receipt should remain open")
+                    .clone()
+            });
+            assert!(
+                pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            publish_watch(&sender, 7usize);
+            assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                pending.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Some(7))
+            ));
+        },
+    );
+}
+
+#[test]
 fn publication_transfer_preserves_original_value_without_early_disposal() {
     isolated(
         "owned_payload::publication_contracts::publication_transfer_preserves_original_value_without_early_disposal",

@@ -19,7 +19,7 @@ struct ShutdownWork {
 }
 
 fn publish(finished: &watch::Sender<Option<Outcome>>, outcome: Outcome) {
-    finished.send_if_modified(|value| {
+    crate::owned_payload::publish_watch_if_modified(finished, |value| {
         if value.is_some() {
             return false;
         }

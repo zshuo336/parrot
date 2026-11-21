@@ -1082,7 +1082,7 @@ impl ActixActorSystem {
                 pending.request_stop(deadline);
             }
             if result.is_ok() && !pending.is_stopping() { creation_reply(&reply, Ok(published)); }
-            ready.send_replace(Some(Outcome::Stopped));
+            crate::owned_payload::publish_watch(&ready, Outcome::Stopped);
         });
         let inputs = Box::pin(async move {
             let (actor, config) = tokio::join!(unpublished_retirement, config_retirement);
@@ -1213,7 +1213,7 @@ impl ActixActorSystem {
                     // Seal admission from this independent lifecycle owner.
                     control.begin_cleanup(control.cleanup_deadline().unwrap_or_else(tokio::time::Instant::now));
                     let timeout = Outcome::Timeout(format!("Actix actor {path} stop exceeded configured deadline"));
-                    finished.send_replace(Some(timeout.clone()));
+                    crate::owned_payload::publish_watch(&finished, timeout.clone());
                     if let Some(reply) = &creation { creation_reply(reply, Err(timeout.result().unwrap_err())); }
                     (cleanup.await, true)
                 }
@@ -1224,7 +1224,9 @@ impl ActixActorSystem {
                     let outcome = status.clone().result();
                     let notification = control.lifetime.finish(retirement);
                     let reason = reason.unwrap_or_else(|| crate::actix::lifecycle::death_reason_from_result(&outcome, control.deadline_was_enforced()));
-                    if !timed_out { finished.send_replace(Some(status.clone())); }
+                    if !timed_out {
+                        crate::owned_payload::publish_watch(&finished, status.clone());
+                    }
                     if let Some(reply) = &creation { creation_reply(reply, Err(status.result().err().unwrap_or(ActorError::Stopped))); }
                     notification.await;
                     control.death_watch.terminated(parrot_api::context::ActorTerminated {
@@ -1234,7 +1236,14 @@ impl ActixActorSystem {
                 None => {
                     control.death_watch.abandon();
                     if !timed_out {
-                        finished.send_replace(Some(Outcome::Failed(crate::error_receipt::ActorReceipt::new(Arc::new(ActorError::InternalError(format!("Actix actor {path} execution was cancelled")))))));
+                        crate::owned_payload::publish_watch(
+                            &finished,
+                            Outcome::Failed(crate::error_receipt::ActorReceipt::new(Arc::new(
+                                ActorError::InternalError(format!(
+                                    "Actix actor {path} execution was cancelled"
+                                ),
+                            )))),
+                        );
                     }
                 }
             }

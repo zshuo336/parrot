@@ -75,7 +75,7 @@ impl Completion {
         self.publish(result);
     }
     fn publish(&self, result: Result<(), ShutdownErrors>) {
-        self.receipt.send_if_modified(|value| {
+        crate::owned_payload::publish_watch_if_modified(&self.receipt, |value| {
             if value.is_some() {
                 return false;
             }

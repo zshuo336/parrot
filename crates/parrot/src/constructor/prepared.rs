@@ -78,7 +78,7 @@ struct Discard<A> {
 }
 impl<A> Drop for Discard<A> {
     fn drop(&mut self) {
-        self.finished.send_replace(Some(self.output.retire()));
+        crate::owned_payload::publish_watch(&self.finished, self.output.retire());
     }
 }
 

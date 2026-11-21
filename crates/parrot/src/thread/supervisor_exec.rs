@@ -176,7 +176,12 @@ impl ThreadActorSystem {
             biased;
             policy = &mut policy_future => (policy, false),
             _ = tokio::time::sleep_until(deadline) => {
-                completion.send_replace(Some(StopOutcome::TimedOut(format!("failed actor {path} supervision decision exceeded deadline"))));
+                crate::owned_payload::publish_watch(
+                    &completion,
+                    StopOutcome::TimedOut(format!(
+                        "failed actor {path} supervision decision exceeded deadline"
+                    )),
+                );
                 (policy_future.await, true)
             }
         };
@@ -248,7 +253,12 @@ impl ThreadActorSystem {
             biased;
             result = &mut retirement => (result, false),
             _ = tokio::time::sleep_until(deadline) => {
-                completion.send_replace(Some(StopOutcome::TimedOut(format!("failed actor {path} cleanup exceeded configured deadline"))));
+                crate::owned_payload::publish_watch(
+                    &completion,
+                    StopOutcome::TimedOut(format!(
+                        "failed actor {path} cleanup exceeded configured deadline"
+                    )),
+                );
                 (retirement.await, true)
             }
         };
@@ -285,23 +295,29 @@ impl ThreadActorSystem {
                 _ = tokio::time::sleep_until(restart_deadline) => {
                     timed_out = true;
                     control.cancel();
-                    completion.send_replace(Some(StopOutcome::TimedOut(format!("restart of {path} exceeded configured deadline"))));
+                    crate::owned_payload::publish_watch(
+                        &completion,
+                        StopOutcome::TimedOut(format!(
+                            "restart of {path} exceeded configured deadline"
+                        )),
+                    );
                     restart.await
                 }
             };
             if result.is_ok() {
                 if !timed_out {
-                    completion.send_replace(Some(StopOutcome::Stopped));
+                    crate::owned_payload::publish_watch(&completion, StopOutcome::Stopped);
                 }
-                retired_sender.send_replace(Some(StopOutcome::Stopped));
+                crate::owned_payload::publish_watch(&retired_sender, StopOutcome::Stopped);
                 return;
             }
         }
         if !timed_out && tokio::time::Instant::now() >= deadline {
             timed_out = true;
-            completion.send_replace(Some(StopOutcome::TimedOut(format!(
-                "recovery of {path} exceeded configured deadline"
-            ))));
+            crate::owned_payload::publish_watch(
+                &completion,
+                StopOutcome::TimedOut(format!("recovery of {path} exceeded configured deadline")),
+            );
         }
         // Only cancellation is a successful stop; a panicking cancelled output
         // or failed capture disposal must remain a reported cleanup failure.
@@ -329,9 +345,12 @@ impl ThreadActorSystem {
         let (disposed, disposal_timed_out) =
             super::stop_deadline::join_until(disposal, deadline, || {
                 control.cancel();
-                completion.send_replace(Some(StopOutcome::TimedOut(format!(
-                    "factory disposal for {path} exceeded configured deadline"
-                ))));
+                crate::owned_payload::publish_watch(
+                    &completion,
+                    StopOutcome::TimedOut(format!(
+                        "factory disposal for {path} exceeded configured deadline"
+                    )),
+                );
             })
             .await;
         timed_out |= disposal_timed_out;
@@ -401,9 +420,9 @@ impl ThreadActorSystem {
                 .and(notified),
         );
         if !timed_out {
-            completion.send_replace(Some(outcome.clone()));
+            crate::owned_payload::publish_watch(&completion, outcome.clone());
         }
-        retired_sender.send_replace(Some(outcome));
+        crate::owned_payload::publish_watch(&retired_sender, outcome);
         notification.await;
     }
 

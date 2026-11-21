@@ -160,7 +160,7 @@ impl Recovery {
         state.error = Some(error.clone());
         state.cancelled = cancelled;
         self.control.cancel();
-        self.progress.send_replace(Progress::Aborted(error));
+        crate::owned_payload::publish_watch_value(&self.progress, Progress::Aborted(error));
     }
     pub(crate) fn is_committed(&self) -> bool {
         self.state.lock().unwrap().committed
@@ -189,7 +189,10 @@ impl Recovery {
                         state.committed = true;
                         commit = true;
                     } else {
-                        self.progress.send_replace(Progress::Phase(state.phase));
+                        crate::owned_payload::publish_watch_value(
+                            &self.progress,
+                            Progress::Phase(state.phase),
+                        );
                     }
                 }
                 None
@@ -206,7 +209,7 @@ impl Recovery {
                 publish();
             }
             self.release(true);
-            self.progress.send_replace(Progress::Active);
+            crate::owned_payload::publish_watch_value(&self.progress, Progress::Active);
         }
         let mut guard = ArrivalGuard {
             recovery: self.clone(),
