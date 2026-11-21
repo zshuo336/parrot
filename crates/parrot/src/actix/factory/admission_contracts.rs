@@ -98,9 +98,11 @@ impl Actor for Probe {
             if self.child_in_init {
                 let counts = self.counts.clone();
                 let result = ctx.spawner().spawn_factory(move || probe(&counts)).await;
-                let ActorError::Other(error) =
-                    result.err().expect("parent init must not wait on itself")
-                else {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("parent init must not wait on itself"),
+                };
+                let ActorError::Other(error) = error else {
                     panic!("recoverable factory error expected")
                 };
                 let error = error
