@@ -20,6 +20,9 @@ use crate::thread::scheduler::queue::SchedulingQueue;
 #[path = "configuration_contracts.rs"]
 mod configuration_contracts;
 #[cfg(test)]
+#[path = "poll_retirement_contracts.rs"]
+mod poll_retirement_contracts;
+#[cfg(test)]
 #[path = "shutdown_contracts.rs"]
 mod shutdown_contracts;
 
@@ -771,6 +774,10 @@ impl SharedThreadPool {
                 failures.join(retirement.await, false);
             }
             while closing.next().await.is_some() {}
+            // Worker task joins do not imply that a cancelled user future's
+            // destructor has run. Wait for the tracked OwnedPayload receipt
+            // before publishing the pool's terminal shutdown state.
+            super::worker::await_isolated_cleanups().await;
             status.store(SchedulerStatus::Shutdown as usize, Ordering::Release);
             sender.send_replace(Some(failures.result()));
         });

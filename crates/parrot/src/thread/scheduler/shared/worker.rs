@@ -10,7 +10,7 @@ use futures::{
     task::{ArcWake, waker_ref},
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
@@ -705,6 +705,49 @@ struct IsolatedFuture<F: Future + Send + 'static> {
     runtime: tokio::runtime::Handle,
     cleanup_slots: Arc<Semaphore>,
 }
+
+/// Process-owned completion accounting for futures cancelled by a scheduler
+/// worker. A worker task can be aborted before its `OwnedPayload` cleanup has
+/// actually run; shutdown must wait for that real disposal receipt rather than
+/// publishing success when only the worker task has stopped.
+struct IsolatedCleanupTracker {
+    pending: AtomicUsize,
+    changed: Notify,
+}
+static ISOLATED_CLEANUPS: OnceLock<Arc<IsolatedCleanupTracker>> = OnceLock::new();
+
+fn isolated_cleanup_tracker() -> Arc<IsolatedCleanupTracker> {
+    ISOLATED_CLEANUPS
+        .get_or_init(|| {
+            Arc::new(IsolatedCleanupTracker {
+                pending: AtomicUsize::new(0),
+                changed: Notify::new(),
+            })
+        })
+        .clone()
+}
+
+pub(crate) async fn await_isolated_cleanups() {
+    let tracker = isolated_cleanup_tracker();
+    loop {
+        let changed = tracker.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if tracker.pending.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        changed.await;
+    }
+}
+
+struct IsolatedCleanupGuard(Arc<IsolatedCleanupTracker>);
+impl Drop for IsolatedCleanupGuard {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_waiters();
+    }
+}
+
 impl<F> IsolatedFuture<F>
 where
     F: Future + Send + 'static,
@@ -728,14 +771,32 @@ impl<F: Future + Send + 'static> Drop for IsolatedFuture<F> {
     fn drop(&mut self) {
         if let Some(future) = self.future.take() {
             // A cancelled future may be one of many actor-owned captures.
-            // OwnedPayload bounds both active cleanup workers and pending
-            // owners. Its async bridge also avoids re-entering spawn_blocking
-            // from a queued blocking-pool destructor.
-            drop(crate::owned_payload::OwnedPayload::new(
+            // Transfer it to the bounded cleanup owner and retain its receipt
+            // until the actual destructor has completed. Shared-pool shutdown
+            // waits on this same process-owned counter.
+            let payload = crate::owned_payload::OwnedPayload::new(
                 CaughtDisposal(Some(future)),
                 &self.runtime,
                 &self.cleanup_slots,
-            ));
+            );
+            let receipt = payload.retire();
+            let tracker = isolated_cleanup_tracker();
+            tracker.pending.fetch_add(1, Ordering::AcqRel);
+            let guard = IsolatedCleanupGuard(tracker);
+            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.runtime.spawn(async move {
+                    let _ = receipt.await;
+                    drop(guard);
+                })
+            }));
+            if dispatched.is_err() {
+                // A runtime that is already closing cannot execute the
+                // observer. Do not retain a false in-flight count forever;
+                // the original OwnedPayload still owns its cleanup receipt.
+                if let Err(payload) = dispatched {
+                    let _ = crate::owned_payload::panic_message(payload);
+                }
+            }
         }
     }
 }
