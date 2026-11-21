@@ -213,7 +213,7 @@ where
         match self.system.upgrade() {
             Some(system) => crate::owned_payload::OwnedPayload::new(
                 value,
-                &system.runtime_handle,
+                system.retirement_runtime(),
                 &system.cleanup_slots,
             ),
             None => crate::owned_payload::OwnedPayload::unbound(value),

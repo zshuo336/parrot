@@ -104,7 +104,11 @@ pub(crate) async fn pending_cleanup_permit(active: &Arc<Semaphore>) -> PendingCl
 }
 
 #[cfg(test)]
+mod host_exit_contracts;
+#[cfg(test)]
 mod publication_contracts;
+#[cfg(test)]
+mod saturation_contracts;
 
 std::thread_local! {
     static DISPOSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

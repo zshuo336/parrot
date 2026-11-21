@@ -22,7 +22,7 @@ impl AsyncCohortRuntime for ThreadActorSystem {
         &self,
         strategy: SupervisorStrategyType,
     ) -> BoxedFuture<'_, Result<Arc<dyn AsyncRootCohort>, SystemError>> {
-        let strategy = OwnedPayload::new(strategy, &self.runtime_handle, &self.cleanup_slots);
+        let strategy = OwnedPayload::new(strategy, self.retirement_runtime(), &self.cleanup_slots);
         let system = self.self_arc();
         Box::pin(parrot_api::trace::capture(async move {
             let Some(system) = system else {
@@ -57,12 +57,12 @@ impl AsyncRootCohort for Cohort {
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
         let actor = OwnedPayload::new(
             actor,
-            &self.system.runtime_handle,
+            self.system.retirement_runtime(),
             &self.system.cleanup_slots,
         );
         let config = OwnedPayload::new(
             config,
-            &self.system.runtime_handle,
+            self.system.retirement_runtime(),
             &self.system.cleanup_slots,
         );
         Box::pin(parrot_api::trace::capture(async move {
@@ -99,7 +99,7 @@ impl AsyncRootCohort for Cohort {
     ) -> BoxedFuture<'a, Result<BoxedActorRef, SystemError>> {
         let factory = OwnedPayload::new(
             factory,
-            &self.system.runtime_handle,
+            self.system.retirement_runtime(),
             &self.system.cleanup_slots,
         );
         Box::pin(parrot_api::trace::capture(async move {

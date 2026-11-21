@@ -1736,7 +1736,11 @@ impl ThreadActorSystem {
         msg: BoxedMessage,
     ) -> impl std::future::Future<Output = Result<(), SystemError>> + Send + '_ {
         let source = crate::broadcast::Input::new(
-            crate::owned_payload::OwnedPayload::new(msg, &self.runtime_handle, &self.cleanup_slots),
+            crate::owned_payload::OwnedPayload::new(
+                msg,
+                self.retirement_runtime(),
+                &self.cleanup_slots,
+            ),
             self.factory_slots.clone(),
         );
         parrot_api::trace::capture(self.broadcast_cloning(source, |msg| {
@@ -2557,7 +2561,11 @@ impl ActorSystem for ThreadActorSystem {
         Self: 'async_trait,
     {
         let source = crate::broadcast::Input::new(
-            crate::owned_payload::OwnedPayload::new(msg, &self.runtime_handle, &self.cleanup_slots),
+            crate::owned_payload::OwnedPayload::new(
+                msg,
+                self.retirement_runtime(),
+                &self.cleanup_slots,
+            ),
             self.factory_slots.clone(),
         );
         Box::pin(parrot_api::trace::capture(async move {

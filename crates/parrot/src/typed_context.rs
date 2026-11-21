@@ -191,7 +191,7 @@ impl TypedTree {
             identity,
             hooks,
             system.config().shutdown_timeout,
-            system.runtime_handle.clone(),
+            system.retirement_runtime().clone(),
             system.cleanup_slots.clone(),
             system.cleanup_slots.clone(),
         )

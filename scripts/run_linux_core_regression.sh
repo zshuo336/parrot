@@ -35,7 +35,7 @@ run_stage build-target python3 scripts/project_inputs.py build-target --root . -
 if [[ "$FAILED" != 0 ]]; then exit "$FAILED"; fi
 CARGO_TARGET_DIR=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["target_dir"])' "$OUT/build-target.log")
 export CARGO_TARGET_DIR
-tests=(--lib --test test_actix_root_creation_capacity --test test_actix_local_creation_capacity --test test_thread_actor_configuration --test test_native_instance_inputs
+tests=(--lib --test test_broadcast_ownership --test test_actix_root_creation_capacity --test test_actix_local_creation_capacity --test test_thread_actor_configuration --test test_native_instance_inputs
     --test test_thread_initialization_trace --test test_root_cohort
     --test test_root_cohort_host_exit --test test_runtime_root_cohort
     --test test_retirement_receipts --test test_shutdown_deadline
