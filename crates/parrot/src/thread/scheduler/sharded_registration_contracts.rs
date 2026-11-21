@@ -142,6 +142,27 @@ async fn receive(replies: &mut Replies) -> Result<(u64, ThreadId), tokio::time::
     .await
 }
 
+#[test]
+fn closed_shard_wake_releases_the_acquired_schedule_slot() {
+    let (mailbox, _, _) = mailbox(false);
+    let (tx, rx) = flume::unbounded();
+    drop(rx);
+    let (stop_tx, _stop_rx) = flume::unbounded();
+    let mailbox_trait: Arc<dyn Mailbox> = mailbox.clone();
+    let registration = ShardRegistration {
+        active: Arc::new(AtomicBool::new(true)),
+        mailbox: Arc::downgrade(&mailbox_trait),
+        shard: Arc::new(Shard { tx, stop_tx }),
+    };
+
+    assert!(!registration.enqueue());
+    assert!(
+        mailbox.schedule_state().try_enqueue(),
+        "a failed shard send must return scheduling ownership"
+    );
+    mailbox.schedule_state().force_release();
+}
+
 #[tokio::test]
 async fn queued_registration_hands_its_slot_to_a_new_registration_without_another_send() {
     let gate = Gate::default();

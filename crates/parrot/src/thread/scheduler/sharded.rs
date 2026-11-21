@@ -297,13 +297,24 @@ impl ShardRegistration {
         if !self.active.load(Ordering::Acquire) {
             return false;
         }
-        if let Some(mailbox) = self.mailbox.upgrade()
-            && mailbox.schedule_state().try_enqueue()
+        let Some(mailbox) = self.mailbox.upgrade() else {
+            return true;
+        };
+        if mailbox.schedule_state().try_enqueue()
+            && self
+                .shard
+                .tx
+                .send(ShardItem {
+                    mailbox: mailbox.clone(),
+                    active: self.active.clone(),
+                })
+                .is_err()
         {
-            let _ = self.shard.tx.send(ShardItem {
-                mailbox,
-                active: self.active.clone(),
-            });
+            // The send owns the scheduling slot only after the item is
+            // accepted. A closed shard must give that ownership back so a
+            // later registration can acquire it and report the failure.
+            mailbox.schedule_state().force_release();
+            return false;
         }
         true
     }
@@ -643,34 +654,66 @@ impl ShardedScheduler {
         let shutting = self.shutdown.clone();
         let assigned = Arc::downgrade(&self.assigned);
         let path = path.to_owned();
-        mailbox.set_wake_hook(Arc::new(move || {
-            if shutting.load(Ordering::Acquire) {
-                return;
-            }
-            if !registration.enqueue()
-                && let Some(assigned) = assigned.upgrade()
+        let rollback_active = active.clone();
+        let rollback_path = path.clone();
+        let rollback_assigned = self.assigned.clone();
+        let rollback = move || {
+            rollback_active.store(false, Ordering::Release);
+            let mut assigned = rollback_assigned.lock().unwrap();
+            if assigned
+                .get(rollback_path.as_str())
+                .is_some_and(|current| Arc::ptr_eq(&current.active, &rollback_active))
             {
-                // A slow old set_wake_hook can complete after a replacement.
-                // Follow only that same mailbox, never a reused path's actor.
-                let current = assigned
-                    .lock()
-                    .unwrap()
-                    .get(&path)
-                    .filter(|current| Weak::ptr_eq(&current.mailbox, &registration.mailbox))
-                    .cloned();
-                if let Some(current) = current {
-                    current.enqueue();
-                }
+                assigned.remove(rollback_path.as_str());
             }
+        };
+        let hook_path = path.clone();
+
+        let hook_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mailbox.set_wake_hook(Arc::new(move || {
+                if shutting.load(Ordering::Acquire) {
+                    return;
+                }
+                if !registration.enqueue()
+                    && let Some(assigned) = assigned.upgrade()
+                {
+                    // A slow old set_wake_hook can complete after a replacement.
+                    // Follow only that same mailbox, never a reused path's actor.
+                    let current = assigned
+                        .lock()
+                        .unwrap()
+                        .get(&hook_path)
+                        .filter(|current| Weak::ptr_eq(&current.mailbox, &registration.mailbox))
+                        .cloned();
+                    if let Some(current) = current {
+                        current.enqueue();
+                    }
+                }
+            }));
         }));
+        if let Err(payload) = hook_result {
+            rollback();
+            return Err(format!(
+                "failed to install sharded scheduler wake hook for {path}: {}",
+                crate::owned_payload::panic_message(payload)
+            ));
+        }
 
         // Initial enqueue so an already-nonempty mailbox is drained.
         if mailbox.schedule_state().try_enqueue() {
             let shard = self.shards[idx].clone();
-            let _ = shard.tx.send(ShardItem {
-                mailbox: mailbox.clone(),
-                active,
-            });
+            if shard
+                .tx
+                .send(ShardItem {
+                    mailbox: mailbox.clone(),
+                    active: active.clone(),
+                })
+                .is_err()
+            {
+                mailbox.schedule_state().force_release();
+                rollback();
+                return Err("shard worker channel closed during registration".into());
+            }
         }
         Ok(())
     }

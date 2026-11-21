@@ -46,6 +46,15 @@ impl WorkerManager {
         path: String,
         mailbox: Arc<dyn Mailbox>,
     ) -> Result<(), crate::thread::error::SystemError> {
+        self.schedule_mailbox_after_register(path, mailbox, || {})
+    }
+
+    fn schedule_mailbox_after_register(
+        &self,
+        path: String,
+        mailbox: Arc<dyn Mailbox>,
+        after_register: impl FnOnce(),
+    ) -> Result<(), crate::thread::error::SystemError> {
         let queue = self
             .scheduling_queue
             .as_ref()
@@ -60,10 +69,24 @@ impl WorkerManager {
             if !queue.register(&mailbox) {
                 return Err(crate::thread::error::SystemError::ShuttingDown);
             }
-            scheduled.insert(path, mailbox.clone());
+            scheduled.insert(path.clone(), mailbox.clone());
         }
-        if mailbox.schedule_state().try_enqueue() {
-            queue.enqueue_registered(mailbox, crate::thread::scheduler::queue::Lane::Normal);
+        after_register();
+        if mailbox.schedule_state().try_enqueue()
+            && !queue.enqueue_registered(
+                mailbox.clone(),
+                crate::thread::scheduler::queue::Lane::Normal,
+            )
+        {
+            queue.unregister(&mailbox);
+            let mut scheduled = self.scheduled.lock().unwrap();
+            if scheduled
+                .get(&path)
+                .is_some_and(|current| Arc::ptr_eq(current, &mailbox))
+            {
+                scheduled.remove(&path);
+            }
+            return Err(crate::thread::error::SystemError::ShuttingDown);
         }
         Ok(())
     }
@@ -108,5 +131,37 @@ impl WorkerManager {
             .iter()
             .filter(|s| matches!(s.load(Ordering::Relaxed), 0 | 4))
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::mailbox::mpsc::MpscMailbox;
+    use parrot_api::address::ActorPath;
+
+    #[test]
+    fn schedule_rolls_back_when_queue_closes_after_registration() {
+        let queue = Arc::new(SchedulingQueue::new(4));
+        let manager = WorkerManager::new(queue.clone());
+        let mailbox: Arc<dyn Mailbox> = Arc::new(MpscMailbox::new(
+            4,
+            ActorPath::placeholder("worker-manager"),
+        ));
+
+        let result = manager.schedule_mailbox_after_register(
+            "worker-manager".into(),
+            mailbox.clone(),
+            || queue.close(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(crate::thread::error::SystemError::ShuttingDown)
+        ));
+        assert_eq!(manager.processor_count(), 0);
+        assert!(!manager.is_scheduled("worker-manager"));
+        assert!(mailbox.schedule_state().try_enqueue());
+        mailbox.schedule_state().force_release();
     }
 }
