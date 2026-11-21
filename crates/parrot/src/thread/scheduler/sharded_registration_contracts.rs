@@ -195,6 +195,38 @@ async fn queued_registration_hands_its_slot_to_a_new_registration_without_anothe
 }
 
 #[tokio::test]
+async fn shutdown_drains_queued_slot_for_mailbox_reuse_by_a_new_scheduler() {
+    let gate = Gate::default();
+    let release = ReleaseGate(gate.clone());
+    let old = ShardedScheduler::start_with_startup(1, 1, move || gate.wait());
+    let (mailbox, processor, mut replies) = mailbox(false);
+    mailbox
+        .push(Box::new(23u64), BackpressureStrategy::Block)
+        .await
+        .unwrap();
+    old.schedule_affinity("/reuse", mailbox.clone(), "old")
+        .unwrap();
+    assert_eq!(old.shard_lengths(), vec![1], "item must remain queued");
+    old.deschedule("/reuse").unwrap();
+
+    // Stop the old worker while its queue is still blocked at startup. The
+    // item must be retired by the worker's shutdown drain, not by processing.
+    old.request_shutdown();
+    drop(release);
+    old.shutdown_result().unwrap();
+
+    let new = ShardedScheduler::start(1, 1);
+    new.schedule_affinity("/reuse", mailbox, "new").unwrap();
+    let reply = receive(&mut replies).await.unwrap();
+    new.shutdown_result().unwrap();
+
+    assert_eq!(reply.0, 23);
+    assert_eq!(processor.initialized.load(Ordering::SeqCst), 1);
+    assert_eq!(processor.max_live.load(Ordering::SeqCst), 1);
+    assert_eq!(processor.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn running_registration_hands_pending_work_to_the_new_owner_without_overlap() {
     let scheduler = ShardedScheduler::start(2, 1);
     let old_key = "old";

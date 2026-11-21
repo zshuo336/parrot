@@ -626,9 +626,6 @@ impl ShardedScheduler {
         mailbox: Arc<dyn Mailbox>,
         affinity_key: &str,
     ) -> Result<(), String> {
-        if self.shutdown.load(Ordering::Relaxed) {
-            return Err("sharded scheduler is shutting down".into());
-        }
         if !mailbox.has_processor() {
             return Err(format!("mailbox for {} has no processor", path));
         }
@@ -642,6 +639,12 @@ impl ShardedScheduler {
         };
         {
             let mut assigned = self.assigned.lock().unwrap();
+            // Admission and shutdown use the same lock so a registration
+            // cannot be published after shutdown has taken ownership of the
+            // existing registrations.
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err("sharded scheduler is shutting down".into());
+            }
             if assigned.contains_key(path) {
                 return Err(format!("actor {path} is already scheduled"));
             }
@@ -857,6 +860,13 @@ impl ShardedScheduler {
     }
     fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        // Invalidate every registration before workers drain their queues.
+        // This lets a queued item hand ownership to a replacement wake hook
+        // when the mailbox is reused by another scheduler.
+        let registrations = std::mem::take(&mut *self.assigned.lock().unwrap());
+        for registration in registrations.values() {
+            registration.active.store(false, Ordering::Release);
+        }
         self.shutdown_notify.notify_waiters();
     }
 
@@ -931,6 +941,25 @@ async fn shard_loop(
         }
     }
     // Dropping the futures cancels suspended actor work on this same thread.
+    // A queued item owns its mailbox scheduling slot even though it never
+    // reached `process_item`. Return that ownership before the worker exits;
+    // otherwise a later scheduler can never acquire the mailbox again.
+    while let Ok(item) = rx.try_recv() {
+        item.mailbox.schedule_state().force_release();
+        let wake = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            item.mailbox.fire_wake_hook();
+        }));
+        if let Err(payload) = wake {
+            let message = crate::owned_payload::panic_message(payload);
+            super::failure_diagnostic(|| {
+                tracing::error!(
+                    path = %item.mailbox.path().path,
+                    %message,
+                    "queued shard wake cleanup panicked"
+                );
+            });
+        }
+    }
 }
 
 // Each acquired schedule slot has one release authority. A failure callback may
