@@ -128,6 +128,49 @@ fn publication_panic_payload_reenters_cleanup_without_secondary_failure() {
 }
 
 #[test]
+fn publication_receipt_waker_panic_does_not_unwind_disposal() {
+    isolated(
+        "owned_payload::publication_contracts::publication_receipt_waker_panic_does_not_unwind_disposal",
+        || {
+            struct WakePanic(AtomicUsize);
+            impl futures::task::ArcWake for WakePanic {
+                fn wake_by_ref(this: &Arc<Self>) {
+                    this.0.fetch_add(1, Ordering::SeqCst);
+                    panic!("publication receipt wake failure");
+                }
+            }
+
+            let runtime = runtime();
+            let slots = Arc::new(Semaphore::new(1));
+            let count = Arc::new(AtomicUsize::new(0));
+            let handle = runtime.handle().clone();
+            runtime.block_on(async {
+                let input = OwnedPayload::new(Counted(count.clone()), &handle, &slots);
+                let mut receipt = input.receipt();
+                let wake = Arc::new(WakePanic(AtomicUsize::new(0)));
+                let waker = futures::task::waker(wake.clone());
+                let mut context = Context::from_waker(&waker);
+                assert!(receipt.as_mut().poll(&mut context).is_pending());
+                drop(input);
+                tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                    while count.load(Ordering::SeqCst) == 0 || wake.0.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+                assert!(matches!(
+                    receipt.as_mut().poll(&mut context),
+                    Poll::Ready(Ok(()))
+                ));
+            });
+        },
+    );
+}
+
+#[test]
 fn publication_transfer_preserves_original_value_without_early_disposal() {
     isolated(
         "owned_payload::publication_contracts::publication_transfer_preserves_original_value_without_early_disposal",

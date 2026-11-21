@@ -209,6 +209,19 @@ pub(crate) fn join_error(error: tokio::task::JoinError) -> String {
     }
 }
 
+fn publish_finished(
+    finished: &watch::Sender<Option<Result<(), String>>>,
+    result: Result<(), String>,
+) {
+    let notified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        finished.send_replace(Some(result));
+    }));
+    if let Err(payload) = notified {
+        let message = panic_message(payload);
+        tracing::warn!(error = %message, "Owned payload cleanup receipt waker panicked");
+    }
+}
+
 // Installed before dispatch: cancellation of an unpolled cleanup task must also
 // retire its value without unwinding through another capture's destructor.
 struct Disposal<T> {
@@ -234,7 +247,7 @@ impl<T> Drop for Disposal<T> {
             drop(self.reservation.take());
             drop(self.pending.take());
             drop(self.global_pending.take());
-            self.finished.send_replace(Some(result));
+            publish_finished(&self.finished, result);
         });
     }
 }
@@ -317,7 +330,7 @@ impl<T: Send + 'static> OwnedPayload<T> {
         let value = self.value.take().expect("unconsumed payload");
         drop(self.reservation.take());
         if let Some(finished) = self.finished.get() {
-            finished.send_replace(Some(Ok(())));
+            publish_finished(finished, Ok(()));
         }
         value
     }
@@ -349,7 +362,7 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
             drop(value);
             drop(self.reservation.take());
             if let Some(finished) = self.finished.get() {
-                finished.send_replace(Some(Ok(())));
+                publish_finished(finished, Ok(()));
             }
             return;
         }
@@ -429,7 +442,7 @@ impl<T: Send + 'static> Drop for OwnedPayload<T> {
             if let Err(error) = result {
                 // Disposal normally publishes the more specific payload result.
                 if finished.borrow().is_none() {
-                    finished.send_replace(Some(Err(error)));
+                    publish_finished(&finished, Err(error));
                 } else {
                     tracing::warn!(error = %error, "cleanup executor dispatch failed; actual disposal receipt retained");
                 }
