@@ -16,6 +16,7 @@ use crate::error::{decode_err_payload, ErrCode};
 use crate::frame::{frame_type, Frame};
 use crate::node::NodeState;
 use crate::registry::{CallbackRegistry, ReplyPayload};
+use crate::topology::hop_forward;
 use crate::transport::FrameSender;
 use tracing::Instrument;
 
@@ -2172,15 +2173,18 @@ impl Ingress {
         else {
             return Some(ErrCode::ActorNotFound);
         };
-        if frame.header.hop_count.saturating_add(1) >= frame.header.hop_limit {
-            back.send_reply(Frame::reply_err(
-                orig_cid,
-                &frame.path,
-                ErrCode::RouteUnreachable,
-                "relay hop limit exhausted",
-            ));
-            return Some(ErrCode::RouteUnreachable);
-        }
+        let next_hop = match hop_forward(frame.header.hop_count, frame.header.hop_limit) {
+            Ok(next_hop) => next_hop,
+            Err(_) => {
+                back.send_reply(Frame::reply_err(
+                    orig_cid,
+                    &frame.path,
+                    ErrCode::RouteUnreachable,
+                    "relay hop limit exhausted",
+                ));
+                return Some(ErrCode::RouteUnreachable);
+            }
+        };
         // ③ 有路由能力但无直连 → RouteUnreachable（比 ActorNotFound 语义准）
         let Some(sender) = router.sender_of(target) else {
             let _ = back
@@ -2219,7 +2223,7 @@ impl Ingress {
         let forward_cid = router.next_cid();
         let mut fwd = frame.clone();
         fwd.header.correlation_id = forward_cid;
-        fwd.header.hop_count = fwd.header.hop_count.saturating_add(1);
+        fwd.header.hop_count = next_hop;
         let fwd = match sender.trace_request(fwd) {
             Ok(frame) => frame,
             Err(error) => {
@@ -2711,9 +2715,9 @@ impl Ingress {
 
     /// hub 转发 TELL（无回程语义——转发成功即完事）。
     fn try_relay_tell(&self, frame: &Frame, back: &FrameSender) -> bool {
-        if frame.header.hop_count.saturating_add(1) >= frame.header.hop_limit {
+        let Ok(next_hop) = hop_forward(frame.header.hop_count, frame.header.hop_limit) else {
             return false;
-        }
+        };
         let Some(target) = target_node(&frame.path) else {
             tracing::debug!(
                 path = %frame.path,
@@ -2738,7 +2742,7 @@ impl Ingress {
             return false;
         };
         let mut fwd = frame.clone();
-        fwd.header.hop_count = fwd.header.hop_count.saturating_add(1);
+        fwd.header.hop_count = next_hop;
         let Ok(fwd) = sender.trace_request(fwd) else {
             return false;
         };
@@ -3054,6 +3058,38 @@ mod tests {
             frame_type::REPLY_ERR
         );
         assert!(frames.try_recv().is_err());
+
+        // The relay gate must remain correct at the largest representable
+        // hop values; a saturating increment must never turn an exhausted
+        // frame into an admissible one.
+        let mut near_max = Frame::ask(
+            8,
+            "parrot://host/user/alias",
+            "unknown:business",
+            payload.clone(),
+            None,
+        );
+        near_max.header.hop_count = 253;
+        near_max.header.hop_limit = u8::MAX;
+        ingress.on_request(near_max, &back).await;
+        assert_eq!(frames.recv().await.unwrap().header.hop_count, 254);
+
+        let mut maxed = Frame::ask(
+            9,
+            "parrot://host/user/alias",
+            "unknown:business",
+            payload.clone(),
+            None,
+        );
+        maxed.header.hop_count = 254;
+        maxed.header.hop_limit = u8::MAX;
+        ingress.on_request(maxed, &back).await;
+        assert_eq!(
+            replies.recv().await.unwrap().header.frame_type,
+            frame_type::REPLY_ERR
+        );
+        assert!(frames.try_recv().is_err());
+
         for frame in [
             Frame::tell("/user/alias", "unknown:business", payload.clone()),
             Frame::stop("parrot://host/user/alias"),
@@ -3079,6 +3115,22 @@ mod tests {
             assert_eq!(forwarded.header.frame_type, kind);
             assert_eq!(forwarded.header.hop_count, 1);
         }
+
+        let mut near_max_tell = Frame::tell(
+            "parrot://other/user/alias",
+            "unknown:business",
+            payload.clone(),
+        );
+        near_max_tell.header.hop_count = 253;
+        near_max_tell.header.hop_limit = u8::MAX;
+        ingress.tell_deliver_or_relay(near_max_tell, &back).await;
+        assert_eq!(frames.recv().await.unwrap().header.hop_count, 254);
+
+        let mut maxed_tell = Frame::tell("parrot://other/user/alias", "unknown:business", payload);
+        maxed_tell.header.hop_count = 254;
+        maxed_tell.header.hop_limit = u8::MAX;
+        ingress.tell_deliver_or_relay(maxed_tell, &back).await;
+        assert!(frames.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 //! Owned MQTT ingress for one explicitly authorized producer and receiver.
 use super::{key_to_topic, TOPIC_PREFIX};
+use crate::topology::hop_forward;
 use crate::{
     durable::{
         DurableEnvelope, DurableOutbox, OutboxConfig, OutboxHandle, DURABLE_KEY,
@@ -308,12 +309,14 @@ fn decode(config: &BridgeConfig, publish: &Publish) -> Result<Work, BridgeError>
         || frame.header.frame_type != frame_type::TELL
         || frame.path != config.target()
         || frame.header.seq != 0
-        || frame.header.hop_count.saturating_add(1) >= frame.header.hop_limit
     {
         return Err(invalid(
             "one TELL to the configured target with a remaining hop is required",
         ));
     }
+    let next_hop = hop_forward(frame.header.hop_count, frame.header.hop_limit).map_err(|_| {
+        invalid("one TELL to the configured target with a remaining hop is required")
+    })?;
     frame
         .validate_payload_flags()
         .map_err(|_| invalid("unsupported Wire payload flags"))?;
@@ -324,7 +327,7 @@ fn decode(config: &BridgeConfig, publish: &Publish) -> Result<Work, BridgeError>
         {
             return Err(invalid("QoS0 requires an ordinary unreceipted TELL"));
         }
-        frame.header.hop_count += 1;
+        frame.header.hop_count = next_hop;
         Ok(Work::Tell(frame))
     } else {
         if frame.header.flags != flags::TELL_ACK
