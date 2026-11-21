@@ -822,7 +822,7 @@ impl SharedThreadPool {
             // owners before publishing its terminal shutdown state.
             cleanups.wait().await;
             status.store(SchedulerStatus::Shutdown as usize, Ordering::Release);
-            sender.send_replace(Some(failures.result()));
+            crate::owned_payload::publish_watch(&sender, failures.result());
         });
         receiver
     }
