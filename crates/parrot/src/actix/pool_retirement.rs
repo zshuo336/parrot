@@ -28,6 +28,15 @@ struct HelperJoin {
     scheduled: AtomicBool,
     changed: Condvar,
 }
+type FallbackOwner = Arc<
+    Mutex<
+        Option<(
+            std::thread::JoinHandle<()>,
+            Arc<Mutex<Vec<NativeWorkerReservation>>>,
+            watch::Sender<Option<Exit>>,
+        )>,
+    >,
+>;
 struct HelperJoinJob {
     owner: Arc<HelperJoin>,
 }
@@ -121,6 +130,24 @@ impl HelperJoin {
             });
         });
     }
+
+    /// Finish an owner when the independent fallback thread could not be
+    /// created. A non-owner caller can safely join synchronously; only the
+    /// worker itself must retain the handle to avoid joining itself.
+    fn finish_fallback(owner: FallbackOwner) {
+        let Some((thread, reservations, finished)) = owner.lock().unwrap().take() else {
+            return;
+        };
+        if thread.thread().id() == std::thread::current().id() {
+            *owner.lock().unwrap() = Some((thread, reservations, finished));
+            // There is no safe synchronous self-join. Keep the exact owner
+            // alive until the process/runtime can make progress.
+            std::mem::forget(owner);
+            return;
+        }
+        let result = Self::join_thread(thread, &reservations);
+        finished.send_replace(Some(result));
+    }
 }
 impl Drop for HelperJoin {
     fn drop(&mut self) {
@@ -150,9 +177,7 @@ impl Drop for HelperJoin {
                 })
         }));
         if !matches!(spawned, Ok(Ok(_))) {
-            // There is no safe synchronous fallback from a destructor. Keep
-            // the exact join owner and its native leases alive for teardown.
-            std::mem::forget(owner);
+            Self::finish_fallback(owner);
         }
     }
 }

@@ -620,3 +620,24 @@ fn saturated_cancelled_waiter_releases_completed_helper_after_synchronous_takeov
         },
     );
 }
+
+#[test]
+fn failed_fallback_thread_creation_is_joined_by_a_non_owner() {
+    let (finished, mut receipt) = watch::channel(None);
+    let reservations = Arc::new(Mutex::new(Vec::new()));
+    let (started, receive_started) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started.send(()).unwrap();
+    });
+    receive_started.recv_timeout(WAIT).unwrap();
+    let owner: FallbackOwner = Arc::new(Mutex::new(Some((worker, reservations, finished))));
+    let weak = Arc::downgrade(&owner);
+
+    // Simulate the Builder::spawn failure branch. The current test thread is
+    // not the worker, so synchronous takeover is safe and must publish the
+    // same terminal receipt instead of forgetting the OS handle.
+    HelperJoin::finish_fallback(owner);
+
+    assert!(weak.upgrade().is_none());
+    assert_eq!(receipt.borrow_and_update().clone(), Some(Ok(())));
+}
