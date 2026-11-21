@@ -906,8 +906,10 @@ impl DylibLoader {
     /// Inspect ELF/Mach-O symbols without executing code or spawning `nm`.
     /// A missing, malformed, unsupported or insufficiently inspectable artifact
     /// is an error, never a clean result. This conservative diagnostic rejects
-    /// component TLS storage; it cannot prove whether a destructor is registered.
-    /// Rust std's own named TLS is exempt. Native code still requires trust.
+    /// every component TLS allocation and thread-destructor registration. Rust
+    /// standard-library TLS is not exempt: unloading a Rust cdylib after it
+    /// registered a TLS destructor can jump into unmapped code on thread exit.
+    /// Native code still requires trust.
     pub fn scan_violations(path: &Path) -> Result<Vec<Violation>, LoadError> {
         Self::scan_violations_with_limits(path, NativeArtifactLimits::default())
     }
@@ -952,39 +954,6 @@ unsafe fn same_symbol_image(first: *const (), second: *const ()) -> bool {
 #[cfg(not(unix))]
 unsafe fn same_symbol_image(_first: *const (), _second: *const ()) -> bool {
     true
-}
-
-fn is_std_tls(name: &str) -> bool {
-    use std::fmt::Write;
-    struct Prefix {
-        bytes: [u8; 6],
-        used: usize,
-    }
-    impl std::fmt::Write for Prefix {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            let n = (6 - self.used).min(text.len());
-            self.bytes[self.used..self.used + n].copy_from_slice(&text.as_bytes()[..n]);
-            self.used += n;
-            if self.used == 6 {
-                Err(std::fmt::Error)
-            } else {
-                Ok(())
-            }
-        }
-    }
-    let mut prefix = Prefix {
-        bytes: [0; 6],
-        used: 0,
-    };
-    // Deliberately stop formatting after six bytes. No expanded owned string
-    // is needed merely to recognize std's root path. rustc-demangle validates
-    // v0 backrefs without expanding their targets before formatting.
-    let _ = write!(
-        &mut prefix,
-        "{:#}",
-        rustc_demangle::demangle(name.strip_suffix("$tlv$init").unwrap_or(name))
-    );
-    prefix.bytes[..5] == *b"std::" || prefix.bytes == *b"<std::"
 }
 
 fn scan_bytes(bytes: &[u8], limits: NativeArtifactLimits) -> Result<Vec<Violation>, LoadError> {
@@ -1035,6 +1004,11 @@ fn scan_bytes(bytes: &[u8], limits: NativeArtifactLimits) -> Result<Vec<Violatio
             let violation = match base {
                 "pthread_create" => Some(ViolationKind::Thread),
                 "signal" | "sigaction" | "sigsetjmp" | "__sigsetjmp" => Some(ViolationKind::Signal),
+                "__tlv_atexit"
+                | "__cxa_thread_atexit"
+                | "__cxa_thread_atexit_impl"
+                | "_tls_used"
+                | "__dyn_tls_init_callback" => Some(ViolationKind::Tls),
                 _ => None,
             };
             if let Some(violation) = violation {
@@ -1072,11 +1046,10 @@ fn scan_bytes(bytes: &[u8], limits: NativeArtifactLimits) -> Result<Vec<Violatio
                 if let Some(index) = symbol.section_index() {
                     tls_symbols.insert(index);
                 }
-                if !is_std_tls(name) {
-                    // Borrow names while scanning; copy only distinct findings
-                    // after all budgets and parse checks have succeeded.
-                    violations.insert((ViolationKind::Tls, name));
-                }
+                // Borrow names while scanning; copy only distinct findings
+                // after all budgets and parse checks have succeeded. Standard
+                // library TLS is intentionally included for unload safety.
+                violations.insert((ViolationKind::Tls, name));
             }
         }
     }
@@ -1138,21 +1111,6 @@ mod artifact_read_tests {
 #[cfg(test)]
 mod inflight_tests {
     use super::*;
-
-    #[test]
-    fn standard_library_method_tls_is_distinguished_from_component_tls() {
-        let symbol = "__RNvNCNKNvNvMNtNtCs82bWklYMk3w_3std4hash6randomNtBa_11RandomState3new4KEYS0s_023___RUST_STD_INTERNAL_VAL";
-        assert!(is_std_tls(symbol), "{:#}", rustc_demangle::demangle(symbol));
-        assert!(is_std_tls(&format!("{symbol}$tlv$init")));
-        for name in [
-            "guest::std::TLS",
-            "<guest::Foo as std::Trait>::TLS",
-            "std_like::TLS",
-            "<std_like::Foo>::TLS",
-        ] {
-            assert!(!is_std_tls(name), "{name}");
-        }
-    }
 
     #[test]
     fn cleanup_observes_an_admitted_call_before_draining() {

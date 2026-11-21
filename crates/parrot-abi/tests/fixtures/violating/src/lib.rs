@@ -11,6 +11,28 @@ use parrot_abi::{
     AbiComponent, AbiHooks, AbiMeta, AbiMsg, AbiReplyBuf, AbiStr, AbiVt, ABI_OK, PARROT_ABI_VERSION,
 };
 
+// Keep the forbidden thread-creation symbol in the component image itself.
+// Dynamic libstd is required for unload-safe Rust fixtures, so relying on
+// std::thread's transitive libc reference would make this test compiler/linker
+// dependent rather than a deterministic scanner contract.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn pthread_create(
+        thread: *mut usize,
+        attr: *const core::ffi::c_void,
+        start: Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void>,
+        arg: *mut core::ffi::c_void,
+    ) -> i32;
+}
+#[cfg(unix)]
+#[used]
+static KEEP_PTHREAD_CREATE: unsafe extern "C" fn(
+    *mut usize,
+    *const core::ffi::c_void,
+    Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void>,
+    *mut core::ffi::c_void,
+) -> i32 = pthread_create;
+
 thread_local! {
     /// 带析构的 TLS（dtor 引用 __tlv_atexit——禁止清单目标）。
     static MARK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };

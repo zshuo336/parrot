@@ -205,7 +205,7 @@ fn exact_scan_budgets_succeed_and_each_exhausted_budget_fails_closed() {
 }
 
 #[test]
-fn std_tls_prefix_exemption_preserves_owned_and_unknown_tls_rejection() {
+fn standard_library_tls_is_rejected_for_unload_safety() {
     let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let artifact = elf(&[
         "_ZN3std3fooE",
@@ -214,12 +214,22 @@ fn std_tls_prefix_exemption_preserves_owned_and_unknown_tls_rejection() {
         "_ZN3std13foo$LT$u8$GT$E$tlv$init",
         "component_tls",
     ]);
-    assert_eq!(
-        DylibLoader::scan_violations(&artifact.0).unwrap(),
-        vec![Violation::TlsDestructor {
-            symbol: "component_tls".into()
-        }]
-    );
+    let violations = DylibLoader::scan_violations(&artifact.0).unwrap();
+    assert_eq!(violations.len(), 5);
+    for symbol in [
+        "_ZN3std3fooE",
+        "_RNvC3std3foo",
+        "_ZN3std13foo$LT$u8$GT$E",
+        "_ZN3std13foo$LT$u8$GT$E$tlv$init",
+        "component_tls",
+    ] {
+        assert!(
+            violations.contains(&Violation::TlsDestructor {
+                symbol: symbol.into()
+            }),
+            "TLS symbol {symbol} must not be exempted"
+        );
+    }
     let stripped = elf(&[]);
     assert!(matches!(
         DylibLoader::scan_violations(&stripped.0),

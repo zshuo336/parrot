@@ -31,9 +31,25 @@ fn build_fixtures() -> PathBuf {
     }
     // Always let Cargo check source/dependency freshness. Existing binaries do
     // not prove they were built from the current fixture and ABI source.
-    let out = std::process::Command::new("cargo")
+    let mut out = std::process::Command::new("cargo");
+    // A Rust cdylib must not carry its own std TLS destructor image when the
+    // host supports unload. Keep libstd in the shared runtime so the loader's
+    // conservative TLS scan can reject only genuinely unload-unsafe artifacts.
+    let rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    let rustflags = if rustflags
+        .split_whitespace()
+        .any(|flag| flag == "prefer-dynamic")
+    {
+        rustflags
+    } else if rustflags.is_empty() {
+        "-C prefer-dynamic".to_owned()
+    } else {
+        format!("{rustflags} -C prefer-dynamic")
+    };
+    let out = out
         .args(["build", "--locked", "--release", "--target-dir"])
         .arg(root.join("target"))
+        .env("RUSTFLAGS", rustflags)
         .current_dir(&root)
         .output()
         .expect("spawn cargo for fixture build");
