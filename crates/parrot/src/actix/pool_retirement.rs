@@ -37,6 +37,20 @@ impl Drop for HelperJoinJob {
     }
 }
 impl HelperJoin {
+    fn join_thread(
+        thread: std::thread::JoinHandle<()>,
+        reservations: &Arc<Mutex<Vec<NativeWorkerReservation>>>,
+    ) -> Exit {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| thread.join()))
+            .map_err(crate::owned_payload::panic_message)
+            .and_then(|result| result.map_err(crate::owned_payload::panic_message))
+            .map_err(|message| format!("Actix retirement thread failed: {message}"));
+        for reservation in reservations.lock().unwrap().drain(..) {
+            reservation.release_after_join();
+        }
+        result
+    }
+
     fn join_blocking(&self) {
         let mut slot = self.thread.lock().unwrap();
         let Some(thread) = slot.take() else {
@@ -46,13 +60,7 @@ impl HelperJoin {
             return;
         };
         drop(slot);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| thread.join()))
-            .map_err(crate::owned_payload::panic_message)
-            .and_then(|result| result.map_err(crate::owned_payload::panic_message))
-            .map_err(|message| format!("Actix retirement thread failed: {message}"));
-        for reservation in self.reservations.lock().unwrap().drain(..) {
-            reservation.release_after_join();
-        }
+        let result = Self::join_thread(thread, &self.reservations);
         let _slot = self.thread.lock().unwrap();
         self.finished.send_replace(Some(result));
         self.changed.notify_all();
@@ -103,6 +111,40 @@ impl HelperJoin {
                 .await;
             });
         });
+    }
+}
+impl Drop for HelperJoin {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.get_mut().unwrap().take() else {
+            return;
+        };
+
+        // A lifecycle task can be cancelled before it creates HelperJoinJob.
+        // Keep the native handle and reservations owned by an independent OS
+        // joiner instead of allowing JoinHandle::drop to detach the thread.
+        let owner = Arc::new(Mutex::new(Some((
+            thread,
+            self.reservations.clone(),
+            self.finished.clone(),
+        ))));
+        let queued = owner.clone();
+        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::Builder::new()
+                .name("parrot-actix-retire-fallback".into())
+                .spawn(move || {
+                    let Some((thread, reservations, finished)) = queued.lock().unwrap().take()
+                    else {
+                        return;
+                    };
+                    let result = Self::join_thread(thread, &reservations);
+                    finished.send_replace(Some(result));
+                })
+        }));
+        if !matches!(spawned, Ok(Ok(_))) {
+            // There is no safe synchronous fallback from a destructor. Keep
+            // the exact join owner and its native leases alive for teardown.
+            std::mem::forget(owner);
+        }
     }
 }
 

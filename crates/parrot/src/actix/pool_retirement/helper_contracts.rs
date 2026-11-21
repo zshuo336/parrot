@@ -340,6 +340,41 @@ fn last_retirement_owner_without_runtime_keeps_actual_helper_join() {
     assert_eq!(fixture.worker_disposed.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn orphaned_helper_owner_keeps_actual_join_and_native_lease() {
+    let gate = Arc::new(Gate::default());
+    let (joined, receive_joined) = mpsc::channel();
+    let moved_gate = gate.clone();
+    let thread = std::thread::Builder::new()
+        .name("parrot-actix-orphaned-helper-test".into())
+        .spawn(move || {
+            moved_gate.wait();
+            joined.send(()).unwrap();
+        })
+        .unwrap();
+    let budget = Arc::new(crate::thread::native_budget::NativeWorkerBudget::with_capacity(1));
+    let reservation = budget.try_reserve().unwrap();
+    let reservations = Arc::new(Mutex::new(vec![reservation]));
+    let (finished, receipt) = watch::channel(None);
+    let helper = Arc::new(HelperJoin {
+        thread: Mutex::new(Some(thread)),
+        reservations,
+        finished,
+        scheduled: AtomicBool::new(false),
+        changed: Condvar::new(),
+    });
+
+    drop(helper);
+    assert!(receive_joined.try_recv().is_err());
+    assert!(budget.try_reserve().is_err());
+    gate.release();
+    receive_joined.recv_timeout(WAIT).unwrap();
+    let result = observer_wait(receipt).unwrap();
+    assert!(result.is_ok(), "fallback join failed: {result:?}");
+    let reclaimed = budget.try_reserve().unwrap();
+    reclaimed.release_after_join();
+}
+
 fn observer_wait(
     receipt: watch::Receiver<Option<Exit>>,
 ) -> Result<Exit, tokio::time::error::Elapsed> {
