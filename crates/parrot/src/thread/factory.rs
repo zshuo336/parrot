@@ -444,10 +444,10 @@ impl ThreadActorSystem {
                     );
                 });
                 let outcome = StopOutcome::from_result(status);
-                pending.retired.send_replace(Some(outcome.clone()));
+                crate::owned_payload::publish_watch(&pending.retired, outcome.clone());
                 if pending.finished.borrow().is_none() {
                     let public = if tokio::time::Instant::now() >= deadline { StopOutcome::TimedOut(format!("factory {path} exceeded creation deadline")) } else { outcome };
-                    pending.finished.send_replace(Some(public));
+                    crate::owned_payload::publish_watch(&pending.finished, public);
                 }
                 let result = if tokio::time::Instant::now() >= deadline {
                     Err(SpawnError::Timeout(format!("factory {path} exceeded creation deadline")))
@@ -461,14 +461,14 @@ impl ThreadActorSystem {
                 _ = tokio::time::sleep_until(deadline) => {
                     pending.control.cancel();
                     if let Some(system) = cancel_system.upgrade() { let _ = system.request_stop_ref(&path, &pending.supervision.mailbox); }
-                    pending.finished.send_replace(Some(StopOutcome::TimedOut(format!("factory {path} exceeded creation deadline"))));
+                    crate::owned_payload::publish_watch(&pending.finished, StopOutcome::TimedOut(format!("factory {path} exceeded creation deadline")));
                     if let Some(send) = send.take() { let _ = send.send(Err(SpawnError::Timeout(format!("factory {path} exceeded creation deadline")))); }
                     work.await
                 }
             };
             if result.is_ok() {
-                if pending.finished.borrow().is_none() { pending.finished.send_replace(Some(StopOutcome::Stopped)); }
-                pending.retired.send_replace(Some(StopOutcome::Stopped));
+                if pending.finished.borrow().is_none() { crate::owned_payload::publish_watch(&pending.finished, StopOutcome::Stopped); }
+                crate::owned_payload::publish_watch(&pending.retired, StopOutcome::Stopped);
             }
             if let Some(send) = send { let _ = send.send(result); }
             if let Some(notification) = notification { notification.await; }

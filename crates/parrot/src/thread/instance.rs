@@ -703,15 +703,15 @@ impl ThreadActorSystem {
                         }
                         let retirement = pending.lifetime.wait().await;
                         let outcome = StopOutcome::from_result(retirement.as_ref().map(|_| ()).map_err(|e| SystemError::ShutdownError(e.to_string())));
-                        pending.retired.send_replace(Some(outcome.clone()));
-                        if pending.finished.borrow().is_none() { pending.finished.send_replace(Some(outcome)); }
+                        crate::owned_payload::publish_watch(&pending.retired, outcome.clone());
+                        if pending.finished.borrow().is_none() { crate::owned_payload::publish_watch(&pending.finished, outcome); }
                         retirement.map_err(|e| SpawnError::DisposalFailed(e.to_string()))?;
                         return Err(if tokio::time::Instant::now() >= deadline {
                             SpawnError::Timeout("instance creation exceeded deadline".into())
                         } else { SpawnError::Cancelled });
                     }
-                    pending.retired.send_replace(Some(StopOutcome::Stopped));
-                    pending.finished.send_replace(Some(StopOutcome::Stopped));
+                    crate::owned_payload::publish_watch(&pending.retired, StopOutcome::Stopped);
+                    crate::owned_payload::publish_watch(&pending.finished, StopOutcome::Stopped);
                     return result;
                 }
                 pending.watches.close();
@@ -733,8 +733,8 @@ impl ThreadActorSystem {
                     _ => Ok(()),
                 };
                 let outcome = StopOutcome::from_result(stopped);
-                pending.retired.send_replace(Some(outcome.clone()));
-                if pending.finished.borrow().is_none() { pending.finished.send_replace(Some(outcome)); }
+                crate::owned_payload::publish_watch(&pending.retired, outcome.clone());
+                if pending.finished.borrow().is_none() { crate::owned_payload::publish_watch(&pending.finished, outcome); }
                 notification.await;
                 result
             };
@@ -745,7 +745,7 @@ impl ThreadActorSystem {
                 _ = tokio::time::sleep_until(deadline) => {
                     if let Some(sender) = reply.take_failure() {
                         pending.control.cancel();
-                        pending.finished.send_replace(Some(StopOutcome::TimedOut("instance creation exceeded deadline".into())));
+                        crate::owned_payload::publish_watch(&pending.finished, StopOutcome::TimedOut("instance creation exceeded deadline".into()));
                         let _ = sender.send(Err(SpawnError::Timeout("instance creation exceeded deadline".into())));
                     }
                     work.await
