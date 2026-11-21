@@ -8,12 +8,14 @@ pub(in crate::actix) struct Creation {
 }
 
 impl ActixActorSystem {
-    /// Maximum admitted dynamic root and child creations, shared by clones and
+    /// Maximum admitted dynamic and static root and child creations, shared by clones and
     /// weak-system upgrades. Admission starts on first poll. Successful init
     /// releases the slot; failed or cancelled inputs retain it through disposal.
     /// Child requests reject with recoverable inputs when full instead of
     /// waiting on a slot that their parent's initialization may hold.
-    /// Static, Local and factory creation use their existing budgets.
+    /// Static factories share this initial-creation budget; reconstruction has
+    /// its own system invocation budget. Local and dynamic factories still use
+    /// their existing budgets.
     pub const MAX_PENDING_INSTANCE_CREATIONS: usize = 1024;
 
     pub(in crate::actix) fn instance_creation_deadline(&self) -> Instant {

@@ -5,7 +5,14 @@ use crate::actix::{
     lifecycle::{ActorControl, Outcome, panic_message},
     system::{ActixActorSystem, Registration},
 };
+mod admission;
+#[cfg(test)]
+mod admission_contracts;
 mod factory;
+pub use admission::{
+    FactoryAdmissionError, FactoryAdmissionInputs, TypedInstanceAdmissionError,
+    TypedInstanceAdmissionInputs,
+};
 mod ready_budget;
 #[cfg(test)]
 mod ready_budget_contracts;
@@ -303,6 +310,7 @@ impl ActixActorSystem {
             policy,
             None,
             Some(cohort),
+            None,
         ))
     }
 
@@ -334,6 +342,7 @@ impl ActixActorSystem {
             policy,
             None,
             Some(cohort),
+            None,
         ))
     }
 
@@ -357,7 +366,7 @@ impl ActixActorSystem {
             &self.cleanup_slots,
         );
         parrot_api::trace::capture(
-            self.spawn_typed_owned_source(payload, factory, path, policy, None, None),
+            self.spawn_typed_owned_source(payload, factory, path, policy, None, None, None),
         )
     }
 
@@ -375,6 +384,17 @@ impl ActixActorSystem {
         M: ParrotMsgVariant<A>,
         F: Fn() -> A + Send + Sync + 'static,
     {
+        let deadline = self.instance_creation_deadline();
+        let reservation = match self.try_instance_creation() {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                return Err(ActorError::Other(anyhow::Error::new(
+                    FactoryAdmissionError::new(reason, factory.take(), policy.take()),
+                )));
+            }
+        };
+        let factory = factory.with_reservation(&reservation);
+        let policy = policy.with_reservation(&reservation);
         let factory = crate::constructor::owned::OwnedFactory::with_admission(
             factory.take(),
             self.constructor_slots.clone(),
@@ -382,8 +402,20 @@ impl ActixActorSystem {
             self.runtime.clone(),
             self.factory_admission.clone(),
         );
-        self.spawn_typed_owned_source(None, Some(factory), path, policy, Some(parent), None)
-            .await
+        factory.factory.reserve_creation(&reservation);
+        self.spawn_typed_owned_source(
+            None,
+            Some(factory),
+            path,
+            policy,
+            Some(parent),
+            None,
+            Some(super::system::Creation {
+                permit: reservation,
+                deadline,
+            }),
+        )
+        .await
     }
 
     pub(crate) async fn spawn_typed_child_source<A, M>(
@@ -399,10 +431,11 @@ impl ActixActorSystem {
         A: ParrotTypedDispatch,
         M: ParrotMsgVariant<A>,
     {
-        self.spawn_typed_owned_source(Some(actor), None, path, policy, Some(parent), None)
+        self.spawn_typed_owned_source(Some(actor), None, path, policy, Some(parent), None, None)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_typed_owned_source<A, M>(
         self: &Arc<Self>,
         payload: Option<crate::owned_payload::OwnedPayload<A>>,
@@ -413,6 +446,87 @@ impl ActixActorSystem {
         >,
         parent: Option<&crate::typed_context::ManagedContext>,
         cohort: Option<&crate::root_cohort::RootCohort>,
+        creation: Option<super::system::Creation>,
+    ) -> ActorResult<TypedActorRef<A, M>>
+    where
+        A: ParrotTypedDispatch,
+        M: ParrotMsgVariant<A>,
+    {
+        let deadline = creation.as_ref().map_or_else(
+            || self.instance_creation_deadline(),
+            |creation| creation.deadline,
+        );
+        let operation = async move {
+            let creation = match creation {
+                Some(creation) => creation,
+                None => {
+                    let permit = if parent.is_some() {
+                        match self.try_instance_creation() {
+                            Ok(permit) => permit,
+                            Err(reason) => {
+                                return Err(ActorError::Other(anyhow::Error::new(
+                                    TypedInstanceAdmissionError {
+                                        reason,
+                                        inputs: std::sync::Mutex::new(
+                                            TypedInstanceAdmissionInputs {
+                                                actor: payload
+                                                    .expect("child instance input")
+                                                    .take(),
+                                                strategy: policy.take(),
+                                            },
+                                        ),
+                                    },
+                                )));
+                            }
+                        }
+                    } else {
+                        let admission = tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep_until(deadline) => Err(ActorError::TimeoutDetail("static creation admission exceeded original deadline".into())),
+                            permit = self.instance_admission.clone().acquire_owned() => permit.map(Arc::new).map_err(|_| ActorError::Stopped),
+                        };
+                        match admission {
+                            Ok(permit) => permit,
+                            Err(error) => {
+                                admission::retire_source(payload, factory, Some(policy)).await?;
+                                return Err(error);
+                            }
+                        }
+                    };
+                    super::system::Creation { permit, deadline }
+                }
+            };
+            let payload = payload.map(|payload| payload.with_reservation(&creation.permit));
+            let policy = policy.with_reservation(&creation.permit);
+            if let Some(factory) = &factory {
+                factory.factory.reserve_creation(&creation.permit);
+            }
+            self.spawn_typed_admitted_source(
+                payload, factory, path, policy, parent, cohort, creation,
+            )
+            .await
+        };
+        tokio::time::timeout_at(deadline, operation)
+            .await
+            .unwrap_or_else(|_| {
+                Err(ActorError::TimeoutDetail(
+                    "static creation exceeded original deadline".into(),
+                ))
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_typed_admitted_source<A, M>(
+        self: &Arc<Self>,
+        payload: Option<crate::owned_payload::OwnedPayload<A>>,
+        factory: Option<crate::constructor::owned::OwnedFactory<A>>,
+        path: &str,
+        policy: crate::owned_payload::OwnedPayload<
+            Option<parrot_api::supervisor::SupervisorStrategyType>,
+        >,
+        parent: Option<&crate::typed_context::ManagedContext>,
+        cohort: Option<&crate::root_cohort::RootCohort>,
+        creation: super::system::Creation,
     ) -> ActorResult<TypedActorRef<A, M>>
     where
         A: ParrotTypedDispatch,
@@ -451,6 +565,11 @@ impl ActixActorSystem {
         .boxed()
         .shared();
         let mut admit = |lifetime: Option<Arc<crate::children::ChildLifetime>>| {
+            if tokio::time::Instant::now() >= creation.deadline {
+                return Err(ActorError::TimeoutDetail(
+                    "static creation exceeded original deadline".into(),
+                ));
+            }
             let (sender, receiver) =
                 parrot_api::typed_channel::typed_channel::<A>(self.settings.mailbox_capacity);
             let lifetime = lifetime.unwrap_or_else(|| {
@@ -467,8 +586,10 @@ impl ActixActorSystem {
                 self.policy_slots.clone(),
             );
             ActorControl::configure_timeouts(&mut control, &self.operation_timeouts);
+            control.reserve_creation(creation.permit.clone());
+            control.bound_initialization(Some(creation.deadline));
             if factory.is_some() {
-                control.begin_construction(tokio::time::Instant::now() + control.creation_timeout);
+                control.begin_construction(creation.deadline);
             }
             let own = Arc::new(std::sync::OnceLock::new());
             let weak_stop = Arc::downgrade(&control);

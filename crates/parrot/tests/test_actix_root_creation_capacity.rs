@@ -33,6 +33,24 @@ struct Probe {
     init: Arc<Semaphore>,
 }
 struct MakeChild(Arc<Counts>);
+
+pub struct StaticRead;
+impl parrot_api::message::Message for StaticRead {
+    type Result = ();
+}
+#[derive(parrot_api::ParrotTypedActor)]
+#[ParrotTypedActor(msgs(StaticRead))]
+struct StaticProbe(Arc<Counts>);
+impl Drop for StaticProbe {
+    fn drop(&mut self) {
+        self.0.actors.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl parrot_api::typed::TypedReceive<StaticRead> for StaticProbe {
+    fn receive_typed<'a>(&'a mut self, _: StaticRead) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
 impl Drop for Probe {
     fn drop(&mut self) {
         self.counts.actors.fetch_add(1, Ordering::SeqCst);
@@ -212,6 +230,80 @@ async fn production_child_cannot_bypass_exhausted_root_creation_capacity() {
     assert_eq!(child_counts.initialized.load(Ordering::SeqCst), 0);
     assert_eq!(child_counts.actors.load(Ordering::SeqCst), 1);
     assert_eq!(child_counts.configs.load(Ordering::SeqCst), 1);
+}
+
+async fn static_creation_capacity(factory: bool) {
+    let system = Arc::new(
+        ActixActorSystem::with_settings(ActixSystemSettings {
+            arbiter_count: 2,
+            shutdown_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    );
+    let counts = Arc::new(Counts::default());
+    let init = Arc::new(Semaphore::new(0));
+    let mut roots = Vec::new();
+    for _ in 0..1024 {
+        roots.push(
+            system
+                .spawn_root_typed(
+                    Probe {
+                        counts: counts.clone(),
+                        init: init.clone(),
+                    },
+                    Config(counts.clone()),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let static_counts = Arc::new(Counts::default());
+    let make_actor = {
+        let counts = static_counts.clone();
+        move || StaticProbe(counts.clone())
+    };
+    let mut creation: BoxedFuture<'_, ActorResult<_>> = if factory {
+        Box::pin(system.spawn_typed_factory::<_, StaticRead, _>(make_actor, "/static-capacity"))
+    } else {
+        Box::pin(system.spawn_typed::<_, StaticRead>(make_actor(), "/static-capacity"))
+    };
+    let first_poll = futures::poll!(&mut creation);
+    let bounded = first_poll.is_pending();
+    let registered = system.status().active_actors;
+    init.add_permits(1024);
+    let reference = match first_poll {
+        Poll::Ready(result) => result.unwrap(),
+        Poll::Pending => creation.await.unwrap(),
+    };
+    reference.ask(StaticRead).await.unwrap();
+    reference.stop().await.unwrap();
+    for actor in roots {
+        actor.stop().await.unwrap();
+    }
+    system.as_ref().clone().shutdown().await.unwrap();
+    assert_eq!(static_counts.actors.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.actors.load(Ordering::SeqCst), 1024);
+    assert_eq!(counts.configs.load(Ordering::SeqCst), 1024);
+    assert_eq!(
+        registered, 1024,
+        "static root or factory published despite exhausted shared creation capacity (factory={factory})"
+    );
+    assert!(
+        bounded,
+        "static root bypassed admission (factory={factory})"
+    );
+}
+
+#[actix::test]
+async fn production_static_root_shares_dynamic_creation_capacity() {
+    static_creation_capacity(false).await;
+}
+
+#[actix::test]
+async fn production_static_factory_shares_dynamic_creation_capacity() {
+    static_creation_capacity(true).await;
 }
 
 #[derive(Default)]

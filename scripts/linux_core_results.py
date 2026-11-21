@@ -18,8 +18,8 @@ STAGES = (
 )
 CONFIGURATIONS = ('debug-default', 'debug-legacy', 'release-default', 'release-legacy')
 BINARIES = {
-    'library': 1532,
-    'test_actix_root_creation_capacity': 3,
+    'library': 1539,
+    'test_actix_root_creation_capacity': 5,
     'test_thread_actor_configuration': 23,
     'test_native_instance_inputs': 22,
     'test_thread_initialization_trace': 3,

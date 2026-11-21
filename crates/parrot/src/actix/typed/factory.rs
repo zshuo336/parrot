@@ -370,7 +370,6 @@ pub(super) async fn run<A: ParrotTypedDispatch>(
                 Step::Escalated(error)=>{let deadline=control.cleanup_deadline().unwrap_or_else(||tokio::time::Instant::now()+control.timeout);match restart(&mut inputs,error.clone(),deadline,&runtime).await? { Restart::Ready=>continue 'generation, Restart::Stopped=>return Ok(()), Restart::Declined=>return Err(crate::supervision_policy::reply_error(error)), }},
                 Step::Ready(outcome)=>{initialization_context=outcome.context;outcome.result.unwrap_or_else(|message|Err(ActorError::Panic(message)))},
             };
-            control.finish_initialization();
             if let Err(error)=initialized {
                 let error=crate::error_receipt::ActorReceipt::from_error(error);let deadline=tokio::time::Instant::now()+control.timeout;
                 let resume=parrot_api::trace::scope(initialization_context,control.lifetime.resume_message(error.clone(),deadline,false,&runtime)).await;
@@ -383,6 +382,8 @@ pub(super) async fn run<A: ParrotTypedDispatch>(
                 }
                 return Err(crate::supervision_policy::reply_error(error));
             }
+            control.finish_initialization();
+            inputs.factory.as_ref().expect("repeatable source").release_creation();
             drop(initialization_context);
             loop {
                 let message=match budget.wait(control.wait_typed_stage(inputs.receiver.as_ref().expect("typed mailbox").recv_async(), &runtime)).await {
