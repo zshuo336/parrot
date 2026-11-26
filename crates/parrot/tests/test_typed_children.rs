@@ -1260,6 +1260,13 @@ fn host_shutdown_isolates_parent_and_child_policy_capture_panics() {
 mod descendant_sources {
     use super::*;
     use std::error::Error;
+    enum Backend {
+        Actix,
+        Shared,
+        Dedicated,
+        Sharded,
+    }
+    use Backend::*;
     struct Spec {
         formats: AtomicUsize,
         sources: AtomicUsize,
@@ -1343,7 +1350,7 @@ mod descendant_sources {
         );
     }
     async fn run(
-        actix: bool,
+        backend: Backend,
         factory: bool,
         depth: usize,
         hostile_display: bool,
@@ -1361,9 +1368,30 @@ mod descendant_sources {
             gate: tokio::sync::Semaphore::new(0),
         });
         let stats = Arc::new(Stats::default());
-        let mut thread = None;
         let mut actix_system = None;
-        let root = if actix {
+        let thread = match backend {
+            Actix => None,
+            Shared => Some(system()),
+            Dedicated => Some(dedicated_system()),
+            Sharded => Some(sharded_system()),
+        };
+        let root = if let Some(system) = &thread {
+            if factory {
+                let stats = stats.clone();
+                system
+                    .spawn_typed_factory::<_, Op, _>(
+                        move || Family::new(stats.clone(), depth),
+                        "/source-tree",
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                system
+                    .spawn_typed::<_, Op>(Family::new(stats.clone(), depth), "/source-tree")
+                    .await
+                    .unwrap()
+            }
+        } else {
             let system = Arc::new(
                 parrot::actix::ActixActorSystem::with_arbiter_count(1)
                     .await
@@ -1386,27 +1414,23 @@ mod descendant_sources {
             };
             actix_system = Some(system);
             root
-        } else {
-            let system = ThreadActorSystem::shared(Default::default());
-            let root = if factory {
-                let stats = stats.clone();
-                system
-                    .spawn_typed_factory::<_, Op, _>(
-                        move || Family::new(stats.clone(), depth),
-                        "/source-tree",
-                    )
-                    .await
-                    .unwrap()
-            } else {
-                system
-                    .spawn_typed::<_, Op>(Family::new(stats.clone(), depth), "/source-tree")
-                    .await
-                    .unwrap()
-            };
-            thread = Some(system);
-            root
         };
         info(&root).await;
+        let placement = match backend {
+            Dedicated => Some(("parrot-dedicated-", depth + 1)),
+            Sharded => Some(("parrot-shard-", 1)),
+            _ => None,
+        };
+        if let Some((prefix, count)) = placement {
+            let owners = stats.init_threads.lock().unwrap();
+            assert_eq!(owners.len(), depth + 1);
+            assert!(
+                owners.iter().all(|(_, name)| name.starts_with(prefix)),
+                "{owners:?}"
+            );
+            let threads: std::collections::HashSet<_> = owners.iter().map(|(id, _)| *id).collect();
+            assert_eq!(threads.len(), count, "{owners:?}");
+        }
         let parent = stats.contexts.lock().unwrap().last().unwrap().clone();
         let leaf = if factory {
             let spec = spec.clone();
@@ -1430,6 +1454,9 @@ mod descendant_sources {
             .unwrap();
         let first = if cancel {
             drop(first);
+            assert!(futures::poll!(&mut second).is_pending());
+            assert_eq!(spec.actor_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(stats.drops.load(Ordering::SeqCst), 0);
             None
         } else {
             Some(first)
@@ -1498,82 +1525,98 @@ mod descendant_sources {
     }
     #[actix::test]
     async fn thread_instance_depth_1_retains_source() {
-        run(false, false, 1, false, false, true).await;
+        run(Shared, false, 1, false, false, true).await;
     }
     #[actix::test]
     async fn thread_instance_depth_3_retains_source() {
-        run(false, false, 3, false, false, true).await;
+        run(Shared, false, 3, false, false, true).await;
     }
     #[actix::test]
     async fn thread_factory_depth_1_retains_source() {
-        run(false, true, 1, false, false, true).await;
+        run(Shared, true, 1, false, false, true).await;
     }
     #[actix::test]
     async fn thread_factory_depth_3_retains_source() {
-        run(false, true, 3, false, false, true).await;
+        run(Shared, true, 3, false, false, true).await;
     }
     #[actix::test]
     async fn thread_hostile_display() {
-        run(false, false, 2, true, false, true).await;
+        run(Shared, false, 2, true, false, true).await;
     }
     #[actix::test]
     async fn thread_cancelled_waiter() {
-        run(false, false, 2, false, true, true).await;
+        run(Shared, false, 2, false, true, true).await;
+    }
+    #[tokio::test]
+    async fn dedicated_instance_cancelled_waiter() {
+        run(Dedicated, false, 2, false, true, true).await;
+    }
+    #[tokio::test]
+    async fn sharded_instance_cancelled_waiter() {
+        run(Sharded, false, 2, false, true, true).await;
+    }
+    #[tokio::test]
+    async fn dedicated_factory_cancelled_waiter() {
+        run(Dedicated, true, 2, false, true, true).await;
+    }
+    #[tokio::test]
+    async fn sharded_factory_cancelled_waiter() {
+        run(Sharded, true, 2, false, true, true).await;
     }
     #[actix::test]
     async fn thread_healthy() {
-        run(false, false, 2, false, false, false).await;
+        run(Shared, false, 2, false, false, false).await;
     }
     #[actix::test]
     async fn actix_instance_depth_1_retains_source() {
-        run(true, false, 1, false, false, true).await;
+        run(Actix, false, 1, false, false, true).await;
     }
     #[actix::test]
     async fn actix_instance_depth_3_retains_source() {
-        run(true, false, 3, false, false, true).await;
+        run(Actix, false, 3, false, false, true).await;
     }
     #[actix::test]
     async fn actix_factory_depth_1_retains_source() {
-        run(true, true, 1, false, false, true).await;
+        run(Actix, true, 1, false, false, true).await;
     }
     #[actix::test]
     async fn actix_factory_depth_3_retains_source() {
-        run(true, true, 3, false, false, true).await;
+        run(Actix, true, 3, false, false, true).await;
     }
     #[actix::test]
     async fn actix_hostile_display() {
-        run(true, false, 2, true, false, true).await;
+        run(Actix, false, 2, true, false, true).await;
     }
     #[actix::test]
     async fn actix_cancelled_waiter() {
-        run(true, false, 2, false, true, true).await;
+        run(Actix, false, 2, false, true, true).await;
     }
     #[actix::test]
     async fn actix_healthy() {
-        run(true, false, 2, false, false, false).await;
+        run(Actix, false, 2, false, false, false).await;
     }
     #[actix::test]
     async fn thread_factory_hostile_display() {
-        run(false, true, 2, true, false, true).await;
+        run(Shared, true, 2, true, false, true).await;
     }
     #[actix::test]
     async fn thread_factory_cancelled_waiter() {
-        run(false, true, 2, false, true, true).await;
+        run(Shared, true, 2, false, true, true).await;
     }
     #[actix::test]
     async fn thread_factory_healthy() {
-        run(false, true, 2, false, false, false).await;
+        run(Shared, true, 2, false, false, false).await;
     }
     #[actix::test]
     async fn actix_factory_hostile_display() {
-        run(true, true, 2, true, false, true).await;
+        run(Actix, true, 2, true, false, true).await;
     }
     #[actix::test]
     async fn actix_factory_cancelled_waiter() {
-        run(true, true, 2, false, true, true).await;
+        run(Actix, true, 2, false, true, true).await;
     }
     #[actix::test]
     async fn actix_factory_healthy() {
-        run(true, true, 2, false, false, false).await;
+        run(Actix, true, 2, false, false, false).await;
     }
 }
