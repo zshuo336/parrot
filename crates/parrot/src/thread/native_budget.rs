@@ -119,6 +119,7 @@ fn dispatch_join(reserved: &mpsc::SyncSender<JoinTask>, job: JoinTask) -> Result
 struct JoinFallback {
     sender: mpsc::Sender<JoinTask>,
     _thread: std::thread::JoinHandle<()>,
+    _reserved_worker: std::thread::JoinHandle<()>,
 }
 
 impl JoinFallback {
@@ -128,24 +129,37 @@ impl JoinFallback {
         if let Some(owner) = &*shared {
             return Ok(owner.clone());
         }
+        let owner = Arc::new(Self::start(|name, job| {
+            std::thread::Builder::new().name(name.into()).spawn(job)
+        })?);
+        *shared = Some(owner.clone());
+        Ok(owner)
+    }
+
+    fn start(
+        mut spawn: impl FnMut(
+            &'static str,
+            Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Result<Self, SystemError> {
         let (reserved, work) = mpsc::sync_channel(0);
-        let reserved_worker = std::thread::Builder::new()
-            .name("parrot-native-join-reserved".into())
-            .spawn(move || {
+        let reserved_worker = spawn(
+            "parrot-native-join-reserved",
+            Box::new(move || {
                 while let Ok(job) = work.recv() {
                     complete_join(job);
                 }
-            })
-            .map_err(|error| {
-                SystemError::ThreadSetupError(format!(
-                    "native join worker initialization failed: {error}"
-                ))
-            })?;
+            }),
+        )
+        .map_err(|error| {
+            SystemError::ThreadSetupError(format!(
+                "native join worker initialization failed: {error}"
+            ))
+        })?;
         let (sender, receiver) = mpsc::channel::<JoinTask>();
-        let thread = std::thread::Builder::new()
-            .name("parrot-native-join-owner".into())
-            .spawn(move || {
-                let _reserved_worker = reserved_worker;
+        let thread = spawn(
+            "parrot-native-join-owner",
+            Box::new(move || {
                 let mut pending: Vec<JoinTask> = Vec::new();
                 loop {
                     let received = if pending.is_empty() {
@@ -179,18 +193,30 @@ impl JoinFallback {
                         }
                     }
                 }
-            })
-            .map_err(|error| {
-                SystemError::ThreadSetupError(format!(
-                    "native join owner initialization failed: {error}"
-                ))
-            })?;
-        let owner = Arc::new(Self {
+            }),
+        )
+        .map_err(|error| {
+            // The failed spawn dropped the dispatcher's sender. Wait for the
+            // reserved worker to leave recv and exit before reporting failure.
+            // Its join handle remains available on the success path below.
+            SystemError::ThreadSetupError(format!(
+                "native join owner initialization failed: {error}"
+            ))
+        });
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                if let Err(payload) = reserved_worker.join() {
+                    let _ = crate::owned_payload::panic_message(payload);
+                }
+                return Err(error);
+            }
+        };
+        Ok(Self {
             sender,
             _thread: thread,
-        });
-        *shared = Some(owner.clone());
-        Ok(owner)
+            _reserved_worker: reserved_worker,
+        })
     }
 }
 

@@ -3,6 +3,41 @@ use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(3);
 
+#[test]
+fn dispatcher_start_failure_joins_reserved_worker_before_returning_error() {
+    let (entered, in_exit) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let mut gate = Some((entered, wait));
+        let failure = JoinFallback::start(|name, job| {
+            if name == "parrot-native-join-owner" {
+                return Err(std::io::Error::other("dispatcher unavailable"));
+            }
+            assert_eq!(name, "parrot-native-join-reserved");
+            let (entered, wait) = gate.take().unwrap();
+            std::thread::Builder::new().spawn(move || {
+                job();
+                entered.send(()).unwrap();
+                wait.recv_timeout(WAIT * 4).unwrap();
+            })
+        });
+        done.send(failure.err()).unwrap();
+    });
+    in_exit.recv_timeout(WAIT).unwrap();
+    let early = result.recv_timeout(Duration::from_millis(150));
+    release.send(()).unwrap();
+    caller.join().unwrap();
+    assert!(
+        matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+        "startup error returned while the reserved worker was still exiting: {early:?}"
+    );
+    assert!(
+        matches!(result.recv_timeout(WAIT).unwrap(), Some(SystemError::ThreadSetupError(detail))
+        if detail == "native join owner initialization failed: dispatcher unavailable")
+    );
+}
+
 fn observe(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + WAIT;
     while !ready() {
