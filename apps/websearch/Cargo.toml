@@ -4,7 +4,7 @@ license-file = "../../LICENSE"
 name = "websearch"
 version = "1.0.0"
 edition = "2021"
-description = "真实搜索引擎应用：五运行时分工（erl frontier / rust 漫爬 / ray 中文分词索引 / akka 检索 / TS 查询页）"
+description = "网页搜索应用：四运行时协作（Erlang frontier / Rust 抓取与 Web / Ray 中文分词 / Akka 检索）"
 
 [[bin]]
 name = "websearch"

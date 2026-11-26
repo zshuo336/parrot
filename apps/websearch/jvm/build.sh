@@ -29,7 +29,7 @@ mkdir -p target
 BUILD_DIR=$(mktemp -d "$PWD/target/build.XXXXXX")
 trap 'rm -rf "$BUILD_DIR"' EXIT
 mkdir "$BUILD_DIR/classes"
-mvn -q -f config-dependencies.pom.xml org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies \
+mvn -q -s ../../../interop/jvm/settings-central.xml -f config-dependencies.pom.xml org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies \
   -DincludeScope=runtime -DoutputDirectory="$BUILD_DIR/config-libs"
 python3 - "$BUILD_DIR/config-libs" <<'CHECK'
 from pathlib import Path
