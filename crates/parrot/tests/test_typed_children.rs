@@ -50,6 +50,7 @@ impl ParrotMsgVariant<Family> for Op {
 struct Stats {
     events: Mutex<Vec<(String, &'static str)>>,
     contexts: Mutex<Vec<TypedContext>>,
+    init_threads: Mutex<Vec<(std::thread::ThreadId, String)>>,
     drops: AtomicUsize,
 }
 struct Family {
@@ -96,6 +97,12 @@ impl ParrotTypedDispatch for Family {
                 .unwrap()
                 .push((self.path.clone(), "init"));
             self.stats.contexts.lock().unwrap().push(ctx.clone());
+            let thread = std::thread::current();
+            self.stats
+                .init_threads
+                .lock()
+                .unwrap()
+                .push((thread.id(), thread.name().unwrap_or_default().to_owned()));
             if self.depth > 0 {
                 let child = ctx
                     .spawn_typed_child::<_, Op>(Family::new(self.stats.clone(), self.depth - 1))
@@ -193,7 +200,30 @@ fn one(decision: SupervisionDecision) -> SupervisorStrategyType {
 
 #[tokio::test]
 async fn typed_context_reports_real_parent_and_recursively_retires_descendants_before_hooks() {
-    let s = system();
+    recursive_retirement(system(), None).await;
+}
+
+#[tokio::test]
+async fn dedicated_typed_root_recursively_retires_its_live_subtree() {
+    let s = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
+        default_scheduling_mode: parrot::thread::config::SchedulingMode::DedicatedThread,
+        ..Default::default()
+    });
+    recursive_retirement(s, Some(("parrot-dedicated-", 3))).await;
+}
+
+#[tokio::test]
+async fn sharded_typed_root_recursively_retires_its_live_subtree() {
+    let s = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
+        default_scheduling_mode: parrot::thread::config::SchedulingMode::Sharded {
+            affinity_key: "typed-subtree".into(),
+        },
+        ..Default::default()
+    });
+    recursive_retirement(s, Some(("parrot-shard-", 1))).await;
+}
+
+async fn recursive_retirement(s: Arc<ThreadActorSystem>, placement: Option<(&str, usize)>) {
     let stats = Arc::new(Stats::default());
     let root = s
         .spawn_typed::<_, Op>(Family::new(stats.clone(), 2), "/tree")
@@ -203,6 +233,16 @@ async fn typed_context_reports_real_parent_and_recursively_retires_descendants_b
     assert_eq!(s.actor_count(), 3);
     let contexts = stats.contexts.lock().unwrap().clone();
     assert_eq!(contexts.len(), 3);
+    if let Some((prefix, count)) = placement {
+        let owners = stats.init_threads.lock().unwrap();
+        assert_eq!(owners.len(), 3);
+        assert!(
+            owners.iter().all(|(_, name)| name.starts_with(prefix)),
+            "{owners:?}"
+        );
+        let threads: std::collections::HashSet<_> = owners.iter().map(|(id, _)| *id).collect();
+        assert_eq!(threads.len(), count, "{owners:?}");
+    }
     for pair in contexts.windows(2) {
         assert_eq!(pair[1].parent().unwrap().path(), pair[0].path());
         assert!(pair[1].path().starts_with(&format!("{}/", pair[0].path())));
@@ -211,15 +251,17 @@ async fn typed_context_reports_real_parent_and_recursively_retires_descendants_b
     assert_eq!(s.actor_count(), 0);
     assert_eq!(stats.drops.load(Ordering::SeqCst), 3);
     let events = stats.events.lock().unwrap().clone();
-    let child_drop = events
-        .iter()
-        .position(|(p, e)| p == contexts[2].path() && *e == "drop")
-        .unwrap();
-    let parent_hook = events
-        .iter()
-        .position(|(p, e)| p == contexts[1].path() && *e == "hook")
-        .unwrap();
-    assert!(child_drop < parent_hook);
+    for pair in contexts.windows(2) {
+        let child_drop = events
+            .iter()
+            .position(|(path, event)| path == pair[1].path() && *event == "drop")
+            .unwrap();
+        let parent_hook = events
+            .iter()
+            .position(|(path, event)| path == pair[0].path() && *event == "hook")
+            .unwrap();
+        assert!(child_drop < parent_hook, "{events:?}");
+    }
     for ctx in contexts {
         assert!(
             ctx.spawn_typed_child::<_, Op>(Family::new(stats.clone(), 0))
