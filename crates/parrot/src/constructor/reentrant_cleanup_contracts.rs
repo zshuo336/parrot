@@ -7,30 +7,23 @@ use std::{
 };
 
 fn isolated(name: &str, body: impl FnOnce()) {
-    const FLAG: &str = "PARROT_REENTRANT_CLEANUP_CASE";
-    if std::env::var(FLAG).as_deref() == Ok(name) {
-        body();
-        return;
-    }
-    let full = format!("constructor::reentrant_cleanup_contracts::{name}");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &full, "--nocapture"])
-        .env(FLAG, name)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "{name}: {status}");
-            return;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("{name}: child failed to retire within the isolation deadline");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    crate::test_support::isolated_with_timeout(
+        &format!("constructor::reentrant_cleanup_contracts::{name}"),
+        Duration::from_secs(20),
+        body,
+    );
+}
+
+#[test]
+fn reentrant_cleanup_rejects_empty_child_selection() {
+    let failure = std::panic::catch_unwind(|| {
+        isolated("__missing_reentrant_cleanup_case__", || unreachable!());
+    })
+    .expect_err("an empty child selection was accepted as completed cleanup");
+    assert!(
+        crate::owned_payload::panic_message(failure)
+            .contains("child did not execute its body exactly once")
+    );
 }
 
 struct Counted(Arc<AtomicUsize>);

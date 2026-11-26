@@ -802,24 +802,13 @@ mod receipt_contracts {
 
     #[test]
     fn global_cleanup_budget_bounds_many_independent_executors() {
-        const FLAG: &str = "PARROT_GLOBAL_CLEANUP_BUDGET_CASE";
-        if std::env::var(FLAG).as_deref() != Ok("1") {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "owned_payload::receipt_contracts::global_cleanup_budget_bounds_many_independent_executors",
-                    "--nocapture",
-                ])
-                .env(FLAG, "1")
-                .status()
-                .unwrap();
-            assert!(
-                status.success(),
-                "global cleanup budget child failed: {status}"
-            );
-            return;
-        }
+        crate::test_support::isolated(
+            "owned_payload::receipt_contracts::global_cleanup_budget_bounds_many_independent_executors",
+            check_global_cleanup_budget,
+        );
+    }
 
+    fn check_global_cleanup_budget() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(4)
