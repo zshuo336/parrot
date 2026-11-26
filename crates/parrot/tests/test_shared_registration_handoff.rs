@@ -14,6 +14,7 @@ use parrot_api::{
     types::{ActorResult, BoxedFuture, BoxedMessage},
 };
 use std::sync::{Arc, Mutex, mpsc};
+use std::thread::ThreadId;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -21,8 +22,9 @@ const PATH: &str = "/shared-registration";
 const WAIT: Duration = Duration::from_secs(3);
 
 struct Counter(u32);
+type Pause = (oneshot::Sender<ThreadId>, oneshot::Receiver<()>);
 struct Request {
-    pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    pause: Option<Pause>,
     reply: oneshot::Sender<u32>,
 }
 impl Actor for Counter {
@@ -39,7 +41,7 @@ impl Actor for Counter {
         Box::pin(async move {
             let Request { pause, reply } = *message.downcast::<Request>().unwrap();
             if let Some((entered, release)) = pause {
-                entered.send(()).unwrap();
+                entered.send(std::thread::current().id()).unwrap();
                 release.await.unwrap();
             }
             self.0 += 1;
@@ -63,10 +65,7 @@ impl Drop for HookRetirement {
     }
 }
 
-async fn submit(
-    mailbox: &MpscMailbox,
-    pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
-) -> oneshot::Receiver<u32> {
+async fn submit(mailbox: &MpscMailbox, pause: Option<Pause>) -> oneshot::Receiver<u32> {
     let (reply, received) = oneshot::channel::<u32>();
     mailbox
         .push(
@@ -279,17 +278,25 @@ async fn shard_to_shared_handoff() {
 }
 
 async fn stop_during_transfer(source: Owner, destination: Owner) {
+    interrupt_transfer(&source, destination, async |_| source.stop().await).await;
+}
+
+async fn interrupt_transfer(
+    source: &Owner,
+    destination: Owner,
+    interrupt: impl AsyncFnOnce(ThreadId),
+) {
     let mailbox = counter(PATH);
     source.schedule(PATH, mailbox.clone()).await;
     let (entered, started) = oneshot::channel();
     let (release, held) = oneshot::channel();
     let first = submit(&mailbox, Some((entered, held))).await;
-    tokio::time::timeout(WAIT, started).await.unwrap().unwrap();
+    let actor_thread = tokio::time::timeout(WAIT, started).await.unwrap().unwrap();
     source.remove(PATH).await;
     let mut second = submit(&mailbox, None).await;
     destination.schedule(PATH, mailbox.clone()).await;
     assert_eq!(second.try_recv(), Err(oneshot::error::TryRecvError::Empty));
-    source.stop().await;
+    interrupt(actor_thread).await;
     assert!(release.is_closed(), "source retained the suspended handler");
     assert!(first.await.is_err(), "cancelled request produced a reply");
     let pending = tokio::time::timeout(WAIT, second).await;
@@ -325,4 +332,62 @@ async fn pending_request_survives_shard_source_shutdown() {
         Owner::Pool(pool(true)),
     )
     .await;
+}
+
+struct ThreadExit(mpsc::Sender<ThreadId>);
+
+impl Drop for ThreadExit {
+    fn drop(&mut self) {
+        let _ = self.0.send(std::thread::current().id());
+    }
+}
+
+async fn exit_during_transfer(work_stealing: bool, destination: Owner) {
+    thread_local! {
+        static EXIT: std::cell::OnceCell<ThreadExit> = const { std::cell::OnceCell::new() };
+    }
+    let (ready, source) = oneshot::channel();
+    let (exit, requested) = oneshot::channel();
+    let (done, joined_runtime) = oneshot::channel();
+    let (retired, threads) = mpsc::channel();
+    let host = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .on_thread_start(move || {
+                EXIT.with(|slot| assert!(slot.set(ThreadExit(retired.clone())).is_ok()));
+            })
+            .build()
+            .unwrap();
+        let source = runtime.block_on(async { pool(work_stealing) });
+        if ready.send(source).is_ok() {
+            let _ = requested.blocking_recv();
+        }
+        drop(runtime);
+        let _ = done.send(());
+    });
+    let source = Owner::Pool(tokio::time::timeout(WAIT, source).await.unwrap().unwrap());
+    interrupt_transfer(&source, destination, async move |actor_thread| {
+        exit.send(()).unwrap();
+        tokio::time::timeout(WAIT, joined_runtime)
+            .await
+            .unwrap()
+            .unwrap();
+        host.join().unwrap();
+        assert!(
+            threads.try_iter().any(|thread| thread == actor_thread),
+            "source polling thread did not retire"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_request_survives_fifo_host_exit() {
+    exit_during_transfer(false, Owner::Pool(pool(true))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_request_survives_work_stealing_host_exit() {
+    exit_during_transfer(true, Owner::Shard(ShardedScheduler::start(1, 1))).await;
 }
