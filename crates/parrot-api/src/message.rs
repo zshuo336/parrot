@@ -318,7 +318,18 @@ impl<T: Message + Clone + Sync + 'static> CloneableMessageTrait for T {
     }
 }
 
-// create wrapper struct for CloneableMessageTrait
+/// An owned payload that can be copied for repeated delivery.
+///
+/// Wrap custom types before erasing them to `BoxedMessage`.
+///
+/// ```
+/// use parrot_api::message::CloneableMessage;
+/// #[derive(Clone, PartialEq, Debug)]
+/// struct Tick(String);
+/// let message = CloneableMessage::from_cloneable(Tick("heartbeat".into()));
+/// let copy = message.clone().into_boxed().downcast::<Tick>().unwrap();
+/// assert_eq!(*copy, Tick("heartbeat".into()));
+/// ```
 pub struct CloneableMessage {
     message: Box<dyn CloneableMessageTrait>,
 }
@@ -332,19 +343,6 @@ impl Clone for CloneableMessage {
     }
 }
 
-/// create a CloneableMessage from a concrete type
-/// let msg = MyMessage { /* ... */ };
-/// let cloneable = CloneableMessage::from_message(msg);
-/// let cloned = cloneable.clone();  // now we can clone
-/// let boxed: BoxedMessage = cloneable.into_boxed();
-///
-/// try to create a CloneableMessage from a BoxedMessage
-/// let boxed_msg: BoxedMessage = /* ... */;
-/// if let Some(cloneable) = CloneableMessage::try_from_boxed(&boxed_msg) {
-///     // the message can be cloned
-///     let cloned = cloneable.clone();
-///     // ...
-/// }
 impl CloneableMessage {
     /// convert a type that implements Message + Clone to CloneableMessage
     pub fn from_message<T>(message: T) -> Self
@@ -361,7 +359,7 @@ impl CloneableMessage {
         self.message.into_boxed_message()
     }
 
-    // create a CloneableMessage from any cloneable type
+    /// Retain a concrete payload's clone operation for subsequent deliveries.
     pub fn from_cloneable<T>(value: T) -> Self
     where
         T: Clone + Send + Sync + 'static,
@@ -383,7 +381,9 @@ impl CloneableMessage {
         }
     }
 
-    // Enhanced try_from_boxed method to support more types
+    /// Recognizes erased `String`, `i32`, `i64`, `u32`, `u64`, `bool`, `()`,
+    /// `f32`, `f64` and `char`. For custom types, use [Self::from_cloneable]
+    /// while the concrete type is known.
     pub fn try_from_boxed(boxed: &BoxedMessage) -> Option<Self> {
         // 1. First try common types directly for efficiency
         if let Some(s) = boxed.as_ref().downcast_ref::<String>() {
@@ -408,9 +408,6 @@ impl CloneableMessage {
             return Some(Self::from_cloneable(*c));
         }
 
-        // 2. Try custom message types
-
-        // Final fallback - we can't reliably clone unknown types
         None
     }
 }

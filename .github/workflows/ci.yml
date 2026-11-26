@@ -901,16 +901,7 @@ jobs:
         run: cargo test --locked -p parrot-api-derive-tests
       - name: Derive dispatch contracts
         run: cargo test --locked -p parrot --test test_actor_macro --test test_derive_dispatch_paths
-      - name: Run README quickstart on both engines
-        run: cargo run --locked -p parrot --example quickstart
-      - name: Observe example business results and confirmed retirement
-        run: |
-          cargo build --locked -p parrot --example simple --example actor_ring --example async_message_handling --example ping_pong \
-            --example actix_basic --example actix_basic_no_tokio --example actor_system_usage --example dedicated_thread_example
-          for example in simple actor_ring async_message_handling ping_pong actix_basic actix_basic_no_tokio actor_system_usage dedicated_thread_example; do
-            python3 scripts/with_timeout.py 15 "target/debug/examples/$example"
-          done
-      - name: Run bounded mirror example
-        run: cargo run --locked -p parrot --example mirror
+      - name: Run every core actor example from Cargo's executable inventory
+        run: python3 scripts/check_core_examples.py
       - name: Actual Wire recording and fresh actor replay example
         run: cargo run --locked -p parrot-app --example record_replay -- "$RUNNER_TEMP/parrot-example-capture.jsonl"
