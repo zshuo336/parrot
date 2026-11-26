@@ -224,6 +224,7 @@ fn saturated_prepared(actix: bool) {
         tokio::time::timeout(WAIT, async {
             loop {
                 let prepared = cohort
+                    .admission
                     .scope
                     .active_recovery
                     .lock()

@@ -16,25 +16,37 @@ mod retirement;
 /// use `stop` or system shutdown to join their actual resource retirement.
 #[derive(Clone)]
 pub struct RootCohort {
-    pub(crate) scope: Arc<ChildScope>,
-    owner: Weak<RootCohorts>,
+    pub(crate) admission: RootAdmission,
     retirement: Arc<retirement::Retirement>,
 }
 impl RootCohort {
     /// Snapshot the currently owned roots, including pending first constructors.
     pub fn members(&self) -> parrot_api::context::ReadOnlyChildrenVec {
-        self.scope.view()
+        self.admission.scope.view()
     }
 
     /// Close admission immediately and join all members and policy captures.
     /// Cleanup continues if this future is dropped. This receipt waits for actual
     /// disposal, including work that has exceeded a member's public stop deadline.
     pub fn stop(&self) -> BoxedFuture<'static, ActorResult<()>> {
-        self.scope.close();
+        self.admission.scope.close();
         self.retirement
-            .start(self.scope.clone(), self.owner.clone())
+            .start(self.admission.scope.clone(), self.admission.owner.clone())
     }
 
+    pub(crate) fn validate(&self, owner: &Arc<RootCohorts>) -> ActorResult<()> {
+        self.admission.validate(owner)
+    }
+}
+
+/// Guardian routing must keep rejecting admission after shutdown without
+/// retaining a public group handle and its process-wide retirement permit.
+#[derive(Clone)]
+pub(crate) struct RootAdmission {
+    pub(crate) scope: Arc<ChildScope>,
+    owner: Weak<RootCohorts>,
+}
+impl RootAdmission {
     pub(crate) fn validate(&self, owner: &Arc<RootCohorts>) -> ActorResult<()> {
         if !Weak::ptr_eq(&self.owner, &Arc::downgrade(owner)) {
             return Err(ActorError::InternalError(
@@ -56,19 +68,19 @@ pub(crate) fn lifecycle_runtime() -> ActorResult<Handle> {
 struct State {
     closed: bool,
     scopes: Vec<RootCohort>,
-    closing: Option<Vec<RootCohort>>,
+    closing: Option<Vec<retirement::Completion>>,
 }
 
 /// Retain live groups independently of public handles, including pending cleanup.
 pub(crate) struct RootCohorts {
     state: Mutex<State>,
-    guardian: OnceLock<RootCohort>,
+    guardian: OnceLock<RootAdmission>,
     retirement_runtime: Handle,
 }
 impl Drop for RootCohorts {
     fn drop(&mut self) {
         let state = self.state.get_mut().unwrap();
-        for group in state.scopes.iter().chain(state.closing.iter().flatten()) {
+        for group in &state.scopes {
             drop(group.stop());
         }
     }
@@ -90,8 +102,18 @@ impl RootCohorts {
     pub(crate) fn set_test_retirement_runtime(&mut self, runtime: Handle) {
         self.retirement_runtime = runtime;
     }
-    pub(crate) fn guardian(&self) -> Option<&RootCohort> {
+    pub(crate) fn guardian(&self) -> Option<&RootAdmission> {
         self.guardian.get()
+    }
+
+    pub(crate) fn admission<'a>(
+        &'a self,
+        cohort: Option<&'a RootCohort>,
+        use_guardian: bool,
+    ) -> Option<&'a RootAdmission> {
+        cohort
+            .map(|group| &group.admission)
+            .or_else(|| if use_guardian { self.guardian() } else { None })
     }
 
     pub(crate) async fn install_guardian(
@@ -101,7 +123,7 @@ impl RootCohorts {
         slots: Arc<Semaphore>,
     ) -> ActorResult<()> {
         let group = self.create(strategy, timeout, slots).await?;
-        if let Err(group) = self.guardian.set(group) {
+        if self.guardian.set(group.admission.clone()).is_err() {
             group.stop().await?;
             return Err(ActorError::InternalError(
                 "guardian already configured".into(),
@@ -130,8 +152,10 @@ impl RootCohorts {
             let scope = ChildScope::new(timeout, slots);
             scope.set_strategy(strategy.take());
             let group = RootCohort {
-                scope: scope.clone(),
-                owner: Arc::downgrade(&owner),
+                admission: RootAdmission {
+                    scope,
+                    owner: Arc::downgrade(&owner),
+                },
                 retirement,
             };
             let accepted = {
@@ -156,18 +180,23 @@ impl RootCohorts {
     }
 
     pub(crate) fn close(&self) {
-        for group in self.begin_close() {
+        let groups = {
+            let mut state = self.state.lock().unwrap();
+            state.closed = true;
+            if state.closing.is_none() {
+                state.closing = Some(
+                    state
+                        .scopes
+                        .iter()
+                        .map(|g| g.retirement.subscribe())
+                        .collect(),
+                );
+            }
+            state.scopes.clone()
+        };
+        for group in groups {
             drop(group.stop());
         }
-    }
-
-    fn begin_close(&self) -> Vec<RootCohort> {
-        let mut state = self.state.lock().unwrap();
-        state.closed = true;
-        if state.closing.is_none() {
-            state.closing = Some(state.scopes.clone());
-        }
-        state.closing.as_ref().unwrap().clone()
     }
 
     fn remove(&self, scope: &Arc<ChildScope>) {
@@ -176,15 +205,16 @@ impl RootCohorts {
             state
                 .scopes
                 .iter()
-                .position(|entry| Arc::ptr_eq(&entry.scope, scope))
+                .position(|entry| Arc::ptr_eq(&entry.admission.scope, scope))
                 .map(|index| state.scopes.swap_remove(index))
         };
         drop(removed);
     }
 
     pub(crate) async fn join(&self) -> ActorResult<()> {
-        let groups = self.begin_close();
-        let results = futures::future::join_all(groups.iter().map(RootCohort::stop)).await;
+        self.close();
+        let receipts = self.state.lock().unwrap().closing.clone().unwrap();
+        let results = futures::future::join_all(receipts.into_iter().map(retirement::wait)).await;
         let mut failure = None;
         for result in results {
             if let Err(error) = result {

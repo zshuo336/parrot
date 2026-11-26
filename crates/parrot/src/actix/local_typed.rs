@@ -934,12 +934,7 @@ impl ActixActorSystem {
             factory.and(policy)?;
             return Err(error);
         }
-        let guardian = cohort.or_else(|| {
-            parent
-                .is_none()
-                .then(|| self.root_cohorts.guardian())
-                .flatten()
-        });
+        let guardian = self.root_cohorts.admission(cohort, parent.is_none());
         let policy = if guardian.is_some() {
             policy.retire().await?;
             crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots)

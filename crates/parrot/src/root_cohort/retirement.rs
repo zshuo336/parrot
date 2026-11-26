@@ -8,7 +8,7 @@ use tokio::{
 
 const CAPACITY: usize = 65536;
 type Job = Box<dyn FnOnce() + Send>;
-type Completion = watch::Receiver<Option<Result<(), ActorReceipt>>>;
+pub(super) type Completion = watch::Receiver<Option<Result<(), ActorReceipt>>>;
 
 fn publish_finished(
     finished: &watch::Sender<Option<Result<(), ActorReceipt>>>,
@@ -171,7 +171,8 @@ pub(super) fn runtime() -> ActorResult<Handle> {
 
 pub(super) struct Retirement {
     reservation: Arc<Reservation>,
-    completion: Mutex<Option<Completion>>,
+    finished: OnceLock<watch::Sender<Option<Result<(), ActorReceipt>>>>,
+    started: std::sync::Once,
 }
 struct Publish(watch::Sender<Option<Result<(), ActorReceipt>>>);
 impl Drop for Publish {
@@ -183,38 +184,38 @@ impl Retirement {
     pub(super) fn new() -> ActorResult<Arc<Self>> {
         Ok(Arc::new(Self {
             reservation: Reservation::new()?,
-            completion: Mutex::new(None),
+            finished: OnceLock::new(),
+            started: std::sync::Once::new(),
         }))
+    }
+    fn sender(&self) -> &watch::Sender<Option<Result<(), ActorReceipt>>> {
+        self.finished.get_or_init(|| watch::channel(None).0)
+    }
+    pub(super) fn subscribe(&self) -> Completion {
+        self.sender().subscribe()
     }
     pub(super) fn start(
         &self,
         scope: Arc<ChildScope>,
         owner: Weak<RootCohorts>,
     ) -> BoxedFuture<'static, ActorResult<()>> {
-        let completion = {
-            let mut slot = self.completion.lock().unwrap();
-            if let Some(completion) = &*slot {
-                completion.clone()
-            } else {
-                let (finished, completion) = watch::channel(None);
-                *slot = Some(completion.clone());
-                let publish = Publish(finished);
-                let reservation = self.reservation.clone();
-                drop(self.reservation.driver.runtime.spawn(async move {
-                    let _reservation = reservation;
-                    let result = scope.join().await.map_err(ActorReceipt::from_error);
-                    if let Some(owner) = owner.upgrade() {
-                        owner.remove(&scope);
-                    }
-                    publish_finished(&publish.0, result);
-                }));
-                completion
-            }
-        };
+        let completion = self.subscribe();
+        self.started.call_once(|| {
+            let publish = Publish(self.sender().clone());
+            let reservation = self.reservation.clone();
+            drop(self.reservation.driver.runtime.spawn(async move {
+                let _reservation = reservation;
+                let result = scope.join().await.map_err(ActorReceipt::from_error);
+                if let Some(owner) = owner.upgrade() {
+                    owner.remove(&scope);
+                }
+                publish_finished(&publish.0, result);
+            }));
+        });
         Box::pin(async move { wait(completion).await })
     }
 }
-async fn wait(mut completion: Completion) -> ActorResult<()> {
+pub(super) async fn wait(mut completion: Completion) -> ActorResult<()> {
     loop {
         if let Some(result) = completion.borrow_and_update().clone() {
             return result.map_err(ActorReceipt::into_error);

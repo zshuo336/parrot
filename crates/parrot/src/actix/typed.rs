@@ -527,12 +527,7 @@ impl ActixActorSystem {
         M: ParrotMsgVariant<A>,
     {
         let creation_context = parrot_api::trace::TraceContext::current();
-        let cohort = cohort.or_else(|| {
-            parent
-                .is_none()
-                .then(|| self.root_cohorts.guardian())
-                .flatten()
-        });
+        let cohort = self.root_cohorts.admission(cohort, parent.is_none());
         let policy = if cohort.is_some() {
             policy.retire().await?;
             crate::owned_payload::OwnedPayload::new(None, &self.runtime, &self.cleanup_slots)

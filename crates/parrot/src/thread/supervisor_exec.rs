@@ -676,7 +676,7 @@ mod disposal_deadline_tests {
             .unwrap();
         // Cancel the epoch without polling any member stop. This fixes the
         // ordering that otherwise races the independent retirement driver.
-        cohort.scope.close();
+        cohort.admission.scope.close();
         assert!(lifetime.recovery().unwrap().was_cancelled());
         assert!(!control.is_cancelled());
         release.send(()).unwrap();

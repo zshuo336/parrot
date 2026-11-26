@@ -872,12 +872,7 @@ impl ThreadActorSystem {
             Some(reservation) => policy.with_reservation(reservation),
             None => policy,
         };
-        let cohort = cohort.or_else(|| {
-            parent
-                .is_none()
-                .then(|| self.root_cohorts.guardian())
-                .flatten()
-        });
+        let cohort = self.root_cohorts.admission(cohort, parent.is_none());
         let policy = if cohort.is_some() {
             if let Err(error) = policy.retire().await {
                 retire_source(payload, factory, None).await?;

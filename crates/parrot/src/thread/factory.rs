@@ -149,7 +149,7 @@ impl ThreadActorSystem {
             };
             let factory = factory.with_reservation(&reservation);
             let config = config.with_reservation(&reservation);
-            let cohort = cohort.or_else(|| self.root_cohorts.guardian());
+            let cohort = self.root_cohorts.admission(cohort, true);
             let factory = Factory::with_admission(
                 factory.take(),
                 self.factory_slots.clone(),

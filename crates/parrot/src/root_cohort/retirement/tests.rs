@@ -165,7 +165,8 @@ fn capacity(retain_handle: bool) {
     let driver = Driver::start(1, build, |job| std::thread::Builder::new().spawn(job)).unwrap();
     let retirement = Arc::new(Retirement {
         reservation: driver.reserve().unwrap(),
-        completion: Mutex::new(None),
+        finished: OnceLock::new(),
+        started: std::sync::Once::new(),
     });
     assert!(driver.reserve().is_err());
     let gate = Arc::new(Gate::default());
@@ -226,4 +227,61 @@ fn pending_cleanup_retains_capacity_after_last_public_handle() {
 #[test]
 fn completed_handle_retains_capacity_until_last_clone_is_released() {
     capacity(true);
+}
+
+fn check_registry_capacity(guardian: bool) {
+    let driver = Driver::shared().unwrap();
+    let available = driver.slots.available_permits();
+    let owner = Arc::new(RootCohorts::new().unwrap());
+    let slots = Arc::new(Semaphore::new(1));
+    let host = build().unwrap();
+    let handle = if guardian {
+        host.block_on(owner.install_guardian(Default::default(), WAIT, slots))
+            .unwrap();
+        None
+    } else {
+        let group = host
+            .block_on(owner.create(Default::default(), WAIT, slots))
+            .unwrap();
+        Some(group.clone())
+    };
+    assert_eq!(driver.slots.available_permits(), available - 1);
+    owner.close();
+    drop(host);
+    let observer = build().unwrap();
+    observer.block_on(async {
+        tokio::time::timeout(WAIT, owner.join())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(group) = handle {
+            assert_eq!(driver.slots.available_permits(), available - 1);
+            group.stop().await.unwrap();
+            drop(group);
+        }
+        // The terminal sender wakes its observer just before its task ends.
+        driver.runtime.spawn(async {}).await.unwrap();
+        assert_eq!(
+            driver.slots.available_permits(),
+            available,
+            "a stopped registry retained retirement capacity after its last group handle"
+        );
+        owner.join().await.unwrap();
+    });
+}
+
+#[test]
+fn closed_registry_returns_group_capacity_after_last_handle() {
+    crate::test_support::isolated(
+        "root_cohort::retirement::tests::closed_registry_returns_group_capacity_after_last_handle",
+        || check_registry_capacity(false),
+    );
+}
+
+#[test]
+fn closed_registry_returns_guardian_capacity_after_host_exit() {
+    crate::test_support::isolated(
+        "root_cohort::retirement::tests::closed_registry_returns_guardian_capacity_after_host_exit",
+        || check_registry_capacity(true),
+    );
 }

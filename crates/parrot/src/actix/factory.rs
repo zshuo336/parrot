@@ -621,7 +621,7 @@ impl ActixActorSystem {
                 };
                 let factory = factory.with_reservation(&permit);
                 let strategy = strategy.with_reservation(&permit);
-                let cohort = cohort.or_else(|| self.root_cohorts.guardian());
+                let cohort = self.root_cohorts.admission(cohort, true);
                 let strategy = if cohort.is_some() {
                     strategy.retire().await?;
                     crate::owned_payload::OwnedPayload::new(

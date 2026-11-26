@@ -105,7 +105,7 @@ async fn cohort_close_before_member_seal_is_successful_cancellation() {
         .clone();
     // Hold the first phase of cohort.stop / system shutdown, before dispatch
     // can request_stop each member on the shared driver.
-    cohort.scope.close();
+    cohort.admission.scope.close();
     assert!(!control.channel.is_sealed());
     drop(release);
     tokio::time::timeout(WAIT, async {

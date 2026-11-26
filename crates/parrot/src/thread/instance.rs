@@ -487,13 +487,9 @@ impl ThreadActorSystem {
             let config = config.with_reservation(&reservation);
             let parent = parent.with_reservation(&reservation);
             let engine = engine.with_reservation(&reservation);
-            let cohort = cohort.or_else(|| {
-                parent
-                    .value()
-                    .is_none()
-                    .then(|| self.root_cohorts.guardian())
-                    .flatten()
-            });
+            let cohort = self
+                .root_cohorts
+                .admission(cohort, parent.value().is_none());
             let path = path.unwrap_or_else(|| format!("/user/{}", uuid::Uuid::new_v4().simple()));
             let defaults = export_engine.then(|| Arc::new(std::sync::OnceLock::new()));
             let admit = |lifetime: Arc<crate::children::ChildLifetime>| {
