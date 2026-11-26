@@ -324,6 +324,7 @@ impl ShardRegistration {
 ///
 /// `shards` must be created via [`ShardedScheduler::start`].
 pub struct ShardedScheduler {
+    join_runtime: tokio::runtime::Handle,
     shards: Vec<Arc<Shard>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
@@ -488,6 +489,7 @@ impl ShardedScheduler {
         R: Fn(usize) -> std::io::Result<tokio::runtime::Runtime> + Clone + Send + 'static,
     {
         Self::validate(n, batch_size)?;
+        let join_runtime = crate::thread::native_budget::join_runtime()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
         let mut shards = Vec::with_capacity(n);
@@ -582,6 +584,7 @@ impl ShardedScheduler {
         construction.armed = false;
         let threads = std::mem::take(&mut construction.threads);
         Ok(Arc::new(Self {
+            join_runtime,
             shards,
             shutdown,
             shutdown_notify,
@@ -889,7 +892,7 @@ impl ShardedScheduler {
                 // The receipt retains this job after caller cancellation. Even
                 // a queued blocking task cancelled by runtime shutdown executes
                 // JoinJob::drop, which joins before publishing its result.
-                drop(tokio::task::spawn_blocking(move || drop(job)));
+                drop(self.join_runtime.spawn_blocking(move || drop(job)));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(crate::thread::error::SystemError::Timeout(

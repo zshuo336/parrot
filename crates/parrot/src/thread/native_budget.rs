@@ -153,6 +153,12 @@ pub(crate) fn prepare_join_fallback() -> Result<(), SystemError> {
     JoinFallback::shared().map(|_| ())
 }
 
+/// Establish the independent join executor before starting the OS worker.
+pub(super) fn join_runtime() -> Result<tokio::runtime::Handle, SystemError> {
+    crate::root_cohort::lifecycle_runtime()
+        .map_err(|error| SystemError::ThreadSetupError(error.to_string()))
+}
+
 /// Transfer an already admitted native owner without allocating another OS
 /// thread. Production callers retain native reservations through this join;
 /// those process-wide reservations also bound the number of queued owners.

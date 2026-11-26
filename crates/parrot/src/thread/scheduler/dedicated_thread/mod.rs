@@ -251,7 +251,7 @@ impl DedicatedThreadScheduler {
             self.config.apply_defaults(config),
             self.config.max_messages_per_batch,
             Some(reservation),
-        ));
+        )?);
 
         worker.start_with_startup(startup).map_err(|e| {
             SystemError::ThreadSetupError(format!(
@@ -654,6 +654,7 @@ struct DedicatedWorker {
     join_slot: Mutex<Option<std::thread::JoinHandle<DedicatedExit>>>,
     join_claimed: AtomicBool,
     join_receipt: Arc<Mutex<Option<DedicatedExit>>>,
+    join_runtime: Handle,
     reservation: Mutex<Option<NativeWorkerReservation>>,
     stop_tx: tokio::sync::mpsc::Sender<StopHookRequest>,
     stop_rx: Mutex<Option<tokio::sync::mpsc::Receiver<StopHookRequest>>>,
@@ -799,7 +800,7 @@ impl DedicatedWorker {
         config: ThreadActorConfig,
         batch_size: usize,
     ) -> Self {
-        Self::new_with_reservation(path, mailbox, processor, config, batch_size, None)
+        Self::new_with_reservation(path, mailbox, processor, config, batch_size, None).unwrap()
     }
 
     fn new_with_reservation(
@@ -809,9 +810,9 @@ impl DedicatedWorker {
         config: ThreadActorConfig,
         batch_size: usize,
         reservation: Option<NativeWorkerReservation>,
-    ) -> Self {
+    ) -> Result<Self, SystemError> {
         let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(super::MAX_CONTROL_QUEUE);
-        Self {
+        Ok(Self {
             path,
             mailbox,
             processor,
@@ -823,10 +824,11 @@ impl DedicatedWorker {
             join_slot: Mutex::new(None),
             join_claimed: AtomicBool::new(false),
             join_receipt: Arc::new(Mutex::new(None)),
+            join_runtime: crate::thread::native_budget::join_runtime()?,
             reservation: Mutex::new(reservation),
             stop_tx,
             stop_rx: Mutex::new(Some(stop_rx)),
-        }
+        })
     }
 
     /// Spawn the dedicated OS thread.
@@ -1053,11 +1055,7 @@ impl DedicatedWorker {
             // Keep the retirement owner on the lifecycle executor. A finished
             // OS handle can still carry thread-local destruction ordering that
             // must not be completed by the scheduler caller itself.
-            if let Ok(handle) = Handle::try_current() {
-                drop(handle.spawn_blocking(move || drop(job)));
-            } else {
-                drop(job);
-            }
+            drop(self.join_runtime.spawn_blocking(move || drop(job)));
         }
         self.join_result()
     }

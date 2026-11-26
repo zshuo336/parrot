@@ -115,6 +115,45 @@ async fn capacity_recovers(budget: &Arc<NativeWorkerBudget>) {
     reservation.release_after_join();
 }
 
+fn close_with_busy_observer(kind: usize) {
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    observer.block_on(async {
+        let live = start(kind).await;
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, finished) = std::sync::mpsc::channel::<()>();
+        let business = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = finished.recv();
+        });
+        entered.await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let joined = match &live {
+            Live::Dedicated(scheduler) => scheduler.shutdown_until(deadline).await,
+            Live::Sharded(scheduler) => scheduler.shutdown_until(deadline).await,
+            Live::Actix(_) => unreachable!(),
+        };
+        assert!(!business.is_finished());
+        drop(release);
+        business.await.unwrap();
+        live.close().await;
+        joined.expect("native worker join depended on the shutdown observer's blocking pool");
+    });
+}
+
+#[test]
+fn dedicated_join_progresses_while_observer_blocking_pool_is_busy() {
+    close_with_busy_observer(0);
+}
+
+#[test]
+fn shard_join_progresses_while_observer_blocking_pool_is_busy() {
+    close_with_busy_observer(1);
+}
+
 #[test]
 fn normal_native_worker_constructors_share_the_real_process_budget() {
     isolated(
