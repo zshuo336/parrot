@@ -418,8 +418,14 @@ impl Worker {
             } else {
                 crate::thread::scheduler::queue::Lane::Normal
             };
-            self.scheduling_queue
-                .enqueue_on_worker(mailbox, lane, Some(self.id));
+            if !self
+                .scheduling_queue
+                .enqueue_on_worker(mailbox, lane, Some(self.id))
+            {
+                // The old queue released the slot. The destination's initial
+                // wake may have coalesced while this batch still owned it.
+                lease.mailbox.fire_wake_hook();
+            }
         }
 
         Ok(())

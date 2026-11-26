@@ -272,6 +272,16 @@ impl ScheduleState {
     const OWNED: u8 = 1;
     const WAKE: u8 = 2;
 
+    /// Coalesce a producer wake without acquiring an idle slot. A free slot
+    /// must be claimed by the mailbox's currently registered scheduler.
+    pub(crate) fn wake_if_owned(&self) -> bool {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & Self::OWNED != 0).then_some(state | Self::WAKE)
+            })
+            .is_ok()
+    }
+
     /// Acquire a free slot, or record a wake for its current owner.
     pub fn try_enqueue(&self) -> bool {
         let mut current = self.state.load(Ordering::Acquire);

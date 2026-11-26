@@ -14,7 +14,7 @@ use crate::thread::config::ThreadActorConfig;
 use crate::thread::error::SystemError;
 use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::ThreadScheduler;
-use crate::thread::scheduler::queue::SchedulingQueue;
+use crate::thread::scheduler::queue::{Lane, SchedulingQueue, WakeAdmission};
 use parrot_api::runtime::LoadBalancingStrategy;
 
 #[cfg(test)]
@@ -668,17 +668,19 @@ impl SharedThreadPool {
                 if shutting_down.load(Ordering::Relaxed) {
                     return;
                 }
-                if let Some(strong) = weak_mailbox.upgrade()
-                    && strong.schedule_state().try_enqueue()
-                {
+                if let Some(strong) = weak_mailbox.upgrade() {
+                    if strong.schedule_state().wake_if_owned() {
+                        return;
+                    }
                     // M2: wake path also honors the priority lane.
                     let lane = if strong.has_high_priority_messages() {
-                        crate::thread::scheduler::queue::Lane::High
+                        Lane::High
                     } else {
-                        crate::thread::scheduler::queue::Lane::Normal
+                        Lane::Normal
                     };
-                    queue.enqueue_registered(strong, lane);
-                    elastic.probe();
+                    if queue.wake_registered(&strong, lane) == WakeAdmission::Queued {
+                        elastic.probe();
+                    }
                 }
             });
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -692,15 +694,13 @@ impl SharedThreadPool {
             }
         }
 
-        if mailbox.schedule_state().try_enqueue() {
-            let admitted = self.scheduling_queue.enqueue_registered(
-                mailbox.clone(),
-                crate::thread::scheduler::queue::Lane::Normal,
-            );
-            if !admitted {
-                rollback();
-                return Err(SystemError::ShuttingDown);
-            }
+        if self
+            .scheduling_queue
+            .wake_registered(&mailbox, Lane::Normal)
+            == WakeAdmission::Detached
+        {
+            rollback();
+            return Err(SystemError::ShuttingDown);
         }
 
         // Shutdown may have closed the queue immediately after the hook was

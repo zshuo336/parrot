@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::thread::mailbox::Mailbox;
-use crate::thread::scheduler::queue::SchedulingQueue;
+use crate::thread::scheduler::queue::{Lane, SchedulingQueue, WakeAdmission};
 
 // The same mailbox and path can be registered again before an older call
 // finishes publishing its hook. Each admission needs its own rollback identity.
@@ -104,12 +104,7 @@ impl WorkerManager {
             registration
         };
         after_register();
-        if mailbox.schedule_state().try_enqueue()
-            && !queue.enqueue_registered(
-                mailbox.clone(),
-                crate::thread::scheduler::queue::Lane::Normal,
-            )
-        {
+        if queue.wake_registered(&mailbox, Lane::Normal) == WakeAdmission::Detached {
             registration.rollback(&self.scheduled, &path, queue);
             return Err(crate::thread::error::SystemError::ShuttingDown);
         }

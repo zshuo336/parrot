@@ -21,6 +21,13 @@ pub enum Lane {
     Normal,
 }
 
+#[derive(PartialEq, Eq)]
+pub(crate) enum WakeAdmission {
+    Detached,
+    Coalesced,
+    Queued,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Admission {
     lane: Lane,
@@ -310,6 +317,7 @@ impl SchedulingQueue {
     }
     /// Called only by a holder of the mailbox's scheduling ownership. Full
     /// queues retain that ownership in one fixed readiness marker per actor.
+    #[cfg(test)]
     pub(crate) fn enqueue_registered(&self, mailbox: ReadyMailbox, lane: Lane) -> bool {
         self.enqueue_on_worker(mailbox, lane, None)
     }
@@ -328,13 +336,38 @@ impl SchedulingQueue {
             schedule.force_release();
             return false;
         }
+        self.admit(&mut state, &mailbox, lane, worker);
+        drop(state);
+        notification::one(&self.notify);
+        true
+    }
+
+    /// Acquire the mailbox slot only while this queue still owns a registration.
+    /// A producer can be holding an old hook snapshot across a move to another pool.
+    pub(crate) fn wake_registered(&self, mailbox: &ReadyMailbox, lane: Lane) -> WakeAdmission {
+        let schedule = mailbox.schedule_state();
+        let mut state = self.state.lock().unwrap();
+        if state.closed || !state.registered.contains_key(&identity(mailbox)) {
+            return WakeAdmission::Detached;
+        }
+        if !schedule.try_enqueue() {
+            return WakeAdmission::Coalesced;
+        }
+        self.admit(&mut state, mailbox, lane, None);
+        drop(state);
+        notification::one(&self.notify);
+        WakeAdmission::Queued
+    }
+
+    fn admit(&self, state: &mut State, mailbox: &ReadyMailbox, lane: Lane, worker: Option<usize>) {
+        let id = identity(mailbox);
         if let Some(deferred) = &mut state.registered.get_mut(&id).unwrap().deferred {
             deferred.lane = deferred.lane.min(lane);
         } else {
             state.refill(self.max_capacity);
             let worker = worker.or_else(|| {
                 if matches!(lane, Lane::Normal) {
-                    self.choose_worker(&mut state)
+                    self.choose_worker(state)
                 } else {
                     None
                 }
@@ -350,9 +383,6 @@ impl SchedulingQueue {
                 state.deferred_count += 1;
             }
         }
-        drop(state);
-        notification::one(&self.notify);
-        true
     }
     pub(crate) fn unregister(&self, mailbox: &ReadyMailbox) {
         let id = identity(mailbox);
@@ -532,6 +562,25 @@ mod tests {
 
     fn make_mailbox(name: &str) -> Arc<dyn Mailbox> {
         Arc::new(MpscMailbox::new(4, ActorPath::placeholder(name)))
+    }
+
+    #[test]
+    fn detached_queue_cannot_claim_or_release_the_new_owners_slot() {
+        let old = SchedulingQueue::new(1);
+        let new = SchedulingQueue::new(1);
+        let mailbox = make_mailbox("/handoff");
+        assert!(old.register(&mailbox));
+        old.unregister(&mailbox);
+        assert!(new.register(&mailbox));
+        assert!(old.wake_registered(&mailbox, Lane::Normal) == WakeAdmission::Detached);
+        assert!(new.wake_registered(&mailbox, Lane::Normal) == WakeAdmission::Queued);
+        assert!(old.wake_registered(&mailbox, Lane::Normal) == WakeAdmission::Detached);
+        assert!(new.wake_registered(&mailbox, Lane::Normal) == WakeAdmission::Coalesced);
+        assert!(old.is_empty());
+        assert_eq!(new.len(), 1);
+        new.unregister(&mailbox);
+        assert!(mailbox.schedule_state().try_enqueue());
+        mailbox.schedule_state().force_release();
     }
 
     #[test]
