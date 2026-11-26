@@ -63,6 +63,8 @@ def parse_tasks(text):
             if len(values) != 1 or not values[0].strip():
                 raise ValueError(identity + " 缺少或重复字段：" + label)
             fields[label] = values[0].strip()
+        additions = re.findall(r"^已做补充：([^\n]+)$", body, re.M)
+        fields["已做"] = "\n".join([fields["已做"], *(item.strip() for item in additions)])
         effort = re.fullmatch(r"(\d+)-(\d+)", fields["剩余人日"])
         if fields["状态"] not in STATES or not effort:
             raise ValueError(identity + " 状态或工作量不合法")

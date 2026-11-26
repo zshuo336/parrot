@@ -13,6 +13,17 @@ tracker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(tracker)
 
 
+class TaskDetails(unittest.TestCase):
+    def test_completed_additions_stay_with_their_task_in_source_order(self):
+        body = ("状态：进行中\n剩余人日：1-2\n依赖：无\n已做：原始进展\n"
+                "待做：复验\n验收：全部通过\n证据：无\n")
+        text = ("### T01-01 首项\n" + body + "已做补充：第二批\n已做补充：第三批\n"
+                + "### T01-02 次项\n" + body)
+        first, second = tracker.parse_tasks(text)
+        self.assertEqual(first['implemented'].splitlines(), ['原始进展', '第二批', '第三批'])
+        self.assertEqual(second['implemented'], '原始进展')
+
+
 class LiveDocumentsTest(unittest.TestCase):
     def test_added_changed_and_removed_document_uses_current_allowlist(self):
         with tempfile.TemporaryDirectory(prefix='parrot-tracker-http-') as directory:
