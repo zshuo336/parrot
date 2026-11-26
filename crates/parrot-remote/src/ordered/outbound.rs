@@ -5,7 +5,7 @@ use crate::{
     error::ErrCode,
     frame::Frame,
     registry::{CallbackRegistry, ReplyPayload},
-    transport::{ConnectionIdentity, FrameSender},
+    transport::FrameSender,
 };
 use parrot_api::{errors::ActorError, types::ActorResult};
 use std::{
@@ -20,8 +20,15 @@ use tokio::time::Instant;
 
 struct Grant {
     receipt: Receipt,
-    connection: ConnectionIdentity,
+    sender: FrameSender,
     renew_at: Instant,
+}
+impl Grant {
+    fn retired_by(&self, receipt: &Receipt) -> bool {
+        !receipt.active
+            && receipt.ticket == self.receipt.ticket
+            && receipt.receiver == self.receipt.receiver
+    }
 }
 
 struct Lane {
@@ -132,13 +139,38 @@ impl Outbound {
             return Ok(Some(frame));
         }
         if state.sequence == u64::MAX {
+            if let Some(grant) = &state.grant {
+                let control = Control {
+                    operation: Operation::Close,
+                    source: self.source.clone(),
+                    incarnation: self.incarnation,
+                    stream: state.stream,
+                    ticket: grant.receipt.ticket,
+                };
+                let retired = request(
+                    &grant.sender,
+                    callbacks,
+                    destination,
+                    &frame.path,
+                    frame.header.hop_limit,
+                    &control,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .map_err(|(code, detail)| code.to_actor_error(detail))?;
+                if !grant.retired_by(&retired) {
+                    return Err(ErrCode::ProtocolViolation
+                        .to_actor_error("ordered sequence retirement identity differs".into()));
+                }
+            }
             state.stream = identity();
             state.grant = None;
+            state.sequence = 0;
         }
         let refresh = state.grant.as_ref().is_none_or(|grant| {
             !grant.receipt.active
                 || grant.renew_at <= Instant::now()
-                || grant.connection.key() != sender.dispatch_key()
+                || grant.sender.dispatch_key() != sender.dispatch_key()
         });
         if refresh {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -166,19 +198,49 @@ impl Outbound {
                 }
                 Err((code, detail)) => return Err(code.to_actor_error(detail)),
             };
+            if let Some(previous) = state
+                .grant
+                .as_ref()
+                .filter(|grant| grant.receipt.receiver != receipt.receiver)
+            {
+                // Only the original receiver can certify its workers retired.
+                // Keep its grant on cancellation or failure so a new route
+                // cannot silently erase an unresolved predecessor.
+                let closing = Control {
+                    operation: Operation::Close,
+                    source: self.source.clone(),
+                    incarnation: self.incarnation,
+                    stream: state.stream,
+                    ticket: previous.receipt.ticket,
+                };
+                let retired = request(
+                    &previous.sender,
+                    callbacks,
+                    destination,
+                    &frame.path,
+                    frame.header.hop_limit,
+                    &closing,
+                    deadline,
+                )
+                .await
+                .map_err(|(code, detail)| code.to_actor_error(detail))?;
+                if !previous.retired_by(&retired) {
+                    return Err(ErrCode::ProtocolViolation
+                        .to_actor_error("ordered predecessor retirement identity differs".into()));
+                }
+            }
             if !receipt.active {
-                if state
-                    .grant
-                    .as_ref()
-                    .is_none_or(|grant| grant.receipt.ticket != receipt.ticket)
-                {
+                if state.grant.as_ref().is_none_or(|grant| {
+                    grant.receipt.ticket != receipt.ticket
+                        || grant.receipt.receiver != receipt.receiver
+                }) {
                     state.sequence = 0;
                 }
                 // Cancellation after COMMIT publication must still leave enough
                 // identity for explicit close to join the receiver's handoff.
                 state.grant = Some(Grant {
                     receipt,
-                    connection: sender.retain_identity(),
+                    sender: sender.clone(),
                     renew_at: Instant::now(),
                 });
                 control.operation = Operation::Commit;
@@ -197,22 +259,21 @@ impl Outbound {
                 if !committed.active
                     || committed.ticket != receipt.ticket
                     || committed.generation != receipt.generation
+                    || committed.receiver != receipt.receiver
                 {
                     return Err(ErrCode::ProtocolViolation
                         .to_actor_error("ordered commit receipt differs from challenge".into()));
                 }
                 receipt = committed;
             }
-            if state
-                .grant
-                .as_ref()
-                .is_none_or(|grant| grant.receipt.ticket != receipt.ticket)
-            {
+            if state.grant.as_ref().is_none_or(|grant| {
+                grant.receipt.ticket != receipt.ticket || grant.receipt.receiver != receipt.receiver
+            }) {
                 state.sequence = 0;
             }
             state.grant = Some(Grant {
                 receipt,
-                connection: sender.retain_identity(),
+                sender: sender.clone(),
                 renew_at: Instant::now()
                     + Duration::from_millis((receipt.lease_ms / 2).max(1) as u64),
             });
@@ -283,7 +344,11 @@ impl Outbound {
                         ticket: grant.receipt.ticket,
                     };
                     let receipt = request(
-                        sender,
+                        if grant.sender.is_closed() {
+                            sender
+                        } else {
+                            &grant.sender
+                        },
                         callbacks,
                         destination,
                         path,
@@ -293,8 +358,7 @@ impl Outbound {
                     )
                     .await;
                     match receipt {
-                        Ok(receipt)
-                            if !receipt.active && receipt.ticket == grant.receipt.ticket => {}
+                        Ok(receipt) if grant.retired_by(&receipt) => {}
                         Err((code, detail)) => return Err(code.to_actor_error(detail)),
                         _ => {
                             return Err(ErrCode::ProtocolViolation

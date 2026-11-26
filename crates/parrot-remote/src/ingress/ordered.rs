@@ -33,6 +33,7 @@ struct Pending {
 }
 
 struct Lease {
+    receiver: Identity,
     source: String,
     incarnation: Identity,
     stream: Identity,
@@ -53,6 +54,7 @@ impl Lease {
     fn receipt(&self, active: bool) -> Receipt {
         Receipt {
             active,
+            receiver: self.receiver,
             ticket: self.ticket,
             generation: self.generation,
             lease_ms: ordered::LEASE_MS,
@@ -111,12 +113,14 @@ struct Source {
 }
 
 pub(super) struct Sessions {
+    receiver: Identity,
     sources: HashMap<String, Source>,
     capacity: usize,
 }
 impl Sessions {
     pub fn new(capacity: usize) -> Self {
         Self {
+            receiver: ordered::identity(),
             sources: HashMap::new(),
             capacity,
         }
@@ -333,6 +337,7 @@ impl Ingress {
                 return Err(ErrCode::Stopped);
             }
             sessions.prune_challenges();
+            let receiver = sessions.receiver;
             if !sessions.sources.contains_key(&control.source)
                 && sessions.sources.len() >= sessions.capacity
             {
@@ -363,6 +368,7 @@ impl Ingress {
                 }) {
                     return Ok(Receipt {
                         active: false,
+                        receiver,
                         ticket: challenge.control.ticket,
                         generation: challenge.generation,
                         lease_ms: ordered::LEASE_MS,
@@ -375,6 +381,7 @@ impl Ingress {
                 control.ticket = ordered::identity();
                 let receipt = Receipt {
                     active: false,
+                    receiver,
                     ticket: control.ticket,
                     generation: source.generation,
                     lease_ms: ordered::LEASE_MS,
@@ -398,6 +405,7 @@ impl Ingress {
             if self.reorder_closed.load(Ordering::Acquire) {
                 return Err(ErrCode::Stopped);
             }
+            let receiver = sessions.receiver;
             let source = sessions
                 .sources
                 .get_mut(&control.source)
@@ -429,6 +437,7 @@ impl Ingress {
                 let cancelled = old.clone();
                 let (tx, rx) = mpsc::channel(256);
                 let lease = Arc::new(Lease {
+                    receiver,
                     source: control.source.clone(),
                     incarnation: control.incarnation,
                     stream: control.stream,
@@ -496,8 +505,10 @@ impl Ingress {
             if self.reorder_closed.load(Ordering::Acquire) {
                 return Err(ErrCode::Stopped);
             }
+            let receiver = sessions.receiver;
             let absent = |generation| Receipt {
                 active: false,
+                receiver,
                 ticket: control.ticket,
                 generation,
                 lease_ms: ordered::LEASE_MS,

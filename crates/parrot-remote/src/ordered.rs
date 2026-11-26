@@ -4,9 +4,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub(crate) mod outbound;
 pub(crate) use outbound::Outbound;
 
-pub const CONTROL_KEY: &str = "parrot:ordered-control#v1";
-pub const RECEIPT_KEY: &str = "parrot:ordered-control-receipt#v1";
-pub const DATA_KEY: &str = "parrot:ordered-tell#v1";
+pub const CONTROL_KEY: &str = "parrot:ordered-control#v2";
+pub const RECEIPT_KEY: &str = "parrot:ordered-control-receipt#v2";
+pub const DATA_KEY: &str = "parrot:ordered-tell#v2";
 pub(crate) const LEASE_MS: u32 = 30_000;
 pub(crate) const CHALLENGE_MS: u32 = 5_000;
 pub(crate) type Identity = [u8; 16];
@@ -35,6 +35,7 @@ pub(crate) struct Control {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Receipt {
     pub active: bool,
+    pub receiver: Identity,
     pub ticket: Identity,
     pub generation: u64,
     pub lease_ms: u32,
@@ -82,7 +83,7 @@ impl Control {
         }
         let length = u16::try_from(self.source.len()).map_err(|_| "ordered source too long")?;
         let mut output = BytesMut::with_capacity(52 + self.source.len());
-        output.put_u8(1);
+        output.put_u8(2);
         output.put_u8(self.operation as u8);
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
@@ -93,7 +94,7 @@ impl Control {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, String> {
-        if input.len() < 52 || input[0] != 1 {
+        if input.len() < 52 || input[0] != 2 {
             return Err("invalid ordered control header".into());
         }
         let length = u16::from_le_bytes(input[50..52].try_into().unwrap()) as usize;
@@ -121,17 +122,18 @@ impl Control {
 
 impl Receipt {
     pub fn encode(&self) -> Bytes {
-        let mut output = BytesMut::with_capacity(30);
-        output.put_u8(1);
+        let mut output = BytesMut::with_capacity(46);
+        output.put_u8(2);
         output.put_u8(u8::from(self.active));
         output.extend_from_slice(&self.ticket);
         output.put_u64_le(self.generation);
         output.put_u32_le(self.lease_ms);
+        output.extend_from_slice(&self.receiver);
         output.freeze()
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, String> {
-        if input.len() != 30 || input[0] != 1 || input[1] > 1 {
+        if input.len() != 46 || input[0] != 2 || input[1] > 1 {
             return Err("invalid ordered receipt header".into());
         }
         let value = Self {
@@ -139,7 +141,9 @@ impl Receipt {
             ticket: input[2..18].try_into().unwrap(),
             generation: u64::from_le_bytes(input[18..26].try_into().unwrap()),
             lease_ms: u32::from_le_bytes(input[26..30].try_into().unwrap()),
+            receiver: input[30..46].try_into().unwrap(),
         };
+        nonzero(value.receiver)?;
         nonzero(value.ticket)?;
         if value.generation == 0 || !(1..=LEASE_MS).contains(&value.lease_ms) {
             return Err("invalid ordered receipt generation or deadline".into());
@@ -166,7 +170,7 @@ impl Data {
             .filter(|&n| n <= crate::frame::MAX_FRAME_LEN as usize)
             .ok_or("ordered data exceeds frame budget")?;
         let mut output = BytesMut::with_capacity(length);
-        output.put_u8(1);
+        output.put_u8(2);
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
         output.extend_from_slice(&self.ticket);
@@ -180,7 +184,7 @@ impl Data {
     }
 
     pub fn decode(input: Bytes) -> Result<Self, String> {
-        if input.len() < 61 || input.len() > crate::frame::MAX_FRAME_LEN as usize || input[0] != 1 {
+        if input.len() < 61 || input.len() > crate::frame::MAX_FRAME_LEN as usize || input[0] != 2 {
             return Err("invalid ordered data header".into());
         }
         let source_len = u16::from_le_bytes(input[57..59].try_into().unwrap()) as usize;
@@ -274,11 +278,26 @@ mod tests {
         }
         let value = Receipt {
             active: true,
+            receiver: [4; 16],
             ticket: [3; 16],
             generation: 7,
             lease_ms: LEASE_MS,
         };
         assert_eq!(Receipt::decode(&value.encode()).unwrap(), value);
+        for end in 0..value.encode().len() {
+            assert!(Receipt::decode(&value.encode()[..end]).is_err());
+        }
+        for offset in [2..18, 30..46] {
+            let mut invalid = value.encode().to_vec();
+            invalid[offset].fill(0);
+            assert!(Receipt::decode(&invalid).is_err());
+        }
+        let mut invalid = value.encode().to_vec();
+        invalid[0] = 1;
+        assert!(Receipt::decode(&invalid).is_err());
+        let mut invalid = value.encode().to_vec();
+        invalid.push(0);
+        assert!(Receipt::decode(&invalid).is_err());
         let mut invalid = value.encode().to_vec();
         invalid[1] = 2;
         assert!(Receipt::decode(&invalid).is_err());

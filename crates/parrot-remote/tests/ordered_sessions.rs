@@ -354,7 +354,7 @@ async fn strict_sessions_execute_over_real_mtls_tcp_and_quic() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn idle_expiry_and_receiver_recreation_get_new_leases_instead_of_reusing_sequence_state() {
+async fn idle_expiry_and_explicitly_retired_receiver_recreation_get_new_leases() {
     let (state, mut receiver) = state();
     let source = start(RemoteConfig::mem("expiry-source"), Arc::new(Empty)).await;
     let target = start(
@@ -369,6 +369,10 @@ async fn idle_expiry_and_receiver_recreation_get_new_leases_instead_of_reusing_s
     tokio::time::advance(Duration::from_secs(31)).await;
     strict(&reference, 2).await;
     seen(&mut receiver, 2).await;
+    reference
+        .close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
     target.shutdown().await.unwrap();
     drop(target);
     let target = start(RemoteConfig::mem("expiry-target"), Arc::new(Target(state))).await;
@@ -381,6 +385,168 @@ async fn idle_expiry_and_receiver_recreation_get_new_leases_instead_of_reusing_s
         .unwrap();
     source.shutdown().await.unwrap();
     target.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_receiver_cannot_certify_retirement_of_the_previous_instance() {
+    let (old_state, _old_receiver) = state();
+    let release = Release(old_state.clone());
+    let old = start(
+        RemoteConfig::tcp("replacement-target", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development(),
+        Arc::new(Target(old_state.clone())),
+    )
+    .await;
+    let source = start(
+        RemoteConfig::tcp("replacement-source", None).with_insecure_development(),
+        Arc::new(Empty),
+    )
+    .await;
+    source
+        .connect(&NodeAddr::tcp(
+            "replacement-target",
+            old.local_addr().unwrap(),
+        ))
+        .await
+        .unwrap();
+    let reference = source
+        .remote_ref("parrot://replacement-target/target")
+        .unwrap();
+    strict(&reference, 700).await;
+    tokio::time::timeout(Duration::from_secs(3), old_state.entered.notified())
+        .await
+        .unwrap();
+    let retiring = old.clone();
+    let shutdown = tokio::spawn(async move { retiring.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(3), old_state.dropping.notified())
+        .await
+        .unwrap();
+
+    let (new_state, mut new_receiver) = state();
+    let replacement = start(
+        RemoteConfig::tcp("replacement-target", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development(),
+        Arc::new(Target(new_state)),
+    )
+    .await;
+    source
+        .connect(&NodeAddr::tcp(
+            "replacement-target",
+            replacement.local_addr().unwrap(),
+        ))
+        .await
+        .unwrap();
+    let result = reference
+        .close_ordered_session(Duration::from_secs(2))
+        .await;
+    assert!(!old_state.dropped.load(Ordering::SeqCst));
+    assert!(
+        result.is_err(),
+        "a replacement receiver certified old retirement while the original Drop was blocked"
+    );
+    for ordinary in [false, true] {
+        let result = if ordinary {
+            reference.deliver(Box::new(Work(99))).await
+        } else {
+            reference
+                .deliver_ordered(Box::new(Work(99)), Default::default())
+                .await
+        };
+        assert!(
+            result.is_err(),
+            "replacement bypassed unresolved predecessor"
+        );
+    }
+    assert!(new_receiver.try_recv().is_err());
+    release.release();
+    shutdown.await.unwrap().unwrap();
+    source.shutdown().await.unwrap();
+    replacement.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_receiver_handoff_waits_for_original_drop_then_delivers_to_the_replacement() {
+    let (old_state, _old_receiver) = state();
+    let release = Release(old_state.clone());
+    let old = start(
+        RemoteConfig::tcp(
+            "live-replacement-target",
+            Some("127.0.0.1:0".parse().unwrap()),
+        )
+        .with_insecure_development(),
+        Arc::new(Target(old_state.clone())),
+    )
+    .await;
+    let source = start(
+        RemoteConfig::tcp("live-replacement-source", None).with_insecure_development(),
+        Arc::new(Empty),
+    )
+    .await;
+    source
+        .connect(&NodeAddr::tcp(
+            "live-replacement-target",
+            old.local_addr().unwrap(),
+        ))
+        .await
+        .unwrap();
+    let reference = source
+        .remote_ref("parrot://live-replacement-target/target")
+        .unwrap();
+    strict(&reference, 700).await;
+    tokio::time::timeout(Duration::from_secs(3), old_state.entered.notified())
+        .await
+        .unwrap();
+    let (new_state, mut receiver) = state();
+    let replacement = start(
+        RemoteConfig::tcp(
+            "live-replacement-target",
+            Some("127.0.0.1:0".parse().unwrap()),
+        )
+        .with_insecure_development(),
+        Arc::new(Target(new_state)),
+    )
+    .await;
+    source
+        .connect(&NodeAddr::tcp(
+            "live-replacement-target",
+            replacement.local_addr().unwrap(),
+        ))
+        .await
+        .unwrap();
+    let sending = reference.clone();
+    let attempt = tokio::spawn(async move {
+        sending
+            .deliver_ordered(Box::new(Work(1)), Default::default())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), old_state.dropping.notified())
+        .await
+        .expect("handoff never retired its original receiver");
+    // The held synchronous destructor may own Tokio's timer driver. Observe
+    // the barrier with an independent wall clock so the test can release it.
+    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(100)))
+        .await
+        .unwrap();
+    assert!(
+        !attempt.is_finished(),
+        "replacement committed before the original worker's actual destructor finished"
+    );
+    assert!(!old_state.dropped.load(Ordering::SeqCst));
+    assert!(receiver.try_recv().is_err());
+    release.release();
+    attempt.await.unwrap().unwrap();
+    assert!(old_state.dropped.load(Ordering::SeqCst));
+    seen(&mut receiver, 1).await;
+    strict(&reference, 2).await;
+    seen(&mut receiver, 2).await;
+    reference
+        .close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(receiver.try_recv().is_err());
+    for node in [&source, &old, &replacement] {
+        node.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -750,7 +916,7 @@ impl Raw {
         ticket: [u8; 16],
         source: &str,
     ) -> Frame {
-        let mut payload = vec![1, operation];
+        let mut payload = vec![2, operation];
         payload.extend_from_slice(&[incarnation; 16]);
         payload.extend_from_slice(&[stream; 16]);
         payload.extend_from_slice(&ticket);
@@ -778,7 +944,7 @@ impl Raw {
     async fn data(&self, incarnation: u8, stream: u8, ticket: [u8; 16], sequence: u64, value: u64) {
         let source = "wire-source";
         let key = Work::TYPE_KEY;
-        let mut payload = vec![1];
+        let mut payload = vec![2];
         payload.extend_from_slice(&[incarnation; 16]);
         payload.extend_from_slice(&[stream; 16]);
         payload.extend_from_slice(&ticket);
@@ -803,8 +969,9 @@ impl Raw {
 fn ticket(reply: &Frame, active: bool) -> [u8; 16] {
     assert_eq!(reply.header.frame_type, frame_type::REPLY);
     assert_eq!(reply.type_key, RECEIPT_KEY);
-    assert_eq!(reply.payload.len(), 30);
-    assert_eq!(&reply.payload[..2], &[1, u8::from(active)]);
+    assert_eq!(reply.payload.len(), 46);
+    assert_eq!(&reply.payload[..2], &[2, u8::from(active)]);
+    assert_ne!(&reply.payload[30..46], &[0; 16]);
     reply.payload[2..18].try_into().unwrap()
 }
 
