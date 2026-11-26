@@ -433,32 +433,16 @@ async fn registration_crosses_shutdown(kind: u8) {
     probe.check();
 }
 
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, test: impl FnOnce()) {
-    if std::env::var("PARROT_REGISTRATION_CHILD").ok().as_deref() == Some(name) {
-        test();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("PARROT_REGISTRATION_CHILD", name)
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(12);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(
-                status.success(),
-                "registration child failed: {name}: {status}"
-            );
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("registration callback deadlocked: {name}");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(
+        name,
+        "PARROT_REGISTRATION_CHILD",
+        Duration::from_secs(12),
+        test,
+    );
 }
 macro_rules! case {
     ($name:ident, $future:expr) => {

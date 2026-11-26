@@ -833,29 +833,11 @@ fn remote_propagation_retires_all_displaced_gateways_even_when_one_panics() {
         },
     );
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, body: impl FnOnce()) {
-    if std::env::var("PARROT_FACADE_CASE").ok().as_deref() == Some(name) {
-        body();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("PARROT_FACADE_CASE", name)
-        .spawn()
-        .unwrap();
-    let end = std::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "child contract failed: {name}: {status}");
-            return;
-        }
-        if std::time::Instant::now() >= end {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("facade callback deadlocked: {name}");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(name, "PARROT_FACADE_CASE", Duration::from_secs(8), body);
 }
 fn run(f: impl std::future::Future<Output = ()>) {
     tokio::runtime::Builder::new_current_thread()

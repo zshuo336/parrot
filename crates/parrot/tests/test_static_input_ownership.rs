@@ -19,7 +19,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 // Destruction may unwind with a payload whose destructor itself panics.
@@ -141,30 +141,16 @@ fn cancel<F: Future + Send>(future: F) {
         "public unpolled creation future unwound through its caller"
     );
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, run: impl FnOnce()) {
-    const FLAG: &str = "PARROT_STATIC_INPUT_CHILD";
-    if std::env::var(FLAG).as_deref() == Ok(name) {
-        run();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env(FLAG, name)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "{name}: isolated child failed: {status}");
-            break;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("{name}: isolated child exceeded deadline");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(
+        name,
+        "PARROT_STATIC_INPUT_CHILD",
+        Duration::from_secs(20),
+        run,
+    );
 }
 fn runtime(run: impl Future<Output = ()>) {
     actix::System::new().block_on(run);

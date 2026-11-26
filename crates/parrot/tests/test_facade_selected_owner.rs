@@ -25,7 +25,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Default)]
@@ -538,29 +538,16 @@ fn remove(facade: &ParrotActorSystem) {
             .expect("registered owner"),
     );
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, body: impl FnOnce()) {
-    if std::env::var("PARROT_SELECTED_OWNER_CHILD").as_deref() == Ok(name) {
-        body();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("PARROT_SELECTED_OWNER_CHILD", name)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "child contract failed: {status}");
-            return;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("selected-owner child timed out: {name}");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(
+        name,
+        "PARROT_SELECTED_OWNER_CHILD",
+        Duration::from_secs(30),
+        body,
+    );
 }
 fn run(future: impl std::future::Future<Output = ()>) {
     tokio::runtime::Builder::new_current_thread()

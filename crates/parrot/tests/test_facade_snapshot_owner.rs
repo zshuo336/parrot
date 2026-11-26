@@ -20,7 +20,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 type Callback = Box<dyn Fn() + Send + Sync>;
@@ -269,30 +269,25 @@ fn check_payload(payload: Box<dyn Any + Send>, original: bool) {
         "original callback panic identity was replaced"
     );
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, body: impl FnOnce()) {
-    if std::env::var("PARROT_SNAPSHOT_CHILD").as_deref() == Ok(name) {
-        body();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("PARROT_SNAPSHOT_CHILD", name)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(12);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "snapshot child failed: {status}");
-            return;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("snapshot child timed out");
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    isolated_child::run(name, "PARROT_SNAPSHOT_CHILD", Duration::from_secs(12), body);
 }
+#[test]
+fn missing_snapshot_child_cannot_pass_the_parent_contract() {
+    let failure = std::panic::catch_unwind(|| {
+        isolated("__missing_snapshot_contract__", || unreachable!());
+    })
+    .expect_err("the parent accepted an empty exact child selection");
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(
+        message.contains("child did not execute its body exactly once"),
+        "{message}"
+    );
+}
+
 fn run(future: impl std::future::Future<Output = ()>) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

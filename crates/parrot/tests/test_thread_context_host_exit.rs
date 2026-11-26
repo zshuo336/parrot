@@ -445,29 +445,11 @@ fn check(sharded: bool, route: usize, action: usize) {
         }
     });
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, body: impl FnOnce()) {
-    if std::env::var("PARROT_CONTEXT_HOST_CASE").as_deref() == Ok(name) {
-        body();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("PARROT_CONTEXT_HOST_CASE", name)
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + WAIT * 6;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "{name}: {status}");
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("{name}: watchdog expired");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(name, "PARROT_CONTEXT_HOST_CASE", WAIT * 6, body);
 }
 fn topology(sharded: bool, cancel: bool) {
     let host = runtime();

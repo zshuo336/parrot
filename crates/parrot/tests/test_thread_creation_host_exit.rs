@@ -491,29 +491,16 @@ fn cancelled_static(factory: bool) {
         shutdown(&s).await;
     });
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, body: impl FnOnce()) {
-    if std::env::var("PARROT_CREATION_HOST_CASE").as_deref() == Ok(name) {
-        body();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("PARROT_CREATION_HOST_CASE", name)
-        .spawn()
-        .unwrap();
-    let end = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "{name}: {status}");
-            return;
-        }
-        if std::time::Instant::now() >= end {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("{name}: watchdog expired");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(
+        name,
+        "PARROT_CREATION_HOST_CASE",
+        Duration::from_secs(30),
+        body,
+    );
 }
 macro_rules! case {
     ($name:ident, $body:expr) => {

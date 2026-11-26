@@ -12,7 +12,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 struct RecursivePanic;
 impl Drop for RecursivePanic {
@@ -241,30 +241,16 @@ async fn run(actix: bool, phase: Phase) {
         system.as_ref().clone().shutdown().await.unwrap();
     }
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, body: impl FnOnce()) {
-    const FLAG: &str = "PARROT_TYPED_RECURSIVE_CASE";
-    if std::env::var(FLAG).as_deref() == Ok(name) {
-        body();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env(FLAG, name)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "{name}: {status}");
-            return;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("{name}: deadline");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(
+        name,
+        "PARROT_TYPED_RECURSIVE_CASE",
+        Duration::from_secs(20),
+        body,
+    );
 }
 macro_rules! case {
     ($name:ident,$actix:expr,$phase:ident) => {

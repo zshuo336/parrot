@@ -24,7 +24,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Default)]
@@ -392,29 +392,18 @@ async fn rejects_live_result(route: usize) {
         }
     }
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, work: impl std::future::Future<Output = ()>) {
-    if std::env::var("PARROT_CREATION_FUTURE_CHILD").as_deref() == Ok(name) {
-        actix::System::new().block_on(work);
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("PARROT_CREATION_FUTURE_CHILD", name)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "creation contract child failed: {status}");
-            return;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("creation child timed out: {name}");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(
+        name,
+        "PARROT_CREATION_FUTURE_CHILD",
+        Duration::from_secs(45),
+        || {
+            actix::System::new().block_on(work);
+        },
+    );
 }
 macro_rules! contract {
     ($name:ident, $work:expr) => {
