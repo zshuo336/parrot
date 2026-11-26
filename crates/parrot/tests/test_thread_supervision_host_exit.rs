@@ -26,46 +26,11 @@ use std::{
 const WAIT: Duration = Duration::from_secs(5);
 const FAILURE: &str = "independent worker business failure";
 
-struct ChildProcess(Option<std::process::Child>);
-impl Drop for ChildProcess {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-fn isolated(case: &str) -> bool {
-    if std::env::var("PARROT_SUPERVISION_HOST_CHILD").as_deref() == Ok(case) {
-        return false;
-    }
-    let mut child = ChildProcess(Some(
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", case, "--nocapture"])
-            .env("PARROT_SUPERVISION_HOST_CHILD", case)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
-    ));
-    let deadline = std::time::Instant::now() + WAIT * 6;
-    loop {
-        if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
-            let output = child.0.take().unwrap().wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "isolated supervision contract failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return true;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "supervision blocked the isolated process"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+#[path = "support/isolated.rs"]
+mod child;
+
+fn isolated(name: &str, body: impl FnOnce()) {
+    child::run(name, "PARROT_SUPERVISION_HOST_CHILD", WAIT * 6, body);
 }
 
 #[derive(Default)]
@@ -74,6 +39,13 @@ struct State {
     drops: [AtomicUsize; 4],
     decisions: Mutex<Vec<(String, Option<[u8; 16]>)>>,
     policies: AtomicUsize,
+}
+
+#[test]
+fn supervision_isolation_drains_large_diagnostics() {
+    isolated("supervision_isolation_drains_large_diagnostics", || {
+        eprintln!("{}", "x".repeat(256 * 1024));
+    });
 }
 struct PolicyCapture(Arc<State>);
 impl Drop for PolicyCapture {
@@ -481,9 +453,7 @@ macro_rules! contract {
     ($name:ident, $scenario:expr) => {
         #[test]
         fn $name() {
-            if !isolated(stringify!($name)) {
-                $scenario;
-            }
+            isolated(stringify!($name), || $scenario);
         }
     };
 }

@@ -23,53 +23,32 @@ use std::{
 
 const WAIT: Duration = Duration::from_secs(5);
 
-struct Child(Option<std::process::Child>);
-impl Drop for Child {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
+#[path = "support/isolated.rs"]
+mod child;
+
+fn isolated(name: &str, body: impl FnOnce()) {
+    child::run(name, "PARROT_COHORT_HOST_CHILD", WAIT * 4, body);
 }
-fn isolated(case: &str) -> bool {
-    if std::env::var("PARROT_COHORT_HOST_CHILD").as_deref() == Ok(case) {
-        return false;
-    }
-    // A broken host-drop join can block before any async timeout is polled.
-    let mut child = Child(Some(
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", case, "--nocapture"])
-            .env("PARROT_COHORT_HOST_CHILD", case)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
-    ));
-    let deadline = std::time::Instant::now() + WAIT * 4;
-    loop {
-        if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
-            let output = child.0.take().unwrap().wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "isolated host-exit contract failed: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return true;
+
+macro_rules! host_contract {
+    ($name:ident, $body:expr) => {
+        #[test]
+        fn $name() {
+            isolated(stringify!($name), || $body);
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "host-exit cleanup blocked the isolated process"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    };
 }
 
 #[derive(Clone)]
 enum Engine {
     Thread(Arc<ThreadActorSystem>),
     Actix(Arc<ActixActorSystem>),
+}
+
+#[test]
+#[should_panic(expected = "child did not execute its body exactly once")]
+fn cohort_isolation_rejects_missing_case() {
+    isolated("__missing_root_cohort_host_exit__", || unreachable!());
 }
 impl Engine {
     async fn new(actix: bool) -> Self {
@@ -259,15 +238,6 @@ fn actix_empty_cohort_retires_policy_after_host_exit() {
 }
 
 fn member_after_host_exit(actix: bool, factory: bool) {
-    let case = match (actix, factory) {
-        (false, false) => "thread_instance_retires_after_host_exit",
-        (false, true) => "thread_factory_retires_after_host_exit",
-        (true, false) => "actix_instance_retires_after_host_exit",
-        (true, true) => "actix_factory_retires_after_host_exit",
-    };
-    if isolated(case) {
-        return;
-    }
     let host = actix::System::new();
     let actors = Arc::new(AtomicUsize::new(0));
     let policies = Arc::new(AtomicUsize::new(0));
@@ -315,22 +285,22 @@ fn member_after_host_exit(actix: bool, factory: bool) {
     );
 }
 
-#[test]
-fn thread_instance_retires_after_host_exit() {
-    member_after_host_exit(false, false);
-}
-#[test]
-fn thread_factory_retires_after_host_exit() {
-    member_after_host_exit(false, true);
-}
-#[test]
-fn actix_instance_retires_after_host_exit() {
-    member_after_host_exit(true, false);
-}
-#[test]
-fn actix_factory_retires_after_host_exit() {
-    member_after_host_exit(true, true);
-}
+host_contract!(
+    thread_instance_retires_after_host_exit,
+    member_after_host_exit(false, false)
+);
+host_contract!(
+    thread_factory_retires_after_host_exit,
+    member_after_host_exit(false, true)
+);
+host_contract!(
+    actix_instance_retires_after_host_exit,
+    member_after_host_exit(true, false)
+);
+host_contract!(
+    actix_factory_retires_after_host_exit,
+    member_after_host_exit(true, true)
+);
 
 #[derive(Default)]
 struct Gate {
@@ -583,15 +553,6 @@ impl ParrotTypedDispatch for TypedProbe {
     }
 }
 fn typed_after_host_exit(actix: bool, factory: bool) {
-    let case = match (actix, factory) {
-        (false, false) => "thread_typed_instance_retires_after_host_exit",
-        (false, true) => "thread_typed_factory_retires_after_host_exit",
-        (true, false) => "actix_typed_instance_retires_after_host_exit",
-        (true, true) => "actix_typed_factory_retires_after_host_exit",
-    };
-    if isolated(case) {
-        return;
-    }
     let host = actix::System::new();
     let actors = Arc::new(AtomicUsize::new(0));
     let policies = Arc::new(AtomicUsize::new(0));
@@ -649,31 +610,24 @@ fn typed_after_host_exit(actix: bool, factory: bool) {
     assert_eq!(policies_at_receipt, 1);
     assert_eq!(members_at_receipt, 0);
 }
-#[test]
-fn thread_typed_instance_retires_after_host_exit() {
-    typed_after_host_exit(false, false);
-}
-#[test]
-fn thread_typed_factory_retires_after_host_exit() {
-    typed_after_host_exit(false, true);
-}
-#[test]
-fn actix_typed_instance_retires_after_host_exit() {
-    typed_after_host_exit(true, false);
-}
-#[test]
-fn actix_typed_factory_retires_after_host_exit() {
-    typed_after_host_exit(true, true);
-}
+host_contract!(
+    thread_typed_instance_retires_after_host_exit,
+    typed_after_host_exit(false, false)
+);
+host_contract!(
+    thread_typed_factory_retires_after_host_exit,
+    typed_after_host_exit(false, true)
+);
+host_contract!(
+    actix_typed_instance_retires_after_host_exit,
+    typed_after_host_exit(true, false)
+);
+host_contract!(
+    actix_typed_factory_retires_after_host_exit,
+    typed_after_host_exit(true, true)
+);
 
 fn pending_factory_after_host_exit(actix: bool) {
-    if isolated(if actix {
-        "actix_pending_factory_retires_after_host_exit"
-    } else {
-        "thread_pending_factory_retires_after_host_exit"
-    }) {
-        return;
-    }
     let host = actix::System::new();
     let gate = Arc::new(Gate::default());
     let _release = Release(gate.clone());
@@ -745,25 +699,16 @@ fn pending_factory_after_host_exit(actix: bool) {
     assert_eq!(cohort.members().len(), 0);
     observer.block_on(system.shutdown());
 }
-#[test]
-fn thread_pending_factory_retires_after_host_exit() {
-    pending_factory_after_host_exit(false);
-}
-#[test]
-fn actix_pending_factory_retires_after_host_exit() {
-    pending_factory_after_host_exit(true);
-}
+host_contract!(
+    thread_pending_factory_retires_after_host_exit,
+    pending_factory_after_host_exit(false)
+);
+host_contract!(
+    actix_pending_factory_retires_after_host_exit,
+    pending_factory_after_host_exit(true)
+);
 
 fn guardian_shutdown(actix: bool, panic: bool) {
-    let case = match (actix, panic) {
-        (false, false) => "thread_guardian_shutdown_joins_after_host_exit",
-        (false, true) => "thread_guardian_shutdown_preserves_policy_failure",
-        (true, false) => "actix_guardian_shutdown_joins_after_host_exit",
-        (true, true) => "actix_guardian_shutdown_preserves_policy_failure",
-    };
-    if isolated(case) {
-        return;
-    }
     let host = actix::System::new();
     let gate = Arc::new(Gate::default());
     let _release = Release(gate.clone());
@@ -874,22 +819,22 @@ fn guardian_shutdown(actix: bool, panic: bool) {
     }
     drop(reference);
 }
-#[test]
-fn thread_guardian_shutdown_joins_after_host_exit() {
-    guardian_shutdown(false, false);
-}
-#[test]
-fn thread_guardian_shutdown_preserves_policy_failure() {
-    guardian_shutdown(false, true);
-}
-#[test]
-fn actix_guardian_shutdown_joins_after_host_exit() {
-    guardian_shutdown(true, false);
-}
-#[test]
-fn actix_guardian_shutdown_preserves_policy_failure() {
-    guardian_shutdown(true, true);
-}
+host_contract!(
+    thread_guardian_shutdown_joins_after_host_exit,
+    guardian_shutdown(false, false)
+);
+host_contract!(
+    thread_guardian_shutdown_preserves_policy_failure,
+    guardian_shutdown(false, true)
+);
+host_contract!(
+    actix_guardian_shutdown_joins_after_host_exit,
+    guardian_shutdown(true, false)
+);
+host_contract!(
+    actix_guardian_shutdown_preserves_policy_failure,
+    guardian_shutdown(true, true)
+);
 
 struct LocalProbe {
     _owner: std::rc::Rc<()>,
@@ -916,10 +861,7 @@ impl ParrotMsgVariant<parrot_api::local_typed::LocalProtocol<LocalProbe>> for Pi
     }
 }
 
-fn ungrouped_after_host_exit(actix: bool, kind: u8, late_group: bool, case: &str) {
-    if isolated(case) {
-        return;
-    }
+fn ungrouped_after_host_exit(actix: bool, kind: u8, late_group: bool) {
     let host = actix::System::new();
     let actors = Arc::new(AtomicUsize::new(0));
     let policies = Arc::new(AtomicUsize::new(0));
@@ -1060,10 +1002,7 @@ fn ungrouped_after_host_exit(actix: bool, kind: u8, late_group: bool, case: &str
 
 macro_rules! ungrouped_contract {
     ($case:ident, $actix:expr, $kind:expr, $late:expr) => {
-        #[test]
-        fn $case() {
-            ungrouped_after_host_exit($actix, $kind, $late, stringify!($case));
-        }
+        host_contract!($case, ungrouped_after_host_exit($actix, $kind, $late));
     };
 }
 ungrouped_contract!(thread_ungrouped_instance_host_exit, false, 0, false);
