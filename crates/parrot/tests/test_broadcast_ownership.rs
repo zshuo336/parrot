@@ -274,49 +274,41 @@ async fn actix_clone_failure() {
     actor.send(Box::new(())).await.unwrap();
     system.shutdown().await.unwrap();
 }
-async fn isolated(name: &str, work: impl std::future::Future<Output = ()>) {
-    const KEY: &str = "PARROT_BROADCAST_WORKER";
-    if std::env::var_os(KEY).is_some() {
-        work.await;
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env(KEY, "1")
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("broadcast worker exceeded independent watchdog");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-    assert!(
-        status.success(),
-        "broadcast clone/cleanup worker failed: {status}"
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
+fn isolated(name: &str, work: impl FnOnce()) {
+    isolated_child::run(
+        name,
+        "PARROT_BROADCAST_WORKER",
+        Duration::from_secs(20),
+        work,
     );
 }
-#[tokio::test]
-async fn thread_clone_and_source_drop_panics_are_independent() {
+#[test]
+#[should_panic(expected = "child did not execute its body exactly once")]
+fn missing_broadcast_child_is_rejected() {
+    isolated("__missing_broadcast_case__", || unreachable!());
+}
+
+#[test]
+fn thread_clone_and_source_drop_panics_are_independent() {
     isolated(
         "thread_clone_and_source_drop_panics_are_independent",
-        thread_clone_failure(),
-    )
-    .await;
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(thread_clone_failure())
+        },
+    );
 }
-#[actix::test]
-async fn actix_clone_and_source_drop_panics_are_independent() {
-    isolated(
-        "actix_clone_and_source_drop_panics_are_independent",
-        actix_clone_failure(),
-    )
-    .await;
+#[test]
+fn actix_clone_and_source_drop_panics_are_independent() {
+    isolated("actix_clone_and_source_drop_panics_are_independent", || {
+        actix::System::new().block_on(actix_clone_failure())
+    });
 }
 
 #[tokio::test]
@@ -612,13 +604,12 @@ async fn actix_cancel_prepared() {
     }
     system.shutdown().await.unwrap();
 }
-#[actix::test]
-async fn actix_cancellation_retires_prepared_and_late_copies_independently() {
+#[test]
+fn actix_cancellation_retires_prepared_and_late_copies_independently() {
     isolated(
         "actix_cancellation_retires_prepared_and_late_copies_independently",
-        actix_cancel_prepared(),
-    )
-    .await;
+        || actix::System::new().block_on(actix_cancel_prepared()),
+    );
 }
 
 async fn bounded_clones(system: ActorSystemImpl, actor: Box<dyn ActorRef>) {
