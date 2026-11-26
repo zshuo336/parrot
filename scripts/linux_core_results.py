@@ -67,7 +67,7 @@ FULL_RESULT = re.compile(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) faile
 ANNOUNCED = re.compile(r'^running (\d+) tests?$')
 
 
-def binary_results(path, target, profile):
+def binary_results(path, target, profile, *, library_crate=None):
     results = {}
     current = None
     announced = None
@@ -82,6 +82,12 @@ def binary_results(path, target, profile):
             executable = PurePosixPath(running[3])
             if executable.parent != PurePosixPath(target) / profile / 'deps':
                 raise ValueError('test binary is outside the fresh build target: ' + str(executable))
+            # The fixed ledger uses Cargo's default integration-test target names.
+            # Other consumers can parse logs with explicitly renamed Cargo targets.
+            if library_crate is not None:
+                artifact = running[2] or library_crate
+                if not re.fullmatch(re.escape(artifact) + r'-[0-9a-f]{16}', executable.name):
+                    raise ValueError(f'test executable does not match {artifact}: {executable.name}')
             if current in results:
                 raise ValueError('duplicate test binary: ' + current)
             announced = None
@@ -154,7 +160,8 @@ def summarize(root, manifest_path):
     configurations = {}
     for label in CONFIGURATIONS:
         try:
-            results = binary_results(root / (label + '.log'), target, label.split('-')[0])
+            results = binary_results(root / (label + '.log'), target, label.split('-')[0],
+                                     library_crate='parrot')
         except (OSError, ValueError) as error:
             errors.append(label + ': ' + str(error))
             results = {}
@@ -175,7 +182,7 @@ def summarize(root, manifest_path):
         except (OSError, ValueError):
             errors.append(name + ': missing or invalid verification result')
     try:
-        api = binary_results(root / 'api-library.log', target, 'debug')
+        api = binary_results(root / 'api-library.log', target, 'debug', library_crate='parrot_api')
     except (OSError, ValueError) as error:
         errors.append('api-library: ' + str(error))
         api = {}

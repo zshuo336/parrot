@@ -16,9 +16,10 @@ LIBRARY_ANNOUNCEMENT = f'running {LIBRARY_COUNT} tests\n'
 LIBRARY_RESULT = f'test result: ok. {LIBRARY_COUNT} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n'
 
 
-def binary(name, count, target, profile='debug'):
+def binary(name, count, target, profile='debug', library_crate='parrot'):
     source = 'unittests src/lib.rs' if name == 'library' else 'tests/' + name + '.rs'
-    return (f'     Running {source} ({target}/{profile}/deps/{name}-fixture)\n'
+    executable = library_crate if name == 'library' else name
+    return (f'     Running {source} ({target}/{profile}/deps/{executable}-1234567890abcdef)\n'
             + f'running {count} tests\n'
             + f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n')
 
@@ -43,7 +44,7 @@ class SummaryContracts(unittest.TestCase):
                                                for name, count in BINARIES.items()))
         for label in ('input-before', 'execution-input-before', 'execution-input-after', 'input-after'):
             self.write(label + '.log', json.dumps({'status': 'ok', 'files': 1, 'action': 'verify'}))
-        self.write('api-library.log', binary('library', 178, self.target))
+        self.write('api-library.log', binary('library', 178, self.target, library_crate='parrot_api'))
         self.write('doctest.log', 'test result: ok. 24 passed; 0 failed; 0 ignored; '
                                  '0 measured; 0 filtered out; finished in 0.01s\n')
         self.assertTrue(self.result()['passed'])
@@ -60,7 +61,8 @@ class SummaryContracts(unittest.TestCase):
                 path = self.root / (label + '.log')
                 original = path.read_text()
                 extra = binary('library', 178 if label == 'api-library' else LIBRARY_COUNT,
-                               self.target, 'release' if label.startswith('release') else 'debug')
+                               self.target, 'release' if label.startswith('release') else 'debug',
+                               library_crate='parrot_api' if label == 'api-library' else 'parrot')
                 self.write(path.name, original + extra)
                 self.assertIn(label + ': duplicate test binary: library', self.result()['errors'])
                 self.write(path.name, original)
@@ -146,6 +148,21 @@ class SummaryContracts(unittest.TestCase):
                     self.assertFalse(result['passed'])
                     self.assertTrue(any('outside the fresh build target' in error for error in result['errors']))
             self.write(path.name, original)
+
+    def test_substituted_executable_in_same_directory_is_rejected(self):
+        for label, correct, wrong in [
+            ('debug-default', 'test_local_children', 'test_shutdown_deadline'),
+            ('release-legacy', 'parrot', 'parrot_api'),
+            ('api-library', 'parrot_api', 'parrot'),
+        ]:
+            with self.subTest(stage=label):
+                path = self.root / (label + '.log')
+                original = path.read_text()
+                changed = original.replace('/deps/' + correct + '-', '/deps/' + wrong + '-')
+                self.assertNotEqual(changed, original)
+                self.write(path.name, changed)
+                self.assertFalse(self.result()['passed'])
+                self.write(path.name, original)
 
     def test_missing_or_wrong_fresh_receipt_is_rejected(self):
         mutations = ('', '[]', '{}', json.dumps(dict(self.receipt, fresh=False)),
