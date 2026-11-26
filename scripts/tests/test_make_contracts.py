@@ -46,7 +46,7 @@ class MakeContracts(unittest.TestCase):
                 '#!/bin/sh\n'
                 'printf "%s\\n" "${0##*/}:$*" >> "$PARROT_MAKE_TEST_EVENTS"\n'
                 'if [ "${0##*/}" = "$PARROT_MAKE_FAIL_TOOL" ] && '
-                '[ "$1" = "$PARROT_MAKE_FAIL_ARG" ]; then exit 23; fi\n'
+                '{ [ "$1" = "$PARROT_MAKE_FAIL_ARG" ] || [ "$*" = "$PARROT_MAKE_FAIL_ARG" ]; }; then exit 23; fi\n'
                 'exit 0\n'
             )
             path.chmod(0o755)
@@ -338,7 +338,7 @@ sys.exit(23 if os.environ['PARROT_PERF_FAILURE'] in names else 0)
             with self.subTest(target=target):
                 self.events.unlink(missing_ok=True)
                 result, events = self.run_make(target, 'CRATE=parrot', fail_tool='python3',
-                                               fail_arg='--native-join')
+                                               fail_arg='scripts/check_mailbox_thread_exhaustion.py --native-join --release')
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(events.count(
                     'python3:scripts/check_mailbox_thread_exhaustion.py --native-join --release'), 1, events)
