@@ -43,7 +43,7 @@ def failed_stage_names(stages):
     for stage in stages:
         actual = stage.get("exit_code", stage.get("code"))
         expected = stage.get("expected_code", stage.get("expected_exit_code", 0))
-        if stage.get("timed_out") or (actual is not None and actual != expected):
+        if stage.get("passed") is False or stage.get("timed_out") or (actual is not None and actual != expected):
             failed.append(stage.get("name", "未命名阶段"))
     return failed
 

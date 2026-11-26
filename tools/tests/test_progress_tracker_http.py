@@ -21,9 +21,13 @@ class TaskDetails(unittest.TestCase):
             dict(name="unexpected success", exit_code=0, expected_exit_code=1),
             dict(name="unexpected failure", exit_code=1),
             dict(name="timed out", exit_code=1, expected_exit_code=1, timed_out=True),
+            dict(name="invalid result", passed=False),
+            dict(name="checks failed after successful command", passed=False, exit_code=0),
+            dict(name="zero tests in expected failure control", passed=0, code=101, expected_code=101),
         ]
         self.assertEqual(tracker.failed_stage_names(stages),
-                         ["unexpected success", "unexpected failure", "timed out"])
+                         ["unexpected success", "unexpected failure", "timed out", "invalid result",
+                          "checks failed after successful command"])
 
     def test_completed_additions_stay_with_their_task_in_source_order(self):
         body = ("状态：进行中\n剩余人日：1-2\n依赖：无\n已做：原始进展\n"
