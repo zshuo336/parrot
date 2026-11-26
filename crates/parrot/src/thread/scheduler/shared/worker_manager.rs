@@ -5,6 +5,36 @@ use std::sync::{Arc, Mutex};
 use crate::thread::mailbox::Mailbox;
 use crate::thread::scheduler::queue::SchedulingQueue;
 
+// The same mailbox and path can be registered again before an older call
+// finishes publishing its hook. Each admission needs its own rollback identity.
+#[derive(Debug)]
+pub(super) struct ScheduledMailbox(pub(super) Arc<dyn Mailbox>);
+pub(super) type ScheduledPaths = Mutex<HashMap<String, Arc<ScheduledMailbox>>>;
+
+impl ScheduledMailbox {
+    pub(super) fn rollback(
+        self: &Arc<Self>,
+        paths: &ScheduledPaths,
+        path: &str,
+        queue: &SchedulingQueue,
+    ) {
+        let removed = {
+            let mut paths = paths.lock().unwrap();
+            if paths
+                .get(path)
+                .is_some_and(|current| Arc::ptr_eq(current, self))
+            {
+                paths.remove(path)
+            } else {
+                None
+            }
+        };
+        if removed.is_some() {
+            queue.unregister(&self.0);
+        }
+    }
+}
+
 /// Manager for worker threads in the shared thread pool
 ///
 /// WorkerManager is responsible for:
@@ -14,7 +44,7 @@ use crate::thread::scheduler::queue::SchedulingQueue;
 #[derive(Debug, Default)]
 pub struct WorkerManager {
     /// Map of scheduled actor paths
-    scheduled: Mutex<HashMap<String, Arc<dyn Mailbox>>>,
+    scheduled: ScheduledPaths,
 
     /// Worker status slots (one per worker, for metrics)
     worker_statuses: Mutex<Vec<Arc<AtomicUsize>>>,
@@ -59,7 +89,7 @@ impl WorkerManager {
             .scheduling_queue
             .as_ref()
             .expect("WorkerManager built without scheduling queue");
-        {
+        let registration = {
             let mut scheduled = self.scheduled.lock().unwrap();
             if scheduled.contains_key(&path) {
                 return Err(crate::thread::error::SystemError::RegistrationError(
@@ -69,8 +99,10 @@ impl WorkerManager {
             if !queue.register(&mailbox) {
                 return Err(crate::thread::error::SystemError::ShuttingDown);
             }
-            scheduled.insert(path.clone(), mailbox.clone());
-        }
+            let registration = Arc::new(ScheduledMailbox(mailbox.clone()));
+            scheduled.insert(path.clone(), registration.clone());
+            registration
+        };
         after_register();
         if mailbox.schedule_state().try_enqueue()
             && !queue.enqueue_registered(
@@ -78,14 +110,7 @@ impl WorkerManager {
                 crate::thread::scheduler::queue::Lane::Normal,
             )
         {
-            queue.unregister(&mailbox);
-            let mut scheduled = self.scheduled.lock().unwrap();
-            if scheduled
-                .get(&path)
-                .is_some_and(|current| Arc::ptr_eq(current, &mailbox))
-            {
-                scheduled.remove(&path);
-            }
+            registration.rollback(&self.scheduled, &path, queue);
             return Err(crate::thread::error::SystemError::ShuttingDown);
         }
         Ok(())
@@ -98,7 +123,7 @@ impl WorkerManager {
                 crate::thread::error::SystemError::ActorNotFound(path.to_string())
             })?;
         if let Some(queue) = &self.scheduling_queue {
-            queue.unregister(&mailbox);
+            queue.unregister(&mailbox.0);
         }
         Ok(())
     }

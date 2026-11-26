@@ -9,7 +9,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use super::worker::{IsolatedCleanupTracker, Worker, WorkerConfig};
-use super::worker_manager::WorkerManager;
+use super::worker_manager::{ScheduledMailbox, ScheduledPaths, WorkerManager};
 use crate::thread::config::ThreadActorConfig;
 use crate::thread::error::SystemError;
 use crate::thread::mailbox::Mailbox;
@@ -429,7 +429,7 @@ pub struct SharedThreadPool {
     status: Arc<AtomicUsize>,
 
     /// Scheduled actor paths (registered by path, executed via queue)
-    scheduled_paths: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<dyn Mailbox>>>>,
+    scheduled_paths: Arc<ScheduledPaths>,
 
     shutdown_receipt: std::sync::Mutex<Option<Receipt>>,
     failures: Arc<Failures>,
@@ -632,7 +632,7 @@ impl SharedThreadPool {
             )));
         }
 
-        {
+        let registration = {
             let mut paths = self.scheduled_paths.lock().unwrap();
             if paths.contains_key(path) {
                 return Err(SystemError::RegistrationError(format!(
@@ -642,22 +642,16 @@ impl SharedThreadPool {
             if !self.scheduling_queue.register(&mailbox) {
                 return Err(SystemError::ShuttingDown);
             }
-            paths.insert(path.to_string(), mailbox.clone());
-        }
+            let registration = Arc::new(ScheduledMailbox(mailbox.clone()));
+            paths.insert(path.to_string(), registration.clone());
+            registration
+        };
 
         // Every admission after this point can race with shutdown. Keep the
         // rollback in one place so a failed initial enqueue never leaves a
         // path that claims to be scheduled after the queue is closed.
-        let rollback = || {
-            self.scheduling_queue.unregister(&mailbox);
-            let mut paths = self.scheduled_paths.lock().unwrap();
-            if paths
-                .get(path)
-                .is_some_and(|registered| Arc::ptr_eq(registered, &mailbox))
-            {
-                paths.remove(path);
-            }
-        };
+        let rollback =
+            || registration.rollback(&self.scheduled_paths, path, &self.scheduling_queue);
 
         // Install the wake hook: whenever a push succeeds after this actor is
         // scheduled, (re-)enqueue the mailbox so a worker picks it up even if
@@ -727,7 +721,7 @@ impl SharedThreadPool {
             paths.remove(path)
         };
         let mailbox = removed.ok_or_else(|| SystemError::ActorNotFound(path.to_string()))?;
-        self.scheduling_queue.unregister(&mailbox);
+        self.scheduling_queue.unregister(&mailbox.0);
         // Keep the hook: queue registration checks make stale wakes harmless.
         // Clearing it here could overwrite a concurrently installed hook when
         // the same mailbox is registered again.
@@ -809,7 +803,7 @@ impl SharedThreadPool {
             let registrations = std::mem::take(&mut *registrations.lock().unwrap());
             for mailbox in registrations.into_values() {
                 closing.push(MailboxClose::new(
-                    mailbox,
+                    mailbox.0.clone(),
                     failures.clone(),
                     "registered mailbox close",
                 ));

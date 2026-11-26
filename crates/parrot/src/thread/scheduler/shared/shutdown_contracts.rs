@@ -846,10 +846,10 @@ async fn expired_grace_keeps_mailbox_drain(kind: usize, hostile: bool) {
                 }
                 _ => {
                     // No resident entry: the host path index must also be drained.
-                    pool.scheduled_paths
-                        .lock()
-                        .unwrap()
-                        .insert("/registered".into(), mailbox.clone());
+                    pool.scheduled_paths.lock().unwrap().insert(
+                        "/registered".into(),
+                        Arc::new(ScheduledMailbox(mailbox.clone())),
+                    );
                 }
             }
             let owner = pool.clone();
