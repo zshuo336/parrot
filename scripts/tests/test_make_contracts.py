@@ -330,6 +330,19 @@ sys.exit(23 if os.environ['PARROT_PERF_FAILURE'] in names else 0)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(any('check_mailbox_thread_exhaustion.py' in event for event in events))
 
+    def test_linux_full_and_stress_propagate_native_join_gate_failure(self):
+        (self.bin / 'uname').write_text('#!/bin/sh\nprintf "Linux\\n"\n')
+        (self.bin / 'uname').chmod(0o755)
+        self.performance_failure('no-performance-failure')
+        for target in ['test-full', 'test-stress']:
+            with self.subTest(target=target):
+                self.events.unlink(missing_ok=True)
+                result, events = self.run_make(target, 'CRATE=parrot', fail_tool='python3',
+                                               fail_arg='--native-join')
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(events.count(
+                    'python3:scripts/check_mailbox_thread_exhaustion.py --native-join --release'), 1, events)
+
     def test_ci_release_acceptance_excludes_only_a5_stretch(self):
         workflow = Path(os.environ.get('PARROT_CI_WORKFLOW', ROOT / '.github/workflows/ci.yml'))
         lines = workflow.read_text().splitlines()

@@ -328,6 +328,9 @@ fn diagnostic(report: impl FnOnce()) {
 #[cfg(test)]
 mod fallback_contracts;
 
+#[cfg(all(test, target_os = "linux"))]
+mod pid_exhaustion_contract;
+
 #[cfg(test)]
 mod tests {
     use super::*;

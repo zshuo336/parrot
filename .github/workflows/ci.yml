@@ -180,7 +180,7 @@ jobs:
           if-no-files-found: error
 
   mailbox-thread-exhaustion:
-    name: Actual mailbox close under OS thread exhaustion
+    name: Mailbox cleanup and native joins under OS thread exhaustion
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -194,6 +194,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build and execute all ten contracts in a bounded disposable container
         run: make check-mailbox-thread-exhaustion
+      - name: Recover the original native join after a kernel PID denial
+        run: make check-native-join-thread-exhaustion
 
   mailbox-notification-contracts:
     name: Vendored mailbox notification and cancellation contracts

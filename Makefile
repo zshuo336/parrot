@@ -65,6 +65,10 @@ ERL_DIR  := interop/erlang
 check-mailbox-thread-exhaustion:
 	python3 scripts/check_mailbox_thread_exhaustion.py $(if $(filter 1,$(RELEASE)),--release,)
 
+.PHONY: check-native-join-thread-exhaustion
+check-native-join-thread-exhaustion:
+	python3 scripts/check_mailbox_thread_exhaustion.py --native-join $(if $(filter 1,$(RELEASE)),--release,)
+
 # GNU Make 3.81 (the macOS system make) ignores .SHELLFLAGS. Put the
 # required failure policy in SHELL so compound recipes and pipelines cannot
 # report success after a failed build/test on either old or modern GNU Make.
@@ -252,6 +256,7 @@ test-full: test-fast lint
 ifeq ($(shell uname -s),Linux)
 ifeq ($(strip $(filter-out parrot,$(CRATE))),)
 	@$(MAKE) --no-print-directory check-mailbox-thread-exhaustion RELEASE=1
+	@$(MAKE) --no-print-directory check-native-join-thread-exhaustion RELEASE=1
 endif
 endif
 	@echo "✓ 全模式完成（debug 全量 + release 当前阈值 + 压测 + lint；A5 stretch 另行执行；doc-tests 的 ignore 示例不参与压测——与 test-stress 同语义）"
@@ -265,6 +270,7 @@ endif
 ifeq ($(shell uname -s),Linux)
 ifeq ($(strip $(filter-out parrot,$(CRATE))),)
 	@$(MAKE) --no-print-directory check-mailbox-thread-exhaustion RELEASE=1
+	@$(MAKE) --no-print-directory check-native-join-thread-exhaustion RELEASE=1
 endif
 endif
 	@echo "✓ 压测模式完成（release --include-ignored，A5 stretch 另行执行；doc-tests 由 fast/full 覆盖——ignore 示例不参与压测语义）"

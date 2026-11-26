@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the real mailbox thread-failure contracts in a bounded Linux container."""
+"""Run mailbox or native join thread-failure contracts in a bounded Linux container."""
 import argparse
 import json
 from pathlib import Path
@@ -14,13 +14,17 @@ def main():
     parser.add_argument('--binary', type=Path, help='already built Linux test binary')
     parser.add_argument('--image', default='ubuntu:24.04')
     parser.add_argument('--release', action='store_true', help='build the optimized test executable')
+    parser.add_argument('--native-join', action='store_true', help='run the library native join retry contract')
     args = parser.parse_args()
+    native_case = 'thread::native_budget::pid_exhaustion_contract::thread_exhaustion_retries_original_native_join'
+    target = 'parrot' if args.native_join else 'test_mailbox_thread_exhaustion'
     binary = args.binary
     if binary is None:
         command = [
             'cargo', 'test', '-p', 'parrot', '--all-features',
-            '--test', 'test_mailbox_thread_exhaustion', '--no-run', '--message-format=json',
+            '--no-run', '--message-format=json',
         ]
+        command.extend(['--lib'] if args.native_join else ['--test', target])
         if args.release:
             command.append('--release')
         build = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
@@ -32,10 +36,10 @@ def main():
         artifacts = [json.loads(line) for line in build.stdout.splitlines() if line.startswith('{')]
         binaries = [item['executable'] for item in artifacts
                     if item.get('reason') == 'compiler-artifact'
-                    and item.get('target', {}).get('name') == 'test_mailbox_thread_exhaustion'
+                    and item.get('target', {}).get('name') == target
                     and item.get('executable')]
         if len(binaries) != 1:
-            raise ValueError('expected exactly one mailbox exhaustion test executable')
+            raise ValueError(f'expected exactly one {target} test executable')
         binary = Path(binaries[0])
     binary = binary.resolve(strict=True)
     container = 'parrot-mailbox-exhaustion-' + uuid.uuid4().hex
@@ -44,7 +48,8 @@ def main():
             'docker', 'run', '--rm', '--init', '--name', container, '--pids-limit=64',
             '--ulimit', 'core=0:0', '--ulimit', 'nofile=65536:65536',
             '--network=none', '-v', str(binary.parent) + ':/tests:ro',
-            args.image, '/tests/' + binary.name, '--ignored', '--test-threads=1',
+            '--entrypoint', '/tests/' + binary.name, args.image, '--ignored', '--test-threads=1',
+            *(['--exact', native_case, '--nocapture'] if args.native_join else []),
         ], capture_output=True, text=True, timeout=120)
     finally:
         subprocess.run(['docker', 'rm', '--force', container],
@@ -53,6 +58,13 @@ def main():
     sys.stderr.write(result.stderr)
     if result.returncode:
         return result.returncode
+    actual = re.findall(r'^test (\S+) \.\.\. ok$', result.stdout, re.MULTILINE)
+    if args.native_join:
+        if actual != [native_case] or not re.search(
+                r'^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out;',
+                result.stdout, re.MULTILINE):
+            raise ValueError('the native join retry contract did not execute')
+        return 0
     expected = {
         'thread_exhaustion_closes_' + kind for kind in ('mpsc', 'spsc', 'ring')
     } | {
@@ -62,7 +74,6 @@ def main():
     } | {
         'thread_exhaustion_cancels_failed_tokio_job'
     }
-    actual = re.findall(r'^test (\S+) \.\.\. ok$', result.stdout, re.MULTILINE)
     if len(actual) != len(expected) or set(actual) != expected:
         raise ValueError('missing, duplicate or unexpected mailbox exhaustion contracts')
     if not re.search(r'^test result: ok\. 10 passed; 0 failed; 0 ignored; 0 measured; '
