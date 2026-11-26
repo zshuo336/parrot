@@ -295,7 +295,6 @@ impl Outbound {
                     match receipt {
                         Ok(receipt)
                             if !receipt.active && receipt.ticket == grant.receipt.ticket => {}
-                        Err((ErrCode::Stopped, _)) => {}
                         Err((code, detail)) => return Err(code.to_actor_error(detail)),
                         _ => {
                             return Err(ErrCode::ProtocolViolation

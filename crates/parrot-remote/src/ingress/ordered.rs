@@ -76,6 +76,9 @@ impl Lease {
         let mut receiver = self.done.subscribe();
         let _ = receiver.wait_for(|done| *done).await;
     }
+    fn is_finished(&self) -> bool {
+        *self.done.borrow()
+    }
 }
 
 struct Challenge {
@@ -84,12 +87,27 @@ struct Challenge {
     expires: Instant,
 }
 
+struct Closing {
+    lease: Arc<Lease>,
+    previous: Option<Arc<Lease>>,
+}
+impl Closing {
+    fn is_finished(&self) -> bool {
+        self.lease.is_finished()
+            && self
+                .previous
+                .as_ref()
+                .is_none_or(|lease| lease.is_finished())
+    }
+}
+
 #[derive(Default)]
 struct Source {
     generation: u64,
     challenge: Option<Challenge>,
     active: Option<Arc<Lease>>,
     retiring: Option<Arc<Lease>>,
+    closing: Option<Closing>,
 }
 
 pub(super) struct Sessions {
@@ -112,6 +130,9 @@ impl Sessions {
     fn prune_challenges(&mut self) {
         let now = Instant::now();
         for source in self.sources.values_mut() {
+            if source.closing.as_ref().is_some_and(Closing::is_finished) {
+                source.closing = None;
+            }
             if source
                 .challenge
                 .as_ref()
@@ -121,14 +142,21 @@ impl Sessions {
             }
         }
         self.sources.retain(|_, source| {
-            source.challenge.is_some() || source.active.is_some() || source.retiring.is_some()
+            source.challenge.is_some()
+                || source.active.is_some()
+                || source.retiring.is_some()
+                || source.closing.is_some()
         });
     }
 }
 impl Drop for Sessions {
     fn drop(&mut self) {
         for source in self.sources.values() {
-            for lease in source.active.iter().chain(source.retiring.iter()) {
+            for lease in source.active.iter().chain(source.retiring.iter()).chain(
+                source.closing.iter().flat_map(|closing| {
+                    std::iter::once(&closing.lease).chain(closing.previous.iter())
+                }),
+            ) {
                 let _ = Cleanup::default().call(|| lease.cancel.cancel());
             }
         }
@@ -173,7 +201,11 @@ impl Drop for Registration {
         {
             source.retiring = None;
         }
-        if source.active.is_none() && source.retiring.is_none() && source.challenge.is_none() {
+        if source.active.is_none()
+            && source.retiring.is_none()
+            && source.challenge.is_none()
+            && source.closing.is_none()
+        {
             sessions.sources.remove(&self.lease.source);
         }
     }
@@ -229,7 +261,12 @@ impl Ingress {
             std::mem::take(&mut sessions.sources)
         };
         for source in retired.into_values() {
-            for lease in source.active.into_iter().chain(source.retiring) {
+            for lease in source.active.into_iter().chain(source.retiring).chain(
+                source
+                    .closing
+                    .into_iter()
+                    .flat_map(|closing| std::iter::once(closing.lease).chain(closing.previous)),
+            ) {
                 let _ = Cleanup::default().call(|| lease.cancel.cancel());
             }
         }
@@ -255,6 +292,14 @@ impl Ingress {
                 .map(|router| router.self_node().to_owned());
             if crate::actor_path::split(&frame.path).map(|pair| pair.0) != receiver.as_deref() {
                 return Err(ErrCode::ProtocolViolation);
+            }
+            if control.operation == Operation::Open
+                && self
+                    .local
+                    .forwarding_target(super::local_path(&frame.path))
+                    .is_some_and(|target| self.is_remote_target(&target))
+            {
+                return Err(ErrCode::NotRemotable);
             }
             match control.operation {
                 Operation::Open => self.open_ordered(control).await.map(Some),
@@ -294,6 +339,9 @@ impl Ingress {
                 return Err(ErrCode::Overloaded);
             }
             let source = sessions.sources.entry(control.source.clone()).or_default();
+            if source.closing.is_some() {
+                return Err(ErrCode::Overloaded);
+            }
             if source.active.as_ref().is_some_and(|lease| {
                 *lease.ready.borrow() == Ready::Preparing
                     && (lease.incarnation != control.incarnation || lease.stream != control.stream)
@@ -354,6 +402,9 @@ impl Ingress {
                 .sources
                 .get_mut(&control.source)
                 .ok_or(ErrCode::Stopped)?;
+            if source.closing.is_some() {
+                return Err(ErrCode::Overloaded);
+            }
             let lease = source
                 .active
                 .as_ref()
@@ -442,28 +493,61 @@ impl Ingress {
     async fn close_ordered_lease(&self, control: Control) -> Result<Receipt, ErrCode> {
         let (lease, previous) = {
             let mut sessions = self.ordered.lock().unwrap();
-            let source = sessions
-                .sources
-                .get_mut(&control.source)
-                .ok_or(ErrCode::Stopped)?;
-            if let Some(lease) = source
+            if self.reorder_closed.load(Ordering::Acquire) {
+                return Err(ErrCode::Stopped);
+            }
+            let absent = |generation| Receipt {
+                active: false,
+                ticket: control.ticket,
+                generation,
+                lease_ms: ordered::LEASE_MS,
+            };
+            let Some(source) = sessions.sources.get_mut(&control.source) else {
+                return Ok(absent(1));
+            };
+            if let Some(closing) = source
+                .closing
+                .as_ref()
+                .filter(|closing| closing.lease.matches(&control))
+            {
+                (closing.lease.clone(), closing.previous.clone())
+            } else if let Some(lease) = source
                 .retiring
                 .as_ref()
                 .filter(|lease| lease.matches(&control))
             {
                 (lease.clone(), None)
             } else {
-                let lease = source
+                let Some(lease) = source
                     .active
                     .as_ref()
                     .filter(|lease| lease.matches(&control))
                     .cloned()
-                    .ok_or(ErrCode::Stopped)?;
+                else {
+                    // Only the live session owner can prove absence. Generic
+                    // request-admission errors carry no retirement guarantee.
+                    let receipt = absent(source.generation.max(1));
+                    if source.challenge.as_ref().is_some_and(|challenge| {
+                        challenge.control.incarnation == control.incarnation
+                            && challenge.control.stream == control.stream
+                            && challenge.control.ticket == control.ticket
+                    }) {
+                        source.challenge = None;
+                    }
+                    sessions.prune_challenges();
+                    return Ok(receipt);
+                };
                 source.active = None;
                 let previous = source.retiring.clone();
                 if previous.is_none() {
                     source.retiring = Some(lease.clone());
                 }
+                // Retain the exact close identity and its predecessor even if
+                // this request is cancelled or the replacement worker exits first.
+                source.closing = Some(Closing {
+                    lease: lease.clone(),
+                    previous: previous.clone(),
+                });
                 (lease, previous)
             }
         };
@@ -474,6 +558,19 @@ impl Ingress {
         lease.finished().await;
         if let Some(previous) = previous {
             previous.finished().await;
+        }
+        {
+            let mut sessions = self.ordered.lock().unwrap();
+            if let Some(source) = sessions.sources.get_mut(&control.source) {
+                if source
+                    .closing
+                    .as_ref()
+                    .is_some_and(|closing| closing.lease.matches(&control) && closing.is_finished())
+                {
+                    source.closing = None;
+                }
+            }
+            sessions.prune_challenges();
         }
         Ok(lease.receipt(false))
     }

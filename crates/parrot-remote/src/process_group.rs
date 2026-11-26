@@ -60,6 +60,15 @@ impl PinnedProcess {
             }
             if let Err(error) = signal_session_groups(child.id(), deadline) {
                 signal_error.get_or_insert(error);
+                // Even when enumeration is unavailable, the unreaped child
+                // still pins its original group. Retire that anchor without
+                // pretending that unobservable sibling groups were proven dead.
+                if unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) } == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        errors.push(format!("kill pinned gateway group: {error}"));
+                    }
+                }
             }
             match liveness::has_live_session(child.id(), deadline) {
                 Ok(false) => break,
@@ -70,6 +79,7 @@ impl PinnedProcess {
                 }
             }
             if Instant::now() >= deadline {
+                errors.push("gateway session remained live at retirement deadline".into());
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -84,8 +94,23 @@ impl PinnedProcess {
                 errors.push(error);
             }
         }
-        if let Err(error) = child.wait() {
-            errors.push(format!("wait gateway guardian: {error}"));
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    errors.push("gateway guardian reap deadline exceeded".into());
+                    // Keep the unreaped identity for a later attempt or Drop.
+                    // A timeout is not a completed retirement receipt.
+                    return Err(errors.join("; "));
+                }
+                Err(error) => {
+                    errors.push(format!("wait gateway guardian: {error}"));
+                    break;
+                }
+            }
         }
         self.child.take();
         let result = if errors.is_empty() {

@@ -309,4 +309,47 @@ mod tests {
         reserved.key = CONTROL_KEY.into();
         assert!(reserved.encode().is_err());
     }
+
+    #[test]
+    fn inspection_preserves_business_trace_and_rejects_invalid_ordered_frames() {
+        use crate::frame::{flags, frame_type, Frame};
+        let data = Data {
+            source: "origin".into(),
+            incarnation: [1; 16],
+            stream: [2; 16],
+            ticket: [3; 16],
+            sequence: 1,
+            key: "bin:inspection#v1".into(),
+            payload: Bytes::from_static(&[0, 255, 1]),
+        };
+        let parent = parrot_api::trace::TraceParent::new([5; 16], [7; 8]).unwrap();
+        let mut wire = Frame::tell("/actor", DATA_KEY, data.encode().unwrap());
+        wire.header.flags = flags::TRACING | flags::URGENT;
+        wire = wire.with_trace_parent(parent).unwrap();
+        let mut business = business_frame(wire.clone()).unwrap().unwrap();
+        assert_eq!(business.take_trace_parent().unwrap(), Some(parent));
+        assert_eq!(business.type_key, data.key);
+        assert_eq!(business.payload, data.payload);
+        assert_eq!(business.header.flags, flags::TRACING | flags::URGENT);
+        for mutation in 0..5 {
+            let mut invalid = wire.clone();
+            match mutation {
+                0 => invalid.header.frame_type = frame_type::ASK,
+                1 => invalid.header.correlation_id = 1,
+                2 => invalid.header.seq = 1,
+                3 => invalid.header.flags |= flags::TELL_ACK,
+                _ => invalid.payload = Bytes::from_static(&[0]),
+            }
+            assert!(business_frame(invalid).is_err(), "mutation {mutation}");
+        }
+        let control = Control {
+            operation: Operation::Open,
+            source: "origin".into(),
+            incarnation: [1; 16],
+            stream: [2; 16],
+            ticket: [0; 16],
+        };
+        let frame = Frame::ask(1, "/actor", CONTROL_KEY, control.encode().unwrap(), None);
+        assert!(business_frame(frame).unwrap().is_none());
+    }
 }

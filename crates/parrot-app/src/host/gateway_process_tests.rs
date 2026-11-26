@@ -316,6 +316,11 @@ async fn unproven_group_retirement_preserves_private_compilation() {
         return;
     }
 
+    // A regression in error-path reaping must fail this isolated contract rather
+    // than leave the whole host test binary waiting indefinitely on output().
+    unsafe {
+        libc::alarm(30);
+    }
     for keep_caller_reference in [false, true] {
         let fixture = Fixture::new();
         let artifacts = Arc::new(PrivateArtifacts::new(tempfile::tempdir().unwrap()));
@@ -351,6 +356,9 @@ async fn unproven_group_retirement_preserves_private_compilation() {
             Some(b"compiled artifact".as_slice()),
             "unproven retirement deleted private compilation"
         );
+    }
+    unsafe {
+        libc::alarm(0);
     }
 }
 

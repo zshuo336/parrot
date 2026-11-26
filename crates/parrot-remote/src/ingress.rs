@@ -3293,10 +3293,10 @@ mod tests {
     }
     #[tokio::test]
     async fn application_alias_forwards_opaque_ask_tell_stop_without_capturing_other_nodes() {
-        let ingress = Ingress::new(
+        let ingress = Arc::new(Ingress::new(
             Arc::new(ApplicationAliases),
             Arc::new(CallbackRegistry::new(8)),
-        );
+        ));
         let (out, mut frames) = tokio::sync::mpsc::channel(8);
         let destination = FrameSender::anon(out);
         *ingress.relay_slot() = Some(Arc::new(AliasRouter(destination.clone())));
@@ -3410,10 +3410,10 @@ mod tests {
 
     #[tokio::test]
     async fn route_acl_is_enforced_before_ask_tell_and_stop_relay() {
-        let ingress = Ingress::new(
+        let ingress = Arc::new(Ingress::new(
             Arc::new(ApplicationAliases),
             Arc::new(CallbackRegistry::new(8)),
-        );
+        ));
         let (out, mut frames) = tokio::sync::mpsc::channel(8);
         let destination = FrameSender::anon(out);
         *ingress.relay_slot() = Some(Arc::new(AliasRouter(destination)));
@@ -3491,11 +3491,15 @@ mod tests {
         assert_eq!(forwarded.header.correlation_id, 900);
     }
 
-    fn route_acl_ingress() -> (Ingress, FrameSender, tokio::sync::mpsc::Receiver<Frame>) {
-        let ingress = Ingress::new(
+    fn route_acl_ingress() -> (
+        Arc<Ingress>,
+        FrameSender,
+        tokio::sync::mpsc::Receiver<Frame>,
+    ) {
+        let ingress = Arc::new(Ingress::new(
             Arc::new(ApplicationAliases),
             Arc::new(CallbackRegistry::new(8)),
-        );
+        ));
         let (out, frames) = tokio::sync::mpsc::channel(8);
         let destination = FrameSender::anon(out);
         *ingress.relay_slot() = Some(Arc::new(AliasRouter(destination.clone())));
@@ -3503,7 +3507,7 @@ mod tests {
     }
 
     async fn check_route_acl_dispatch(
-        ingress: &Ingress,
+        ingress: &Arc<Ingress>,
         destination: &FrameSender,
         frames: &mut tokio::sync::mpsc::Receiver<Frame>,
         allowed: bool,
@@ -4119,9 +4123,32 @@ mod tests {
     }
 
     // EG3（边界）：未注册 type_key 的 TELL → 死信 + UnknownTypeKey 语义
+    fn isolated_metric_contract(name: &str) -> bool {
+        if std::env::var("PARROT_INGRESS_METRIC_CONTRACT").as_deref() == Ok(name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1"])
+            .env("PARROT_INGRESS_METRIC_CONTRACT", name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated metric contract failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+        false
+    }
+
     #[tokio::test]
     async fn eg3_unknown_typekey_dead_letter() {
-        let (ig, _sink) = recording_ingress();
+        if !isolated_metric_contract("ingress::tests::eg3_unknown_typekey_dead_letter") {
+            return;
+        }
+        let (ig, sink) = recording_ingress();
         let (tx, _rx) = tokio::sync::mpsc::channel::<Frame>(4);
         let back = FrameSender::anon(tx);
         let before = DEAD_TELL_DROPPED.load(Ordering::Relaxed);
@@ -4140,6 +4167,8 @@ mod tests {
             before + 1,
             "未知 type_key → 死信（部署版本不齐的观测点）"
         );
+        assert!(sink.lock().unwrap().is_empty());
+        assert!(!back.is_closed());
     }
 
     // EG4（边界）：无主 REPLY（无对应 cid）→ 迟到计数不 panic
@@ -4261,6 +4290,9 @@ mod tests {
     // ingress_dispatch_matrix：ASK 命中/ASK miss/REPLY 回调/REPLY_ERR/TELL miss 死信
     #[tokio::test]
     async fn ingress_dispatch_matrix() {
+        if !isolated_metric_contract("ingress::tests::ingress_dispatch_matrix") {
+            return;
+        }
         let (ig, ch) = ingress();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(16);
         let back = FrameSender::anon(tx);

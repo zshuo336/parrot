@@ -433,7 +433,11 @@ async fn recorded_transport(scheme: &str, direct: bool) {
     let remote = client
         .remote_ref(&format!("parrot://{server_name}/counter"))
         .unwrap();
-    remote.deliver(Box::new(Delta(2))).await.unwrap();
+    let parent = parrot_api::trace::TraceContext::root();
+    parent
+        .scope(async { remote.deliver(Box::new(Delta(2))).await })
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while value(&lookup).await != 2 {
             tokio::task::yield_now().await;
@@ -471,9 +475,51 @@ async fn recorded_transport(scheme: &str, direct: bool) {
     let requests: Vec<_> = log
         .records
         .iter()
-        .filter(|r| r.dir == "rx" && matches!(r.frame_type, frame_type::ASK | frame_type::TELL))
+        .filter(|r| {
+            r.dir == "rx"
+                && matches!(r.frame_type, frame_type::ASK | frame_type::TELL)
+                && r.type_key != parrot_remote::ordered::CONTROL_KEY
+        })
         .collect();
     assert_eq!(requests.len(), 3);
+    assert_eq!(
+        log.records
+            .iter()
+            .filter(|r| r.dir == "rx" && r.type_key == parrot_remote::ordered::CONTROL_KEY)
+            .count(),
+        2
+    );
+    let ordered = requests
+        .iter()
+        .copied()
+        .find(|r| r.type_key == parrot_remote::ordered::DATA_KEY)
+        .unwrap();
+    let mut captured = parrot_remote::frame::Frame::tell(
+        &ordered.path,
+        &ordered.type_key,
+        ordered.payload_bytes().unwrap().into(),
+    );
+    captured.header.flags = ordered.wire.as_ref().unwrap().flags;
+    let business = parrot_remote::ordered::business_frame(captured)
+        .unwrap()
+        .unwrap();
+    assert_eq!(business.type_key, "bin:replay.Delta");
+    assert_eq!(
+        business.split_trace_parent().unwrap().0,
+        Some(parent.as_parent())
+    );
+    assert_eq!(
+        CodecRegistry::global()
+            .decode_incoming(
+                &business.type_key,
+                &business.split_trace_parent().unwrap().1
+            )
+            .unwrap()
+            .downcast::<Delta>()
+            .unwrap()
+            .0,
+        2
+    );
     for record in requests {
         let wire = record.wire.as_ref().unwrap();
         assert_eq!(wire.local_node, server_name);
@@ -486,7 +532,7 @@ async fn recorded_transport(scheme: &str, direct: bool) {
         .replay_local(
             &lookup,
             ReplayOptions {
-                target_node: Some(server_name),
+                target_node: Some(server_name.clone()),
                 ..Default::default()
             },
         )
@@ -510,7 +556,11 @@ async fn recorded_transport(scheme: &str, direct: bool) {
     let observed: Vec<_> = log
         .records
         .iter()
-        .filter(|r| r.dir == "tx" && r.frame_type == frame_type::REPLY)
+        .filter(|r| {
+            r.dir == "tx"
+                && r.frame_type == frame_type::REPLY
+                && r.type_key != parrot_remote::ordered::RECEIPT_KEY
+        })
         .collect();
     assert_eq!(observed.len(), replay.replies.len());
     for (wire, result) in observed.iter().zip(&replay.replies) {
@@ -518,6 +568,34 @@ async fn recorded_transport(scheme: &str, direct: bool) {
         assert_eq!(wire.payload_bytes().unwrap(), result.payload);
     }
     fresh.shutdown_internal().await.unwrap();
+    for missing_wire in [false, true] {
+        let (fresh, lookup) = engine().await;
+        let mut invalid = (*ordered).clone();
+        invalid.seq = 1;
+        if missing_wire {
+            invalid.wire = None;
+        } else {
+            invalid.wire.as_mut().unwrap().flags = 0;
+            invalid.payload_hex = "00".into();
+        }
+        let invalid = ReplayLog {
+            records: vec![record(0, "rx", frame_type::ASK, 3), invalid],
+        };
+        assert!(matches!(
+            invalid
+                .replay_local(
+                    &lookup,
+                    ReplayOptions {
+                        target_node: Some(server_name.clone()),
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(ReplayError::Delivery { completed: 0, .. })
+        ));
+        assert_eq!(value(&lookup).await, 0);
+        fresh.shutdown_internal().await.unwrap();
+    }
     std::fs::remove_file(path).unwrap();
 }
 #[tokio::test]

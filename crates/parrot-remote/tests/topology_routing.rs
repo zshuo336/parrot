@@ -102,7 +102,7 @@ struct Network {
     target: Arc<RemoteActorSystem>,
     calls: Echo,
     capture: FrameCapture,
-    recording: std::thread::JoinHandle<Vec<String>>,
+    recording: std::thread::JoinHandle<(Vec<String>, Vec<String>)>,
 }
 
 impl Network {
@@ -119,6 +119,7 @@ impl Network {
         let (capture, mut receiver) = FrameCapture::channel(CaptureLimits::default()).unwrap();
         let recording = std::thread::spawn(move || {
             let mut peers = Vec::new();
+            let mut controls = Vec::new();
             while let Some(event) = receiver.blocking_recv() {
                 if event.direction == CaptureDirection::Tx
                     && matches!(
@@ -127,15 +128,20 @@ impl Network {
                     )
                     && event.frame.path == "parrot://topology-target/echo"
                 {
-                    peers.push(
-                        event
-                            .wire
-                            .peer_node
-                            .expect("business writer has a verified peer"),
-                    );
+                    let peer = event
+                        .wire
+                        .peer_node
+                        .expect("request writer has a verified peer");
+                    match parrot_remote::ordered::business_frame(event.frame).unwrap() {
+                        Some(business) => {
+                            assert_eq!(business.type_key, "bin:parrot.topology.routing.Ping#v1");
+                            peers.push(peer);
+                        }
+                        None => controls.push(peer),
+                    }
                 }
             }
-            peers
+            (peers, controls)
         });
         // Exercise the real config folding and runtime conversion for every mode.
         let mut resolved = ParrotConfig::builder()
@@ -277,9 +283,26 @@ impl Network {
         let mut messages = self.calls.1.lock().unwrap().clone();
         messages.sort_unstable();
         self.capture.close();
-        let peers = tokio::task::spawn_blocking(move || self.recording.join().unwrap())
+        let (peers, controls) = tokio::task::spawn_blocking(move || self.recording.join().unwrap())
             .await
             .unwrap();
+        if !peers.is_empty() {
+            assert_eq!(
+                peers.len(),
+                3,
+                "only actual business requests count toward the route contract"
+            );
+            assert_eq!(
+                controls,
+                vec![peers[1].clone(); 2],
+                "OPEN and COMMIT must follow the TELL's actual next hop"
+            );
+        } else {
+            assert!(
+                controls.is_empty(),
+                "rejected routes must not publish session control"
+            );
+        }
         if !messages.is_empty() {
             assert_eq!(
                 messages,

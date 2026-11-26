@@ -465,6 +465,237 @@ async fn source_recreation_and_cancelled_intermediate_handoff_cannot_bypass_actu
     target.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_commit_and_retried_close_wait_for_actual_predecessor_cleanup() {
+    let (state, mut receiver) = state();
+    let release = Release(state.clone());
+    let target = start(
+        RemoteConfig::mem("close-handoff-target"),
+        Arc::new(Target(state.clone())),
+    )
+    .await;
+    let first = start(RemoteConfig::mem("close-handoff-source"), Arc::new(Empty)).await;
+    first.connect_mem_pair(&target).await.unwrap();
+    let reference = first
+        .remote_ref("parrot://close-handoff-target/target")
+        .unwrap();
+    strict(&reference, 700).await;
+    tokio::time::timeout(Duration::from_secs(3), state.entered.notified())
+        .await
+        .unwrap();
+    first.shutdown().await.unwrap();
+    drop(first);
+
+    let second = start(RemoteConfig::mem("close-handoff-source"), Arc::new(Empty)).await;
+    second.connect_mem_pair(&target).await.unwrap();
+    let reference = second
+        .remote_ref("parrot://close-handoff-target/target")
+        .unwrap();
+    let sending = reference.clone();
+    let attempt = tokio::spawn(async move {
+        sending
+            .deliver_ordered(Box::new(Work(1)), Default::default())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), state.dropping.notified())
+        .await
+        .unwrap();
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        reference
+            .close_ordered_session(Duration::from_millis(100))
+            .await,
+        Err(parrot_api::errors::ActorError::Timeout
+            | parrot_api::errors::ActorError::TimeoutDetail(_))
+    ));
+    let closing = reference.clone();
+    let mut retry =
+        tokio::spawn(async move { closing.close_ordered_session(Duration::from_secs(3)).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut retry)
+            .await
+            .is_err(),
+        "a repeated CLOSE acknowledged while its predecessor's real Drop was blocked"
+    );
+    assert!(!state.dropped.load(Ordering::SeqCst));
+    assert!(receiver.try_recv().is_err());
+    release.release();
+    retry.await.unwrap().unwrap();
+    assert!(state.dropped.load(Ordering::SeqCst));
+    strict(&reference, 2).await;
+    seen(&mut receiver, 2).await;
+    assert!(receiver.try_recv().is_err());
+    second.shutdown().await.unwrap();
+    target.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_close_reclaims_the_bounded_outgoing_destination_slot() {
+    let (state, mut receiver) = state();
+    let source = start(
+        RemoteConfig::mem("slot-source").with_knobs(RuntimeKnobs {
+            reorder_stream_capacity: 1,
+            ..Default::default()
+        }),
+        Arc::new(Empty),
+    )
+    .await;
+    let first = start(
+        RemoteConfig::mem("slot-first"),
+        Arc::new(Target(state.clone())),
+    )
+    .await;
+    let second = start(RemoteConfig::mem("slot-second"), Arc::new(Target(state))).await;
+    source.connect_mem_pair(&first).await.unwrap();
+    source.connect_mem_pair(&second).await.unwrap();
+    let a = source.remote_ref("parrot://slot-first/target").unwrap();
+    let b = source.remote_ref("parrot://slot-second/target").unwrap();
+    strict(&a, 1).await;
+    seen(&mut receiver, 1).await;
+    let error = b
+        .deliver_ordered(Box::new(Work(99)), Default::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("remote overloaded"), "{error}");
+    a.close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    strict(&b, 2).await;
+    seen(&mut receiver, 2).await;
+    b.close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    strict(&a, 3).await;
+    seen(&mut receiver, 3).await;
+    assert!(receiver.try_recv().is_err());
+    for node in [&source, &first, &second] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_request_admission_is_not_a_session_retirement_receipt() {
+    let (state, _receiver) = state();
+    let release = Release(state.clone());
+    let target = start(
+        RemoteConfig::mem("closed-admission-target"),
+        Arc::new(Target(state.clone())),
+    )
+    .await;
+    let source = start(
+        RemoteConfig::mem("closed-admission-source"),
+        Arc::new(Empty),
+    )
+    .await;
+    source.connect_mem_pair(&target).await.unwrap();
+    let reference = source
+        .remote_ref("parrot://closed-admission-target/target")
+        .unwrap();
+    strict(&reference, 700).await;
+    tokio::time::timeout(Duration::from_secs(3), state.entered.notified())
+        .await
+        .unwrap();
+    target.ingress.close_asks();
+    let result = reference
+        .close_ordered_session(Duration::from_secs(3))
+        .await;
+    assert!(
+        result.is_err(),
+        "generic admission Stopped was treated as proof of actual session retirement"
+    );
+    assert!(!state.dropped.load(Ordering::SeqCst));
+    release.release();
+    source.shutdown().await.unwrap();
+    target.shutdown().await.unwrap();
+}
+
+struct Forwarding;
+#[async_trait::async_trait]
+impl LocalLookup for Forwarding {
+    async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
+        None
+    }
+    fn forwarding_target(&self, path: &str) -> Option<String> {
+        (path == "/target").then(|| "parrot://alias-target/target".into())
+    }
+}
+
+#[tokio::test]
+async fn ordinary_tell_preserves_application_alias_forwarding_and_strict_tell_rejects_before_data()
+{
+    let (state, mut receiver) = state();
+    let target = start(RemoteConfig::mem("alias-target"), Arc::new(Target(state))).await;
+    let alias = start(RemoteConfig::mem("alias-host"), Arc::new(Forwarding)).await;
+    let source = start(RemoteConfig::mem("alias-source"), Arc::new(Empty)).await;
+    source.connect_mem_pair(&alias).await.unwrap();
+    alias.connect_mem_pair(&target).await.unwrap();
+    let reference = source.remote_ref("parrot://alias-host/target").unwrap();
+    assert!(
+        reference
+            .deliver_ordered(Box::new(Work(99)), Default::default())
+            .await
+            .is_err(),
+        "strict session falsely confirmed an alias instead of the final business endpoint"
+    );
+    reference.deliver(Box::new(Work(1))).await.unwrap();
+    seen(&mut receiver, 1).await;
+    assert!(receiver.try_recv().is_err());
+    for node in [&source, &alias, &target] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn ordinary_delivery_cannot_downgrade_a_lane_after_ordered_publication() {
+    let (state, mut receiver) = state();
+    let target = start(
+        RemoteConfig::tcp("downgrade-target", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development(),
+        Arc::new(Target(state.clone())),
+    )
+    .await;
+    let source = start(
+        RemoteConfig::tcp("downgrade-source", None).with_insecure_development(),
+        Arc::new(Empty),
+    )
+    .await;
+    source
+        .connect(&NodeAddr::tcp(
+            "downgrade-target",
+            target.local_addr().unwrap(),
+        ))
+        .await
+        .unwrap();
+    let reference = source
+        .remote_ref("parrot://downgrade-target/target")
+        .unwrap();
+    reference.deliver(Box::new(Work(1))).await.unwrap();
+    seen(&mut receiver, 1).await;
+    target.shutdown().await.unwrap();
+    drop(target);
+    let target = start(
+        RemoteConfig::tcp("downgrade-target", Some("127.0.0.1:0".parse().unwrap())),
+        Arc::new(Target(state)),
+    )
+    .await;
+    source
+        .connect(&NodeAddr::tcp(
+            "downgrade-target",
+            target.local_addr().unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert!(reference.deliver(Box::new(Work(99))).await.is_err());
+    reference
+        .send_with_timeout(Box::new(Work(2)), Some(Duration::from_secs(3)))
+        .await
+        .unwrap();
+    assert!(receiver.try_recv().is_err());
+    source.shutdown().await.unwrap();
+    target.shutdown().await.unwrap();
+}
+
 struct Raw {
     handle: ConnectionHandle,
     incoming: tokio::sync::mpsc::Receiver<(Frame, parrot_remote::transport::FrameSender, String)>,
@@ -473,6 +704,9 @@ struct Raw {
 }
 impl Raw {
     async fn connect(target: &RemoteActorSystem) -> Self {
+        Self::connect_with_caps(target, caps::BIN | caps::ORDERED_TELL).await
+    }
+    async fn connect_with_caps(target: &RemoteActorSystem, capabilities: u32) -> Self {
         let io = tokio::net::TcpStream::connect(target.local_addr().unwrap())
             .await
             .unwrap();
@@ -487,7 +721,7 @@ impl Raw {
                 scheme: "tcp",
                 local_handshake: HandshakeBody {
                     node_id: "wire-source".into(),
-                    capabilities: caps::BIN | caps::ORDERED_TELL,
+                    capabilities,
                     ..Default::default()
                 },
                 inbound,
@@ -573,6 +807,63 @@ fn ticket(reply: &Frame, active: bool) -> [u8; 16] {
     assert_eq!(&reply.payload[..2], &[1, u8::from(active)]);
     reply.payload[2..18].try_into().unwrap()
 }
+
+#[tokio::test]
+async fn negotiated_link_rejects_malformed_ordered_payload_without_business_delivery() {
+    let (state, mut receiver) = state();
+    let target = start(
+        RemoteConfig::tcp("bad-ordered-target", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development(),
+        Arc::new(Target(state)),
+    )
+    .await;
+    let raw = Raw::connect(&target).await;
+    raw.handle
+        .sender
+        .send(Frame::tell(
+            "parrot://bad-ordered-target/target",
+            DATA_KEY,
+            Bytes::from_static(&[0]),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), raw.handle.sender.closed())
+        .await
+        .unwrap();
+    assert!(receiver.try_recv().is_err());
+    raw.shutdown.send_replace(true);
+    target.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn nonnegotiated_ordered_frames_fail_before_sender_and_receiver_publication() {
+    let (state, mut receiver) = state();
+    let target = start(
+        RemoteConfig::tcp("unnegotiated-target", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development(),
+        Arc::new(Target(state)),
+    )
+    .await;
+    let raw = Raw::connect_with_caps(&target, caps::BIN).await;
+    assert!(!raw.handle.sender.supports_ordered_tell());
+    let data = Frame::tell(
+        "parrot://unnegotiated-target/target",
+        DATA_KEY,
+        Bytes::new(),
+    );
+    assert!(raw.handle.sender.send(data.clone()).await.is_err());
+    assert!(!raw.handle.sender.is_closed());
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let unnegotiated = parrot_remote::transport::FrameSender::new(tx, "wire-source");
+    target
+        .ingress
+        .dispatch(data, &unnegotiated, "wire-source")
+        .await;
+    assert!(unnegotiated.is_closed());
+    assert!(receiver.try_recv().is_err());
+    raw.shutdown.send_replace(true);
+    target.shutdown().await.unwrap();
+}
 #[tokio::test]
 async fn actual_wire_old_open_commit_close_and_data_cannot_retire_or_overwrite_the_new_ticket() {
     let (state, mut receiver) = state();
@@ -610,15 +901,17 @@ async fn actual_wire_old_open_commit_close_and_data_cannot_retire_or_overwrite_t
         new
     );
     raw.data(1, 2, old, 4, 99).await;
-    for operation in [1, 2] {
-        assert_eq!(
-            raw.control(operation, 1, 2, old, "wire-source")
-                .await
-                .header
-                .frame_type,
-            frame_type::REPLY_ERR
-        );
-    }
+    assert_eq!(
+        raw.control(1, 1, 2, old, "wire-source")
+            .await
+            .header
+            .frame_type,
+        frame_type::REPLY_ERR
+    );
+    assert_eq!(
+        ticket(&raw.control(2, 1, 2, old, "wire-source").await, false),
+        old
+    );
     raw.data(3, 4, new, 1, 5).await;
     seen(&mut receiver, 5).await;
     let stale_open = raw.control(0, 1, 2, [0; 16], "wire-source").await;
@@ -637,5 +930,47 @@ async fn actual_wire_old_open_commit_close_and_data_cannot_retire_or_overwrite_t
     seen(&mut receiver, 7).await;
     assert!(receiver.try_recv().is_err());
     raw.shutdown.send_replace(true);
+    target.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn closing_an_uncommitted_challenge_releases_receiver_source_capacity() {
+    let (state, mut receiver) = state();
+    let target = start(
+        RemoteConfig::tcp("wire-target", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development()
+            .with_knobs(RuntimeKnobs {
+                reorder_stream_capacity: 1,
+                ..Default::default()
+            }),
+        Arc::new(Target(state)),
+    )
+    .await;
+    let mut raw = Raw::connect(&target).await;
+    let pending = ticket(&raw.control(0, 1, 2, [0; 16], "wire-source").await, false);
+    let source = start(
+        RemoteConfig::tcp("challenge-next", None).with_insecure_development(),
+        Arc::new(Empty),
+    )
+    .await;
+    source
+        .connect(&NodeAddr::tcp("wire-target", target.local_addr().unwrap()))
+        .await
+        .unwrap();
+    let reference = source.remote_ref("parrot://wire-target/target").unwrap();
+    let error = reference
+        .deliver_ordered(Box::new(Work(99)), Default::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("remote overloaded"), "{error}");
+    assert_eq!(
+        ticket(&raw.control(2, 1, 2, pending, "wire-source").await, false),
+        pending
+    );
+    strict(&reference, 1).await;
+    seen(&mut receiver, 1).await;
+    assert!(receiver.try_recv().is_err());
+    raw.shutdown.send_replace(true);
+    source.shutdown().await.unwrap();
     target.shutdown().await.unwrap();
 }
