@@ -12,12 +12,13 @@ pub(crate) fn run(full_name: &str, flag: &str, timeout: Duration, body: impl FnO
         println!("{marker}");
         return;
     }
-    let log = tempfile::NamedTempFile::new().unwrap();
+    let stdout = tempfile::NamedTempFile::new().unwrap();
+    let stderr = tempfile::NamedTempFile::new().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", full_name, "--nocapture"])
         .env(flag, full_name)
-        .stdout(log.as_file().try_clone().unwrap())
-        .stderr(log.as_file().try_clone().unwrap())
+        .stdout(stdout.as_file().try_clone().unwrap())
+        .stderr(stderr.as_file().try_clone().unwrap())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + timeout;
@@ -32,8 +33,13 @@ pub(crate) fn run(full_name: &str, flag: &str, timeout: Duration, body: impl FnO
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let output = std::fs::read_to_string(log.path()).unwrap();
+    // libtest writes its summary in fragments. Worker diagnostics must not split it.
+    let output = std::fs::read_to_string(stdout.path()).unwrap();
     print!("{output}");
+    eprint!(
+        "{}",
+        String::from_utf8_lossy(&std::fs::read(stderr.path()).unwrap())
+    );
     assert!(
         status.is_some_and(|status| status.success()),
         "{full_name}: {status:?}"

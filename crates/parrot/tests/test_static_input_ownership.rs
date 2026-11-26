@@ -152,6 +152,16 @@ fn isolated(name: &str, run: impl FnOnce()) {
         run,
     );
 }
+
+#[test]
+fn isolated_completion_ignores_worker_stderr() {
+    let name = "isolated_completion_ignores_worker_stderr";
+    isolated(name, || {
+        // A diagnostic can quote a completion marker without completing a second test.
+        eprintln!("PARROT_ISOLATED_CASE_OK {name}");
+    });
+}
+
 fn runtime(run: impl Future<Output = ()>) {
     actix::System::new().block_on(run);
 }
