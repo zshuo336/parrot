@@ -204,11 +204,12 @@ impl Retirement {
             let publish = Publish(self.sender().clone());
             let reservation = self.reservation.clone();
             drop(self.reservation.driver.runtime.spawn(async move {
-                let _reservation = reservation;
                 let result = scope.join().await.map_err(ActorReceipt::from_error);
                 if let Some(owner) = owner.upgrade() {
                     owner.remove(&scope);
                 }
+                // A receipt waker can immediately admit another group.
+                drop(reservation);
                 publish_finished(&publish.0, result);
             }));
         });

@@ -160,6 +160,16 @@ impl Drop for Policy {
     }
 }
 
+struct ReserveOnWake {
+    driver: Arc<Driver>,
+    observed: mpsc::Sender<bool>,
+}
+impl futures::task::ArcWake for ReserveOnWake {
+    fn wake_by_ref(this: &Arc<Self>) {
+        let _ = this.observed.send(this.driver.reserve().is_ok());
+    }
+}
+
 fn capacity(retain_handle: bool) {
     // Keep an external driver owner until every task and reservation is retired.
     let driver = Driver::start(1, build, |job| std::thread::Builder::new().spawn(job)).unwrap();
@@ -180,7 +190,7 @@ fn capacity(retain_handle: bool) {
             decider: parrot_api::supervisor::BasicDecisionFn::new(move |_| policy.decide()),
         },
     ));
-    let waiting = retirement.start(scope, Weak::new());
+    let mut waiting = retirement.start(scope, Weak::new());
     let mut retained = Some(retirement);
     if !retain_handle {
         drop(retained.take());
@@ -195,9 +205,25 @@ fn capacity(retain_handle: bool) {
             "pending cleanup released its reservation"
         );
         assert_eq!(gate.disposed.load(Ordering::SeqCst), 0);
+        let (observed, receipt) = mpsc::channel();
+        let waker = futures::task::waker(Arc::new(ReserveOnWake {
+            driver: driver.clone(),
+            observed,
+        }));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+                .is_pending()
+        );
         gate.release();
+        let admitted_at_publication = receipt.recv_timeout(WAIT).unwrap();
         tokio::time::timeout(WAIT, waiting).await.unwrap().unwrap();
         assert_eq!(gate.disposed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            admitted_at_publication, !retain_handle,
+            "unexpected retirement capacity at receipt publication"
+        );
         if retain_handle {
             assert!(
                 driver.reserve().is_err(),
@@ -205,17 +231,10 @@ fn capacity(retain_handle: bool) {
             );
             drop(retained.take());
         }
-        tokio::time::timeout(WAIT, async {
-            loop {
-                if let Ok(reservation) = driver.reserve() {
-                    drop(reservation);
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("actual disposal did not restore capacity");
+        assert!(
+            driver.reserve().is_ok(),
+            "retirement capacity remained held"
+        );
     });
     drop(observer);
     drop(driver);
@@ -259,8 +278,6 @@ fn check_registry_capacity(guardian: bool) {
             group.stop().await.unwrap();
             drop(group);
         }
-        // The terminal sender wakes its observer just before its task ends.
-        driver.runtime.spawn(async {}).await.unwrap();
         assert_eq!(
             driver.slots.available_permits(),
             available,
