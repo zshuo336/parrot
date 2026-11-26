@@ -342,8 +342,12 @@ impl DedicatedThreadScheduler {
         }
         match worker.stop_tx.try_send(request) {
             Ok(()) => Ok(()),
-            Err(flume::TrySendError::Full(request)) => Err(ControlEnqueueError::Full(request)),
-            Err(flume::TrySendError::Disconnected(_)) => Err(ControlEnqueueError::Disconnected),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+                Err(ControlEnqueueError::Full(request))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(ControlEnqueueError::Rejected(SystemError::ShuttingDown))
+            }
         }
     }
 
@@ -651,8 +655,8 @@ struct DedicatedWorker {
     join_claimed: AtomicBool,
     join_receipt: Arc<Mutex<Option<DedicatedExit>>>,
     reservation: Mutex<Option<NativeWorkerReservation>>,
-    stop_tx: flume::Sender<StopHookRequest>,
-    stop_rx: Mutex<Option<flume::Receiver<StopHookRequest>>>,
+    stop_tx: tokio::sync::mpsc::Sender<StopHookRequest>,
+    stop_rx: Mutex<Option<tokio::sync::mpsc::Receiver<StopHookRequest>>>,
 }
 
 impl std::fmt::Debug for DedicatedWorker {
@@ -806,7 +810,7 @@ impl DedicatedWorker {
         batch_size: usize,
         reservation: Option<NativeWorkerReservation>,
     ) -> Self {
-        let (stop_tx, stop_rx) = flume::bounded(super::MAX_CONTROL_QUEUE);
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(super::MAX_CONTROL_QUEUE);
         Self {
             path,
             mailbox,
@@ -827,7 +831,7 @@ impl DedicatedWorker {
 
     /// Spawn the dedicated OS thread.
     fn start_with_startup<F: FnOnce() + Send + 'static>(&self, startup: F) -> Result<(), String> {
-        let stop_rx = self
+        let mut stop_rx = self
             .stop_rx
             .lock()
             .unwrap()
@@ -931,8 +935,8 @@ impl DedicatedWorker {
                                 if let Err(error) = result { notify_dedicated_error(&*processor, error); }
                                 break;
                             },
-                            request = stop_rx.recv_async() => {
-                                let Ok(request) = request else { break };
+                            request = stop_rx.recv() => {
+                                let Some(request) = request else { break };
                                 stopping.push(request.run());
                             }
                             _ = stopping.next(), if !stopping.is_empty() => {}
@@ -944,6 +948,12 @@ impl DedicatedWorker {
                                 break;
                             }
                         }
+                    }
+                    // No more hooks can run. Resolve requests accepted before close
+                    // while the registry can still retain this worker's sender.
+                    stop_rx.close();
+                    while let Ok(request) = stop_rx.try_recv() {
+                        let _ = request.completion.send(Err(SystemError::ShuttingDown));
                     }
                     // Dispose the observer before releasing the work and actor storage.
                     if let Some(observer) = cancellation.as_mut()
@@ -1133,8 +1143,8 @@ mod tests {
             1,
         );
         assert_eq!(
-            worker.stop_tx.capacity(),
-            Some(super::super::MAX_CONTROL_QUEUE)
+            worker.stop_tx.max_capacity(),
+            super::super::MAX_CONTROL_QUEUE
         );
 
         for index in 0..=super::super::MAX_CONTROL_QUEUE {
@@ -1151,12 +1161,52 @@ mod tests {
             if index < super::super::MAX_CONTROL_QUEUE {
                 assert!(result.is_ok(), "request {index} should fit in the queue");
             } else {
-                let Err(flume::TrySendError::Full(request)) = result else {
+                let Err(tokio::sync::mpsc::error::TrySendError::Full(request)) = result else {
                     panic!("the first request beyond the bound must be rejected");
                 };
                 assert_eq!(request.path, "/control/128");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn queued_stop_hook_receives_shutdown_when_dedicated_worker_exits() {
+        let path = "/dedicated/queued-stop";
+        let (mailbox, processor) = build_actor_stack(path);
+        let scheduler = DedicatedThreadScheduler::new(None);
+        let (release, startup) = std::sync::mpsc::channel();
+        scheduler
+            .schedule_with_startup(
+                path,
+                mailbox,
+                processor.clone(),
+                ThreadActorConfig::default(),
+                move || startup.recv().unwrap(),
+            )
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (completion, mut receipt) = tokio::sync::oneshot::channel();
+        scheduler
+            .enqueue_stop_hook_until(StopHookRequest {
+                trace_context: None,
+                path: path.into(),
+                processor,
+                deadline,
+                completion,
+                retire_only: false,
+            })
+            .await
+            .unwrap();
+        // Keep the registered worker (and its sender) alive across the real join.
+        let worker = scheduler.workers.lock().unwrap().get(path).unwrap().clone();
+        worker.request_stop();
+        release.send(()).unwrap();
+        worker.stop_until(deadline).await.unwrap();
+        let result = receipt.try_recv();
+        assert!(
+            matches!(result, Ok(Err(SystemError::ShuttingDown))),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1169,7 +1219,7 @@ mod tests {
             ThreadActorConfig::default(),
             1,
         ));
-        let receiver = worker.stop_rx.lock().unwrap().take().unwrap();
+        let mut receiver = worker.stop_rx.lock().unwrap().take().unwrap();
         for index in 0..super::super::MAX_CONTROL_QUEUE {
             let (completion, _result) = tokio::sync::oneshot::channel();
             worker
@@ -1209,10 +1259,10 @@ mod tests {
             "a full control queue must retain the request while no slot is available"
         );
 
-        let released = receiver.recv_async().await.unwrap();
+        let released = receiver.recv().await.unwrap();
         assert_eq!(released.path, "/control/0");
         enqueue.await.unwrap();
-        assert_eq!(worker.stop_tx.len(), super::super::MAX_CONTROL_QUEUE);
+        assert_eq!(receiver.len(), super::super::MAX_CONTROL_QUEUE);
 
         let mut retried = false;
         while let Ok(request) = receiver.try_recv() {
