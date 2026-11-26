@@ -277,8 +277,20 @@ async fn factory_reconstruction_preserves_original_typed_reference_and_budget() 
                     assert!(actor.ask(Op::Fail).await.is_err());
                 }
                 assert!(actor.ask(Op::Read).await.is_err());
-                let error = AsyncEngineRuntime::shutdown(&system).await.unwrap_err();
-                assert!(error.to_string().contains("requested failure"));
+                // The original actor retains its failure after leaving the registry.
+                // A later system shutdown only joins actors still registered.
+                let error = actor.stop().await.unwrap_err();
+                assert!(error.to_string().contains("requested failure"), "{error}");
+                assert_eq!(
+                    actor.stop().await.unwrap_err().to_string(),
+                    error.to_string()
+                );
+                assert!(
+                    AsyncEngineRuntime::get_actor(&system, "/factory")
+                        .await
+                        .is_none()
+                );
+                AsyncEngineRuntime::shutdown(&system).await.unwrap();
                 assert_eq!(stats.built.load(Ordering::SeqCst), 3);
                 assert_eq!(stats.dropped.load(Ordering::SeqCst), 3);
             }
