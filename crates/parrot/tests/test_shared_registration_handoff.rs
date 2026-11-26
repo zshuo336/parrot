@@ -277,3 +277,52 @@ async fn shard_to_shared_handoff() {
     )
     .await;
 }
+
+async fn stop_during_transfer(source: Owner, destination: Owner) {
+    let mailbox = counter(PATH);
+    source.schedule(PATH, mailbox.clone()).await;
+    let (entered, started) = oneshot::channel();
+    let (release, held) = oneshot::channel();
+    let first = submit(&mailbox, Some((entered, held))).await;
+    tokio::time::timeout(WAIT, started).await.unwrap().unwrap();
+    source.remove(PATH).await;
+    let mut second = submit(&mailbox, None).await;
+    destination.schedule(PATH, mailbox.clone()).await;
+    assert_eq!(second.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+    source.stop().await;
+    assert!(release.is_closed(), "source retained the suspended handler");
+    assert!(first.await.is_err(), "cancelled request produced a reply");
+    let pending = tokio::time::timeout(WAIT, second).await;
+    let subsequent = send(&mailbox).await;
+    destination.remove(PATH).await;
+    destination.stop().await;
+    assert_eq!(
+        pending.expect("source exit lost the pending wake").unwrap(),
+        1
+    );
+    assert_eq!(subsequent.unwrap(), 2);
+    assert!(mailbox.is_empty().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_request_survives_fifo_source_shutdown() {
+    stop_during_transfer(Owner::Pool(pool(false)), Owner::Pool(pool(true))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_request_survives_work_stealing_source_shutdown() {
+    stop_during_transfer(
+        Owner::Pool(pool(true)),
+        Owner::Shard(ShardedScheduler::start(1, 1)),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_request_survives_shard_source_shutdown() {
+    stop_during_transfer(
+        Owner::Shard(ShardedScheduler::start(1, 1)),
+        Owner::Pool(pool(true)),
+    )
+    .await;
+}

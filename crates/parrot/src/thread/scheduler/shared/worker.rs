@@ -272,7 +272,7 @@ impl Worker {
                         let poll_finished = poll_finished.clone();
                         // Own the dequeued schedule slot even if this queued
                         // async job is dropped before its first poll.
-                        let lease = SharedLease::new(mailbox.clone());
+                        let lease = SharedLease::new(mailbox.clone(), self.scheduling_queue.clone());
                         running.push(async move {
                             let owned_mailbox = mailbox.clone();
                             let cleanups = worker.cleanups.clone();
@@ -316,7 +316,7 @@ impl Worker {
         mailbox: Arc<dyn Mailbox>,
         max_messages: usize,
     ) -> anyhow::Result<()> {
-        let lease = SharedLease::new(mailbox.clone());
+        let lease = SharedLease::new(mailbox.clone(), self.scheduling_queue.clone());
         self.process_mailbox_with_lease(mailbox, max_messages, &lease)
             .await
     }
@@ -464,18 +464,33 @@ impl Worker {
 // owner drops must not release that newer admission.
 struct SharedLease {
     mailbox: Arc<dyn Mailbox>,
+    queue: Arc<SchedulingQueue>,
     owned: std::sync::atomic::AtomicBool,
 }
 impl SharedLease {
-    fn new(mailbox: Arc<dyn Mailbox>) -> Self {
+    fn new(mailbox: Arc<dyn Mailbox>, queue: Arc<SchedulingQueue>) -> Self {
         Self {
             mailbox,
+            queue,
             owned: std::sync::atomic::AtomicBool::new(true),
         }
     }
     fn release(&self) {
-        if self.owned.swap(false, Ordering::AcqRel) {
-            self.mailbox.schedule_state().force_release();
+        if !self.owned.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        // A new scheduler can have recorded its initial wake against this
+        // slot before cancellation disposed the old handler.
+        if self.mailbox.schedule_state().release_pending_wake()
+            && !self.queue.is_registered(&self.mailbox)
+            && let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.mailbox.fire_wake_hook();
+            }))
+        {
+            let message = crate::owned_payload::panic_message(payload);
+            super::super::failure_diagnostic(|| {
+                error!(%message, "mailbox wake after shared worker retirement panicked");
+            });
         }
     }
     fn hand_off(&self) {

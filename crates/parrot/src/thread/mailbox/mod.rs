@@ -327,6 +327,11 @@ impl ScheduleState {
     pub fn force_release(&self) {
         self.state.store(0, Ordering::Release);
     }
+
+    /// Give up the slot and take any wake that arrived while it was owned.
+    pub(crate) fn release_pending_wake(&self) -> bool {
+        self.state.swap(0, Ordering::AcqRel) & Self::WAKE != 0
+    }
 }
 
 /// Trait defining a mailbox that buffers messages for an actor.

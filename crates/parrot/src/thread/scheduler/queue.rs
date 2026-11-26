@@ -315,6 +315,14 @@ impl SchedulingQueue {
         );
         true
     }
+
+    pub(crate) fn is_registered(&self, mailbox: &ReadyMailbox) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .registered
+            .contains_key(&identity(mailbox))
+    }
     /// Called only by a holder of the mailbox's scheduling ownership. Full
     /// queues retain that ownership in one fixed readiness marker per actor.
     #[cfg(test)]
