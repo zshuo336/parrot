@@ -1,7 +1,62 @@
 //! Separate the public stop deadline from the owned work's actual retirement.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::time::Instant;
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(super) enum Phase {
+    Admitted,
+    MailboxDrain,
+    StopHook,
+    SchedulerRetirement,
+    ResourcesFinished,
+    PolicyDisposal,
+    FactoryDisposal,
+    TerminationNotification,
+    RegistryRemoval,
+    Finished,
+}
+
+#[derive(Default)]
+pub(super) struct Progress {
+    phase: AtomicU8,
+    children_finished: AtomicBool,
+}
+impl Progress {
+    pub(super) fn enter(&self, phase: Phase) {
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    pub(super) fn children_finished(&self) {
+        self.children_finished.store(true, Ordering::Release);
+    }
+
+    // A timeout must not take user/registry locks just to describe stalled work.
+    pub(super) fn timeout_detail(&self, path: &str) -> String {
+        let phase = match self.phase.load(Ordering::Acquire) {
+            value if value == Phase::Admitted as u8 => "admitted",
+            value if value == Phase::MailboxDrain as u8 => "mailbox-drain",
+            value if value == Phase::StopHook as u8 => "stop-hook",
+            value if value == Phase::SchedulerRetirement as u8 => "scheduler-retirement",
+            value if value == Phase::ResourcesFinished as u8 => "resources-finished",
+            value if value == Phase::PolicyDisposal as u8 => "policy-disposal",
+            value if value == Phase::FactoryDisposal as u8 => "factory-disposal",
+            value if value == Phase::TerminationNotification as u8 => "termination-notification",
+            value if value == Phase::RegistryRemoval as u8 => "registry-removal",
+            _ => "finished",
+        };
+        let children = if self.children_finished.load(Ordering::Acquire) {
+            "finished"
+        } else {
+            "pending"
+        };
+        format!(
+            "actor {path} stop exceeded configured deadline (observed phase={phase}, children={children})"
+        )
+    }
+}
 
 pub(super) async fn join_until<F: Future>(
     work: F,

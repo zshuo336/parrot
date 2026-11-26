@@ -1709,24 +1709,32 @@ impl ThreadActorSystem {
                 let schedulers = self.scheduler_group.clone();
                 let timeout = self.config.shutdown_timeout;
                 let slots = self.cleanup_slots.clone();
+                let progress = Arc::new(super::stop_deadline::Progress::default());
                 self.retirement_runtime()
                     .spawn(parrot_api::trace::capture(async move {
                         let work = async {
                             let (children_result, result) = tokio::join!(
-                                children.join(),
-                                stop_actor_resources(
+                                async {
+                                    let result = children.join().await;
+                                    progress.children_finished();
+                                    result
+                                },
+                                stop_actor_resources_tracked(
                                     &path,
                                     mailbox.clone(),
                                     mode,
                                     schedulers,
                                     slots,
-                                    deadline
+                                    deadline,
+                                    progress.clone(),
                                 )
                             );
+                            progress.enter(super::stop_deadline::Phase::PolicyDisposal);
                             let policy_disposal = lifetime
                                 .dispose_policy()
                                 .await
                                 .map_err(SystemError::policy_disposal);
+                            progress.enter(super::stop_deadline::Phase::FactoryDisposal);
                             let factory_disposal = match factory {
                                 Some(factory) => factory.dispose().await,
                                 None => Ok(()),
@@ -1760,6 +1768,7 @@ impl ThreadActorSystem {
                                 path: path.clone(),
                                 reason: reason.clone(),
                             };
+                            progress.enter(super::stop_deadline::Phase::TerminationNotification);
                             let (_, notified) = tokio::join!(
                                 watches.common.terminated(
                                     event,
@@ -1774,6 +1783,7 @@ impl ThreadActorSystem {
                                         .saturating_duration_since(tokio::time::Instant::now())
                                 )
                             );
+                            progress.enter(super::stop_deadline::Phase::RegistryRemoval);
                             {
                                 let mut registry = registry.write().unwrap();
                                 if registry
@@ -1784,15 +1794,14 @@ impl ThreadActorSystem {
                                     registry.remove(&path);
                                 }
                             }
+                            progress.enter(super::stop_deadline::Phase::Finished);
                             result.and(notified)
                         };
                         let (result, timed_out) =
                             super::stop_deadline::join_until(work, deadline, || {
                                 crate::owned_payload::publish_watch(
                                     &sender,
-                                    StopOutcome::TimedOut(format!(
-                                        "actor {path} stop exceeded configured deadline"
-                                    )),
+                                    StopOutcome::TimedOut(progress.timeout_detail(&path)),
                                 );
                             })
                             .await;
@@ -2086,11 +2095,33 @@ pub(crate) async fn stop_actor_resources(
     slots: Arc<tokio::sync::Semaphore>,
     deadline: tokio::time::Instant,
 ) -> Result<(), SystemError> {
+    stop_actor_resources_tracked(
+        path,
+        mailbox,
+        mode,
+        schedulers,
+        slots,
+        deadline,
+        Arc::new(super::stop_deadline::Progress::default()),
+    )
+    .await
+}
+
+async fn stop_actor_resources_tracked(
+    path: &str,
+    mailbox: Arc<dyn Mailbox>,
+    mode: SchedulingMode,
+    schedulers: Arc<SchedulerGroup>,
+    slots: Arc<tokio::sync::Semaphore>,
+    deadline: tokio::time::Instant,
+    progress: Arc<super::stop_deadline::Progress>,
+) -> Result<(), SystemError> {
     mailbox.seal();
     let processor = mailbox.get_processor();
     if let Some(processor) = &processor {
         processor.cancel_context_tasks();
     }
+    progress.enter(super::stop_deadline::Phase::MailboxDrain);
     let mut drained = drain_mailbox(mailbox, slots.clone());
     let drain = tokio::select! {
         biased;
@@ -2102,6 +2133,7 @@ pub(crate) async fn stop_actor_resources(
             Err(SystemError::Timeout(format!("actor {path} mailbox disposal exceeded deadline")))
         }
     };
+    progress.enter(super::stop_deadline::Phase::StopHook);
     let stopped = match (&processor, drain) {
         (Some(processor), Ok(())) => tokio::time::timeout_at(
             deadline,
@@ -2115,6 +2147,7 @@ pub(crate) async fn stop_actor_resources(
         }),
         (_, result) => result,
     };
+    progress.enter(super::stop_deadline::Phase::SchedulerRetirement);
     let retired = if let Some(processor) = processor {
         schedulers
             .retire_actor(path, &mode, processor, slots, deadline)
@@ -2127,6 +2160,7 @@ pub(crate) async fn stop_actor_resources(
         let _ = sharded.deschedule(path);
     }
     // A destructor panic is material even when an earlier hook also failed.
+    progress.enter(super::stop_deadline::Phase::ResourcesFinished);
     retired.and(stopped)
 }
 
