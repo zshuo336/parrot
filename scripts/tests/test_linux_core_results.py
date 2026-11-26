@@ -44,7 +44,8 @@ class SummaryContracts(unittest.TestCase):
         for label in ('input-before', 'execution-input-before', 'execution-input-after', 'input-after'):
             self.write(label + '.log', json.dumps({'status': 'ok', 'files': 1, 'action': 'verify'}))
         self.write('api-library.log', binary('library', 178, self.target))
-        self.write('doctest.log', 'test result: ok. 24 passed; 0 failed; 0 ignored;\n')
+        self.write('doctest.log', 'test result: ok. 24 passed; 0 failed; 0 ignored; '
+                                 '0 measured; 0 filtered out; finished in 0.01s\n')
         self.assertTrue(self.result()['passed'])
 
     def write(self, name, content):
@@ -84,6 +85,13 @@ class SummaryContracts(unittest.TestCase):
         path = self.root / 'doctest.log'
         self.write(path.name, 'test result: FAILED. 0 passed; 1 failed; 0 ignored;\n' + path.read_text())
         self.assertIn('missing or unexpected doctest result', self.result()['errors'])
+
+    def test_doctests_must_report_a_complete_unfiltered_run(self):
+        prefix = 'test result: ok. 24 passed; 0 failed; 0 ignored;'
+        for suffix in ('', ' 0 measured; 1 filtered out;', ' 1 measured; 0 filtered out;'):
+            with self.subTest(suffix=suffix):
+                self.write('doctest.log', prefix + suffix + '\n')
+                self.assertIn('missing or unexpected doctest result', self.result()['errors'])
 
     def test_filtered_and_interleaved_children_do_not_replace_parent_result(self):
         path = self.root / 'debug-default.log'

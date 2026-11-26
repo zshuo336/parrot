@@ -61,6 +61,7 @@ BINARIES = {
     'test_local_stream_retirement': 4,
 }
 RUNNING = re.compile(r'^\s+Running (unittests src/lib\.rs|tests/([^ ]+)\.rs) \(([^)]+)\)$')
+# Archived validation drivers import this three-count prefix to summarize their logs.
 RESULT = re.compile(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;')
 FULL_RESULT = re.compile(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;')
 ANNOUNCED = re.compile(r'^running (\d+) tests?$')
@@ -181,10 +182,10 @@ def summarize(root, manifest_path):
     if api != {'library': {'passed': 178, 'failed': 0, 'ignored': 0}}:
         errors.append('missing or unexpected API library result')
     doctest_path = root / 'doctest.log'
-    doctests = [tuple(map(int, match.groups())) if (match := RESULT.match(line)) else None
+    doctests = [match.groups() if (match := FULL_RESULT.match(line)) else None
                 for line in doctest_path.read_text().splitlines()
                 if line.startswith('test result: ')] if doctest_path.exists() else []
-    if doctests != [(24, 0, 0)]:
+    if doctests != [('ok', '24', '0', '0', '0', '0')]:
         errors.append('missing or unexpected doctest result')
     return {
         'passed': not errors, 'input_count': input_count, 'manifest_sha256': digest,
