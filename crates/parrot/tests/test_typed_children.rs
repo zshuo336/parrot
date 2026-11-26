@@ -232,7 +232,12 @@ async fn sharded_typed_root_recursively_retires_its_live_subtree() {
     recursive_retirement(sharded_system(), Some(("parrot-shard-", 1))).await;
 }
 
-fn native_tree_host_exit(name: &str, mode: parrot::thread::config::SchedulingMode, prefix: &str) {
+fn native_tree_host_exit(
+    name: &str,
+    mode: parrot::thread::config::SchedulingMode,
+    prefix: &str,
+    factory_tree: bool,
+) {
     isolated::run(
         name,
         "PARROT_NATIVE_TREE_HOST_EXIT",
@@ -246,6 +251,7 @@ fn native_tree_host_exit(name: &str, mode: parrot::thread::config::SchedulingMod
             };
             let host = runtime();
             let stats = Arc::new(Stats::default());
+            let factory_drops = Arc::new(AtomicUsize::new(0));
             let (system, actors, paths) = host.block_on(async {
                 let system = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
                     default_scheduling_mode: mode,
@@ -253,12 +259,45 @@ fn native_tree_host_exit(name: &str, mode: parrot::thread::config::SchedulingMod
                     shared_burst_workers_max: 0,
                     ..Default::default()
                 });
-                let root = system
-                    .spawn_typed::<_, Op>(Family::new(stats.clone(), 0), "/host-tree")
-                    .await
-                    .unwrap();
-                let branch = child(&root, 0).await;
-                let leaf = child(&branch, 0).await;
+                let (root, branch, leaf) = if factory_tree {
+                    struct Capture(Arc<AtomicUsize>);
+                    impl Drop for Capture {
+                        fn drop(&mut self) {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    let factory = || {
+                        let capture = Capture(factory_drops.clone());
+                        let stats = stats.clone();
+                        move || {
+                            let _ = &capture;
+                            Family::new(stats.clone(), 0)
+                        }
+                    };
+                    let root = system
+                        .spawn_typed_factory::<_, Op, _>(factory(), "/host-tree")
+                        .await
+                        .unwrap();
+                    let branch = context(&root)
+                        .await
+                        .spawn_typed_child_factory::<_, Op, _>(factory())
+                        .await
+                        .unwrap();
+                    let leaf = context(&branch)
+                        .await
+                        .spawn_typed_child_factory::<_, Op, _>(factory())
+                        .await
+                        .unwrap();
+                    (root, branch, leaf)
+                } else {
+                    let root = system
+                        .spawn_typed::<_, Op>(Family::new(stats.clone(), 0), "/host-tree")
+                        .await
+                        .unwrap();
+                    let branch = child(&root, 0).await;
+                    let leaf = child(&branch, 0).await;
+                    (root, branch, leaf)
+                };
                 let (root_path, parent, children) = info(&root).await;
                 assert!(parent.is_none());
                 assert_eq!(children, 1);
@@ -280,6 +319,7 @@ fn native_tree_host_exit(name: &str, mode: parrot::thread::config::SchedulingMod
                     [root_path, branch_path, leaf_path],
                 )
             });
+            assert_eq!(factory_drops.load(Ordering::SeqCst), 0);
             drop(host);
             runtime().block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -305,6 +345,7 @@ fn native_tree_host_exit(name: &str, mode: parrot::thread::config::SchedulingMod
                 .expect("original host exit must retire the live native subtree");
                 assert_eq!(system.actor_count(), 0);
                 assert_eq!(stats.drops.load(Ordering::SeqCst), 3);
+                assert_eq!(factory_drops.load(Ordering::SeqCst), if factory_tree { 3 } else { 0 });
                 for path in paths {
                     assert_eq!(
                         stats
@@ -333,6 +374,7 @@ fn dedicated_typed_subtree_retires_after_host_exit_with_live_references() {
         "dedicated_typed_subtree_retires_after_host_exit_with_live_references",
         parrot::thread::config::SchedulingMode::DedicatedThread,
         "parrot-dedicated-",
+        false,
     );
 }
 
@@ -344,6 +386,29 @@ fn sharded_typed_subtree_retires_after_host_exit_with_live_references() {
             affinity_key: "host-tree".into(),
         },
         "parrot-shard-",
+        false,
+    );
+}
+
+#[test]
+fn dedicated_factory_subtree_retires_after_host_exit_with_live_references() {
+    native_tree_host_exit(
+        "dedicated_factory_subtree_retires_after_host_exit_with_live_references",
+        parrot::thread::config::SchedulingMode::DedicatedThread,
+        "parrot-dedicated-",
+        true,
+    );
+}
+
+#[test]
+fn sharded_factory_subtree_retires_after_host_exit_with_live_references() {
+    native_tree_host_exit(
+        "sharded_factory_subtree_retires_after_host_exit_with_live_references",
+        parrot::thread::config::SchedulingMode::Sharded {
+            affinity_key: "host-tree".into(),
+        },
+        "parrot-shard-",
+        true,
     );
 }
 
