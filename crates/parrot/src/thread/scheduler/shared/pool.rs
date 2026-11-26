@@ -716,6 +716,10 @@ impl SharedThreadPool {
 
     /// Deschedule an actor from the thread pool
     pub async fn deschedule(&self, path: &str) -> Result<(), SystemError> {
+        self.deschedule_now(path)
+    }
+
+    fn deschedule_now(&self, path: &str) -> Result<(), SystemError> {
         let removed = {
             let mut paths = self.scheduled_paths.lock().unwrap();
             paths.remove(path)
@@ -932,15 +936,11 @@ impl ThreadScheduler for SharedThreadPool {
         mailbox: Arc<dyn Mailbox>,
         config: Option<ThreadActorConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.runtime_handle
-            .block_on(async { self.schedule(path, mailbox, config).await })
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        Ok(self.schedule_now(path, mailbox, config)?)
     }
 
     fn deschedule(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.runtime_handle
-            .block_on(async { self.deschedule(path).await })
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        Ok(self.deschedule_now(path)?)
     }
 
     fn is_scheduled(&self, path: &str) -> bool {
@@ -1023,6 +1023,29 @@ mod tests {
             }),
             tokio::runtime::Handle::current(),
         )
+    }
+
+    #[tokio::test]
+    async fn synchronous_registration_from_runtime_preserves_path_and_errors() {
+        let pool = make_pool(1);
+        let scheduler: &dyn ThreadScheduler = &pool;
+        let path = "/sync/registration";
+        let mailbox = build_mailbox(path);
+        scheduler.schedule(path, mailbox.clone(), None).unwrap();
+        assert!(scheduler.is_scheduled(path));
+        let duplicate = scheduler.schedule(path, mailbox, None).unwrap_err();
+        assert!(matches!(
+            duplicate.downcast_ref::<SystemError>(),
+            Some(SystemError::RegistrationError(_))
+        ));
+        scheduler.deschedule(path).unwrap();
+        assert!(!scheduler.is_scheduled(path));
+        let missing = scheduler.deschedule(path).unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<SystemError>(),
+            Some(SystemError::ActorNotFound(missing_path)) if missing_path == path
+        ));
+        pool.shutdown(5000).await.unwrap();
     }
 
     #[tokio::test]
