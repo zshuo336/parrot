@@ -14,6 +14,17 @@ SPEC.loader.exec_module(tracker)
 
 
 class TaskDetails(unittest.TestCase):
+    def test_expected_nonzero_controls_and_timeouts_have_distinct_results(self):
+        stages = [
+            dict(name="historical control", exit_code=1, expected_exit_code=1),
+            dict(name="standard control", code=101, expected_code=101),
+            dict(name="unexpected success", exit_code=0, expected_exit_code=1),
+            dict(name="unexpected failure", exit_code=1),
+            dict(name="timed out", exit_code=1, expected_exit_code=1, timed_out=True),
+        ]
+        self.assertEqual(tracker.failed_stage_names(stages),
+                         ["unexpected success", "unexpected failure", "timed out"])
+
     def test_completed_additions_stay_with_their_task_in_source_order(self):
         body = ("状态：进行中\n剩余人日：1-2\n依赖：无\n已做：原始进展\n"
                 "待做：复验\n验收：全部通过\n证据：无\n")

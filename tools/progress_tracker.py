@@ -38,6 +38,16 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest() if hasattr(hashlib, "file_digest") else hashlib.sha256(stream.read()).hexdigest()
 
 
+def failed_stage_names(stages):
+    failed = []
+    for stage in stages:
+        actual = stage.get("exit_code", stage.get("code"))
+        expected = stage.get("expected_code", stage.get("expected_exit_code", 0))
+        if stage.get("timed_out") or (actual is not None and actual != expected):
+            failed.append(stage.get("name", "未命名阶段"))
+    return failed
+
+
 def within(root, relative):
     root = Path(root).resolve()
     if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
@@ -227,10 +237,7 @@ def load_state(root):
             stages = raw.get("stages", [])
             if not isinstance(stages, list) or any(not isinstance(stage, dict) for stage in stages):
                 raise ValueError(identity + " 报告stages须为对象数组")
-            for stage in stages:
-                code = stage.get("exit_code", stage.get("code"))
-                if stage.get("timed_out") or (code is not None and code != stage.get("expected_code", 0)):
-                    batch["failed_stages"].append(stage.get("name", "未命名阶段"))
+            batch["failed_stages"] = failed_stage_names(stages)
             checks = raw.get("checks", [])
             batch["check_count"] = checks if type(checks) is int else len(checks) if isinstance(checks, list) else 0
         else:
