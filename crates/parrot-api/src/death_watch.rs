@@ -114,11 +114,18 @@ impl DeathWatch {
         {
             return Err(ActorError::Stopped);
         }
-        if target_state.incoming.contains_key(&watcher.id()) {
+        // Detaching a watcher removes its outgoing entry before unlinking the
+        // peer. A concurrent registration must replace that one-sided edge.
+        let incoming = target_state.incoming.get(&watcher.id());
+        let outgoing = watcher_state.outgoing.get(&self.id());
+        if incoming
+            .zip(outgoing)
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+        {
             return Ok(());
         }
-        if target_state.incoming.len() >= self.0.limit
-            || watcher_state.outgoing.len() >= watcher.0.limit
+        if (incoming.is_none() && target_state.incoming.len() >= self.0.limit)
+            || (outgoing.is_none() && watcher_state.outgoing.len() >= watcher.0.limit)
         {
             return Err(ActorError::InternalError(
                 "death-watch subscription limit reached".into(),
@@ -241,6 +248,9 @@ impl DeathWatch {
                 };
                 let result = async {
                     let mut cancelled = guard.0.cancel.subscribe();
+                    // Calling deliver may synchronously admit the event. Skip
+                    // subscriptions already cancelled before this dispatch.
+                    if *cancelled.borrow() { return Ok(()); }
                     let Some(watcher) = guard.0.watcher.upgrade() else { return Ok(()); };
                     let Some(endpoint) = watcher.endpoint.get().cloned() else { return Ok(()); };
                     let mut endpoint = RecipientInput::new(endpoint, &failure, "recipient");
@@ -293,6 +303,7 @@ struct DeliveryFailure<'a> {
     target: &'a Inner,
     recorded: AtomicBool,
 }
+
 impl DeliveryFailure<'_> {
     fn record(&self) {
         if !self.recorded.swap(true, Ordering::Relaxed) {
@@ -418,6 +429,9 @@ impl Drop for Inner {
         }
     }
 }
+
+#[cfg(test)]
+mod registration_contracts;
 
 #[cfg(test)]
 mod tests {
