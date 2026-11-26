@@ -519,8 +519,12 @@ class Suite:
         require(actual_port != blocked_port, "app claimed the occupied port")
         stats = self.ready(app, actual_port, gateways)
         require(stats["docs"] == stats["terms"] == stats["postings"] == 0, f"empty index: {stats}")
-        require("暂无索引" in text_at(actual_port, "/docs"), "empty docs not rendered")
-        require("暂无词条" in text_at(actual_port, "/terms"), "empty terms not rendered")
+        docs = text_at(actual_port, "/docs")
+        terms = text_at(actual_port, "/terms")
+        require("共 0 个站点 · 0 个页面" in docs and "暂无" in docs
+                and "<td class=\"n\">" not in docs, "expected zero hosts, zero documents and an empty table")
+        require("共 0 个词条" in terms and "暂无" in terms
+                and 'href="/search?q=' not in terms, "expected zero terms and no term search links")
         require(results(actual_port, self.token)[0] == [], "empty index returned results")
         self.corpus.assert_requests(expected_requests)
         self.passed_case("late JVM readiness, owned port collision and empty index business responses")

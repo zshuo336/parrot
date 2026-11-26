@@ -1,4 +1,4 @@
-//! websearch：真实搜索引擎应用（五运行时分工——同 crawler-lab 原则）。
+//! websearch：由四个运行时协作的网页搜索应用。
 //!
 //! 用户四诉求（真实化）：
 //!   1. 真实网页漫爬（reqwest HTTPS + seed URL + BFS + robots 礼貌策略）
@@ -6,7 +6,7 @@
 //!   3. 四服务独立（erl frontier / rust crawler / ray 分词索引 / akka 检索）
 //!   4. 浏览器百度式查询页（本进程内置 HTTP → akka Search）
 //!
-//! 五运行时分工：
+//! 四个运行时各自负责：
 //!   Erlang  frontier   URL 去重 + BFS 调度（ETS 有序表——调度天生形态）
 //!   Rust    crawler    tokio 并发真实抓取 + HTML 抽链/抽文 + 编排 + Web 页
 //!   Ray     tokenizer  jieba 中文分词 + 词频（CPU 密集）
@@ -1174,20 +1174,19 @@ async fn serve_web(
                 match path.as_str() {
                     "/search" => {
                         let q = params.get("q").cloned().unwrap_or_default();
-                        // The UI exposes ten pages, with at most 100 ranked hits.
-                        // Clamp before arithmetic (p=0 used to underflow).
+                        // Fetch the bounded result window once so navigation
+                        // reflects actual hits, including sparse final pages.
                         let p = params
                             .get("p")
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(1)
-                            .clamp(1, 10) as usize;
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(1);
                         if q.is_empty() {
                             let _ = sock.write_all(&redirect_home()).await;
                             return;
                         }
                         qc.fetch_add(1, Ordering::Relaxed);
-                        let per_page = 10usize;
-                        let k = (p * per_page) as u32;
+                        let per_page = SEARCH_PAGE_SIZE;
+                        let k = MAX_SEARCH_RESULTS as u32;
                         let items = match searcher
                             .send(Box::new(WsSearch(enc_search(k, &q))))
                             .await
@@ -1203,13 +1202,12 @@ async fn serve_web(
                                 return;
                             }
                         };
-                        let page_items: Vec<_> = items
+                        let hits: Vec<_> = items
                             .into_iter()
                             .map(|hit| (hit.score, hit.url, hit.title, hit.snippet))
-                            .skip((p - 1) * per_page)
-                            .take(per_page)
+                            .take(MAX_SEARCH_RESULTS)
                             .collect();
-                        let html = render_results(&q, &page_items, p, per_page);
+                        let html = render_results(&q, &hits, p, per_page);
                         let _ = sock
                             .write_all(&http_resp(200, "text/html; charset=utf-8", &html))
                             .await;
@@ -1344,27 +1342,50 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+const SEARCH_PAGE_SIZE: usize = 10;
+const MAX_SEARCH_RESULTS: usize = 100;
+
 const PAGE_CSS: &str = r#"
+*{box-sizing:border-box}
 body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;color:#222}
-.hd{padding:20px 28px;border-bottom:1px solid #eee;display:flex;gap:14px;align-items:center}
+.hd{padding:16px 28px;border-bottom:1px solid #eee;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto auto;gap:14px;align-items:center}
 .logo{font-size:23px;font-weight:700;color:#2932E1;white-space:nowrap}
-form{flex:1;display:flex;gap:8px}
-input[type=text]{flex:1;max-width:600px;padding:10px 16px;border:2px solid #2932E1;
-  border-radius:22px;font-size:16px;outline:none}
-button{padding:10px 24px;background:#2932E1;color:#fff;border:0;border-radius:22px;
-  font-size:16px;cursor:pointer}
+form{min-width:0;max-width:740px;display:flex;gap:8px}
+input[type=text]{min-width:0;width:100%;flex:1;padding:10px 14px;border:2px solid #2932E1;
+  border-radius:8px;font-size:16px;outline:none}
+input[type=text]:focus-visible{outline:2px solid #bcc5ff;outline-offset:2px}
+button{flex:none;padding:10px 20px;background:#2932E1;color:#fff;border:0;border-radius:8px;
+  font-size:16px;cursor:pointer;min-height:44px}
 button:hover{background:#1d24b8}
 .bd{max-width:740px;margin:24px auto;padding:0 18px}
 .meta{color:#9195A3;font-size:13px;margin-bottom:18px}
-.item{margin-bottom:24px}
+.item{margin-bottom:24px;overflow-wrap:anywhere}
 .t a{color:#2440B3;font-size:18px;text-decoration:none}
 .t a:hover{text-decoration:underline}
 .u{color:#008000;font-size:13px;margin:2px 0;word-break:break-all}
 .s{color:#444;font-size:14px;line-height:1.7}
-.bar{margin-top:30px;text-align:center}
-.bar a,.bar b{color:#2932E1;margin:0 8px}
+.bar{margin-top:30px;display:flex;justify-content:center;gap:8px;flex-wrap:wrap}
+.bar a,.bar [aria-current]{color:#2932E1;min-width:32px;min-height:40px;display:inline-flex;align-items:center;justify-content:center}
+.bar [aria-current]{font-weight:700;text-decoration:underline}
 .empty{color:#666;text-align:center;margin:70px 0;font-size:15px}
-.stats{font-size:13px;color:#9195A3;white-space:nowrap}
+.stats{font-size:12px;color:#666;width:14em;min-height:2.8em;display:flex;align-items:center;overflow-wrap:anywhere}
+.home{text-align:center;margin:64px 0}
+.home h1{font-size:26px;margin:0 0 24px}
+.home a{color:#2932E1;margin:0 8px}
+.table-wrap{max-width:100%;overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:10px 8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+th{color:#666;font-weight:500;white-space:nowrap}
+.n{font-variant-numeric:tabular-nums;white-space:nowrap}
+@media(max-width:767px){
+  .hd{padding:12px 16px;grid-template-columns:minmax(0,1fr) auto auto;gap:10px}
+  .logo{font-size:20px}
+  form{grid-column:1/-1;grid-row:2}
+  .stats{grid-column:1/-1;grid-row:3;width:100%;min-height:1.4em}
+  .bd{margin:20px auto;padding:0 16px}
+  button{padding:10px 16px}
+  .home{margin:40px 0}
+}
 "#;
 
 fn page_shell(q: &str, body: &str) -> String {
@@ -1374,15 +1395,16 @@ fn page_shell(q: &str, body: &str) -> String {
         format!("{q} · WebSearch")
     };
     format!(
-        r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>{}</title><style>{PAGE_CSS}</style></head><body>
-<div class="hd"><a href="/" class="logo" style="text-decoration:none">🔍 WebSearch</a>
+        r#"<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{}</title><style>{PAGE_CSS}</style></head><body>
+<header class="hd"><a href="/" class="logo" style="text-decoration:none">🔍 WebSearch</a>
 <form action="/search" method="get">
-<input type="text" name="q" value="{}" placeholder="输入关键词，回车搜索…" autofocus>
-<button>搜一下</button></form><a href="/docs" style="font-size:13px;color:#2932E1;white-space:nowrap">站点</a><a href="/terms" style="font-size:13px;color:#2932E1;white-space:nowrap">分词表</a><span class="stats" id="st"></span></div>
-<div class="bd">{}</div>
-<script>setInterval(async()=>{{try{{const r=await fetch('/stats');const j=await r.json();
+<input type="text" name="q" value="{}" aria-label="搜索关键词" placeholder="搜索网页" autofocus>
+<button type="submit">搜索</button></form><a href="/docs" style="font-size:13px;color:#2932E1;white-space:nowrap">站点</a><a href="/terms" style="font-size:13px;color:#2932E1;white-space:nowrap">分词表</a><span class="stats" id="st" aria-live="polite"></span></header>
+<main class="bd">{}</main>
+<script>async function updateStats(){{try{{const r=await fetch('/stats');if(!r.ok)return;const j=await r.json();
 const e=document.getElementById('st');
-if(e&&j.docs)e.textContent=`已索引 ${{j.docs}} 页 · ${{j.terms}} 词项`;}}catch(_){{}}}},5000)</script>
+if(e&&typeof j.docs==='number'&&typeof j.terms==='number')e.textContent=`已索引 ${{j.docs}} 页 · ${{j.terms}} 词项`;}}catch(_){{}}}}
+updateStats();setInterval(updateStats,5000)</script>
 </body></html>"#,
         esc(&title),
         esc(q),
@@ -1393,11 +1415,8 @@ if(e&&j.docs)e.textContent=`已索引 ${{j.docs}} 页 · ${{j.terms}} 词项`;}}
 fn render_home() -> String {
     page_shell(
         "",
-        r#"<div class="empty" style="margin-top:120px;font-size:17px">五运行时真实搜索引擎<br>
-<span style="font-size:13px;color:#9195A3">Erlang Frontier · Rust Crawler · Ray jieba 分词 · Akka BM25 检索</span></div>
-<div style="text-align:center;margin-top:28px;font-size:14px">
-<a href="/docs" style="color:#2932E1">📋 已索引站点</a> ·
-<a href="/terms" style="color:#2932E1">📖 分词表</a></div>"#,
+        r#"<div class="home"><h1>WebSearch</h1>
+<a href="/docs">已索引站点</a><a href="/terms">分词表</a></div>"#,
     )
 }
 
@@ -1418,7 +1437,7 @@ fn render_docs_page(data: &DocumentPage) -> String {
         ));
     }
     if rows.is_empty() {
-        rows = r#"<tr><td colspan="4" style="text-align:center;color:#999;padding:40px">暂无索引——先跑一次爬取（run.sh）</td></tr>"#.into();
+        rows = r#"<tr><td colspan="4" style="text-align:center;color:#999;padding:40px">暂无已索引站点</td></tr>"#.into();
     }
     let nav = pager_nav("/docs", page, last_page);
     page_shell(
@@ -1426,9 +1445,9 @@ fn render_docs_page(data: &DocumentPage) -> String {
         &format!(
             r#"<h2 style="font-size:20px;margin:10px 0 4px">已索引站点</h2>
 <div class="meta">共 {hosts_total} 个站点 · {docs_total} 个页面（按页面数降序）</div>
-<table style="width:100%;border-collapse:collapse;font-size:14px">
+<div class="table-wrap"><table>
 <tr style="color:#9195A3;text-align:left"><th style="padding:8px">#</th><th>站点</th><th>页面数</th><th>样例 URL</th></tr>
-{rows}</table>{nav}"#
+{rows}</table></div>{nav}"#
         ),
     )
 }
@@ -1451,7 +1470,7 @@ fn render_terms_page(data: &TermPage) -> String {
         ));
     }
     if rows.is_empty() {
-        rows = r#"<tr><td colspan="4" style="text-align:center;color:#999;padding:40px">暂无词条——先跑一次爬取</td></tr>"#.into();
+        rows = r#"<tr><td colspan="4" style="text-align:center;color:#999;padding:40px">暂无词条</td></tr>"#.into();
     }
     let nav = pager_nav("/terms", page, last_page);
     page_shell(
@@ -1459,9 +1478,9 @@ fn render_terms_page(data: &TermPage) -> String {
         &format!(
             r#"<h2 style="font-size:20px;margin:10px 0 4px">分词表</h2>
 <div class="meta">共 {total} 个词条（jieba 切出 · 按文档频率 df 降序——点词条直接搜索）</div>
-<table style="width:100%;border-collapse:collapse;font-size:14px">
+<div class="table-wrap"><table>
 <tr style="color:#9195A3;text-align:left"><th style="padding:8px">#</th><th>词条</th><th>df</th><th></th></tr>
-{rows}</table>{nav}"#
+{rows}</table></div>{nav}"#
         ),
     )
 }
@@ -1496,8 +1515,14 @@ fn render_results(
     page: usize,
     per_page: usize,
 ) -> String {
+    let total = items.len().min(MAX_SEARCH_RESULTS);
+    let last_page = total.div_ceil(per_page).max(1);
+    let page = page.clamp(1, last_page);
     let rows: String = items
         .iter()
+        .take(total)
+        .skip((page - 1) * per_page)
+        .take(per_page)
         .map(|(score, url, title, snippet)| {
             let title = if title.is_empty() { url } else { title };
             let snip = highlight(snippet, q);
@@ -1515,24 +1540,27 @@ fn render_results(
     } else {
         ""
     };
-    let max_p = 10;
-    let nav: String = (1..=max_p)
+    let nav: String = (1..=last_page)
+        .filter(|_| last_page > 1)
         .map(|p| {
             if p == page {
-                format!("<b>[{p}]</b>")
+                format!(r#"<span aria-current="page">{p}</span>"#)
             } else {
                 let eq = urlencode(q);
-                format!(r#"<a href="/search?q={eq}&p={p}">[{p}]</a>"#)
+                format!(r#"<a href="/search?q={eq}&p={p}" aria-label="第 {p} 页">{p}</a>"#)
             }
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let _ = per_page;
+    let summary = if total == MAX_SEARCH_RESULTS {
+        format!("前 {total} 条匹配结果")
+    } else {
+        format!("找到 {total} 条结果")
+    };
     page_shell(
         q,
         &format!(
-            r#"<div class="meta">找到约 {} 条结果</div>{empty}{rows}<div class="bar">{nav}</div>"#,
-            items.len()
+            r#"<div class="meta">{summary}</div>{empty}{rows}<nav class="bar" aria-label="搜索结果分页">{nav}</nav>"#,
         ),
     )
 }
@@ -1600,6 +1628,9 @@ fn highlight(text: &str, query: &str) -> String {
 
 #[cfg(test)]
 mod json_tests;
+
+#[cfg(test)]
+mod pagination_tests;
 
 #[cfg(test)]
 #[path = "../../test_support/reply_peer.rs"]

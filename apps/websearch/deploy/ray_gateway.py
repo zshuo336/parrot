@@ -11,7 +11,7 @@ signal.signal(signal.SIGTERM, terminate)
 try:
     serve(0, ray_kwargs={'address': 'local', 'num_cpus': 2, 'include_dashboard': False,
                          'log_to_driver': False, '_temp_dir': sys.argv[1]},
-          parrot_addr=sys.argv[2] or None)
+          parrot_addr=sys.argv[2] or None, owned_workers=True)
 except KeyboardInterrupt:
     pass
 finally:

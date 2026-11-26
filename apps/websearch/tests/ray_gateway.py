@@ -23,6 +23,7 @@ try:
             "_temp_dir": sys.argv[2],
         },
         parrot_addr=sys.argv[3] if len(sys.argv) > 3 else None,
+        owned_workers=True,
     )
 except KeyboardInterrupt:
     pass

@@ -1,6 +1,6 @@
 /** websearch 检索服务（akka 方言——用户查询 Web 入口）。
   *
-  * 五运行时分工（用户裁定）：本组件 = 检索/用户查询侧——
+  * Akka 组件负责索引与查询：
   *   - jieba-analysis 中文分词（查询切词——与 ray jieba / rust jieba-rs 同族）
   *   - 倒排索引 + BM25 打分（k1=1.2 b=0.75）
   *   - 完整快照（data/index/seg-*.segment——Flush确认后恢复最新快照）

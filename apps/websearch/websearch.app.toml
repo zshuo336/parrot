@@ -1,4 +1,4 @@
-# websearch.app.toml —— 真实搜索引擎应用（五运行时全分工）
+# websearch.app.toml —— 四个运行时协作的网页搜索应用
 #
 # 与 crawler-lab（合成测试）同族架构，但面向真实互联网：
 #   frontier(erl)  真实 URL 去重 + BFS 调度（ETS 有序表）
