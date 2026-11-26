@@ -551,14 +551,22 @@ where
         } else {
             actor_ctx.idle.enter()
         };
-        if !message.envelope.payload.is::<crate::streams::StreamEvent>()
-            && !message
+        // Framework lifecycle messages always use their own async dispatch.
+        // For ordinary messages the selector is user code, just like the handler.
+        let async_handler = if message.envelope.payload.is::<crate::streams::StreamEvent>()
+            || message
                 .envelope
                 .payload
                 .is::<crate::children::ChildTerminated>()
-            && !inner.use_async_handler()
         {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Ok(true)
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parrot_api::trace::in_scope(trace_context.clone(), || inner.use_async_handler())
+            }))
+        };
+        if !matches!(async_handler, Ok(true)) {
+            let invoke_sync = || {
                 parrot_api::trace::in_scope(trace_context.clone(), || {
                     let recording = parrot_api::trace::SpanGuard::current(
                         parrot_api::trace::SpanKind::DynamicHandler,
@@ -594,7 +602,9 @@ where
                     ));
                     result
                 })
-            }));
+            };
+            let result = async_handler
+                .and_then(|_| std::panic::catch_unwind(std::panic::AssertUnwindSafe(invoke_sync)));
             let result = match result {
                 Ok(Some(result)) => result,
                 Ok(None) => return Box::pin(futures::future::ready(Some(Err(ActorError::MessageHandlingError("Message not handled: the sync engine handler (handle_message_engine) returned None for this message type. Handle it there, or opt the actor into the async dispatch path with #[ParrotActor(async_handler = true)] / use_async_handler() == true.".into())))).into_actor(self)),

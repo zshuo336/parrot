@@ -302,10 +302,15 @@ pub trait Actor: Send + 'static {
     ///   A `None` return reports an unhandled-message error; it does not retry
     ///   the consumed message through `receive_message`.
     /// - `true`: the Actix engine skips the sync probe entirely and routes
-    ///   every message through `receive_message`. The handler may `.await`
+    ///   ordinary messages through `receive_message`. The handler may `.await`
     ///   freely (real IO); the actor stays logically serial — subsequent
     ///   messages queue behind the in-flight one — while the arbiter thread
     ///   is released to poll other actors during the await.
+    ///
+    /// The dynamic Actix adapter calls this selector on the owning arbiter
+    /// with the message's trace context. A selector panic follows the actor's
+    /// message failure policy. Stream and child termination events use their
+    /// dedicated callbacks without consulting this selector.
     ///
     /// The thread engine always uses `receive_message`. Setting this to `true`
     /// selects the same business handler on both engines; scheduling and
