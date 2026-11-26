@@ -85,8 +85,39 @@ impl<T: Send + 'static, F: FnOnce(std::thread::Result<T>) + Send> PendingJoin
     }
 }
 
+type JoinTask = Box<dyn PendingJoin>;
+
+fn complete_join(job: JoinTask) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.finish())) {
+        let message = crate::owned_payload::panic_message(payload);
+        diagnostic(|| tracing::error!(error = %message, "native join completion failed"));
+    }
+}
+
+/// The reserved worker can join under PID exhaustion. Keep the dispatcher
+/// available while that worker is in an OS join or a completion callback.
+fn dispatch_join(reserved: &mpsc::SyncSender<JoinTask>, job: JoinTask) -> Result<(), JoinTask> {
+    let job = match reserved.try_send(job) {
+        Ok(()) => return Ok(()),
+        Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => job,
+    };
+    // Hand off the job only after spawn succeeds. A failed spawn drops its
+    // closure on the caller and must not detach the original worker.
+    let (send, receive) = mpsc::sync_channel(1);
+    match std::thread::Builder::new()
+        .name("parrot-native-join".into())
+        .spawn(move || {
+            if let Ok(job) = receive.recv() {
+                complete_join(job);
+            }
+        }) {
+        Ok(_) => send.send(job).map_err(|error| error.0),
+        Err(_) => Err(job),
+    }
+}
+
 struct JoinFallback {
-    sender: mpsc::Sender<Box<dyn PendingJoin>>,
+    sender: mpsc::Sender<JoinTask>,
     _thread: std::thread::JoinHandle<()>,
 }
 
@@ -97,14 +128,30 @@ impl JoinFallback {
         if let Some(owner) = &*shared {
             return Ok(owner.clone());
         }
-        let (sender, receiver) = mpsc::channel::<Box<dyn PendingJoin>>();
+        let (reserved, work) = mpsc::sync_channel(0);
+        let reserved_worker = std::thread::Builder::new()
+            .name("parrot-native-join-reserved".into())
+            .spawn(move || {
+                while let Ok(job) = work.recv() {
+                    complete_join(job);
+                }
+            })
+            .map_err(|error| {
+                SystemError::ThreadSetupError(format!(
+                    "native join worker initialization failed: {error}"
+                ))
+            })?;
+        let (sender, receiver) = mpsc::channel::<JoinTask>();
         let thread = std::thread::Builder::new()
             .name("parrot-native-join-owner".into())
             .spawn(move || {
-                let mut pending: Vec<Box<dyn PendingJoin>> = Vec::new();
+                let _reserved_worker = reserved_worker;
+                let mut pending: Vec<JoinTask> = Vec::new();
                 loop {
                     let received = if pending.is_empty() {
-                        receiver.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                        receiver
+                            .recv()
+                            .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
                     } else {
                         receiver.recv_timeout(std::time::Duration::from_millis(1))
                     };
@@ -126,11 +173,9 @@ impl JoinFallback {
                             continue;
                         }
                         let job = pending.swap_remove(index);
-                        if let Err(payload) =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.finish()))
-                        {
-                            let message = crate::owned_payload::panic_message(payload);
-                            diagnostic(|| tracing::error!(error = %message, "native join completion failed"));
+                        if let Err(job) = dispatch_join(&reserved, job) {
+                            pending.push(job);
+                            break;
                         }
                     }
                 }
@@ -159,9 +204,8 @@ pub(super) fn join_runtime() -> Result<tokio::runtime::Handle, SystemError> {
         .map_err(|error| SystemError::ThreadSetupError(error.to_string()))
 }
 
-/// Transfer an already admitted native owner without allocating another OS
-/// thread. Production callers retain native reservations through this join;
-/// those process-wide reservations also bound the number of queued owners.
+/// Transfer an admitted owner to the process dispatcher. Its native reservation
+/// bounds queued and concurrent joins and remains held until the actual join.
 pub(crate) fn defer_join<T: Send + 'static>(
     thread: std::thread::JoinHandle<T>,
     finished: impl FnOnce(std::thread::Result<T>) + Send + 'static,

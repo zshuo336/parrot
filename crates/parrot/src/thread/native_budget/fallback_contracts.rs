@@ -94,3 +94,69 @@ fn panicking_completion_does_not_stop_later_joins() {
     });
     assert_eq!(observe_finished.recv_timeout(WAIT).unwrap(), 42);
 }
+
+#[test]
+fn a_worker_in_tls_drop_does_not_delay_an_exited_sibling_receipt() {
+    struct TlsGate(mpsc::Sender<()>, mpsc::Receiver<()>);
+    impl Drop for TlsGate {
+        fn drop(&mut self) {
+            self.0.send(()).unwrap();
+            self.1.recv_timeout(WAIT * 4).unwrap();
+        }
+    }
+    thread_local! {
+        static EXIT: std::cell::RefCell<Option<TlsGate>> = const { std::cell::RefCell::new(None) };
+    }
+    prepare_join_fallback().unwrap();
+    let budget = Arc::new(NativeWorkerBudget::with_capacity(2));
+    let first = budget.try_reserve().unwrap();
+    let second = budget.try_reserve().unwrap();
+    let (entered, in_tls) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let (first_done, first_receipt) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        EXIT.with(|slot| slot.replace(Some(TlsGate(entered, wait))));
+    });
+    in_tls.recv_timeout(WAIT).unwrap();
+    defer_join(worker, move |joined| {
+        joined.unwrap();
+        first.release_after_join();
+        first_done.send(()).unwrap();
+    });
+    let (second_done, second_receipt) = mpsc::channel();
+    let sibling = std::thread::spawn(|| 73);
+    defer_join(sibling, move |joined| {
+        second.release_after_join();
+        second_done.send(joined.unwrap()).unwrap();
+    });
+
+    let early = second_receipt.recv_timeout(WAIT);
+    let early_slot = budget.try_reserve().ok();
+    let recovered_one = early_slot.is_some() && budget.try_reserve().is_err();
+    assert!(matches!(
+        first_receipt.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release.send(()).unwrap();
+    first_receipt.recv_timeout(WAIT).unwrap();
+    let value = early
+        .as_ref()
+        .ok()
+        .copied()
+        .unwrap_or_else(|| second_receipt.recv_timeout(WAIT).unwrap());
+    assert_eq!(value, 73);
+    drop(early_slot);
+    let one = budget.try_reserve().unwrap();
+    let two = budget.try_reserve().unwrap();
+    one.release_after_join();
+    two.release_after_join();
+    assert_eq!(
+        early,
+        Ok(73),
+        "sibling joined only after unrelated TLS was released"
+    );
+    assert!(
+        recovered_one,
+        "only the exited sibling's slot should have returned"
+    );
+}
