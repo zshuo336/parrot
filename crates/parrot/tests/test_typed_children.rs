@@ -21,6 +21,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "support/isolated.rs"]
+mod isolated;
+
 type Ref = TypedActorRef<Family, Op>;
 enum Op {
     Info,
@@ -227,6 +230,121 @@ async fn dedicated_typed_root_recursively_retires_its_live_subtree() {
 #[tokio::test]
 async fn sharded_typed_root_recursively_retires_its_live_subtree() {
     recursive_retirement(sharded_system(), Some(("parrot-shard-", 1))).await;
+}
+
+fn native_tree_host_exit(name: &str, mode: parrot::thread::config::SchedulingMode, prefix: &str) {
+    isolated::run(
+        name,
+        "PARROT_NATIVE_TREE_HOST_EXIT",
+        Duration::from_secs(15),
+        || {
+            let runtime = || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            };
+            let host = runtime();
+            let stats = Arc::new(Stats::default());
+            let (system, actors, paths) = host.block_on(async {
+                let system = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
+                    default_scheduling_mode: mode,
+                    shared_pool_size: 1,
+                    shared_burst_workers_max: 0,
+                    ..Default::default()
+                });
+                let root = system
+                    .spawn_typed::<_, Op>(Family::new(stats.clone(), 0), "/host-tree")
+                    .await
+                    .unwrap();
+                let branch = child(&root, 0).await;
+                let leaf = child(&branch, 0).await;
+                let (root_path, parent, children) = info(&root).await;
+                assert!(parent.is_none());
+                assert_eq!(children, 1);
+                let (branch_path, parent, children) = info(&branch).await;
+                assert_eq!(parent.as_deref(), Some(root_path.as_str()));
+                assert_eq!(children, 1);
+                let (leaf_path, parent, children) = info(&leaf).await;
+                assert_eq!(parent.as_deref(), Some(branch_path.as_str()));
+                assert_eq!(children, 0);
+                let owners = stats.init_threads.lock().unwrap();
+                assert_eq!(owners.len(), 3);
+                assert!(
+                    owners.iter().all(|(_, thread)| thread.starts_with(prefix)),
+                    "{owners:?}"
+                );
+                (
+                    system,
+                    [root, branch, leaf],
+                    [root_path, branch_path, leaf_path],
+                )
+            });
+            drop(host);
+            runtime().block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    for actor in &actors {
+                        loop {
+                            use parrot_api::address::RetirementStatus;
+                            match actor.retirement_status() {
+                                RetirementStatus::Retired(outcome) => {
+                                    outcome.unwrap();
+                                    break;
+                                }
+                                RetirementStatus::Pending => tokio::task::yield_now().await,
+                                RetirementStatus::Unsupported => {
+                                    panic!("managed actor must expose retirement")
+                                }
+                            }
+                        }
+                        assert!(!actor.is_alive());
+                        assert!(actor.ask(Op::Info).await.is_err());
+                    }
+                })
+                .await
+                .expect("original host exit must retire the live native subtree");
+                assert_eq!(system.actor_count(), 0);
+                assert_eq!(stats.drops.load(Ordering::SeqCst), 3);
+                for path in paths {
+                    assert_eq!(
+                        stats
+                            .events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|(actor, event)| actor == &path && *event == "drop")
+                            .count(),
+                        1
+                    );
+                }
+                for _ in 0..2 {
+                    let result = system.shutdown_internal().await;
+                    assert!(matches!(result, Err(parrot::thread::error::SystemError::ShutdownError(ref text))
+                        if text == "1 shared cleanup failure(s): shared task unexpectedly cancelled"), "{result:?}");
+                }
+            });
+        },
+    );
+}
+
+#[test]
+fn dedicated_typed_subtree_retires_after_host_exit_with_live_references() {
+    native_tree_host_exit(
+        "dedicated_typed_subtree_retires_after_host_exit_with_live_references",
+        parrot::thread::config::SchedulingMode::DedicatedThread,
+        "parrot-dedicated-",
+    );
+}
+
+#[test]
+fn sharded_typed_subtree_retires_after_host_exit_with_live_references() {
+    native_tree_host_exit(
+        "sharded_typed_subtree_retires_after_host_exit_with_live_references",
+        parrot::thread::config::SchedulingMode::Sharded {
+            affinity_key: "host-tree".into(),
+        },
+        "parrot-shard-",
+    );
 }
 
 async fn recursive_retirement(s: Arc<ThreadActorSystem>, placement: Option<(&str, usize)>) {
