@@ -163,6 +163,22 @@ impl ParrotTypedDispatch for Family {
 fn system() -> Arc<ThreadActorSystem> {
     ThreadActorSystem::shared(Default::default())
 }
+
+fn dedicated_system() -> Arc<ThreadActorSystem> {
+    ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
+        default_scheduling_mode: parrot::thread::config::SchedulingMode::DedicatedThread,
+        ..Default::default()
+    })
+}
+
+fn sharded_system() -> Arc<ThreadActorSystem> {
+    ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
+        default_scheduling_mode: parrot::thread::config::SchedulingMode::Sharded {
+            affinity_key: "typed-subtree".into(),
+        },
+        ..Default::default()
+    })
+}
 async fn info(actor: &Ref) -> (String, Option<String>, usize) {
     match actor.ask(Op::Info).await.unwrap() {
         Reply::Info(a, b, c) => (a, b, c),
@@ -205,22 +221,12 @@ async fn typed_context_reports_real_parent_and_recursively_retires_descendants_b
 
 #[tokio::test]
 async fn dedicated_typed_root_recursively_retires_its_live_subtree() {
-    let s = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
-        default_scheduling_mode: parrot::thread::config::SchedulingMode::DedicatedThread,
-        ..Default::default()
-    });
-    recursive_retirement(s, Some(("parrot-dedicated-", 3))).await;
+    recursive_retirement(dedicated_system(), Some(("parrot-dedicated-", 3))).await;
 }
 
 #[tokio::test]
 async fn sharded_typed_root_recursively_retires_its_live_subtree() {
-    let s = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
-        default_scheduling_mode: parrot::thread::config::SchedulingMode::Sharded {
-            affinity_key: "typed-subtree".into(),
-        },
-        ..Default::default()
-    });
-    recursive_retirement(s, Some(("parrot-shard-", 1))).await;
+    recursive_retirement(sharded_system(), Some(("parrot-shard-", 1))).await;
 }
 
 async fn recursive_retirement(s: Arc<ThreadActorSystem>, placement: Option<(&str, usize)>) {
@@ -390,7 +396,20 @@ async fn typed_explicit_child_policy_overrides_parent_and_escalation_reaches_act
 }
 #[tokio::test]
 async fn typed_root_restart_retires_old_children_and_old_context_cannot_stop_replacement() {
-    let s = system();
+    restart_with_live_child(system(), None).await;
+}
+
+#[tokio::test]
+async fn dedicated_factory_restart_replaces_child_and_rejects_stale_context() {
+    restart_with_live_child(dedicated_system(), Some("parrot-dedicated-")).await;
+}
+
+#[tokio::test]
+async fn sharded_factory_restart_replaces_child_and_rejects_stale_context() {
+    restart_with_live_child(sharded_system(), Some("parrot-shard-")).await;
+}
+
+async fn restart_with_live_child(s: Arc<ThreadActorSystem>, placement: Option<&str>) {
     let stats = Arc::new(Stats::default());
     let made = stats.clone();
     let root = s
@@ -403,6 +422,29 @@ async fn typed_root_restart_retires_old_children_and_old_context_cannot_stop_rep
     assert!(root.ask(Op::Fail).await.is_err());
     assert_eq!(info(&root).await.2, 1);
     absent(&s, &old_child).await;
+    let next = context(&root).await;
+    let next_child = next.children().get(0).unwrap().path().to_string();
+    assert_ne!(old_child, next_child);
+    assert_eq!(s.actor_count(), 2);
+    if let Some(prefix) = placement {
+        let owners = stats.init_threads.lock().unwrap();
+        assert_eq!(owners.len(), 4);
+        assert!(
+            owners.iter().all(|(_, name)| name.starts_with(prefix)),
+            "{owners:?}"
+        );
+        assert_eq!(owners[0].0, owners[2].0, "factory parent changed worker");
+        if prefix == "parrot-shard-" {
+            assert!(owners.iter().all(|(id, _)| *id == owners[0].0));
+        } else {
+            assert_ne!(owners[1].0, owners[0].0);
+            assert_ne!(owners[3].0, owners[2].0);
+            assert_ne!(
+                owners[1].0, owners[3].0,
+                "replacement reused the retired child worker"
+            );
+        }
+    }
     assert!(
         old.spawn_typed_child::<_, Op>(Family::new(stats.clone(), 0))
             .await
@@ -410,6 +452,7 @@ async fn typed_root_restart_retires_old_children_and_old_context_cannot_stop_rep
     );
     old.stop();
     assert_eq!(info(&root).await.0, "/replace");
+    assert_eq!(next.children().get(0).unwrap().path(), next_child);
     root.stop().await.unwrap();
     assert_eq!(s.actor_count(), 0);
     s.shutdown_internal().await.unwrap();
