@@ -15,11 +15,48 @@ fn kernel_denials() -> u64 {
         .unwrap()
 }
 
+fn check_partial_startup(budget: &Arc<NativeWorkerBudget>) {
+    // Keep one PID we can release after the real cgroup limit is reached.
+    let (release, wait) = mpsc::channel::<()>();
+    let spare = std::thread::spawn(move || {
+        let _ = wait.recv();
+    });
+    let full = thread_budget::ThreadBudget::exhaust();
+    drop(release);
+    spare.join().unwrap();
+    let pids = |file: &str| -> usize {
+        std::fs::read_to_string(format!("/sys/fs/cgroup/pids.{file}"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let limit = pids("max");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pids("current") != limit - 1 {
+        assert!(Instant::now() < deadline, "expected one available PID");
+        std::thread::yield_now();
+    }
+    let before = kernel_denials();
+    let error = budget.try_reserve().unwrap_err();
+    assert!(
+        matches!(error, SystemError::ThreadSetupError(ref detail)
+        if detail.starts_with("native join owner initialization failed:")),
+        "{error}"
+    );
+    let after = kernel_denials();
+    assert!(after > before);
+    assert_eq!(budget.slots.available_permits(), budget.capacity);
+    drop(full);
+    eprintln!("native join startup PID denials {before} -> {after}; worker admission rolled back");
+}
+
 #[test]
 #[ignore = "requires a private Linux cgroup v2 container with --pids-limit=64"]
 fn thread_exhaustion_retries_original_native_join() {
     let timeout = Duration::from_secs(5);
     let budget = Arc::new(NativeWorkerBudget::with_capacity(2));
+    check_partial_startup(&budget);
     let first = budget.try_reserve().unwrap();
     let second = budget.try_reserve().unwrap();
     let original = Arc::new(73);
