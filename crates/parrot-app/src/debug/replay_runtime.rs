@@ -305,7 +305,9 @@ impl ReplayLog {
             }
             if matches!(
                 frame.type_key.as_str(),
-                parrot_remote::ordered::CONTROL_KEY | parrot_remote::ordered::DATA_KEY
+                parrot_remote::ordered::CONTROL_KEY
+                    | parrot_remote::ordered::DATA_KEY
+                    | parrot_remote::ordered::ADMIT_KEY
             ) {
                 if record.wire.is_none() {
                     return Err(failed(

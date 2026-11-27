@@ -498,7 +498,9 @@ impl RemoteConfig {
                 | if self.scheme == "mem"
                     || !matches!(&self.security, crate::security::RemoteSecurity::Local)
                 {
-                    crate::handshake::caps::ORDERED_TELL | crate::handshake::caps::ORDERED_RECOVERY
+                    crate::handshake::caps::ORDERED_TELL
+                        | crate::handshake::caps::ORDERED_RECOVERY
+                        | crate::handshake::caps::ORDERED_ADMISSION
                 } else {
                     0
                 }

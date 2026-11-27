@@ -295,6 +295,9 @@ impl Ingress {
                 .map_err(|_| ErrCode::ProtocolViolation)?;
             let control = Control::decode(&payload).map_err(|_| ErrCode::ProtocolViolation)?;
             self.ordered_origin(&control.source, &frame, back)?;
+            if control.operation == Operation::OpenAdmission && !back.supports_ordered_admission() {
+                return Err(ErrCode::NotRemotable);
+            }
             if self
                 .ordered
                 .lock()
@@ -324,16 +327,20 @@ impl Ingress {
             if crate::actor_path::split(&frame.path).map(|pair| pair.0) != receiver.as_deref() {
                 return Err(ErrCode::ProtocolViolation);
             }
-            if control.operation == Operation::Open
-                && self
-                    .local
-                    .forwarding_target(super::local_path(&frame.path))
-                    .is_some_and(|target| self.is_remote_target(&target))
+            if matches!(
+                control.operation,
+                Operation::Open | Operation::OpenAdmission
+            ) && self
+                .local
+                .forwarding_target(super::local_path(&frame.path))
+                .is_some_and(|target| self.is_remote_target(&target))
             {
                 return Err(ErrCode::NotRemotable);
             }
             match control.operation {
-                Operation::Open => self.open_ordered(control).await.map(Some),
+                Operation::Open | Operation::OpenAdmission => {
+                    self.open_ordered(control).await.map(Some)
+                }
                 Operation::Commit => self.commit_ordered(control).await.map(Some),
                 Operation::Close => self.close_ordered_lease(control).await.map(Some),
                 Operation::Recover { receiver, epoch } => {
@@ -652,15 +659,24 @@ impl Ingress {
                 return;
             }
         };
-        let data = match Data::decode(payload) {
+        let (admission, data) = match Data::decode_frame(&frame.type_key, payload) {
             Ok(data) => data,
             Err(_) => {
                 back.close();
                 return;
             }
         };
-        if self.ordered_origin(&data.source, &frame, back).is_err() {
+        let cid = frame.header.correlation_id;
+        if let Err(code) = self.ordered_origin(&data.source, &frame, back) {
             DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if admission.is_some() {
+                back.send_reply(Frame::reply_err(
+                    cid,
+                    &frame.path,
+                    code,
+                    "ordered origin rejected",
+                ));
+            }
             return;
         }
         if self.is_remote_target(&frame.path) {
@@ -670,11 +686,29 @@ impl Ingress {
                 return;
             };
             parrot_api::trace::scope(context, async {
-                if !self.try_relay_tell(&frame, back) {
+                if admission.is_some() {
+                    self.try_relay_request(&frame, back, cid).await;
+                } else if !self.try_relay_tell(&frame, back) {
                     DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
                 }
             })
             .await;
+            return;
+        }
+        if admission.is_some()
+            && !self
+                .relay
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|router| super::target_node(&frame.path) == Some(router.self_node()))
+        {
+            back.send_reply(Frame::reply_err(
+                cid,
+                &frame.path,
+                ErrCode::ProtocolViolation,
+                "invalid ordered destination",
+            ));
             return;
         }
         let lease = {
@@ -685,6 +719,14 @@ impl Ingress {
                 .is_some_and(|owner| !owner.valid_process())
             {
                 DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                if admission.is_some() {
+                    back.send_reply(Frame::reply_err(
+                        cid,
+                        &frame.path,
+                        ErrCode::Stopped,
+                        "receiver unavailable",
+                    ));
+                }
                 return;
             }
             sessions
@@ -693,6 +735,7 @@ impl Ingress {
                 .and_then(|source| source.active.as_ref())
                 .filter(|lease| {
                     lease.incarnation == data.incarnation
+                        && admission.is_none_or(|id| id.receiver == lease.receiver)
                         && lease.stream == data.stream
                         && lease.ticket == data.ticket
                         && *lease.ready.borrow() == Ready::Active
@@ -702,6 +745,14 @@ impl Ingress {
         };
         let Some(lease) = lease else {
             DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if let Some(id) = admission {
+                back.send_reply(Frame::reply(
+                    cid,
+                    "",
+                    ordered::ADMISSION_RECEIPT_KEY,
+                    id.receipt(false),
+                ));
+            }
             return;
         };
         let Some(frame) = self.charge_reorder(frame) else {
@@ -714,10 +765,21 @@ impl Ingress {
             sequence: data.sequence,
             frame,
         };
-        tokio::select! {
+        let admitted = tokio::select! {
             biased;
-            _ = lease.cancel.cancelled() => { DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed); },
-            sent = lease.tx.send(pending) => if sent.is_err() { DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed); },
+            _ = lease.cancel.cancelled() => false,
+            sent = lease.tx.send(pending) => sent.is_ok(),
+        };
+        if !admitted {
+            DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(id) = admission {
+            back.send_reply(Frame::reply(
+                cid,
+                "",
+                ordered::ADMISSION_RECEIPT_KEY,
+                id.receipt(admitted),
+            ));
         }
     }
 
@@ -727,7 +789,10 @@ impl Ingress {
         let result = unwind::run(&cleanup, || {
             Box::pin(async {
                 let context = self.request_context(&mut frame).map_err(|_| ())?;
-                let data = Data::decode(frame.payload.clone()).map_err(|_| ())?;
+                let (_, data) =
+                    Data::decode_frame(&frame.type_key, frame.payload.clone()).map_err(|_| ())?;
+                frame.header.flags &= !crate::frame::flags::TELL_ACK;
+                frame.header.correlation_id = 0;
                 frame.type_key = data.key;
                 frame.payload = data.payload;
                 // The lease terminates at its confirmed node. An application alias

@@ -695,41 +695,59 @@ async fn actual_mtls_tcp_and_quic_recover_the_retired_receiver_without_an_old_so
 
 #[tokio::test(start_paused = true)]
 async fn authorized_memory_relay_preserves_the_restart_proof_when_the_source_renews() {
+    check_relay_restart(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn routed_ordered_delivery_reaches_restarted_receiver_before_renewal() {
+    check_relay_restart(false).await;
+}
+
+async fn check_relay_restart(wait_for_renewal: bool) {
     let directory = tempfile::tempdir().unwrap();
+    let suffix = if wait_for_renewal {
+        "renewed"
+    } else {
+        "cached"
+    };
+    let hub_id = format!("recovery-hub-{suffix}");
+    let target_id = format!("recovery-target-{suffix}");
     let memory = |id: &str| {
         let mut config = RemoteConfig::mem(id);
         config.heartbeat_enabled = false;
         config
     };
-    let target_config = memory("recovery-target")
-        .with_ordered_relays(["recovery-hub".into()])
+    let target_config = memory(&target_id)
+        .with_ordered_relays([hub_id.clone()])
         .with_ordered_receiver_state(OrderedReceiverState {
             directory: directory.path().into(),
             realm: "relay-recovery".into(),
         });
     let hub = start(
-        memory("recovery-hub").with_role(parrot_remote::handshake::TopologyRole::Hub),
+        memory(&hub_id).with_role(parrot_remote::handshake::TopologyRole::Hub),
         state(None).0,
     )
     .await;
-    let source = start(memory("recovery-source"), state(None).0).await;
+    let source = start(memory(&format!("recovery-source-{suffix}")), state(None).0).await;
     source.connect_mem_pair(&hub).await.unwrap();
     let (target_state, mut rx) = state(None);
     let old = start(target_config.clone(), target_state.clone()).await;
     old.connect_mem_pair(&hub).await.unwrap();
     let reference = source
-        .remote_ref("parrot://recovery-target/target")
+        .remote_ref(&format!("parrot://{target_id}/target"))
         .unwrap();
     send(&reference, 1).await;
     seen(&mut rx, 1).await;
     old.shutdown().await.unwrap();
     let new = start(target_config, target_state).await;
     new.connect_mem_pair(&hub).await.unwrap();
-    // A stable first hop does not report its downstream receiver's restart.
-    // Renewal discovers the new receiver; this is not an immediate-lossless claim.
-    tokio::time::advance(Duration::from_secs(16)).await;
+    if wait_for_renewal {
+        tokio::time::advance(Duration::from_secs(16)).await;
+    }
     send(&reference, 2).await;
+    send(&reference, 3).await;
     seen(&mut rx, 2).await;
+    seen(&mut rx, 3).await;
     reference
         .close_ordered_session(Duration::from_secs(5))
         .await
@@ -737,4 +755,5 @@ async fn authorized_memory_relay_preserves_the_restart_proof_when_the_source_ren
     for node in [&source, &hub, &new] {
         node.shutdown().await.unwrap();
     }
+    assert!(rx.try_recv().is_err());
 }

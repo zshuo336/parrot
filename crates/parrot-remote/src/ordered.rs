@@ -8,6 +8,8 @@ pub(crate) use outbound::Outbound;
 pub const CONTROL_KEY: &str = "parrot:ordered-control#v2";
 pub const RECEIPT_KEY: &str = "parrot:ordered-control-receipt#v2";
 pub const DATA_KEY: &str = "parrot:ordered-tell#v2";
+pub const ADMIT_KEY: &str = "parrot:ordered-admit#v1";
+pub const ADMISSION_RECEIPT_KEY: &str = "parrot:ordered-admission-receipt#v1";
 pub(crate) const LEASE_MS: u32 = 30_000;
 pub(crate) const CHALLENGE_MS: u32 = 5_000;
 pub(crate) type Identity = [u8; 16];
@@ -19,6 +21,7 @@ pub(crate) fn identity() -> Identity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Operation {
     Open,
+    OpenAdmission,
     Commit,
     Close,
     Recover { receiver: Identity, epoch: u64 },
@@ -54,6 +57,36 @@ pub(crate) struct Data {
     pub payload: Bytes,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdmissionId {
+    pub receiver: Identity,
+    pub ticket: Identity,
+    pub sequence: u64,
+}
+
+impl AdmissionId {
+    pub fn receipt(&self, admitted: bool) -> Bytes {
+        let mut bytes = BytesMut::with_capacity(41);
+        bytes.put_u8(u8::from(admitted));
+        bytes.extend_from_slice(&self.receiver);
+        bytes.extend_from_slice(&self.ticket);
+        bytes.put_u64_le(self.sequence);
+        bytes.freeze()
+    }
+
+    pub fn outcome(&self, bytes: &[u8]) -> Option<bool> {
+        if bytes.len() != 41
+            || bytes[0] > 1
+            || bytes[1..17] != self.receiver
+            || bytes[17..33] != self.ticket
+            || bytes[33..] != self.sequence.to_le_bytes()
+        {
+            return None;
+        }
+        Some(bytes[0] == 1)
+    }
+}
+
 fn node(source: &str) -> Result<(), String> {
     parrot_config::endpoint::validate_node_id(source)
 }
@@ -80,7 +113,9 @@ impl Control {
         node(&self.source)?;
         nonzero(self.incarnation)?;
         nonzero(self.stream)?;
-        if (self.operation == Operation::Open) != (self.ticket == [0; 16]) {
+        if matches!(self.operation, Operation::Open | Operation::OpenAdmission)
+            != (self.ticket == [0; 16])
+        {
             return Err("ordered control ticket disagrees with operation".into());
         }
         let length = u16::try_from(self.source.len()).map_err(|_| "ordered source too long")?;
@@ -101,6 +136,7 @@ impl Control {
             Operation::Commit => 1,
             Operation::Close => 2,
             Operation::Recover { .. } => 3,
+            Operation::OpenAdmission => 4,
         });
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
@@ -128,6 +164,7 @@ impl Control {
                 0 => Operation::Open,
                 1 => Operation::Commit,
                 2 => Operation::Close,
+                4 => Operation::OpenAdmission,
                 3 => Operation::Recover {
                     receiver: input[52 + length..68 + length].try_into().unwrap(),
                     epoch: u64::from_le_bytes(input[68 + length..].try_into().unwrap()),
@@ -188,6 +225,10 @@ impl Receipt {
 
 impl Data {
     pub fn encode(&self) -> Result<Bytes, String> {
+        self.encode_for(None)
+    }
+
+    pub fn encode_for(&self, receiver: Option<Identity>) -> Result<Bytes, String> {
         node(&self.source)?;
         nonzero(self.incarnation)?;
         nonzero(self.stream)?;
@@ -199,11 +240,16 @@ impl Data {
         let source_len = u16::try_from(self.source.len()).map_err(|_| "ordered source too long")?;
         let length = 61usize
             .checked_add(self.source.len())
+            .and_then(|n| n.checked_add(if receiver.is_some() { 16 } else { 0 }))
             .and_then(|n| n.checked_add(self.key.len()))
             .and_then(|n| n.checked_add(self.payload.len()))
             .filter(|&n| n <= crate::frame::MAX_FRAME_LEN as usize)
             .ok_or("ordered data exceeds frame budget")?;
         let mut output = BytesMut::with_capacity(length);
+        if let Some(receiver) = receiver {
+            nonzero(receiver)?;
+            output.extend_from_slice(&receiver);
+        }
         output.put_u8(2);
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
@@ -250,6 +296,27 @@ impl Data {
         }
         Ok(value)
     }
+
+    pub fn decode_frame(key: &str, payload: Bytes) -> Result<(Option<AdmissionId>, Self), String> {
+        if key != ADMIT_KEY {
+            return Ok((None, Self::decode(payload)?));
+        }
+        let receiver: Identity = payload
+            .get(..16)
+            .ok_or("missing ordered receiver")?
+            .try_into()
+            .unwrap();
+        nonzero(receiver)?;
+        let data = Self::decode(payload.slice(16..))?;
+        Ok((
+            Some(AdmissionId {
+                receiver,
+                ticket: data.ticket,
+                sequence: data.sequence,
+            }),
+            data,
+        ))
+    }
 }
 
 /// Inspect a captured ordered frame without granting origin authority or
@@ -258,7 +325,7 @@ impl Data {
 pub fn business_frame(
     mut frame: crate::frame::Frame,
 ) -> Result<Option<crate::frame::Frame>, String> {
-    if !matches!(frame.type_key.as_str(), CONTROL_KEY | DATA_KEY) {
+    if !matches!(frame.type_key.as_str(), CONTROL_KEY | DATA_KEY | ADMIT_KEY) {
         return Ok(Some(frame));
     }
     frame
@@ -272,7 +339,9 @@ pub fn business_frame(
     let parent = frame
         .take_trace_parent()
         .map_err(|error| error.to_string())?;
-    let data = Data::decode(frame.payload)?;
+    let (_, data) = Data::decode_frame(&frame.type_key, frame.payload)?;
+    frame.header.flags &= !crate::frame::flags::TELL_ACK;
+    frame.header.correlation_id = 0;
     frame.type_key = data.key;
     frame.payload = data.payload;
     if let Some(parent) = parent {
@@ -291,6 +360,7 @@ mod tests {
     fn identity_control_and_receipts_are_versioned_and_exact() {
         for operation in [
             Operation::Open,
+            Operation::OpenAdmission,
             Operation::Commit,
             Operation::Close,
             Operation::Recover {
@@ -303,7 +373,7 @@ mod tests {
                 source: "origin".into(),
                 incarnation: [1; 16],
                 stream: [2; 16],
-                ticket: if operation == Operation::Open {
+                ticket: if matches!(operation, Operation::Open | Operation::OpenAdmission) {
                     [0; 16]
                 } else {
                     [3; 16]

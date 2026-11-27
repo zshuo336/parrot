@@ -406,20 +406,34 @@ async fn recorded_transport(scheme: &str, direct: bool) {
                 .with_insecure_development(),
             "quic" => RemoteConfig::quic(id, Some("127.0.0.1:0".parse().unwrap()))
                 .with_insecure_development(),
-            "mem" => RemoteConfig::mem(id),
+            "mem" | "relay" => RemoteConfig::mem(id),
             _ => unreachable!(),
         };
     let server_name = format!("{name}-server");
     let client_name = format!("{name}-client");
+    let hub_name = format!("{name}-hub");
     let server = RemoteActorSystem::new(
-        config(server_name.clone()).with_capture(recording.capture()),
+        config(server_name.clone())
+            .with_ordered_relays([hub_name.clone()])
+            .with_capture(recording.capture()),
         lookup.clone(),
     )
     .unwrap();
     let client = RemoteActorSystem::new(config(client_name.clone()), lookup.clone()).unwrap();
     server.start().await.unwrap();
     client.start().await.unwrap();
-    if direct {
+    let mut hub = None;
+    if scheme == "relay" {
+        let relay = RemoteActorSystem::new(
+            config(hub_name.clone()).with_role(parrot_remote::handshake::TopologyRole::Hub),
+            lookup.clone(),
+        )
+        .unwrap();
+        relay.start().await.unwrap();
+        relay.connect_mem_pair(&server).await.unwrap();
+        client.connect_mem_pair(&relay).await.unwrap();
+        hub = Some(relay);
+    } else if direct {
         client.connect_mem_pair(&server).await.unwrap();
     } else {
         let address = match scheme {
@@ -456,6 +470,9 @@ async fn recorded_transport(scheme: &str, direct: bool) {
     assert_eq!(original, [5, 9]);
     client.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
+    if let Some(hub) = hub {
+        hub.shutdown().await.unwrap();
+    }
     system.shutdown_internal().await.unwrap();
     let receipt = tokio::task::spawn_blocking(move || recording.finish())
         .await
@@ -492,7 +509,14 @@ async fn recorded_transport(scheme: &str, direct: bool) {
     let ordered = requests
         .iter()
         .copied()
-        .find(|r| r.type_key == parrot_remote::ordered::DATA_KEY)
+        .find(|r| {
+            r.type_key
+                == if scheme == "relay" {
+                    parrot_remote::ordered::ADMIT_KEY
+                } else {
+                    parrot_remote::ordered::DATA_KEY
+                }
+        })
         .unwrap();
     let mut captured = parrot_remote::frame::Frame::tell(
         &ordered.path,
@@ -500,14 +524,16 @@ async fn recorded_transport(scheme: &str, direct: bool) {
         ordered.payload_bytes().unwrap().into(),
     );
     captured.header.flags = ordered.wire.as_ref().unwrap().flags;
+    captured.header.correlation_id = ordered.cid;
     let business = parrot_remote::ordered::business_frame(captured)
         .unwrap()
         .unwrap();
     assert_eq!(business.type_key, "bin:replay.Delta");
-    assert_eq!(
-        business.split_trace_parent().unwrap().0,
-        Some(parent.as_parent())
-    );
+    let incoming_parent = business.split_trace_parent().unwrap().0.unwrap();
+    assert_eq!(incoming_parent.trace_id(), parent.trace_id());
+    if scheme != "relay" {
+        assert_eq!(incoming_parent, parent.as_parent());
+    }
     assert_eq!(
         CodecRegistry::global()
             .decode_incoming(
@@ -523,8 +549,13 @@ async fn recorded_transport(scheme: &str, direct: bool) {
     for record in requests {
         let wire = record.wire.as_ref().unwrap();
         assert_eq!(wire.local_node, server_name);
-        assert_eq!(wire.peer_node.as_deref(), Some(client_name.as_str()));
-        assert_eq!(wire.scheme, scheme);
+        let (peer, transport) = if scheme == "relay" {
+            (&hub_name, "mem")
+        } else {
+            (&client_name, scheme)
+        };
+        assert_eq!(wire.peer_node.as_deref(), Some(peer.as_str()));
+        assert_eq!(wire.scheme, transport);
         assert_ne!(wire.connection, 0);
     }
     let (fresh, lookup) = engine().await;
@@ -560,6 +591,7 @@ async fn recorded_transport(scheme: &str, direct: bool) {
             r.dir == "tx"
                 && r.frame_type == frame_type::REPLY
                 && r.type_key != parrot_remote::ordered::RECEIPT_KEY
+                && r.type_key != parrot_remote::ordered::ADMISSION_RECEIPT_KEY
         })
         .collect();
     assert_eq!(observed.len(), replay.replies.len());
@@ -613,6 +645,11 @@ async fn automatic_memory_capture_replays_into_fresh_actor() {
 #[tokio::test]
 async fn automatic_direct_memory_capture_replays_into_fresh_actor() {
     recorded_transport("mem", true).await;
+}
+
+#[tokio::test]
+async fn routed_ordered_admission_capture_replays_as_one_business_tell() {
+    recorded_transport("relay", false).await;
 }
 
 #[tokio::test]

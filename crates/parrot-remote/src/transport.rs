@@ -175,6 +175,11 @@ impl FrameSender {
         self.supports_ordered_tell()
             && self.negotiated_capabilities & crate::handshake::caps::ORDERED_RECOVERY != 0
     }
+    pub(crate) fn supports_ordered_admission(&self) -> bool {
+        use crate::handshake::caps;
+        let required = caps::ORDERED_TELL | caps::TELL_COMPLETION | caps::ORDERED_ADMISSION;
+        self.negotiated_capabilities & required == required
+    }
 
     /// Admin parents are separately negotiated so business-only peers keep
     /// receiving their original SYSTEM_EVENT payload and flags.
@@ -204,6 +209,15 @@ impl FrameSender {
     }
 
     fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+        if (frame.type_key == crate::ordered::ADMIT_KEY
+            || (frame.type_key == crate::ordered::CONTROL_KEY
+                && frame.borrowed_ask_payload()?.starts_with(&[2, 4])))
+            && !self.supports_ordered_admission()
+        {
+            return Err(RemoteError::Transport(
+                "ordered admission was not negotiated".into(),
+            ));
+        }
         if frame.type_key == crate::ordered::CONTROL_KEY
             && frame.borrowed_ask_payload()?.starts_with(&[2, 3])
             && !self.supports_ordered_recovery()

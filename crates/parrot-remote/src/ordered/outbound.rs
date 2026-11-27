@@ -1,5 +1,6 @@
 use super::{
-    identity, Control, Data, Identity, Operation, Receipt, CONTROL_KEY, DATA_KEY, RECEIPT_KEY,
+    identity, AdmissionId, Control, Data, Identity, Operation, Receipt, ADMISSION_RECEIPT_KEY,
+    ADMIT_KEY, CONTROL_KEY, DATA_KEY, RECEIPT_KEY,
 };
 use crate::{
     error::ErrCode,
@@ -180,10 +181,12 @@ impl Outbound {
         destination: &str,
         sender: &FrameSender,
         callbacks: &CallbackRegistry,
-        mut frame: Frame,
+        frame: Frame,
         required: bool,
     ) -> ActorResult<Option<Frame>> {
-        let supports_ordered = sender.supports_ordered_tell();
+        let routed = destination != sender.node_id();
+        let supports_ordered =
+            sender.supports_ordered_tell() && (!routed || sender.supports_ordered_admission());
         let Some(lane) = self.lane(destination, supports_ordered)? else {
             return legacy_fallback(frame, required);
         };
@@ -196,111 +199,54 @@ impl Outbound {
         if !supports_ordered {
             return legacy_fallback(frame, required || state.sent_ordered);
         }
-        if state.sequence == u64::MAX {
-            if let Some(grant) = &state.grant {
-                let control = Control {
-                    operation: Operation::Close,
+        let mut retried = false;
+        loop {
+            if state.sequence == u64::MAX {
+                if let Some(grant) = &state.grant {
+                    let control = Control {
+                        operation: Operation::Close,
+                        source: self.source.clone(),
+                        incarnation: self.incarnation,
+                        stream: state.stream,
+                        ticket: grant.receipt.ticket,
+                    };
+                    retire(
+                        grant,
+                        sender,
+                        callbacks,
+                        Route {
+                            destination,
+                            path: &frame.path,
+                            hops: frame.header.hop_limit,
+                        },
+                        &control,
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .await?;
+                }
+                state.stream = identity();
+                state.grant = None;
+                state.sequence = 0;
+            }
+            let refresh = state.grant.as_ref().is_none_or(|grant| {
+                !grant.receipt.active
+                    || grant.renew_at <= Instant::now()
+                    || grant.sender.dispatch_key() != sender.dispatch_key()
+            });
+            if refresh {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut control = Control {
+                    operation: if routed {
+                        Operation::OpenAdmission
+                    } else {
+                        Operation::Open
+                    },
                     source: self.source.clone(),
                     incarnation: self.incarnation,
                     stream: state.stream,
-                    ticket: grant.receipt.ticket,
+                    ticket: [0; 16],
                 };
-                retire(
-                    grant,
-                    sender,
-                    callbacks,
-                    Route {
-                        destination,
-                        path: &frame.path,
-                        hops: frame.header.hop_limit,
-                    },
-                    &control,
-                    Instant::now() + Duration::from_secs(5),
-                )
-                .await?;
-            }
-            state.stream = identity();
-            state.grant = None;
-            state.sequence = 0;
-        }
-        let refresh = state.grant.as_ref().is_none_or(|grant| {
-            !grant.receipt.active
-                || grant.renew_at <= Instant::now()
-                || grant.sender.dispatch_key() != sender.dispatch_key()
-        });
-        if refresh {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut control = Control {
-                operation: Operation::Open,
-                source: self.source.clone(),
-                incarnation: self.incarnation,
-                stream: state.stream,
-                ticket: [0; 16],
-            };
-            let opened = request(
-                sender,
-                callbacks,
-                destination,
-                &frame.path,
-                frame.header.hop_limit,
-                &control,
-                deadline,
-            )
-            .await;
-            let mut receipt = match opened {
-                Ok(receipt) => receipt,
-                Err((ErrCode::NotRemotable, _)) if !required && !state.sent_ordered => {
-                    return Ok(Some(frame))
-                }
-                Err((code, detail)) => return Err(code.to_actor_error(detail)),
-            };
-            if let Some(previous) = state
-                .grant
-                .as_ref()
-                .filter(|grant| grant.receipt.receiver != receipt.receiver)
-            {
-                // Only the original receiver can certify its workers retired.
-                // Keep its grant on cancellation or failure so a new route
-                // cannot silently erase an unresolved predecessor.
-                let closing = Control {
-                    operation: Operation::Close,
-                    source: self.source.clone(),
-                    incarnation: self.incarnation,
-                    stream: state.stream,
-                    ticket: previous.receipt.ticket,
-                };
-                retire(
-                    previous,
-                    sender,
-                    callbacks,
-                    Route {
-                        destination,
-                        path: &frame.path,
-                        hops: frame.header.hop_limit,
-                    },
-                    &closing,
-                    deadline,
-                )
-                .await?;
-            }
-            usage.retained = true;
-            if !receipt.active {
-                if state.grant.as_ref().is_none_or(|grant| {
-                    grant.receipt.ticket != receipt.ticket
-                        || grant.receipt.receiver != receipt.receiver
-                }) {
-                    state.sequence = 0;
-                }
-                // Cancellation after COMMIT publication must still leave enough
-                // identity for explicit close to join the receiver's handoff.
-                state.grant = Some(Grant {
-                    receipt,
-                    sender: sender.clone(),
-                    renew_at: Instant::now(),
-                });
-                control.operation = Operation::Commit;
-                control.ticket = receipt.ticket;
-                let committed = request(
+                let opened = request(
                     sender,
                     callbacks,
                     destination,
@@ -309,52 +255,152 @@ impl Outbound {
                     &control,
                     deadline,
                 )
-                .await
-                .map_err(|(code, detail)| code.to_actor_error(detail))?;
-                if !committed.active
-                    || committed.ticket != receipt.ticket
-                    || committed.generation != receipt.generation
-                    || committed.receiver != receipt.receiver
-                    || committed.epoch != receipt.epoch
+                .await;
+                let mut receipt = match opened {
+                    Ok(receipt) => receipt,
+                    Err((ErrCode::NotRemotable, _)) if !required && !state.sent_ordered => {
+                        return Ok(Some(frame))
+                    }
+                    Err((code, detail)) => return Err(code.to_actor_error(detail)),
+                };
+                if let Some(previous) = state
+                    .grant
+                    .as_ref()
+                    .filter(|grant| grant.receipt.receiver != receipt.receiver)
                 {
-                    return Err(ErrCode::ProtocolViolation
-                        .to_actor_error("ordered commit receipt differs from challenge".into()));
+                    // Only the original receiver can certify its workers retired.
+                    // Keep its grant on cancellation or failure so a new route
+                    // cannot silently erase an unresolved predecessor.
+                    let closing = Control {
+                        operation: Operation::Close,
+                        source: self.source.clone(),
+                        incarnation: self.incarnation,
+                        stream: state.stream,
+                        ticket: previous.receipt.ticket,
+                    };
+                    retire(
+                        previous,
+                        sender,
+                        callbacks,
+                        Route {
+                            destination,
+                            path: &frame.path,
+                            hops: frame.header.hop_limit,
+                        },
+                        &closing,
+                        deadline,
+                    )
+                    .await?;
                 }
-                receipt = committed;
+                usage.retained = true;
+                if !receipt.active {
+                    if state.grant.as_ref().is_none_or(|grant| {
+                        grant.receipt.ticket != receipt.ticket
+                            || grant.receipt.receiver != receipt.receiver
+                    }) {
+                        state.sequence = 0;
+                    }
+                    // Cancellation after COMMIT publication must still leave enough
+                    // identity for explicit close to join the receiver's handoff.
+                    state.grant = Some(Grant {
+                        receipt,
+                        sender: sender.clone(),
+                        renew_at: Instant::now(),
+                    });
+                    control.operation = Operation::Commit;
+                    control.ticket = receipt.ticket;
+                    let committed = request(
+                        sender,
+                        callbacks,
+                        destination,
+                        &frame.path,
+                        frame.header.hop_limit,
+                        &control,
+                        deadline,
+                    )
+                    .await
+                    .map_err(|(code, detail)| code.to_actor_error(detail))?;
+                    if !committed.active
+                        || committed.ticket != receipt.ticket
+                        || committed.generation != receipt.generation
+                        || committed.receiver != receipt.receiver
+                        || committed.epoch != receipt.epoch
+                    {
+                        return Err(ErrCode::ProtocolViolation.to_actor_error(
+                            "ordered commit receipt differs from challenge".into(),
+                        ));
+                    }
+                    receipt = committed;
+                }
+                if state.grant.as_ref().is_none_or(|grant| {
+                    grant.receipt.ticket != receipt.ticket
+                        || grant.receipt.receiver != receipt.receiver
+                }) {
+                    state.sequence = 0;
+                }
+                state.grant = Some(Grant {
+                    receipt,
+                    sender: sender.clone(),
+                    renew_at: Instant::now()
+                        + Duration::from_millis((receipt.lease_ms / 2).max(1) as u64),
+                });
             }
-            if state.grant.as_ref().is_none_or(|grant| {
-                grant.receipt.ticket != receipt.ticket || grant.receipt.receiver != receipt.receiver
-            }) {
-                state.sequence = 0;
+            if self
+                .publish(&mut state, &frame, sender, callbacks, destination, routed)
+                .await?
+            {
+                return Ok(None);
             }
-            state.grant = Some(Grant {
-                receipt,
-                sender: sender.clone(),
-                renew_at: Instant::now()
-                    + Duration::from_millis((receipt.lease_ms / 2).max(1) as u64),
-            });
+            // A matching negative receipt proves this attempt never entered the worker.
+            // Preserve its grant so refresh must still fence any previous receiver.
+            state.sequence -= 1;
+            state.grant.as_mut().expect("confirmed grant").renew_at = Instant::now();
+            if retried {
+                return Err(ErrCode::Stopped
+                    .to_actor_error("ordered receiver rejected the refreshed ticket".into()));
+            }
+            retried = true;
         }
+    }
+
+    async fn publish(
+        &self,
+        state: &mut Lane,
+        original: &Frame,
+        sender: &FrameSender,
+        callbacks: &CallbackRegistry,
+        destination: &str,
+        routed: bool,
+    ) -> ActorResult<bool> {
+        let mut frame = original.clone();
+        let receipt = state.grant.as_ref().expect("confirmed grant").receipt;
         let sequence = state.sequence.checked_add(1).ok_or_else(|| {
             ErrCode::Overloaded.to_actor_error("ordered sequence exhausted".into())
         })?;
+        let id = AdmissionId {
+            receiver: receipt.receiver,
+            ticket: receipt.ticket,
+            sequence,
+        };
         let envelope = Data {
             source: self.source.clone(),
             incarnation: self.incarnation,
             stream: state.stream,
-            ticket: state
-                .grant
-                .as_ref()
-                .expect("confirmed grant")
-                .receipt
-                .ticket,
+            ticket: receipt.ticket,
             sequence,
             key: frame.type_key,
             payload: frame.payload,
         };
-        frame.type_key = DATA_KEY.into();
-        frame.payload = envelope
-            .encode()
-            .map_err(|detail| ErrCode::ProtocolViolation.to_actor_error(detail))?;
+        frame.payload = if routed {
+            frame.type_key = ADMIT_KEY.into();
+            frame.header.flags |= crate::frame::flags::TELL_ACK;
+            frame.header.correlation_id = callbacks.next_cid();
+            envelope.encode_for(Some(id.receiver))
+        } else {
+            frame.type_key = DATA_KEY.into();
+            envelope.encode()
+        }
+        .map_err(|detail| ErrCode::ProtocolViolation.to_actor_error(detail))?;
         frame.header.seq = 0;
         let frame = sender
             .trace_request(frame)
@@ -363,11 +409,34 @@ impl Outbound {
             .reserve(&frame)
             .await
             .map_err(|error| error.to_actor_error())?;
+        let pending = if routed {
+            Some(
+                callbacks
+                    .register_on(frame.header.correlation_id, destination.to_owned(), sender)
+                    .map_err(|error| error.to_actor_error())?,
+            )
+        } else {
+            None
+        };
         // No await separates assigning a sequence from publication.
         state.sequence = sequence;
         state.sent_ordered = true;
         permit.send(frame);
-        Ok(None)
+        let Some((reply, _guard)) = pending else {
+            return Ok(true);
+        };
+        tokio::select! {
+            biased;
+            result = reply => match result {
+                Ok(ReplyPayload::Ok(bytes, key)) if key == ADMISSION_RECEIPT_KEY => id.outcome(&bytes)
+                    .ok_or_else(|| ErrCode::ProtocolViolation.to_actor_error("ordered admission identity differs".into())),
+                Ok(ReplyPayload::Err(code, detail)) => Err(code.to_actor_error(detail)),
+                Ok(_) => Err(ErrCode::ProtocolViolation.to_actor_error("invalid ordered admission response".into())),
+                Err(_) => Err(ErrCode::ConnectionLost.to_actor_error("ordered admission callback closed".into())),
+            },
+            _ = sender.closed() => Err(ErrCode::ConnectionLost.to_actor_error("ordered admission connection closed".into())),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => Err(ActorError::Timeout),
+        }
     }
 
     pub async fn close_lane(
@@ -564,11 +633,110 @@ mod tests {
     use crate::handshake::caps;
 
     #[tokio::test(start_paused = true)]
+    async fn ambiguous_admission_never_republishes_or_reuses_the_sequence() {
+        let outbound = Outbound::new("source".into(), 1);
+        let callbacks = CallbackRegistry::default();
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        let sender = FrameSender::capability_test_sender(
+            tx,
+            "hub",
+            caps::ORDERED_TELL | caps::TELL_COMPLETION | caps::ORDERED_ADMISSION,
+        );
+        let lane = outbound.lane("target", true).unwrap().unwrap();
+        lane.lock().await.grant = Some(Grant {
+            receipt: Receipt {
+                receiver: [2; 16],
+                ticket: [3; 16],
+                active: true,
+                generation: 1,
+                epoch: None,
+                lease_ms: super::super::LEASE_MS,
+            },
+            sender: sender.clone(),
+            renew_at: Instant::now() + Duration::from_secs(30),
+        });
+        let mut last_cid = None;
+        for sequence in 1..=5 {
+            let frame = Frame::tell("parrot://target/service", "work", bytes::Bytes::new());
+            let mut send = Box::pin(outbound.send("target", &sender, &callbacks, frame, true));
+            assert!(futures::poll!(&mut send).is_pending());
+            let published = frames.try_recv().unwrap();
+            let (Some(id), data) =
+                Data::decode_frame(&published.type_key, published.payload).unwrap()
+            else {
+                panic!("expected correlated ordered data");
+            };
+            assert_eq!(data.sequence, sequence);
+            let cid = published.header.correlation_id;
+            let response = |bytes| ReplyPayload::Ok(bytes, ADMISSION_RECEIPT_KEY.into());
+            if let Some(late) = last_cid {
+                assert!(!callbacks.complete_from(late, response(id.receipt(false)), &sender));
+                assert!(futures::poll!(&mut send).is_pending());
+            }
+            match sequence {
+                1 => drop(send),
+                2 => assert!(matches!(send.await, Err(ActorError::Timeout))),
+                3 => {
+                    let other = AdmissionId {
+                        ticket: [9; 16],
+                        ..id
+                    };
+                    assert!(callbacks.complete_from(cid, response(other.receipt(false)), &sender));
+                    assert!(send
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("identity differs"));
+                }
+                4 => {
+                    assert!(callbacks.complete_from(cid, response(id.receipt(true)), &sender));
+                    assert!(send.await.unwrap().is_none());
+                }
+                _ => {
+                    sender.close();
+                    assert!(send.await.is_err());
+                }
+            }
+            assert!(frames.try_recv().is_err());
+            assert!(callbacks.is_empty());
+            last_cid = Some(cid);
+        }
+    }
+
+    #[tokio::test]
+    async fn older_first_hop_rejects_strict_routed_data_before_grant_allocation() {
+        let outbound = Outbound::new("source".into(), 1);
+        let callbacks = CallbackRegistry::default();
+        let (tx, mut frames) = tokio::sync::mpsc::channel(2);
+        let sender = FrameSender::capability_test_sender(tx, "hub", caps::ORDERED_TELL);
+        let frame = Frame::tell("parrot://target/service", "work", bytes::Bytes::new());
+        assert!(outbound
+            .send("target", &sender, &callbacks, frame.clone(), true)
+            .await
+            .is_err());
+        assert_eq!(
+            outbound
+                .send("target", &sender, &callbacks, frame.clone(), false)
+                .await
+                .unwrap()
+                .unwrap()
+                .type_key,
+            frame.type_key
+        );
+        assert!(frames.try_recv().is_err());
+        assert!(outbound.lanes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pending_sends_and_close_hold_the_slot_until_the_last_user_cancels() {
         let outbound = Outbound::new("source".into(), 1);
         let callbacks = CallbackRegistry::default();
         let (tx, mut frames) = tokio::sync::mpsc::channel(4);
-        let sender = FrameSender::capability_test_sender(tx, "hub", caps::BIN | caps::ORDERED_TELL);
+        let sender = FrameSender::capability_test_sender(
+            tx,
+            "hub",
+            caps::BIN | caps::ORDERED_TELL | caps::TELL_COMPLETION | caps::ORDERED_ADMISSION,
+        );
         let send = |destination| {
             let frame = Frame::tell("/target", "work", bytes::Bytes::new());
             Box::pin(outbound.send(destination, &sender, &callbacks, frame, true))

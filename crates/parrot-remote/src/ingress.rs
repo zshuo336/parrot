@@ -770,6 +770,7 @@ impl Ingress {
             frame.type_key.as_str(),
             crate::ordered::CONTROL_KEY | crate::ordered::DATA_KEY
         ) && !back.supports_ordered_tell()
+            || frame.type_key == crate::ordered::ADMIT_KEY && !back.supports_ordered_admission()
         {
             back.close();
             return;
@@ -1622,6 +1623,10 @@ impl Ingress {
     }
 
     async fn on_request(self: &Arc<Self>, mut frame: Frame, back: &FrameSender) {
+        if frame.type_key == crate::ordered::ADMIT_KEY {
+            self.on_ordered_tell(frame, back).await;
+            return;
+        }
         if frame.type_key == crate::ordered::CONTROL_KEY {
             self.on_ordered_control(frame, back).await;
             return;
@@ -2260,6 +2265,21 @@ impl Ingress {
                 .await;
             return Some(ErrCode::RouteUnreachable);
         };
+        if (frame.type_key == crate::ordered::ADMIT_KEY
+            || (frame.type_key == crate::ordered::CONTROL_KEY
+                && frame
+                    .borrowed_ask_payload()
+                    .is_ok_and(|p| p.starts_with(&[2, 4]))))
+            && !sender.supports_ordered_admission()
+        {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                &frame.path,
+                ErrCode::NotRemotable,
+                "next hop does not support ordered admission",
+            ));
+            return Some(ErrCode::NotRemotable);
+        }
         if frame.header.flags & crate::frame::flags::TELL_ACK != 0
             && sender.peer_capabilities() & crate::handshake::caps::TELL_COMPLETION == 0
         {
@@ -3300,6 +3320,67 @@ mod tests {
         }
         fn on_hint(&self, _: &str, _: &str) {}
     }
+    #[tokio::test]
+    async fn admission_open_and_rerouted_data_stop_before_a_legacy_downstream_link() {
+        use crate::{handshake::caps, ordered};
+        let ingress = Ingress::new(Arc::new(TestLookup), Arc::new(CallbackRegistry::default()));
+        let (tx, mut downstream) = tokio::sync::mpsc::channel(4);
+        let legacy = FrameSender::capability_test_sender(
+            tx,
+            "gateway",
+            caps::ORDERED_TELL | caps::TELL_COMPLETION,
+        );
+        *ingress.relay_slot() = Some(Arc::new(AliasRouter(legacy)));
+        let (tx, mut replies) = tokio::sync::mpsc::channel(4);
+        let back = FrameSender::anon(tx);
+        let path = "parrot://gateway/target";
+        let control = ordered::Control {
+            operation: ordered::Operation::OpenAdmission,
+            source: "source".into(),
+            stream: [2; 16],
+            incarnation: [1; 16],
+            ticket: [0; 16],
+        };
+        let data = ordered::Data {
+            source: control.source.clone(),
+            incarnation: control.incarnation,
+            stream: control.stream,
+            ticket: [3; 16],
+            sequence: 1,
+            key: "work".into(),
+            payload: Bytes::new(),
+        };
+        for frame in [
+            Frame::ask(
+                5,
+                path,
+                ordered::CONTROL_KEY,
+                control.encode().unwrap(),
+                None,
+            ),
+            Frame::tell_with_ack(
+                6,
+                path,
+                ordered::ADMIT_KEY,
+                data.encode_for(Some([4; 16])).unwrap(),
+            ),
+        ] {
+            let cid = frame.header.correlation_id;
+            assert_eq!(
+                ingress.try_relay_request(&frame, &back, cid).await,
+                Some(ErrCode::NotRemotable)
+            );
+            let reply = replies.try_recv().unwrap();
+            assert_eq!(cid, reply.header.correlation_id);
+            assert_eq!(
+                decode_err_payload(&reply.payload).unwrap().0,
+                ErrCode::NotRemotable
+            );
+            assert!(downstream.try_recv().is_err());
+            assert!(ingress.relay_table.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn application_alias_forwards_opaque_ask_tell_stop_without_capturing_other_nodes() {
         let ingress = Arc::new(Ingress::new(
