@@ -8,6 +8,7 @@ pub(crate) use outbound::Outbound;
 pub const CONTROL_KEY: &str = "parrot:ordered-control#v2";
 pub const RECEIPT_KEY: &str = "parrot:ordered-control-receipt#v2";
 pub const ENDPOINT_KEY: &str = "parrot:ordered-endpoint#v1";
+pub(crate) const OPEN_ALIAS: &str = "ordered endpoint resolution required (v1)";
 pub const DATA_KEY: &str = "parrot:ordered-tell#v2";
 pub const ADMIT_KEY: &str = "parrot:ordered-admit#v1";
 pub const ADMISSION_RECEIPT_KEY: &str = "parrot:ordered-admission-receipt#v1";

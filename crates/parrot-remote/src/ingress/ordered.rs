@@ -448,7 +448,18 @@ impl Ingress {
                 control.operation,
                 Operation::Open | Operation::OpenAdmission
             ) {
-                self.ordered_local_path(&frame.path)?;
+                match self.ordered_local_path(&frame.path) {
+                    Err(ErrCode::NotRemotable) if back.supports_ordered_endpoint() => {
+                        back.send_reply(Frame::reply_err(
+                            frame.header.correlation_id,
+                            "",
+                            ErrCode::NotRemotable,
+                            ordered::OPEN_ALIAS,
+                        ));
+                        return Ok(None);
+                    }
+                    other => other?,
+                }
             }
             match control.operation {
                 Operation::Open | Operation::OpenAdmission => {

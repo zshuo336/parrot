@@ -123,6 +123,169 @@ async fn endpoint_lookup_follows_authorized_aliases_and_observes_remapping() {
 struct Replaceable(RwLock<Target>);
 
 #[tokio::test]
+async fn mtls_hub_alias_close_cannot_cancel_a_reopened_direct_session() {
+    let pki = Pki::new();
+    let config = |name: &str| {
+        RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())).with_mtls(pki.node(name), [])
+    };
+    let source = start(
+        config("shared-tls-src").with_knobs(RuntimeKnobs {
+            reorder_stream_capacity: 1,
+            ..Default::default()
+        }),
+        Arc::new(Empty),
+    )
+    .await;
+    let hub = start(
+        config("shared-tls-hub").with_role(TopologyRole::Hub),
+        Arc::new(Empty),
+    )
+    .await;
+    let host = start(
+        config("shared-tls-host").with_ordered_relays(["shared-tls-hub".into()]),
+        Arc::new(AliasLookup(RwLock::new(Some(
+            "parrot://shared-tls-end/target".into(),
+        )))),
+    )
+    .await;
+    let (actor, mut received) = state();
+    let end = start(
+        config("shared-tls-end")
+            .with_ordered_relays(["shared-tls-hub".into(), "shared-tls-host".into()]),
+        Arc::new(Target(actor.clone())),
+    )
+    .await;
+    let hub_addr = NodeAddr::tcp("shared-tls-hub", hub.local_addr().unwrap());
+    let end_addr = NodeAddr::tcp("shared-tls-end", end.local_addr().unwrap());
+    source.connect(&hub_addr).await.unwrap();
+    host.connect(&hub_addr).await.unwrap();
+    host.connect(&end_addr).await.unwrap();
+    end.connect(&hub_addr).await.unwrap();
+    let alias = source.remote_ref("parrot://shared-tls-host/alias").unwrap();
+    let direct = source.remote_ref("parrot://shared-tls-end/target").unwrap();
+    strict(&direct, 40).await;
+    seen(&mut received, 40).await;
+    strict(&alias, 41).await;
+    seen(&mut received, 41).await;
+    source.connect(&end_addr).await.unwrap();
+    let timeout = Duration::from_secs(3);
+    direct.close_ordered_session(timeout).await.unwrap();
+    strict(&direct, 701).await;
+    tokio::time::timeout(timeout, actor.entered.notified())
+        .await
+        .unwrap();
+    alias.close_ordered_session(timeout).await.unwrap();
+    strict(&direct, 42).await;
+    actor.resume.notify_one();
+    for value in [701, 42] {
+        seen(&mut received, value).await;
+    }
+    direct.close_ordered_session(timeout).await.unwrap();
+    for node in [&source, &hub, &host, &end] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remapped_alias_retries_only_after_the_old_receiver_has_retired() {
+    let routes = Arc::new(AliasLookup(RwLock::new(Some(
+        "parrot://remap-old/target".into(),
+    ))));
+    let (held, _old_messages) = state();
+    let release = Release(held.clone());
+    let (next_actor, mut next_messages) = state();
+    let source = start(RemoteConfig::mem("remap-src"), Arc::new(Empty)).await;
+    let host = start(RemoteConfig::mem("remap-host"), routes.clone()).await;
+    let old = start(
+        RemoteConfig::mem("remap-old").with_ordered_relays(["remap-host".into()]),
+        Arc::new(Target(held.clone())),
+    )
+    .await;
+    let next = start(
+        RemoteConfig::mem("remap-next").with_ordered_relays(["remap-host".into()]),
+        Arc::new(Target(next_actor)),
+    )
+    .await;
+    source.connect_mem_pair(&host).await.unwrap();
+    host.connect_mem_pair(&old).await.unwrap();
+    host.connect_mem_pair(&next).await.unwrap();
+    let reference = source.remote_ref("parrot://remap-host/alias").unwrap();
+    strict(&reference, 700).await;
+    let timeout = Duration::from_secs(3);
+    tokio::time::timeout(timeout, held.entered.notified())
+        .await
+        .unwrap();
+    *routes.0.write().unwrap() = Some("parrot://remap-next/target".into());
+    let send = |value| {
+        let reference = reference.clone();
+        tokio::spawn(async move {
+            reference
+                .deliver_ordered(Box::new(Work(value)), Default::default())
+                .await
+        })
+    };
+    let interrupted = send(801);
+    tokio::time::timeout(timeout, held.dropping.notified())
+        .await
+        .unwrap();
+    interrupted.abort();
+    assert!(interrupted.await.unwrap_err().is_cancelled());
+    let mut retry = send(802);
+    assert!(tokio::time::timeout(Duration::from_millis(80), &mut retry)
+        .await
+        .is_err());
+    assert!(matches!(
+        next_messages.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    release.release();
+    retry.await.unwrap().unwrap();
+    assert!(held.dropped.load(Ordering::Acquire));
+    seen(&mut next_messages, 802).await;
+    reference.close_ordered_session(timeout).await.unwrap();
+    for node in [&source, &host, &old, &next] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn strict_alias_and_direct_path_share_the_receiving_worker() {
+    let routes = Arc::new(AliasLookup(RwLock::new(Some(
+        "parrot://shared-end/target".into(),
+    ))));
+    let (actor, mut received) = state();
+    let source = start(RemoteConfig::mem("shared-src"), Arc::new(Empty)).await;
+    let host = start(RemoteConfig::mem("shared-host"), routes).await;
+    let end = start(
+        RemoteConfig::mem("shared-end").with_ordered_relays(["shared-host".into()]),
+        Arc::new(Target(actor.clone())),
+    )
+    .await;
+    source.connect_mem_pair(&host).await.unwrap();
+    host.connect_mem_pair(&end).await.unwrap();
+    let alias = source.remote_ref("parrot://shared-host/alias").unwrap();
+    strict(&alias, 701).await;
+    tokio::time::timeout(Duration::from_secs(3), actor.entered.notified())
+        .await
+        .unwrap();
+    source.connect_mem_pair(&end).await.unwrap();
+    let direct = source.remote_ref("parrot://shared-end/target").unwrap();
+    strict(&direct, 702).await;
+    strict(&alias, 703).await;
+    actor.resume.notify_one();
+    for value in [701, 702, 703] {
+        seen(&mut received, value).await;
+    }
+    alias
+        .close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    for node in [&source, &host, &end] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn cyclic_alias_lookups_end_at_the_hop_limit_and_leave_the_link_usable() {
     let source = start(
         RemoteConfig::mem("cycle-src").with_knobs(RuntimeKnobs {

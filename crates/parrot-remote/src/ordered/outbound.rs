@@ -19,6 +19,37 @@ use std::{
 };
 use tokio::time::Instant;
 
+mod aliases;
+
+enum Attempt {
+    Delivered,
+    Legacy(Frame),
+    Alias(Frame),
+    Full(Frame),
+}
+
+#[derive(Debug)]
+enum LaneError {
+    Stopped,
+    Full,
+}
+
+impl From<LaneError> for ActorError {
+    fn from(error: LaneError) -> Self {
+        match error {
+            LaneError::Stopped => Self::Stopped,
+            LaneError::Full => ErrCode::Overloaded
+                .to_actor_error("outgoing ordered destination capacity exhausted".into()),
+        }
+    }
+}
+
+enum Admission {
+    Accepted,
+    Inactive,
+    Alias,
+}
+
 struct Grant {
     receipt: Receipt,
     sender: FrameSender,
@@ -60,6 +91,7 @@ pub(crate) struct Outbound {
     lanes: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Lane>>>>,
     closed: AtomicBool,
     cancel: tokio_util::sync::CancellationToken,
+    aliases: aliases::AliasRoutes,
 }
 
 /// A negotiation owns its destination slot while any sender or closer still uses it.
@@ -102,11 +134,13 @@ impl Drop for LaneUse<'_> {
         // Release this reference under the map lock so simultaneous cancellations
         // cannot both see another owner and abandon the slot.
         drop(lane);
-        if let Some(unique) = Arc::get_mut(entry) {
-            let state = unique.get_mut();
-            if state.grant.is_none() && !state.sent_ordered {
-                lanes.remove(self.destination);
-            }
+        // Alias bindings carry weak identities, never an owner of this lane.
+        if Arc::strong_count(entry) == 1
+            && entry
+                .try_lock()
+                .is_ok_and(|state| state.grant.is_none() && !state.sent_ordered)
+        {
+            lanes.remove(self.destination);
         }
     }
 }
@@ -120,6 +154,7 @@ impl Outbound {
             lanes: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             cancel: tokio_util::sync::CancellationToken::new(),
+            aliases: Default::default(),
         }
     }
 
@@ -167,6 +202,7 @@ impl Outbound {
     pub fn close(&self) {
         self.close_admission();
         self.cancel.cancel();
+        self.aliases.clear();
         let retired = std::mem::take(&mut *self.lanes.lock().unwrap());
         drop(retired);
     }
@@ -175,10 +211,10 @@ impl Outbound {
         &self,
         destination: &str,
         supports_ordered: bool,
-    ) -> ActorResult<Option<Arc<tokio::sync::Mutex<Lane>>>> {
+    ) -> Result<Option<Arc<tokio::sync::Mutex<Lane>>>, LaneError> {
         let mut lanes = self.lanes.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
-            return Err(ActorError::Stopped);
+            return Err(LaneError::Stopped);
         }
         if let Some(lane) = lanes.get(destination) {
             return Ok(Some(lane.clone()));
@@ -187,8 +223,7 @@ impl Outbound {
             return Ok(None);
         }
         if lanes.len() >= self.capacity {
-            return Err(ErrCode::Overloaded
-                .to_actor_error("outgoing ordered destination capacity exhausted".into()));
+            return Err(LaneError::Full);
         }
         let lane = Arc::new(tokio::sync::Mutex::new(Lane::default()));
         lanes.insert(destination.into(), lane.clone());
@@ -197,7 +232,8 @@ impl Outbound {
 
     /// Some(frame) is an explicit pre-session compatibility fallback. Once any
     /// ordered data has been published, route changes cannot downgrade the lane.
-    pub async fn send(
+    #[cfg(test)]
+    async fn send(
         &self,
         destination: &str,
         sender: &FrameSender,
@@ -209,7 +245,12 @@ impl Outbound {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => Err(ActorError::Stopped),
-                result = self.send_open(destination, sender, callbacks, frame, required) => result,
+                result = self.send_open(destination, sender, callbacks, frame, required, None) => match result? {
+                    Attempt::Delivered => Ok(None),
+                    Attempt::Legacy(frame) => Ok(Some(frame)),
+                    Attempt::Alias(_) => Err(ErrCode::NotRemotable.to_actor_error(super::OPEN_ALIAS.into())),
+                    Attempt::Full(_) => Err(LaneError::Full.into()),
+                },
             }
         })
         .await
@@ -222,12 +263,20 @@ impl Outbound {
         callbacks: &CallbackRegistry,
         frame: Frame,
         required: bool,
-    ) -> ActorResult<Option<Frame>> {
+        binding: Option<(&str, &super::OrderedEndpoint)>,
+    ) -> ActorResult<Attempt> {
         let routed = destination != sender.node_id();
         let supports_ordered =
             sender.supports_ordered_tell() && (!routed || sender.supports_ordered_admission());
-        let Some(lane) = self.lane(destination, supports_ordered)? else {
-            return legacy_fallback(frame, required);
+        let lane = match self.lane(destination, supports_ordered) {
+            Ok(Some(lane)) => lane,
+            Ok(None) => return legacy_fallback(frame, required),
+            Err(LaneError::Full)
+                if required && binding.is_none() && sender.supports_ordered_endpoint() =>
+            {
+                return Ok(Attempt::Full(frame));
+            }
+            Err(error) => return Err(error.into()),
         };
         let mut usage = LaneUse::new(self, destination, lane);
         let mut state = usage.lane.as_ref().expect("live lane handle").lock().await;
@@ -238,6 +287,23 @@ impl Outbound {
         if !supports_ordered {
             return legacy_fallback(frame, required || state.sent_ordered);
         }
+        if binding.is_some() && !sender.supports_ordered_admission() {
+            return Err(ErrCode::NotRemotable
+                .to_actor_error("resolved endpoint requires receiver admission".into()));
+        }
+        let bind_ticket = |ticket| {
+            if let Some((alias, endpoint)) = binding {
+                self.aliases.bind(
+                    alias,
+                    endpoint,
+                    usage.lane.as_ref().expect("live lane handle"),
+                    ticket,
+                    self.capacity,
+                )?;
+            }
+            Ok::<_, ActorError>(())
+        };
+        let expected_receiver = binding.map(|(_, endpoint)| endpoint.receiver);
         let mut retried = false;
         loop {
             if state.sequence == u64::MAX {
@@ -269,6 +335,7 @@ impl Outbound {
             }
             let refresh = state.grant.as_ref().is_none_or(|grant| {
                 !grant.receipt.active
+                    || expected_receiver.is_some_and(|receiver| receiver != grant.receipt.receiver)
                     || grant.path != frame.path
                     || grant.renew_at <= Instant::now()
                     || grant.sender.dispatch_key() != sender.dispatch_key()
@@ -298,11 +365,23 @@ impl Outbound {
                 .await;
                 let mut receipt = match opened {
                     Ok(receipt) => receipt,
+                    Err((ErrCode::NotRemotable, detail))
+                        if required
+                            && sender.supports_ordered_endpoint()
+                            && detail == super::OPEN_ALIAS =>
+                    {
+                        return Ok(Attempt::Alias(frame))
+                    }
                     Err((ErrCode::NotRemotable, _)) if !required && !state.sent_ordered => {
-                        return Ok(Some(frame))
+                        return Ok(Attempt::Legacy(frame))
                     }
                     Err((code, detail)) => return Err(code.to_actor_error(detail)),
                 };
+                if expected_receiver.is_some_and(|receiver| receiver != receipt.receiver) {
+                    return Err(
+                        ErrCode::Stopped.to_actor_error("resolved ordered receiver changed".into())
+                    );
+                }
                 if let Some(previous) = state
                     .grant
                     .as_ref()
@@ -332,6 +411,7 @@ impl Outbound {
                     )
                     .await?;
                 }
+                bind_ticket(receipt.ticket)?;
                 usage.retained = true;
                 if !receipt.active {
                     if state.grant.as_ref().is_none_or(|grant| {
@@ -386,8 +466,10 @@ impl Outbound {
                     renew_at: Instant::now()
                         + Duration::from_millis((receipt.lease_ms / 2).max(1) as u64),
                 });
+            } else {
+                bind_ticket(state.grant.as_ref().expect("active grant").receipt.ticket)?;
             }
-            if self
+            match self
                 .publish(
                     &mut state,
                     &frame,
@@ -398,7 +480,14 @@ impl Outbound {
                 )
                 .await?
             {
-                return Ok(None);
+                Admission::Accepted => return Ok(Attempt::Delivered),
+                Admission::Alias if required && sender.supports_ordered_endpoint() => {
+                    return Ok(Attempt::Alias(frame))
+                }
+                Admission::Alias => {
+                    return Err(ErrCode::NotRemotable.to_actor_error(super::OPEN_ALIAS.into()))
+                }
+                Admission::Inactive => {}
             }
             // A matching negative receipt proves this attempt never entered the worker.
             // Preserve its grant so refresh must still fence any previous receiver.
@@ -420,7 +509,7 @@ impl Outbound {
         callbacks: &CallbackRegistry,
         destination: &str,
         confirm_admission: bool,
-    ) -> ActorResult<bool> {
+    ) -> ActorResult<Admission> {
         let mut frame = original.clone();
         let receipt = state.grant.as_ref().expect("confirmed grant").receipt;
         let sequence = state.sequence.checked_add(1).ok_or_else(|| {
@@ -472,12 +561,13 @@ impl Outbound {
         state.sent_ordered = true;
         permit.send(frame);
         let Some((reply, _guard)) = pending else {
-            return Ok(true);
+            return Ok(Admission::Accepted);
         };
         tokio::select! {
             biased;
             result = reply => match result {
                 Ok(ReplyPayload::Ok(bytes, key)) if key == ADMISSION_RECEIPT_KEY => id.outcome(&bytes)
+                    .map(|admitted| if admitted { Admission::Accepted } else { Admission::Inactive })
                     .ok_or_else(|| ErrCode::ProtocolViolation.to_actor_error("ordered admission identity differs".into())),
                 Ok(ReplyPayload::Err(ErrCode::Overloaded, detail)) if detail == id.capacity_error() => {
                     // We still hold the lane lock. Only this exact attempted sequence
@@ -488,7 +578,7 @@ impl Outbound {
                 Ok(ReplyPayload::Err(ErrCode::NotRemotable, detail)) if detail == id.alias_error() => {
                     state.sequence -= 1;
                     state.grant.as_mut().expect("confirmed grant").renew_at = Instant::now();
-                    Err(ErrCode::NotRemotable.to_actor_error("ordered destination now points to a remote alias".into()))
+                    Ok(Admission::Alias)
                 }
                 Ok(ReplyPayload::Err(code @ (ErrCode::ActorNotFound | ErrCode::Timeout | ErrCode::ProtocolViolation), detail))
                     if detail == id.endpoint_error() => {
@@ -511,12 +601,33 @@ impl Outbound {
         callbacks: &CallbackRegistry,
         deadline: Instant,
     ) -> ActorResult<()> {
+        self.close_matching(
+            destination,
+            resolve_sender,
+            callbacks,
+            deadline,
+            aliases::CloseScope::Node,
+        )
+        .await
+    }
+
+    async fn close_matching(
+        &self,
+        destination: &str,
+        resolve_sender: impl std::future::Future<Output = Option<FrameSender>>,
+        callbacks: &CallbackRegistry,
+        deadline: Instant,
+        scope: aliases::CloseScope<'_>,
+    ) -> ActorResult<()> {
         let lane = {
             let lanes = self.lanes.lock().unwrap();
             if self.closed.load(Ordering::Acquire) {
                 return Err(ActorError::Stopped);
             }
-            lanes.get(destination).cloned()
+            lanes
+                .get(destination)
+                .filter(|lane| scope.matches_lane(lane))
+                .cloned()
         };
         let Some(lane) = lane else {
             return Ok(());
@@ -527,7 +638,7 @@ impl Outbound {
             tokio::time::timeout_at(deadline, async {
                 let mut state = lane.lock().await;
                 usage.retained = state.grant.is_some() || state.sent_ordered;
-                if state.closed {
+                if state.closed || !scope.matches_grant(state.grant.as_ref()) {
                     return Ok(());
                 }
                 if let Some(grant) = &state.grant {
@@ -571,12 +682,12 @@ impl Outbound {
     }
 }
 
-fn legacy_fallback(frame: Frame, requires_ordered: bool) -> ActorResult<Option<Frame>> {
+fn legacy_fallback(frame: Frame, requires_ordered: bool) -> ActorResult<Attempt> {
     if requires_ordered {
         return Err(ErrCode::NotRemotable
             .to_actor_error("route does not support ordered TELL sessions".into()));
     }
-    Ok(Some(frame))
+    Ok(Attempt::Legacy(frame))
 }
 
 struct Route<'a> {

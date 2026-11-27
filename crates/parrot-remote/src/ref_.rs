@@ -100,7 +100,7 @@ impl RemoteInner {
             .map(|(_, s, _)| s.clone())
             .or_else(|| self.uplink.clone().filter(|s| !s.is_closed()))
     }
-    async fn ensure_sender(&self, node_id: &str) -> Option<FrameSender> {
+    pub(crate) async fn ensure_sender(&self, node_id: &str) -> Option<FrameSender> {
         if let Some(system) = &self.system {
             crate::system::RemoteActorSystem::sender_for(system, node_id).await
         } else {
@@ -233,12 +233,7 @@ impl RemoteActorRef {
                     .to_actor_error("ordered sessions require an owning remote system".into())
             })?;
         outbound
-            .close_lane(
-                &self.node_id,
-                self.inner.ensure_sender(&self.node_id),
-                &self.inner.callbacks,
-                deadline,
-            )
+            .close_reference(&self.node_id, &self.path, &self.inner, deadline)
             .await
     }
 
@@ -281,13 +276,7 @@ impl RemoteActorRef {
                         .map(|system| system.outbound_ordered.clone());
                     if let Some(outbound) = outbound {
                         match outbound
-                            .send(
-                                &self.node_id,
-                                &sender,
-                                &self.inner.callbacks,
-                                frame,
-                                required,
-                            )
+                            .send_reference(&self.node_id, &sender, &self.inner, frame, required)
                             .await?
                         {
                             None => return Ok(()),
