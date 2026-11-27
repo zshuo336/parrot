@@ -1,3 +1,6 @@
+#[path = "support/isolated.rs"]
+mod isolated;
+
 use futures::FutureExt;
 use parrot_api::{
     actor::{Actor, ActorState, EmptyConfig},
@@ -414,24 +417,15 @@ async fn successful_child_keeps_real_parent_address_message_and_lifecycle() {
 }
 #[test]
 fn child_configuration_and_actor_panics_are_isolated_in_real_process() {
-    const FLAG: &str = "PARROT_CHILD_INPUT_DOUBLE_PANIC";
-    if std::env::var_os(FLAG).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "child_configuration_and_actor_panics_are_isolated_in_real_process",
-                "--nocapture",
-            ])
-            .env(FLAG, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    isolated::run(
+        "child_configuration_and_actor_panics_are_isolated_in_real_process",
+        "PARROT_CHILD_INPUT_DOUBLE_PANIC",
+        std::time::Duration::from_secs(30),
+        child_input_double_panic,
+    );
+}
+
+fn child_input_double_panic() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

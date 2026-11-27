@@ -1,3 +1,6 @@
+#[path = "support/isolated.rs"]
+mod isolated;
+
 use parrot::actix::{ActixActor, ActixActorSystem, ActixContext};
 use parrot_api::{
     actor::{ActixEngineExt, Actor, ActorState, EmptyConfig},
@@ -530,25 +533,15 @@ async fn dynamic_lifecycle_stays_on_owning_arbiter() {
 
 #[test]
 fn host_runtime_teardown_does_not_construct_hook_without_a_reactor() {
-    const CHILD: &str = "PARROT_ACTIX_TEARDOWN_PROBE";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "host_runtime_teardown_does_not_construct_hook_without_a_reactor",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "isolated teardown regression failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    isolated::run(
+        "host_runtime_teardown_does_not_construct_hook_without_a_reactor",
+        "PARROT_ACTIX_TEARDOWN_PROBE",
+        std::time::Duration::from_secs(30),
+        host_teardown,
+    );
+}
+
+fn host_teardown() {
     let panics = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = panics.clone();
     let previous = std::panic::take_hook();

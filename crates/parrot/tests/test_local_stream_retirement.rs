@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 #[derive(Default)]
 struct Stats {
@@ -138,52 +138,37 @@ async fn bounded<F: std::future::Future>(future: F) -> F::Output {
         .await
         .expect("actor cleanup deadline")
 }
+#[path = "support/isolated.rs"]
+mod isolated_child;
+
 fn isolated(name: &str, body: impl FnOnce()) {
-    if std::env::var("PARROT_LOCAL_ENGINE_RETIREMENT_CASE")
-        .ok()
-        .as_deref()
-        == Some(name)
-    {
-        // Expected nested panics force std's symbolic backtrace even with
-        // RUST_BACKTRACE=0; keep that diagnostic work out of actor deadlines.
-        let original = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if info.payload().is::<Payload>() {
-                return;
-            }
-            let text = info
-                .payload()
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str));
-            if !matches!(
-                text,
-                Some("payload destructor" | "source destructor 0" | "source destructor 1")
-            ) {
-                original(info);
-            }
-        }));
-        body();
-        return;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("PARROT_LOCAL_ENGINE_RETIREMENT_CASE", name)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "actor child {name}: {status}");
-            return;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("actor child deadline: {name}");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    isolated_child::run(
+        name,
+        "PARROT_LOCAL_ENGINE_RETIREMENT_CASE",
+        Duration::from_secs(30),
+        || {
+            // Expected nested panics force std's symbolic backtrace even with
+            // RUST_BACKTRACE=0; keep that diagnostic work out of actor deadlines.
+            let original = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if info.payload().is::<Payload>() {
+                    return;
+                }
+                let text = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str));
+                if !matches!(
+                    text,
+                    Some("payload destructor" | "source destructor 0" | "source destructor 1")
+                ) {
+                    original(info);
+                }
+            }));
+            body();
+        },
+    );
 }
 fn run(init_error: bool, hostile: bool, poll_hostile: bool) {
     actix::System::new().block_on(async {

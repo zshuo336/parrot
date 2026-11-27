@@ -1,8 +1,8 @@
 //! Unpublished outputs must outlive actual actor cleanup, including public stop expiry.
-use parrot::{
-    system::{ActorSystemImpl, ParrotActorSystem},
-    thread::{SchedulingMode, ThreadActorSystem, ThreadActorSystemConfig},
-};
+#[path = "support/pending_retirement.rs"]
+mod pending_retirement;
+
+use parrot::system::{ActorSystemImpl, ParrotActorSystem};
 use parrot_api::{
     actor::{Actor, ActorState},
     address::{ActorRef, RetirementStatus},
@@ -246,32 +246,7 @@ async fn check_fault(route: usize, cancel: bool, backend: usize, fault: usize) {
         .observation_panics
         .store(usize::from(fault == 3), Ordering::SeqCst);
     let release = Release(state.clone());
-    let native: Arc<dyn AsyncEngineRuntime> = if backend == 3 {
-        Arc::new(
-            parrot::actix::ActixActorSystem::with_settings(parrot::actix::ActixSystemSettings {
-                arbiter_count: 1,
-                shutdown_timeout: Duration::from_millis(30),
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        )
-    } else {
-        ThreadActorSystem::shared(ThreadActorSystemConfig {
-            shutdown_timeout: Duration::from_millis(30),
-            default_scheduling_mode: match backend {
-                0 => SchedulingMode::SharedPool {
-                    max_messages_per_run: 32,
-                },
-                1 => SchedulingMode::DedicatedThread,
-                2 => SchedulingMode::Sharded {
-                    affinity_key: "late-retirement".into(),
-                },
-                _ => unreachable!(),
-            },
-            ..Default::default()
-        })
-    };
+    let native = pending_retirement::native_runtime(backend, "late-retirement").await;
     let facade = ParrotActorSystem::new(Default::default()).await.unwrap();
     let extension = Arc::new(Extension {
         native,
@@ -291,7 +266,12 @@ async fn check_fault(route: usize, cancel: bool, backend: usize, fault: usize) {
             let actor_state = state.clone();
             facade.spawn_factory_on(
                 "external",
-                Box::new(move || Box::new(Member(actor_state.clone()))),
+                Box::new(move || {
+                    // Initial construction may outlast a stop deadline before
+                    // there is a published actor to stop.
+                    std::thread::sleep(pending_retirement::STOP_TIMEOUT * 2);
+                    Box::new(Member(actor_state.clone()))
+                }),
                 FactoryOptions {
                     spawn: SpawnOptions::at("/late/member"),
                     ..Default::default()
@@ -306,7 +286,10 @@ async fn check_fault(route: usize, cancel: bool, backend: usize, fault: usize) {
         _ => unreachable!(),
     };
     tokio::select! {
-        result = &mut work => panic!("creation returned before actor Drop entered: {}", result.is_err()),
+        result = &mut work => panic!(
+            "creation returned before actor Drop entered: error={:?}, published={}",
+            result.err(), state.reference.lock().unwrap().is_some()
+        ),
         _ = until(&state.entered) => {}
     }
     let reference = state

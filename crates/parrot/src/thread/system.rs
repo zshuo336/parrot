@@ -593,7 +593,9 @@ impl ThreadActorSystem {
         Self::with_guardian_and_timeouts(config, guardian, Default::default())
     }
 
-    pub(crate) fn with_guardian_and_timeouts(
+    /// Start with native scheduling settings, a root supervision policy, and explicit
+    /// creation, handler and shutdown deadlines. Zero retains the native defaults.
+    pub fn with_guardian_and_timeouts(
         config: ThreadActorSystemConfig,
         guardian: parrot_api::system::GuardianConfig,
         timeouts: parrot_api::system::SystemTimeouts,

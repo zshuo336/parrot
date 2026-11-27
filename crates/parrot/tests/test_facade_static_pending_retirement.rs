@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Cancellation must retain a static result's reservation until actual retirement.
-use parrot::{
-    system::ParrotActorSystem,
-    thread::{SchedulingMode, ThreadActorSystem, ThreadActorSystemConfig},
-};
+#[path = "support/pending_retirement.rs"]
+mod pending_retirement;
+
+use parrot::system::ParrotActorSystem;
 use parrot_api::{
     actor::{Actor, ActorState},
     address::RetirementStatus,
@@ -159,32 +159,7 @@ async fn until(mut condition: impl FnMut() -> bool) {
     .expect("actual lifecycle phase did not complete");
 }
 async fn check(backend: usize, factory: bool) {
-    let native: Arc<dyn AsyncEngineRuntime> = if backend == 3 {
-        Arc::new(
-            parrot::actix::ActixActorSystem::with_settings(parrot::actix::ActixSystemSettings {
-                arbiter_count: 1,
-                shutdown_timeout: Duration::from_millis(30),
-                ..Default::default()
-            })
-            .await
-            .unwrap(),
-        )
-    } else {
-        ThreadActorSystem::shared(ThreadActorSystemConfig {
-            shutdown_timeout: Duration::from_millis(30),
-            default_scheduling_mode: match backend {
-                0 => SchedulingMode::SharedPool {
-                    max_messages_per_run: 32,
-                },
-                1 => SchedulingMode::DedicatedThread,
-                2 => SchedulingMode::Sharded {
-                    affinity_key: "static-retirement".into(),
-                },
-                _ => unreachable!(),
-            },
-            ..Default::default()
-        })
-    };
+    let native = pending_retirement::native_runtime(backend, "static-retirement").await;
     let facade = ParrotActorSystem::new(Default::default()).await.unwrap();
     facade
         .register_runtime("native".into(), native, true)

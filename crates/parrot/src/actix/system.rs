@@ -592,7 +592,9 @@ impl ActixActorSystem {
         Self::with_guardian_and_timeouts(settings, guardian, Default::default())
     }
 
-    pub(crate) fn with_guardian_and_timeouts(
+    /// Start with native arbiter settings, a root supervision policy, and explicit
+    /// creation, handler and shutdown deadlines. Zero retains the native defaults.
+    pub fn with_guardian_and_timeouts(
         settings: ActixSystemSettings,
         guardian: parrot_api::system::GuardianConfig,
         timeouts: parrot_api::system::SystemTimeouts,
