@@ -118,7 +118,7 @@ def config_from_environment(directory, environment=None):
     jar = ROOT / 'interop/jvm/target/parrot-protocol-jvm-0.1.0.jar'
     for path in [jar, ROOT / 'interop/jvm/target/cp.txt', ROOT / 'interop/erlang/parrot_gw.beam', ROOT / 'interop/erlang/parrot_trace.beam', ROOT / 'interop/erlang/parrot_component_runtime.beam', ROOT / 'interop/erlang/parrot_beam_snapshot.beam', ROOT / 'interop/erlang/parrot_beam_guest.beam', ROOT / 'interop/erlang/parrot_beam_host.beam']:
         if not path.is_file():
-            raise ValueError(f'missing gateway artifact: {path}; run make check-jvm check-erl')
+            raise ValueError(f'missing gateway artifact: {path}; run make build-jvm build-erl')
     classpath = (ROOT / 'interop/jvm/target/cp.txt').read_text().strip()
     # Resolve relative classpath entries in the same directory as the old JVM entrypoint.
     cwd = ROOT / 'interop/jvm/target'

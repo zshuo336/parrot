@@ -1,13 +1,40 @@
 import json
 from pathlib import Path
+import queue
 import socket
 import sys
 import tempfile
 import unittest
 
-from run_gateways import OwnedGateways, manager
+from run_gateways import OwnedGateways, check_watch_samples, manager
 
 FIXTURE=Path(__file__).with_name('gateway_fixture.py')
+
+
+class WatchSamples(unittest.TestCase):
+    nodes = ('erl-gw-1', 'jvm-search-1', 'ray-gw-1')
+
+    def check_rounds(self, first, second):
+        ready = queue.Queue()
+        for tick, rows in enumerate((first, second)):
+            for name, rate in rows:
+                ready.put(f'{tick}.0s] {name}: asks/s={rate} tells/s=0.00')
+        ready.put(None)
+        check_watch_samples(ready, self.nodes)
+
+    def test_both_rounds_cover_all_nodes_in_any_order(self):
+        self.check_rounds([(n, 'n/a') for n in self.nodes], [(n, '0.00') for n in reversed(self.nodes)])
+
+    def test_missing_duplicate_or_unmeasured_second_sample_fails(self):
+        first = [(n, 'n/a') for n in self.nodes]
+        second = [(n, '0.00') for n in self.nodes]
+        for bad in [second[:-1], second[:2] + [second[0]], second[:2] + [(self.nodes[2], 'n/a')]]:
+            with self.subTest(second=bad), self.assertRaises(AssertionError):
+                self.check_rounds(first, bad)
+
+    def test_first_round_must_establish_a_baseline(self):
+        with self.assertRaises(AssertionError):
+            self.check_rounds([(n, '0.00') for n in self.nodes], [(n, '0.00') for n in self.nodes])
 
 
 class RunnerOwnership(unittest.TestCase):

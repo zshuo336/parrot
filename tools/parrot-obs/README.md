@@ -23,7 +23,9 @@ cargo run --locked -p parrot-obs -- --help
 cargo test --locked -p parrot-obs --all-targets
 cargo clippy --locked -p parrot-obs --all-targets -- -D warnings
 node --test tools/parrot-obs/tests/dashboard.test.cjs
-# 需先构建 JVM / Erlang 网关并安装 interop/python[ray]：
+# 需先为运行脚本的 Python 安装 interop/python[ray]
+make build-jvm build-erl
+cargo build --locked -p parrot-obs
 python3 tools/parrot-obs/tests/run_gateways.py
 ```
 

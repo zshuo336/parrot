@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the real obs binary against owned Erlang, JVM and Ray gateway processes.
 
-Prerequisites: cargo build --locked -p parrot-obs; make check-erl check-jvm;
+Prerequisites: cargo build --locked -p parrot-obs; make build-erl build-jvm;
 install interop/python[ray]. Missing artifacts/tools fail, never silently skip.
 """
 from contextlib import ExitStack
@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 import os
 import queue
+import re
 import signal
 import socket
 import json
@@ -93,6 +94,21 @@ class ObservedCli:
         self.process.stdout.close()
 
 
+def check_watch_samples(ready, nodes):
+    for round_number in (1, 2):
+        remaining = set(nodes)
+        while remaining:
+            sample = ready.get(timeout=15)
+            row = re.match(r'^\d+\.\d+s\] (\S+): asks/s=(\S+)(?:\s|$)', sample or '')
+            if not row or row[1] not in remaining:
+                raise AssertionError(f"watch round {round_number} expected {sorted(remaining)}, got {sample!r}")
+            name, rate = row.groups()
+            expected = r'n/a' if round_number == 1 else r'\d+\.\d+'
+            if not re.fullmatch(expected, rate):
+                raise AssertionError(f"watch round {round_number} got {rate!r} for {name}")
+            remaining.remove(name)
+
+
 def run():
     binary = ROOT / "target/debug/parrot-obs"
     if not binary.is_file():
@@ -115,12 +131,7 @@ def run():
         # Watch must produce a second sampling round and honor graceful interruption.
         watcher = ObservedCli([str(binary), "watch", *nodes, "--interval=1", "--insecure-development"], "[")
         cleanup.callback(watcher.close)
-        for _ in range(4):
-            sample = watcher.ready.get(timeout=15)
-            if sample is None or "asks/s=" not in sample:
-                raise AssertionError(f"watch failed: {sample!r}")
-        if "asks/s=n/a" in sample:
-            raise AssertionError("second sampling round failed to establish a rate")
+        check_watch_samples(watcher.ready, gateways.snapshot["nodes"].values())
         watcher.process.send_signal(signal.SIGINT)
         if watcher.process.wait(timeout=10) != 0:
             raise AssertionError("watch did not shut down cleanly on Ctrl-C")
