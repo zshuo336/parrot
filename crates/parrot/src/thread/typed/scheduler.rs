@@ -146,7 +146,7 @@ impl Driver {
                 .schedule_affinity(path, mailbox, affinity_key)
                 .map_err(SystemError::ThreadSetupError)?,
             SchedulingMode::SharedPool { .. } => {
-                unreachable!("shared static polls keep their executor")
+                group.shared_scheduler.schedule_now(path, mailbox, None)?;
             }
         }
         self.scheduled.store(true, Ordering::Release);
@@ -166,11 +166,12 @@ impl Driver {
             let result = group
                 .retire_actor(path, mode, self.clone(), slots, deadline)
                 .await;
-            if matches!(mode, SchedulingMode::Sharded { .. }) {
+            // The system registry reserves this path until finish returns.
+            if matches!(mode, SchedulingMode::SharedPool { .. }) {
+                let _ = group.shared_scheduler.deschedule(path).await;
+            } else if matches!(mode, SchedulingMode::Sharded { .. }) {
                 let shard = group.sharded_scheduler.lock().unwrap().clone();
                 if let Some(shard) = shard {
-                    // The system registry still retains this generation until
-                    // finish returns, so its path cannot yet name a replacement.
                     let _ = shard.deschedule(path);
                 }
             }

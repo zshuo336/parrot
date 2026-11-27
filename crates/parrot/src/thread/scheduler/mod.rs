@@ -376,6 +376,7 @@ pub trait ThreadScheduler: fmt::Debug + Send + Sync {
 /// It provides a way to manage and access both schedulers.
 pub struct SchedulerGroup {
     pub shared_scheduler: Arc<SharedThreadPool>,
+    pub(crate) shared_placement: bool,
     pub dedicated_scheduler: Arc<DedicatedThreadScheduler>,
     /// Lazily-started shard pool (ADR-14). Shard count defaults to CPU count;
     /// started on first `Sharded` actor spawn.
@@ -624,6 +625,7 @@ impl ThreadSchedulerFactory {
             DedicatedThreadScheduler::try_new(Some(dedicated_config))?
                 .with_runtime_handle(self.runtime_handle.clone()),
         );
+        let shared_placement = !matches!(worker_strategy, LoadBalancingStrategy::RoundRobin);
         let shared_scheduler = Arc::new(SharedThreadPool::try_new_with_strategy(
             Some(config),
             self.runtime_handle.clone(),
@@ -631,6 +633,7 @@ impl ThreadSchedulerFactory {
         )?);
         Ok(SchedulerGroup {
             shared_scheduler,
+            shared_placement,
             dedicated_scheduler,
             sharded_scheduler: Mutex::new(None),
             sharded_default_size,

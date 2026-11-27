@@ -1055,7 +1055,7 @@ impl ThreadActorSystem {
                             task_control.lifetime.set_strategy(strategy);
                             run_typed_actor(inputs, task_control, batch_size, runtime).await
                 };
-                let (execution, driver) = if matches!(mode, crate::thread::config::SchedulingMode::SharedPool { .. }) {
+                let (execution, driver) = if matches!(mode, crate::thread::config::SchedulingMode::SharedPool { .. }) && !group.shared_placement {
                     (execution_runtime.spawn(async move {
                         let permit = slots.clone().acquire_owned().await?;
                         crate::thread::scheduler::shared::poll_isolated_with_retirement(

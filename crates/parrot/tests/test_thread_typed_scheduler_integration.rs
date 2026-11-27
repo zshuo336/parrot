@@ -20,6 +20,7 @@ use std::{
 enum Op {
     Owner,
     Hold(Arc<tokio::sync::Notify>),
+    Block(Arc<Drops>),
 }
 impl Message for Op {
     type Result = ThreadId;
@@ -31,6 +32,15 @@ struct Drops {
     gate: Option<(Mutex<bool>, Condvar)>,
 }
 impl Drops {
+    fn wait(&self) {
+        self.entered.notify_one();
+        if let Some((open, changed)) = &self.gate {
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = changed.wait(open).unwrap();
+            }
+        }
+    }
     fn release(&self) {
         if let Some((open, changed)) = &self.gate {
             *open.lock().unwrap() = true;
@@ -47,13 +57,7 @@ impl Drop for Release {
 struct Static(Arc<Drops>);
 impl Drop for Static {
     fn drop(&mut self) {
-        self.0.entered.notify_one();
-        if let Some((open, changed)) = &self.0.gate {
-            let mut open = open.lock().unwrap();
-            while !*open {
-                open = changed.wait(open).unwrap();
-            }
-        }
+        self.0.wait();
         self.0
             .owners
             .lock()
@@ -71,6 +75,10 @@ impl ParrotTypedDispatch for Static {
                 Op::Hold(entered) => {
                     entered.notify_one();
                     std::future::pending().await
+                }
+                Op::Block(gate) => {
+                    gate.wait();
+                    Ok(std::thread::current().id())
                 }
             }
         })
@@ -120,6 +128,81 @@ async fn empty(system: &ThreadActorSystem) {
     })
     .await
     .expect("actual registration retirement stalled");
+}
+
+#[tokio::test]
+async fn explicit_shared_placement_enforces_one_poll_budget_across_both_protocols() {
+    use parrot_api::runtime::{LoadBalancingStrategy, RuntimeConfig, SchedulerConfig};
+    for strategy in [
+        LoadBalancingStrategy::Random,
+        LoadBalancingStrategy::LeastLoaded,
+    ] {
+        let system = ThreadActorSystem::with_runtime_config(
+            ThreadActorSystemConfig {
+                shared_burst_workers_max: 0,
+                ..Default::default()
+            },
+            RuntimeConfig {
+                worker_threads: Some(1),
+                scheduler_config: SchedulerConfig {
+                    load_balancing: strategy,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let dynamic = system
+            .spawn_at(Dynamic, "/other", None, ThreadActorConfig::default())
+            .await
+            .unwrap();
+        dynamic.send(Box::new(())).await.unwrap();
+        let actor = system
+            .spawn_typed::<_, Op>(Static(Arc::default()), "/holder")
+            .await
+            .unwrap();
+        let gate = Arc::new(Drops {
+            gate: Some((Mutex::new(false), Condvar::new())),
+            ..Default::default()
+        });
+        let _release = Release(gate.clone());
+        actor.tell(Op::Block(gate.clone())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+            .await
+            .unwrap();
+        let reply = dynamic.send(Box::new(()));
+        tokio::pin!(reply);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut reply)
+                .await
+                .is_err(),
+            "dynamic handler ran while the static handler occupied the only worker"
+        );
+        gate.release();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), reply)
+                .await
+                .unwrap()
+                .unwrap()
+                .is::<ThreadId>()
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        actor.tell(Op::Hold(entered.clone())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            dynamic
+                .send_with_timeout(Box::new(()), Some(Duration::from_secs(3)))
+                .await
+                .unwrap()
+                .is::<ThreadId>()
+        );
+        actor.stop().await.unwrap();
+        dynamic.stop().await.unwrap();
+        system.shutdown_internal().await.unwrap();
+    }
 }
 
 #[tokio::test]

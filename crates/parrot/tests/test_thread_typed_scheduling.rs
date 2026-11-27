@@ -341,3 +341,69 @@ async fn facade_default_factory_restarts_on_selected_worker() {
 async fn facade_named_factory_restarts_on_selected_worker() {
     facade_lifecycle(Entry::Named, true).await;
 }
+
+#[tokio::test]
+async fn shared_placement_applies_to_typed_roots_factories_and_context_children() {
+    use parrot_api::runtime::{LoadBalancingStrategy, RuntimeConfig, SchedulerConfig};
+
+    for strategy in [
+        LoadBalancingStrategy::Random,
+        LoadBalancingStrategy::LeastLoaded,
+    ] {
+        let engine = ThreadActorSystem::with_runtime_config(
+            ThreadActorSystemConfig {
+                shared_burst_workers_max: 0,
+                ..Default::default()
+            },
+            RuntimeConfig {
+                worker_threads: Some(2),
+                scheduler_config: SchedulerConfig {
+                    load_balancing: strategy,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let facade = ParrotActorSystem::new(Default::default()).await.unwrap();
+        facade
+            .register_thread_system("placement".into(), engine.clone(), true)
+            .await
+            .unwrap();
+        let selections = || {
+            let metrics = engine.scheduler_metrics().unwrap();
+            metrics.local_selections + metrics.work_steals
+        };
+        for factory in [false, true] {
+            let before = selections();
+            let make = || Probe {
+                events: Events::default(),
+                generation: 0,
+            };
+            let root = if factory {
+                facade
+                    .spawn_typed_factory_on::<_, Op, _>("placement", make, "/placement")
+                    .await
+            } else {
+                engine.spawn_typed::<_, Op>(make(), "/placement").await
+            }
+            .unwrap();
+            root.ask(Op::Ping).await.unwrap();
+            let after_root = selections();
+            root.ask(Op::Child).await.unwrap();
+            let after_child = selections();
+            root.stop().await.unwrap();
+            assert_eq!(engine.actor_count(), 0);
+            assert!(
+                after_root > before,
+                "typed root bypassed the configured shared scheduler"
+            );
+            assert!(
+                after_child > after_root,
+                "typed child bypassed the configured shared scheduler"
+            );
+        }
+        facade.shutdown_runtime().await.unwrap();
+    }
+}
