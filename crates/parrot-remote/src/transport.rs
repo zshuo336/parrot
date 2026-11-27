@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod batching;
 mod lifecycle;
 #[cfg(test)]
 mod notification_contracts;
@@ -227,7 +228,29 @@ impl FrameSender {
         Ok(frame)
     }
 
-    fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+    fn supports_ordered_batch(&self) -> bool {
+        self.supports_batch_frames()
+            && self.supports_ordered_tell()
+            && self.negotiated_capabilities & crate::handshake::caps::ORDERED_BATCH != 0
+    }
+
+    pub(crate) fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+        if frame.is_ordered_batch() {
+            if !self.supports_ordered_batch() {
+                return Err(FrameError::UnsupportedFlags {
+                    flags: frame.header.flags,
+                }
+                .into());
+            }
+            for member in frame.batch_frames()? {
+                self.check_member_features(&member)?;
+            }
+            return Ok(());
+        }
+        self.check_member_features(frame)
+    }
+
+    fn check_member_features(&self, frame: &Frame) -> Result<(), RemoteError> {
         if crate::ordered::requires_sender_sessions(frame) && !self.supports_sender_sessions() {
             return Err(RemoteError::Transport(
                 "ordered actor sender was not negotiated".into(),
@@ -956,22 +979,31 @@ where
                             );
                             // A request with a caller-visible correlation must
                             // fail fast instead of hanging until its deadline.
-                            // Ordinary TELL has no receipt and is intentionally
-                            // shed under overload. Batch envelopes are omitted
-                            // because their member CIDs cannot be reconstructed
-                            // safely at this transport layer.
+                            // Each accepted request in a batch has its own CID.
                             let request_needs_reply = frame.header.frame_type == frame_type::ASK
                                 || (frame.header.frame_type == frame_type::TELL
                                     && frame.header.flags & crate::frame::flags::TELL_ACK != 0);
-                            if frame.header.flags & crate::frame::flags::BATCH == 0
-                                && request_needs_reply
-                            {
-                                back.send_reply(Frame::reply_err(
-                                    frame.header.correlation_id,
-                                    &frame.path,
-                                    crate::error::ErrCode::Overloaded,
-                                    "inbound dispatch queue full",
-                                ));
+                            if request_needs_reply {
+                                let refuse = |cid| {
+                                    back.send_reply(Frame::reply_err(
+                                        cid,
+                                        &frame.path,
+                                        crate::error::ErrCode::Overloaded,
+                                        "inbound dispatch queue full",
+                                    ))
+                                };
+                                if frame.header.flags & crate::frame::flags::BATCH == 0 {
+                                    refuse(frame.header.correlation_id);
+                                } else if let Ok(members) = frame.batch_frames() {
+                                    for member in members {
+                                        refuse(member.header.correlation_id);
+                                        if back.is_closed() {
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    back.close();
+                                }
                             }
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
@@ -979,6 +1011,7 @@ where
                 }
             };
             let write = async {
+                let mut batch = batching::TellBatcher::new(&back_sender);
                 loop {
                     tokio::task::consume_budget().await;
                     // Terminal errors take priority between complete frames.
@@ -994,7 +1027,7 @@ where
                             tokio::select! {
                                 _ = ack_needed.notified() => Some(Frame::heartbeat_ack()),
                                 _ = heartbeat_needed.notified() => Some(Frame::heartbeat()),
-                                frame = rx.recv() => frame,
+                                frame = batch.recv(&mut rx) => frame,
                             }
                         } => match frame {
                             Some(frame) => (frame, false),

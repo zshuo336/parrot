@@ -7,6 +7,8 @@ mod endpoint_identity;
 mod first_hop;
 #[path = "ordered_sessions/multihost.rs"]
 mod multihost;
+#[path = "ordered_sessions/outbound_batch.rs"]
+mod outbound_batch;
 #[path = "ordered_sessions/relay_shutdown.rs"]
 mod relay_shutdown;
 use parrot_api::{
@@ -108,7 +110,10 @@ impl LocalLookup for Target {
 }
 impl ActorRef for Target {
     fn deliver<'a>(&'a self, message: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        let value = message.downcast_ref::<Work>().unwrap().0;
+        let value = match message.downcast_ref::<outbound_batch::Sample>() {
+            Some(sample) => sample.number(),
+            None => message.downcast_ref::<Work>().unwrap().0,
+        };
         if value == 700 {
             return Box::pin(HeldDrop(self.0.clone()));
         }
@@ -446,6 +451,86 @@ async fn plain_tcp_falls_back_without_claiming_authenticated_ordering() {
 #[path = "ordered_sessions/pki.rs"]
 mod pki;
 use pki::Pki;
+#[tokio::test]
+async fn ordinary_references_batch_over_mtls_while_preserving_two_senders_and_terminal_receipts() {
+    use parrot_remote::capture::{CaptureDirection, CaptureLimits, FrameCapture};
+    let pki = Pki::new();
+    let config = |name: &str| {
+        RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())).with_mtls(pki.node(name), [])
+    };
+    let (target_state, mut received) = state();
+    let (capture, mut records) = FrameCapture::channel(CaptureLimits::default()).unwrap();
+    let sink = start(
+        config("batch-target").with_capture(capture.clone()),
+        Arc::new(Target(target_state)),
+    )
+    .await;
+    let a = start(config("batch-first"), Arc::new(Empty)).await;
+    let b = start(config("batch-second"), Arc::new(Empty)).await;
+    for sender in [&a, &b] {
+        sender
+            .connect(&NodeAddr::tcp("batch-target", sink.local_addr().unwrap()))
+            .await
+            .unwrap();
+    }
+    let run = |source: Arc<RemoteActorSystem>, base: u64| async move {
+        let target = source.remote_ref("parrot://batch-target/target").unwrap();
+        for i in 0..96 {
+            target.deliver(Box::new(Work(base + i))).await.unwrap();
+        }
+        target
+    };
+    let (first, second) = tokio::join!(run(a.clone(), 0), run(b.clone(), 1000));
+    let mut counts = [0; 2];
+    for _ in 0..192 {
+        let value = tokio::time::timeout(Duration::from_secs(4), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let index = usize::from(value >= 1000);
+        assert_eq!(value, index as u64 * 1000 + counts[index]);
+        counts[index] += 1;
+    }
+    assert_eq!(counts, [96, 96]);
+    for reference in [first, second] {
+        reference
+            .close_ordered_session(Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
+    for system in [&a, &b, &sink] {
+        system.shutdown().await.unwrap();
+    }
+    capture.close();
+    let mut wire = std::collections::BTreeMap::<String, Vec<usize>>::new();
+    tokio::task::spawn_blocking(move || {
+        while let Some(event) = records.blocking_recv() {
+            if event.direction == CaptureDirection::Rx && event.frame.type_key == DATA_KEY {
+                let n = if event.frame.header.flags & parrot_remote::frame::flags::BATCH != 0 {
+                    event.frame.iter_batch().unwrap().len()
+                } else {
+                    1
+                };
+                wire.entry(event.wire.peer_node.unwrap())
+                    .or_default()
+                    .push(n);
+            }
+        }
+        assert_eq!(records.final_stats().lost, 0);
+        assert_eq!(wire.len(), 2);
+        for (source, members) in wire {
+            assert_eq!(members.iter().sum::<usize>(), 96);
+            assert!(
+                members.iter().any(|n| *n > 1),
+                "{source} emitted only singles"
+            );
+            assert!(members.iter().all(|n| *n <= 64));
+            println!("{source} received BATCH/single member counts: {members:?}");
+        }
+    })
+    .await
+    .unwrap();
+}
 #[tokio::test]
 async fn strict_sessions_execute_over_real_mtls_tcp_and_quic() {
     let pki = Pki::new();

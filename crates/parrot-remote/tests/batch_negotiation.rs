@@ -198,6 +198,126 @@ async fn sender_advertisement_alone_cannot_authorize_inbound_batch() {
 }
 
 struct NoActors;
+
+#[tokio::test]
+async fn ordered_batch_checks_both_hellos_and_every_member_before_dispatch() {
+    // Both peers already support the original explicit BATCH format.
+    let common = caps::ORDERED_TELL | caps::TELL_COMPLETION | caps::ORDERED_ADMISSION;
+    let new = 1 << 31;
+    let sender = caps::ORDERED_ACTOR | caps::ORDERED_SENDER;
+    let plain = Frame::tell(
+        "/t",
+        parrot_remote::ordered::DATA_KEY,
+        Bytes::from_static(&[2]),
+    );
+    let scoped = Frame::tell(
+        "/t",
+        parrot_remote::ordered::DATA_KEY,
+        Bytes::from_static(&[4]),
+    );
+    let mixed = Frame::batch(&[plain, scoped]).unwrap();
+    let mut malformed = mixed.clone();
+    malformed.payload.truncate(malformed.payload.len() - 1);
+    for (local, peer, frame, accept) in [
+        (sender, new | sender, &mixed, false),
+        (new | sender, sender, &mixed, false),
+        (new | caps::ORDERED_ACTOR, new | sender, &mixed, false),
+        (new | sender, new | sender, &malformed, false),
+        (new | sender, new | sender, &mixed, true),
+    ] {
+        let (io, raw) = tokio::io::duplex(4096);
+        let (shutdown, _) = watch::channel(false);
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut settings = params(ConnSide::Accept, "receiver", true, tx, &shutdown);
+        settings.local_handshake.capabilities |= common | local;
+        let server = tokio::spawn(run_connection(io, settings));
+        let mut raw = tokio_util::codec::Framed::new(raw, FrameCodec);
+        let mut remote = hello("peer", true);
+        remote.capabilities |= common | peer;
+        let mut bytes = bytes::BytesMut::new();
+        remote.encode_tlv(&mut bytes).unwrap();
+        raw.send(Frame::handshake(bytes.freeze())).await.unwrap();
+        assert_eq!(
+            raw.next().await.unwrap().unwrap().header.frame_type,
+            frame_type::HANDSHAKE_ACK
+        );
+        let connection = server.await.unwrap().unwrap();
+        raw.send(frame.clone()).await.unwrap();
+        if accept {
+            let (received, _, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received.iter_batch().unwrap(), mixed.iter_batch().unwrap());
+        } else {
+            let terminal = tokio::time::timeout(Duration::from_secs(2), raw.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.header.frame_type, frame_type::ERROR);
+            assert_eq!(
+                terminal.payload[..2],
+                (parrot_remote::ErrCode::ProtocolViolation as u16).to_le_bytes()
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        shutdown.send_replace(true);
+        connection.closed.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn full_dispatch_queue_refuses_every_batched_admission_by_its_original_cid() {
+    let (io_a, io_b) = tokio::io::duplex(8192);
+    let (shutdown, _) = watch::channel(false);
+    let (a_tx, mut replies) = mpsc::channel(8);
+    let (b_tx, mut requests) = mpsc::channel(1);
+    let mut a = params(ConnSide::Connect, "a", true, a_tx, &shutdown);
+    let mut b = params(ConnSide::Accept, "b", true, b_tx, &shutdown);
+    for settings in [&mut a, &mut b] {
+        settings.local_handshake.capabilities |= caps::ORDERED_TELL
+            | caps::ORDERED_BATCH
+            | caps::TELL_COMPLETION
+            | caps::ORDERED_ADMISSION;
+    }
+    let (a, b) = tokio::join!(run_connection(io_a, a), run_connection(io_b, b));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    a.sender.send(Frame::stop("/first")).await.unwrap();
+    let admissions: Vec<_> = [23, 41, 53]
+        .iter()
+        .map(|&cid| {
+            let mut frame = Frame::tell("/target", parrot_remote::ordered::ADMIT_KEY, Bytes::new());
+            frame.header.flags = flags::TELL_ACK;
+            frame.header.correlation_id = cid;
+            frame
+        })
+        .collect();
+    a.sender
+        .send(Frame::batch(&admissions).unwrap())
+        .await
+        .unwrap();
+    for request in admissions {
+        let (reply, _, _) = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.header.frame_type, frame_type::REPLY_ERR);
+        assert_eq!(reply.header.correlation_id, request.header.correlation_id);
+        assert_eq!(
+            reply.payload[..2],
+            (parrot_remote::ErrCode::Overloaded as u16).to_le_bytes()
+        );
+    }
+    assert_eq!(
+        requests.try_recv().unwrap().0.header.frame_type,
+        frame_type::STOP
+    );
+    assert!(requests.try_recv().is_err());
+    shutdown.send_replace(true);
+    a.closed.await.unwrap();
+    b.closed.await.unwrap();
+}
 #[async_trait::async_trait]
 impl LocalLookup for NoActors {
     async fn lookup(&self, _: &str) -> Option<parrot_api::types::BoxedActorRef> {

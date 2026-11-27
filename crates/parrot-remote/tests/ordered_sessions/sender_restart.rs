@@ -34,7 +34,13 @@ async fn sender_process_fixture() {
     let reference = source
         .remote_ref("parrot://recovery-target/target")
         .unwrap();
-    send(&reference, 700).await;
+    if std::env::var_os("PARROT_BATCH_IN_FLIGHT").is_some() {
+        for value in 700..716 {
+            reference.deliver(Box::new(Work(value))).await.unwrap();
+        }
+    } else {
+        send(&reference, 700).await;
+    }
     std::fs::write(dir.join("sent"), b"sent").unwrap();
     if std::env::var_os("PARROT_CLOSE_IN_FLIGHT").is_some() {
         reference
@@ -46,12 +52,18 @@ async fn sender_process_fixture() {
     std::future::pending::<()>().await;
 }
 
-async fn restart(close_in_flight: bool) {
+async fn restart(close_in_flight: bool, batch_in_flight: bool) {
+    use parrot_remote::capture::{CaptureDirection, CaptureLimits, FrameCapture};
     let directory = tempfile::tempdir().unwrap();
     let receiver_directory = tempfile::tempdir().unwrap();
     let (target_state, mut rx) = state(None);
     let release = Release(target_state.clone());
-    let target = start(config(receiver_directory.path()), target_state.clone()).await;
+    let (capture, mut records) = FrameCapture::channel(CaptureLimits::default()).unwrap();
+    let target = start(
+        config(receiver_directory.path()).with_capture(capture.clone()),
+        target_state.clone(),
+    )
+    .await;
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
     cmd.args([
         "--exact",
@@ -63,7 +75,11 @@ async fn restart(close_in_flight: bool) {
         "PARROT_SENDER_TARGET",
         target.local_addr().unwrap().to_string(),
     )
-    .env_remove("PARROT_CLOSE_IN_FLIGHT");
+    .env_remove("PARROT_CLOSE_IN_FLIGHT")
+    .env_remove("PARROT_BATCH_IN_FLIGHT");
+    if batch_in_flight {
+        cmd.env("PARROT_BATCH_IN_FLIGHT", "1");
+    }
     if close_in_flight {
         cmd.env("PARROT_CLOSE_IN_FLIGHT", "1");
     }
@@ -129,16 +145,46 @@ async fn restart(close_in_flight: bool) {
     let next = start(disabled, state(None).0).await;
     next.shutdown().await.unwrap();
     target.shutdown().await.unwrap();
+    capture.close();
+    if batch_in_flight {
+        tokio::task::spawn_blocking(move || {
+            let mut batches = Vec::new();
+            while let Some(event) = records.blocking_recv() {
+                if event.direction == CaptureDirection::Rx
+                    && event.frame.type_key == parrot_remote::ordered::DATA_KEY
+                {
+                    let size = if event.frame.header.flags & parrot_remote::frame::flags::BATCH != 0
+                    {
+                        event.frame.batch_frames().unwrap().len()
+                    } else {
+                        1
+                    };
+                    batches.push(size);
+                }
+            }
+            assert_eq!(records.final_stats().lost, 0);
+            assert!(batches.first().is_some_and(|n| *n > 1), "{batches:?}");
+            println!("killed sender data frame sizes={batches:?}");
+        })
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_sender_recovers_the_original_ticket_before_replacement_delivery() {
-    restart(false).await;
+    restart(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_sender_resumes_pending_close_until_actual_receiver_cleanup() {
-    restart(true).await;
+    restart(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killed_sender_retires_blocked_batch_and_discards_old_suffix() {
+    restart(false, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

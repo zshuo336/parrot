@@ -87,6 +87,8 @@ pub mod caps {
     pub const ORDERED_ACTOR: u32 = 1 << 29;
     /// Authenticated node plus runtime actor identity in ordered sessions.
     pub const ORDERED_SENDER: u32 = 1 << 30;
+    /// Accept batched ordered data and admissions with intact member envelopes and CIDs.
+    pub const ORDERED_BATCH: u32 = 1 << 31;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

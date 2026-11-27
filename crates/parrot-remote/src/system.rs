@@ -511,6 +511,7 @@ impl RemoteConfig {
                         | crate::handshake::caps::ORDERED_ROUTE
                         | crate::handshake::caps::ORDERED_ACTOR
                         | crate::handshake::caps::ORDERED_SENDER
+                        | crate::handshake::caps::ORDERED_BATCH
                 } else {
                     0
                 }

@@ -24,6 +24,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::str::Utf8Error;
 
 use crate::error::ErrCode;
+mod ordered_batch;
 
 pub const PROTOCOL_VERSION: u8 = 0x01;
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024; // 16 MiB
@@ -697,78 +698,19 @@ impl Frame {
                 max: MAX_BATCH_ITEMS,
             });
         }
-        let malformed = || FrameError::BatchMalformed {
-            offset: 0,
-            total: frames.len(),
-        };
-        let mut encoded = 8usize;
-        let mut expanded = 0usize;
-        let mut hop_count = 0;
-        let mut hop_limit = u8::MAX;
+        let mut layout = BatchLayout::new();
         for frame in frames {
-            frame.validate_payload_flags()?;
-            if !matches!(
-                frame.header.frame_type,
-                frame_type::ASK | frame_type::TELL | frame_type::REPLY
-            ) || frame.header.frame_type != first.header.frame_type
-                || frame.path != first.path
-                || frame.type_key != first.type_key
-                || frame.header.flags != first.header.flags
-                || frame.header.flags & (flags::BATCH | flags::URGENT) != 0
-                || frame.header.version != PROTOCOL_VERSION
-                || frame.header.seq != SEQ_NONE
-            {
-                return Err(malformed());
-            }
-            hop_count = hop_count.max(frame.header.hop_count);
-            hop_limit = hop_limit.min(frame.header.hop_limit);
-            encoded = encoded
-                .checked_add(12)
-                .and_then(|n| n.checked_add(frame.payload.len()))
-                .ok_or_else(malformed)?;
-            expanded = batch_expanded_size(
-                expanded,
-                frame.path.len(),
-                frame.type_key.len(),
-                frame.payload.len(),
-            )?;
+            layout.push(first, frame, MAX_FRAME_LEN)?;
         }
-        if hop_count >= hop_limit {
-            return Err(FrameError::HopExceeded {
-                count: hop_count,
-                limit: hop_limit,
-            });
-        }
-        let body = encoded
-            .checked_add(BODY_FIXED_OVERHEAD)
-            .and_then(|n| n.checked_add(first.path.len()))
-            .and_then(|n| n.checked_add(first.type_key.len()))
-            .ok_or_else(malformed)?;
-        if body > MAX_FRAME_LEN as usize {
-            return Err(FrameError::BatchLimit {
-                what: "encoded bytes",
-                max: MAX_FRAME_LEN as usize,
-            });
-        }
-        let mut payload = BytesMut::with_capacity(encoded);
-        payload.put_u64_le(frames.len() as u64);
-        for frame in frames {
-            payload.put_u64_le(frame.header.correlation_id);
-            payload.put_u32_le(frame.payload.len() as u32);
-            payload.put_slice(&frame.payload);
-        }
-        let mut header = first.header.clone();
-        header.frame_len = 0;
-        header.flags |= flags::BATCH;
-        header.correlation_id = 0;
-        header.hop_count = hop_count;
-        header.hop_limit = hop_limit;
-        Ok(Frame {
-            header,
-            path: first.path.clone(),
-            type_key: first.type_key.clone(),
-            payload: payload.freeze(),
-        })
+        Ok(layout.encode(frames))
+    }
+
+    pub(crate) fn is_ordered_batch(&self) -> bool {
+        self.header.flags & flags::BATCH != 0
+            && matches!(
+                self.type_key.as_str(),
+                crate::ordered::DATA_KEY | crate::ordered::ADMIT_KEY
+            )
     }
 
     /// Reject flags whose payload transformations this runtime cannot interpret.
@@ -792,14 +734,15 @@ impl Frame {
                         & !(flags::TRACING
                             | flags::URGENT
                             | flags::TRACE_CONTEXT
-                            | flags::TELL_ACK)
+                            | flags::TELL_ACK
+                            | flags::BATCH)
                         != 0))
             || (self.type_key == crate::ordered::DATA_KEY
                 && (self.header.frame_type != frame_type::TELL
                     || self.header.seq != 0
                     || self.header.correlation_id != 0
                     || self.header.flags
-                        & !(flags::TRACING | flags::URGENT | flags::TRACE_CONTEXT)
+                        & !(flags::TRACING | flags::URGENT | flags::TRACE_CONTEXT | flags::BATCH)
                         != 0))
         {
             return Err(FrameError::UnsupportedFlags {
@@ -940,6 +883,7 @@ impl Frame {
         if self.header.flags & flags::BATCH == 0
             || self.header.version != PROTOCOL_VERSION
             || self.header.seq != SEQ_NONE
+            || (self.is_ordered_batch() && self.header.correlation_id != 0)
         {
             return Err(malformed(0));
         }
@@ -954,7 +898,8 @@ impl Frame {
                 got: self.payload.len(),
             });
         }
-        let count = u64::from_le_bytes(self.payload[..8].try_into().unwrap());
+        let raw_count = u64::from_le_bytes(self.payload[..8].try_into().unwrap());
+        let count = raw_count & !ordered_batch::SHARED;
         if count == 0 {
             return Err(FrameError::BatchEmpty { got: 0 });
         }
@@ -964,14 +909,18 @@ impl Frame {
                 max: MAX_BATCH_ITEMS,
             });
         }
+        if raw_count != count {
+            return ordered_batch::members(self, count as usize);
+        }
         let mut position = 8usize;
         let mut expanded = 0;
         for _ in 0..count {
             if self.payload.len() - position < 12 {
                 return Err(malformed(position));
             }
-            if self.header.flags & flags::TELL_ACK != 0
-                && u64::from_le_bytes(self.payload[position..position + 8].try_into().unwrap()) == 0
+            let cid = u64::from_le_bytes(self.payload[position..position + 8].try_into().unwrap());
+            if (self.header.flags & flags::TELL_ACK != 0 && cid == 0)
+                || (self.type_key == crate::ordered::DATA_KEY && cid != 0)
             {
                 return Err(malformed(position));
             }
@@ -997,6 +946,7 @@ impl Frame {
             frame: self,
             position: 8,
             remaining: count as usize,
+            shared: None,
         })
     }
 
@@ -1015,6 +965,108 @@ fn decode_trace_parent(bytes: &[u8]) -> Result<parrot_api::trace::TraceParent, F
         bytes[17..25].try_into().unwrap(),
     )
     .map_err(|_| FrameError::InvalidTraceContext)
+}
+
+/// Incremental preflight shared by explicit batches and the connection writer.
+/// A rejected member leaves the current batch intact.
+pub(crate) struct BatchLayout {
+    encoded: usize,
+    expanded: usize,
+    count: usize,
+    hops: u8,
+    limit: u8,
+}
+
+impl BatchLayout {
+    pub(crate) fn new() -> Self {
+        Self {
+            encoded: 8,
+            expanded: 0,
+            count: 0,
+            hops: 0,
+            limit: u8::MAX,
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        first: &Frame,
+        frame: &Frame,
+        max_body: u32,
+    ) -> Result<(), FrameError> {
+        frame.validate_payload_flags()?;
+        if self.count >= MAX_BATCH_ITEMS {
+            return Err(FrameError::BatchLimit {
+                what: "item count",
+                max: MAX_BATCH_ITEMS,
+            });
+        }
+        if !matches!(
+            frame.header.frame_type,
+            frame_type::ASK | frame_type::TELL | frame_type::REPLY
+        ) || frame.header.frame_type != first.header.frame_type
+            || frame.path != first.path
+            || frame.type_key != first.type_key
+            || frame.header.flags != first.header.flags
+            || frame.header.flags & (flags::BATCH | flags::URGENT) != 0
+            || frame.header.version != PROTOCOL_VERSION
+            || frame.header.seq != SEQ_NONE
+        {
+            return Err(FrameError::BatchMalformed {
+                offset: 0,
+                total: self.count + 1,
+            });
+        }
+        let hops = self.hops.max(frame.header.hop_count);
+        let limit = self.limit.min(frame.header.hop_limit);
+        if hops >= limit {
+            return Err(FrameError::HopExceeded { count: hops, limit });
+        }
+        let expanded = batch_expanded_size(
+            self.expanded,
+            frame.path.len(),
+            frame.type_key.len(),
+            frame.payload.len(),
+        )?;
+        // expanded already bounds each addend and every accepted prefix to 16 MiB.
+        let encoded = self.encoded + 12 + frame.payload.len();
+        let max = max_body.min(MAX_FRAME_LEN) as usize;
+        if encoded + BODY_FIXED_OVERHEAD + first.path.len() + first.type_key.len() > max {
+            return Err(FrameError::BatchLimit {
+                what: "encoded bytes",
+                max,
+            });
+        }
+        self.encoded = encoded;
+        self.expanded = expanded;
+        self.count += 1;
+        self.hops = hops;
+        self.limit = limit;
+        Ok(())
+    }
+
+    pub(crate) fn encode(&self, frames: &[Frame]) -> Frame {
+        debug_assert_eq!(self.count, frames.len());
+        let mut payload = BytesMut::with_capacity(self.encoded);
+        payload.put_u64_le(self.count as u64);
+        for frame in frames {
+            payload.put_u64_le(frame.header.correlation_id);
+            payload.put_u32_le(frame.payload.len() as u32);
+            payload.put_slice(&frame.payload);
+        }
+        let mut frame = frames[0].clone();
+        frame.header.frame_len = 0;
+        frame.header.flags |= flags::BATCH;
+        frame.header.correlation_id = 0;
+        frame.header.hop_count = self.hops;
+        frame.header.hop_limit = self.limit;
+        frame.payload = payload.freeze();
+        frame
+    }
+
+    pub(crate) fn encode_outbound(&self, frames: &[Frame]) -> Frame {
+        ordered_batch::encode(frames).unwrap_or_else(|| self.encode(frames))
+    }
 }
 
 fn batch_expanded_size(
@@ -1037,6 +1089,7 @@ pub struct BatchFrames<'a> {
     frame: &'a Frame,
     position: usize,
     remaining: usize,
+    shared: Option<ordered_batch::SharedHeader<'a>>,
 }
 impl Iterator for BatchFrames<'_> {
     type Item = Frame;
@@ -1045,14 +1098,22 @@ impl Iterator for BatchFrames<'_> {
             return None;
         }
         let bytes = &self.frame.payload;
-        let cid = u64::from_le_bytes(bytes[self.position..self.position + 8].try_into().unwrap());
-        let len = u32::from_le_bytes(
-            bytes[self.position + 8..self.position + 12]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        self.position += 12;
-        let payload = bytes.slice(self.position..self.position + len);
+        let cid = if self.shared.is_some() {
+            0
+        } else {
+            let cid =
+                u64::from_le_bytes(bytes[self.position..self.position + 8].try_into().unwrap());
+            self.position += 8;
+            cid
+        };
+        let len = u32::from_le_bytes(bytes[self.position..self.position + 4].try_into().unwrap())
+            as usize;
+        self.position += 4;
+        let body = bytes.slice(self.position..self.position + len);
+        let payload = match &self.shared {
+            Some(shared) => shared.restore(self.remaining, &body),
+            None => body,
+        };
         self.position += len;
         self.remaining -= 1;
         let mut header = self.frame.header.clone();

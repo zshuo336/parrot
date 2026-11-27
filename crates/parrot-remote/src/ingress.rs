@@ -796,7 +796,12 @@ impl Ingress {
     }
 
     async fn dispatch_inner(self: &Arc<Self>, frame: Frame, back: &FrameSender, from_node: &str) {
-        if matches!(
+        if frame.is_ordered_batch() {
+            if back.check_negotiated_features(&frame).is_err() {
+                back.close();
+                return;
+            }
+        } else if matches!(
             frame.type_key.as_str(),
             crate::ordered::CONTROL_KEY | crate::ordered::DATA_KEY
         ) && !back.supports_ordered_tell()

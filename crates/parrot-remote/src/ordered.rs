@@ -439,7 +439,7 @@ impl Data {
         Ok(output.freeze())
     }
 
-    pub fn decode(input: Bytes) -> Result<Self, String> {
+    pub(crate) fn header_len(input: &[u8]) -> Result<usize, String> {
         if input.len() < 61
             || input.len() > crate::frame::MAX_FRAME_LEN as usize
             || !matches!(input[0], 2..=4)
@@ -452,6 +452,12 @@ impl Data {
         if source_len > MAX_SOURCE_BYTES || key_len > 1024 || end > input.len() {
             return Err("invalid ordered data field length".into());
         }
+        Ok(end)
+    }
+
+    pub fn decode(input: Bytes) -> Result<Self, String> {
+        let end = Self::header_len(&input)?;
+        let source_len = u16::from_le_bytes(input[57..59].try_into().unwrap()) as usize;
         let source = std::str::from_utf8(&input[61..61 + source_len])
             .map_err(|_| "invalid ordered source UTF-8")?;
         let type_key = std::str::from_utf8(&input[61 + source_len..end])
