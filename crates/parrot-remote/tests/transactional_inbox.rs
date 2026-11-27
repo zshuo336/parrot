@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "support/storage_probe.rs"]
+mod storage_probe;
+
 use bytes::Bytes;
 use parrot_remote::{
     durable::*, frame::Frame, registry::ReplyPayload, LocalLookup, NodeAddr, RemoteActorSystem,
@@ -881,7 +885,7 @@ fn partial_snapshot_write_never_publishes_half_a_business_dedup_transaction() {
         return;
     }
     let dir = Scratch::new();
-    probe(
+    storage_probe::run_blocking(
         "partial_snapshot_write_never_publishes_half_a_business_dedup_transaction",
         ENV,
         &dir.0,
@@ -898,32 +902,6 @@ fn partial_snapshot_write_never_publishes_half_a_business_dedup_transaction() {
             assert_eq!(value(&owner.handle().snapshot().state), 14);
             owner.close().await.unwrap();
         });
-}
-#[cfg(unix)]
-fn probe(test: &str, key: &str, dir: &std::path::Path) {
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
-        .env(key, dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            let output = child.wait_with_output().unwrap();
-            print!("{}", String::from_utf8_lossy(&output.stdout));
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
-            assert!(output.status.success(), "{test}: {}", output.status);
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("child {test} stalled");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
 }
 
 #[tokio::test]
@@ -1011,7 +989,7 @@ fn special_snapshot_paths_fail_without_following_symlinks_or_blocking() {
         return;
     }
     let dir = Scratch::new();
-    probe(
+    storage_probe::run_blocking(
         "special_snapshot_paths_fail_without_following_symlinks_or_blocking",
         ENV,
         &dir.0,

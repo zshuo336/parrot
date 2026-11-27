@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "support/storage_probe.rs"]
+mod storage_probe;
+
 use parrot_api::{
     address::ActorRef,
     message::RemoteMessage,
@@ -1080,11 +1084,12 @@ async fn identity_symlink_and_special_file_are_rejected_without_following_or_blo
     const ENV: &str = "PARROT_OUTBOX_SPECIAL_CHILD";
     let Some(path) = std::env::var_os(ENV) else {
         let scratch = Scratch::new();
-        run_probe(
+        storage_probe::run(
             "identity_symlink_and_special_file_are_rejected_without_following_or_blocking",
             ENV,
             &scratch.0,
-        );
+        )
+        .await;
         return;
     };
     use std::os::unix::fs::symlink;
@@ -1187,7 +1192,7 @@ fn actual_partial_write_stops_worker_rejects_future_commands_and_recovers_prior_
         return;
     }
     let scratch = Scratch::new();
-    run_probe(
+    storage_probe::run_blocking(
         "actual_partial_write_stops_worker_rejects_future_commands_and_recovers_prior_acceptance",
         ENV,
         &scratch.0,
@@ -1203,31 +1208,29 @@ fn actual_partial_write_stops_worker_rejects_future_commands_and_recovers_prior_
 }
 
 #[cfg(unix)]
-fn run_probe(test: &str, key: &str, directory: &std::path::Path) {
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
-        .env(key, directory)
-        // RLIMIT_FSIZE must affect WAL writes, not the parent's redirected log.
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            let output = child.wait_with_output().unwrap();
-            print!("{}", String::from_utf8_lossy(&output.stdout));
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
-            assert!(output.status.success(), "child {test}: {}", output.status);
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("probe {test} did not terminate");
-        }
-        std::thread::sleep(Duration::from_millis(10));
+#[test]
+#[should_panic(expected = "expected one successful child test")]
+fn storage_probe_rejects_an_empty_exact_selection() {
+    let scratch = Scratch::new();
+    storage_probe::run_blocking(
+        "__missing_storage_probe__",
+        "PARROT_STORAGE_MISSING",
+        &scratch.0,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_probe_drains_both_output_streams() {
+    const KEY: &str = "PARROT_STORAGE_OUTPUT_CHILD";
+    if std::env::var_os(KEY).is_some() {
+        let diagnostic = "x".repeat(256 * 1024);
+        eprintln!("{diagnostic}");
+        println!("{diagnostic}");
+        return;
     }
+    let scratch = Scratch::new();
+    storage_probe::run_blocking("storage_probe_drains_both_output_streams", KEY, &scratch.0);
 }
 
 #[tokio::test]
