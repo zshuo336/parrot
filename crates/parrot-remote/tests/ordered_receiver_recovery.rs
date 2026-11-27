@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #[path = "ordered_sessions/pki.rs"]
 mod pki;
+#[path = "ordered_sessions/receiver_handoff.rs"]
+mod receiver_handoff;
 #[path = "ordered_sessions/sender_restart.rs"]
 mod sender_restart;
 use parrot_api::{

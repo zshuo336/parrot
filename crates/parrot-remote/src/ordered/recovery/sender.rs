@@ -52,15 +52,11 @@ pub(crate) struct Journal {
 }
 
 impl Journal {
-    pub fn open(
-        owner: &Arc<ReceiverOwner>,
-        enabled: bool,
-        capacity: usize,
-    ) -> Result<Option<Self>, String> {
-        let path = owner.directory.join("sender.state");
+    fn read(directory: &std::path::Path, namespace: Identity) -> Result<Snapshot, String> {
+        let path = directory.join("sender.state");
         let saved = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Snapshot {
-                namespace: owner.namespace,
+                namespace,
                 tickets: Vec::new(),
             },
             Err(e) => return Err(error(e)),
@@ -80,7 +76,29 @@ impl Journal {
                 serde_json::from_slice(&bytes[40..]).map_err(error)?
             }
         };
-        if saved.namespace != owner.namespace || saved.tickets.len() > capacity {
+        if saved.namespace != namespace {
+            return Err("ordered sender state binding differs".into());
+        }
+        Ok(saved)
+    }
+
+    pub(super) fn ensure_drained(
+        directory: &std::path::Path,
+        namespace: Identity,
+    ) -> Result<(), String> {
+        if !Self::read(directory, namespace)?.tickets.is_empty() {
+            return Err("close outstanding sender tickets before receiver handoff".into());
+        }
+        Ok(())
+    }
+
+    pub fn open(
+        owner: &Arc<ReceiverOwner>,
+        enabled: bool,
+        capacity: usize,
+    ) -> Result<Option<Self>, String> {
+        let saved = Self::read(&owner.directory, owner.namespace)?;
+        if saved.tickets.len() > capacity {
             return Err("ordered sender state binding or capacity differs".into());
         }
         if !enabled {

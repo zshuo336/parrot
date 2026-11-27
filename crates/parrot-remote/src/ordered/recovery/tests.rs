@@ -1,5 +1,79 @@
 use super::*;
 
+#[tokio::test]
+async fn handoff_preserves_outstanding_sender_records_until_they_are_drained() {
+    let from = tempfile::tempdir().unwrap();
+    let to = tempfile::tempdir().unwrap();
+    let cfg = config(from.path());
+    let target = handoff::prepare(&config(to.path()), "node").unwrap();
+    let ticket = sender::Ticket {
+        source: "node".into(),
+        incarnation: [1; 16],
+        stream: [2; 16],
+        receiver: [3; 16],
+        epoch: None,
+        ticket: [4; 16],
+        actor: true,
+        destination: "peer".into(),
+        path: "parrot://peer/actor".into(),
+    };
+    let owner = ReceiverOwner::open(&cfg, "node").unwrap();
+    let journal = sender::Journal::open(&owner, true, 1).unwrap().unwrap();
+    journal.record(ticket.clone(), false).await.unwrap();
+    drop((journal, owner));
+    assert!(handoff::seal(&cfg, "node", &target)
+        .unwrap_err()
+        .contains("outstanding sender tickets"));
+    let owner = ReceiverOwner::open(&cfg, "node").unwrap();
+    let journal = sender::Journal::open(&owner, true, 1).unwrap().unwrap();
+    assert_eq!(journal.pending(), [ticket.clone()]);
+    journal.record(ticket, true).await.unwrap();
+    drop((journal, owner));
+    handoff::seal(&cfg, "node", &target).unwrap();
+}
+
+#[test]
+fn receiver_handoff_is_exclusive_retryable_and_preserves_all_retired_epochs() {
+    let dirs = [
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    ];
+    let [a, b, c] = dirs.each_ref().map(|d| config(d.path()));
+    let node = "receiver";
+    let first = ReceiverOwner::open(&a, node).unwrap();
+    let first_id = first.receiver();
+    let destination = handoff::prepare(&b, node).unwrap();
+    let other = handoff::prepare(&c, node).unwrap();
+    assert_eq!(handoff::prepare(&b, node).unwrap(), destination);
+    assert!(ReceiverOwner::open(&b, node).is_err());
+    assert!(handoff::seal(&a, node, &destination).is_err());
+    drop(first);
+    let seal = handoff::seal(&a, node, &destination).unwrap();
+    assert!(ReceiverOwner::open(&a, node).is_err());
+    assert_eq!(seal, handoff::seal(&a, node, &destination).unwrap());
+    assert!(handoff::seal(&a, node, &other).is_err());
+    let digest = Sha256::digest(&seal).into();
+    assert!(handoff::activate(&c, node, &seal, digest).is_err());
+    assert!(handoff::activate(&b, node, &seal, [0; 32]).is_err());
+    handoff::activate(&b, node, &seal, digest).unwrap();
+    handoff::activate(&b, node, &seal, digest).unwrap();
+    let second = ReceiverOwner::open(&b, node).unwrap();
+    let second_id = second.receiver();
+    assert_eq!(second.epoch(), 2);
+    assert!(second.proves_retired(first_id, 1));
+    assert!(!second.proves_retired(second_id, 2));
+    drop(second);
+    handoff::activate(&b, node, &seal, digest).unwrap();
+    let next = handoff::seal(&b, node, &other).unwrap();
+    assert!(handoff::activate(&b, node, &seal, digest).is_err());
+    handoff::activate(&c, node, &next, Sha256::digest(&next).into()).unwrap();
+    let third = ReceiverOwner::open(&c, node).unwrap();
+    assert_eq!(third.epoch(), 3);
+    assert!(third.proves_retired(first_id, 1));
+    assert!(third.proves_retired(second_id, 2));
+}
+
 fn config(directory: &Path) -> OrderedReceiverState {
     OrderedReceiverState {
         directory: directory.into(),

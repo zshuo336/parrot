@@ -1,5 +1,6 @@
 //! Cooperative local-filesystem ownership, retained through real worker cleanup.
 use super::Identity;
+pub mod handoff;
 pub(crate) mod sender;
 use parrot_config::OrderedReceiverState;
 use sha2::{Digest, Sha256};
@@ -24,6 +25,8 @@ struct Saved {
     anchor: [u64; 2],
     namespace: Identity,
     epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff: Option<handoff::Phase>,
 }
 
 struct Lock {
@@ -45,10 +48,15 @@ pub(crate) struct ReceiverOwner {
     epoch: u64,
     lock: Lock,
 }
-impl ReceiverOwner {
-    /// Open only on a startup owner thread; publication performs synchronous IO.
-    pub fn open(config: &OrderedReceiverState, node: &str) -> Result<Arc<Self>, String> {
+struct LockedDirectory {
+    directory: std::path::PathBuf,
+    lock: Lock,
+}
+
+impl LockedDirectory {
+    fn load(config: &OrderedReceiverState, node: &str) -> Result<(Self, Saved), String> {
         config.validate()?;
+        parrot_config::endpoint::validate_node_id(node)?;
         if !std::fs::symlink_metadata(&config.directory)
             .map_err(error)?
             .is_dir()
@@ -78,7 +86,7 @@ impl ReceiverOwner {
         lock.file.sync_all().map_err(error)?;
         let main = directory.join("ordered.state");
         let next = directory.join("ordered.next");
-        let mut saved = match std::fs::symlink_metadata(&main) {
+        let saved = match std::fs::symlink_metadata(&main) {
             Ok(_) => {
                 let mut bytes = Vec::new();
                 regular(&main, Access::Read)?
@@ -97,7 +105,7 @@ impl ReceiverOwner {
                     || saved.node != node
                     || saved.anchor != anchor
                     || saved.namespace == [0; 16]
-                    || saved.epoch == 0
+                    || (saved.epoch == 0) != matches!(saved.handoff, Some(handoff::Phase::Prepared))
                 {
                     return Err("ordered receiver state binding differs".into());
                 }
@@ -114,14 +122,18 @@ impl ReceiverOwner {
                     anchor,
                     namespace,
                     epoch: 0,
+                    handoff: None,
                 }
             }
             Err(e) => return Err(error(e)),
         };
-        saved.epoch = saved
-            .epoch
-            .checked_add(1)
-            .ok_or("ordered receiver epoch exhausted")?;
+        Ok((Self { directory, lock }, saved))
+    }
+
+    fn publish(&self, saved: &Saved) -> Result<(), String> {
+        let directory = &self.directory;
+        let main = directory.join("ordered.state");
+        let next = directory.join("ordered.next");
         match std::fs::symlink_metadata(&next) {
             Ok(_) => {
                 // A previous open never advertised its unpublished temporary.
@@ -131,7 +143,7 @@ impl ReceiverOwner {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(error(e)),
         }
-        let bytes = serde_json::to_vec(&saved).map_err(error)?;
+        let bytes = serde_json::to_vec(saved).map_err(error)?;
         if bytes.len() > LIMIT {
             return Err("ordered receiver state capacity exceeded".into());
         }
@@ -141,7 +153,7 @@ impl ReceiverOwner {
         file.write_all(&bytes).map_err(error)?;
         file.sync_all().map_err(error)?;
         std::fs::rename(&next, &main).map_err(error)?;
-        File::open(&directory)
+        File::open(directory)
             .map_err(error)?
             .sync_all()
             .map_err(error)?;
@@ -149,16 +161,34 @@ impl ReceiverOwner {
             .map_err(error)?
             .sync_all()
             .map_err(error)?;
+        Ok(())
+    }
+}
+
+impl ReceiverOwner {
+    /// Open only on a startup owner thread; publication performs synchronous IO.
+    pub fn open(config: &OrderedReceiverState, node: &str) -> Result<Arc<Self>, String> {
+        let (locked, mut saved) = LockedDirectory::load(config, node)?;
+        match saved.handoff {
+            Some(handoff::Phase::Prepared) => return Err("receiver awaits handoff".into()),
+            Some(handoff::Phase::Sealed { .. }) => return Err("receiver sealed for handoff".into()),
+            _ => {}
+        }
+        saved.epoch = saved
+            .epoch
+            .checked_add(1)
+            .ok_or("ordered receiver epoch exhausted")?;
+        locked.publish(&saved)?;
         let receiver = receiver_identity(saved.namespace, saved.epoch);
         if receiver == [0; 16] {
             return Err("invalid ordered receiver identity".into());
         }
         Ok(Arc::new(Self {
-            directory,
+            directory: locked.directory,
             receiver,
             namespace: saved.namespace,
             epoch: saved.epoch,
-            lock,
+            lock: locked.lock,
         }))
     }
 

@@ -3,6 +3,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 pub(crate) mod outbound;
 pub(crate) mod recovery;
+pub use recovery::handoff;
 pub(crate) mod route;
 pub(crate) use outbound::Outbound;
 
