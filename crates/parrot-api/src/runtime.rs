@@ -680,6 +680,10 @@ impl ActorRuntime for TokioActorRuntime {
             ));
         }
         inner.state.lock().unwrap().shutting_down = true;
+        // Active work may depend on disposal of an input waiting for its permit.
+        for permits in [&inner.permits, &inner.io_permits].into_iter().flatten() {
+            permits.close();
+        }
         inner.retire_if_idle();
         inner.changed.notify_waiters();
         Self::wait_for_idle(&inner).await;

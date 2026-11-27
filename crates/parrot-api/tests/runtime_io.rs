@@ -155,16 +155,88 @@ async fn io_capacity_and_cancelled_shutdown_preserve_pending_work_contract() {
         runtime.spawn_io(async { 1 }).await,
         Err(ActorError::Stopped)
     ));
-    release.notify_one();
-    tokio::time::timeout(WAIT, active).await.unwrap().unwrap();
     assert!(matches!(
-        tokio::time::timeout(WAIT, queued).await.unwrap(),
+        tokio::time::timeout(WAIT, queued)
+            .await
+            .expect("queued I/O must be rejected while the I/O permit is occupied"),
         Err(ActorError::Stopped)
     ));
+    assert_eq!(runtime.metrics().active_actors, 1);
+    assert_eq!(runtime.metrics().pending_messages, 0);
+    release.notify_one();
+    tokio::time::timeout(WAIT, active).await.unwrap().unwrap();
     tokio::time::timeout(WAIT, runtime.clone().shutdown())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(runtime.metrics().active_actors, 0);
     assert_eq!(runtime.metrics().pending_messages, 0);
+}
+
+#[tokio::test]
+async fn shutdown_breaks_cross_lane_wait_for_queued_input_disposal() {
+    for strategy in [
+        LoadBalancingStrategy::RoundRobin,
+        LoadBalancingStrategy::Random,
+        LoadBalancingStrategy::LeastLoaded,
+    ] {
+        let runtime = TokioActorRuntime::start(RuntimeConfig {
+            worker_threads: Some(2),
+            io_threads: Some(1),
+            scheduler_config: SchedulerConfig {
+                load_balancing: strategy,
+                task_queue_capacity: 1,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+        let (queued_actor_input, actor_disposed) = oneshot::channel::<()>();
+        let (queued_io_input, io_disposed) = oneshot::channel::<()>();
+        let (actor_started, actor_ready) = oneshot::channel();
+        let (io_started, io_ready) = oneshot::channel();
+        let actor = runtime.spawn(async move {
+            actor_started.send(()).unwrap();
+            io_disposed.await.expect_err("queued I/O was executed");
+            41
+        });
+        let io = runtime.spawn_io(async move {
+            io_started.send(()).unwrap();
+            actor_disposed.await.expect_err("queued actor was executed");
+            42
+        });
+        tokio::pin!(actor, io);
+        assert!(futures::poll!(&mut actor).is_pending());
+        assert!(futures::poll!(&mut io).is_pending());
+        tokio::time::timeout(WAIT, async {
+            actor_ready.await.unwrap();
+            io_ready.await.unwrap();
+        })
+        .await
+        .unwrap();
+        let queued_actor = runtime.spawn(async move { queued_actor_input.send(()).unwrap() });
+        let queued_io = runtime.spawn_io(async move { queued_io_input.send(()).unwrap() });
+        tokio::pin!(queued_actor, queued_io);
+        assert!(futures::poll!(&mut queued_actor).is_pending());
+        assert!(futures::poll!(&mut queued_io).is_pending());
+        assert_eq!(runtime.metrics().pending_messages, 2);
+        let (closed, actor_result, io_result, rejected_actor, rejected_io) =
+            tokio::time::timeout(WAIT, async {
+                tokio::join!(
+                    runtime.clone().shutdown(),
+                    actor,
+                    io,
+                    queued_actor,
+                    queued_io
+                )
+            })
+            .await
+            .expect("shutdown must wake both capacity queues to let active work finish");
+        closed.unwrap();
+        assert_eq!((actor_result.unwrap(), io_result.unwrap()), (41, 42));
+        assert!(matches!(rejected_actor, Err(ActorError::Stopped)));
+        assert!(matches!(rejected_io, Err(ActorError::Stopped)));
+        assert_eq!(runtime.metrics().active_actors, 0);
+        assert_eq!(runtime.metrics().pending_messages, 0);
+    }
 }

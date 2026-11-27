@@ -99,7 +99,6 @@ async fn queued_cleanup(cancel: bool) {
     .unwrap();
     let (active_entered, active_observed) = oneshot::channel();
     let (active_release, active_held) = oneshot::channel();
-    let mut active_release = Some(active_release);
     let active_runtime = runtime.clone();
     let active = tokio::spawn(async move {
         active_runtime
@@ -124,13 +123,13 @@ async fn queued_cleanup(cancel: bool) {
         queued.abort();
     } else {
         assert!(futures::poll!(&mut shutdown).is_pending());
-        active_release.take().unwrap().send(()).unwrap();
     }
-    tokio::time::timeout(WAIT, observed).await.unwrap().unwrap();
+    tokio::time::timeout(WAIT, observed)
+        .await
+        .expect("queued input must begin disposal while the execution permit is occupied")
+        .unwrap();
     let retained_pending = runtime.metrics().pending_messages;
-    if cancel {
-        active_release.take().unwrap().send(()).unwrap();
-    }
+    active_release.send(()).unwrap();
     assert_eq!(
         tokio::time::timeout(WAIT, active)
             .await
