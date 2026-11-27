@@ -465,6 +465,48 @@ fn escalation_with_child(
         shutdown(&system).await;
     });
 }
+async fn mixed_tree_root(
+    system: &Arc<ThreadActorSystem>,
+    root: &Arc<State>,
+    middle: &Arc<State>,
+    capture: Arc<()>,
+) -> (parrot::thread::ThreadActorRef<Generation>, BoxedActorRef) {
+    let parent = system
+        .spawn_at(
+            Generation::new(root.clone()),
+            "/tree",
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let reply = parent
+        .send(Box::new(SpawnFactoryChild {
+            state: middle.clone(),
+            capture,
+        }))
+        .await
+        .unwrap();
+    (parent, *reply.downcast::<BoxedActorRef>().unwrap())
+}
+
+async fn assert_tree_retired(
+    system: &ThreadActorSystem,
+    members: [&dyn ActorRef; 3],
+    states: [&Arc<State>; 3],
+) {
+    for (member, state) in members.iter().zip(states) {
+        assert!(matches!(
+            member.retirement_status(),
+            RetirementStatus::Retired(Ok(()))
+        ));
+        assert!(system.get_actor_ref(&member.path()).is_none());
+        assert!(member.send(Box::new(())).await.is_err());
+        assert_eq!(state.built.load(Ordering::SeqCst), 1);
+        assert_eq!(state.drops[0].load(Ordering::SeqCst), 1);
+    }
+}
+
 fn retire_mixed_tree(sharded: bool) {
     let host = runtime();
     let root_state = Arc::new(State::default());
@@ -474,23 +516,7 @@ fn retire_mixed_tree(sharded: bool) {
     let factory_capture = Arc::downgrade(&capture);
     let (system, parent, middle) = host.block_on(async {
         let system = system(sharded);
-        let parent = system
-            .spawn_at(
-                Generation::new(root_state.clone()),
-                "/tree",
-                None,
-                Default::default(),
-            )
-            .await
-            .unwrap();
-        let reply = parent
-            .send(Box::new(SpawnFactoryChild {
-                state: middle_state.clone(),
-                capture,
-            }))
-            .await
-            .unwrap();
-        let middle = *reply.downcast::<BoxedActorRef>().unwrap();
+        let (parent, middle) = mixed_tree_root(&system, &root_state, &middle_state, capture).await;
         assert_eq!(query(middle.as_ref(), 0, sharded).await.1, 10);
         (system, parent, middle)
     });
@@ -507,19 +533,7 @@ fn retire_mixed_tree(sharded: bool) {
             .await
             .unwrap()
             .unwrap();
-        for (member, state) in members
-            .iter()
-            .zip([&root_state, &middle_state, &leaf_state])
-        {
-            assert!(matches!(
-                member.retirement_status(),
-                RetirementStatus::Retired(Ok(()))
-            ));
-            assert!(system.get_actor_ref(&member.path()).is_none());
-            assert!(member.send(Box::new(())).await.is_err());
-            assert_eq!(state.built.load(Ordering::SeqCst), 1);
-            assert_eq!(state.drops[0].load(Ordering::SeqCst), 1);
-        }
+        assert_tree_retired(&system, members, [&root_state, &middle_state, &leaf_state]).await;
         assert!(factory_capture.upgrade().is_none());
         shutdown(&system).await;
     });
@@ -531,6 +545,51 @@ macro_rules! contract {
             isolated(stringify!($name), || $scenario);
         }
     };
+}
+
+#[test]
+fn shared_mixed_tree_shutdown_after_host_exit() {
+    isolated("shared_mixed_tree_shutdown_after_host_exit", || {
+        let host = runtime();
+        let root_state = Arc::new(State::default());
+        let middle_state = Arc::new(State::default());
+        let leaf_state = Arc::new(State::default());
+        let capture = Arc::new(());
+        let weak_capture = Arc::downgrade(&capture);
+        let (system, parent, middle, leaf) = host.block_on(async {
+            let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
+                shared_pool_size: 1,
+                shared_burst_workers_max: 0,
+                default_scheduling_mode: SchedulingMode::SharedPool {
+                    max_messages_per_run: 8,
+                },
+                shutdown_timeout: WAIT,
+                ..Default::default()
+            });
+            let (parent, middle) =
+                mixed_tree_root(&system, &root_state, &middle_state, capture).await;
+            let leaf = spawn_child(middle.as_ref(), &leaf_state).await;
+            let actors: [&dyn ActorRef; 3] = [&parent, middle.as_ref(), leaf.as_ref()];
+            for (actor, value) in actors.iter().zip([10, 11, 10]) {
+                let view = *actor
+                    .send(Box::new(()))
+                    .await
+                    .unwrap()
+                    .downcast::<View>()
+                    .unwrap();
+                assert_eq!((view.0, view.1), (0, value));
+            }
+            assert!(weak_capture.upgrade().is_some());
+            (system, parent, middle, leaf)
+        });
+        drop(host);
+        runtime().block_on(async {
+            shutdown(&system).await;
+            let actors: [&dyn ActorRef; 3] = [&parent, middle.as_ref(), leaf.as_ref()];
+            assert_tree_retired(&system, actors, [&root_state, &middle_state, &leaf_state]).await;
+            assert!(weak_capture.upgrade().is_none());
+        });
+    });
 }
 contract!(dedicated_legacy_error, root(false, false, false));
 contract!(
