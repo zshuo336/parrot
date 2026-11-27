@@ -11,6 +11,7 @@ pub const RECEIPT_KEY: &str = "parrot:ordered-control-receipt#v2";
 pub const ENDPOINT_KEY: &str = "parrot:ordered-endpoint#v1";
 pub const ROUTE_RECEIPT_KEY: &str = "parrot:ordered-route-receipt#v1";
 pub(crate) const OPEN_ALIAS: &str = "ordered endpoint resolution required (v1)";
+pub(crate) const ACTOR_UNSUPPORTED: &str = "next hop does not support actor sessions";
 pub const DATA_KEY: &str = "parrot:ordered-tell#v2";
 pub const ADMIT_KEY: &str = "parrot:ordered-admit#v1";
 pub const ADMISSION_RECEIPT_KEY: &str = "parrot:ordered-admission-receipt#v1";
@@ -30,6 +31,9 @@ pub(crate) enum Operation {
     ResolveRoute,
     Commit,
     Close,
+    OpenActor,
+    CommitActor,
+    CloseActor,
     Recover { receiver: Identity, epoch: u64 },
 }
 
@@ -40,6 +44,29 @@ pub(crate) struct Control {
     pub incarnation: Identity,
     pub stream: Identity,
     pub ticket: Identity,
+}
+
+impl Operation {
+    pub fn actor_scoped(self) -> bool {
+        matches!(self, Self::OpenActor | Self::CommitActor | Self::CloseActor)
+    }
+}
+
+pub(crate) fn actor_scoped_data(key: &str, payload: &[u8]) -> bool {
+    let offset = if key == ADMIT_KEY { 16 } else { 0 };
+    payload.get(offset) == Some(&3)
+}
+
+pub(crate) fn requires_actor_sessions(frame: &crate::frame::Frame) -> bool {
+    match frame.type_key.as_str() {
+        CONTROL_KEY => frame
+            .borrowed_ask_payload()
+            .is_ok_and(|p| matches!(p, [2, 7..=9, ..])),
+        ADMIT_KEY | DATA_KEY => frame
+            .split_trace_parent()
+            .is_ok_and(|(_, p)| actor_scoped_data(&frame.type_key, &p)),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +213,7 @@ impl Control {
                 | Operation::OpenAdmission
                 | Operation::ResolveEndpoint
                 | Operation::ResolveRoute
+                | Operation::OpenActor
         ) != (self.ticket == [0; 16])
         {
             return Err("ordered control ticket disagrees with operation".into());
@@ -211,6 +239,9 @@ impl Control {
             Operation::OpenAdmission => 4,
             Operation::ResolveEndpoint => 5,
             Operation::ResolveRoute => 6,
+            Operation::OpenActor => 7,
+            Operation::CommitActor => 8,
+            Operation::CloseActor => 9,
         });
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
@@ -241,6 +272,9 @@ impl Control {
                 4 => Operation::OpenAdmission,
                 5 => Operation::ResolveEndpoint,
                 6 => Operation::ResolveRoute,
+                7 => Operation::OpenActor,
+                8 => Operation::CommitActor,
+                9 => Operation::CloseActor,
                 3 => Operation::Recover {
                     receiver: input[52 + length..68 + length].try_into().unwrap(),
                     epoch: u64::from_le_bytes(input[68 + length..].try_into().unwrap()),
@@ -300,11 +334,17 @@ impl Receipt {
 }
 
 impl Data {
+    #[cfg(test)]
     pub fn encode(&self) -> Result<Bytes, String> {
         self.encode_for(None)
     }
 
+    #[cfg(test)]
     pub fn encode_for(&self, receiver: Option<Identity>) -> Result<Bytes, String> {
+        self.encode_scoped(receiver, false)
+    }
+
+    pub fn encode_scoped(&self, receiver: Option<Identity>, actor: bool) -> Result<Bytes, String> {
         node(&self.source)?;
         nonzero(self.incarnation)?;
         nonzero(self.stream)?;
@@ -326,7 +366,7 @@ impl Data {
             nonzero(receiver)?;
             output.extend_from_slice(&receiver);
         }
-        output.put_u8(2);
+        output.put_u8(if actor { 3 } else { 2 });
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
         output.extend_from_slice(&self.ticket);
@@ -340,7 +380,10 @@ impl Data {
     }
 
     pub fn decode(input: Bytes) -> Result<Self, String> {
-        if input.len() < 61 || input.len() > crate::frame::MAX_FRAME_LEN as usize || input[0] != 2 {
+        if input.len() < 61
+            || input.len() > crate::frame::MAX_FRAME_LEN as usize
+            || !matches!(input[0], 2 | 3)
+        {
             return Err("invalid ordered data header".into());
         }
         let source_len = u16::from_le_bytes(input[57..59].try_into().unwrap()) as usize;

@@ -1147,15 +1147,32 @@ async fn check_warmed_alias(routed: bool, change_same_path: bool) {
             .is_err(),
         "the local path's ticket certified an alias whose endpoint did not grant the session"
     );
-    assert!(
-        alias.deliver(Box::new(Work(3))).await.is_err(),
-        "active ordered lane downgraded"
-    );
+    if change_same_path {
+        assert!(
+            alias.deliver(Box::new(Work(3))).await.is_err(),
+            "an actor with an active ordered ticket downgraded"
+        );
+    } else {
+        // The alias has never published ordered work. Its sibling's ticket
+        // does not remove the alias's original compatibility fallback.
+        alias.deliver(Box::new(Work(3))).await.unwrap();
+        seen(&mut actual_rx, 3).await;
+    }
     strict(&raw, 4).await;
     seen(&mut local_rx, 4).await;
     raw.close_ordered_session(Duration::from_secs(3))
         .await
         .unwrap();
+    if change_same_path {
+        assert!(
+            alias.deliver(Box::new(Work(3))).await.is_err(),
+            "closing a different actor released the active ticket"
+        );
+        alias
+            .close_ordered_session(Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
     alias.deliver(Box::new(Work(5))).await.unwrap();
     seen(&mut actual_rx, 5).await;
     assert!(local_rx.try_recv().is_err() && actual_rx.try_recv().is_err());
@@ -1516,5 +1533,69 @@ async fn closing_an_uncommitted_challenge_releases_receiver_source_capacity() {
     assert!(receiver.try_recv().is_err());
     raw.shutdown.send_replace(true);
     source.shutdown().await.unwrap();
+    target.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn modern_and_legacy_session_scopes_require_real_retirement_before_switching() {
+    use parrot_remote::error::{decode_err_payload, ErrCode};
+    let (actor, mut messages) = state();
+    let target = start(
+        RemoteConfig::tcp("wire-target", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development(),
+        Arc::new(Target(actor)),
+    )
+    .await;
+    let mut raw = Raw::connect_with_caps(
+        &target,
+        caps::BIN
+            | caps::TELL_COMPLETION
+            | caps::ORDERED_TELL
+            | caps::ORDERED_ADMISSION
+            | caps::ORDERED_ACTOR,
+    )
+    .await;
+    let source = "wire-source";
+    let error = |frame: Frame| {
+        assert_eq!(frame.header.frame_type, frame_type::REPLY_ERR);
+        decode_err_payload(&frame.payload).unwrap().0
+    };
+    let scoped = ticket(&raw.control(7, 1, 2, [0; 16], source).await, false);
+    assert_eq!(
+        ticket(&raw.control(8, 1, 2, scoped, source).await, true),
+        scoped
+    );
+    assert_eq!(
+        error(raw.control(2, 1, 2, scoped, source).await),
+        ErrCode::Forbidden
+    );
+    assert_eq!(
+        error(raw.control(0, 2, 3, [0; 16], source).await),
+        ErrCode::Overloaded
+    );
+    assert_eq!(
+        ticket(&raw.control(9, 1, 2, scoped, source).await, false),
+        scoped
+    );
+    let node = ticket(&raw.control(0, 2, 3, [0; 16], source).await, false);
+    assert_eq!(
+        ticket(&raw.control(1, 2, 3, node, source).await, true),
+        node
+    );
+    assert_eq!(
+        error(raw.control(9, 2, 3, node, source).await),
+        ErrCode::Forbidden
+    );
+    assert_eq!(
+        error(raw.control(7, 1, 2, [0; 16], source).await),
+        ErrCode::Overloaded
+    );
+    raw.data(2, 3, node, 1, 83).await;
+    seen(&mut messages, 83).await;
+    assert_eq!(
+        ticket(&raw.control(2, 2, 3, node, source).await, false),
+        node
+    );
+    raw.shutdown.send_replace(true);
     target.shutdown().await.unwrap();
 }

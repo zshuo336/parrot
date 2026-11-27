@@ -47,11 +47,17 @@ impl Drop for PinnedActor {
     }
 }
 
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct SourceKey {
+    node: String,
+    actor: Option<String>,
+}
+
 struct Lease {
     receiver: Identity,
     epoch: Option<u64>,
     _owner: Option<Arc<ordered::recovery::ReceiverOwner>>,
-    source: String,
+    source: SourceKey,
     incarnation: Identity,
     stream: Identity,
     ticket: Identity,
@@ -131,14 +137,42 @@ struct Source {
     closing: Option<Closing>,
 }
 
+impl Source {
+    fn owns_ticket(&self, ticket: Identity) -> bool {
+        self.challenge
+            .as_ref()
+            .is_some_and(|c| c.control.ticket == ticket)
+            || self
+                .active
+                .iter()
+                .chain(self.retiring.iter())
+                .any(|l| l.ticket == ticket)
+            || self.closing.as_ref().is_some_and(|c| {
+                c.lease.ticket == ticket || c.previous.as_ref().is_some_and(|l| l.ticket == ticket)
+            })
+    }
+}
+
 pub(super) struct Sessions {
     receiver: Identity,
     route_key: ring::hmac::Key,
     owner: Option<Arc<ordered::recovery::ReceiverOwner>>,
-    sources: HashMap<String, Source>,
+    sources: HashMap<SourceKey, Source>,
     capacity: usize,
 }
 impl Sessions {
+    fn conflicting_scope(&self, key: &SourceKey) -> bool {
+        if key.actor.is_some() {
+            self.sources.contains_key(&SourceKey {
+                node: key.node.clone(),
+                actor: None,
+            })
+        } else {
+            self.sources
+                .keys()
+                .any(|other| other.node == key.node && other.actor.is_some())
+        }
+    }
     pub fn new(capacity: usize) -> Self {
         Self {
             receiver: ordered::identity(),
@@ -482,7 +516,7 @@ impl Ingress {
                     if !self.is_remote_target(&frame.path) {
                         let retire = matches!(
                             control.operation,
-                            Operation::Close | Operation::Recover { .. }
+                            Operation::Close | Operation::CloseActor | Operation::Recover { .. }
                         );
                         self.advance_ordered_route(
                             &mut frame,
@@ -538,7 +572,7 @@ impl Ingress {
             }
             if matches!(
                 control.operation,
-                Operation::Open | Operation::OpenAdmission
+                Operation::Open | Operation::OpenAdmission | Operation::OpenActor
             ) {
                 match self.ordered_local_path(&frame.path) {
                     Err(ErrCode::NotRemotable) if back.supports_ordered_endpoint() => {
@@ -553,17 +587,25 @@ impl Ingress {
                     other => other?,
                 }
             }
+            let key = SourceKey {
+                node: control.source.clone(),
+                actor: control.operation.actor_scoped().then(|| frame.path.clone()),
+            };
             match control.operation {
-                Operation::Open | Operation::OpenAdmission => {
-                    self.open_ordered(control).await.map(Some)
+                Operation::Open | Operation::OpenAdmission | Operation::OpenActor => {
+                    self.open_ordered(key, control).await.map(Some)
                 }
-                Operation::Commit => self.commit_ordered(control).await.map(Some),
+                Operation::Commit | Operation::CommitActor => {
+                    self.commit_ordered(key, control).await.map(Some)
+                }
                 Operation::ResolveEndpoint | Operation::ResolveRoute => {
                     self.resolve_ordered_endpoint(&frame, back, &control)
                         .await?;
                     Ok(None)
                 }
-                Operation::Close => self.close_ordered_lease(control).await.map(Some),
+                Operation::Close | Operation::CloseActor => {
+                    self.close_ordered_lease(key, control).await.map(Some)
+                }
                 Operation::Recover { receiver, epoch } => {
                     let sessions = self.ordered.lock().unwrap();
                     if self.reorder_closed.load(Ordering::Acquire) {
@@ -608,7 +650,7 @@ impl Ingress {
         let _ = back.send(response).await;
     }
 
-    async fn open_ordered(&self, mut control: Control) -> Result<Receipt, ErrCode> {
+    async fn open_ordered(&self, key: SourceKey, mut control: Control) -> Result<Receipt, ErrCode> {
         let existing = {
             let mut sessions = self.ordered.lock().unwrap();
             if self.reorder_closed.load(Ordering::Acquire) {
@@ -617,12 +659,12 @@ impl Ingress {
             sessions.prune_challenges();
             let receiver = sessions.receiver;
             let epoch = sessions.owner.as_ref().map(|owner| owner.epoch());
-            if !sessions.sources.contains_key(&control.source)
-                && sessions.sources.len() >= sessions.capacity
+            if !sessions.sources.contains_key(&key)
+                && (sessions.sources.len() >= sessions.capacity || sessions.conflicting_scope(&key))
             {
                 return Err(ErrCode::Overloaded);
             }
-            let source = sessions.sources.entry(control.source.clone()).or_default();
+            let source = sessions.sources.entry(key).or_default();
             if source.closing.is_some() {
                 return Err(ErrCode::Overloaded);
             }
@@ -681,7 +723,11 @@ impl Ingress {
         Ok(lease.receipt(true))
     }
 
-    async fn commit_ordered(self: &Arc<Self>, control: Control) -> Result<Receipt, ErrCode> {
+    async fn commit_ordered(
+        self: &Arc<Self>,
+        key: SourceKey,
+        control: Control,
+    ) -> Result<Receipt, ErrCode> {
         let (lease, cancelled) = {
             let mut sessions = self.ordered.lock().unwrap();
             if self.reorder_closed.load(Ordering::Acquire) {
@@ -689,10 +735,7 @@ impl Ingress {
             }
             let receiver = sessions.receiver;
             let owner = sessions.owner.clone();
-            let source = sessions
-                .sources
-                .get_mut(&control.source)
-                .ok_or(ErrCode::Stopped)?;
+            let source = sessions.sources.get_mut(&key).ok_or(ErrCode::Stopped)?;
             if source.closing.is_some() {
                 return Err(ErrCode::Overloaded);
             }
@@ -723,7 +766,7 @@ impl Ingress {
                     receiver,
                     epoch: owner.as_ref().map(|owner| owner.epoch()),
                     _owner: owner,
-                    source: control.source.clone(),
+                    source: key,
                     incarnation: control.incarnation,
                     stream: control.stream,
                     ticket: control.ticket,
@@ -789,7 +832,11 @@ impl Ingress {
         Ok(lease.receipt(true))
     }
 
-    async fn close_ordered_lease(&self, control: Control) -> Result<Receipt, ErrCode> {
+    async fn close_ordered_lease(
+        &self,
+        key: SourceKey,
+        control: Control,
+    ) -> Result<Receipt, ErrCode> {
         let (lease, previous) = {
             let mut sessions = self.ordered.lock().unwrap();
             if self.reorder_closed.load(Ordering::Acquire) {
@@ -805,7 +852,14 @@ impl Ingress {
                 generation,
                 lease_ms: ordered::LEASE_MS,
             };
-            let Some(source) = sessions.sources.get_mut(&control.source) else {
+            // Absence in another path or in the legacy namespace cannot certify
+            // retirement of a ticket which this receiver still owns.
+            if sessions.sources.iter().any(|(other, source)| {
+                other.node == key.node && other != &key && source.owns_ticket(control.ticket)
+            }) {
+                return Err(ErrCode::Forbidden);
+            }
+            let Some(source) = sessions.sources.get_mut(&key) else {
                 return Ok(absent(1));
             };
             if let Some(closing) = source
@@ -864,7 +918,7 @@ impl Ingress {
         }
         {
             let mut sessions = self.ordered.lock().unwrap();
-            if let Some(source) = sessions.sources.get_mut(&control.source) {
+            if let Some(source) = sessions.sources.get_mut(&key) {
                 if source
                     .closing
                     .as_ref()
@@ -886,6 +940,7 @@ impl Ingress {
                 return;
             }
         };
+        let scoped = ordered::actor_scoped_data(&frame.type_key, &payload);
         let (admission, data) = match Data::decode_frame(&frame.type_key, payload) {
             Ok(data) => data,
             Err(_) => {
@@ -978,7 +1033,10 @@ impl Ingress {
             }
             sessions
                 .sources
-                .get(&data.source)
+                .get(&SourceKey {
+                    node: data.source,
+                    actor: scoped.then(|| frame.path.clone()),
+                })
                 .and_then(|source| source.active.as_ref())
                 .filter(|lease| {
                     lease.incarnation == data.incarnation

@@ -21,18 +21,30 @@ pub(super) struct Binding {
 }
 
 pub(super) enum CloseScope<'a> {
+    #[cfg(test)]
     Node,
+    Reference(&'a str),
     Path(&'a str),
     Binding(&'a Binding),
 }
 
 impl CloseScope<'_> {
+    pub(super) fn path(&self) -> Option<&str> {
+        match self {
+            #[cfg(test)]
+            Self::Node => None,
+            Self::Reference(path) | Self::Path(path) => Some(path),
+            Self::Binding(binding) => Some(&binding.endpoint.path),
+        }
+    }
     pub(super) fn matches_lane(&self, lane: &Arc<tokio::sync::Mutex<Lane>>) -> bool {
         !matches!(self, Self::Binding(binding) if binding.lane.as_ptr() != Arc::as_ptr(lane))
     }
     pub(super) fn matches_grant(&self, grant: Option<&super::Grant>) -> bool {
         match self {
+            #[cfg(test)]
             Self::Node => true,
+            Self::Reference(_) => true,
             Self::Path(path) => grant.is_some_and(|g| g.path == *path),
             Self::Binding(binding) => grant.is_some_and(|g| {
                 g.receipt.ticket == binding.ticket
@@ -257,11 +269,12 @@ impl Outbound {
                 self.aliases.bindings.lock().unwrap().remove(path);
                 Ok(())
             } else {
-                self.close_lane(
+                self.close_matching(
                     destination,
                     |first| async move { inner.ensure_sender(&first).await },
                     &inner.callbacks,
                     deadline,
+                    CloseScope::Reference(path),
                 )
                 .await
             }

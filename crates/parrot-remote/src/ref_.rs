@@ -200,8 +200,9 @@ impl RemoteActorRef {
     }
 
     /// Require an authenticated, end-to-end confirmed TELL session. Ordering
-    /// starts with this node session; admission is not a business completion
-    /// receipt. Unsupported routes fail before publishing the business frame.
+    /// uses the final actor path when both ends and the relay hops negotiate
+    /// actor sessions. Older peers share a node session. A successful call
+    /// acknowledges admission to the receiver's worker.
     pub fn deliver_ordered<'a>(
         &'a self,
         msg: BoxedMessage,
@@ -211,7 +212,8 @@ impl RemoteActorRef {
     }
 
     /// Cancel this destination's session and wait for its actual receiver worker
-    /// to retire. Already admitted actor work is not retracted. Explicit close
+    /// to retire. Pending worker deliveries can be cancelled. Actor-scoped
+    /// sessions leave siblings running; legacy sessions share one worker. Close
     /// frees the bounded source-side destination slot. Concurrent callers join
     /// the same retirement. While the source is running, closing an absent
     /// session succeeds without contacting the destination.

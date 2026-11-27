@@ -190,6 +190,11 @@ impl FrameSender {
             && self.negotiated_capabilities & crate::handshake::caps::ORDERED_ROUTE != 0
     }
 
+    pub(crate) fn supports_actor_sessions(&self) -> bool {
+        self.supports_ordered_admission()
+            && self.negotiated_capabilities & crate::handshake::caps::ORDERED_ACTOR != 0
+    }
+
     /// Admin parents are separately negotiated so business-only peers keep
     /// receiving their original SYSTEM_EVENT payload and flags.
     pub fn supports_admin_trace_context(&self) -> bool {
@@ -218,6 +223,11 @@ impl FrameSender {
     }
 
     fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+        if crate::ordered::requires_actor_sessions(frame) && !self.supports_actor_sessions() {
+            return Err(RemoteError::Transport(
+                "actor sessions were not negotiated".into(),
+            ));
+        }
         if crate::ordered::route::required(frame) && !self.supports_ordered_route() {
             return Err(RemoteError::Transport(
                 "ordered alias route was not negotiated".into(),

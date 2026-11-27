@@ -771,6 +771,7 @@ impl Ingress {
             crate::ordered::CONTROL_KEY | crate::ordered::DATA_KEY
         ) && !back.supports_ordered_tell()
             || frame.type_key == crate::ordered::ADMIT_KEY && !back.supports_ordered_admission()
+            || crate::ordered::requires_actor_sessions(&frame) && !back.supports_actor_sessions()
         {
             back.close();
             return;
@@ -2271,6 +2272,15 @@ impl Ingress {
                 .await;
             return Some(ErrCode::RouteUnreachable);
         };
+        if crate::ordered::requires_actor_sessions(frame) && !sender.supports_actor_sessions() {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                "",
+                ErrCode::NotRemotable,
+                crate::ordered::ACTOR_UNSUPPORTED,
+            ));
+            return Some(ErrCode::NotRemotable);
+        }
         if routed && !sender.supports_ordered_route() {
             back.send_reply(Frame::reply_err(
                 orig_cid,

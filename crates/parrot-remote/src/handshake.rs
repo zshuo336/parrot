@@ -83,6 +83,8 @@ pub mod caps {
     pub const ORDERED_ENDPOINT: u32 = 1 << 27;
     /// Receiver-confirmed alias edges for nested ordered forwarding and close.
     pub const ORDERED_ROUTE: u32 = 1 << 28;
+    /// Independently fence a destination actor's ordered stream.
+    pub const ORDERED_ACTOR: u32 = 1 << 29;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

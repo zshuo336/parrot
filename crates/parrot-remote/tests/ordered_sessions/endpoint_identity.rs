@@ -648,6 +648,134 @@ async fn two_alias_edges_admit_and_retire_over_mtls_tcp() {
 
 struct HeldLookup(Arc<State>);
 
+struct TwoActors(Target, Target);
+
+#[async_trait::async_trait]
+impl LocalLookup for TwoActors {
+    async fn lookup(&self, path: &str) -> Option<BoxedActorRef> {
+        let actor = match path {
+            "/first" => &self.0,
+            "/second" => &self.1,
+            _ => return None,
+        };
+        Some(Box::new(actor.clone()))
+    }
+}
+
+async fn check_independent_close(used: bool) {
+    let (first, mut received) = state();
+    let (second, mut other) = state();
+    let suffix = if used { "used" } else { "unused" };
+    let destination = format!("actor-end-{suffix}");
+    let source = start(
+        RemoteConfig::mem(format!("actor-src-{suffix}")),
+        Arc::new(Empty),
+    )
+    .await;
+    let end = start(
+        RemoteConfig::mem(&destination),
+        Arc::new(TwoActors(Target(first.clone()), Target(second))),
+    )
+    .await;
+    source.connect_mem_pair(&end).await.unwrap();
+    let busy = source
+        .remote_ref(&format!("parrot://{destination}/first"))
+        .unwrap();
+    let sibling = source
+        .remote_ref(&format!("parrot://{destination}/second"))
+        .unwrap();
+    if used {
+        strict(&sibling, 91).await;
+        seen(&mut other, 91).await;
+    }
+    strict(&busy, 701).await;
+    let timeout = Duration::from_secs(3);
+    tokio::time::timeout(timeout, first.entered.notified())
+        .await
+        .unwrap();
+    strict(&busy, 92).await;
+    sibling.close_ordered_session(timeout).await.unwrap();
+    first.resume.notify_one();
+    seen(&mut received, 701).await;
+    seen(&mut received, 92).await;
+    strict(&sibling, 93).await;
+    seen(&mut other, 93).await;
+    busy.close_ordered_session(timeout).await.unwrap();
+    sibling.close_ordered_session(timeout).await.unwrap();
+    source.shutdown().await.unwrap();
+    end.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn closing_unused_sibling_preserves_admitted_actor_work() {
+    check_independent_close(false).await;
+}
+
+#[tokio::test]
+async fn retiring_active_sibling_preserves_admitted_actor_work() {
+    check_independent_close(true).await;
+}
+
+#[tokio::test]
+async fn closing_a_routed_alias_retires_only_its_final_actor_over_mtls() {
+    let pki = Pki::new();
+    let config = |name: &str| {
+        RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())).with_mtls(pki.node(name), [])
+    };
+    let source = start(config("scope-src"), Arc::new(Empty)).await;
+    let hub = start(
+        config("scope-hub").with_role(TopologyRole::Hub),
+        Arc::new(Empty),
+    )
+    .await;
+    let alias = start(
+        config("scope-alias").with_ordered_relays(["scope-hub".into()]),
+        Arc::new(AliasLookup(RwLock::new(Some(
+            "parrot://scope-end/second".into(),
+        )))),
+    )
+    .await;
+    let (first, mut received) = state();
+    let (second, mut other) = state();
+    let end = start(
+        config("scope-end").with_ordered_relays(["scope-hub".into(), "scope-alias".into()]),
+        Arc::new(TwoActors(Target(first.clone()), Target(second.clone()))),
+    )
+    .await;
+    let hub_addr = NodeAddr::tcp("scope-hub", hub.local_addr().unwrap());
+    for node in [&source, &alias, &end] {
+        node.connect(&hub_addr).await.unwrap();
+    }
+    alias
+        .connect(&NodeAddr::tcp("scope-end", end.local_addr().unwrap()))
+        .await
+        .unwrap();
+    let busy = source.remote_ref("parrot://scope-end/first").unwrap();
+    let sibling = source.remote_ref("parrot://scope-alias/alias").unwrap();
+    let timeout = Duration::from_secs(3);
+    strict(&busy, 701).await;
+    tokio::time::timeout(timeout, first.entered.notified())
+        .await
+        .unwrap();
+    strict(&busy, 81).await;
+    strict(&sibling, 701).await;
+    tokio::time::timeout(timeout, second.entered.notified())
+        .await
+        .unwrap();
+    sibling.close_ordered_session(timeout).await.unwrap();
+    first.resume.notify_one();
+    seen(&mut received, 701).await;
+    seen(&mut received, 81).await;
+    second.resume.notify_one();
+    strict(&sibling, 82).await;
+    seen(&mut other, 82).await;
+    busy.close_ordered_session(timeout).await.unwrap();
+    sibling.close_ordered_session(timeout).await.unwrap();
+    for node in [&source, &hub, &alias, &end] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[async_trait::async_trait]
 impl LocalLookup for HeldLookup {
     async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
