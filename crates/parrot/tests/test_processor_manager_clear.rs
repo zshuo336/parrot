@@ -6,6 +6,13 @@ use std::sync::{Arc, atomic::Ordering};
 use support::{Counts, Probe, isolated, panics};
 
 #[test]
+fn manager_isolation_can_report_large_diagnostics() {
+    isolated("manager_isolation_can_report_large_diagnostics", || {
+        eprintln!("{}", "x".repeat(256 * 1024));
+    });
+}
+
+#[test]
 fn try_clear_reports_each_panicking_path_after_disposing_every_snapshot_handle() {
     isolated(
         "try_clear_reports_each_panicking_path_after_disposing_every_snapshot_handle",

@@ -6,13 +6,15 @@ use parrot_api::types::BoxedFuture;
 use std::{
     any::Any,
     panic::AssertUnwindSafe,
-    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[path = "isolated.rs"]
+mod child;
 
 #[derive(Default)]
 pub struct Counts {
@@ -78,38 +80,15 @@ impl ProcessorInterface for Probe {
 }
 
 pub fn isolated(name: &str, test: impl FnOnce()) {
-    if std::env::var("PARROT_MANAGER_CHILD").as_deref() == Ok(name) {
-        test();
-        println!("manager ownership complete: {name}");
-        return;
-    }
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([name, "--exact", "--nocapture", "--test-threads=1"])
-        .env("PARROT_MANAGER_CHILD", name)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let timed_out = loop {
-        if child.try_wait().unwrap().is_some() {
-            break false;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            break true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !timed_out && output.status.success(),
-        "manager child failed: timed_out={timed_out}, status={:?}\n{stdout}\n{stderr}",
-        output.status
+    child::run(
+        name,
+        "PARROT_MANAGER_CHILD",
+        Duration::from_secs(10),
+        || {
+            test();
+            println!("manager ownership complete: {name}");
+        },
     );
-    assert!(stdout.contains(&format!("manager ownership complete: {name}")));
 }
 
 pub fn panics(action: impl FnOnce()) -> bool {
