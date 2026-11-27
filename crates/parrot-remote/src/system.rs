@@ -502,6 +502,7 @@ impl RemoteConfig {
                         | crate::handshake::caps::ORDERED_RECOVERY
                         | crate::handshake::caps::ORDERED_ADMISSION
                         | crate::handshake::caps::ORDERED_ENDPOINT
+                        | crate::handshake::caps::ORDERED_ROUTE
                 } else {
                     0
                 }

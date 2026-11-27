@@ -524,7 +524,130 @@ async fn failed_route_lookup_preserves_the_next_ordered_delivery() {
     target.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn alias_delivery_when_only_the_alias_owner_has_the_final_route() {
+    let source = start(RemoteConfig::mem("nested-src"), Arc::new(Empty)).await;
+    let hub = start(
+        RemoteConfig::mem("nested-hub").with_role(TopologyRole::Hub),
+        Arc::new(Empty),
+    )
+    .await;
+    let host = start(
+        RemoteConfig::mem("nested-host").with_ordered_relays(["nested-hub".into()]),
+        Arc::new(AliasLookup(RwLock::new(Some(
+            "parrot://nested-end/target".into(),
+        )))),
+    )
+    .await;
+    let (actor, mut messages) = state();
+    let end = start(
+        RemoteConfig::mem("nested-end").with_ordered_relays(["nested-host".into()]),
+        Arc::new(Target(actor)),
+    )
+    .await;
+    source.connect_mem_pair(&hub).await.unwrap();
+    host.connect_mem_pair(&hub).await.unwrap();
+    host.connect_mem_pair(&end).await.unwrap();
+    let reference = source.remote_ref("parrot://nested-host/alias").unwrap();
+    assert_eq!(
+        reference
+            .resolve_ordered_endpoint(Duration::from_secs(3))
+            .await
+            .unwrap()
+            .path,
+        "parrot://nested-end/target"
+    );
+    let sent = reference
+        .deliver_ordered(Box::new(Work(18)), Default::default())
+        .await;
+    assert!(
+        sent.is_ok(),
+        "resolved alias did not admit work over its original route: {sent:?}"
+    );
+    seen(&mut messages, 18).await;
+    reference
+        .close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    for node in [&source, &hub, &host, &end] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn two_alias_edges_admit_and_retire_over_mtls_tcp() {
+    let pki = Pki::new();
+    let config = |name: &str| {
+        RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())).with_mtls(pki.node(name), [])
+    };
+    let alias = |next: &str| Arc::new(AliasLookup(RwLock::new(Some(next.into()))));
+    let source = start(config("chain-source"), Arc::new(Empty)).await;
+    let hub = start(
+        config("chain-hub").with_role(TopologyRole::Hub),
+        Arc::new(Empty),
+    )
+    .await;
+    let left = start(
+        config("chain-left").with_ordered_relays(["chain-hub".into()]),
+        alias("parrot://chain-right/alias"),
+    )
+    .await;
+    let right = start(
+        config("chain-right").with_ordered_relays(["chain-left".into()]),
+        alias("parrot://chain-end/target"),
+    )
+    .await;
+    let (actor, mut messages) = state();
+    let end = start(
+        config("chain-end").with_ordered_relays(["chain-right".into()]),
+        Arc::new(Target(actor)),
+    )
+    .await;
+    for (from, to, name) in [
+        (&source, &hub, "chain-hub"),
+        (&left, &hub, "chain-hub"),
+        (&left, &right, "chain-right"),
+        (&right, &end, "chain-end"),
+    ] {
+        from.connect(&NodeAddr::tcp(name, to.local_addr().unwrap()))
+            .await
+            .unwrap();
+    }
+    let reference = source.remote_ref("parrot://chain-left/alias").unwrap();
+    for value in [31, 32] {
+        strict(&reference, value).await;
+        seen(&mut messages, value).await;
+        if value == 31 {
+            right.set_route_acl(Default::default(), "source").unwrap();
+            let err = reference
+                .close_ordered_session(Duration::from_secs(3))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("forbidden"), "{err:?}");
+            right.clear_route_acl().unwrap();
+            let links = source.links_snapshot().await;
+            let (_, first, _) = links
+                .iter()
+                .find(|(node, _, _)| node == "chain-hub")
+                .unwrap();
+            first.close();
+            source
+                .connect(&NodeAddr::tcp("chain-hub", hub.local_addr().unwrap()))
+                .await
+                .unwrap();
+        }
+        reference
+            .close_ordered_session(Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
+    for node in [&source, &hub, &left, &right, &end] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 struct HeldLookup(Arc<State>);
+
 #[async_trait::async_trait]
 impl LocalLookup for HeldLookup {
     async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {

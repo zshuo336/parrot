@@ -158,17 +158,20 @@ impl Outbound {
         let _write = gate.write().await;
         let deadline = Instant::now() + Duration::from_secs(5);
         let endpoint = self
-            .resolve_endpoint(
-                destination,
-                &frame.path,
+            .lookup(
+                super::Route {
+                    destination,
+                    path: &frame.path,
+                    hops: frame.header.hop_limit,
+                },
                 sender,
                 &inner.callbacks,
-                frame.header.hop_limit,
+                true,
                 deadline,
             )
             .await;
-        let endpoint = match endpoint {
-            Ok(endpoint) if !at_capacity || endpoint.path != frame.path => endpoint,
+        let (endpoint, signed) = match endpoint {
+            Ok(result) if !at_capacity || result.0.path != frame.path => result,
             _ if at_capacity => return Err(LaneError::Full.into()),
             other => other?,
         };
@@ -187,20 +190,23 @@ impl Outbound {
         } else if endpoint.path != frame.path {
             self.close_matching(
                 destination,
-                std::future::ready(Some(sender.clone())),
+                |first| async move { inner.ensure_sender(&first).await },
                 &inner.callbacks,
                 deadline,
                 CloseScope::Path(&frame.path),
             )
             .await?;
         }
-        // A direct alias owner can also relay a canonical target on its own
-        // physical link. The final node still authenticates the original source.
-        let route = inner
-            .ensure_sender(node)
-            .await
-            .unwrap_or_else(|| sender.clone());
-        let alias = std::mem::replace(&mut frame.path, endpoint.path.clone());
+        let current = inner.ensure_sender(node).await;
+        let (route, path) = match (current, signed) {
+            (Some(direct), _) if direct.node_id() == node => (direct, endpoint.path.clone()),
+            (_, Some(path)) => (sender.clone(), path),
+            (current, None) => (
+                current.unwrap_or_else(|| sender.clone()),
+                endpoint.path.clone(),
+            ),
+        };
+        let alias = std::mem::replace(&mut frame.path, path);
         match self
             .send_open(
                 node,
@@ -228,7 +234,7 @@ impl Outbound {
             crate::actor_path::split(&binding.endpoint.path).expect("validated endpoint");
         self.close_matching(
             node,
-            inner.ensure_sender(node),
+            |first| async move { inner.ensure_sender(&first).await },
             &inner.callbacks,
             deadline,
             CloseScope::Binding(binding),
@@ -253,7 +259,7 @@ impl Outbound {
             } else {
                 self.close_lane(
                     destination,
-                    inner.ensure_sender(destination),
+                    |first| async move { inner.ensure_sender(&first).await },
                     &inner.callbacks,
                     deadline,
                 )

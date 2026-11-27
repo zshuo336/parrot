@@ -2222,7 +2222,13 @@ impl Ingress {
         let Some(target) = target_node(&frame.path) else {
             return Some(ErrCode::ActorNotFound);
         };
-        if !self.route_allowed(&frame.path) {
+        let routed = crate::ordered::route::required(frame);
+        let acl_path = if routed {
+            crate::ordered::route::head(&frame.path)
+        } else {
+            &frame.path
+        };
+        if !self.route_allowed(acl_path) {
             back.send_reply(Frame::reply_err(
                 orig_cid,
                 &frame.path,
@@ -2265,6 +2271,15 @@ impl Ingress {
                 .await;
             return Some(ErrCode::RouteUnreachable);
         };
+        if routed && !sender.supports_ordered_route() {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                "",
+                ErrCode::NotRemotable,
+                crate::ordered::route::UNSUPPORTED,
+            ));
+            return Some(ErrCode::NotRemotable);
+        }
         if frame.type_key == crate::ordered::CONTROL_KEY
             && frame
                 .borrowed_ask_payload()

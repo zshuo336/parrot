@@ -185,6 +185,10 @@ impl FrameSender {
         self.supports_ordered_admission()
             && self.negotiated_capabilities & crate::handshake::caps::ORDERED_ENDPOINT != 0
     }
+    pub(crate) fn supports_ordered_route(&self) -> bool {
+        self.supports_ordered_endpoint()
+            && self.negotiated_capabilities & crate::handshake::caps::ORDERED_ROUTE != 0
+    }
 
     /// Admin parents are separately negotiated so business-only peers keep
     /// receiving their original SYSTEM_EVENT payload and flags.
@@ -214,6 +218,11 @@ impl FrameSender {
     }
 
     fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+        if crate::ordered::route::required(frame) && !self.supports_ordered_route() {
+            return Err(RemoteError::Transport(
+                "ordered alias route was not negotiated".into(),
+            ));
+        }
         if frame.type_key == crate::ordered::CONTROL_KEY
             && frame.borrowed_ask_payload()?.starts_with(&[2, 5])
             && !self.supports_ordered_endpoint()

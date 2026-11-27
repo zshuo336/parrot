@@ -3,11 +3,13 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 pub(crate) mod outbound;
 pub(crate) mod recovery;
+pub(crate) mod route;
 pub(crate) use outbound::Outbound;
 
 pub const CONTROL_KEY: &str = "parrot:ordered-control#v2";
 pub const RECEIPT_KEY: &str = "parrot:ordered-control-receipt#v2";
 pub const ENDPOINT_KEY: &str = "parrot:ordered-endpoint#v1";
+pub const ROUTE_RECEIPT_KEY: &str = "parrot:ordered-route-receipt#v1";
 pub(crate) const OPEN_ALIAS: &str = "ordered endpoint resolution required (v1)";
 pub const DATA_KEY: &str = "parrot:ordered-tell#v2";
 pub const ADMIT_KEY: &str = "parrot:ordered-admit#v1";
@@ -25,6 +27,7 @@ pub(crate) enum Operation {
     Open,
     OpenAdmission,
     ResolveEndpoint,
+    ResolveRoute,
     Commit,
     Close,
     Recover { receiver: Identity, epoch: u64 },
@@ -68,17 +71,25 @@ impl OrderedEndpoint {
     }
 
     pub(crate) fn decode(bytes: &[u8], challenge: Identity) -> Option<Self> {
-        if bytes.len() > 32 + 4096 || bytes.get(..16)? != challenge {
+        if bytes.len() > 32 + 4096 {
             return None;
         }
-        let receiver = bytes.get(16..32)?.try_into().ok()?;
-        nonzero(receiver).ok()?;
-        let path = std::str::from_utf8(bytes.get(32..)?).ok()?;
+        let (receiver, path) = Self::fields(bytes, challenge)?;
         crate::actor_path::split(path)?;
         Some(Self {
             receiver,
             path: path.to_owned(),
         })
+    }
+
+    fn fields(bytes: &[u8], challenge: Identity) -> Option<(Identity, &str)> {
+        if bytes.get(..16)? != challenge {
+            return None;
+        }
+        let receiver = bytes.get(16..32)?.try_into().ok()?;
+        nonzero(receiver).ok()?;
+        let path = std::str::from_utf8(bytes.get(32..)?).ok()?;
+        Some((receiver, path))
     }
 }
 
@@ -171,7 +182,10 @@ impl Control {
         nonzero(self.stream)?;
         if matches!(
             self.operation,
-            Operation::Open | Operation::OpenAdmission | Operation::ResolveEndpoint
+            Operation::Open
+                | Operation::OpenAdmission
+                | Operation::ResolveEndpoint
+                | Operation::ResolveRoute
         ) != (self.ticket == [0; 16])
         {
             return Err("ordered control ticket disagrees with operation".into());
@@ -196,6 +210,7 @@ impl Control {
             Operation::Recover { .. } => 3,
             Operation::OpenAdmission => 4,
             Operation::ResolveEndpoint => 5,
+            Operation::ResolveRoute => 6,
         });
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
@@ -225,6 +240,7 @@ impl Control {
                 2 => Operation::Close,
                 4 => Operation::OpenAdmission,
                 5 => Operation::ResolveEndpoint,
+                6 => Operation::ResolveRoute,
                 3 => Operation::Recover {
                     receiver: input[52 + length..68 + length].try_into().unwrap(),
                     epoch: u64::from_le_bytes(input[68 + length..].try_into().unwrap()),
@@ -393,13 +409,29 @@ pub fn business_frame(
         .map_err(|error| error.to_string())?;
     if frame.type_key == CONTROL_KEY {
         let (_, payload) = frame.split_reply_to().map_err(|error| error.to_string())?;
-        Control::decode(&payload)?;
+        let control = Control::decode(&payload)?;
+        if control.operation == Operation::ResolveRoute {
+            route::discovery(&frame.path, frame.header.hop_count).map_err(|e| e.name())?;
+        } else if frame.path.contains('#') {
+            if control.operation == Operation::ResolveEndpoint {
+                return Err("legacy endpoint lookup requires a canonical path".into());
+            }
+            route::terminal(&frame.path).map_err(|e| e.name())?;
+        }
         return Ok(None);
     }
     let parent = frame
         .take_trace_parent()
         .map_err(|error| error.to_string())?;
-    let (_, data) = Data::decode_frame(&frame.type_key, frame.payload)?;
+    let (admission, data) = Data::decode_frame(&frame.type_key, frame.payload)?;
+    if frame.path.contains('#') {
+        if admission.is_none() {
+            return Err("signed route requires correlated ordered admission".into());
+        }
+        frame.path = route::terminal(&frame.path)
+            .map_err(|e| e.name())?
+            .to_owned();
+    }
     frame.header.flags &= !crate::frame::flags::TELL_ACK;
     frame.header.correlation_id = 0;
     frame.type_key = data.key;
@@ -586,6 +618,15 @@ mod tests {
         assert_eq!(business.type_key, data.key);
         assert_eq!(business.payload, data.payload);
         assert_eq!(business.header.flags, flags::TRACING | flags::URGENT);
+        let route = format!("parrot://host/alias#{}#parrot://end/actor", "a".repeat(64));
+        let mut routed = Frame::tell(&route, ADMIT_KEY, data.encode_for(Some([3; 16])).unwrap());
+        routed.header.flags = flags::TELL_ACK;
+        routed.header.correlation_id = 3;
+        let decoded = business_frame(routed.clone()).unwrap().unwrap();
+        assert_eq!(decoded.path, "parrot://end/actor");
+        assert_eq!(decoded.payload, data.payload);
+        routed.path.push('#');
+        assert!(business_frame(routed).is_err());
         for mutation in 0..5 {
             let mut invalid = wire.clone();
             match mutation {

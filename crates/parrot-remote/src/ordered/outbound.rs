@@ -171,6 +171,29 @@ impl Outbound {
         hops: u8,
         deadline: Instant,
     ) -> ActorResult<super::OrderedEndpoint> {
+        self.lookup(
+            Route {
+                destination,
+                path,
+                hops,
+            },
+            sender,
+            callbacks,
+            false,
+            deadline,
+        )
+        .await
+        .map(|(endpoint, _)| endpoint)
+    }
+
+    async fn lookup(
+        &self,
+        route: Route<'_>,
+        sender: &FrameSender,
+        callbacks: &CallbackRegistry,
+        signed: bool,
+        deadline: Instant,
+    ) -> ActorResult<(super::OrderedEndpoint, Option<String>)> {
         if self.closed.load(Ordering::Acquire) {
             return Err(ActorError::Stopped);
         }
@@ -179,25 +202,49 @@ impl Outbound {
                 ErrCode::NotRemotable.to_actor_error("ordered endpoint lookup unavailable".into())
             );
         }
-        let control = Control {
-            operation: Operation::ResolveEndpoint,
+        let mut control = Control {
+            operation: if signed && sender.supports_ordered_route() {
+                Operation::ResolveRoute
+            } else {
+                Operation::ResolveEndpoint
+            },
             source: self.source.clone(),
             incarnation: self.incarnation,
             stream: identity(),
             ticket: [0; 16],
         };
-        let (bytes, key) = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => return Err(ActorError::Stopped),
-            reply = exchange(sender, callbacks, destination, path, hops, &control, deadline) =>
-                reply.map_err(|(code, detail)| code.to_actor_error(detail))?,
-        };
-        if key == super::ENDPOINT_KEY {
-            if let Some(endpoint) = super::OrderedEndpoint::decode(&bytes, control.stream) {
-                return Ok(endpoint);
+        loop {
+            let reply = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(ActorError::Stopped),
+                reply = exchange(sender, callbacks, route.destination, route.path, route.hops, &control, deadline) => reply,
+            };
+            let (bytes, key) = match reply {
+                Err((ErrCode::NotRemotable, detail))
+                    if control.operation == Operation::ResolveRoute
+                        && detail == super::route::UNSUPPORTED =>
+                {
+                    control.operation = Operation::ResolveEndpoint;
+                    control.stream = identity();
+                    continue;
+                }
+                other => other.map_err(|(code, detail)| code.to_actor_error(detail))?,
+            };
+            if control.operation == Operation::ResolveRoute && key == super::ROUTE_RECEIPT_KEY {
+                if let Some((endpoint, path)) =
+                    super::route::decode_receipt(&bytes, control.stream, route.path)
+                {
+                    return Ok((endpoint, Some(path)));
+                }
+            } else if control.operation == Operation::ResolveEndpoint && key == super::ENDPOINT_KEY
+            {
+                if let Some(endpoint) = super::OrderedEndpoint::decode(&bytes, control.stream) {
+                    return Ok((endpoint, None));
+                }
             }
+            return Err(ErrCode::ProtocolViolation
+                .to_actor_error("invalid ordered endpoint receipt".into()));
         }
-        Err(ErrCode::ProtocolViolation.to_actor_error("invalid ordered endpoint receipt".into()))
     }
     pub fn close(&self) {
         self.close_admission();
@@ -594,10 +641,10 @@ impl Outbound {
         }
     }
 
-    pub async fn close_lane(
+    pub async fn close_lane<F: std::future::Future<Output = Option<FrameSender>>>(
         &self,
         destination: &str,
-        resolve_sender: impl std::future::Future<Output = Option<FrameSender>>,
+        resolve_sender: impl FnOnce(String) -> F,
         callbacks: &CallbackRegistry,
         deadline: Instant,
     ) -> ActorResult<()> {
@@ -611,10 +658,10 @@ impl Outbound {
         .await
     }
 
-    async fn close_matching(
+    async fn close_matching<F: std::future::Future<Output = Option<FrameSender>>>(
         &self,
         destination: &str,
-        resolve_sender: impl std::future::Future<Output = Option<FrameSender>>,
+        resolve_sender: impl FnOnce(String) -> F,
         callbacks: &CallbackRegistry,
         deadline: Instant,
         scope: aliases::CloseScope<'_>,
@@ -642,7 +689,9 @@ impl Outbound {
                     return Ok(());
                 }
                 if let Some(grant) = &state.grant {
-                    let current = resolve_sender.await;
+                    let first = crate::actor_path::split(super::route::head(&grant.path))
+                        .map_or(destination, |(node, _)| node);
+                    let current = resolve_sender(first.to_owned()).await;
                     let sender = current.as_ref().unwrap_or(&grant.sender);
                     let control = Control {
                         operation: Operation::Close,
@@ -704,6 +753,12 @@ async fn retire(
     control: &Control,
     deadline: Instant,
 ) -> ActorResult<()> {
+    let current_path = if current.node_id() == route.destination && route.path.contains('#') {
+        super::route::terminal(route.path)
+            .map_err(|code| code.to_actor_error("invalid saved ordered route".into()))?
+    } else {
+        route.path
+    };
     if let Some(epoch) = grant
         .receipt
         .epoch
@@ -718,7 +773,7 @@ async fn retire(
             current,
             callbacks,
             route.destination,
-            route.path,
+            current_path,
             route.hops,
             &recovery,
             deadline,
@@ -734,16 +789,16 @@ async fn retire(
             Err((code, detail)) => return Err(code.to_actor_error(detail)),
         }
     }
-    let sender = if grant.sender.is_closed() {
-        current
+    let (sender, path) = if grant.sender.is_closed() {
+        (current, current_path)
     } else {
-        &grant.sender
+        (&grant.sender, route.path)
     };
     let receipt = request(
         sender,
         callbacks,
         route.destination,
-        route.path,
+        path,
         route.hops,
         control,
         deadline,
@@ -835,6 +890,73 @@ async fn exchange(
 mod tests {
     use super::*;
     use crate::handshake::caps;
+
+    #[tokio::test]
+    async fn signed_lookup_retries_only_explicit_capability_refusal() {
+        let outbound = Outbound::new("source".into(), 1);
+        let callbacks = CallbackRegistry::default();
+        let path = "parrot://alias/service";
+        let endpoint = super::super::OrderedEndpoint {
+            path: "parrot://end/target".into(),
+            receiver: [2; 16],
+        };
+        let base = caps::ORDERED_TELL
+            | caps::TELL_COMPLETION
+            | caps::ORDERED_ADMISSION
+            | caps::ORDERED_ENDPOINT;
+        for (cap, fallback) in [
+            (base, false),
+            (base | caps::ORDERED_ROUTE, true),
+            (base | caps::ORDERED_ROUTE, false),
+        ] {
+            let (tx, mut frames) = tokio::sync::mpsc::channel(2);
+            let sender = FrameSender::capability_test_sender(tx, "hub", cap);
+            let mut lookup = Box::pin(outbound.lookup(
+                Route {
+                    destination: "alias",
+                    path,
+                    hops: 4,
+                },
+                &sender,
+                &callbacks,
+                true,
+                Instant::now() + Duration::from_secs(3),
+            ));
+            assert!(futures::poll!(&mut lookup).is_pending());
+            let mut frame = frames.try_recv().unwrap();
+            let decode =
+                |frame: &Frame| Control::decode(frame.borrowed_ask_payload().unwrap()).unwrap();
+            let initial = decode(&frame);
+            if cap != base {
+                assert_eq!(initial.operation, Operation::ResolveRoute);
+                let error = if fallback {
+                    ReplyPayload::Err(
+                        ErrCode::NotRemotable,
+                        super::super::route::UNSUPPORTED.into(),
+                    )
+                } else {
+                    ReplyPayload::Err(ErrCode::Forbidden, "denied".into())
+                };
+                assert!(callbacks.complete_from(frame.header.correlation_id, error, &sender));
+                if !fallback {
+                    assert!(lookup.await.unwrap_err().to_string().contains("forbidden"));
+                    assert!(frames.try_recv().is_err());
+                    continue;
+                }
+                assert!(futures::poll!(&mut lookup).is_pending());
+                frame = frames.try_recv().unwrap();
+                assert_ne!(initial.stream, decode(&frame).stream);
+            }
+            let control = decode(&frame);
+            assert_eq!(control.operation, Operation::ResolveEndpoint);
+            let reply = ReplyPayload::Ok(
+                endpoint.encode(control.stream),
+                super::super::ENDPOINT_KEY.into(),
+            );
+            assert!(callbacks.complete_from(frame.header.correlation_id, reply, &sender));
+            assert_eq!(lookup.await.unwrap(), (endpoint.clone(), None));
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn ambiguous_admission_never_republishes_or_reuses_the_sequence() {
@@ -983,7 +1105,7 @@ mod tests {
         assert!(futures::poll!(&mut retry).is_pending());
         let mut closing = Box::pin(outbound.close_lane(
             "first",
-            std::future::ready(Some(sender.clone())),
+            |_| std::future::ready(Some(sender.clone())),
             &callbacks,
             Instant::now() + Duration::from_secs(5),
         ));

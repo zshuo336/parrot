@@ -81,6 +81,8 @@ pub mod caps {
     pub const ORDERED_ADMISSION: u32 = 1 << 26;
     /// Resolve an application alias through authorized ordered relay hops.
     pub const ORDERED_ENDPOINT: u32 = 1 << 27;
+    /// Receiver-confirmed alias edges for nested ordered forwarding and close.
+    pub const ORDERED_ROUTE: u32 = 1 << 28;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

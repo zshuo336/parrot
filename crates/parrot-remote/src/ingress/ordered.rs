@@ -133,6 +133,7 @@ struct Source {
 
 pub(super) struct Sessions {
     receiver: Identity,
+    route_key: ring::hmac::Key,
     owner: Option<Arc<ordered::recovery::ReceiverOwner>>,
     sources: HashMap<String, Source>,
     capacity: usize,
@@ -141,6 +142,10 @@ impl Sessions {
     pub fn new(capacity: usize) -> Self {
         Self {
             receiver: ordered::identity(),
+            route_key: ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                &[ordered::identity(), ordered::identity()].concat(),
+            ),
             owner: None,
             sources: HashMap::new(),
             capacity,
@@ -349,19 +354,39 @@ impl Ingress {
         &self,
         frame: &Frame,
         back: &FrameSender,
-        challenge: Identity,
+        control: &Control,
     ) -> Result<(), ErrCode> {
         let alias = |path: &str| {
             Cleanup::default()
                 .call(|| self.local.forwarding_target(super::local_path(path)))
                 .map_err(|_| ErrCode::ProtocolViolation)
         };
-        if let Some(target) = alias(&frame.path)? {
+        let routed = control.operation == Operation::ResolveRoute;
+        let (current, trail) = if routed {
+            ordered::route::discovery(&frame.path, frame.header.hop_count)?
+        } else {
+            (frame.path.as_str(), frame.path.as_str())
+        };
+        if let Some(target) = alias(current)? {
+            if routed && !self.route_allowed(current) {
+                return Err(ErrCode::Forbidden);
+            }
             if crate::actor_path::split(&target).is_none() || !self.is_remote_target(&target) {
                 return Err(ErrCode::NotRemotable);
             }
             let mut forwarded = frame.clone();
-            forwarded.path = target;
+            forwarded.path = if routed {
+                let extended = ordered::route::extend(
+                    trail,
+                    &target,
+                    &control.source,
+                    control.incarnation,
+                    &self.ordered.lock().unwrap().route_key,
+                )?;
+                format!("{target}#{extended}")
+            } else {
+                target
+            };
             self.try_relay_request(&forwarded, back, frame.header.correlation_id)
                 .await;
             return Ok(());
@@ -369,9 +394,7 @@ impl Ingress {
         let cleanup = Cleanup::default();
         let actor = tokio::time::timeout(
             Duration::from_secs(5),
-            unwind::run(&cleanup, || {
-                self.local.lookup(super::local_path(&frame.path))
-            }),
+            unwind::run(&cleanup, || self.local.lookup(super::local_path(current))),
         )
         .await
         .map_err(|_| ErrCode::Timeout)?
@@ -381,7 +404,7 @@ impl Ingress {
         if cleanup.failed() {
             return Err(ErrCode::ProtocolViolation);
         }
-        if alias(&frame.path)?.is_some() {
+        if alias(current)?.is_some() {
             return Err(ErrCode::NotRemotable);
         }
         if !present {
@@ -389,25 +412,87 @@ impl Ingress {
         }
         let receiver = self.ordered.lock().unwrap().receiver;
         let endpoint = ordered::OrderedEndpoint {
-            path: frame.path.clone(),
+            path: trail.into(),
             receiver,
         };
         back.send_reply(Frame::reply(
             frame.header.correlation_id,
             "",
-            ordered::ENDPOINT_KEY,
-            endpoint.encode(challenge),
+            if routed {
+                ordered::ROUTE_RECEIPT_KEY
+            } else {
+                ordered::ENDPOINT_KEY
+            },
+            endpoint.encode(control.stream),
         ));
         Ok(())
     }
 
-    pub(super) async fn on_ordered_control(self: &Arc<Self>, frame: Frame, back: &FrameSender) {
+    fn advance_ordered_route(
+        &self,
+        frame: &mut Frame,
+        source: &str,
+        incarnation: Identity,
+        retire: bool,
+    ) -> Result<(), ErrCode> {
+        let current = ordered::route::head(&frame.path);
+        if !self.route_allowed(current) {
+            return Err(ErrCode::Forbidden);
+        }
+        let next = ordered::route::peel(
+            &frame.path,
+            source,
+            incarnation,
+            &self.ordered.lock().unwrap().route_key,
+        )?;
+        let target = ordered::route::head(next);
+        if !self.is_remote_target(target) {
+            return Err(ErrCode::ProtocolViolation);
+        }
+        if !retire {
+            let actual = Cleanup::default()
+                .call(|| self.local.forwarding_target(super::local_path(current)))
+                .map_err(|_| ErrCode::ProtocolViolation)?;
+            if actual.as_deref() != Some(target) {
+                return Err(ErrCode::NotRemotable);
+            }
+        }
+        frame.path = next.to_owned();
+        Ok(())
+    }
+
+    pub(super) async fn on_ordered_control(self: &Arc<Self>, mut frame: Frame, back: &FrameSender) {
         let result = async {
             let (_, payload) = frame
                 .split_reply_to()
                 .map_err(|_| ErrCode::ProtocolViolation)?;
             let control = Control::decode(&payload).map_err(|_| ErrCode::ProtocolViolation)?;
             self.ordered_origin(&control.source, &frame, back)?;
+            if ordered::route::required(&frame) {
+                if !back.supports_ordered_route() {
+                    return Err(ErrCode::NotRemotable);
+                }
+                if control.operation == Operation::ResolveRoute {
+                    ordered::route::discovery(&frame.path, frame.header.hop_count)?;
+                } else {
+                    if control.operation == Operation::ResolveEndpoint {
+                        return Err(ErrCode::ProtocolViolation);
+                    }
+                    ordered::route::terminal(&frame.path)?;
+                    if !self.is_remote_target(&frame.path) {
+                        let retire = matches!(
+                            control.operation,
+                            Operation::Close | Operation::Recover { .. }
+                        );
+                        self.advance_ordered_route(
+                            &mut frame,
+                            &control.source,
+                            control.incarnation,
+                            retire,
+                        )?;
+                    }
+                }
+            }
             if control.operation == Operation::ResolveEndpoint && !back.supports_ordered_endpoint()
             {
                 return Err(ErrCode::NotRemotable);
@@ -441,7 +526,14 @@ impl Ingress {
                 .unwrap()
                 .as_ref()
                 .map(|router| router.self_node().to_owned());
-            if crate::actor_path::split(&frame.path).map(|pair| pair.0) != receiver.as_deref() {
+            let local = if control.operation == Operation::ResolveRoute {
+                ordered::route::head(&frame.path)
+            } else {
+                &frame.path
+            };
+            if crate::actor_path::split(local)
+                .is_none_or(|(node, _)| Some(node) != receiver.as_deref())
+            {
                 return Err(ErrCode::ProtocolViolation);
             }
             if matches!(
@@ -466,8 +558,8 @@ impl Ingress {
                     self.open_ordered(control).await.map(Some)
                 }
                 Operation::Commit => self.commit_ordered(control).await.map(Some),
-                Operation::ResolveEndpoint => {
-                    self.resolve_ordered_endpoint(&frame, back, control.stream)
+                Operation::ResolveEndpoint | Operation::ResolveRoute => {
+                    self.resolve_ordered_endpoint(&frame, back, &control)
                         .await?;
                     Ok(None)
                 }
@@ -786,7 +878,7 @@ impl Ingress {
         Ok(lease.receipt(false))
     }
 
-    pub(super) async fn on_ordered_tell(self: &Arc<Self>, frame: Frame, back: &FrameSender) {
+    pub(super) async fn on_ordered_tell(self: &Arc<Self>, mut frame: Frame, back: &FrameSender) {
         let (parent, payload) = match frame.split_trace_parent() {
             Ok(parts) => parts,
             Err(_) => {
@@ -813,6 +905,26 @@ impl Ingress {
                 ));
             }
             return;
+        }
+        if frame.path.contains('#') {
+            let result = if !back.supports_ordered_route() || admission.is_none() {
+                Err(ErrCode::NotRemotable)
+            } else if self.is_remote_target(&frame.path) {
+                ordered::route::terminal(&frame.path).map(|_| ())
+            } else {
+                self.advance_ordered_route(&mut frame, &data.source, data.incarnation, false)
+            };
+            if let Err(code) = result {
+                if let Some(id) = admission {
+                    let detail = if code == ErrCode::NotRemotable {
+                        id.alias_error()
+                    } else {
+                        "invalid ordered alias route".into()
+                    };
+                    back.send_reply(Frame::reply_err(cid, "", code, &detail));
+                }
+                return;
+            }
         }
         if self.is_remote_target(&frame.path) {
             let mut frame = frame;
