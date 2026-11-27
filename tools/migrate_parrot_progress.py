@@ -126,13 +126,12 @@ def write_plan(tasks: list[dict]) -> None:
     ]
     for task in tasks:
         deps = ",".join(task["dependencies"]) or "无"
-        evidence = ",".join(task["evidence"]) or "无"
         lines.extend(
             [
                 f"### {task['id']} {task['title']}",
                 f"状态：{task['status']}",
                 f"实现：{task['package_existing']} 目标是：{task['deliverable']}",
-                f"验证：依赖 {deps}；使用真实代码、测试、目标环境和原始报告，证据入口 {evidence}。",
+                f"验证：依赖 {deps}。实际用例与验收记录见[任务 {task['id']}](progress/PROJECT_TODO_OFFLINE.html#{task['id']})。",
                 f"退出：{task['acceptance']} 本切片只有在剩余工作为 0、依赖已验证且报告固定后才能标为已验证。",
                 "",
             ]
