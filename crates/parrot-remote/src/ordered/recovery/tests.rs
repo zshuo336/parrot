@@ -81,6 +81,43 @@ fn config(directory: &Path) -> OrderedReceiverState {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn live_registration_pins_the_source_directory_and_a_single_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("source");
+    let moved = root.path().join("moved");
+    std::fs::create_dir(&dir).unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let invite = handoff::prepare(&config(first.path()), "node").unwrap();
+    let other = handoff::prepare(&config(second.path()), "node").unwrap();
+    let owner = ReceiverOwner::open(&config(&dir), "node").unwrap();
+    std::fs::rename(&dir, &moved).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    let foreign = ReceiverOwner::open(&config(&dir), "node").unwrap();
+    assert!(owner
+        .reserve_standby(&invite)
+        .unwrap_err()
+        .contains("replaced"));
+    drop(foreign);
+    std::fs::rename(&dir, root.path().join("foreign")).unwrap();
+    std::fs::rename(moved, &dir).unwrap();
+    let proof = owner.reserve_standby(&invite).unwrap();
+    assert_eq!(owner.reserve_standby(&invite).unwrap(), proof);
+    assert!(owner.reserve_standby(&other).is_err());
+    drop(owner);
+    assert!(ReceiverOwner::open(&config(&dir), "node")
+        .err()
+        .unwrap()
+        .contains("sealed"));
+    assert!(handoff::seal(&config(&dir), "node", &other).is_err());
+    assert_eq!(
+        handoff::seal(&config(&dir), "node", &invite).unwrap(),
+        proof
+    );
+}
+
 #[test]
 fn epochs_serialize_owners_and_only_attest_previous_owners_of_the_same_domain() {
     let directory = tempfile::tempdir().unwrap();

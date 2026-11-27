@@ -36,15 +36,51 @@ struct Seal {
 }
 
 impl Invitation {
-    fn verify(&self, config: &OrderedReceiverState, node: &str) -> Result<(), String> {
+    fn verify(&self, realm: &str, node: &str) -> Result<(), String> {
         if self.version != 1
-            || self.realm != config.realm
+            || self.realm != realm
             || self.node != node
             || self.destination == [0; 16]
         {
             return Err("receiver handoff invitation binding differs".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl super::ReceiverOwner {
+    pub(super) fn reserve_standby(&self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        if !self.valid_process() {
+            return Err("standby registration requires the owning process".into());
+        }
+        let invitation: Invitation = parse(bytes)?;
+        let mut saved = self.saved.lock().map_err(error)?;
+        use std::os::fd::AsRawFd;
+        let dir = std::fs::File::open(&self.directory).map_err(error)?;
+        let pinned = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        let lock = super::regular(&pinned.join(".parrot-ordered.lock"), super::Access::Read)?;
+        if super::anchor(&lock)? != saved.anchor {
+            return Err("standby source directory was replaced".into());
+        }
+        invitation.verify(&saved.realm, &saved.node)?;
+        if invitation.destination == saved.namespace || saved.epoch == u64::MAX {
+            return Err("standby invitation does not match this receiver".into());
+        }
+        if matches!(saved.handoff, Some(Phase::Sealed { destination }) if destination != invitation.destination)
+        {
+            return Err("receiver already reserved for another standby".into());
+        }
+        let destination = invitation.destination;
+        let proof = document(&Seal {
+            invitation,
+            namespace: saved.namespace,
+            epoch: saved.epoch,
+        })?;
+        // Keep the same target on retry even if directory sync fails after rename.
+        saved.handoff = Some(Phase::Sealed { destination });
+        saved.publish(&pinned)?;
+        Ok(proof)
     }
 }
 
@@ -62,6 +98,20 @@ fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
         return Err("receiver handoff document too large".into());
     }
     serde_json::from_slice(bytes).map_err(error)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn verify_standby(invitation: &[u8], proof: &[u8]) -> Result<(), String> {
+    let seal: Seal = parse(proof)?;
+    if document(&seal.invitation)? != invitation
+        || seal.epoch == 0
+        || seal.epoch == u64::MAX
+        || seal.namespace == [0; 16]
+        || seal.namespace == seal.invitation.destination
+    {
+        return Err("invalid standby enrollment".into());
+    }
+    Ok(())
 }
 
 /// Reserve a fresh target without permitting runtime startup. Safe to retry.
@@ -96,7 +146,7 @@ pub fn seal(
     invitation: &[u8],
 ) -> Result<Vec<u8>, String> {
     let invitation: Invitation = parse(invitation)?;
-    invitation.verify(config, node)?;
+    invitation.verify(&config.realm, node)?;
     let (locked, mut saved) = LockedDirectory::load(config, node)?;
     if saved.epoch == 0 || saved.epoch == u64::MAX || invitation.destination == saved.namespace {
         return Err("receiver has no transferable epoch".into());
@@ -129,7 +179,7 @@ pub fn activate(
     if Sha256::digest(bytes)[..] != digest {
         return Err("receiver handoff digest differs".into());
     }
-    proof.invitation.verify(config, node)?;
+    proof.invitation.verify(&config.realm, node)?;
     if proof.epoch == 0
         || proof.epoch == u64::MAX
         || proof.namespace == [0; 16]

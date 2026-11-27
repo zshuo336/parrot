@@ -7,6 +7,9 @@ mod receiver_handoff;
 mod relay_restart;
 #[path = "ordered_sessions/sender_restart.rs"]
 mod sender_restart;
+#[cfg(target_os = "linux")]
+#[path = "ordered_sessions/standby.rs"]
+mod standby;
 use parrot_api::{
     address::ActorRef,
     types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage},

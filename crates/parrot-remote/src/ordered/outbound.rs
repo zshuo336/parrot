@@ -169,6 +169,11 @@ impl Drop for LaneUse<'_> {
 }
 
 impl Outbound {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn persists_tickets(&self) -> bool {
+        self.journal.is_some()
+    }
+
     #[cfg(test)]
     pub fn new(source: String, capacity: usize) -> Self {
         Self::with_journal(source, capacity, None)

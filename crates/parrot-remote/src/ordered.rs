@@ -4,6 +4,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub(crate) mod outbound;
 pub(crate) mod recovery;
 pub use recovery::handoff;
+#[cfg(target_os = "linux")]
+pub use recovery::standby;
 pub(crate) mod route;
 pub(crate) use outbound::Outbound;
 

@@ -326,6 +326,11 @@ impl Ingress {
         sessions.owner = Some(owner);
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ordered_receiver_owner(&self) -> Option<Arc<ordered::recovery::ReceiverOwner>> {
+        self.ordered.lock().unwrap().owner.clone()
+    }
+
     /// Grant only authenticated relays permission to preserve an ordered origin.
     pub fn set_ordered_relays(
         &self,

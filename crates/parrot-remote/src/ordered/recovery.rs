@@ -2,6 +2,8 @@
 use super::Identity;
 pub mod handoff;
 pub(crate) mod sender;
+#[cfg(target_os = "linux")]
+pub mod standby;
 use parrot_config::OrderedReceiverState;
 use sha2::{Digest, Sha256};
 use std::{
@@ -47,6 +49,8 @@ pub(crate) struct ReceiverOwner {
     namespace: Identity,
     epoch: u64,
     lock: Lock,
+    #[cfg(target_os = "linux")]
+    saved: std::sync::Mutex<Saved>,
 }
 struct LockedDirectory {
     directory: std::path::PathBuf,
@@ -131,7 +135,16 @@ impl LockedDirectory {
     }
 
     fn publish(&self, saved: &Saved) -> Result<(), String> {
-        let directory = &self.directory;
+        saved.publish(&self.directory)?;
+        File::open(self.directory.parent().unwrap_or(Path::new("/")))
+            .map_err(error)?
+            .sync_all()
+            .map_err(error)
+    }
+}
+
+impl Saved {
+    fn publish(&self, directory: &Path) -> Result<(), String> {
         let main = directory.join("ordered.state");
         let next = directory.join("ordered.next");
         match std::fs::symlink_metadata(&next) {
@@ -143,7 +156,7 @@ impl LockedDirectory {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(error(e)),
         }
-        let bytes = serde_json::to_vec(saved).map_err(error)?;
+        let bytes = serde_json::to_vec(self).map_err(error)?;
         if bytes.len() > LIMIT {
             return Err("ordered receiver state capacity exceeded".into());
         }
@@ -154,10 +167,6 @@ impl LockedDirectory {
         file.sync_all().map_err(error)?;
         std::fs::rename(&next, &main).map_err(error)?;
         File::open(directory)
-            .map_err(error)?
-            .sync_all()
-            .map_err(error)?;
-        File::open(directory.parent().unwrap_or(Path::new("/")))
             .map_err(error)?
             .sync_all()
             .map_err(error)?;
@@ -189,6 +198,8 @@ impl ReceiverOwner {
             namespace: saved.namespace,
             epoch: saved.epoch,
             lock: locked.lock,
+            #[cfg(target_os = "linux")]
+            saved: std::sync::Mutex::new(saved),
         }))
     }
 

@@ -40,6 +40,11 @@ async fn original_host() {
             .unwrap(),
     );
     let original = start(cfg.clone(), delivery.clone()).await;
+    #[cfg(target_os = "linux")]
+    if let Ok(hex) = std::env::var("PARROT_HANDOFF_STANDBY_DIGEST") {
+        let digest = hex::decode(hex).unwrap().try_into().unwrap();
+        original.register_receiver_standby(digest).await.unwrap();
+    }
     std::fs::write(
         root.join("address"),
         original.local_addr().unwrap().to_string(),

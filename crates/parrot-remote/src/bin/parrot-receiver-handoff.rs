@@ -4,7 +4,7 @@ use parrot_remote::ordered::handoff;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-const USAGE: &str = "usage: parrot-receiver-handoff prepare|seal|activate DIRECTORY REALM NODE [SEAL_SHA256]\nprepare writes an invitation to stdout; seal reads it on stdin and writes a private seal to stdout and its SHA-256 to stderr; activate reads the seal on stdin and verifies the trusted source digest";
+const USAGE: &str = "usage: parrot-receiver-handoff prepare|seal|activate DIRECTORY REALM NODE [SEAL_SHA256]\nLinux: watch DIRECTORY REALM NODE, or witness < invitation.json\nprepare writes an invitation to stdout; seal and witness read an invitation and write a private seal to stdout and its SHA-256 to stderr; activate checks the trusted digest before publishing";
 
 fn input() -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
@@ -21,6 +21,15 @@ fn input() -> Result<Vec<u8>, String> {
 
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    if args.as_slice() == ["witness"] {
+        let seal = parrot_remote::ordered::standby::witness(&input()?)?;
+        eprintln!("{}", hex::encode(Sha256::digest(&seal)));
+        return std::io::stdout()
+            .lock()
+            .write_all(&seal)
+            .map_err(|e| e.to_string());
+    }
     let [action, directory, realm, node, rest @ ..] = args.as_slice() else {
         return Err(USAGE.into());
     };
@@ -29,6 +38,8 @@ fn run() -> Result<(), String> {
         realm: realm.clone(),
     };
     let bytes = match (action.as_str(), rest) {
+        #[cfg(target_os = "linux")]
+        ("watch", []) => return parrot_remote::ordered::standby::watch(&config, node),
         ("prepare", []) => handoff::prepare(&config, node)?,
         ("seal", []) => {
             let seal = handoff::seal(&config, node, &input()?)?;
