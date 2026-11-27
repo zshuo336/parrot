@@ -756,7 +756,9 @@ impl Ingress {
             return;
         };
         let Some(frame) = self.charge_reorder(frame) else {
-            self.reject_reorder(back);
+            let reply = admission
+                .map(|id| Frame::reply_err(cid, "", ErrCode::Overloaded, &id.capacity_error()));
+            self.reject_reorder(back, reply);
             return;
         };
         *lease.deadline.lock().unwrap() =

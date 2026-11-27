@@ -65,6 +65,14 @@ pub(crate) struct AdmissionId {
 }
 
 impl AdmissionId {
+    /// Keep the standard Overloaded error readable by v1 callers. Its bound detail
+    /// lets the sender distinguish receiver pre-admission from a generic relay error.
+    pub fn capacity_error(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let binding = Sha256::digest(self.receipt(false));
+        format!("ordered admission capacity exhausted (v1/{binding:x})")
+    }
+
     pub fn receipt(&self, admitted: bool) -> Bytes {
         let mut bytes = BytesMut::with_capacity(41);
         bytes.put_u8(u8::from(admitted));
@@ -355,6 +363,16 @@ pub fn business_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_capacity_refusal_has_a_stable_v1_binding() {
+        let id = AdmissionId {
+            receiver: [2; 16],
+            ticket: [3; 16],
+            sequence: 4,
+        };
+        assert_eq!(id.capacity_error(), "ordered admission capacity exhausted (v1/7c4ec89798e6dd0e5e4f6198d4c912b016246b358ee2d12609664b419c571465)");
+    }
 
     #[test]
     fn identity_control_and_receipts_are_versioned_and_exact() {

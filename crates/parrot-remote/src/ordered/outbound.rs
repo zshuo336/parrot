@@ -430,6 +430,12 @@ impl Outbound {
             result = reply => match result {
                 Ok(ReplyPayload::Ok(bytes, key)) if key == ADMISSION_RECEIPT_KEY => id.outcome(&bytes)
                     .ok_or_else(|| ErrCode::ProtocolViolation.to_actor_error("ordered admission identity differs".into())),
+                Ok(ReplyPayload::Err(ErrCode::Overloaded, detail)) if detail == id.capacity_error() => {
+                    // We still hold the lane lock. Only this exact attempted sequence
+                    // was refused before enqueue; the active ticket remains valid.
+                    state.sequence -= 1;
+                    Err(ErrCode::Overloaded.to_actor_error("ordered receiver at capacity".into()))
+                }
                 Ok(ReplyPayload::Err(code, detail)) => Err(code.to_actor_error(detail)),
                 Ok(_) => Err(ErrCode::ProtocolViolation.to_actor_error("invalid ordered admission response".into())),
                 Err(_) => Err(ErrCode::ConnectionLost.to_actor_error("ordered admission callback closed".into())),
@@ -656,7 +662,7 @@ mod tests {
             renew_at: Instant::now() + Duration::from_secs(30),
         });
         let mut last_cid = None;
-        for sequence in 1..=5 {
+        for sequence in 1..=9 {
             let frame = Frame::tell("parrot://target/service", "work", bytes::Bytes::new());
             let mut send = Box::pin(outbound.send("target", &sender, &callbacks, frame, true));
             assert!(futures::poll!(&mut send).is_pending());
@@ -691,6 +697,36 @@ mod tests {
                 4 => {
                     assert!(callbacks.complete_from(cid, response(id.receipt(true)), &sender));
                     assert!(send.await.unwrap().is_none());
+                }
+                5..=8 => {
+                    let detail = match sequence {
+                        5 => "inbound dispatch queue full".into(),
+                        6 => AdmissionId {
+                            receiver: [9; 16],
+                            ..id
+                        }
+                        .capacity_error(),
+                        7 => AdmissionId {
+                            ticket: [9; 16],
+                            ..id
+                        }
+                        .capacity_error(),
+                        _ => AdmissionId {
+                            sequence: sequence - 1,
+                            ..id
+                        }
+                        .capacity_error(),
+                    };
+                    assert!(callbacks.complete_from(
+                        cid,
+                        ReplyPayload::Err(ErrCode::Overloaded, detail),
+                        &sender
+                    ));
+                    assert!(send
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("remote overloaded"));
                 }
                 _ => {
                     sender.close();

@@ -32,6 +32,7 @@ impl parrot_api::Message for Work {
 struct State {
     seen: tokio::sync::mpsc::UnboundedSender<u64>,
     entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
     dropping: tokio::sync::Notify,
     dropped: AtomicBool,
     gate: (Mutex<bool>, Condvar),
@@ -42,6 +43,7 @@ fn state() -> (Arc<State>, tokio::sync::mpsc::UnboundedReceiver<u64>) {
         Arc::new(State {
             seen,
             entered: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
             dropping: tokio::sync::Notify::new(),
             dropped: AtomicBool::new(false),
             gate: (Mutex::new(false), Condvar::new()),
@@ -101,6 +103,10 @@ impl ActorRef for Target {
             return Box::pin(HeldDrop(self.0.clone()));
         }
         Box::pin(async move {
+            if value == 701 {
+                self.0.entered.notify_one();
+                self.0.resume.notified().await;
+            }
             self.0.seen.send(value).unwrap();
             Ok(())
         })
@@ -212,6 +218,97 @@ async fn authenticated_memory_hub_keeps_sources_independent_and_closes_sessions(
         .unwrap();
     strict(&a, 20).await;
     seen(&mut receiver, 20).await;
+    for node in [&first, &second, &hub, &target] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn saturated_frame_budget_preserves_the_shared_hub_and_next_ordered_sequence() {
+    check_ordered_saturation("frames", 1, 1 << 20).await;
+}
+
+#[tokio::test]
+async fn saturated_byte_budget_preserves_the_shared_hub_and_next_ordered_sequence() {
+    check_ordered_saturation("bytes", 32, 256).await;
+}
+
+async fn check_ordered_saturation(label: &str, frames: usize, bytes: usize) {
+    let hub_id = format!("busy-hub-{label}");
+    let target_id = format!("busy-target-{label}");
+    let path = format!("parrot://{target_id}/target");
+    let (target_state, mut rx) = state();
+    let hub = start(
+        RemoteConfig::mem(&hub_id).with_role(TopologyRole::Hub),
+        Arc::new(Empty),
+    )
+    .await;
+    let target = start(
+        RemoteConfig::mem(&target_id)
+            .with_ordered_relays([hub_id])
+            .with_knobs(RuntimeKnobs {
+                reorder_frame_capacity: frames,
+                reorder_byte_capacity: bytes,
+                reorder_gap_timeout_ms: 20_000,
+                ..Default::default()
+            }),
+        Arc::new(Target(target_state.clone())),
+    )
+    .await;
+    let first = start(
+        RemoteConfig::mem(format!("busy-first-{label}")),
+        Arc::new(Empty),
+    )
+    .await;
+    let second = start(
+        RemoteConfig::mem(format!("busy-second-{label}")),
+        Arc::new(Empty),
+    )
+    .await;
+    for node in [&first, &second, &target] {
+        node.connect_mem_pair(&hub).await.unwrap();
+    }
+    let held = first.remote_ref(&path).unwrap();
+    let busy = second.remote_ref(&path).unwrap();
+    let [(_, downstream, _)] = target
+        .links_snapshot()
+        .await
+        .try_into()
+        .unwrap_or_else(|_| panic!("expected one hub connection"));
+    strict(&held, 701).await;
+    tokio::time::timeout(Duration::from_secs(3), target_state.entered.notified())
+        .await
+        .unwrap();
+    let error = busy
+        .deliver_ordered(Box::new(Work(2)), Default::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("remote overloaded"), "{error}");
+    assert!(rx.try_recv().is_err());
+    // The same downstream connection still serves this other source before any budget is released.
+    let echo = held
+        .send_with_timeout(Box::new(Work(77)), Some(Duration::from_secs(3)))
+        .await
+        .unwrap();
+    assert_eq!(echo.downcast_ref::<Work>().unwrap().0, 77);
+    assert!(!downstream.is_closed());
+    assert!(target
+        .links_snapshot()
+        .await
+        .iter()
+        .any(|(_, link, _)| link.same_connection(&downstream)));
+    target_state.resume.notify_one();
+    seen(&mut rx, 701).await;
+    held.close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    strict(&busy, 3).await;
+    // The configured gap deadline is 20 seconds. A consumed rejected sequence would stall here.
+    seen(&mut rx, 3).await;
+    busy.close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(rx.try_recv().is_err());
     for node in [&first, &second, &hub, &target] {
         node.shutdown().await.unwrap();
     }

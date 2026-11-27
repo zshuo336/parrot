@@ -2527,12 +2527,12 @@ impl Ingress {
         // An idle worker may retire between sender acquisition and enqueue.
         // Retry through the registered worker, never bypass FIFO via direct delivery.
         let Some(mut pending) = self.charge_reorder(frame) else {
-            self.reject_reorder(back);
+            self.reject_reorder(back, None);
             return;
         };
         loop {
             let Some(tx) = self.reorder_tx_of(from_node) else {
-                self.reject_reorder(back);
+                self.reject_reorder(back, None);
                 return;
             };
             tokio::select! {
@@ -2555,10 +2555,15 @@ impl Ingress {
         Some(ReorderPending { frame, permit })
     }
 
-    fn reject_reorder(&self, back: &FrameSender) {
+    fn reject_reorder(&self, back: &FrameSender, reply: Option<Frame>) {
         DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
-        if !self.reorder_closed.load(Ordering::Acquire) {
+        let open = !self.reorder_closed.load(Ordering::Acquire);
+        if open {
             REORDER_REJECTED.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(reply) = reply {
+            back.send_reply(reply);
+        } else if open {
             back.close();
         }
     }
