@@ -1,4 +1,7 @@
 //! Facade groups must share actual native recovery across static and erased members.
+#[path = "support/isolated.rs"]
+mod isolated;
+
 use parrot::{
     actix::ActixActorSystem,
     system::{FacadeRootCohort, ParrotActorSystem},
@@ -68,6 +71,7 @@ struct Plan {
     hooks: AtomicUsize,
     block_drop: Option<Arc<BlockGate>>,
     bad_drop: bool,
+    observed_worker: Mutex<Option<std::thread::Thread>>,
 }
 struct Member {
     plan: Arc<Plan>,
@@ -84,6 +88,9 @@ impl Member {
     }
     fn handle(&mut self, op: Op, path: String, root: bool) -> ActorResult<Report> {
         assert!(root, "cohort introduced a synthetic parent");
+        if matches!(op, Op::ObserveWorker) {
+            *self.plan.observed_worker.lock().unwrap() = Some(std::thread::current());
+        }
         if matches!(op, Op::Fail) {
             self.failures += 1;
             return Err(ActorError::MessageHandlingError(
@@ -108,6 +115,7 @@ impl Drop for Member {
 enum Op {
     Read,
     Fail,
+    ObserveWorker,
 }
 #[derive(Debug, PartialEq, Eq)]
 struct Report(usize, usize, String);
@@ -969,6 +977,141 @@ fn native_facade_groups_join_static_members_after_original_host_exit() {
         .open(receipt)
         .unwrap();
     std::io::Write::write_all(&mut stream, CASE.as_bytes()).unwrap();
+}
+
+fn mixed_group_after_host_exit(
+    name: &str,
+    mode: parrot::thread::config::SchedulingMode,
+    prefix: &str,
+) {
+    isolated::run(name, "PARROT_MIXED_COHORT_HOST_EXIT", WAIT * 4, || {
+        let host = actix::System::new();
+        let plans = [Arc::new(Plan::default()), Arc::new(Plan::default())];
+        let policy_drops = Arc::new(AtomicUsize::new(0));
+        let (system, group, typed, erased) = host.block_on(async {
+            let system = ParrotActorSystem::new(Default::default()).await.unwrap();
+            let engine = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
+                default_scheduling_mode: mode,
+                shared_pool_size: 1,
+                shared_burst_workers_max: 0,
+                ..Default::default()
+            });
+            system
+                .register_thread_system("native".into(), engine, true)
+                .await
+                .unwrap();
+            let group = system
+                .native_root_cohort(captured_policy(Capture(policy_drops.clone(), false)))
+                .await
+                .unwrap();
+            let plan = plans[0].clone();
+            let typed = group
+                .spawn_typed_factory::<_, Op, _>(move || Member::new(&plan), "/typed")
+                .await
+                .unwrap();
+            let plan = plans[1].clone();
+            let erased = group
+                .spawn_factory(
+                    Box::new(move || Box::new(Member::new(&plan))),
+                    SpawnOptions::at("/erased"),
+                )
+                .await
+                .unwrap();
+            for generation in 0..=1 {
+                assert_eq!(
+                    typed.ask(Op::ObserveWorker).await.unwrap(),
+                    Report(generation, 0, "/typed".into())
+                );
+                assert_eq!(
+                    dynamic(&erased, Op::ObserveWorker).await.unwrap(),
+                    Report(generation, 0, "/erased".into())
+                );
+                let [first, second] = plans
+                    .each_ref()
+                    .map(|plan| plan.observed_worker.lock().unwrap().take().unwrap());
+                for thread in [&first, &second] {
+                    assert!(
+                        thread.name().unwrap_or_default().starts_with(prefix),
+                        "expected {prefix}, got {thread:?}"
+                    );
+                }
+                assert_eq!(first.id() == second.id(), prefix == "parrot-shard-");
+                if generation == 0 {
+                    assert!(typed.ask(Op::Fail).await.is_err());
+                    while plans
+                        .iter()
+                        .any(|p| p.initialized.load(Ordering::SeqCst) < 2)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    // Initialization precedes publication of the new generations.
+                    recovered(&typed.clone().into_dyn(), "/typed").await;
+                    recovered(&erased, "/erased").await;
+                }
+            }
+            (system, group, typed, erased)
+        });
+        drop(host);
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        observer.block_on(bounded(async {
+            use parrot_api::address::RetirementStatus;
+            loop {
+                match typed.retirement_status() {
+                    RetirementStatus::Retired(result) => {
+                        result.unwrap();
+                        break;
+                    }
+                    RetirementStatus::Pending => tokio::task::yield_now().await,
+                    RetirementStatus::Unsupported => panic!("missing typed retirement receipt"),
+                }
+            }
+            group.stop().await.unwrap();
+            group.stop().await.unwrap();
+            assert!(group.members().is_empty());
+            assert_eq!(policy_drops.load(Ordering::SeqCst), 1);
+            for plan in &plans {
+                assert_eq!(plan.built.load(Ordering::SeqCst), 2);
+                assert_eq!(plan.dropped.load(Ordering::SeqCst), 2);
+            }
+            for path in ["/typed", "/erased"] {
+                assert!(AsyncEngineRuntime::get_actor(&system, path).await.is_none());
+            }
+            assert!(typed.ask(Op::Read).await.is_err());
+            assert!(dynamic(&erased, Op::Read).await.is_err());
+            let first = system.shutdown_runtime().await.unwrap_err().to_string();
+            assert!(
+                first.contains("shared task unexpectedly cancelled"),
+                "{first}"
+            );
+            assert_eq!(
+                system.shutdown_runtime().await.unwrap_err().to_string(),
+                first
+            );
+        }));
+    });
+}
+
+#[test]
+fn dedicated_mixed_cohort_recovers_and_retires_after_host_exit() {
+    mixed_group_after_host_exit(
+        "dedicated_mixed_cohort_recovers_and_retires_after_host_exit",
+        parrot::thread::config::SchedulingMode::DedicatedThread,
+        "parrot-dedicated-",
+    );
+}
+
+#[test]
+fn sharded_mixed_cohort_recovers_and_retires_after_host_exit() {
+    mixed_group_after_host_exit(
+        "sharded_mixed_cohort_recovers_and_retires_after_host_exit",
+        parrot::thread::config::SchedulingMode::Sharded {
+            affinity_key: "cohort".into(),
+        },
+        "parrot-shard-",
+    );
 }
 
 struct DynamicOnly(Arc<ThreadActorSystem>);
