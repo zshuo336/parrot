@@ -143,7 +143,7 @@ enum Op {
     Hold(
         tokio::sync::oneshot::Sender<usize>,
         Arc<tokio::sync::Notify>,
-        Arc<()>,
+        BoxedMessage,
     ),
     Queued(tokio::sync::oneshot::Sender<usize>, BlockedDrop),
     InstallExit(Arc<BlockGate>, Arc<()>),
@@ -926,7 +926,7 @@ async fn mixed_group_with_unread_tell(
     let active = Arc::new(());
     let live = Arc::downgrade(&active);
     let release = Arc::new(tokio::sync::Notify::new());
-    let hold = Op::Hold(started, release.clone(), active);
+    let hold = Op::Hold(started, release.clone(), Box::new(active));
     let mut held: BoxedFuture<'_, ActorResult<Report>> = if dynamic_receiver {
         Box::pin(dynamic(&peer, hold))
     } else {
@@ -1100,7 +1100,10 @@ async fn thread_root_stop_retires_stalled_dynamic_ask_and_keeps_timeout() {
             let (started, entered) = tokio::sync::oneshot::channel();
             let active = Arc::new(());
             let live = Arc::downgrade(&active);
-            let request = dynamic(&peer, Op::Hold(started, Default::default(), active));
+            let request = dynamic(
+                &peer,
+                Op::Hold(started, Default::default(), Box::new(active)),
+            );
             tokio::pin!(request);
             tokio::select! {
                 result = &mut request => panic!("held request finished early: {result:?}"),
@@ -1344,6 +1347,106 @@ fn native_facade_groups_join_static_members_after_original_host_exit() {
         .open(receipt)
         .unwrap();
     std::io::Write::write_all(&mut stream, CASE.as_bytes()).unwrap();
+}
+
+#[test]
+fn local_group_joins_handler_and_unread_input_after_original_host_exit() {
+    struct DropThread(tokio::sync::mpsc::UnboundedSender<std::thread::ThreadId>);
+    impl Drop for DropThread {
+        fn drop(&mut self) {
+            self.0.send(std::thread::current().id()).unwrap();
+        }
+    }
+    isolated::run(
+        "local_group_joins_handler_and_unread_input_after_original_host_exit",
+        "PARROT_LOCAL_GROUP_HOST_EXIT",
+        WAIT * 4,
+        || {
+            let host = actix::System::new();
+            let plan = Arc::new(Plan::default());
+            let policies = Arc::new(AtomicUsize::new(0));
+            let gate = Arc::new(BlockGate::default());
+            let _release = Release(gate.clone());
+            let (delivered, arrived) = tokio::sync::oneshot::channel();
+            let (drops, mut handler_drop) = tokio::sync::mpsc::unbounded_channel();
+            let capture = Arc::new(());
+            let factory_capture = Arc::downgrade(&capture);
+            let (system, group, actor, held, owner) = host.block_on(async {
+                let system = facade(true).await;
+                let group = system
+                    .native_root_cohort(captured_policy(Capture(policies.clone(), false)))
+                    .await
+                    .unwrap();
+                let made = plan.clone();
+                let actor = group
+                    .local_runtime()
+                    .unwrap()
+                    .spawn_local_factory(
+                        Box::new(move || {
+                            let _keep = &capture;
+                            Box::new(LocalMember {
+                                member: Member::new(&made),
+                                owner: std::thread::current().id(),
+                                local: Rc::new(()),
+                            })
+                        }),
+                        SpawnOptions::at("/local"),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    dynamic(&actor, Op::ObserveWorker).await.unwrap(),
+                    Report(0, 0, "/local".into())
+                );
+                let owner = plan.observed_worker.lock().unwrap().take().unwrap().id();
+                assert_ne!(owner, std::thread::current().id());
+                let (started, entered) = tokio::sync::oneshot::channel();
+                let reference = actor.clone_boxed();
+                let mut held = Box::pin(async move {
+                    dynamic(
+                        &reference,
+                        Op::Hold(started, Default::default(), Box::new(DropThread(drops))),
+                    )
+                    .await
+                });
+                tokio::select! {
+                    result = &mut held => panic!("active Local request ended early: {result:?}"),
+                    generation = entered => assert_eq!(generation.unwrap(), 0),
+                }
+                actor
+                    .deliver(Box::new(Op::Queued(delivered, BlockedDrop(gate.clone()))))
+                    .await
+                    .unwrap();
+                assert_eq!(group.members().len(), 1);
+                (system, group, actor, held, owner)
+            });
+            drop(host);
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(bounded(async {
+                let mut first = group.stop();
+                tokio::select! {
+                    result = &mut first => panic!("Local group retired before queued disposal: {result:?}"),
+                    _ = gate.entered.notified() => {}
+                }
+                drop(first);
+                let mut second = group.stop();
+                assert!(futures::poll!(&mut second).is_pending());
+                gate.release();
+                second.await.unwrap();
+                assert_eq!(handler_drop.recv().await, Some(owner));
+                assert!(handler_drop.recv().await.is_none());
+                assert!(matches!(held.await, Err(ActorError::Stopped | ActorError::ReplyChannelError(_))));
+                assert!(arrived.await.is_err());
+                assert_eq!(plan.dropped.load(Ordering::SeqCst), 1);
+                assert!(factory_capture.upgrade().is_none());
+                assert_eq!(policies.load(Ordering::SeqCst), 1);
+                assert!(group.members().is_empty());
+                assert!(AsyncEngineRuntime::get_actor(&system, "/local").await.is_none());
+                actor.stop().await.unwrap();
+                group.stop().await.unwrap();
+                system.shutdown_runtime().await.unwrap();
+            }));
+        },
+    );
 }
 
 fn mixed_group_after_host_exit(
