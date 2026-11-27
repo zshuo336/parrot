@@ -650,6 +650,79 @@ struct HeldLookup(Arc<State>);
 
 struct TwoActors(Target, Target);
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_alias_can_retire_only_the_original_receiver_and_actor_path() {
+    let pki = Pki::new();
+    let config = |name: &str| {
+        RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())).with_mtls(pki.node(name), [])
+    };
+    let src = start(config("restart-src"), Arc::new(Empty)).await;
+    let hub = start(
+        config("restart-hub").with_role(TopologyRole::Hub),
+        Arc::new(Empty),
+    )
+    .await;
+    let alias_config = || config("restart-alias").with_ordered_relays(["restart-hub".into()]);
+    let mapping = Arc::new(AliasLookup(RwLock::new(Some(
+        "parrot://restart-end/first".into(),
+    ))));
+    let alias = start(alias_config(), mapping.clone()).await;
+    let (first, mut received) = state();
+    let release = Release(first.clone());
+    let (second, mut sibling) = state();
+    let end = start(
+        config("restart-end").with_ordered_relays(["restart-alias".into()]),
+        Arc::new(TwoActors(Target(first.clone()), Target(second))),
+    )
+    .await;
+    let hub_addr = NodeAddr::tcp("restart-hub", hub.local_addr().unwrap());
+    let end_addr = NodeAddr::tcp("restart-end", end.local_addr().unwrap());
+    src.connect(&hub_addr).await.unwrap();
+    alias.connect(&hub_addr).await.unwrap();
+    alias.connect(&end_addr).await.unwrap();
+    let timeout = Duration::from_secs(4);
+    let reference = src.remote_ref("parrot://restart-alias/alias").unwrap();
+    strict(&reference, 700).await;
+    tokio::time::timeout(timeout, first.entered.notified())
+        .await
+        .unwrap();
+
+    alias.shutdown().await.unwrap();
+    drop(alias);
+    let alias = start(alias_config(), mapping.clone()).await;
+    alias.connect(&end_addr).await.unwrap();
+    alias.connect(&hub_addr).await.unwrap();
+    *mapping.0.write().unwrap() = Some("parrot://restart-end/second".into());
+    let close = || reference.close_ordered_session(timeout);
+    assert!(
+        close().await.is_err(),
+        "a remapped path certified retirement"
+    );
+    *mapping.0.write().unwrap() = Some("parrot://restart-end/first".into());
+    alias.set_route_acl(Default::default(), "source").unwrap();
+    assert!(
+        close().await.is_err(),
+        "retirement ignored current route authorization"
+    );
+    alias.clear_route_acl().unwrap();
+
+    let closing = close();
+    tokio::pin!(closing);
+    tokio::select! {
+        result = &mut closing => panic!("retirement ended before the original worker dropped: {result:?}"),
+        result = tokio::time::timeout(timeout, first.dropping.notified()) => result.expect("original worker never started retirement"),
+    }
+    release.release();
+    closing.await.unwrap();
+    strict(&reference, 82).await;
+    seen(&mut received, 82).await;
+    assert!(sibling.try_recv().is_err());
+    close().await.unwrap();
+    for node in [&src, &hub, &alias, &end] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[async_trait::async_trait]
 impl LocalLookup for TwoActors {
     async fn lookup(&self, path: &str) -> Option<BoxedActorRef> {
@@ -659,6 +732,66 @@ impl LocalLookup for TwoActors {
             _ => return None,
         };
         Some(Box::new(actor.clone()))
+    }
+}
+
+#[tokio::test]
+async fn restarted_alias_and_receiver_require_the_original_persistent_authority() {
+    let original = tempfile::tempdir().unwrap();
+    let unrelated = tempfile::tempdir().unwrap();
+    let end_config = |dir: &std::path::Path| {
+        RemoteConfig::mem("proof-end")
+            .with_ordered_relays(["proof-alias".into()])
+            .with_ordered_receiver_state(parrot_config::OrderedReceiverState {
+                directory: dir.into(),
+                realm: "alias-proof".into(),
+            })
+    };
+    let new_alias = || {
+        start(
+            RemoteConfig::mem("proof-alias"),
+            Arc::new(AliasLookup(RwLock::new(Some(
+                "parrot://proof-end/target".into(),
+            )))),
+        )
+    };
+    let src = start(RemoteConfig::mem("proof-src"), Arc::new(Empty)).await;
+    let alias = new_alias().await;
+    let (first, mut received) = state();
+    let end = start(end_config(original.path()), Arc::new(Target(first))).await;
+    src.connect_mem_pair(&alias).await.unwrap();
+    alias.connect_mem_pair(&end).await.unwrap();
+    let reference = src.remote_ref("parrot://proof-alias/alias").unwrap();
+    strict(&reference, 63).await;
+    seen(&mut received, 63).await;
+    alias.shutdown().await.unwrap();
+    end.shutdown().await.unwrap();
+    drop((alias, end));
+
+    let alias = new_alias().await;
+    let (other, mut other_messages) = state();
+    let other = start(end_config(unrelated.path()), Arc::new(Target(other))).await;
+    src.connect_mem_pair(&alias).await.unwrap();
+    alias.connect_mem_pair(&other).await.unwrap();
+    let close = || reference.close_ordered_session(Duration::from_secs(3));
+    assert!(
+        close().await.is_err(),
+        "unrelated directory certified the old receiver"
+    );
+    assert!(other_messages.try_recv().is_err());
+    other.shutdown().await.unwrap();
+    drop(other);
+    let (next, mut next_messages) = state();
+    let next = start(end_config(original.path()), Arc::new(Target(next))).await;
+    alias.connect_mem_pair(&next).await.unwrap();
+    close()
+        .await
+        .expect("matching persistent owner must prove retirement through the new alias");
+    strict(&reference, 64).await;
+    seen(&mut next_messages, 64).await;
+    close().await.unwrap();
+    for node in [&src, &alias, &next] {
+        node.shutdown().await.unwrap();
     }
 }
 

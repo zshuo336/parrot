@@ -471,7 +471,7 @@ impl Outbound {
                             stream: state.stream,
                             ticket: grant.receipt.ticket,
                         };
-                        retire(
+                        self.retire(
                             grant,
                             sender,
                             callbacks,
@@ -568,7 +568,7 @@ impl Outbound {
                             stream: state.stream,
                             ticket: previous.receipt.ticket,
                         };
-                        retire(
+                        self.retire(
                             previous,
                             sender,
                             callbacks,
@@ -844,7 +844,7 @@ impl Outbound {
                         stream: state.stream,
                         ticket: grant.receipt.ticket,
                     };
-                    retire(
+                    self.retire(
                         grant,
                         sender,
                         callbacks,
@@ -889,85 +889,136 @@ struct Route<'a> {
     hops: u8,
 }
 
-async fn retire(
-    grant: &Grant,
-    current: &FrameSender,
-    callbacks: &CallbackRegistry,
-    route: Route<'_>,
-    control: &Control,
-    deadline: Instant,
-) -> ActorResult<()> {
-    let current_path = if current.node_id() == route.destination && route.path.contains('#') {
-        super::route::terminal(route.path)
-            .map_err(|code| code.to_actor_error("invalid saved ordered route".into()))?
-    } else {
-        route.path
-    };
-    // Recovery and Close must carry the original sender and any signed route.
-    // A replacement link can advertise node recovery without either feature.
-    let carries_identity = |sender: &FrameSender, path: &str| {
-        (!control.source.contains('@') || sender.supports_sender_sessions())
-            && (!path.contains('#') || sender.supports_ordered_route())
-    };
-    if let Some(epoch) = grant
-        .receipt
-        .epoch
-        .filter(|_| current.supports_ordered_recovery() && carries_identity(current, current_path))
-    {
-        let mut recovery = control.clone();
-        recovery.operation = Operation::Recover {
-            receiver: grant.receipt.receiver,
-            epoch,
+impl Outbound {
+    async fn retire(
+        &self,
+        grant: &Grant,
+        current: &FrameSender,
+        callbacks: &CallbackRegistry,
+        route: Route<'_>,
+        control: &Control,
+        deadline: Instant,
+    ) -> ActorResult<()> {
+        let current_path = if current.node_id() == route.destination && route.path.contains('#') {
+            super::route::terminal(route.path)
+                .map_err(|code| code.to_actor_error("invalid saved ordered route".into()))?
+        } else {
+            route.path
         };
-        match request(
-            current,
+        // Recovery and Close must carry the original sender and any signed route.
+        // A replacement link can advertise node recovery without either feature.
+        let carries_identity = |sender: &FrameSender, path: &str| {
+            (!control.source.contains('@') || sender.supports_sender_sessions())
+                && (!path.contains('#') || sender.supports_ordered_route())
+        };
+        if let Some(epoch) = grant.receipt.epoch.filter(|_| {
+            current.supports_ordered_recovery() && carries_identity(current, current_path)
+        }) {
+            let mut recovery = control.clone();
+            recovery.operation = Operation::Recover {
+                receiver: grant.receipt.receiver,
+                epoch,
+            };
+            match request(
+                current,
+                callbacks,
+                route.destination,
+                current_path,
+                route.hops,
+                &recovery,
+                deadline,
+            )
+            .await
+            {
+                Ok(receipt) if grant.retired_by(&receipt) => return Ok(()),
+                Ok(_) => {
+                    return Err(ErrCode::ProtocolViolation
+                        .to_actor_error("ordered recovery identity differs".into()))
+                }
+                Err((ErrCode::NotRemotable | ErrCode::Forbidden, _)) => {}
+                Err((code, detail)) => return Err(code.to_actor_error(detail)),
+            }
+        }
+        let (sender, path) = if grant.sender.is_closed() {
+            (current, current_path)
+        } else {
+            (&grant.sender, route.path)
+        };
+        if !carries_identity(sender, path)
+            || !sender.supports_ordered_tell()
+            || (grant.actor && !sender.supports_actor_sessions())
+        {
+            return Err(ErrCode::NotRemotable
+                .to_actor_error("route cannot retire the original ordered session".into()));
+        }
+        let result = request(
+            sender,
             callbacks,
             route.destination,
-            current_path,
+            path,
             route.hops,
-            &recovery,
+            control,
             deadline,
         )
-        .await
-        {
-            Ok(receipt) if grant.retired_by(&receipt) => return Ok(()),
-            Ok(_) => {
-                return Err(ErrCode::ProtocolViolation
-                    .to_actor_error("ordered recovery identity differs".into()))
+        .await;
+        let receipt = match result {
+            Err((ErrCode::Forbidden, detail))
+                if path.contains('#') && current.supports_ordered_route() =>
+            {
+                // A restarted issuer has a new signing key. Re-discover through
+                // current policy, then require proof about the original grant.
+                let alias = super::route::head(path);
+                let (first, _) = crate::actor_path::split(alias).expect("validated saved alias");
+                let (endpoint, signed) = self
+                    .lookup(
+                        Route {
+                            destination: first,
+                            path: alias,
+                            hops: route.hops,
+                        },
+                        current,
+                        callbacks,
+                        true,
+                        deadline,
+                    )
+                    .await?;
+                let terminal = super::route::terminal(path)
+                    .map_err(|code| code.to_actor_error("invalid saved ordered route".into()))?;
+                let signed = signed
+                    .filter(|fresh| fresh != path && endpoint.path == terminal)
+                    .ok_or_else(|| ErrCode::Forbidden.to_actor_error(detail.clone()))?;
+                let mut retry = control.clone();
+                if endpoint.receiver != grant.receipt.receiver {
+                    let epoch = grant
+                        .receipt
+                        .epoch
+                        .filter(|_| current.supports_ordered_recovery())
+                        .ok_or_else(|| ErrCode::Forbidden.to_actor_error(detail))?;
+                    retry.operation = Operation::Recover {
+                        receiver: grant.receipt.receiver,
+                        epoch,
+                    };
+                }
+                request(
+                    current,
+                    callbacks,
+                    route.destination,
+                    &signed,
+                    route.hops,
+                    &retry,
+                    deadline,
+                )
+                .await
             }
-            Err((ErrCode::NotRemotable | ErrCode::Forbidden, _)) => {}
-            Err((code, detail)) => return Err(code.to_actor_error(detail)),
+            other => other,
         }
+        .map_err(|(code, detail)| code.to_actor_error(detail))?;
+        if !grant.retired_by(&receipt) {
+            return Err(ErrCode::ProtocolViolation
+                .to_actor_error("ordered retirement identity differs".into()));
+        }
+        Ok(())
     }
-    let (sender, path) = if grant.sender.is_closed() {
-        (current, current_path)
-    } else {
-        (&grant.sender, route.path)
-    };
-    if !carries_identity(sender, path)
-        || !sender.supports_ordered_tell()
-        || (grant.actor && !sender.supports_actor_sessions())
-    {
-        return Err(ErrCode::NotRemotable
-            .to_actor_error("route cannot retire the original ordered session".into()));
-    }
-    let receipt = request(
-        sender,
-        callbacks,
-        route.destination,
-        path,
-        route.hops,
-        control,
-        deadline,
-    )
-    .await
-    .map_err(|(code, detail)| code.to_actor_error(detail))?;
-    if !grant.retired_by(&receipt) {
-        return Err(
-            ErrCode::ProtocolViolation.to_actor_error("ordered retirement identity differs".into())
-        );
-    }
-    Ok(())
 }
 
 async fn request(
@@ -996,6 +1047,18 @@ async fn request(
         ));
     }
     let receipt = Receipt::decode(&bytes).map_err(|detail| (ErrCode::ProtocolViolation, detail))?;
+    if let Operation::Recover { receiver, epoch } = control.operation {
+        if receipt.active
+            || receipt.ticket != control.ticket
+            || receipt.receiver != receiver
+            || receipt.epoch != Some(epoch)
+        {
+            return Err((
+                ErrCode::ProtocolViolation,
+                "ordered recovery receipt differs from request".into(),
+            ));
+        }
+    }
     if receipt.epoch.is_some() && !sender.supports_ordered_recovery() {
         return Err((
             ErrCode::ProtocolViolation,
@@ -1047,6 +1110,55 @@ async fn exchange(
 mod tests {
     use super::*;
     use crate::handshake::caps;
+
+    #[tokio::test]
+    async fn recovery_confirmation_requires_the_requested_epoch() {
+        let callbacks = CallbackRegistry::default();
+        let (tx, mut frames) = tokio::sync::mpsc::channel(1);
+        let sender = FrameSender::capability_test_sender(
+            tx,
+            "target",
+            caps::ORDERED_TELL | caps::ORDERED_RECOVERY,
+        );
+        let control = Control {
+            source: "source".into(),
+            incarnation: [1; 16],
+            stream: [2; 16],
+            ticket: [3; 16],
+            operation: Operation::Recover {
+                receiver: [4; 16],
+                epoch: 7,
+            },
+        };
+        for epoch in [None, Some(6), Some(7)] {
+            let mut reply = Box::pin(request(
+                &sender,
+                &callbacks,
+                "target",
+                "parrot://target/service",
+                4,
+                &control,
+                Instant::now() + Duration::from_secs(3),
+            ));
+            assert!(futures::poll!(&mut reply).is_pending());
+            let frame = frames.try_recv().unwrap();
+            let receipt = Receipt {
+                receiver: [4; 16],
+                ticket: [3; 16],
+                epoch,
+                active: false,
+                generation: 1,
+                lease_ms: super::super::LEASE_MS,
+            };
+            let response = ReplyPayload::Ok(receipt.encode(), RECEIPT_KEY.into());
+            assert!(callbacks.complete_from(frame.header.correlation_id, response, &sender));
+            if epoch == Some(7) {
+                assert_eq!(reply.await.unwrap(), receipt);
+            } else {
+                assert_eq!(reply.await.unwrap_err().0, ErrCode::ProtocolViolation);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn signed_lookup_retries_only_explicit_capability_refusal() {
