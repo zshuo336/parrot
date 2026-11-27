@@ -1,4 +1,6 @@
 use bytes::Bytes;
+#[path = "ordered_sessions/admission_measurements.rs"]
+mod admission_measurements;
 use parrot_api::{
     address::ActorRef,
     message::{MessageOptions, RemoteMessage},
