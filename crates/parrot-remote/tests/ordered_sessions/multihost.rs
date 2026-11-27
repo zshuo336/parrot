@@ -88,7 +88,6 @@ async fn receive(bind: SocketAddr, routed: bool) {
         target.connect(&NodeAddr::tcp(HUB, addr)).await.unwrap();
     }
     println!("FLOW_READY {addr}");
-    let ack = target.remote_ref("parrot://flow-source/target").unwrap();
     for round in 0..=ROUNDS {
         let mut next = [0; FLOWS];
         for _ in 0..FLOWS * count(round) {
@@ -102,7 +101,10 @@ async fn receive(bind: SocketAddr, routed: bool) {
             "FLOW_RECEIVED {}",
             serde_json::json!({"round": round, "counts": next})
         );
-        ack.deliver_with_ack(Box::new(Work(round as u64)), TIMEOUT)
+        target
+            .remote_ref("parrot://flow-source/target")
+            .unwrap()
+            .deliver_with_ack(Box::new(Work(round as u64)), TIMEOUT)
             .await
             .unwrap();
     }
