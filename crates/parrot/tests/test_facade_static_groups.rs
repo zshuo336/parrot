@@ -792,29 +792,76 @@ async fn group_policy_unpolled_and_missing_engine_rejection_isolate_destructors(
     .await;
 }
 
+async fn cancelled_mixed_stop(system: ParrotActorSystem) {
+    bounded(async {
+        let group = system.native_root_cohort(resume()).await.unwrap();
+        let gate = Arc::new(BlockGate::default());
+        let _release = Release(gate.clone());
+        let plan = Arc::new(Plan {
+            block_drop: Some(gate.clone()),
+            ..Default::default()
+        });
+        let actor = group
+            .spawn_typed::<_, Op>(Member::new(&plan), "/blocked")
+            .await
+            .unwrap();
+        let peer_plan = Arc::new(Plan::default());
+        let factory_plan = peer_plan.clone();
+        let peer = group
+            .spawn_factory(
+                Box::new(move || Box::new(Member::new(&factory_plan))),
+                SpawnOptions::at("/peer"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.ask(Op::Read).await.unwrap(),
+            Report(0, 0, "/blocked".into())
+        );
+        assert_eq!(
+            dynamic(&peer, Op::Read).await.unwrap(),
+            Report(0, 0, "/peer".into())
+        );
+        let mut first = group.stop();
+        tokio::select! {
+            result = &mut first => panic!("premature group retirement: {result:?}"),
+            _ = gate.entered.notified() => {}
+        }
+        drop(first);
+        let mut second = group.stop();
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "second stop completed while member disposal was blocked"
+        );
+        assert!(
+            group
+                .members()
+                .read_all()
+                .iter()
+                .any(|member| member.path() == actor.path())
+        );
+        assert_eq!(plan.dropped.load(Ordering::SeqCst), 0);
+        gate.release();
+        second.await.unwrap();
+        assert!(group.members().is_empty());
+        assert_eq!(plan.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(peer_plan.dropped.load(Ordering::SeqCst), 1);
+        actor.stop().await.unwrap();
+        peer.stop().await.unwrap();
+        group.stop().await.unwrap();
+        for path in ["/blocked", "/peer"] {
+            assert!(AsyncEngineRuntime::get_actor(&system, path).await.is_none());
+        }
+        shutdown(&system).await;
+    })
+    .await;
+}
+
 #[actix::test]
 async fn cancelled_group_stop_waiter_keeps_blocked_member_retirement_owned() {
-    bounded(async {
-        for actix in [false,true] {
-            let system=facade(actix).await;
-            let group=system.native_root_cohort(resume()).await.unwrap();
-            let gate=Arc::new(BlockGate::default());
-            let _release=Release(gate.clone());
-            let plan=Arc::new(Plan {block_drop:Some(gate.clone()),..Default::default()});
-            let actor=group.spawn_typed::<_,Op>(Member::new(&plan),"/blocked").await.unwrap();
-            actor.ask(Op::Read).await.unwrap();
-            let mut stop=group.stop();
-            tokio::select! { result=&mut stop=>panic!("premature group retirement: {result:?}"), _=gate.entered.notified()=>{} }
-            drop(stop);
-            assert_eq!(group.members().len(),1);
-            assert_eq!(plan.dropped.load(Ordering::SeqCst),0);
-            gate.release();
-            group.stop().await.unwrap();
-            assert_eq!(plan.dropped.load(Ordering::SeqCst),1);
-            assert!(group.members().is_empty());
-            shutdown(&system).await;
-        }
-    }).await;
+    for actix in [false, true] {
+        cancelled_mixed_stop(facade(actix).await).await;
+    }
 }
 
 #[actix::test]
