@@ -1,5 +1,6 @@
 //! Static protocols must use the configured native scheduler for their lifetime.
 use parrot::{
+    system::ParrotActorSystem,
     thread::{
         ThreadActorSystem,
         config::{SchedulingMode, ThreadActorSystemConfig},
@@ -7,7 +8,7 @@ use parrot::{
     typed_context::{TypedContext, TypedContextExt},
 };
 use parrot_api::{
-    Message,
+    ActorSystem, Message,
     errors::ActorError,
     supervisor::{BasicDecisionFn, OneForOneStrategy, SupervisionDecision},
     typed::{ParrotMsgVariant, ParrotTypedDispatch},
@@ -159,7 +160,14 @@ fn assert_lifecycle(
         assert_eq!(event.thread, owner, "{} migrated", event.stage);
     }
 }
-async fn lifecycle(mode: SchedulingMode, prefix: &str, factory: bool) {
+#[derive(Clone, Copy)]
+enum Entry {
+    Native,
+    Default,
+    Named,
+}
+
+async fn lifecycle(mode: SchedulingMode, prefix: &str, factory: bool, entry: Entry) {
     let events = Events::default();
     let system = ThreadActorSystem::shared(ThreadActorSystemConfig {
         default_scheduling_mode: mode,
@@ -167,36 +175,76 @@ async fn lifecycle(mode: SchedulingMode, prefix: &str, factory: bool) {
         shutdown_timeout: Duration::from_secs(3),
         ..Default::default()
     });
-    let reference = if factory {
-        let generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let events = events.clone();
-        system
-            .spawn_typed_factory_with_strategy::<_, Op, _>(
-                move || Probe {
-                    events: events.clone(),
-                    generation: generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-                },
-                "/static-affinity",
-                OneForOneStrategy {
-                    max_restarts: 1,
-                    within: Duration::from_secs(30),
-                    decider: BasicDecisionFn::new(|_| SupervisionDecision::Restart),
-                },
-            )
-            .await
-            .unwrap()
-    } else {
-        system
-            .spawn_typed::<_, Op>(
-                Probe {
-                    events: events.clone(),
-                    generation: 0,
-                },
-                "/static-affinity",
-            )
-            .await
-            .unwrap()
+    let facade = match entry {
+        Entry::Native => None,
+        Entry::Default | Entry::Named => {
+            let facade = ParrotActorSystem::new(Default::default()).await.unwrap();
+            facade
+                .register_thread_system(
+                    "fallback".into(),
+                    ThreadActorSystem::shared(Default::default()),
+                    true,
+                )
+                .await
+                .unwrap();
+            facade
+                .register_thread_system(
+                    "selected".into(),
+                    system.clone(),
+                    matches!(entry, Entry::Default),
+                )
+                .await
+                .unwrap();
+            Some(facade)
+        }
     };
+    const PATH: &str = "/static-affinity";
+    let reference = if factory {
+        let generation = std::sync::atomic::AtomicUsize::new(0);
+        let events = events.clone();
+        let make = move || Probe {
+            events: events.clone(),
+            generation: generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        };
+        let strategy = OneForOneStrategy {
+            max_restarts: 1,
+            within: Duration::from_secs(30),
+            decider: BasicDecisionFn::new(|_| SupervisionDecision::Restart),
+        };
+        match &facade {
+            None => {
+                system
+                    .spawn_typed_factory_with_strategy::<_, Op, _>(make, PATH, strategy)
+                    .await
+            }
+            Some(f) if matches!(entry, Entry::Named) => {
+                f.spawn_typed_factory_with_strategy_on::<_, Op, _>("selected", make, PATH, strategy)
+                    .await
+            }
+            Some(f) => {
+                f.spawn_typed_factory_with_strategy::<_, Op, _>(make, PATH, strategy)
+                    .await
+            }
+        }
+    } else {
+        let actor = Probe {
+            events: events.clone(),
+            generation: 0,
+        };
+        match &facade {
+            None => system.spawn_typed::<_, Op>(actor, PATH).await,
+            Some(f) if matches!(entry, Entry::Named) => {
+                f.spawn_typed_on::<_, Op>("selected", actor, PATH).await
+            }
+            Some(f) => f.spawn_typed::<_, Op>(actor, PATH).await,
+        }
+    }
+    .unwrap();
+    assert_eq!(
+        system.actor_count(),
+        1,
+        "root was registered on the wrong engine"
+    );
     let first = reference.ask(Op::Ping).await.unwrap();
     let child = reference.ask(Op::Child).await.unwrap();
     let replacement = if factory {
@@ -206,7 +254,11 @@ async fn lifecycle(mode: SchedulingMode, prefix: &str, factory: bool) {
         None
     };
     reference.stop().await.unwrap();
-    system.shutdown_internal().await.unwrap();
+    if let Some(facade) = facade {
+        facade.shutdown().await.unwrap();
+    } else {
+        system.shutdown_internal().await.unwrap();
+    }
     assert_eq!(system.actor_count(), 0);
     let events = events.lock().unwrap();
     assert_lifecycle(&events, 100, child, prefix, 1, true);
@@ -235,17 +287,57 @@ async fn lifecycle(mode: SchedulingMode, prefix: &str, factory: bool) {
 
 #[tokio::test]
 async fn dedicated_instance_and_child_keep_native_lifecycle_affinity() {
-    lifecycle(SchedulingMode::DedicatedThread, "parrot-dedicated-", false).await;
+    lifecycle(
+        SchedulingMode::DedicatedThread,
+        "parrot-dedicated-",
+        false,
+        Entry::Native,
+    )
+    .await;
 }
 #[tokio::test]
 async fn sharded_instance_and_child_share_native_affinity() {
-    lifecycle(sharded(), "parrot-shard-", false).await;
+    lifecycle(sharded(), "parrot-shard-", false, Entry::Native).await;
 }
 #[tokio::test]
 async fn dedicated_factory_replacement_keeps_its_native_owner() {
-    lifecycle(SchedulingMode::DedicatedThread, "parrot-dedicated-", true).await;
+    lifecycle(
+        SchedulingMode::DedicatedThread,
+        "parrot-dedicated-",
+        true,
+        Entry::Native,
+    )
+    .await;
 }
 #[tokio::test]
 async fn sharded_factory_replacement_keeps_its_native_owner() {
-    lifecycle(sharded(), "parrot-shard-", true).await;
+    lifecycle(sharded(), "parrot-shard-", true, Entry::Native).await;
+}
+
+async fn facade_lifecycle(entry: Entry, factory: bool) {
+    lifecycle(
+        SchedulingMode::DedicatedThread,
+        "parrot-dedicated-",
+        factory,
+        entry,
+    )
+    .await;
+    lifecycle(sharded(), "parrot-shard-", factory, entry).await;
+}
+
+#[tokio::test]
+async fn facade_default_instance_and_child_use_selected_workers() {
+    facade_lifecycle(Entry::Default, false).await;
+}
+#[tokio::test]
+async fn facade_named_instance_and_child_use_selected_workers() {
+    facade_lifecycle(Entry::Named, false).await;
+}
+#[tokio::test]
+async fn facade_default_factory_restarts_on_selected_worker() {
+    facade_lifecycle(Entry::Default, true).await;
+}
+#[tokio::test]
+async fn facade_named_factory_restarts_on_selected_worker() {
+    facade_lifecycle(Entry::Named, true).await;
 }
