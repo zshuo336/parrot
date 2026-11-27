@@ -264,6 +264,9 @@ impl RemoteActorRef {
             let result = async {
                 let input = &mut input;
                 options.validate_single_attempt()?;
+                if actor.as_ref().is_some_and(|sender| sender.is_retired()) {
+                    return Err(ActorError::Stopped);
+                }
                 let started = tokio::time::Instant::now();
                 let (key, payload) = self.encode_outgoing(input.value())?;
                 let timeout = remaining_budget(started, options.timeout)?;
@@ -319,6 +322,9 @@ impl RemoteActorRef {
                         .reserve(&frame)
                         .await
                         .map_err(|error| error.to_actor_error())?;
+                    if actor.as_ref().is_some_and(|sender| sender.is_retired()) {
+                        return Err(ActorError::Stopped);
+                    }
                     frame.header.seq = self.inner.next_seq(self.node_id.clone());
                     permit.send(frame);
                     Ok(())

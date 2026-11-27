@@ -486,7 +486,6 @@ where
 {
     /// The underlying Actix address
     addr: Arc<Addr<A>>,
-    pub(crate) sender: parrot_api::sender::ActorSender,
     stop_control: Option<Arc<crate::actix::lifecycle::ActorControl>>,
     tasks: Arc<crate::context_tasks::ContextTasks>,
     pub(crate) idle: Arc<crate::receive_timeout::ReceiveTimeout>,
@@ -512,7 +511,6 @@ where
     fn clone(&self) -> Self {
         Self {
             addr: self.addr.clone(),
-            sender: self.sender.clone(),
             stop_control: self.stop_control.clone(),
             tasks: self.tasks.clone(),
             idle: self.idle.clone(),
@@ -560,7 +558,6 @@ where
         );
         Self {
             addr: Arc::new(addr),
-            sender: parrot_api::sender::ActorSender::new(path.path()),
             stop_control: None,
             idle: crate::receive_timeout::ReceiveTimeout::new(),
             idle_spawner: actix::Arbiter::try_current(),

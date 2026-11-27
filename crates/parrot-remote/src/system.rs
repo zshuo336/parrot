@@ -1021,6 +1021,12 @@ impl RemoteActorSystem {
         *started = true;
         self.install_admin_hook();
         self.start_receptionist();
+        let outbound = self.outbound_ordered.clone();
+        let source = Arc::downgrade(self);
+        let callbacks = self.callbacks.clone();
+        self.spawn_background(
+            async move { outbound.retire_stopped_senders(source, callbacks).await },
+        );
         // hub 转发出口注入（07 §6 两两互通：A→hub→B 中转；Weak 防循环引用）
         *self.ingress.relay_slot() = Some(Arc::new(SystemRelay {
             system: Arc::downgrade(self),

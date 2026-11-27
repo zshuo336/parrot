@@ -1536,6 +1536,77 @@ async fn closing_an_uncommitted_challenge_releases_receiver_source_capacity() {
     target.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_name_sender_waits_for_remote_drop_and_stale_handle_cannot_retire_replacement() {
+    use parrot_api::sender::ActorSenderOwner;
+    let (target, mut received) = state();
+    let release = Release(target.clone());
+    let src = start(RemoteConfig::mem("sender-retire-src"), Arc::new(Empty)).await;
+    let end = start(
+        RemoteConfig::mem("sender-retire-end"),
+        Arc::new(Target(target.clone())),
+    )
+    .await;
+    src.connect_mem_pair(&end).await.unwrap();
+    let reference = src.remote_ref("parrot://sender-retire-end/target").unwrap();
+    let old = ActorSenderOwner::new("/user/source");
+    let captured = old.sender();
+    let fresh = ActorSenderOwner::new("/user/source");
+    let timeout = Duration::from_secs(4);
+    captured.scope(strict(&reference, 700)).await;
+    tokio::time::timeout(timeout, target.entered.notified())
+        .await
+        .unwrap();
+    let stale_send =
+        captured.in_scope(|| reference.deliver_ordered(Box::new(Work(51)), Default::default()));
+    drop(old);
+    tokio::time::timeout(timeout, target.dropping.notified())
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale_send.await,
+        Err(parrot_api::errors::ActorError::Stopped)
+    ));
+    let send = |n| {
+        fresh
+            .sender()
+            .in_scope(|| reference.deliver_ordered(Box::new(Work(n)), Default::default()))
+    };
+    let blocked = send(52).await.unwrap_err();
+    assert!(blocked.to_string().contains("overloaded"), "{blocked}");
+    release.release();
+    tokio::time::timeout(timeout, async {
+        loop {
+            match send(53).await {
+                Ok(()) => break,
+                Err(e) if e.to_string().contains("overloaded") => tokio::task::yield_now().await,
+                Err(e) => panic!("fresh generation failed: {e}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    seen(&mut received, 53).await;
+    // A previous generation closing its reference must leave queued work alive.
+    fresh.sender().scope(strict(&reference, 701)).await;
+    tokio::time::timeout(timeout, target.entered.notified())
+        .await
+        .unwrap();
+    captured
+        .in_scope(|| reference.close_ordered_session(timeout))
+        .await
+        .unwrap();
+    target.resume.notify_one();
+    seen(&mut received, 701).await;
+    fresh
+        .sender()
+        .in_scope(|| reference.close_ordered_session(timeout))
+        .await
+        .unwrap();
+    src.shutdown().await.unwrap();
+    end.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn modern_and_legacy_session_scopes_require_real_retirement_before_switching() {
     use parrot_remote::error::{decode_err_payload, ErrCode};

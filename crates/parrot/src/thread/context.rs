@@ -96,7 +96,6 @@ pub type WeakSystemRef = Weak<crate::thread::system::ThreadActorSystem>;
 /// actor can await `ActorRef::stop` to observe lifecycle completion.
 #[derive(Debug)]
 pub struct ThreadContext<A: Actor + Send + Sync + 'static> {
-    pub(crate) sender: parrot_api::sender::ActorSender,
     /// Weak reference to the actor system
     system: WeakSystemRef,
 
@@ -185,7 +184,6 @@ impl<A: Actor + Send + Sync + 'static> ThreadContext<A> {
             },
         );
         Self {
-            sender: parrot_api::sender::ActorSender::new(path.path()),
             tasks,
             system: system.clone(),
             runtime_handle,

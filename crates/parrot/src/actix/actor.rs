@@ -88,6 +88,7 @@ where
     control: Arc<ActorControl>,
     outcome: ActorOutcome,
     path: String,
+    sender: parrot_api::sender::ActorSenderOwner,
     initialized: bool,
     hook_started: bool,
     managed: bool,
@@ -106,6 +107,9 @@ where
     /// Low-level adapter for direct Actix use. System spawns additionally own
     /// registry membership, stop receipts and arbiter retirement.
     pub fn new(inner: A) -> Self {
+        Self::with_path(inner, format!("actix://{}", uuid::Uuid::new_v4()))
+    }
+    fn with_path(inner: A, path: String) -> Self {
         let (control, _) = ActorControl::new(Duration::from_secs(5));
         Self {
             inner: Some(inner),
@@ -114,7 +118,8 @@ where
             state: ActorState::Starting,
             control,
             outcome: Default::default(),
-            path: format!("actix://{}", uuid::Uuid::new_v4()),
+            sender: parrot_api::sender::ActorSenderOwner::new(&path),
+            path,
             initialized: false,
             hook_started: false,
             managed: false,
@@ -132,8 +137,7 @@ where
         capacity: usize,
         ask_timeout: Duration,
     ) -> Self {
-        let mut actor = Self::new(inner);
-        actor.path = path;
+        let mut actor = Self::with_path(inner, path);
         actor.control = control;
         actor.outcome = outcome;
         actor.managed = true;
@@ -295,7 +299,7 @@ where
             }));
         let mut inner = self.inner.take().expect("actor not yet initialized");
         let control = self.control.clone();
-        let sender = actor_ctx.sender.clone();
+        let sender = self.sender.sender();
         let initialize = async move {
             let mut cleanup = StageCleanup::new(control.clone());
             let result = std::panic::AssertUnwindSafe(initialize_after_admission(
@@ -427,7 +431,7 @@ where
         self.hook_started = true;
         let control = self.control.clone();
         let stop_context = control.take_stop_context();
-        let sender = actor_ctx.sender.clone();
+        let sender = self.sender.sender();
         let stop = async move {
             let mut cleanup = StageCleanup::new(control.clone());
             let result = std::panic::AssertUnwindSafe(async {
@@ -478,6 +482,7 @@ where
         Running::Continue
     }
     fn stopped(&mut self, _: &mut Self::Context) {
+        self.sender.retire();
         self.state = ActorState::Stopped;
     }
 }
@@ -555,7 +560,7 @@ where
         };
         // Framework lifecycle messages always use their own async dispatch.
         // For ordinary messages the selector is user code, just like the handler.
-        let sender = actor_ctx.sender.clone();
+        let sender = self.sender.sender();
         let async_handler = if message.envelope.payload.is::<crate::streams::StreamEvent>()
             || message
                 .envelope

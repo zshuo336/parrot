@@ -20,6 +20,8 @@ use std::{
 use tokio::time::Instant;
 
 mod aliases;
+mod retirement;
+use retirement::{LaneEntry, SenderLane};
 
 enum Attempt {
     Delivered,
@@ -89,12 +91,14 @@ impl Default for Lane {
 pub(crate) struct Outbound {
     source: String,
     incarnation: Identity,
+    lifetime: Option<parrot_api::sender::WeakActorSender>,
     tables: Arc<SessionTables>,
 }
 
 pub(crate) struct SessionTables {
     capacity: usize,
-    lanes: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Lane>>>>,
+    lanes: Mutex<HashMap<String, LaneEntry>>,
+    sender_added: tokio::sync::Notify,
     closed: AtomicBool,
     cancel: tokio_util::sync::CancellationToken,
     aliases: aliases::AliasRoutes,
@@ -136,6 +140,7 @@ impl Drop for LaneUse<'_> {
         let lane = self.lane.take().expect("live lane handle");
         let Some(entry) = lanes
             .get_mut(&self.destination)
+            .map(|entry| &entry.lane)
             .filter(|entry| Arc::ptr_eq(entry, &lane))
         else {
             return;
@@ -159,9 +164,11 @@ impl Outbound {
         Self {
             source,
             incarnation: identity(),
+            lifetime: None,
             tables: Arc::new(SessionTables {
                 capacity,
                 lanes: Mutex::new(HashMap::new()),
+                sender_added: Default::default(),
                 closed: AtomicBool::new(false),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 aliases: Default::default(),
@@ -178,6 +185,7 @@ impl Outbound {
                 hex::encode(Sha256::digest(actor.path().as_bytes()))
             ),
             incarnation: actor.incarnation(),
+            lifetime: Some(actor.downgrade()),
             tables: self.tables.clone(),
         }
     }
@@ -191,8 +199,25 @@ impl Outbound {
     }
 
     pub(crate) fn has_reference(&self, path: &str) -> bool {
-        let key = self.table_key(path);
-        self.lanes.lock().unwrap().contains_key(key.as_ref()) || self.aliases.contains(key.as_ref())
+        self.lanes
+            .lock()
+            .unwrap()
+            .contains_key(self.lane_key(path).as_ref())
+            || self.aliases.contains(&self.table_key(path))
+    }
+
+    // A replacement with the same logical source must wait for the prior
+    // generation's retirement even when unused capacity is available.
+    fn lane_key<'a>(&self, path: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.lifetime.is_some() {
+            format!("{}@{path}", self.source).into()
+        } else {
+            path.into()
+        }
+    }
+
+    fn sender_retired(&self) -> bool {
+        self.lifetime.as_ref().is_some_and(|life| life.is_retired())
     }
 
     pub fn close_admission(&self) {
@@ -299,12 +324,12 @@ impl Outbound {
         supports_ordered: bool,
     ) -> Result<Option<LaneUse<'_>>, LaneError> {
         let mut lanes = self.lanes.lock().unwrap();
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.sender_retired() {
             return Err(LaneError::Stopped);
         }
         // Keep an established scope across reconnects, including capability loss.
-        let actor_key = self.table_key(path);
-        let node_key = self.table_key(destination);
+        let actor_key = self.lane_key(path);
+        let node_key = self.lane_key(destination);
         let key = if lanes.contains_key(actor_key.as_ref())
             || (actor && !lanes.contains_key(node_key.as_ref()))
         {
@@ -312,8 +337,11 @@ impl Outbound {
         } else {
             node_key.as_ref()
         };
-        if let Some(lane) = lanes.get(key) {
-            return Ok(Some(LaneUse::new(self, key, lane.clone())));
+        if let Some(entry) = lanes.get(key) {
+            if !entry.owned_by(self.incarnation) {
+                return Err(LaneError::Full);
+            }
+            return Ok(Some(LaneUse::new(self, key, entry.lane.clone())));
         }
         if !supports_ordered {
             return Ok(None);
@@ -322,7 +350,23 @@ impl Outbound {
             return Err(LaneError::Full);
         }
         let lane = Arc::new(tokio::sync::Mutex::new(Lane::default()));
-        lanes.insert(key.into(), lane.clone());
+        let owner = self.lifetime.as_ref().map(|life| SenderLane {
+            source: self.source.clone(),
+            incarnation: self.incarnation,
+            lifetime: life.clone(),
+            destination: destination.into(),
+            path: path.into(),
+        });
+        if owner.is_some() {
+            self.sender_added.notify_one();
+        }
+        lanes.insert(
+            key.into(),
+            LaneEntry {
+                lane: lane.clone(),
+                owner,
+            },
+        );
         Ok(Some(LaneUse::new(self, key, lane)))
     }
 
@@ -383,13 +427,13 @@ impl Outbound {
                     }
                     Err(error) => return Err(error.into()),
                 };
-            let actor = usage.destination != self.table_key(destination);
+            let actor = usage.destination != self.lane_key(destination);
             if actor && !actor_capable {
                 return Err(ErrCode::NotRemotable.to_actor_error(super::ACTOR_UNSUPPORTED.into()));
             }
             let mut state = usage.lane.as_ref().expect("live lane handle").lock().await;
             usage.retained = state.grant.is_some() || state.sent_ordered;
-            if state.closed || self.closed.load(Ordering::Acquire) {
+            if state.closed || self.closed.load(Ordering::Acquire) || self.sender_retired() {
                 return Err(ActorError::Stopped);
             }
             if !supports_ordered {
@@ -692,6 +736,9 @@ impl Outbound {
             None
         };
         // No await separates assigning a sequence from publication.
+        if self.sender_retired() {
+            return Err(ActorError::Stopped);
+        }
         state.sequence = sequence;
         state.sent_ordered = true;
         permit.send(frame);
@@ -762,10 +809,12 @@ impl Outbound {
             }
             scope
                 .path()
-                .and_then(|path| lanes.get_key_value(self.table_key(path).as_ref()))
-                .or_else(|| lanes.get_key_value(self.table_key(destination).as_ref()))
-                .filter(|(_, lane)| scope.matches_lane(lane))
-                .map(|(key, lane)| (key.clone(), lane.clone()))
+                .and_then(|path| lanes.get_key_value(self.lane_key(path).as_ref()))
+                .or_else(|| lanes.get_key_value(self.lane_key(destination).as_ref()))
+                .filter(|(_, entry)| {
+                    entry.owned_by(self.incarnation) && scope.matches_lane(&entry.lane)
+                })
+                .map(|(key, entry)| (key.clone(), entry.lane.clone()))
         };
         let Some((key, lane)) = found else {
             return Ok(());
@@ -813,7 +862,7 @@ impl Outbound {
                 let mut lanes = self.lanes.lock().unwrap();
                 if lanes
                     .get(&key)
-                    .is_some_and(|entry| Arc::ptr_eq(entry, lane))
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.lane, lane))
                 {
                     lanes.remove(&key);
                 }

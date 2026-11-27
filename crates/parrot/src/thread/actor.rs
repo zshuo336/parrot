@@ -33,6 +33,7 @@ where
     state: ActorState,
     /// Actor path for addressing
     path: ActorPath,
+    sender: parrot_api::sender::ActorSenderOwner,
     /// Set of watcher paths that are watching this actor
     watchers: Option<HashSet<String>>,
     /// Whether `Actor::init` has already run successfully. The state machine
@@ -56,6 +57,7 @@ where
         Self {
             inner: actor,
             state: ActorState::Starting,
+            sender: parrot_api::sender::ActorSenderOwner::new(path.path()),
             path,
             watchers: None,
             initialized: false,
@@ -112,7 +114,7 @@ where
             .map_or(std::time::Duration::ZERO, |system| {
                 system.operation_timeouts.actor_creation
             });
-        let sender = ctx.sender.clone();
+        let sender = self.sender.sender();
         let stage = sender
             .scope(crate::typed_supervision::recorded_lifecycle_stage(
                 parrot_api::trace::SpanKind::ActorInit,
@@ -182,8 +184,8 @@ where
         ctx: &'a mut ThreadContext<A>,
     ) -> impl Future<Output = ActorResult<BoxedMessage>> + Send + 'a {
         let input = MessageInput::new(msg, self.stage_failures.clone());
-        ctx.sender
-            .clone()
+        self.sender
+            .sender()
             .scope(self.process_message_inner(input, ctx))
     }
 
@@ -352,8 +354,8 @@ where
         let mut cleanup = StageCleanup::new(self.stage_failures.clone());
         let batch = cleanup.batch();
         outcome(
-            ctx.sender
-                .clone()
+            self.sender
+                .sender()
                 .scope(parrot_api::batch_dispatch::scope(
                     batch,
                     crate::typed_supervision::guarded_batch_stage(
@@ -483,7 +485,7 @@ where
 
         let result = if self.initialized {
             let mut cleanup = StageCleanup::new(self.stage_failures.clone());
-            let sender = ctx.sender.clone();
+            let sender = self.sender.sender();
             let result = outcome(
                 sender
                     .scope(crate::typed_supervision::recorded_lifecycle_stage(
@@ -505,6 +507,7 @@ where
         // Transition to Stopped state regardless of result
         self.state = ActorState::Stopped;
         self.shutdown_committed = true;
+        self.sender.retire();
 
         // Notify all watchers
         self.notify_watchers_of_termination(ctx).await;

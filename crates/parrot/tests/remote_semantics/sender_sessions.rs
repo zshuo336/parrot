@@ -20,7 +20,7 @@ async fn command(target: &RemoteActorRef, msg: BoxedMessage) -> ActorResult<Boxe
     Ok(Box::new(result.map_err(|error| error.to_string())))
 }
 
-struct ThreadSender(RemoteActorRef);
+struct ThreadSender(RemoteActorRef, bool);
 impl Actor for ThreadSender {
     type Config = EmptyConfig;
     type Context = ThreadContext<Self>;
@@ -28,7 +28,11 @@ impl Actor for ThreadSender {
         ActorState::Running
     }
     fn before_stop<'a>(&'a mut self, _: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(self.0.close_ordered_session(Duration::from_secs(3)))
+        if self.1 {
+            Box::pin(self.0.close_ordered_session(Duration::from_secs(3)))
+        } else {
+            Box::pin(async { Ok(()) })
+        }
     }
     fn receive_message<'a>(
         &'a mut self,
@@ -38,7 +42,7 @@ impl Actor for ThreadSender {
         Box::pin(command(&self.0, msg))
     }
 }
-struct ActixSender(RemoteActorRef);
+struct ActixSender(RemoteActorRef, bool);
 impl Actor for ActixSender {
     type Config = EmptyConfig;
     type Context = ActixContext<ActixActor<Self>>;
@@ -49,7 +53,11 @@ impl Actor for ActixSender {
         true
     }
     fn before_stop<'a>(&'a mut self, _: &'a mut Self::Context) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(self.0.close_ordered_session(Duration::from_secs(3)))
+        if self.1 {
+            Box::pin(self.0.close_ordered_session(Duration::from_secs(3)))
+        } else {
+            Box::pin(async { Ok(()) })
+        }
     }
     fn receive_message<'a>(
         &'a mut self,
@@ -70,8 +78,8 @@ async fn call(actor: &dyn ActorRef, op: Option<u64>) -> Result<(), String> {
         .unwrap()
 }
 
-async fn verify(actix: bool, limit_at_source: bool) {
-    let label = format!("senders-{actix}-{limit_at_source}");
+async fn verify(actix: bool, limit_at_source: bool, explicit_close: bool) {
+    let label = format!("senders-{actix}-{limit_at_source}-{explicit_close}");
     let facade = Arc::new(
         ParrotActorSystem::new(ActorSystemConfig::default())
             .await
@@ -118,15 +126,20 @@ async fn verify(actix: bool, limit_at_source: bool) {
     let mut actors: Vec<BoxedActorRef> = Vec::new();
     for path in ["/user/a", "/user/b"] {
         actors.push(if let Some(pool) = &pool {
-            pool.spawn_root_typed(ActixSender(target.clone()), EmptyConfig)
+            pool.spawn_root_typed(ActixSender(target.clone(), explicit_close), EmptyConfig)
                 .await
                 .unwrap()
                 .clone_boxed()
         } else {
-            ts.spawn_at(ThreadSender(target.clone()), path, None, Default::default())
-                .await
-                .unwrap()
-                .clone_boxed()
+            ts.spawn_at(
+                ThreadSender(target.clone(), explicit_close),
+                path,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap()
+            .clone_boxed()
         });
     }
     let (a, b) = (actors[0].as_ref(), actors[1].as_ref());
@@ -157,9 +170,41 @@ async fn verify(actix: bool, limit_at_source: bool) {
     }
     wait_seen(local.as_ref(), &[11, 12]).await;
     a.stop().await.unwrap();
-    call(b, Some(13)).await.unwrap();
+    let replacement = if !actix && !explicit_close {
+        Some(
+            ts.spawn_at(
+                ThreadSender(target.clone(), false),
+                "/user/a",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    let next = replacement
+        .as_ref()
+        .map_or(b, |actor| actor as &dyn ActorRef);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match call(next, Some(13)).await {
+                Ok(()) => break,
+                Err(error) if !explicit_close && error.contains("overloaded") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("replacement send failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("retired sender still occupies the only session slot");
     wait_seen(local.as_ref(), &[11, 12, 13]).await;
     b.stop().await.unwrap();
+    if let Some(actor) = replacement {
+        actor.stop().await.unwrap();
+    }
     for node in [&src, &hub, &end] {
         node.shutdown().await.unwrap();
     }
@@ -171,10 +216,20 @@ async fn verify(actix: bool, limit_at_source: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn thread_senders_own_separate_tickets_with_one_outbound_slot() {
-    verify(false, true).await;
+    verify(false, true, true).await;
 }
 
 #[actix::test]
 async fn actix_senders_own_separate_tickets_with_one_receiver_slot() {
-    verify(true, false).await;
+    verify(true, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thread_replacement_recovers_slot_after_sender_stops_without_close() {
+    verify(false, true, false).await;
+}
+
+#[actix::test]
+async fn actix_sibling_recovers_slot_after_sender_stops_without_close() {
+    verify(true, false, false).await;
 }

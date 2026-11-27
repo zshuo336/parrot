@@ -784,7 +784,7 @@ impl LocalLookup for HeldLookup {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retiring_one_sender_over_a_tls_alias_preserves_the_other_senders_queue() {
     use parrot_api::sender::ActorSender;
     let pki = Pki::new();
@@ -831,6 +831,32 @@ async fn retiring_one_sender_over_a_tls_alias_preserves_the_other_senders_queue(
     a.in_scope(|| target.close_ordered_session(timeout))
         .await
         .unwrap();
+    let owner = parrot_api::sender::ActorSenderOwner::new("/user/retiring");
+    let release = Release(first.clone());
+    owner.sender().scope(strict(&target, 700)).await;
+    tokio::time::timeout(timeout, first.entered.notified())
+        .await
+        .unwrap();
+    end.ingress.set_ordered_relays(Default::default()).unwrap();
+    assert!(owner
+        .sender()
+        .in_scope(|| target.close_ordered_session(timeout))
+        .await
+        .is_err());
+    drop(owner);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(350), first.dropping.notified())
+            .await
+            .is_err()
+    );
+    end.ingress
+        .set_ordered_relays(["sender-alias".to_owned()].into_iter().collect())
+        .unwrap();
+    // No more sends or explicit Close. The source retries using the saved route.
+    tokio::time::timeout(timeout, first.dropping.notified())
+        .await
+        .unwrap();
+    release.release();
     for node in [&source, &alias, &end] {
         node.shutdown().await.unwrap();
     }
