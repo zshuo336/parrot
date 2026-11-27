@@ -34,6 +34,7 @@ enum Attempt {
 enum LaneError {
     Stopped,
     Full,
+    SenderScope,
 }
 
 impl From<LaneError> for ActorError {
@@ -42,6 +43,10 @@ impl From<LaneError> for ActorError {
             LaneError::Stopped => Self::Stopped,
             LaneError::Full => ErrCode::Overloaded
                 .to_actor_error("outgoing ordered destination capacity exhausted".into()),
+            LaneError::SenderScope => ErrCode::Overloaded.to_actor_error(
+                "conflicting ordered sender scope; retire the previous session before switching"
+                    .into(),
+            ),
         }
     }
 }
@@ -88,10 +93,20 @@ impl Default for Lane {
 }
 
 #[derive(Clone)]
+enum SenderContext {
+    Node,
+    Actor(parrot_api::sender::WeakActorSender),
+    Shared {
+        life: parrot_api::sender::WeakActorSender,
+        existing_only: bool,
+    },
+}
+
+#[derive(Clone)]
 pub(crate) struct Outbound {
     source: String,
     incarnation: Identity,
-    lifetime: Option<parrot_api::sender::WeakActorSender>,
+    context: SenderContext,
     tables: Arc<SessionTables>,
 }
 
@@ -164,7 +179,7 @@ impl Outbound {
         Self {
             source,
             incarnation: identity(),
-            lifetime: None,
+            context: SenderContext::Node,
             tables: Arc::new(SessionTables {
                 capacity,
                 lanes: Mutex::new(HashMap::new()),
@@ -185,7 +200,7 @@ impl Outbound {
                 hex::encode(Sha256::digest(actor.path().as_bytes()))
             ),
             incarnation: actor.incarnation(),
-            lifetime: Some(actor.downgrade()),
+            context: SenderContext::Actor(actor.downgrade()),
             tables: self.tables.clone(),
         }
     }
@@ -206,10 +221,47 @@ impl Outbound {
             || self.aliases.contains(&self.table_key(path))
     }
 
+    pub(crate) fn for_delivery(
+        &self,
+        actor: &parrot_api::sender::ActorSender,
+        destination: &str,
+        path: &str,
+        sender: &FrameSender,
+        required: bool,
+    ) -> Self {
+        let owner = self.for_actor(actor);
+        if required {
+            return owner;
+        }
+        let existing_only = sender.supports_sender_sessions();
+        if existing_only {
+            let lanes = self.lanes.lock().unwrap();
+            if !Self::shared_at(&lanes, destination, path) {
+                return owner;
+            }
+        }
+        if owner.has_reference(path) {
+            return owner;
+        }
+        Self {
+            context: SenderContext::Shared {
+                life: actor.downgrade(),
+                existing_only,
+            },
+            ..self.clone()
+        }
+    }
+
+    fn shared_at(lanes: &HashMap<String, LaneEntry>, destination: &str, path: &str) -> bool {
+        [destination, path]
+            .iter()
+            .any(|key| lanes.get(*key).is_some_and(|e| e.shared_by_actors))
+    }
+
     // A replacement with the same logical source must wait for the prior
     // generation's retirement even when unused capacity is available.
     fn lane_key<'a>(&self, path: &'a str) -> std::borrow::Cow<'a, str> {
-        if self.lifetime.is_some() {
+        if matches!(self.context, SenderContext::Actor(_)) {
             format!("{}@{path}", self.source).into()
         } else {
             path.into()
@@ -217,7 +269,10 @@ impl Outbound {
     }
 
     fn sender_retired(&self) -> bool {
-        self.lifetime.as_ref().is_some_and(|life| life.is_retired())
+        match &self.context {
+            SenderContext::Node => false,
+            SenderContext::Actor(life) | SenderContext::Shared { life, .. } => life.is_retired(),
+        }
     }
 
     pub fn close_admission(&self) {
@@ -337,10 +392,37 @@ impl Outbound {
         } else {
             node_key.as_ref()
         };
-        if let Some(entry) = lanes.get(key) {
+        // Reserve the delivery scope under the same lock as the lane itself.
+        // A pending Open or Close must fence a concurrent capability transition.
+        let owner = match &self.context {
+            SenderContext::Actor(_) if Self::shared_at(&lanes, destination, path) => {
+                return Err(LaneError::SenderScope);
+            }
+            SenderContext::Actor(life) => Some(life),
+            SenderContext::Shared { existing_only, .. } => {
+                let continuing = lanes.get(key).is_some_and(|entry| entry.shared_by_actors);
+                if !continuing
+                    && (*existing_only
+                        || lanes
+                            .values()
+                            .filter_map(|entry| entry.owner.as_ref())
+                            .any(|owner| {
+                                owner.destination == destination
+                                    && (key == destination || owner.path == path)
+                            }))
+                {
+                    return Err(LaneError::SenderScope);
+                }
+                None
+            }
+            SenderContext::Node => None,
+        };
+        let shared_by_actors = matches!(self.context, SenderContext::Shared { .. });
+        if let Some(entry) = lanes.get_mut(key) {
             if !entry.owned_by(self.incarnation) {
                 return Err(LaneError::Full);
             }
+            entry.shared_by_actors |= shared_by_actors && supports_ordered;
             return Ok(Some(LaneUse::new(self, key, entry.lane.clone())));
         }
         if !supports_ordered {
@@ -350,7 +432,7 @@ impl Outbound {
             return Err(LaneError::Full);
         }
         let lane = Arc::new(tokio::sync::Mutex::new(Lane::default()));
-        let owner = self.lifetime.as_ref().map(|life| SenderLane {
+        let owner = owner.map(|life| SenderLane {
             source: self.source.clone(),
             incarnation: self.incarnation,
             lifetime: life.clone(),
@@ -365,6 +447,7 @@ impl Outbound {
             LaneEntry {
                 lane: lane.clone(),
                 owner,
+                shared_by_actors,
             },
         );
         Ok(Some(LaneUse::new(self, key, lane)))
@@ -1110,6 +1193,44 @@ async fn exchange(
 mod tests {
     use super::*;
     use crate::handshake::caps;
+
+    #[test]
+    fn sender_scope_is_reserved_at_allocation_and_rechecked_after_selection() {
+        let outbound = Outbound::new("source".into(), 4);
+        let owner = parrot_api::sender::ActorSenderOwner::new("/user/writer");
+        let actor = owner.sender();
+        let path = "parrot://target/service";
+        let other = "parrot://target/other";
+        let base = caps::ORDERED_TELL
+            | caps::ORDERED_ADMISSION
+            | caps::TELL_COMPLETION
+            | caps::ORDERED_ACTOR;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let old = FrameSender::capability_test_sender(tx.clone(), "target", base);
+        let new = FrameSender::capability_test_sender(tx, "target", base | caps::ORDERED_SENDER);
+        let fallback = outbound.for_delivery(&actor, "target", path, &old, false);
+        let private = outbound.for_actor(&actor);
+        let slot = fallback.lane("target", path, true, true).unwrap().unwrap();
+        let selected = outbound.for_delivery(&actor, "target", path, &new, false);
+        assert!(matches!(
+            private.lane("target", path, true, true),
+            Err(LaneError::SenderScope)
+        ));
+        // A path-scoped shared ticket leaves other destination paths independent.
+        let sibling = private.lane("target", other, true, true).unwrap().unwrap();
+        drop(slot);
+        assert!(matches!(
+            selected.lane("target", path, true, true),
+            Err(LaneError::SenderScope)
+        ));
+        let replacement = private.lane("target", path, true, true).unwrap().unwrap();
+        assert!(matches!(
+            fallback.lane("target", path, true, true),
+            Err(LaneError::SenderScope)
+        ));
+        drop((sibling, replacement));
+        assert!(outbound.lanes.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn recovery_confirmation_requires_the_requested_epoch() {

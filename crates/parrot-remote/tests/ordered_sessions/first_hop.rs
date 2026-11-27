@@ -149,3 +149,126 @@ async fn actor_close_uses_live_grant_when_selected_link_only_supports_node_recov
 async fn disconnected_actor_grant_survives_capability_loss_until_compatible_reconnect() {
     switch_first_hop(true).await;
 }
+
+async fn upgrade_shared_sender(actor_paths: bool) {
+    let (target, mut received) = state();
+    let receiver = start(
+        RemoteConfig::tcp("wire-source", None).with_insecure_development(),
+        Arc::new(Target(target.clone())),
+    )
+    .await;
+    let source = start(
+        RemoteConfig::tcp("upgrading-source", Some("127.0.0.1:0".parse().unwrap()))
+            .with_insecure_development(),
+        Arc::new(Empty),
+    )
+    .await;
+    let base = caps::BIN | caps::ORDERED_TELL | caps::TELL_COMPLETION | caps::ORDERED_ADMISSION;
+    let old = if actor_paths {
+        base | caps::ORDERED_ACTOR
+    } else {
+        base
+    };
+    let (stop_old, old_task) = attach(&source, &receiver, old).await;
+    let target_ref = source.remote_ref("parrot://wire-source/target").unwrap();
+    let writer = ActorSenderOwner::new("/user/writer");
+    let sibling = ActorSenderOwner::new("/user/sibling");
+    let timeout = Duration::from_secs(3);
+    writer
+        .sender()
+        .in_scope(|| target_ref.deliver(Box::new(Work(701))))
+        .await
+        .unwrap();
+    tokio::time::timeout(timeout, target.entered.notified())
+        .await
+        .unwrap();
+    sibling
+        .sender()
+        .in_scope(|| target_ref.deliver(Box::new(Work(2))))
+        .await
+        .unwrap();
+    let (stop_new, new_task) = attach(
+        &source,
+        &receiver,
+        base | caps::ORDERED_ACTOR | caps::ORDERED_SENDER,
+    )
+    .await;
+    let upgrade = || {
+        writer
+            .sender()
+            .in_scope(|| target_ref.deliver_ordered(Box::new(Work(3)), Default::default()))
+    };
+    let release = Release(target.clone());
+    assert!(
+        upgrade().await.is_err(),
+        "private session overtook a live shared delivery"
+    );
+    writer
+        .sender()
+        .in_scope(|| target_ref.close_ordered_session(timeout))
+        .await
+        .unwrap();
+    assert!(
+        upgrade().await.is_err(),
+        "one actor closed a ticket shared with another actor"
+    );
+    writer
+        .sender()
+        .in_scope(|| target_ref.deliver(Box::new(Work(8))))
+        .await
+        .unwrap();
+    target.resume.notify_one();
+    seen(&mut received, 701).await;
+    seen(&mut received, 2).await;
+    seen(&mut received, 8).await;
+    writer
+        .sender()
+        .in_scope(|| target_ref.deliver(Box::new(Work(700))))
+        .await
+        .unwrap();
+    tokio::time::timeout(timeout, target.entered.notified())
+        .await
+        .unwrap();
+    {
+        let close = target_ref.close_ordered_session(timeout);
+        tokio::pin!(close);
+        tokio::select! {
+            early = &mut close => panic!("shared worker still owns a delivery: {early:?}"),
+            result = tokio::time::timeout(timeout, target.dropping.notified()) => result.unwrap(),
+        }
+        // Cancelling the caller cannot remove the fence while Drop is blocked.
+    }
+    let error = upgrade().await.unwrap_err();
+    assert!(
+        error.to_string().contains("ordered sender scope"),
+        "{error}"
+    );
+    release.release();
+    target_ref.close_ordered_session(timeout).await.unwrap();
+    assert!(target.dropped.load(Ordering::SeqCst));
+    upgrade()
+        .await
+        .expect("a retired shared ticket must allow promotion");
+    seen(&mut received, 3).await;
+    // Node-originated and private deliveries can coexist on a fully capable connection.
+    strict(&target_ref, 4).await;
+    seen(&mut received, 4).await;
+    writer.sender().scope(strict(&target_ref, 5)).await;
+    seen(&mut received, 5).await;
+    stop_new.send_replace(true);
+    stop_old.send_replace(true);
+    source.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
+    new_task.await.unwrap();
+    old_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_wide_shared_ticket_fences_sender_upgrade() {
+    upgrade_shared_sender(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destination_actor_shared_ticket_fences_sender_upgrade() {
+    upgrade_shared_sender(true).await;
+}

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-use super::{aliases::CloseScope, Identity, Lane, Outbound};
+use super::{aliases::CloseScope, Identity, Lane, Outbound, SenderContext};
 use crate::{registry::CallbackRegistry, system::RemoteActorSystem};
 use futures::{stream, StreamExt};
 use parrot_api::sender::WeakActorSender;
@@ -11,6 +11,7 @@ use std::{
 pub(super) struct LaneEntry {
     pub(super) lane: Arc<tokio::sync::Mutex<Lane>>,
     pub(super) owner: Option<SenderLane>,
+    pub(super) shared_by_actors: bool,
 }
 
 impl LaneEntry {
@@ -63,7 +64,7 @@ impl Outbound {
                         let source = Self {
                             source: owner.source,
                             incarnation: owner.incarnation,
-                            lifetime: Some(owner.lifetime),
+                            context: SenderContext::Actor(owner.lifetime),
                             tables: self.tables.clone(),
                         };
                         let _ =

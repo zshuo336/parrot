@@ -294,15 +294,16 @@ impl RemoteActorRef {
                         .and_then(|system| system.upgrade())
                         .map(|system| system.outbound_ordered.clone());
                     if let Some(outbound) = outbound {
-                        let owner = actor.as_ref().map(|actor| outbound.for_actor(actor));
-                        let session = owner
-                            .as_ref()
-                            .filter(|owner| {
-                                required
-                                    || sender.supports_sender_sessions()
-                                    || owner.has_reference(&self.path)
-                            })
-                            .unwrap_or(&outbound);
+                        let owner = actor.as_ref().map(|actor| {
+                            outbound.for_delivery(
+                                actor,
+                                &self.node_id,
+                                &self.path,
+                                &sender,
+                                required,
+                            )
+                        });
+                        let session = owner.as_ref().unwrap_or(&outbound);
                         match session
                             .send_reference(&self.node_id, &sender, &self.inner, frame, required)
                             .await?
