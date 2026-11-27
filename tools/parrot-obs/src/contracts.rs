@@ -87,12 +87,16 @@ fn probe_checks_dialect_type_and_exact_business_result() {
 
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{mpsc, oneshot};
+
+type PendingEcho = (u64, oneshot::Sender<u64>);
+
 #[derive(Clone, Debug)]
 struct EchoService {
     kind: &'static str,
     bad: Arc<AtomicUsize>,
     seen: Arc<AtomicUsize>,
-    gate: Option<Arc<tokio::sync::Semaphore>>,
+    pending: Option<mpsc::UnboundedSender<PendingEcho>>,
 }
 #[async_trait::async_trait]
 impl parrot_api::address::ActorRef for EchoService {
@@ -103,9 +107,13 @@ impl parrot_api::address::ActorRef for EchoService {
                 .expect("wire decoder preserves Ping type")
                 .0;
             self.seen.fetch_add(1, Ordering::SeqCst);
-            if let Some(gate) = &self.gate {
-                gate.acquire().await.unwrap().forget();
-            }
+            let value = if let Some(pending) = &self.pending {
+                let (reply, received) = oneshot::channel();
+                pending.send((value, reply)).unwrap();
+                received.await.unwrap()
+            } else {
+                value
+            };
             let reply: BoxedMessage = match self.bad.load(Ordering::SeqCst) {
                 1 => Box::new(ProbePong(0)),
                 2 => Box::new(ProbePing(value)),
@@ -154,7 +162,7 @@ impl LocalLookup for EchoLookup {
 }
 async fn tcp_pair(
     kind: &'static str,
-    gate: Option<Arc<tokio::sync::Semaphore>>,
+    pending: Option<mpsc::UnboundedSender<PendingEcho>>,
 ) -> (
     Arc<RemoteActorSystem>,
     Arc<RemoteActorSystem>,
@@ -170,7 +178,7 @@ async fn tcp_pair(
         kind,
         bad: Arc::new(AtomicUsize::new(0)),
         seen: Arc::new(AtomicUsize::new(0)),
-        gate,
+        pending,
     };
     let server = RemoteActorSystem::new(
         RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())).with_insecure_development(),
@@ -203,33 +211,45 @@ async fn actual_tcp_probe_checks_all_three_wire_dialects_and_invalid_business_re
         assert_eq!(actor.seen.load(Ordering::SeqCst), 3);
     }
 }
-#[tokio::test]
-async fn load_retains_inflight_completion_time_and_finishes_owned_workers() {
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let (client, server, node, actor) = tcp_pair("ray", Some(gate.clone())).await;
+async fn two_inflight_replies(swap: bool) -> load::LoadReport {
+    let (pending, mut requests) = mpsc::unbounded_channel();
+    let (client, server, node, actor) = tcp_pair("ray", Some(pending)).await;
     let worker = tokio::spawn(load::run_load(
         client.clone(),
         vec![node],
         Duration::from_millis(200),
         2,
     ));
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while actor.seen.load(Ordering::SeqCst) != 2 {
-            tokio::task::yield_now().await;
-        }
+    let ((a, reply_a), (b, reply_b)) = tokio::time::timeout(Duration::from_secs(2), async {
+        (
+            requests.recv().await.unwrap(),
+            requests.recv().await.unwrap(),
+        )
     })
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
-    gate.add_permits(2);
+    reply_a.send(if swap { b } else { a }).unwrap();
+    reply_b.send(if swap { a } else { b }).unwrap();
     let result = worker.await.unwrap().unwrap();
     client.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
-    assert_eq!(result.ok, 2);
-    assert_eq!(result.errors, 0);
     assert!(result.elapsed >= Duration::from_millis(250));
     assert_eq!(actor.seen.load(Ordering::SeqCst), 2);
+    result
+}
+#[tokio::test]
+async fn load_retains_inflight_completion_time_and_finishes_owned_workers() {
+    let result = two_inflight_replies(false).await;
+    assert_eq!(result.ok, 2);
+    assert_eq!(result.errors, 0);
     result.verify().unwrap();
+}
+#[tokio::test]
+async fn load_rejects_exchanged_replies_between_concurrent_workers() {
+    let result = two_inflight_replies(true).await;
+    assert_eq!((result.ok, result.errors), (0, 2));
+    assert!(result.verify().is_err());
 }
 #[tokio::test]
 async fn wrong_tcp_reply_is_a_failed_load_not_successful_throughput() {

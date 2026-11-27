@@ -86,12 +86,13 @@ pub(crate) async fn run_load(
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + duration;
     let mut workers = tokio::task::JoinSet::new();
-    for _ in 0..concurrency {
+    for worker in 0..concurrency {
         let client = client.clone();
         let nodes = nodes.clone();
         workers.spawn(async move {
             let mut report = LoadReport::default();
-            let mut sequence = 0;
+            // Distinct business values let the probe detect replies exchanged between workers.
+            let mut sequence = worker as u64;
             'work: loop {
                 for node in &nodes {
                     if tokio::time::Instant::now() >= deadline {
@@ -109,7 +110,7 @@ pub(crate) async fn run_load(
                             report.errors += 1;
                         }
                     }
-                    sequence += 1;
+                    sequence += concurrency as u64;
                     // Failed immediate requests must not monopolize the executor,
                     // including on current-thread test/application runtimes.
                     tokio::task::yield_now().await;
