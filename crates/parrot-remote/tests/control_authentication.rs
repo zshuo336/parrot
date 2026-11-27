@@ -195,7 +195,11 @@ impl Pki {
         }
     }
     fn node(&self, name: &str) -> parrot_remote::tls::TlsConfig {
+        self.issue(name, None)
+    }
+    fn issue(&self, name: &str, serial: Option<u64>) -> parrot_remote::tls::TlsConfig {
         let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+        params.serial_number = serial.map(Into::into);
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
@@ -209,6 +213,8 @@ impl Pki {
         }
     }
 }
+#[path = "control_authentication/revocation.rs"]
+mod revocation;
 fn config(scheme: &str, name: &str) -> RemoteConfig {
     let bind = Some("127.0.0.1:0".parse().unwrap());
     if scheme == "tcp" {

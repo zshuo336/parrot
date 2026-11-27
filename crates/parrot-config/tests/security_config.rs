@@ -14,6 +14,7 @@ fn security_defaults_to_local_and_rejects_ignored_credentials() {
     for text in [
         "[remote.security]\nmode='typo'",
         "[remote.security]\nmode='local'\nadmin_nodes=['admin']",
+        "[remote.security]\nmode='local'\nrequire_crl=true",
         "[remote.security]\nmode='insecure-development'\nca_path='ca.pem'",
         "[remote.security]\nmode='mtls'\ncert_path='cert.pem'\nkey_path='key.pem'",
         "[remote.security]\nmode='mtls'\ncert_path=''\nkey_path='key.pem'\nca_path='ca.pem'",
@@ -29,6 +30,7 @@ fn security_layers_keep_credentials_and_explicit_empty_admin_allowlist() {
         cert_path: Some("cert.pem".into()),
         key_path: Some("key.pem".into()),
         ca_path: Some("ca.pem".into()),
+        require_crl: Some(true),
         admin_nodes: Some(vec!["operator".into()]),
     };
     let mut higher = ParrotConfig::default();
@@ -38,6 +40,7 @@ fn security_layers_keep_credentials_and_explicit_empty_admin_allowlist() {
         cert_path,
         key_path,
         ca_path,
+        require_crl,
         admin_nodes,
     } = result.remote.security
     else {
@@ -47,6 +50,7 @@ fn security_layers_keep_credentials_and_explicit_empty_admin_allowlist() {
         (cert_path.as_str(), key_path.as_str(), ca_path.as_str()),
         ("cert.pem", "key.pem", "ca.pem")
     );
+    assert!(require_crl, "lost inherited CRL requirement");
     assert!(
         admin_nodes.is_empty(),
         "empty allowlist must revoke lower-layer authorization"

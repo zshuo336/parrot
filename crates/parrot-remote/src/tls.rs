@@ -2,14 +2,15 @@
 //! Used by RemoteActorSystem TCP and QUIC when mutual TLS is configured.
 //!
 //! Callers supply a trusted CA bundle and node certificates (subject CN=node_id).
-//! Multiple CA roots can be trusted together; certificate issuance, rotation,
-//! revocation and automatic rotation are separate, unfinished capabilities.
+//! CA bundles may include signed CRLs for full-chain checks on new connections.
 
 use rustls_pki_types::pem::{Error as PemError, PemObject};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::pki_types::{
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName,
+};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::ServerConfig;
@@ -31,6 +32,16 @@ pub struct TlsConfig {
 }
 
 impl TlsConfig {
+    /// Require a CRL in this credential snapshot before constructing a node.
+    pub fn require_crls(self) -> Result<Self, RemoteError> {
+        if load_crls(&self.ca_pem)?.is_empty() {
+            return Err(RemoteError::Transport(
+                "required X509 CRL missing from CA bundle".into(),
+            ));
+        }
+        Ok(self)
+    }
+
     /// Read regular files with bounded input. Symlinks to regular files are
     /// accepted so deployment tools can rotate credentials by replacing links.
     pub fn from_paths(cert_path: &str, key_path: &str, ca_path: &str) -> Result<Self, RemoteError> {
@@ -124,6 +135,50 @@ fn load_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, RemoteError> {
     })
 }
 
+fn load_crls(pem: &[u8]) -> Result<Vec<CertificateRevocationListDer<'static>>, RemoteError> {
+    check_material_size(pem.len() as u64)?;
+    let mut issuers = std::collections::HashSet::new();
+    let mut crls = Vec::new();
+    for item in CertificateRevocationListDer::pem_slice_iter(pem) {
+        if crls.len() == MAX_TLS_CERTIFICATES {
+            return Err(RemoteError::Transport(
+                "TLS material limit: too many CRLs".into(),
+            ));
+        }
+        let der = item.map_err(|e| RemoteError::Transport(format!("CRL PEM: {e}")))?;
+        let (rest, parsed) = x509_parser::parse_x509_crl(der.as_ref())
+            .map_err(|e| RemoteError::Transport(format!("CRL DER: {e}")))?;
+        let now = x509_parser::time::ASN1Time::now();
+        if !rest.is_empty()
+            || parsed.last_update() > now
+            || !parsed.next_update().is_some_and(|next| next > now)
+        {
+            return Err(RemoteError::Transport(
+                "invalid CRL encoding or validity interval".into(),
+            ));
+        }
+        // WebPKI selects the first authoritative CRL. An older entry must
+        // never shadow its replacement in the same credential snapshot.
+        if !issuers.insert(parsed.issuer().as_raw().to_vec()) {
+            return Err(RemoteError::Transport(
+                "expected one current full CRL per issuer".into(),
+            ));
+        }
+        crls.push(der);
+    }
+    Ok(crls)
+}
+
+fn trust_roots(pem: &[u8]) -> Result<Arc<rustls::RootCertStore>, RemoteError> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in load_certs(pem)? {
+        roots
+            .add(cert)
+            .map_err(|e| RemoteError::Transport(format!("ca add: {e}")))?;
+    }
+    Ok(Arc::new(roots))
+}
+
 // Honor an explicitly installed provider. Otherwise select the already-enabled
 // ring implementation locally; feature unification can enable multiple rustls
 // backends, so relying on its implicit global selection would panic.
@@ -138,24 +193,25 @@ pub fn server_config(cfg: &TlsConfig) -> Result<ServerConfig, RemoteError> {
     cfg.validate_size()?;
     let certs = load_certs(&cfg.cert_pem)?;
     let key = load_key(&cfg.key_pem)?;
-    let mut ca = load_certs(&cfg.ca_pem)?;
-    // 双证书容忍（P2）：CA 链可含多张根（新旧并存）
-    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for c in ca.drain(..) {
-        roots
-            .add(c)
-            .map_err(|e| RemoteError::Transport(format!("ca add: {e}")))?;
-    }
+    let roots = trust_roots(&cfg.ca_pem)?;
+    let crls = load_crls(&cfg.ca_pem)?;
+    let check_revocation = !crls.is_empty();
     let provider = crypto_provider();
-    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+    let verifier = WebPkiClientVerifier::builder_with_provider(roots, provider.clone())
+        .with_crls(crls)
+        .enforce_revocation_expiration()
         .build()
         .map_err(|e| RemoteError::Transport(format!("verifier: {e}")))?;
-    let sc = ServerConfig::builder_with_provider(provider)
+    let mut sc = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| RemoteError::Transport(format!("server TLS versions: {e}")))?
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .map_err(|e| RemoteError::Transport(format!("server cert: {e}")))?;
+    if check_revocation {
+        sc.send_tls13_tickets = 0;
+        sc.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    }
     Ok(sc)
 }
 
@@ -164,19 +220,25 @@ pub fn client_config(cfg: &TlsConfig) -> Result<ClientConfig, RemoteError> {
     cfg.validate_size()?;
     let certs = load_certs(&cfg.cert_pem)?;
     let key = load_key(&cfg.key_pem)?;
-    let mut ca = load_certs(&cfg.ca_pem)?;
-    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for c in ca.drain(..) {
-        roots
-            .add(c)
-            .map_err(|e| RemoteError::Transport(format!("ca add: {e}")))?;
-    }
-    let cc = ClientConfig::builder_with_provider(crypto_provider())
+    let provider = crypto_provider();
+    let roots = trust_roots(&cfg.ca_pem)?;
+    let crls = load_crls(&cfg.ca_pem)?;
+    let check_revocation = !crls.is_empty();
+    let verifier =
+        rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
+            .with_crls(crls)
+            .enforce_revocation_expiration()
+            .build()
+            .map_err(|e| RemoteError::Transport(format!("server verifier: {e}")))?;
+    let mut cc = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| RemoteError::Transport(format!("client TLS versions: {e}")))?
-        .with_root_certificates(roots)
+        .with_webpki_verifier(verifier)
         .with_client_auth_cert(certs, key)
         .map_err(|e| RemoteError::Transport(format!("client cert: {e}")))?;
+    if check_revocation {
+        cc.resumption = rustls::client::Resumption::disabled();
+    }
     Ok(cc)
 }
 

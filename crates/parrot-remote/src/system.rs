@@ -379,9 +379,17 @@ impl RemoteConfig {
                 cert_path,
                 key_path,
                 ca_path,
+                require_crl,
                 admin_nodes,
             } => crate::RemoteSecurity::MutualTls {
                 credentials: crate::tls::TlsConfig::from_paths(cert_path, key_path, ca_path)
+                    .and_then(|tls| {
+                        if *require_crl {
+                            tls.require_crls()
+                        } else {
+                            Ok(tls)
+                        }
+                    })
                     .map_err(|e| config_error("remote.security", e.to_string()))?,
                 admin_nodes: admin_nodes.iter().cloned().collect(),
             },

@@ -110,6 +110,8 @@ pub struct RemoteSecuritySection {
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
     pub ca_path: Option<String>,
+    /// Require at least one X509 CRL in the CA bundle, even after replacement.
+    pub require_crl: Option<bool>,
     pub admin_nodes: Option<Vec<String>>,
 }
 
@@ -121,6 +123,7 @@ pub enum RemoteSecurityResolved {
         cert_path: String,
         key_path: String,
         ca_path: String,
+        require_crl: bool,
         admin_nodes: Vec<String>,
     },
     InsecureDevelopment,
@@ -148,17 +151,19 @@ impl RemoteSecuritySection {
                 cert_path: required("cert_path", &self.cert_path)?,
                 key_path: required("key_path", &self.key_path)?,
                 ca_path: required("ca_path", &self.ca_path)?,
+                require_crl: self.require_crl.unwrap_or(false),
                 admin_nodes,
             })
         } else {
             if self.cert_path.is_some()
                 || self.key_path.is_some()
                 || self.ca_path.is_some()
+                || self.require_crl.is_some()
                 || self.admin_nodes.is_some()
             {
                 return Err(invalid(
                     "mode",
-                    "credentials and admin_nodes require mtls mode",
+                    "credentials, require_crl and admin_nodes require mtls mode",
                 ));
             }
             match mode {
@@ -612,7 +617,7 @@ impl ParrotConfig {
         merge!(self.remote.transport, fallback.remote.transport; connection_capacity, handshake_capacity, heartbeat_interval_ms, heartbeat_max_loss, outbound_queue, inbound_ask_capacity, inbound_ask_bytes, inbound_dispatch_capacity, inbound_dispatch_per_connection, inbound_dispatch_bytes, default_hop_limit);
         merge!(self.remote.reorder, fallback.remote.reorder; gap_timeout_ms, buffer_cap, stream_capacity, frame_capacity, byte_capacity, ordered_relays, receiver_state, persist_sender_sessions);
         merge!(self.remote.codec, fallback.remote.codec; extra_caps);
-        merge!(self.remote.security, fallback.remote.security; mode, cert_path, key_path, ca_path, admin_nodes);
+        merge!(self.remote.security, fallback.remote.security; mode, cert_path, key_path, ca_path, require_crl, admin_nodes);
         merge!(self.remote.receptionist, fallback.remote.receptionist; default_deny, roles, relays, max_subscriptions, max_subscription_bytes, max_registrations, max_registration_bytes);
         merge!(self.tracing, fallback.tracing; enabled, otlp_endpoint, allow_insecure_http, capacity, socket, interval_ms, request_timeout_ms, max_attempts);
         self.topology = self.topology.with_fallback(fallback.topology);
@@ -1113,6 +1118,10 @@ impl ParrotConfig {
         );
         m.insert("remote.security.key_path", "mtls 节点 PEM 私钥路径");
         m.insert("remote.security.ca_path", "mtls 信任 CA PEM 集合路径");
+        m.insert(
+            "remote.security.require_crl",
+            "mtls 启动时要求 CA PEM 包含签发者撤销列表",
+        );
         m.insert(
             "remote.security.admin_nodes",
             "允许管理命令的已认证节点 ID 列表；默认空",

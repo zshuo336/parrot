@@ -98,6 +98,7 @@
 # cert_path = "/private/parrot/node-cert.pem"
 # key_path = "/private/parrot/node-key.pem"
 # ca_path = "/private/parrot/ca.pem"
+# require_crl = true  # require a signed X509 CRL in the CA PEM bundle
 # Certificate identity must match node_id; mTLS seeds require node-id@host:port.
 # Authenticated administrators are separate from receptionist service grants.
 # admin_nodes = []
