@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Neutral Local children belong to the actual parent generation and cohort.
 use parrot::actix::ActixActorSystem;
 use parrot_api::{
@@ -28,6 +29,10 @@ use std::{
     },
     time::Duration,
 };
+
+#[path = "support/isolated.rs"]
+mod isolated;
+
 async fn bounded<F: std::future::Future>(f: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(8), f)
         .await
@@ -346,7 +351,7 @@ fn parent_flavors(_via_facade: bool) -> &'static [Flavor] {
 // box, so treating that bridge's result as a raw Local reply is a test error.
 struct Parent {
     reference: BoxedActorRef,
-    native_ready: Arc<AtomicUsize>,
+    generations: Arc<AtomicUsize>,
     typed: Option<parrot_api::typed_channel::TypedActorRef<TypedParent, Cmd>>,
 }
 impl std::ops::Deref for Parent {
@@ -372,14 +377,20 @@ async fn root_with_runtime(
     flavor: Flavor,
 ) -> Parent {
     let mut typed = None;
-    let native_ready = Arc::new(AtomicUsize::new(0));
-    let ready = native_ready.clone();
+    let generations = Arc::new(AtomicUsize::new(0));
+    let ready = generations.clone();
     let reference = match flavor {
         Flavor::Local => runtime
             .local_runtime()
             .expect("live Local capability")
             .spawn_local_factory(
-                factory(&Arc::new(Stats::default()), Setup::default()),
+                {
+                    let make = factory(&Arc::new(Stats::default()), Setup::default());
+                    Box::new(move || {
+                        ready.fetch_add(1, Ordering::SeqCst);
+                        make()
+                    })
+                },
                 FactoryOptions {
                     spawn: SpawnOptions::at("/parent"),
                     ..Default::default()
@@ -388,15 +399,19 @@ async fn root_with_runtime(
             .await
             .unwrap(),
         Flavor::Typed => {
+            let make = move || {
+                ready.fetch_add(1, Ordering::SeqCst);
+                TypedParent
+            };
             let actor = if let Some(facade) =
                 (runtime as &dyn Any).downcast_ref::<parrot::system::ParrotActorSystem>()
             {
                 facade
-                    .spawn_typed_factory::<_, Cmd, _>(|| TypedParent, "/parent")
+                    .spawn_typed_factory::<_, Cmd, _>(make, "/parent")
                     .await
                     .unwrap()
             } else {
-                s.spawn_typed_factory::<_, Cmd, _>(|| TypedParent, "/parent")
+                s.spawn_typed_factory::<_, Cmd, _>(make, "/parent")
                     .await
                     .unwrap()
             };
@@ -424,7 +439,7 @@ async fn root_with_runtime(
     Parent {
         reference,
         typed,
-        native_ready,
+        generations,
     }
 }
 
@@ -543,56 +558,190 @@ async fn case_nested_init(via_facade: bool) {
     })
     .await;
 }
-async fn case_replacement(via_facade: bool) {
-    bounded(async {
-        for flavor in parent_flavors(via_facade).iter().copied() {
-            let s = system().await;
-            let runtime = runtime_for(&s, via_facade).await;
-            let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
-            let stats = Arc::new(Stats::default());
-            let nested = Arc::new(Stats::default());
-            let actor = child(
-                &parent,
-                &stats,
-                Setup {
-                    nested: Some(nested.clone()),
-                    ..Default::default()
-                },
-                None,
-            )
+struct ReplacementTree {
+    runtime: Arc<dyn AsyncEngineRuntime>,
+    flavor: Flavor,
+    parent: Parent,
+    actor: BoxedActorRef,
+    leaf: BoxedActorRef,
+    old: TypedContext,
+    old_parent: Option<TypedContext>,
+    stats: Arc<Stats>,
+    nested: Arc<Stats>,
+}
+impl ReplacementTree {
+    async fn create(via_facade: bool, flavor: Flavor) -> Self {
+        let s = system().await;
+        let runtime = runtime_for(&s, via_facade).await;
+        let parent = root_with_runtime(&s, runtime.as_ref(), flavor).await;
+        let stats = Arc::new(Stats::default());
+        let nested = Arc::new(Stats::default());
+        let actor = child(
+            &parent,
+            &stats,
+            Setup {
+                nested: Some(nested.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let old = report(&actor).await.context;
+        assert_eq!(parent.generations.load(Ordering::SeqCst), 1);
+        let old_parent = match flavor {
+            Flavor::Local | Flavor::Typed => Some(
+                *parent
+                    .send(Box::new(Cmd::Context))
+                    .await
+                    .unwrap()
+                    .downcast::<TypedContext>()
+                    .unwrap(),
+            ),
+            Flavor::Native => None,
+        };
+        let leaf = {
+            let children = old.children();
+            let children = children.read_all();
+            assert_eq!(children.len(), 1);
+            children[0].clone_boxed()
+        };
+        assert_eq!(report(&leaf).await.generation, 1);
+        Self {
+            runtime,
+            flavor,
+            parent,
+            actor,
+            leaf,
+            old,
+            old_parent,
+            stats,
+            nested,
+        }
+    }
+
+    async fn replace(self) {
+        let Self {
+            runtime,
+            flavor,
+            parent,
+            actor,
+            leaf,
+            old,
+            old_parent,
+            stats,
+            nested,
+        } = self;
+        assert!(parent.send(Box::new(Cmd::Fail)).await.is_err());
+        // Native factories temporarily have no current generation; failure
+        // reply is not a publication barrier. Observe actual replacement init.
+        if matches!(flavor, Flavor::Native) {
+            bounded(async {
+                while parent.generations.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await;
-            let old = report(&actor).await.context;
-            assert!(parent.send(Box::new(Cmd::Fail)).await.is_err());
-            // Native factories temporarily have no current generation; failure
-            // reply is not a publication barrier. Observe actual replacement init.
-            if matches!(flavor, Flavor::Native) {
-                bounded(async {
-                    while parent.native_ready.load(Ordering::SeqCst) < 2 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await;
-            }
-            parent.send(Box::new(Cmd::Read)).await.unwrap();
-            assert!(!actor.is_alive().await);
-            assert_eq!(stats.drops.load(Ordering::SeqCst), 1);
-            assert_eq!(nested.drops.load(Ordering::SeqCst), 1);
+        }
+        parent.send(Box::new(Cmd::Read)).await.unwrap();
+        assert_eq!(parent.generations.load(Ordering::SeqCst), 2);
+        for retired in [&actor, &leaf] {
+            assert!(!retired.is_alive().await);
+            assert!(runtime.get_actor(&retired.path()).await.is_none());
+            assert!(retired.send(Box::new(Cmd::Read)).await.is_err());
+        }
+        for retired in [&stats, &nested] {
+            assert_eq!(retired.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(retired.captures.load(Ordering::SeqCst), 1);
+            retired.affinity();
+        }
+        for stale in std::iter::once(old).chain(old_parent) {
             let rejected = Arc::new(Stats::default());
-            let error = old
+            let result = stale
                 .local_spawner()
                 .unwrap()
                 .spawn_local_factory(factory(&rejected, Setup::default()), None)
                 .await;
-            assert!(error.is_err());
+            assert!(
+                matches!(result, Err(ActorError::Stopped)),
+                "stale generation must reject child creation as stopped: {result:?}"
+            );
             assert_eq!(rejected.built.load(Ordering::SeqCst), 0);
             assert_eq!(rejected.captures.load(Ordering::SeqCst), 1);
-            let fresh = child(&parent, &Arc::new(Stats::default()), Setup::default(), None).await;
-            report(&fresh).await;
-            parent.stop().await.unwrap();
-            runtime.shutdown().await.unwrap();
+        }
+        let fresh_stats = Arc::new(Stats::default());
+        let fresh = child(&parent, &fresh_stats, Setup::default(), None).await;
+        let found = runtime.get_actor(&fresh.path()).await.unwrap();
+        let current = report(&found).await;
+        assert_eq!(current.generation, 1);
+        assert_eq!(
+            current
+                .context
+                .parent()
+                .unwrap()
+                .death_watch()
+                .unwrap()
+                .id(),
+            parent.death_watch().unwrap().id()
+        );
+        assert_ne!(
+            found.death_watch().unwrap().id(),
+            actor.death_watch().unwrap().id()
+        );
+        parent.stop().await.unwrap();
+        assert_eq!(fresh_stats.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(fresh_stats.captures.load(Ordering::SeqCst), 1);
+        fresh_stats.affinity();
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+async fn case_replacement(via_facade: bool) {
+    bounded(async {
+        for flavor in parent_flavors(via_facade).iter().copied() {
+            let tree = ReplacementTree::create(via_facade, flavor).await;
+            tree.replace().await;
         }
     })
     .await;
+}
+fn replace_after_host_exit(name: &str, flavor: Flavor) {
+    isolated::run(
+        name,
+        "PARROT_FACADE_LOCAL_TREE_HOST_EXIT",
+        Duration::from_secs(30),
+        || {
+            let host = actix::System::new();
+            let tree = host.block_on(bounded(ReplacementTree::create(true, flavor)));
+            drop(host);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(bounded(tree.replace()));
+        },
+    );
+}
+
+#[test]
+fn facade_local_parent_replaces_subtree_after_host_exit() {
+    replace_after_host_exit(
+        "facade_local_parent_replaces_subtree_after_host_exit",
+        Flavor::Local,
+    );
+}
+#[test]
+fn facade_typed_parent_replaces_subtree_after_host_exit() {
+    replace_after_host_exit(
+        "facade_typed_parent_replaces_subtree_after_host_exit",
+        Flavor::Typed,
+    );
+}
+#[test]
+fn facade_dynamic_parent_replaces_subtree_after_host_exit() {
+    replace_after_host_exit(
+        "facade_dynamic_parent_replaces_subtree_after_host_exit",
+        Flavor::Native,
+    );
 }
 async fn case_policy(via_facade: bool) {
     bounded(async {
