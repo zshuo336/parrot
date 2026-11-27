@@ -1103,6 +1103,27 @@ impl Outbound {
         )
         .await;
         let receipt = match result {
+            Err((ErrCode::Stopped | ErrCode::ConnectionLost, _))
+                if sender.node_id() != route.destination
+                    && current.node_id() == route.destination
+                    && !path.contains('#')
+                    && carries_identity(current, path)
+                    && current.supports_ordered_tell()
+                    && (!saved.actor || current.supports_actor_sessions()) =>
+            {
+                // A hub can stop forwarding while its physical link stays open.
+                // The direct destination must certify this exact ticket below.
+                request(
+                    current,
+                    callbacks,
+                    route.destination,
+                    path,
+                    route.hops,
+                    control,
+                    deadline,
+                )
+                .await
+            }
             Err((ErrCode::Forbidden, detail))
                 if path.contains('#') && current.supports_ordered_route() =>
             {

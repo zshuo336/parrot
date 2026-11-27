@@ -7,6 +7,8 @@ mod endpoint_identity;
 mod first_hop;
 #[path = "ordered_sessions/multihost.rs"]
 mod multihost;
+#[path = "ordered_sessions/relay_shutdown.rs"]
+mod relay_shutdown;
 use parrot_api::{
     address::ActorRef,
     message::{MessageOptions, RemoteMessage},

@@ -124,6 +124,7 @@ impl RelayMetrics {
 /// 来源/目标断连时按实际连接清理；同节点其他连接不受牵连。
 pub struct RelayTable {
     slots: std::sync::Mutex<std::collections::HashMap<u64, RelaySlot>>,
+    closed: std::sync::atomic::AtomicBool,
     ttl: std::time::Duration,
     capacity: usize,
 }
@@ -149,6 +150,7 @@ impl RelayTable {
     pub fn new() -> Self {
         Self {
             slots: Default::default(),
+            closed: Default::default(),
             ttl: std::time::Duration::from_secs(65),
             capacity: 65536,
         }
@@ -163,7 +165,8 @@ impl RelayTable {
         target: &FrameSender,
     ) -> bool {
         let mut slots = self.slots.lock().unwrap();
-        if slots.len() >= self.capacity
+        if self.closed.load(Ordering::Acquire)
+            || slots.len() >= self.capacity
             || slots.contains_key(&forward_cid)
             || back.is_closed()
             || target.is_closed()
@@ -262,6 +265,29 @@ impl RelayTable {
     pub fn len(&self) -> usize {
         self.slots.lock().unwrap().len()
     }
+
+    fn close_admission(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn drain_closed(&self) {
+        debug_assert!(self.closed.load(Ordering::Acquire));
+        let slots = std::mem::take(&mut *self.slots.lock().unwrap());
+        let cleanup = Cleanup::default();
+        for slot in slots.into_values() {
+            // The destination may already be executing the request.
+            let _ = cleanup.call(|| {
+                slot.back.send_reply(Frame::reply_err(
+                    slot.orig_cid,
+                    "",
+                    ErrCode::ConnectionLost,
+                    "relay closed",
+                ));
+            });
+            cleanup.dispose(slot);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -580,9 +606,11 @@ impl Ingress {
     /// Fence admission synchronously, then cancel all accepted ASK futures.
     pub fn close_asks(&self) {
         *self.ask_open.lock().unwrap() = false;
+        self.relay_table.close_admission();
         let cleanup = Cleanup::default();
         let _ = cleanup.call(|| self.ask_tasks.close());
         let _ = cleanup.call(|| self.ask_cancel.cancel());
+        self.relay_table.drain_closed();
     }
 
     /// Wait until every accepted ASK future has been dropped. Call close first.
@@ -596,6 +624,7 @@ impl Ingress {
         self.reorder_closed.store(true, Ordering::Release);
         drop(_map);
         *self.ask_open.lock().unwrap() = false;
+        self.relay_table.close_admission();
         self.mirror_control.close_admission();
         self.mirrors.close_admission();
     }
@@ -614,6 +643,7 @@ impl Ingress {
         let _ = cleanup.call(|| self.ask_cancel.cancel());
         let _ = cleanup.call(|| self.reorder_cancel.cancel());
         let _ = cleanup.call(|| self.close_ordered());
+        self.relay_table.drain_closed();
         for sender in retired.into_values() {
             cleanup.dispose(sender);
         }
@@ -2410,7 +2440,9 @@ impl Ingress {
             .relay_table
             .insert(forward_cid, orig_cid, back.clone(), &sender)
         {
-            let code = if sender.is_closed() || back.is_closed() {
+            let code = if self.relay_table.closed.load(Ordering::Acquire) {
+                ErrCode::Stopped
+            } else if sender.is_closed() || back.is_closed() {
                 ErrCode::ConnectionLost
             } else {
                 ErrCode::Overloaded
@@ -3384,6 +3416,41 @@ mod tests {
         }
         fn on_hint(&self, _: &str, _: &str) {}
     }
+    #[tokio::test]
+    async fn relay_waiting_for_capacity_cannot_publish_after_ingress_close() {
+        let ingress = Ingress::new(Arc::new(TestLookup), Arc::new(CallbackRegistry::default()));
+        let (tx, mut downstream) = tokio::sync::mpsc::channel(1);
+        let target = FrameSender::new(tx, "gateway");
+        target.send_frame_sync(Frame::heartbeat()).unwrap();
+        *ingress.relay_slot() = Some(Arc::new(AliasRouter(target.clone())));
+        let (tx, mut upstream) = tokio::sync::mpsc::channel(4);
+        let source = FrameSender::new(tx, "source");
+        assert!(ingress.relay_table.insert(901, 7, source.clone(), &target));
+        let frame = Frame::ask(8, "parrot://gateway/actual", "business", Bytes::new(), None);
+        let mut pending = std::pin::pin!(ingress.try_relay_request(&frame, &source, 8));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        ingress.close();
+        ingress.close();
+        let reply = upstream.try_recv().unwrap();
+        assert_eq!(reply.header.correlation_id, 7);
+        assert_eq!(
+            decode_err_payload(&reply.payload).unwrap().0,
+            ErrCode::ConnectionLost
+        );
+        downstream.try_recv().unwrap();
+        assert_eq!(pending.await, Some(ErrCode::Stopped));
+        let reply = upstream.try_recv().unwrap();
+        assert_eq!(reply.header.correlation_id, 8);
+        assert_eq!(
+            decode_err_payload(&reply.payload).unwrap().0,
+            ErrCode::Stopped
+        );
+        ingress.on_reply(Frame::reply(901, "", "business", Bytes::new()), &target);
+        assert!(downstream.try_recv().is_err());
+        assert!(upstream.try_recv().is_err());
+        assert!(ingress.relay_table.is_empty());
+    }
+
     #[tokio::test]
     async fn admission_open_and_rerouted_data_stop_before_a_legacy_downstream_link() {
         use crate::{handshake::caps, ordered};
@@ -4384,9 +4451,9 @@ mod tests {
     #[test]
     fn relay_table_capacity_and_expiry() {
         let table = RelayTable {
-            slots: Default::default(),
             ttl: std::time::Duration::ZERO,
             capacity: 1,
+            ..RelayTable::new()
         };
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let source = FrameSender::anon(tx);
@@ -4405,9 +4472,9 @@ mod tests {
     fn expired_relay_reply_reports_timeout_instead_of_consuming_silently() {
         let mut ingress = Ingress::new(Arc::new(TestLookup), Arc::new(CallbackRegistry::default()));
         ingress.relay_table = Arc::new(RelayTable {
-            slots: Default::default(),
             ttl: std::time::Duration::ZERO,
             capacity: 2,
+            ..RelayTable::new()
         });
         let (tx, mut replies) = tokio::sync::mpsc::channel(4);
         let source = FrameSender::new(tx, "source");
