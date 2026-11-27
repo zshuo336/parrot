@@ -1,4 +1,6 @@
 //! Receiver-owned challenges, fenced handoff and bounded ordered TELL workers.
+#[cfg(test)]
+mod retirement_tests;
 use super::{
     unwind, Cleanup, Ingress, ReorderPending, DEAD_TELL_DROPPED, REORDER_BUFFERED,
     REORDER_GAP_FLUSHED,
@@ -892,6 +894,10 @@ impl Ingress {
                             && challenge.control.ticket == control.ticket
                     }) {
                         source.challenge = None;
+                    } else if source.owns_ticket(control.ticket) {
+                        // A restored caller may have the ticket but a new
+                        // stream or incarnation. Its original owner is live.
+                        return Err(ErrCode::Forbidden);
                     }
                     sessions.prune_challenges();
                     return Ok(receipt);
