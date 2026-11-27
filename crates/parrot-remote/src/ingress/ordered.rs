@@ -30,6 +30,21 @@ enum Ready {
 struct Pending {
     sequence: u64,
     frame: ReorderPending,
+    actor: Option<PinnedActor>,
+}
+
+// A cancelled or retired queue can drop application-owned handles without
+// entering the delivery routine that normally isolates their destructors.
+pub(super) struct PinnedActor(Option<parrot_api::types::BoxedActorRef>);
+impl PinnedActor {
+    pub(super) fn take(mut self) -> parrot_api::types::BoxedActorRef {
+        self.0.take().expect("pinned actor")
+    }
+}
+impl Drop for PinnedActor {
+    fn drop(&mut self) {
+        Cleanup::default().dispose(self.0.take());
+    }
 }
 
 struct Lease {
@@ -43,6 +58,7 @@ struct Lease {
     generation: u64,
     tx: mpsc::Sender<Pending>,
     cancel: CancellationToken,
+    lookups: tokio::sync::RwLock<()>,
     deadline: Mutex<Instant>,
     ready: watch::Sender<Ready>,
     done: watch::Sender<bool>,
@@ -236,6 +252,32 @@ impl Ingress {
         }
     }
 
+    async fn pin_ordered_actor<'a>(
+        &self,
+        lease: &'a Lease,
+        path: &str,
+        parent: Option<parrot_api::trace::TraceParent>,
+    ) -> Result<(PinnedActor, tokio::sync::RwLockReadGuard<'a, ()>), ErrCode> {
+        let guard = lease.lookups.try_read().map_err(|_| ErrCode::Stopped)?;
+        let cleanup = Cleanup::default();
+        let lookup = parrot_api::trace::scope(
+            self.trace_recorder.context(parent),
+            unwind::run(&cleanup, || self.local.lookup(super::local_path(path))),
+        );
+        let found = tokio::select! {
+            biased;
+            _ = lease.cancel.cancelled() => return Err(ErrCode::Stopped),
+            result = tokio::time::timeout(Duration::from_secs(5), lookup) =>
+                result.map_err(|_| ErrCode::Timeout)?.map_err(|_| ErrCode::ProtocolViolation)?,
+        };
+        let actor = found.map(|target| PinnedActor(Some(target)));
+        if cleanup.failed() {
+            return Err(ErrCode::ProtocolViolation);
+        }
+        self.ordered_local_path(path)?;
+        Ok((actor.ok_or(ErrCode::ActorNotFound)?, guard))
+    }
+
     pub(crate) fn set_ordered_receiver_owner(&self, owner: Arc<ordered::recovery::ReceiverOwner>) {
         let mut sessions = self.ordered.lock().unwrap();
         assert!(sessions.sources.is_empty() && sessions.owner.is_none());
@@ -425,6 +467,7 @@ impl Ingress {
             if let Some(active) = source.active.as_ref().filter(|lease| {
                 lease.incarnation == control.incarnation
                     && lease.stream == control.stream
+                    && !lease.cancel.is_cancelled()
                     && *lease.deadline.lock().unwrap() > Instant::now()
             }) {
                 *active.deadline.lock().unwrap() =
@@ -519,6 +562,7 @@ impl Ingress {
                     generation,
                     tx,
                     cancel: self.reorder_cancel.child_token(),
+                    lookups: tokio::sync::RwLock::new(()),
                     deadline: Mutex::new(
                         Instant::now() + Duration::from_millis(ordered::LEASE_MS as u64),
                     ),
@@ -562,6 +606,10 @@ impl Ingress {
                             _ = worker.cancel.cancelled() => {},
                             _ = work => {},
                         }
+                        // Admission can be resolving a local actor while older
+                        // work runs. Fence those owners before publishing done.
+                        worker.cancel.cancel();
+                        let _retired = worker.lookups.write().await;
                     }));
                 (lease, cancelled)
             }
@@ -663,8 +711,8 @@ impl Ingress {
     }
 
     pub(super) async fn on_ordered_tell(self: &Arc<Self>, frame: Frame, back: &FrameSender) {
-        let payload = match frame.split_trace_parent() {
-            Ok((_, payload)) => payload,
+        let (parent, payload) = match frame.split_trace_parent() {
+            Ok(parts) => parts,
             Err(_) => {
                 back.close();
                 return;
@@ -784,11 +832,34 @@ impl Ingress {
             self.reject_reorder(back, reply);
             return;
         };
+        let (actor, _lookup_guard) = if let Some(id) = admission {
+            match self
+                .pin_ordered_actor(&lease, &frame.frame.path, parent)
+                .await
+            {
+                Ok((actor, guard)) => (Some(actor), Some(guard)),
+                Err(code) => {
+                    DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    let reply = match code {
+                        ErrCode::Stopped => {
+                            Frame::reply(cid, "", ordered::ADMISSION_RECEIPT_KEY, id.receipt(false))
+                        }
+                        ErrCode::NotRemotable => Frame::reply_err(cid, "", code, &id.alias_error()),
+                        _ => Frame::reply_err(cid, "", code, &id.endpoint_error()),
+                    };
+                    back.send_reply(reply);
+                    return;
+                }
+            }
+        } else {
+            (None, None)
+        };
         *lease.deadline.lock().unwrap() =
             Instant::now() + Duration::from_millis(ordered::LEASE_MS as u64);
         let pending = Pending {
             sequence: data.sequence,
             frame,
+            actor,
         };
         let admitted = tokio::select! {
             biased;
@@ -824,7 +895,7 @@ impl Ingress {
                 // must not silently strip origin/lease identity and forward elsewhere.
                 parrot_api::trace::scope(
                     context,
-                    self.tell_deliver_scoped(frame, &FrameSender::detached(), false),
+                    self.tell_deliver_scoped(frame, &FrameSender::detached(), false, pending.actor),
                 )
                 .await;
                 Ok::<_, ()>(())

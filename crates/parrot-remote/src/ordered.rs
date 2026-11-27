@@ -75,6 +75,10 @@ impl AdmissionId {
         self.bound_error("ordered admission requires the final endpoint")
     }
 
+    pub fn endpoint_error(&self) -> String {
+        self.bound_error("ordered endpoint was not acquired")
+    }
+
     fn bound_error(&self, reason: &str) -> String {
         use sha2::{Digest, Sha256};
         let binding = Sha256::digest(self.receipt(false));

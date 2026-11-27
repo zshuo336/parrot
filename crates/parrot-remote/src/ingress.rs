@@ -2790,10 +2790,16 @@ impl Ingress {
             back.close();
             return;
         };
-        parrot_api::trace::scope(context, self.tell_deliver_scoped(frame, back, true)).await;
+        parrot_api::trace::scope(context, self.tell_deliver_scoped(frame, back, true, None)).await;
     }
 
-    async fn tell_deliver_scoped(&self, mut frame: Frame, back: &FrameSender, forward: bool) {
+    async fn tell_deliver_scoped(
+        &self,
+        mut frame: Frame,
+        back: &FrameSender,
+        forward: bool,
+        pinned: Option<ordered::PinnedActor>,
+    ) {
         self.mirror_application(&frame);
         if forward {
             self.resolve_application_path(&mut frame);
@@ -2824,7 +2830,11 @@ impl Ingress {
         };
         let mut decoded = cleanup.owned(decoded);
         let mut failed = false;
-        match unwind::run(&cleanup, || self.local.lookup(local_path(&frame.path))).await {
+        let target = match pinned {
+            Some(actor) => Ok(Some(actor.take())),
+            None => unwind::run(&cleanup, || self.local.lookup(local_path(&frame.path))).await,
+        };
+        match target {
             Ok(Some(target)) => {
                 let mut target = cleanup.owned(target);
                 let result = if cleanup.failed() {

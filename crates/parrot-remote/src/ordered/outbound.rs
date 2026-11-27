@@ -452,6 +452,11 @@ impl Outbound {
                     state.grant.as_mut().expect("confirmed grant").renew_at = Instant::now();
                     Err(ErrCode::NotRemotable.to_actor_error("ordered destination now points to a remote alias".into()))
                 }
+                Ok(ReplyPayload::Err(code @ (ErrCode::ActorNotFound | ErrCode::Timeout | ErrCode::ProtocolViolation), detail))
+                    if detail == id.endpoint_error() => {
+                    state.sequence -= 1;
+                    Err(code.to_actor_error("ordered receiver could not acquire the destination actor".into()))
+                }
                 Ok(ReplyPayload::Err(code, detail)) => Err(code.to_actor_error(detail)),
                 Ok(_) => Err(ErrCode::ProtocolViolation.to_actor_error("invalid ordered admission response".into())),
                 Err(_) => Err(ErrCode::ConnectionLost.to_actor_error("ordered admission callback closed".into())),
