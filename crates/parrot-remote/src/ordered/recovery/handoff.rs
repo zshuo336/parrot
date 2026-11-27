@@ -141,6 +141,16 @@ fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn require_bound_invitation(bytes: &[u8]) -> Result<(), String> {
+    let invitation: Invitation = parse(bytes)?;
+    invitation.verify(&invitation.realm, &invitation.node)?;
+    if invitation.source.is_none() {
+        return Err("guest witness requires a source-bound invitation".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn verify_standby(invitation: &[u8], proof: &[u8]) -> Result<(), String> {
     let seal: Seal = parse(proof)?;
     if document(&seal.invitation)? != invitation

@@ -22,6 +22,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import uuid
 
 
 def checked(args, **kwargs):
@@ -161,11 +162,15 @@ def exercise(args, root):
         port = probe.getsockname()[1]
         health.bind(("127.0.0.1", 0))
         health_port = health.getsockname()[1]
-    qemu = ["qemu-system-x86_64", "-machine", "q35,accel=kvm", "-cpu", "host", "-m", "384",
+    guest_uuid = str(uuid.uuid4())
+    boot_args = "console=ttyS0 rdinit=/init panic=-1 loglevel=3 net.ifnames=0"
+    if args.external:
+        boot_args += " parrot_external"
+    qemu = ["qemu-system-x86_64", "-uuid", guest_uuid, "-machine", "q35,accel=kvm", "-cpu", "host", "-m", "384",
             "-smp", "2", "-no-reboot", "-nodefaults", "-display", "none",
             "-monitor", "none", "-kernel", args.kernel, "-initrd", root / "initrd",
             "-qmp", f"unix:{root}/monitor,server=on,wait=off",
-            "-append", "console=ttyS0 rdinit=/init panic=-1 loglevel=3 net.ifnames=0",
+            "-append", boot_args,
             "-drive", f"id=receiver-disk,file={disk},format=raw,if=virtio",
             "-object", f"memory-backend-file,id=shm,size=1M,share=on,mem-path={root}/guard.mem",
             "-device", "ivshmem-plain,id=guard,bus=pcie.0,memdev=shm,master=off",
@@ -194,7 +199,45 @@ def exercise(args, root):
         with socket.socket(socket.AF_UNIX) as admin:
             admin.connect(str(admin_socket))
             admin.sendall(invite)
-            marker(old, "original", "PARROT_ENROLLED")
+            marker(old, "original", "PARROT_LISTENING")
+        custody = {}
+        if args.external:
+            journal = root / "external-journal"
+            journal.mkdir(mode=0o700)
+            command = [args.handoff, "witness-qemu", journal, guest_uuid, root / "monitor",
+                       admin_socket, shutil.which("qemu-system-x86_64")]
+            def reject(case, cmd, document, expected):
+                proc = subprocess.run(cmd, input=document, capture_output=True, timeout=8)
+                require(proc.returncode == 1 and not proc.stdout and expected in proc.stderr,
+                        repr((proc.returncode, proc.stderr)))
+                custody[case] = proc.stderr.decode().strip()
+            wrong_vm = command.copy()
+            wrong_vm[3] = str(uuid.uuid4())
+            reject("wrong_vm", wrong_vm, invite, b"wrong QEMU guest UUID")
+            no_guard = command.copy()
+            no_guard[4] = root / "unguarded.sock"
+            with running([command[-1], "-uuid", guest_uuid, "-machine", "q35,accel=kvm",
+                          "-nodefaults", "-S", "-display", "none", "-monitor", "none",
+                          "-qmp", f"unix:{no_guard[4]},server=on,wait=off"], root / "unguarded.log") as vm:
+                wait_for(vm, no_guard[4].exists, lambda: "unguarded VM failed to start")
+                reject("missing_guard", no_guard, invite, b"QMP command qom-get failed")
+            legacy = root / "unbound"
+            legacy.mkdir()
+            reject("unbound_invitation", command, checked([args.handoff, "prepare", legacy, *params]),
+                   b"source-bound invitation")
+            wrong_port = command.copy()
+            wrong_port[5] = root / "foreign.sock"
+            with socket.socket(socket.AF_UNIX) as foreign:
+                foreign.bind(str(wrong_port[5]))
+                foreign.listen(1)
+                reject("foreign_serial", wrong_port, invite, b"different processes")
+            (root / "invite").write_bytes(invite)
+            witness_log = root / "external.log"
+            def witness():
+                return stack.enter_context(running(command, witness_log,
+                    stdin=stack.enter_context((root / "invite").open("rb"))))
+            watcher = witness()
+        marker(old, "original", "PARROT_ENROLLED")
         senderlog = root / "sender.log"
         sender = stack.enter_context(running(
             [args.receiver, "--ignored", "--exact", "receiver_handoff::destination_host",
@@ -220,32 +263,81 @@ def exercise(args, root):
                                  capture_output=True, timeout=5)
         require(attempt.returncode != 0 and b"write" in attempt.stderr.lower()
                 and b"lock" in attempt.stderr.lower(), attempt.stderr.decode())
+        if args.external:
+            require(watcher.poll() is None and not witness_log.read_bytes(),
+                    "witness released while the guest was paused")
+            watcher.kill()
+            require(watcher.wait(timeout=5) == -signal.SIGKILL, "witness did not exit")
+            reject("wrong_vm_replay", wrong_vm, invite, b"guest binding differs")
+            reject("wrong_witness_mode", [args.handoff, "witness", journal], invite,
+                   b"guest binding differs")
+            other = root / "other-target"
+            other.mkdir()
+            reject("wrong_target", command, checked([args.handoff, "prepare", other, *params, receiver_id]),
+                   b"invalid standby enrollment")
+            retired_volume = stack.enter_context(disk.open("rb"))
+            disk.unlink()
+            watcher = witness()
+            # The observer must actually have reopened the original process's
+            # pidfd, before testing that the resumed waiter still withholds it.
+            def watching_old():
+                directory = Path(f"/proc/{watcher.pid}/fdinfo")
+                for fd in directory.iterdir():
+                    try:
+                        if f"Pid:\t{old.pid}\n" in fd.read_text():
+                            return True
+                    except FileNotFoundError:
+                        continue
+                return False
+            wait_for(watcher, watching_old, witness_log.read_text)
+            custody.update(original_pid=old.pid, resumed_observer_pid=watcher.pid,
+                           resumed_wait_on_original_pidfd=True)
+            require(not witness_log.read_bytes(), "resumed observer released a live VM")
         old.send_signal(signal.SIGCONT)
         old.kill()
         require(old.wait(timeout=8) == -signal.SIGKILL, "original VM was not power cut")
+
+        def activate(seal):
+            digest = hashlib.sha256(seal).hexdigest()
+            checked([args.handoff, "activate", state, *params, digest], input=seal)
+            (root / "activated").touch()
+            require(sender.wait(timeout=15) == 0 and "observed message 37" in senderlog.read_text(),
+                    senderlog.read_text())
+            return digest
+
+        if args.external:
+            require(watcher.wait(timeout=8) == 0 and not disk.exists(), "missing exterior release")
+            require(witness_log.stat().st_size > 0, "first response was empty")
+            # Lose the entire first response, then request another with both VM
+            # sockets gone. Only restore the disk after successful app delivery.
+            witness_log.unlink()
+            replay = subprocess.run(command, input=invite, capture_output=True, check=True, timeout=8)
+            custody.update(disk_path_at_activation=disk.exists(), first_delivery_discarded=True)
+            digest = activate(replay.stdout)
+            require(replay.stderr.decode().strip() == digest, "replayed digest mismatch")
+            with disk.open("xb") as recovered:
+                shutil.copyfileobj(retired_volume, recovered)
         reboot = stack.enter_context(guest("reboot", "file:" + str(proof)))
-        marker(reboot, "reboot", "PARROT_OFFLINE_SEAL")
-        for expected in ("PARROT_REFUSED_OLD_RECEIVER", "PARROT_REFUSED_MISSING_STATE",
-                         "PARROT_REFUSED_OLD_BOOT"):
+        for expected in ("PARROT_REFUSED_OLD_RECEIVER", "PARROT_REFUSED_MISSING_STATE"):
             marker(reboot, "reboot", expected)
+        if not args.external:
+            marker(reboot, "reboot", "PARROT_REFUSED_OLD_BOOT")
+            marker(reboot, "reboot", "PARROT_OFFLINE_SEAL")
         require(reboot.wait(timeout=12) == 0, "rescue boot did not shut down cleanly")
         def boot_id(label):
             return re.search(r"PARROT_BOOT ([0-9a-f-]{36})", (root / label).read_text())[1]
         boots = [Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                  boot_id("original"), boot_id("reboot")]
         require(len(set(boots)) == 3, "host and guests require distinct kernel boots")
-        seal = proof.read_bytes()
-        digest = hashlib.sha256(seal).hexdigest()
-        checked([args.handoff, "activate", state, *params, digest], input=seal)
-        (root / "activated").touch()
-        require(sender.wait(timeout=15) == 0 and "observed message 37" in senderlog.read_text(),
-                senderlog.read_text())
+        if not args.external:
+            digest = activate(proof.read_bytes())
         return dict(passed=True, boot_ids=boots, receiver_id=receiver_id, nic_partition_and_recovery=True,
                     qemu_denials=denied,
                     paused_disk_attach_rejected=True,
-                    pending_witness_rejected_after_reboot=True, sealed_receiver_rejoin_rejected=True,
+                    pending_guest_witness_rejected_after_reboot=not args.external, sealed_receiver_rejoin_rejected=True,
                     missing_state_reinitialization_rejected=True,
-                    recovered_original_volume=True, application_received=37, seal_sha256=digest,
+                    volume_available_at_takeover=not args.external, external_witness_replay=args.external,
+                    custody=custody, guest_uuid=guest_uuid, application_received=37, seal_sha256=digest,
                     hypervisor=checked(["qemu-system-x86_64", "--version"]).decode().splitlines()[0],
                     disk_lock_error=attempt.stderr.decode().replace(str(root), "$RUN"),
                     original_console=(root / "original").read_text(),
@@ -255,6 +347,7 @@ def exercise(args, root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--external", action="store_true", help="use the management host's persistent witness")
     for arg in ("kernel", "busybox", "receiver", "handoff"):
         parser.add_argument("--" + arg, required=True, type=lambda p: Path(p).resolve(strict=True))
     args = parser.parse_args()

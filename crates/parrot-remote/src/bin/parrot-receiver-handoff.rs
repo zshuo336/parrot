@@ -4,7 +4,7 @@ use parrot_remote::ordered::handoff;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-const USAGE: &str = "usage: parrot-receiver-handoff prepare DIRECTORY REALM NODE [SOURCE_RECEIVER_HEX]\n       parrot-receiver-handoff seal|activate DIRECTORY REALM NODE [SEAL_SHA256]\nLinux: watch DIRECTORY REALM NODE, or witness [PRIVATE_JOURNAL_DIRECTORY] < invitation.json\nprepare writes an invitation to stdout; seal and witness read an invitation and write a private seal to stdout and its SHA-256 to stderr; activate checks the trusted digest before publishing";
+const USAGE: &str = "usage: parrot-receiver-handoff prepare DIRECTORY REALM NODE [SOURCE_RECEIVER_HEX]\n       parrot-receiver-handoff seal|activate DIRECTORY REALM NODE [SEAL_SHA256]\nLinux: watch DIRECTORY REALM NODE, or witness [PRIVATE_JOURNAL_DIRECTORY] < invitation.json\nQEMU guest: enroll-guest UART < bound-invitation.json\nQEMU host: witness-qemu PRIVATE_JOURNAL_DIRECTORY GUEST_UUID QMP_SOCKET UART_SOCKET QEMU_EXECUTABLE < bound-invitation.json\nprepare writes an invitation to stdout; seal and witness commands write a private seal to stdout and its SHA-256 to stderr; activate checks the trusted digest before publishing";
 
 fn input() -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
@@ -22,19 +22,35 @@ fn input() -> Result<Vec<u8>, String> {
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     #[cfg(target_os = "linux")]
-    if args.first().is_some_and(|arg| arg == "witness") {
-        let seal = match &args[1..] {
-            [] => parrot_remote::ordered::standby::witness(&input()?)?,
-            [directory] => {
-                parrot_remote::ordered::standby::durable_witness(&input()?, directory.as_ref())?
+    if let [action, rest @ ..] = args.as_slice() {
+        let seal = match (action.as_str(), rest) {
+            ("enroll-guest", [uart]) => {
+                return parrot_remote::ordered::standby::enroll_guest(&input()?, uart.as_ref())
             }
-            _ => return Err(USAGE.into()),
+            ("witness-qemu", [directory, uuid, monitor, serial, executable]) => {
+                Some(parrot_remote::ordered::standby::qemu_witness(
+                    &input()?,
+                    directory.as_ref(),
+                    uuid::Uuid::parse_str(uuid).map_err(|_| "invalid guest UUID")?,
+                    monitor.as_ref(),
+                    serial.as_ref(),
+                    executable.as_ref(),
+                )?)
+            }
+            ("witness", []) => Some(parrot_remote::ordered::standby::witness(&input()?)?),
+            ("witness", [directory]) => Some(parrot_remote::ordered::standby::durable_witness(
+                &input()?,
+                directory.as_ref(),
+            )?),
+            _ => None,
         };
-        eprintln!("{}", hex::encode(Sha256::digest(&seal)));
-        return std::io::stdout()
-            .lock()
-            .write_all(&seal)
-            .map_err(|e| e.to_string());
+        if let Some(seal) = seal {
+            eprintln!("{}", hex::encode(Sha256::digest(&seal)));
+            return std::io::stdout()
+                .lock()
+                .write_all(&seal)
+                .map_err(|e| e.to_string());
+        }
     }
     let [action, directory, realm, node, rest @ ..] = args.as_slice() else {
         return Err(USAGE.into());

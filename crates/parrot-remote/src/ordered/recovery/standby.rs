@@ -21,6 +21,8 @@ use std::{
 
 mod journal;
 pub use journal::durable_witness;
+mod qemu;
+pub use qemu::{enroll_guest, qemu_witness};
 
 // Hashing the invitation gives each prepared directory its own abstract address.
 // SO_PEERCRED authenticates both endpoints; no socket pathname survives a crash.
@@ -112,14 +114,14 @@ fn process_identity(pid: i32) -> Result<[u8; 12], String> {
     Ok(id)
 }
 
-fn send(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), String> {
+fn send(stream: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
     stream
         .write_all(&(bytes.len() as u32).to_le_bytes())
         .map_err(error)?;
     stream.write_all(bytes).map_err(error)
 }
 
-fn receive(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
+fn receive(stream: &mut impl Read) -> Result<Vec<u8>, String> {
     let mut len = [0; 4];
     stream.read_exact(&mut len).map_err(error)?;
     let size = u32::from_le_bytes(len) as usize;

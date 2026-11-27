@@ -21,6 +21,9 @@ httpd -p 8318 -h /tmp/health
 old_receiver() {
     /receiver --ignored --exact receiver_handoff::original_host --nocapture
 }
+external() {
+    grep -qw parrot_external /proc/cmdline
+}
 if [ -f /runlab/enrolled ]; then
     test ! -s /runlab/proof
     if old_receiver >/tmp/rejoin 2>&1; then exit 1; fi
@@ -33,6 +36,10 @@ if [ -f /runlab/enrolled ]; then
     test ! -e /runlab/state/ordered.state
     mv /runlab/saved.state /runlab/state/ordered.state
     echo PARROT_REFUSED_MISSING_STATE
+    if external; then
+        sync
+        poweroff -f
+    fi
     if /handoff witness /runlab/witness </runlab/invitation >/tmp/proof 2>/tmp/reason; then exit 1; fi
     test ! -s /tmp/proof
     grep -Fq 'original boot' /tmp/reason
@@ -57,22 +64,27 @@ echo "PARROT_SOURCE $(cat /runlab/receiver-id)"
 IFS= read -r invitation </dev/ttyS1
 printf '%s\n' "$invitation" >/runlab/invitation
 digest=$(sha256sum /runlab/invitation | cut -d' ' -f1)
-/handoff witness /runlab/witness </runlab/invitation >/runlab/proof 2>/runlab/witness.log &
+if external; then
+    /handoff enroll-guest /dev/ttyS1 </runlab/invitation >/runlab/proof 2>/runlab/witness.log &
+else
+    /handoff witness /runlab/witness </runlab/invitation >/runlab/proof 2>/runlab/witness.log &
+fi
 witness=$!
 until grep -Fq "parrot.standby.$digest" /proc/net/unix; do
     kill -0 "$witness" || { cat /runlab/witness.log; exit 1; }
     sleep .05
 done
+echo PARROT_LISTENING
 echo "$digest" >/runlab/invite-digest.next
 mv /runlab/invite-digest.next /runlab/invite-digest
-until test -s /runlab/address; do kill -0 "$owner" || { cat /runlab/original.log; exit 1; }; sleep .05; done
+until test -s /runlab/address; do kill -0 "$owner" || { cat /runlab/original.log /runlab/witness.log; exit 1; }; sleep .05; done
 touch /runlab/enrolled
 sync
 echo PARROT_ENROLLED
 until test -f /runlab/entered; do sleep .05; done
 touch /runlab/stop
 until test -f /runlab/dropping; do sleep .05; done
-kill -0 "$witness"
+if external; then wait "$witness"; else kill -0 "$witness"; fi
 test ! -s /runlab/proof
 sync
 echo PARROT_DELIVERY_BLOCKED

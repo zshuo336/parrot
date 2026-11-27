@@ -47,6 +47,8 @@ enum Phase {
 struct Record {
     phase: Phase,
     seal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guest: Option<[u8; 16]>,
 }
 
 struct Journal {
@@ -106,10 +108,11 @@ impl Journal {
             .map_err(error)
     }
 
-    fn publish(&self, phase: Phase, proof: &[u8]) -> Result<(), String> {
+    fn publish(&self, phase: Phase, proof: &[u8], guest: Option<[u8; 16]>) -> Result<(), String> {
         let bytes = serde_json::to_vec(&Record {
             phase,
             seal: std::str::from_utf8(proof).map_err(error)?.to_owned(),
+            guest,
         })
         .map_err(error)?;
         if bytes.len() > MAX_RECORD {
@@ -162,9 +165,23 @@ fn resume(kernel: Kernel, pid: i32) -> Result<(), String> {
 /// local directory per invitation. Pending recovery requires the same kernel
 /// boot and observer PID namespace. Only expose the command output to consumers.
 pub fn durable_witness(invitation: &[u8], directory: &Path) -> Result<Vec<u8>, String> {
+    observe(invitation, directory, None, |save| enroll(invitation, save))
+}
+
+pub(super) type SaveEnrollment<'a> = dyn FnMut(i32, &[u8]) -> Result<(), String> + 'a;
+
+pub(super) fn observe(
+    invitation: &[u8],
+    directory: &Path,
+    guest: Option<[u8; 16]>,
+    register: impl FnOnce(&mut SaveEnrollment<'_>) -> Result<(Vec<u8>, OwnedFd), String>,
+) -> Result<Vec<u8>, String> {
     let journal = Journal::open(directory)?;
     let proof = match journal.read()? {
         Some(record) => {
+            if record.guest != guest {
+                return Err("witness guest binding differs".into());
+            }
             let proof = record.seal.into_bytes();
             handoff::verify_standby(invitation, &proof)?;
             match record.phase {
@@ -174,15 +191,21 @@ pub fn durable_witness(invitation: &[u8], directory: &Path) -> Result<Vec<u8>, S
             proof
         }
         None => {
-            let kernel = Kernel::current()?;
-            let (proof, pidfd) = enroll(invitation, |pid, proof| {
-                journal.publish(Phase::Waiting { kernel, pid }, proof)
+            let (proof, pidfd) = register(&mut |pid, proof| {
+                journal.publish(
+                    Phase::Waiting {
+                        kernel: Kernel::current()?,
+                        pid,
+                    },
+                    proof,
+                    guest,
+                )
             })?;
             wait_for_exit(&pidfd)?;
             proof
         }
     };
-    journal.publish(Phase::Released, &proof)?;
+    journal.publish(Phase::Released, &proof, guest)?;
     Ok(proof)
 }
 
