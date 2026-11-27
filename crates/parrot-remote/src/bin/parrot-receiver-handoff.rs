@@ -4,7 +4,7 @@ use parrot_remote::ordered::handoff;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-const USAGE: &str = "usage: parrot-receiver-handoff prepare|seal|activate DIRECTORY REALM NODE [SEAL_SHA256]\nLinux: watch DIRECTORY REALM NODE, or witness < invitation.json\nprepare writes an invitation to stdout; seal and witness read an invitation and write a private seal to stdout and its SHA-256 to stderr; activate checks the trusted digest before publishing";
+const USAGE: &str = "usage: parrot-receiver-handoff prepare|seal|activate DIRECTORY REALM NODE [SEAL_SHA256]\nLinux: watch DIRECTORY REALM NODE, or witness [PRIVATE_JOURNAL_DIRECTORY] < invitation.json\nprepare writes an invitation to stdout; seal and witness read an invitation and write a private seal to stdout and its SHA-256 to stderr; activate checks the trusted digest before publishing";
 
 fn input() -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
@@ -22,8 +22,14 @@ fn input() -> Result<Vec<u8>, String> {
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     #[cfg(target_os = "linux")]
-    if args.as_slice() == ["witness"] {
-        let seal = parrot_remote::ordered::standby::witness(&input()?)?;
+    if args.first().is_some_and(|arg| arg == "witness") {
+        let seal = match &args[1..] {
+            [] => parrot_remote::ordered::standby::witness(&input()?)?,
+            [directory] => {
+                parrot_remote::ordered::standby::durable_witness(&input()?, directory.as_ref())?
+            }
+            _ => return Err(USAGE.into()),
+        };
         eprintln!("{}", hex::encode(Sha256::digest(&seal)));
         return std::io::stdout()
             .lock()

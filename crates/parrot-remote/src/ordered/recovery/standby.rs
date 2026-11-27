@@ -19,6 +19,9 @@ use std::{
     time::Duration,
 };
 
+mod journal;
+pub use journal::durable_witness;
+
 // Hashing the invitation gives each prepared directory its own abstract address.
 // SO_PEERCRED authenticates both endpoints; no socket pathname survives a crash.
 fn address(digest: &[u8; 32]) -> Result<SocketAddr, String> {
@@ -162,6 +165,15 @@ pub fn watch(config: &OrderedReceiverState, node: &str) -> Result<(), String> {
 /// Release a private seal for a remote standby after the enrolled process exits.
 /// No access to the source or destination state directory is required.
 pub fn witness(invitation: &[u8]) -> Result<Vec<u8>, String> {
+    let (proof, pidfd) = enroll(invitation, |_, _| Ok(()))?;
+    wait_for_exit(&pidfd)?;
+    Ok(proof)
+}
+
+fn enroll(
+    invitation: &[u8],
+    before_ack: impl FnOnce(i32, &[u8]) -> Result<(), String>,
+) -> Result<(Vec<u8>, OwnedFd), String> {
     if invitation.len() > handoff::MAX_BYTES {
         return Err("standby invitation too large".into());
     }
@@ -180,12 +192,12 @@ pub fn witness(invitation: &[u8]) -> Result<Vec<u8>, String> {
     send(&mut stream, invitation)?;
     let proof = receive(&mut stream)?;
     handoff::verify_standby(invitation, &proof)?;
+    before_ack(cred.pid, &proof)?;
     // Once the complete registration arrives, loss of the ACK cannot cancel it.
     let _ = stream.write_all(b"R");
     drop(stream);
     drop(listener);
-    wait_for_exit(&pidfd)?;
-    Ok(proof)
+    Ok((proof, pidfd))
 }
 
 impl RemoteActorSystem {
