@@ -143,7 +143,7 @@ pub struct DedicatedThreadScheduler {
     /// Configuration
     config: DedicatedThreadConfig,
 
-    /// Runtime handle (used to join worker threads through blocking tasks)
+    /// Retained host handle for schedulers constructed by an existing host.
     runtime_handle: Option<Handle>,
 
     /// Process-wide admission shared with Sharded and Actix workers.
@@ -180,7 +180,7 @@ impl DedicatedThreadScheduler {
         Ok(scheduler)
     }
 
-    /// Attach a runtime handle (used for join bookkeeping).
+    /// Retain the host handle. Native worker joins have an independent owner.
     pub fn with_runtime_handle(mut self, handle: Handle) -> Self {
         self.runtime_handle = Some(handle);
         self
@@ -294,32 +294,42 @@ impl DedicatedThreadScheduler {
         processor: Option<&Arc<dyn ProcessorInterface>>,
         deadline: tokio::time::Instant,
     ) -> Result<(), SystemError> {
-        let worker = {
-            let workers = self.workers.lock().unwrap();
-            let worker = workers
-                .get(path)
-                .filter(|w| processor.is_none_or(|p| Arc::ptr_eq(&w.processor, p)))
-                .cloned();
-            if worker.is_none() {
-                // Keep the registry lock until receipt lookup. Reaping publishes
-                // a generation receipt before removing that registry entry.
-                return self
-                    .receipts
-                    .lock()
-                    .unwrap()
-                    .find(path, processor)
-                    .map_or_else(
-                        || Err(SystemError::ActorNotFound(path.into())),
-                        |r| dedicated_exit(path, r),
-                    );
-            }
-            worker.unwrap()
+        let Some(worker) = self.worker_for_removal(path, processor)? else {
+            return Ok(());
         };
         let result = worker.stop_until(deadline).await;
-        if let Some(joined) = worker.join_result() {
-            self.remove_finished(path, &worker, joined);
-        }
+        self.record_worker_exit(&worker);
         result
+    }
+
+    fn worker_for_removal(
+        &self,
+        path: &str,
+        processor: Option<&Arc<dyn ProcessorInterface>>,
+    ) -> Result<Option<Arc<DedicatedWorker>>, SystemError> {
+        let workers = self.workers.lock().unwrap();
+        if let Some(worker) = workers
+            .get(path)
+            .filter(|w| processor.is_none_or(|p| Arc::ptr_eq(&w.processor, p)))
+        {
+            return Ok(Some(worker.clone()));
+        }
+        // Keep the registry lock through lookup: reaping records the receipt
+        // before removing the worker generation.
+        let receipt = self
+            .receipts
+            .lock()
+            .unwrap()
+            .find(path, processor)
+            .ok_or_else(|| SystemError::ActorNotFound(path.into()))?;
+        dedicated_exit(path, receipt)?;
+        Ok(None)
+    }
+
+    fn record_worker_exit(&self, worker: &Arc<DedicatedWorker>) {
+        if let Some(joined) = worker.join_result() {
+            self.remove_finished(&worker.path, worker, joined);
+        }
     }
 
     fn try_enqueue_stop_hook(&self, request: StopHookRequest) -> Result<(), ControlEnqueueError> {
@@ -424,6 +434,17 @@ impl DedicatedThreadScheduler {
     }
 
     pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> Result<(), SystemError> {
+        let mut failure = None;
+        for worker in self.begin_shutdown() {
+            if let Err(error) = worker.stop_until(deadline).await {
+                failure = Some(error);
+            }
+            self.record_worker_exit(&worker);
+        }
+        self.finish_shutdown(failure)
+    }
+
+    fn begin_shutdown(&self) -> Vec<Arc<DedicatedWorker>> {
         self.status.store(2, Ordering::SeqCst); // ShuttingDown
         self.is_shutting_down.store(true, Ordering::SeqCst);
 
@@ -435,15 +456,10 @@ impl DedicatedThreadScheduler {
         for worker in &workers {
             worker.request_stop();
         }
-        let mut failure = None;
-        for worker in workers {
-            if let Err(error) = worker.stop_until(deadline).await {
-                failure = Some(error);
-            }
-            if let Some(result) = worker.join_result() {
-                self.remove_finished(&worker.path, &worker, result);
-            }
-        }
+        workers
+    }
+
+    fn finish_shutdown(&self, mut failure: Option<SystemError>) -> Result<(), SystemError> {
         // Reaping must not consume an error or turn repeated close into Ok.
         if failure.is_none()
             && let Some(error) = &self.receipts.lock().unwrap().first_failure
@@ -496,14 +512,12 @@ impl ThreadScheduler for DedicatedThreadScheduler {
     }
 
     fn deschedule(&self, path: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        if let Some(handle) = &self.runtime_handle {
-            return handle
-                .block_on(async { self.deschedule(path).await })
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
-        }
-        Handle::current()
-            .block_on(async { self.deschedule(path).await })
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        let Some(worker) = self.worker_for_removal(path, None)? else {
+            return Ok(());
+        };
+        let result = worker.stop_blocking_until(std::time::Instant::now() + Duration::from_secs(5));
+        self.record_worker_exit(&worker);
+        Ok(result?)
     }
 
     fn is_scheduled(&self, path: &str) -> bool {
@@ -511,15 +525,15 @@ impl ThreadScheduler for DedicatedThreadScheduler {
     }
 
     fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let fut = async { self.shutdown().await };
-        if let Some(handle) = &self.runtime_handle {
-            return handle
-                .block_on(fut)
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut failure = None;
+        for worker in self.begin_shutdown() {
+            if let Err(error) = worker.stop_blocking_until(deadline) {
+                failure = Some(error);
+            }
+            self.record_worker_exit(&worker);
         }
-        Handle::current()
-            .block_on(fut)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        Ok(self.finish_shutdown(failure)?)
     }
 }
 
@@ -1016,16 +1030,34 @@ impl DedicatedWorker {
                 return dedicated_exit(&self.path, result);
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(SystemError::Timeout(format!(
-                    "dedicated actor {} did not exit before the shutdown deadline",
-                    self.path
-                )));
+                return Err(self.stop_timeout());
             }
             tokio::time::sleep_until(
                 deadline.min(tokio::time::Instant::now() + Duration::from_millis(1)),
             )
             .await;
         }
+    }
+
+    fn stop_blocking_until(&self, deadline: std::time::Instant) -> Result<(), SystemError> {
+        self.request_stop();
+        loop {
+            if let Some(result) = self.join_if_finished() {
+                return dedicated_exit(&self.path, result);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(self.stop_timeout());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
+
+    fn stop_timeout(&self) -> SystemError {
+        SystemError::Timeout(format!(
+            "dedicated actor {} did not exit before the shutdown deadline",
+            self.path
+        ))
     }
 
     fn join_result(&self) -> Option<DedicatedExit> {
