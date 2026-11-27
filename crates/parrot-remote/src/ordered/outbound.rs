@@ -22,6 +22,7 @@ use tokio::time::Instant;
 struct Grant {
     receipt: Receipt,
     sender: FrameSender,
+    path: String,
     renew_at: Instant,
 }
 
@@ -216,7 +217,7 @@ impl Outbound {
                         callbacks,
                         Route {
                             destination,
-                            path: &frame.path,
+                            path: &grant.path,
                             hops: frame.header.hop_limit,
                         },
                         &control,
@@ -230,6 +231,7 @@ impl Outbound {
             }
             let refresh = state.grant.as_ref().is_none_or(|grant| {
                 !grant.receipt.active
+                    || grant.path != frame.path
                     || grant.renew_at <= Instant::now()
                     || grant.sender.dispatch_key() != sender.dispatch_key()
             });
@@ -284,7 +286,7 @@ impl Outbound {
                         callbacks,
                         Route {
                             destination,
-                            path: &frame.path,
+                            path: &previous.path,
                             hops: frame.header.hop_limit,
                         },
                         &closing,
@@ -305,6 +307,7 @@ impl Outbound {
                     state.grant = Some(Grant {
                         receipt,
                         sender: sender.clone(),
+                        path: frame.path.clone(),
                         renew_at: Instant::now(),
                     });
                     control.operation = Operation::Commit;
@@ -341,12 +344,20 @@ impl Outbound {
                 state.grant = Some(Grant {
                     receipt,
                     sender: sender.clone(),
+                    path: frame.path.clone(),
                     renew_at: Instant::now()
                         + Duration::from_millis((receipt.lease_ms / 2).max(1) as u64),
                 });
             }
             if self
-                .publish(&mut state, &frame, sender, callbacks, destination, routed)
+                .publish(
+                    &mut state,
+                    &frame,
+                    sender,
+                    callbacks,
+                    destination,
+                    routed || (required && sender.supports_ordered_admission()),
+                )
                 .await?
             {
                 return Ok(None);
@@ -370,7 +381,7 @@ impl Outbound {
         sender: &FrameSender,
         callbacks: &CallbackRegistry,
         destination: &str,
-        routed: bool,
+        confirm_admission: bool,
     ) -> ActorResult<bool> {
         let mut frame = original.clone();
         let receipt = state.grant.as_ref().expect("confirmed grant").receipt;
@@ -391,7 +402,7 @@ impl Outbound {
             key: frame.type_key,
             payload: frame.payload,
         };
-        frame.payload = if routed {
+        frame.payload = if confirm_admission {
             frame.type_key = ADMIT_KEY.into();
             frame.header.flags |= crate::frame::flags::TELL_ACK;
             frame.header.correlation_id = callbacks.next_cid();
@@ -409,7 +420,7 @@ impl Outbound {
             .reserve(&frame)
             .await
             .map_err(|error| error.to_actor_error())?;
-        let pending = if routed {
+        let pending = if confirm_admission {
             Some(
                 callbacks
                     .register_on(frame.header.correlation_id, destination.to_owned(), sender)
@@ -436,6 +447,11 @@ impl Outbound {
                     state.sequence -= 1;
                     Err(ErrCode::Overloaded.to_actor_error("ordered receiver at capacity".into()))
                 }
+                Ok(ReplyPayload::Err(ErrCode::NotRemotable, detail)) if detail == id.alias_error() => {
+                    state.sequence -= 1;
+                    state.grant.as_mut().expect("confirmed grant").renew_at = Instant::now();
+                    Err(ErrCode::NotRemotable.to_actor_error("ordered destination now points to a remote alias".into()))
+                }
                 Ok(ReplyPayload::Err(code, detail)) => Err(code.to_actor_error(detail)),
                 Ok(_) => Err(ErrCode::ProtocolViolation.to_actor_error("invalid ordered admission response".into())),
                 Err(_) => Err(ErrCode::ConnectionLost.to_actor_error("ordered admission callback closed".into())),
@@ -450,7 +466,6 @@ impl Outbound {
         destination: &str,
         resolve_sender: impl std::future::Future<Output = Option<FrameSender>>,
         callbacks: &CallbackRegistry,
-        path: &str,
         deadline: Instant,
     ) -> ActorResult<()> {
         let lane = {
@@ -488,7 +503,7 @@ impl Outbound {
                         callbacks,
                         Route {
                             destination,
-                            path,
+                            path: &grant.path,
                             hops: crate::frame::DEFAULT_HOP_LIMIT,
                         },
                         &control,
@@ -659,6 +674,7 @@ mod tests {
                 lease_ms: super::super::LEASE_MS,
             },
             sender: sender.clone(),
+            path: "parrot://target/service".into(),
             renew_at: Instant::now() + Duration::from_secs(30),
         });
         let mut last_cid = None;
@@ -786,7 +802,6 @@ mod tests {
             "first",
             std::future::ready(Some(sender.clone())),
             &callbacks,
-            "/target",
             Instant::now() + Duration::from_secs(5),
         ));
         assert!(futures::poll!(&mut closing).is_pending());

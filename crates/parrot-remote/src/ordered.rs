@@ -68,9 +68,17 @@ impl AdmissionId {
     /// Keep the standard Overloaded error readable by v1 callers. Its bound detail
     /// lets the sender distinguish receiver pre-admission from a generic relay error.
     pub fn capacity_error(&self) -> String {
+        self.bound_error("ordered admission capacity exhausted")
+    }
+
+    pub fn alias_error(&self) -> String {
+        self.bound_error("ordered admission requires the final endpoint")
+    }
+
+    fn bound_error(&self, reason: &str) -> String {
         use sha2::{Digest, Sha256};
         let binding = Sha256::digest(self.receipt(false));
-        format!("ordered admission capacity exhausted (v1/{binding:x})")
+        format!("{reason} (v1/{binding:x})")
     }
 
     pub fn receipt(&self, admitted: bool) -> Bytes {

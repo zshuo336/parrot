@@ -186,7 +186,6 @@ impl RemoteActorRef {
                 &self.node_id,
                 self.inner.ensure_sender(&self.node_id),
                 &self.inner.callbacks,
-                &self.path,
                 deadline,
             )
             .await

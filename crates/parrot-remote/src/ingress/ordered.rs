@@ -221,6 +221,21 @@ impl Drop for Registration {
 }
 
 impl Ingress {
+    fn ordered_local_path(&self, path: &str) -> Result<(), ErrCode> {
+        let forwarded = Cleanup::default()
+            .call(|| {
+                self.local
+                    .forwarding_target(super::local_path(path))
+                    .is_some_and(|target| self.is_remote_target(&target))
+            })
+            .map_err(|_| ErrCode::ProtocolViolation)?;
+        if forwarded {
+            Err(ErrCode::NotRemotable)
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn set_ordered_receiver_owner(&self, owner: Arc<ordered::recovery::ReceiverOwner>) {
         let mut sessions = self.ordered.lock().unwrap();
         assert!(sessions.sources.is_empty() && sessions.owner.is_none());
@@ -330,12 +345,8 @@ impl Ingress {
             if matches!(
                 control.operation,
                 Operation::Open | Operation::OpenAdmission
-            ) && self
-                .local
-                .forwarding_target(super::local_path(&frame.path))
-                .is_some_and(|target| self.is_remote_target(&target))
-            {
-                return Err(ErrCode::NotRemotable);
+            ) {
+                self.ordered_local_path(&frame.path)?;
             }
             match control.operation {
                 Operation::Open | Operation::OpenAdmission => {
@@ -755,6 +766,18 @@ impl Ingress {
             }
             return;
         };
+        if let Err(code) = self.ordered_local_path(&frame.path) {
+            DEAD_TELL_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if let Some(id) = admission {
+                let detail = if code == ErrCode::NotRemotable {
+                    id.alias_error()
+                } else {
+                    "ordered endpoint lookup failed".into()
+                };
+                back.send_reply(Frame::reply_err(cid, "", code, &detail));
+            }
+            return;
+        }
         let Some(frame) = self.charge_reorder(frame) else {
             let reply = admission
                 .map(|id| Frame::reply_err(cid, "", ErrCode::Overloaded, &id.capacity_error()));

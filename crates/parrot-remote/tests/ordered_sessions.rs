@@ -1045,6 +1045,115 @@ impl LocalLookup for Forwarding {
     }
 }
 
+struct MixedPaths {
+    local: Target,
+    alias_to: String,
+    forward: AtomicBool,
+}
+#[async_trait::async_trait]
+impl LocalLookup for MixedPaths {
+    async fn lookup(&self, path: &str) -> Option<BoxedActorRef> {
+        // Include a real local namesake. It must never receive the alias traffic.
+        matches!(path, "/local" | "/alias").then(|| self.local.clone_boxed())
+    }
+    fn forwarding_target(&self, path: &str) -> Option<String> {
+        (path == "/alias" && self.forward.load(Ordering::Acquire)).then(|| self.alias_to.clone())
+    }
+}
+
+#[tokio::test]
+async fn warmed_direct_ticket_cannot_admit_an_unconfirmed_alias_path() {
+    check_warmed_alias(false, false).await;
+}
+
+#[tokio::test]
+async fn warmed_routed_ticket_cannot_admit_an_unconfirmed_alias_path() {
+    check_warmed_alias(true, false).await;
+}
+
+#[tokio::test]
+async fn warmed_direct_path_changed_to_alias_cannot_capture_the_local_namesake() {
+    check_warmed_alias(false, true).await;
+}
+
+#[tokio::test]
+async fn warmed_routed_path_changed_to_alias_cannot_capture_the_local_namesake() {
+    check_warmed_alias(true, true).await;
+}
+
+async fn check_warmed_alias(routed: bool, change_same_path: bool) {
+    let label = format!("{routed}-{change_same_path}");
+    let host_id = format!("warm-host-{label}");
+    let hub_id = format!("warm-hub-{label}");
+    let end_id = format!("warm-end-{label}");
+    let (actual, mut actual_rx) = state();
+    let (local, mut local_rx) = state();
+    let end = start(RemoteConfig::mem(&end_id), Arc::new(Target(actual))).await;
+    let routes = Arc::new(MixedPaths {
+        local: Target(local),
+        alias_to: format!("parrot://{end_id}/target"),
+        forward: AtomicBool::new(!change_same_path),
+    });
+    let host = start(
+        RemoteConfig::mem(&host_id)
+            .with_ordered_relays([hub_id.clone()])
+            .with_knobs(RuntimeKnobs {
+                reorder_gap_timeout_ms: 20_000,
+                ..Default::default()
+            }),
+        routes.clone(),
+    )
+    .await;
+    let source = start(
+        RemoteConfig::mem(format!("warm-source-{label}")),
+        Arc::new(Empty),
+    )
+    .await;
+    let hub = start(
+        RemoteConfig::mem(hub_id).with_role(TopologyRole::Hub),
+        Arc::new(Empty),
+    )
+    .await;
+    if routed {
+        source.connect_mem_pair(&hub).await.unwrap();
+        host.connect_mem_pair(&hub).await.unwrap();
+    } else {
+        source.connect_mem_pair(&host).await.unwrap();
+    }
+    host.connect_mem_pair(&end).await.unwrap();
+    let alias = source
+        .remote_ref(&format!("parrot://{host_id}/alias"))
+        .unwrap();
+    let raw = source
+        .remote_ref(&format!("parrot://{host_id}/local"))
+        .unwrap();
+    strict(if change_same_path { &alias } else { &raw }, 1).await;
+    seen(&mut local_rx, 1).await;
+    routes.forward.store(true, Ordering::Release);
+    assert!(
+        alias
+            .deliver_ordered(Box::new(Work(2)), Default::default())
+            .await
+            .is_err(),
+        "the local path's ticket certified an alias whose endpoint did not grant the session"
+    );
+    assert!(
+        alias.deliver(Box::new(Work(3))).await.is_err(),
+        "active ordered lane downgraded"
+    );
+    strict(&raw, 4).await;
+    seen(&mut local_rx, 4).await;
+    raw.close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    alias.deliver(Box::new(Work(5))).await.unwrap();
+    seen(&mut actual_rx, 5).await;
+    assert!(local_rx.try_recv().is_err() && actual_rx.try_recv().is_err());
+    for node in [&source, &host, &hub, &end] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn ordinary_tell_preserves_application_alias_forwarding_and_strict_tell_rejects_before_data()
 {
