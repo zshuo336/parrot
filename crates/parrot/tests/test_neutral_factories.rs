@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Business actors and contract functions depend only on the public neutral API.
 use futures::FutureExt;
+use parrot::thread::{SchedulingMode, ThreadActorSystem, ThreadActorSystemConfig};
 use parrot_api::{
     actor::{Actor, ActorState},
     context::ActorContext,
@@ -17,14 +19,24 @@ use std::{
     time::Duration,
 };
 
+#[path = "support/isolated.rs"]
+mod isolated;
+
 async fn bounded<F: std::future::Future>(f: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(8), f)
         .await
         .expect("contract deadline")
 }
 #[derive(Clone, Copy)]
+enum Backend {
+    Shared,
+    Dedicated,
+    Sharded,
+    Actix,
+}
+#[derive(Clone, Copy)]
 struct Entry {
-    actix: bool,
+    backend: Backend,
     facade: bool,
 }
 async fn engine(entry: Entry) -> Arc<dyn AsyncEngineRuntime> {
@@ -37,7 +49,7 @@ async fn engine(entry: Entry) -> Arc<dyn AsyncEngineRuntime> {
     } else {
         None
     };
-    if entry.actix {
+    if matches!(entry.backend, Backend::Actix) {
         let native = parrot::actix::ActixActorSystem::with_arbiter_count(1)
             .await
             .unwrap();
@@ -51,7 +63,23 @@ async fn engine(entry: Entry) -> Arc<dyn AsyncEngineRuntime> {
             Arc::new(native)
         }
     } else {
-        let native = parrot::thread::ThreadActorSystem::shared(Default::default());
+        let mode = match entry.backend {
+            Backend::Dedicated => Some(SchedulingMode::DedicatedThread),
+            Backend::Sharded => Some(SchedulingMode::Sharded {
+                affinity_key: "neutral-factory".into(),
+            }),
+            Backend::Shared => None,
+            Backend::Actix => unreachable!(),
+        };
+        let config = mode.map_or_else(ThreadActorSystemConfig::default, |mode| {
+            ThreadActorSystemConfig {
+                shared_pool_size: 1,
+                shared_burst_workers_max: 0,
+                default_scheduling_mode: mode,
+                ..Default::default()
+            }
+        });
+        let native = ThreadActorSystem::shared(config);
         if let Some(facade) = facade {
             facade
                 .register_thread_system("selected".into(), native, true)
@@ -90,6 +118,7 @@ struct Report {
     value: u64,
     parent: Option<String>,
     path: String,
+    thread: String,
 }
 impl Actor for Probe {
     type Config = Box<dyn Any + Send>;
@@ -111,6 +140,7 @@ impl Actor for Probe {
                 value: self.value,
                 parent: ctx.parent().map(|p| p.path()),
                 path: ctx.get_self_ref().path(),
+                thread: std::thread::current().name().unwrap_or_default().to_owned(),
             }) as BoxedMessage)
         })
     }
@@ -162,11 +192,23 @@ fn options(path: &str, max: u32) -> FactoryOptions {
         within: Duration::from_secs(60),
     }
 }
-async fn report(reference: &BoxedActorRef, generation: usize) -> Report {
+async fn report(entry: Entry, reference: &BoxedActorRef, generation: usize) -> Report {
     bounded(async {
         loop {
             if let Ok(answer) = reference.send(Box::new(())).await {
                 let report = *answer.downcast::<Report>().unwrap();
+                let prefix = match entry.backend {
+                    Backend::Dedicated => Some("parrot-dedicated-"),
+                    Backend::Sharded => Some("parrot-shard-"),
+                    _ => None,
+                };
+                if let Some(prefix) = prefix {
+                    assert!(
+                        report.thread.starts_with(prefix),
+                        "expected {prefix} worker, got {}",
+                        report.thread
+                    );
+                }
                 if report.generation == generation {
                     return report;
                 }
@@ -200,16 +242,16 @@ async fn root_restart(entry: Entry) {
     .await
     .unwrap();
     let identity = reference.death_watch().unwrap().id();
-    let first = report(&reference, 1).await;
+    let first = report(entry, &reference, 1).await;
     assert_eq!(first.value, 42);
     assert!(first.parent.is_none());
     assert_eq!(first.path, "/neutral/factory");
     assert!(reference.send(Box::new(true)).await.is_err());
-    let second = report(&reference, 2).await;
+    let second = report(entry, &reference, 2).await;
     assert_eq!(second.value, 42);
     let lookup = runtime.get_actor("/neutral/factory").await.unwrap();
     assert_eq!(lookup.death_watch().unwrap().id(), identity);
-    assert_eq!(report(&lookup, 2).await.path, first.path);
+    assert_eq!(report(entry, &lookup, 2).await.path, first.path);
     assert!(reference.send(Box::new(true)).await.is_err());
     drained(runtime.as_ref()).await;
     assert!(!reference.is_alive().await);
@@ -242,7 +284,7 @@ async fn duplicate(entry: Entry) {
             .await
             .is_err()
     );
-    assert_eq!(report(&reference, 1).await.value, 42);
+    assert_eq!(report(entry, &reference, 1).await.value, 42);
     assert_eq!(
         counts.built.load(Ordering::SeqCst),
         1,
@@ -265,7 +307,7 @@ async fn duplicate(entry: Entry) {
             .await
             .is_err()
     );
-    assert_eq!(report(&instance, 10).await.value, 42);
+    assert_eq!(report(entry, &instance, 10).await.value, 42);
     instance.stop().await.unwrap();
     bounded(runtime.shutdown()).await.unwrap();
     assert_eq!(counts.capture.load(Ordering::SeqCst), 3);
@@ -427,7 +469,7 @@ async fn child_scope(entry: Entry, factory_child: bool) {
     .await
     .unwrap();
     let child = *answer.downcast::<BoxedActorRef>().unwrap();
-    let info = report(&child, 1).await;
+    let info = report(entry, &child, 1).await;
     assert_eq!(info.parent.as_deref(), Some("/neutral/parent"));
     assert!(info.path.starts_with("/neutral/parent/"));
     assert!(runtime.get_actor(&info.path).await.is_some());
@@ -469,10 +511,10 @@ async fn child_restart(entry: Entry) {
         .unwrap()
         .downcast::<BoxedActorRef>()
         .unwrap();
-    let original = report(&child, 1).await;
+    let original = report(entry, &child, 1).await;
     let identity = child.death_watch().unwrap().id();
     assert!(child.send(Box::new(true)).await.is_err());
-    let replacement = report(&child, 2).await;
+    let replacement = report(entry, &child, 2).await;
     assert_eq!(replacement.parent, original.parent);
     assert_eq!(replacement.path, original.path);
     assert_eq!(
@@ -502,8 +544,8 @@ macro_rules! pair {
         pair!(@entries false; $thread, $actix, $body $(, $arg)*);
     };
     (@entries $facade:expr; $thread:ident, $actix:ident, $body:ident $(, $arg:expr)*) => {
-        #[tokio::test] async fn $thread() { $body(Entry { actix: false, facade: $facade } $(, $arg)*).await; }
-        #[actix::test] async fn $actix() { $body(Entry { actix: true, facade: $facade } $(, $arg)*).await; }
+        #[tokio::test] async fn $thread() { $body(Entry { backend: Backend::Shared, facade: $facade } $(, $arg)*).await; }
+        #[actix::test] async fn $actix() { $body(Entry { backend: Backend::Actix, facade: $facade } $(, $arg)*).await; }
     }
 }
 pair!(
@@ -707,6 +749,96 @@ pair!(
 mod facade {
     use super::*;
 
+    fn host_exit(name: &str, backend: Backend) {
+        isolated::run(
+            name,
+            "PARROT_NEUTRAL_FACTORY_HOST_EXIT",
+            Duration::from_secs(30),
+            || {
+                let entry = Entry {
+                    backend,
+                    facade: true,
+                };
+                let host = actix::System::new();
+                let path = "/neutral/surviving-parent";
+                let (system, parent) = host.block_on(async {
+                    let system = engine(entry).await;
+                    let parent = system
+                        .spawn(Box::new(Parent), Box::new(()), SpawnOptions::at(path))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        *parent
+                            .send(Box::new(()))
+                            .await
+                            .unwrap()
+                            .downcast::<usize>()
+                            .unwrap(),
+                        0
+                    );
+                    (system, parent)
+                });
+                drop(host);
+                let observer = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                observer.block_on(bounded(async {
+                let counts = Arc::new(Counts::default());
+                let child = *parent.send(Box::new(Create { factory: true, counts: counts.clone(), stop: None }))
+                    .await.unwrap().downcast::<BoxedActorRef>().unwrap();
+                let first = report(entry, &child, 1).await;
+                assert_eq!(first.parent.as_deref(), Some(path));
+                let lookup = system.get_actor(&first.path).await.unwrap();
+                assert_eq!(child.death_watch().unwrap().id(), lookup.death_watch().unwrap().id());
+                assert!(child.send(Box::new(true)).await.is_err());
+                let next = report(entry, &lookup, 2).await;
+                assert_eq!(next.value, 42);
+                assert_eq!((next.parent, next.path), (first.parent, first.path));
+                assert_eq!(counts.dropped.load(Ordering::SeqCst), 1);
+                parent.stop().await.unwrap();
+                assert_eq!(counts.built.load(Ordering::SeqCst), 2);
+                assert_eq!(counts.dropped.load(Ordering::SeqCst), 2);
+                for member in [&parent, &child, &lookup] {
+                    assert!(matches!(member.retirement_status(), parrot_api::address::RetirementStatus::Retired(Ok(()))));
+                    assert!(system.get_actor(&member.path()).await.is_none());
+                    assert!(member.send(Box::new(())).await.is_err());
+                }
+                let stopped = system.shutdown().await;
+                if matches!(backend, Backend::Actix) {
+                    stopped.unwrap();
+                } else {
+                    let error = stopped.unwrap_err().to_string();
+                    assert!(error.contains("engine \"selected\": Failed during shutdown: 1 shared cleanup failure(s): shared task unexpectedly cancelled"), "{error}");
+                    assert_eq!(system.shutdown().await.unwrap_err().to_string(), error);
+                }
+            }));
+            },
+        );
+    }
+
+    #[test]
+    fn dedicated_child_restart_after_host_exit() {
+        host_exit(
+            "facade::dedicated_child_restart_after_host_exit",
+            Backend::Dedicated,
+        );
+    }
+    #[test]
+    fn sharded_child_restart_after_host_exit() {
+        host_exit(
+            "facade::sharded_child_restart_after_host_exit",
+            Backend::Sharded,
+        );
+    }
+    #[test]
+    fn actix_child_restart_after_host_exit() {
+        host_exit(
+            "facade::actix_child_restart_after_host_exit",
+            Backend::Actix,
+        );
+    }
+
     pair!(@entries true; thread_root_restart_budget, actix_root_restart_budget, root_restart);
     pair!(@entries true; thread_shared_namespace, actix_shared_namespace, duplicate);
     pair!(@entries true; thread_factory_input_retirement, actix_factory_input_retirement, rejected_inputs);
@@ -716,4 +848,55 @@ mod facade {
     pair!(@entries true; thread_cancelled_construction, actix_cancelled_construction, cancelled_construction);
     pair!(@entries true; thread_cancelled_rejection, actix_cancelled_rejection, cancelled_rejection);
     pair!(@entries true; thread_malformed_child_inputs, actix_malformed_child_inputs, malformed_child_inputs);
+
+    macro_rules! thread_contracts {
+        ($module:ident, $backend:expr) => {
+            mod $module {
+                use super::*;
+                const ENTRY: Entry = Entry {
+                    backend: $backend,
+                    facade: true,
+                };
+
+                #[tokio::test]
+                async fn root_restart_budget() {
+                    root_restart(ENTRY).await;
+                }
+                #[tokio::test]
+                async fn shared_namespace() {
+                    duplicate(ENTRY).await;
+                }
+                #[tokio::test]
+                async fn factory_input_retirement() {
+                    rejected_inputs(ENTRY).await;
+                }
+                #[tokio::test]
+                async fn child_instance_scope() {
+                    child_scope(ENTRY, false).await;
+                }
+                #[tokio::test]
+                async fn child_factory_scope() {
+                    child_scope(ENTRY, true).await;
+                }
+                #[tokio::test]
+                async fn child_reconstruction() {
+                    child_restart(ENTRY).await;
+                }
+                #[tokio::test]
+                async fn cancelled_factory_construction() {
+                    cancelled_construction(ENTRY).await;
+                }
+                #[tokio::test]
+                async fn cancelled_factory_rejection() {
+                    cancelled_rejection(ENTRY).await;
+                }
+                #[tokio::test]
+                async fn malformed_inputs() {
+                    malformed_child_inputs(ENTRY).await;
+                }
+            }
+        };
+    }
+    thread_contracts!(dedicated, Backend::Dedicated);
+    thread_contracts!(sharded, Backend::Sharded);
 }
