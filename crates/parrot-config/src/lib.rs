@@ -1666,6 +1666,7 @@ mode = "mtls"
 cert_path = "cert.pem"
 key_path = "key.pem"
 ca_path = "ca.pem"
+require_crl = true
 admin_nodes = ["operator"]
 
 [remote.receptionist]
@@ -1786,6 +1787,13 @@ rpc_timeout_ms = 2400
         assert_eq!(r.remote.reorder.byte_capacity, 262144);
         assert_eq!(r.remote.reorder.ordered_relays, ["hub-1", "relay-1"]);
         assert_eq!(r.remote.extra_caps, 2);
+        assert!(matches!(
+            r.remote.security,
+            RemoteSecurityResolved::MutualTls {
+                require_crl: true,
+                ..
+            }
+        ));
         assert!(r.remote.receptionist.default_deny);
         assert_eq!(r.remote.receptionist.roles.len(), 2);
         assert_eq!(r.remote.receptionist.roles["hub-1"], ["edge/public"]);
