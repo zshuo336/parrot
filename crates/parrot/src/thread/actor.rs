@@ -112,16 +112,18 @@ where
             .map_or(std::time::Duration::ZERO, |system| {
                 system.operation_timeouts.actor_creation
             });
-        let stage = crate::typed_supervision::recorded_lifecycle_stage(
-            parrot_api::trace::SpanKind::ActorInit,
-            self.path.path(),
-            || self.inner.init(ctx),
-            cleanup
-                .borrow()
-                .with_timeout(timeout)
-                .with_deadline(self.initialization_deadline),
-        )
-        .await;
+        let sender = ctx.sender.clone();
+        let stage = sender
+            .scope(crate::typed_supervision::recorded_lifecycle_stage(
+                parrot_api::trace::SpanKind::ActorInit,
+                self.path.path(),
+                || self.inner.init(ctx),
+                cleanup
+                    .borrow()
+                    .with_timeout(timeout)
+                    .with_deadline(self.initialization_deadline),
+            ))
+            .await;
         match outcome(stage.result) {
             Ok(_) => {
                 // Mark initialized; the transition to Running is handled by
@@ -180,7 +182,9 @@ where
         ctx: &'a mut ThreadContext<A>,
     ) -> impl Future<Output = ActorResult<BoxedMessage>> + Send + 'a {
         let input = MessageInput::new(msg, self.stage_failures.clone());
-        self.process_message_inner(input, ctx)
+        ctx.sender
+            .clone()
+            .scope(self.process_message_inner(input, ctx))
     }
 
     async fn process_message_inner<'a>(
@@ -348,14 +352,16 @@ where
         let mut cleanup = StageCleanup::new(self.stage_failures.clone());
         let batch = cleanup.batch();
         outcome(
-            parrot_api::batch_dispatch::scope(
-                batch,
-                crate::typed_supervision::guarded_batch_stage(
-                    || self.inner.receive_batch(messages, ctx),
-                    cleanup.borrow().with_timeout(timeout),
-                ),
-            )
-            .await,
+            ctx.sender
+                .clone()
+                .scope(parrot_api::batch_dispatch::scope(
+                    batch,
+                    crate::typed_supervision::guarded_batch_stage(
+                        || self.inner.receive_batch(messages, ctx),
+                        cleanup.borrow().with_timeout(timeout),
+                    ),
+                ))
+                .await,
         )
         .unwrap_or_else(|error| {
             let receipt = crate::error_receipt::ActorReceipt::from_error(error);
@@ -477,15 +483,17 @@ where
 
         let result = if self.initialized {
             let mut cleanup = StageCleanup::new(self.stage_failures.clone());
+            let sender = ctx.sender.clone();
             let result = outcome(
-                crate::typed_supervision::recorded_lifecycle_stage(
-                    parrot_api::trace::SpanKind::ActorBeforeStop,
-                    self.path.path(),
-                    || self.inner.before_stop(ctx),
-                    cleanup.borrow(),
-                )
-                .await
-                .result,
+                sender
+                    .scope(crate::typed_supervision::recorded_lifecycle_stage(
+                        parrot_api::trace::SpanKind::ActorBeforeStop,
+                        self.path.path(),
+                        || self.inner.before_stop(ctx),
+                        cleanup.borrow(),
+                    ))
+                    .await
+                    .result,
             )
             .map_err(crate::error_receipt::protect_actor);
             drop(cleanup);

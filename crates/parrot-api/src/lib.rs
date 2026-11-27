@@ -90,6 +90,7 @@ mod receptionist_scope;
 #[cfg(feature = "remote")]
 mod remote_decode;
 pub mod runtime;
+pub mod sender;
 pub mod stream;
 mod stream_dispatch;
 pub mod supervisor;

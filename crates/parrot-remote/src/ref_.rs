@@ -201,8 +201,9 @@ impl RemoteActorRef {
 
     /// Require an authenticated, end-to-end confirmed TELL session. Ordering
     /// uses the final actor path when both ends and the relay hops negotiate
-    /// actor sessions. Older peers share a node session. A successful call
-    /// acknowledges admission to the receiver's worker.
+    /// actor sessions. A managed actor handler requires sender-session support
+    /// on every hop. Calls outside a handler use the node's sender identity.
+    /// Relayed admission and capable direct peers confirm receiver queuing.
     pub fn deliver_ordered<'a>(
         &'a self,
         msg: BoxedMessage,
@@ -216,27 +217,39 @@ impl RemoteActorRef {
     /// sessions leave siblings running; legacy sessions share one worker. Close
     /// frees the bounded source-side destination slot. Concurrent callers join
     /// the same retirement. While the source is running, closing an absent
-    /// session succeeds without contacting the destination.
-    pub async fn close_ordered_session(&self, timeout: Duration) -> ActorResult<()> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .filter(|_| !timeout.is_zero())
-            .ok_or_else(|| {
-                ErrCode::ProtocolViolation.to_actor_error("invalid ordered close deadline".into())
-            })?;
-        let outbound = self
-            .inner
-            .system
-            .as_ref()
-            .and_then(|system| system.upgrade())
-            .map(|system| system.outbound_ordered.clone())
-            .ok_or_else(|| {
-                ErrCode::NotRemotable
-                    .to_actor_error("ordered sessions require an owning remote system".into())
-            })?;
-        outbound
-            .close_reference(&self.node_id, &self.path, &self.inner, deadline)
-            .await
+    /// session succeeds without contacting the destination. The actor sender
+    /// is captured when this method is called. A handler can close its own
+    /// session from its before-stop hook.
+    pub fn close_ordered_session(
+        &self,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = ActorResult<()>> + '_ {
+        let actor = parrot_api::sender::ActorSender::current();
+        async move {
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .filter(|_| !timeout.is_zero())
+                .ok_or_else(|| {
+                    ErrCode::ProtocolViolation
+                        .to_actor_error("invalid ordered close deadline".into())
+                })?;
+            let outbound = self
+                .inner
+                .system
+                .as_ref()
+                .and_then(|system| system.upgrade())
+                .map(|system| system.outbound_ordered.clone())
+                .ok_or_else(|| {
+                    ErrCode::NotRemotable
+                        .to_actor_error("ordered sessions require an owning remote system".into())
+                })?;
+            let owner = actor.as_ref().map(|actor| outbound.for_actor(actor));
+            owner
+                .as_ref()
+                .unwrap_or(&outbound)
+                .close_reference(&self.node_id, &self.path, &self.inner, deadline)
+                .await
+        }
     }
 
     fn deliver_mode<'a>(
@@ -246,6 +259,7 @@ impl RemoteActorRef {
         required: bool,
     ) -> BoxedFuture<'a, ActorResult<()>> {
         let mut input = OutboundInput(Some(msg));
+        let actor = parrot_api::sender::ActorSender::current();
         Box::pin(parrot_api::trace::capture(async move {
             let result = async {
                 let input = &mut input;
@@ -277,7 +291,16 @@ impl RemoteActorRef {
                         .and_then(|system| system.upgrade())
                         .map(|system| system.outbound_ordered.clone());
                     if let Some(outbound) = outbound {
-                        match outbound
+                        let owner = actor.as_ref().map(|actor| outbound.for_actor(actor));
+                        let session = owner
+                            .as_ref()
+                            .filter(|owner| {
+                                required
+                                    || sender.supports_sender_sessions()
+                                    || owner.has_reference(&self.path)
+                            })
+                            .unwrap_or(&outbound);
+                        match session
                             .send_reference(&self.node_id, &sender, &self.inner, frame, required)
                             .await?
                         {

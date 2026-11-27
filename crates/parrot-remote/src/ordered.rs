@@ -18,6 +18,8 @@ pub const ADMISSION_RECEIPT_KEY: &str = "parrot:ordered-admission-receipt#v1";
 pub(crate) const LEASE_MS: u32 = 30_000;
 pub(crate) const CHALLENGE_MS: u32 = 5_000;
 pub(crate) type Identity = [u8; 16];
+// A node name, optionally followed by '@' and a hex SHA-256 actor path.
+const MAX_SOURCE_BYTES: usize = 1024 + 1 + 64;
 
 pub(crate) fn identity() -> Identity {
     *uuid::Uuid::new_v4().as_bytes()
@@ -54,14 +56,21 @@ impl Operation {
 
 pub(crate) fn actor_scoped_data(key: &str, payload: &[u8]) -> bool {
     let offset = if key == ADMIT_KEY { 16 } else { 0 };
-    payload.get(offset) == Some(&3)
+    matches!(payload.get(offset), Some(3 | 4))
+}
+
+pub(crate) fn control_operation(payload: &[u8]) -> Option<u8> {
+    match payload {
+        [2 | 4, operation, ..] => Some(*operation),
+        _ => None,
+    }
 }
 
 pub(crate) fn requires_actor_sessions(frame: &crate::frame::Frame) -> bool {
     match frame.type_key.as_str() {
         CONTROL_KEY => frame
             .borrowed_ask_payload()
-            .is_ok_and(|p| matches!(p, [2, 7..=9, ..])),
+            .is_ok_and(|p| matches!(control_operation(p), Some(7..=9))),
         ADMIT_KEY | DATA_KEY => frame
             .split_trace_parent()
             .is_ok_and(|(_, p)| actor_scoped_data(&frame.type_key, &p)),
@@ -181,8 +190,36 @@ impl AdmissionId {
     }
 }
 
+pub(crate) fn source_node(source: &str) -> &str {
+    source.split_once('@').map_or(source, |(node, _)| node)
+}
+
 fn node(source: &str) -> Result<(), String> {
-    parrot_config::endpoint::validate_node_id(source)
+    if source_node(source).len() > 1024 {
+        return Err("ordered source too long".into());
+    }
+    if let Some((_, actor)) = source.split_once('@') {
+        if actor.len() != 64
+            || !actor
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("invalid ordered sender identity".into());
+        }
+    }
+    parrot_config::endpoint::validate_node_id(source_node(source))
+}
+
+pub(crate) fn requires_sender_sessions(frame: &crate::frame::Frame) -> bool {
+    match frame.type_key.as_str() {
+        CONTROL_KEY => frame
+            .borrowed_ask_payload()
+            .is_ok_and(|bytes| bytes.first() == Some(&4)),
+        ADMIT_KEY | DATA_KEY => frame.split_trace_parent().is_ok_and(|(_, bytes)| {
+            bytes.get(if frame.type_key == ADMIT_KEY { 16 } else { 0 }) == Some(&4)
+        }),
+        _ => false,
+    }
 }
 
 fn nonzero(id: Identity) -> Result<(), String> {
@@ -207,6 +244,14 @@ impl Control {
         node(&self.source)?;
         nonzero(self.incarnation)?;
         nonzero(self.stream)?;
+        if self.source.contains('@')
+            && matches!(
+                self.operation,
+                Operation::Open | Operation::OpenAdmission | Operation::Commit | Operation::Close
+            )
+        {
+            return Err("ordered sender requires an actor session".into());
+        }
         if matches!(
             self.operation,
             Operation::Open
@@ -230,7 +275,7 @@ impl Control {
         };
         let mut output =
             BytesMut::with_capacity(52 + self.source.len() + recovery.map_or(0, |_| 24));
-        output.put_u8(2);
+        output.put_u8(if self.source.contains('@') { 4 } else { 2 });
         output.put_u8(match self.operation {
             Operation::Open => 0,
             Operation::Commit => 1,
@@ -256,12 +301,12 @@ impl Control {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, String> {
-        if input.len() < 52 || input[0] != 2 {
+        if input.len() < 52 || !matches!(input[0], 2 | 4) {
             return Err("invalid ordered control header".into());
         }
         let length = u16::from_le_bytes(input[50..52].try_into().unwrap()) as usize;
         let recovery_length = if input[1] == 3 { 24 } else { 0 };
-        if length > 1024 || input.len() != 52 + length + recovery_length {
+        if length > MAX_SOURCE_BYTES || input.len() != 52 + length + recovery_length {
             return Err("invalid ordered control length".into());
         }
         let value = Self {
@@ -288,6 +333,9 @@ impl Control {
             stream: input[18..34].try_into().unwrap(),
             ticket: input[34..50].try_into().unwrap(),
         };
+        if (input[0] == 4) != value.source.contains('@') {
+            return Err("ordered sender disagrees with control version".into());
+        }
         value.encode()?;
         Ok(value)
     }
@@ -366,7 +414,16 @@ impl Data {
             nonzero(receiver)?;
             output.extend_from_slice(&receiver);
         }
-        output.put_u8(if actor { 3 } else { 2 });
+        output.put_u8(if self.source.contains('@') {
+            if !actor {
+                return Err("ordered sender requires an actor session".into());
+            }
+            4
+        } else if actor {
+            3
+        } else {
+            2
+        });
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
         output.extend_from_slice(&self.ticket);
@@ -382,14 +439,14 @@ impl Data {
     pub fn decode(input: Bytes) -> Result<Self, String> {
         if input.len() < 61
             || input.len() > crate::frame::MAX_FRAME_LEN as usize
-            || !matches!(input[0], 2 | 3)
+            || !matches!(input[0], 2..=4)
         {
             return Err("invalid ordered data header".into());
         }
         let source_len = u16::from_le_bytes(input[57..59].try_into().unwrap()) as usize;
         let key_len = u16::from_le_bytes(input[59..61].try_into().unwrap()) as usize;
         let end = 61 + source_len + key_len;
-        if source_len > 1024 || key_len > 1024 || end > input.len() {
+        if source_len > MAX_SOURCE_BYTES || key_len > 1024 || end > input.len() {
             return Err("invalid ordered data field length".into());
         }
         let source = std::str::from_utf8(&input[61..61 + source_len])
@@ -397,6 +454,9 @@ impl Data {
         let type_key = std::str::from_utf8(&input[61 + source_len..end])
             .map_err(|_| "invalid ordered key UTF-8")?;
         node(source)?;
+        if (input[0] == 4) != source.contains('@') {
+            return Err("ordered sender disagrees with data version".into());
+        }
         key(type_key)?;
         let value = Self {
             source: source.into(),
@@ -612,6 +672,50 @@ mod tests {
             ..value
         };
         assert!(Receipt::decode(&invalid.encode()).is_err());
+    }
+
+    #[test]
+    fn sender_versions_preserve_node_length_and_require_an_actor_operation() {
+        let source = format!("{}@{}", "n".repeat(1024), "a".repeat(64));
+        let open = Control {
+            source: source.clone(),
+            operation: Operation::OpenActor,
+            incarnation: [1; 16],
+            stream: [2; 16],
+            ticket: [0; 16],
+        };
+        let bytes = open.encode().unwrap();
+        assert_eq!(&bytes[..2], &[4, 7]);
+        assert_eq!(Control::decode(&bytes).unwrap(), open);
+        let mut wrong_version = bytes.to_vec();
+        wrong_version[0] = 2;
+        assert!(Control::decode(&wrong_version).is_err());
+        assert!(Control {
+            operation: Operation::Open,
+            ..open
+        }
+        .encode()
+        .is_err());
+
+        let data = Data {
+            source,
+            incarnation: [1; 16],
+            stream: [2; 16],
+            ticket: [3; 16],
+            sequence: 1,
+            key: "bin:example#v1".into(),
+            payload: Bytes::from_static(b"message"),
+        };
+        assert!(data.encode_scoped(None, false).is_err());
+        let bytes = data.encode_scoped(Some([4; 16]), true).unwrap();
+        assert!(actor_scoped_data(ADMIT_KEY, &bytes));
+        assert_eq!(
+            Data::decode_frame(ADMIT_KEY, bytes.clone()).unwrap().1,
+            data
+        );
+        let mut wrong_version = bytes.to_vec();
+        wrong_version[16] = 3;
+        assert!(Data::decode_frame(ADMIT_KEY, wrong_version.into()).is_err());
     }
 
     #[test]

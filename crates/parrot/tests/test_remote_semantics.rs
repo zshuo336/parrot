@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 #[path = "support/network.rs"]
 mod network_support;
 
+#[path = "remote_semantics/sender_sessions.rs"]
+mod sender_sessions;
+
 // ===========================================================================
 // 远程消息（bincode 注册——inventory 经测试文件内 submit）
 // ===========================================================================

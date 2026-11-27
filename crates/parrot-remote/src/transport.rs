@@ -195,6 +195,11 @@ impl FrameSender {
             && self.negotiated_capabilities & crate::handshake::caps::ORDERED_ACTOR != 0
     }
 
+    pub(crate) fn supports_sender_sessions(&self) -> bool {
+        self.supports_actor_sessions()
+            && self.negotiated_capabilities & crate::handshake::caps::ORDERED_SENDER != 0
+    }
+
     /// Admin parents are separately negotiated so business-only peers keep
     /// receiving their original SYSTEM_EVENT payload and flags.
     pub fn supports_admin_trace_context(&self) -> bool {
@@ -223,6 +228,11 @@ impl FrameSender {
     }
 
     fn check_negotiated_features(&self, frame: &Frame) -> Result<(), RemoteError> {
+        if crate::ordered::requires_sender_sessions(frame) && !self.supports_sender_sessions() {
+            return Err(RemoteError::Transport(
+                "ordered actor sender was not negotiated".into(),
+            ));
+        }
         if crate::ordered::requires_actor_sessions(frame) && !self.supports_actor_sessions() {
             return Err(RemoteError::Transport(
                 "actor sessions were not negotiated".into(),
@@ -234,7 +244,7 @@ impl FrameSender {
             ));
         }
         if frame.type_key == crate::ordered::CONTROL_KEY
-            && frame.borrowed_ask_payload()?.starts_with(&[2, 5])
+            && crate::ordered::control_operation(frame.borrowed_ask_payload()?) == Some(5)
             && !self.supports_ordered_endpoint()
         {
             return Err(RemoteError::Transport(
@@ -243,7 +253,7 @@ impl FrameSender {
         }
         if (frame.type_key == crate::ordered::ADMIT_KEY
             || (frame.type_key == crate::ordered::CONTROL_KEY
-                && frame.borrowed_ask_payload()?.starts_with(&[2, 4])))
+                && crate::ordered::control_operation(frame.borrowed_ask_payload()?) == Some(4)))
             && !self.supports_ordered_admission()
         {
             return Err(RemoteError::Transport(
@@ -251,7 +261,7 @@ impl FrameSender {
             ));
         }
         if frame.type_key == crate::ordered::CONTROL_KEY
-            && frame.borrowed_ask_payload()?.starts_with(&[2, 3])
+            && crate::ordered::control_operation(frame.borrowed_ask_payload()?) == Some(3)
             && !self.supports_ordered_recovery()
         {
             return Err(RemoteError::Transport(

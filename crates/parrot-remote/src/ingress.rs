@@ -772,6 +772,7 @@ impl Ingress {
         ) && !back.supports_ordered_tell()
             || frame.type_key == crate::ordered::ADMIT_KEY && !back.supports_ordered_admission()
             || crate::ordered::requires_actor_sessions(&frame) && !back.supports_actor_sessions()
+            || crate::ordered::requires_sender_sessions(&frame) && !back.supports_sender_sessions()
         {
             back.close();
             return;
@@ -2272,6 +2273,15 @@ impl Ingress {
                 .await;
             return Some(ErrCode::RouteUnreachable);
         };
+        if crate::ordered::requires_sender_sessions(frame) && !sender.supports_sender_sessions() {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                "",
+                ErrCode::NotRemotable,
+                "next hop does not support ordered sender sessions",
+            ));
+            return Some(ErrCode::NotRemotable);
+        }
         if crate::ordered::requires_actor_sessions(frame) && !sender.supports_actor_sessions() {
             back.send_reply(Frame::reply_err(
                 orig_cid,
@@ -2293,7 +2303,7 @@ impl Ingress {
         if frame.type_key == crate::ordered::CONTROL_KEY
             && frame
                 .borrowed_ask_payload()
-                .is_ok_and(|p| p.starts_with(&[2, 5]))
+                .is_ok_and(|p| crate::ordered::control_operation(p) == Some(5))
             && !sender.supports_ordered_endpoint()
         {
             back.send_reply(Frame::reply_err(
@@ -2308,7 +2318,7 @@ impl Ingress {
             || (frame.type_key == crate::ordered::CONTROL_KEY
                 && frame
                     .borrowed_ask_payload()
-                    .is_ok_and(|p| p.starts_with(&[2, 4]))))
+                    .is_ok_and(|p| crate::ordered::control_operation(p) == Some(4))))
             && !sender.supports_ordered_admission()
         {
             back.send_reply(Frame::reply_err(

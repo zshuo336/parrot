@@ -85,14 +85,26 @@ impl Default for Lane {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Outbound {
     source: String,
     incarnation: Identity,
+    tables: Arc<SessionTables>,
+}
+
+pub(crate) struct SessionTables {
     capacity: usize,
     lanes: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Lane>>>>,
     closed: AtomicBool,
     cancel: tokio_util::sync::CancellationToken,
     aliases: aliases::AliasRoutes,
+}
+
+impl std::ops::Deref for Outbound {
+    type Target = SessionTables;
+    fn deref(&self) -> &Self::Target {
+        &self.tables
+    }
 }
 
 /// A negotiation owns its destination slot while any sender or closer still uses it.
@@ -147,12 +159,40 @@ impl Outbound {
         Self {
             source,
             incarnation: identity(),
-            capacity,
-            lanes: Mutex::new(HashMap::new()),
-            closed: AtomicBool::new(false),
-            cancel: tokio_util::sync::CancellationToken::new(),
-            aliases: Default::default(),
+            tables: Arc::new(SessionTables {
+                capacity,
+                lanes: Mutex::new(HashMap::new()),
+                closed: AtomicBool::new(false),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                aliases: Default::default(),
+            }),
         }
+    }
+
+    pub(crate) fn for_actor(&self, actor: &parrot_api::sender::ActorSender) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            source: format!(
+                "{}@{}",
+                self.source,
+                hex::encode(Sha256::digest(actor.path().as_bytes()))
+            ),
+            incarnation: actor.incarnation(),
+            tables: self.tables.clone(),
+        }
+    }
+
+    fn table_key<'a>(&self, path: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.source.contains('@') {
+            format!("{}@{path}", hex::encode(self.incarnation)).into()
+        } else {
+            path.into()
+        }
+    }
+
+    pub(crate) fn has_reference(&self, path: &str) -> bool {
+        let key = self.table_key(path);
+        self.lanes.lock().unwrap().contains_key(key.as_ref()) || self.aliases.contains(key.as_ref())
     }
 
     pub fn close_admission(&self) {
@@ -263,10 +303,14 @@ impl Outbound {
             return Err(LaneError::Stopped);
         }
         // Keep an established scope across reconnects, including capability loss.
-        let key = if lanes.contains_key(path) || (actor && !lanes.contains_key(destination)) {
-            path
+        let actor_key = self.table_key(path);
+        let node_key = self.table_key(destination);
+        let key = if lanes.contains_key(actor_key.as_ref())
+            || (actor && !lanes.contains_key(node_key.as_ref()))
+        {
+            actor_key.as_ref()
         } else {
-            destination
+            node_key.as_ref()
         };
         if let Some(lane) = lanes.get(key) {
             return Ok(Some(LaneUse::new(self, key, lane.clone())));
@@ -318,6 +362,10 @@ impl Outbound {
         binding: Option<(&str, &super::OrderedEndpoint)>,
     ) -> ActorResult<Attempt> {
         let routed = destination != sender.node_id();
+        if self.source.contains('@') && !sender.supports_sender_sessions() {
+            return Err(ErrCode::NotRemotable
+                .to_actor_error("route does not support ordered sender sessions".into()));
+        }
         let supports_ordered =
             sender.supports_ordered_tell() && (!routed || sender.supports_ordered_admission());
         let actor_path = binding.map_or(frame.path.as_str(), |(_, endpoint)| &endpoint.path);
@@ -335,7 +383,7 @@ impl Outbound {
                     }
                     Err(error) => return Err(error.into()),
                 };
-            let actor = usage.destination != destination;
+            let actor = usage.destination != self.table_key(destination);
             if actor && !actor_capable {
                 return Err(ErrCode::NotRemotable.to_actor_error(super::ACTOR_UNSUPPORTED.into()));
             }
@@ -354,7 +402,7 @@ impl Outbound {
             let bind_ticket = |ticket| {
                 if let Some((alias, endpoint)) = binding {
                     self.aliases.bind(
-                        alias,
+                        &self.table_key(alias),
                         endpoint,
                         usage.lane.as_ref().expect("live lane handle"),
                         ticket,
@@ -433,7 +481,10 @@ impl Outbound {
                     let mut receipt = match opened {
                         Ok(receipt) => receipt,
                         Err((ErrCode::NotRemotable, detail))
-                            if actor && !usage.retained && detail == super::ACTOR_UNSUPPORTED =>
+                            if actor
+                                && !self.source.contains('@')
+                                && !usage.retained
+                                && detail == super::ACTOR_UNSUPPORTED =>
                         {
                             actor_capable = false;
                             continue 'negotiate;
@@ -711,8 +762,8 @@ impl Outbound {
             }
             scope
                 .path()
-                .and_then(|path| lanes.get_key_value(path))
-                .or_else(|| lanes.get_key_value(destination))
+                .and_then(|path| lanes.get_key_value(self.table_key(path).as_ref()))
+                .or_else(|| lanes.get_key_value(self.table_key(destination).as_ref()))
                 .filter(|(_, lane)| scope.matches_lane(lane))
                 .map(|(key, lane)| (key.clone(), lane.clone()))
         };

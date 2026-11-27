@@ -504,6 +504,7 @@ impl RemoteConfig {
                         | crate::handshake::caps::ORDERED_ENDPOINT
                         | crate::handshake::caps::ORDERED_ROUTE
                         | crate::handshake::caps::ORDERED_ACTOR
+                        | crate::handshake::caps::ORDERED_SENDER
                 } else {
                     0
                 }

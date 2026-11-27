@@ -784,6 +784,58 @@ impl LocalLookup for HeldLookup {
     }
 }
 
+#[tokio::test]
+async fn retiring_one_sender_over_a_tls_alias_preserves_the_other_senders_queue() {
+    use parrot_api::sender::ActorSender;
+    let pki = Pki::new();
+    let config = |name: &str| {
+        RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())).with_mtls(pki.node(name), [])
+    };
+    let source = start(config("sender-src"), Arc::new(Empty)).await;
+    let alias = start(
+        config("sender-alias").with_role(TopologyRole::Hub),
+        Arc::new(AliasLookup(RwLock::new(Some(
+            "parrot://sender-end/first".into(),
+        )))),
+    )
+    .await;
+    let (first, mut received) = state();
+    let (second, _other) = state();
+    let end = start(
+        config("sender-end").with_ordered_relays(["sender-alias".into()]),
+        Arc::new(TwoActors(Target(first.clone()), Target(second))),
+    )
+    .await;
+    let addr = NodeAddr::tcp("sender-alias", alias.local_addr().unwrap());
+    for node in [&source, &end] {
+        node.connect(&addr).await.unwrap();
+    }
+    let target = source.remote_ref("parrot://sender-alias/alias").unwrap();
+    let a = ActorSender::new("/user/a");
+    let b = ActorSender::new("/user/b");
+    let timeout = Duration::from_secs(3);
+    a.scope(strict(&target, 701)).await;
+    tokio::time::timeout(timeout, first.entered.notified())
+        .await
+        .unwrap();
+    a.scope(strict(&target, 92)).await;
+    b.scope(strict(&target, 91)).await;
+    seen(&mut received, 91).await;
+    // Poll outside the handler. The public close captured B at construction.
+    b.in_scope(|| target.close_ordered_session(timeout))
+        .await
+        .unwrap();
+    first.resume.notify_one();
+    seen(&mut received, 701).await;
+    seen(&mut received, 92).await;
+    a.in_scope(|| target.close_ordered_session(timeout))
+        .await
+        .unwrap();
+    for node in [&source, &alias, &end] {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_joins_a_cancelled_actor_lookup_destructor() {
     let (held, _received) = state();

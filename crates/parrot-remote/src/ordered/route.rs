@@ -38,7 +38,7 @@ pub(crate) fn required(frame: &Frame) -> bool {
             frame.path.contains('#')
                 || frame
                     .borrowed_ask_payload()
-                    .is_ok_and(|p| p.starts_with(&[2, 6]))
+                    .is_ok_and(|p| super::control_operation(p) == Some(6))
         }
         super::ADMIT_KEY => frame.path.contains('#'),
         _ => false,

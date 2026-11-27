@@ -85,6 +85,8 @@ pub mod caps {
     pub const ORDERED_ROUTE: u32 = 1 << 28;
     /// Independently fence a destination actor's ordered stream.
     pub const ORDERED_ACTOR: u32 = 1 << 29;
+    /// Authenticated node plus runtime actor identity in ordered sessions.
+    pub const ORDERED_SENDER: u32 = 1 << 30;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

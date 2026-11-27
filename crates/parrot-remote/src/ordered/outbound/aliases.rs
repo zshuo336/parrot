@@ -73,6 +73,9 @@ impl Default for AliasRoutes {
 }
 
 impl AliasRoutes {
+    pub(super) fn contains(&self, key: &str) -> bool {
+        self.bindings.lock().unwrap().contains_key(key)
+    }
     fn gate(&self, path: &str) -> &RwLock<()> {
         &self.gates[self.hash.hash_one(path) as usize % self.gates.len()]
     }
@@ -143,7 +146,8 @@ impl Outbound {
         mut frame: Frame,
         required: bool,
     ) -> ActorResult<Option<Frame>> {
-        let gate = self.aliases.gate(&frame.path);
+        let alias_key = self.table_key(&frame.path).into_owned();
+        let gate = self.aliases.gate(&alias_key);
         let read = gate.read().await;
         let mut at_capacity = false;
         if !self
@@ -151,7 +155,7 @@ impl Outbound {
             .bindings
             .lock()
             .unwrap()
-            .contains_key(&frame.path)
+            .contains_key(&alias_key)
         {
             match self
                 .send_open(destination, sender, &inner.callbacks, frame, required, None)
@@ -193,7 +197,7 @@ impl Outbound {
             .bindings
             .lock()
             .unwrap()
-            .get(&frame.path)
+            .get(&alias_key)
             .cloned();
         if let Some(binding) = previous {
             if binding.endpoint != endpoint {
@@ -262,11 +266,18 @@ impl Outbound {
         deadline: Instant,
     ) -> ActorResult<()> {
         tokio::time::timeout_at(deadline, async {
-            let _write = self.aliases.gate(path).write().await;
-            let binding = self.aliases.bindings.lock().unwrap().get(path).cloned();
+            let key = self.table_key(path);
+            let _write = self.aliases.gate(&key).write().await;
+            let binding = self
+                .aliases
+                .bindings
+                .lock()
+                .unwrap()
+                .get(key.as_ref())
+                .cloned();
             if let Some(binding) = binding {
                 self.retire_binding(&binding, inner, deadline).await?;
-                self.aliases.bindings.lock().unwrap().remove(path);
+                self.aliases.bindings.lock().unwrap().remove(key.as_ref());
                 Ok(())
             } else {
                 self.close_matching(

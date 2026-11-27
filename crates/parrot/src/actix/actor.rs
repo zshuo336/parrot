@@ -295,6 +295,7 @@ where
             }));
         let mut inner = self.inner.take().expect("actor not yet initialized");
         let control = self.control.clone();
+        let sender = actor_ctx.sender.clone();
         let initialize = async move {
             let mut cleanup = StageCleanup::new(control.clone());
             let result = std::panic::AssertUnwindSafe(initialize_after_admission(
@@ -341,7 +342,7 @@ where
             (inner, actor_ctx, result)
         };
         ctx.wait(
-            parrot_api::trace::scope(self.initialization_trace.take(), initialize)
+            parrot_api::trace::scope(self.initialization_trace.take(), sender.scope(initialize))
                 .into_actor(self)
                 .map(|(inner, actor_ctx, result), actor, ctx| {
                     actor.inner = Some(inner);
@@ -426,6 +427,7 @@ where
         self.hook_started = true;
         let control = self.control.clone();
         let stop_context = control.take_stop_context();
+        let sender = actor_ctx.sender.clone();
         let stop = async move {
             let mut cleanup = StageCleanup::new(control.clone());
             let result = std::panic::AssertUnwindSafe(async {
@@ -464,7 +466,7 @@ where
             (inner, actor_ctx, result)
         };
         ctx.wait(
-            parrot_api::trace::scope(stop_context, stop)
+            parrot_api::trace::scope(stop_context, sender.scope(stop))
                 .into_actor(self)
                 .map(|(inner, actor_ctx, result), actor, ctx| {
                     actor.inner = Some(inner);
@@ -553,6 +555,7 @@ where
         };
         // Framework lifecycle messages always use their own async dispatch.
         // For ordinary messages the selector is user code, just like the handler.
+        let sender = actor_ctx.sender.clone();
         let async_handler = if message.envelope.payload.is::<crate::streams::StreamEvent>()
             || message
                 .envelope
@@ -562,7 +565,9 @@ where
             Ok(true)
         } else {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                parrot_api::trace::in_scope(trace_context.clone(), || inner.use_async_handler())
+                sender.in_scope(|| {
+                    parrot_api::trace::in_scope(trace_context.clone(), || inner.use_async_handler())
+                })
             }))
         };
         if !matches!(async_handler, Ok(true)) {
@@ -603,8 +608,11 @@ where
                     result
                 })
             };
-            let result = async_handler
-                .and_then(|_| std::panic::catch_unwind(std::panic::AssertUnwindSafe(invoke_sync)));
+            let result = async_handler.and_then(|_| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sender.in_scope(invoke_sync)
+                }))
+            });
             let result = match result {
                 Ok(Some(result)) => result,
                 Ok(None) => return Box::pin(futures::future::ready(Some(Err(ActorError::MessageHandlingError("Message not handled: the sync engine handler (handle_message_engine) returned None for this message type. Handle it there, or opt the actor into the async dispatch path with #[ParrotActor(async_handler = true)] / use_async_handler() == true.".into())))).into_actor(self)),
@@ -724,7 +732,7 @@ where
             (inner, actor_ctx, result, failure)
         };
         Box::pin(
-            parrot_api::trace::scope(trace_context, dispatch)
+            parrot_api::trace::scope(trace_context, sender.scope(dispatch))
                 .into_actor(self)
                 .map(|(inner, actor_ctx, result, failure), actor, ctx| {
                     actor.inner = Some(inner);

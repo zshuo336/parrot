@@ -349,7 +349,7 @@ impl Ingress {
             return Err(ErrCode::Forbidden);
         }
         if frame.header.hop_count == 0 {
-            if back.node_id() == source {
+            if back.node_id() == ordered::source_node(source) {
                 Ok(())
             } else {
                 Err(ErrCode::Forbidden)
@@ -854,9 +854,11 @@ impl Ingress {
             };
             // Absence in another path or in the legacy namespace cannot certify
             // retirement of a ticket which this receiver still owns.
-            if sessions.sources.iter().any(|(other, source)| {
-                other.node == key.node && other != &key && source.owns_ticket(control.ticket)
-            }) {
+            if sessions
+                .sources
+                .iter()
+                .any(|(other, source)| other != &key && source.owns_ticket(control.ticket))
+            {
                 return Err(ErrCode::Forbidden);
             }
             let Some(source) = sessions.sources.get_mut(&key) else {
