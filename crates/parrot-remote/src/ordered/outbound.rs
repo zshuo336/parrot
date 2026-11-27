@@ -60,6 +60,55 @@ pub(crate) struct Outbound {
     cancel: tokio_util::sync::CancellationToken,
 }
 
+/// A negotiation owns its destination slot while any sender or closer still uses it.
+/// Once a ticket exists, explicit retirement owns the slot instead.
+struct LaneUse<'a> {
+    outbound: &'a Outbound,
+    destination: &'a str,
+    lane: Option<Arc<tokio::sync::Mutex<Lane>>>,
+    retained: bool,
+}
+
+impl<'a> LaneUse<'a> {
+    fn new(
+        outbound: &'a Outbound,
+        destination: &'a str,
+        lane: Arc<tokio::sync::Mutex<Lane>>,
+    ) -> Self {
+        Self {
+            outbound,
+            destination,
+            lane: Some(lane),
+            retained: false,
+        }
+    }
+}
+
+impl Drop for LaneUse<'_> {
+    fn drop(&mut self) {
+        if self.retained {
+            return;
+        }
+        let mut lanes = self.outbound.lanes.lock().unwrap();
+        let lane = self.lane.take().expect("live lane handle");
+        let Some(entry) = lanes
+            .get_mut(self.destination)
+            .filter(|entry| Arc::ptr_eq(entry, &lane))
+        else {
+            return;
+        };
+        // Release this reference under the map lock so simultaneous cancellations
+        // cannot both see another owner and abandon the slot.
+        drop(lane);
+        if let Some(unique) = Arc::get_mut(entry) {
+            let state = unique.get_mut();
+            if state.grant.is_none() && !state.sent_ordered {
+                lanes.remove(self.destination);
+            }
+        }
+    }
+}
+
 impl Outbound {
     pub fn new(source: String, capacity: usize) -> Self {
         Self {
@@ -138,7 +187,9 @@ impl Outbound {
         let Some(lane) = self.lane(destination, supports_ordered)? else {
             return legacy_fallback(frame, required);
         };
-        let mut state = lane.lock().await;
+        let mut usage = LaneUse::new(self, destination, lane);
+        let mut state = usage.lane.as_ref().expect("live lane handle").lock().await;
+        usage.retained = state.grant.is_some() || state.sent_ordered;
         if state.closed || self.closed.load(Ordering::Acquire) {
             return Err(ActorError::Stopped);
         }
@@ -232,6 +283,7 @@ impl Outbound {
                 )
                 .await?;
             }
+            usage.retained = true;
             if !receipt.active {
                 if state.grant.as_ref().is_none_or(|grant| {
                     grant.receipt.ticket != receipt.ticket
@@ -330,6 +382,8 @@ impl Outbound {
         let Some(lane) = lane else {
             return Ok(());
         };
+        let mut usage = LaneUse::new(self, destination, lane);
+        let lane = usage.lane.as_ref().expect("live lane handle");
         let deadline = Instant::now()
             .checked_add(timeout)
             .filter(|_| !timeout.is_zero())
@@ -339,6 +393,7 @@ impl Outbound {
         crate::transport::notify_safely(async {
             tokio::time::timeout_at(deadline, async {
                 let mut state = lane.lock().await;
+                usage.retained = state.grant.is_some() || state.sent_ordered;
                 if let Some(grant) = &state.grant {
                     let control = Control {
                         operation: Operation::Close,
@@ -365,7 +420,7 @@ impl Outbound {
                 let mut lanes = self.lanes.lock().unwrap();
                 if lanes
                     .get(destination)
-                    .is_some_and(|entry| Arc::ptr_eq(entry, &lane))
+                    .is_some_and(|entry| Arc::ptr_eq(entry, lane))
                 {
                     lanes.remove(destination);
                 }
@@ -496,4 +551,64 @@ async fn request(
     tokio::time::timeout_at(deadline, operation)
         .await
         .unwrap_or_else(|_| Err((ErrCode::Timeout, "ordered control deadline exceeded".into())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handshake::caps;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_sends_and_close_hold_the_slot_until_the_last_user_cancels() {
+        let outbound = Outbound::new("source".into(), 1);
+        let callbacks = CallbackRegistry::default();
+        let (tx, mut frames) = tokio::sync::mpsc::channel(4);
+        let sender = FrameSender::capability_test_sender(tx, "hub", caps::BIN | caps::ORDERED_TELL);
+        let send = |destination| {
+            let frame = Frame::tell("/target", "work", bytes::Bytes::new());
+            Box::pin(outbound.send(destination, &sender, &callbacks, frame, true))
+        };
+        let mut first = send("first");
+        assert!(futures::poll!(&mut first).is_pending());
+        assert_eq!(frames.try_recv().unwrap().type_key, CONTROL_KEY);
+        let mut retry = send("first");
+        assert!(futures::poll!(&mut retry).is_pending());
+        let mut closing = Box::pin(outbound.close_lane(
+            "first",
+            &sender,
+            &callbacks,
+            "/target",
+            Duration::from_secs(5),
+        ));
+        assert!(futures::poll!(&mut closing).is_pending());
+
+        drop(first);
+        assert!(futures::poll!(&mut retry).is_pending());
+        assert_eq!(frames.try_recv().unwrap().type_key, CONTROL_KEY);
+        assert!(send("second")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("capacity"));
+        drop(retry);
+        assert!(send("second")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("capacity"));
+        drop(closing);
+        assert!(callbacks.is_empty());
+
+        // An admitted Open sends a control frame; let its unacknowledged ticket time out.
+        let mut next = send("second");
+        assert!(futures::poll!(&mut next).is_pending());
+        assert_eq!(frames.try_recv().unwrap().type_key, CONTROL_KEY);
+        assert!(matches!(next.await, Err(ActorError::TimeoutDetail(detail))
+            if detail == "ordered control deadline exceeded"));
+        let mut after_timeout = send("third");
+        assert!(futures::poll!(&mut after_timeout).is_pending());
+        assert_eq!(frames.try_recv().unwrap().type_key, CONTROL_KEY);
+        drop(after_timeout);
+        assert!(callbacks.is_empty());
+    }
 }

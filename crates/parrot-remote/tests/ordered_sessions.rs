@@ -230,7 +230,14 @@ async fn strict_delivery_rejects_missing_relay_grants_but_ordinary_delivery_can_
         Arc::new(Target(state)),
     )
     .await;
-    let source = start(RemoteConfig::mem("ungranted-source"), Arc::new(Empty)).await;
+    let source = start(
+        RemoteConfig::mem("ungranted-source").with_knobs(RuntimeKnobs {
+            reorder_stream_capacity: 1,
+            ..Default::default()
+        }),
+        Arc::new(Empty),
+    )
+    .await;
     source.connect_mem_pair(&hub).await.unwrap();
     target.connect_mem_pair(&hub).await.unwrap();
     let reference = source
@@ -243,7 +250,17 @@ async fn strict_delivery_rejects_missing_relay_grants_but_ordinary_delivery_can_
     reference.deliver(Box::new(Work(2))).await.unwrap();
     seen(&mut receiver, 2).await;
     assert!(receiver.try_recv().is_err());
-    for node in [&source, &hub, &target] {
+    let (direct_state, mut direct_rx) = self::state();
+    let direct = start(
+        RemoteConfig::mem("direct-target"),
+        Arc::new(Target(direct_state)),
+    )
+    .await;
+    source.connect_mem_pair(&direct).await.unwrap();
+    let direct_ref = source.remote_ref("parrot://direct-target/target").unwrap();
+    strict(&direct_ref, 3).await;
+    seen(&mut direct_rx, 3).await;
+    for node in [&source, &hub, &target, &direct] {
         node.shutdown().await.unwrap();
     }
 }
