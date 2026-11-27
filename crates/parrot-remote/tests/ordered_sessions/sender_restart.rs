@@ -3,6 +3,9 @@ use super::*;
 use std::os::unix::process::ExitStatusExt;
 #[path = "sender_alias_restart.rs"]
 mod alias_restart;
+#[cfg(target_os = "linux")]
+#[path = "sender_journal_measurements.rs"]
+mod measurements;
 
 fn sender_config(directory: &Path) -> RemoteConfig {
     let mut cfg = RemoteConfig::tcp("recovery-source", None)
