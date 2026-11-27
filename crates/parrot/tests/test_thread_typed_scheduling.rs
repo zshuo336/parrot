@@ -124,14 +124,31 @@ fn sharded() -> SchedulingMode {
         affinity_key: "static-lifecycle".into(),
     }
 }
-fn assert_owner(events: &Events, generation: usize, prefix: &str) -> ThreadId {
-    let events = events.lock().unwrap();
+fn assert_lifecycle(
+    events: &[Event],
+    generation: usize,
+    owner: ThreadId,
+    prefix: &str,
+    messages: usize,
+    normal_stop: bool,
+) {
     let selected: Vec<_> = events
         .iter()
         .filter(|event| event.generation == generation)
         .collect();
-    assert!(!selected.is_empty());
-    let owner = selected[0].thread;
+    let mut expected = vec!["init construct", "init poll", "init resumed"];
+    for _ in 0..messages {
+        expected.extend(["handler construct", "handler poll", "handler resumed"]);
+    }
+    if normal_stop {
+        expected.extend(["stop construct", "stop poll", "stop resumed"]);
+    }
+    expected.push("drop");
+    assert_eq!(
+        selected.iter().map(|event| event.stage).collect::<Vec<_>>(),
+        expected,
+        "generation {generation} lifecycle"
+    );
     for event in selected {
         assert!(
             event.name.starts_with(prefix),
@@ -141,7 +158,6 @@ fn assert_owner(events: &Events, generation: usize, prefix: &str) -> ThreadId {
         );
         assert_eq!(event.thread, owner, "{} migrated", event.stage);
     }
-    owner
 }
 async fn lifecycle(mode: SchedulingMode, prefix: &str, factory: bool) {
     let events = Events::default();
@@ -192,26 +208,28 @@ async fn lifecycle(mode: SchedulingMode, prefix: &str, factory: bool) {
     reference.stop().await.unwrap();
     system.shutdown_internal().await.unwrap();
     assert_eq!(system.actor_count(), 0);
-    assert_eq!(assert_owner(&events, 0, prefix), first);
-    assert_eq!(assert_owner(&events, 100, prefix), child);
-    if factory {
-        assert_eq!(assert_owner(&events, 1, prefix), first);
-        assert_eq!(replacement, Some(first));
+    let events = events.lock().unwrap();
+    assert_lifecycle(&events, 100, child, prefix, 1, true);
+    if let Some(replacement) = replacement {
+        assert_lifecycle(&events, 0, first, prefix, 3, false);
+        assert_lifecycle(&events, 1, replacement, prefix, 1, true);
+        assert_eq!(replacement, first);
+        let retired = events
+            .iter()
+            .rposition(|event| event.generation == 0)
+            .unwrap();
+        let restarted = events
+            .iter()
+            .position(|event| event.generation == 1)
+            .unwrap();
+        assert!(retired < restarted, "old generation survived replacement");
+    } else {
+        assert_lifecycle(&events, 0, first, prefix, 2, true);
     }
     if prefix == "parrot-shard-" {
         assert_eq!(child, first, "same affinity must use the same native shard");
     } else {
         assert_ne!(child, first, "each dedicated actor needs its own OS worker");
-    }
-    let events = events.lock().unwrap();
-    for generation in [0, 100] {
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.generation == generation && event.stage == "drop")
-                .count(),
-            1
-        );
     }
 }
 
