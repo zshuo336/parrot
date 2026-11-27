@@ -41,7 +41,17 @@ async fn original_host() {
     );
     let original = start(cfg.clone(), delivery.clone()).await;
     #[cfg(target_os = "linux")]
-    if let Ok(hex) = std::env::var("PARROT_HANDOFF_STANDBY_DIGEST") {
+    let digest_hex = if std::env::var_os("PARROT_HANDOFF_DISCOVER").is_some() {
+        let id = hex::encode(original.ordered_receiver_id().unwrap());
+        std::fs::write(root.join("receiver-id"), id).unwrap();
+        signal(&root, "invite-digest").await;
+        Some(std::fs::read_to_string(root.join("invite-digest")).unwrap())
+    } else {
+        std::env::var("PARROT_HANDOFF_STANDBY_DIGEST").ok()
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(hex) = digest_hex {
+        let hex = hex.trim();
         let digest = hex::decode(hex).unwrap().try_into().unwrap();
         original.register_receiver_standby(digest).await.unwrap();
     }

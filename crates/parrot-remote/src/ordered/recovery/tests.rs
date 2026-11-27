@@ -82,6 +82,90 @@ fn config(directory: &Path) -> OrderedReceiverState {
 }
 
 #[test]
+fn source_bound_handoff_requires_the_enrolled_incarnation_and_prepared_destination() {
+    let dirs = std::array::from_fn::<_, 4, _>(|_| tempfile::tempdir().unwrap());
+    let [source, other, target, second_target] = dirs.each_ref().map(|dir| config(dir.path()));
+    let node = "receiver";
+    let owner = ReceiverOwner::open(&source, node).unwrap();
+    let id = owner.receiver();
+    let invitation = handoff::prepare_from(&target, node, id).unwrap();
+    let other_invitation = handoff::prepare_from(&second_target, node, id).unwrap();
+    assert_eq!(
+        handoff::prepare_from(&target, node, id).unwrap(),
+        invitation
+    );
+    assert!(handoff::prepare(&target, node).is_err());
+    assert!(ReceiverOwner::open(&target, node).is_err());
+
+    let wrong = ReceiverOwner::open(&other, node).unwrap();
+    assert_ne!(wrong.receiver(), id);
+    assert!(handoff::prepare_from(&target, node, wrong.receiver()).is_err());
+    #[cfg(target_os = "linux")]
+    assert!(wrong
+        .reserve_standby(&invitation)
+        .unwrap_err()
+        .contains("source receiver"));
+    drop(wrong);
+    assert!(handoff::seal(&other, node, &invitation)
+        .unwrap_err()
+        .contains("source receiver"));
+
+    drop(owner);
+    // A real v1 seal can have the same destination and a valid trusted digest.
+    // The destination must independently enforce its persisted source binding.
+    let mut legacy: serde_json::Value = serde_json::from_slice(&invitation).unwrap();
+    legacy.as_object_mut().unwrap().remove("source");
+    legacy["version"] = 1.into();
+    let legacy_proof = handoff::seal(&other, node, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let digest = Sha256::digest(&legacy_proof).into();
+    assert!(handoff::activate(&target, node, &legacy_proof, digest).is_err());
+
+    let seal = handoff::seal(&source, node, &invitation).unwrap();
+    let digest = Sha256::digest(&seal).into();
+    assert!(handoff::seal(&source, node, &other_invitation).is_err());
+    assert!(handoff::activate(&second_target, node, &seal, digest).is_err());
+    let mut wrong_epoch: serde_json::Value = serde_json::from_slice(&seal).unwrap();
+    wrong_epoch["epoch"] = 2.into();
+    let stale = serde_json::to_vec(&wrong_epoch).unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(handoff::verify_standby(&invitation, &stale)
+        .unwrap_err()
+        .contains("source receiver"));
+    assert!(
+        handoff::activate(&target, node, &stale, Sha256::digest(&stale).into())
+            .unwrap_err()
+            .contains("source receiver")
+    );
+    handoff::activate(&target, node, &seal, digest).unwrap();
+    handoff::activate(&target, node, &seal, digest).unwrap();
+    assert!(ReceiverOwner::open(&target, node)
+        .unwrap()
+        .proves_retired(id, 1));
+}
+
+#[test]
+fn source_restart_invalidates_an_invitation_prepared_for_its_previous_epoch() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let cfg = config(source.path());
+    let owner = ReceiverOwner::open(&cfg, "node").unwrap();
+    let invitation =
+        handoff::prepare_from(&config(target.path()), "node", owner.receiver()).unwrap();
+    drop(owner);
+    let restarted = ReceiverOwner::open(&cfg, "node").unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(restarted
+        .reserve_standby(&invitation)
+        .unwrap_err()
+        .contains("source receiver"));
+    drop(restarted);
+    assert!(handoff::seal(&cfg, "node", &invitation)
+        .unwrap_err()
+        .contains("source receiver"));
+    assert_eq!(ReceiverOwner::open(&cfg, "node").unwrap().epoch(), 3);
+}
+
+#[test]
 fn missing_published_state_cannot_reopen_or_repurpose_a_sealed_receiver() {
     let source = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();

@@ -33,14 +33,14 @@ if [ -f /runlab/enrolled ]; then
     test ! -e /runlab/state/ordered.state
     mv /runlab/saved.state /runlab/state/ordered.state
     echo PARROT_REFUSED_MISSING_STATE
-    if /handoff witness /runlab/witness </invitation >/tmp/proof 2>/tmp/reason; then exit 1; fi
+    if /handoff witness /runlab/witness </runlab/invitation >/tmp/proof 2>/tmp/reason; then exit 1; fi
     test ! -s /tmp/proof
     grep -Fq 'original boot' /tmp/reason
     echo PARROT_REFUSED_OLD_BOOT
     # The original volume has become available again. Only release the seal
     # over the separate administration serial port after all checks succeed.
     stty -F /dev/ttyS1 raw -echo
-    /handoff seal /runlab/state recovery-contract recovery-target </invitation >/dev/ttyS1
+    /handoff seal /runlab/state recovery-contract recovery-target </runlab/invitation >/dev/ttyS1
     echo PARROT_OFFLINE_SEAL
     sync
     poweroff -f
@@ -48,16 +48,23 @@ fi
 
 mkdir -m 700 /runlab/state /runlab/witness
 cp /tls/* /runlab/
-digest=$(sha256sum /invitation | cut -d' ' -f1)
-export PARROT_HANDOFF_STANDBY_DIGEST="$digest"
-/handoff witness /runlab/witness </invitation >/runlab/proof 2>/runlab/witness.log &
+export PARROT_HANDOFF_DISCOVER=1
+old_receiver >/runlab/original.log 2>&1 &
+owner=$!
+until test -s /runlab/receiver-id; do kill -0 "$owner" || { cat /runlab/original.log; exit 1; }; sleep .05; done
+stty -F /dev/ttyS1 raw -echo
+echo "PARROT_SOURCE $(cat /runlab/receiver-id)"
+IFS= read -r invitation </dev/ttyS1
+printf '%s\n' "$invitation" >/runlab/invitation
+digest=$(sha256sum /runlab/invitation | cut -d' ' -f1)
+/handoff witness /runlab/witness </runlab/invitation >/runlab/proof 2>/runlab/witness.log &
 witness=$!
 until grep -Fq "parrot.standby.$digest" /proc/net/unix; do
     kill -0 "$witness" || { cat /runlab/witness.log; exit 1; }
     sleep .05
 done
-old_receiver >/runlab/original.log 2>&1 &
-owner=$!
+echo "$digest" >/runlab/invite-digest.next
+mv /runlab/invite-digest.next /runlab/invite-digest
 until test -s /runlab/address; do kill -0 "$owner" || { cat /runlab/original.log; exit 1; }; sleep .05; done
 touch /runlab/enrolled
 sync

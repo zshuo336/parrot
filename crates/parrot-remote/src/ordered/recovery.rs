@@ -134,7 +134,11 @@ impl LockedDirectory {
                     || saved.node != node
                     || saved.anchor != anchor
                     || saved.namespace == [0; 16]
-                    || (saved.epoch == 0) != matches!(saved.handoff, Some(handoff::Phase::Prepared))
+                    || (saved.epoch == 0)
+                        != saved
+                            .handoff
+                            .as_ref()
+                            .is_some_and(handoff::Phase::is_prepared)
                 {
                     return Err("ordered receiver state binding differs".into());
                 }
@@ -219,7 +223,7 @@ impl ReceiverOwner {
     pub fn open(config: &OrderedReceiverState, node: &str) -> Result<Arc<Self>, String> {
         let (locked, mut saved) = LockedDirectory::load(config, node)?;
         match saved.handoff {
-            Some(handoff::Phase::Prepared) => return Err("receiver awaits handoff".into()),
+            Some(ref phase) if phase.is_prepared() => return Err("receiver awaits handoff".into()),
             Some(handoff::Phase::Sealed { .. }) => return Err("receiver sealed for handoff".into()),
             _ => {}
         }

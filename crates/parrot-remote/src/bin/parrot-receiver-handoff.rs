@@ -4,7 +4,7 @@ use parrot_remote::ordered::handoff;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
-const USAGE: &str = "usage: parrot-receiver-handoff prepare|seal|activate DIRECTORY REALM NODE [SEAL_SHA256]\nLinux: watch DIRECTORY REALM NODE, or witness [PRIVATE_JOURNAL_DIRECTORY] < invitation.json\nprepare writes an invitation to stdout; seal and witness read an invitation and write a private seal to stdout and its SHA-256 to stderr; activate checks the trusted digest before publishing";
+const USAGE: &str = "usage: parrot-receiver-handoff prepare DIRECTORY REALM NODE [SOURCE_RECEIVER_HEX]\n       parrot-receiver-handoff seal|activate DIRECTORY REALM NODE [SEAL_SHA256]\nLinux: watch DIRECTORY REALM NODE, or witness [PRIVATE_JOURNAL_DIRECTORY] < invitation.json\nprepare writes an invitation to stdout; seal and witness read an invitation and write a private seal to stdout and its SHA-256 to stderr; activate checks the trusted digest before publishing";
 
 fn input() -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
@@ -47,6 +47,12 @@ fn run() -> Result<(), String> {
         #[cfg(target_os = "linux")]
         ("watch", []) => return parrot_remote::ordered::standby::watch(&config, node),
         ("prepare", []) => handoff::prepare(&config, node)?,
+        ("prepare", [source]) => {
+            let mut receiver = [0; 16];
+            hex::decode_to_slice(source, &mut receiver)
+                .map_err(|_| "invalid source receiver hex")?;
+            handoff::prepare_from(&config, node, receiver)?
+        }
         ("seal", []) => {
             let seal = handoff::seal(&config, node, &input()?)?;
             eprintln!("{}", hex::encode(Sha256::digest(&seal)));
