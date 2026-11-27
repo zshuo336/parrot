@@ -18,6 +18,9 @@ mod tests;
 
 const MAGIC: &[u8; 8] = b"PORCV01\0";
 const LIMIT: usize = 8192;
+// Only a newly created lock may authorize the first publication. Existing
+// installations have empty lock files, which already denote published state.
+const FRESH: &[u8] = b"PARROT-UNPUBLISHED-1\n";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +37,35 @@ struct Saved {
 struct Lock {
     file: File,
     pid: u32,
+}
+impl Lock {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        let (file, created) = match options(Access::New).open(path) {
+            Ok(file) => (file, true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                (regular(path, Access::Lock)?, false)
+            }
+            Err(e) => return Err(error(e)),
+        };
+        if created {
+            (&file).write_all(FRESH).map_err(error)?;
+        }
+        file.try_lock()
+            .map_err(|e| format!("ordered receiver owner lock: {e}"))?;
+        file.sync_all().map_err(error)?;
+        Ok(Self {
+            file,
+            pid: std::process::id(),
+        })
+    }
+
+    fn finish_publication(&self) -> Result<(), String> {
+        if self.file.metadata().map_err(error)?.len() != 0 {
+            self.file.set_len(0).map_err(error)?;
+            self.file.sync_all().map_err(error)?;
+        }
+        Ok(())
+    }
 }
 impl Drop for Lock {
     fn drop(&mut self) {
@@ -79,15 +111,8 @@ impl LockedDirectory {
                 );
             }
         }
-        let file = regular(&directory.join(".parrot-ordered.lock"), Access::Lock)?;
-        file.try_lock()
-            .map_err(|e| format!("ordered receiver owner lock: {e}"))?;
-        let lock = Lock {
-            file,
-            pid: std::process::id(),
-        };
+        let lock = Lock::acquire(&directory.join(".parrot-ordered.lock"))?;
         let anchor = anchor(&lock.file)?;
-        lock.file.sync_all().map_err(error)?;
         let main = directory.join("ordered.state");
         let next = directory.join("ordered.next");
         let saved = match std::fs::symlink_metadata(&main) {
@@ -113,11 +138,25 @@ impl LockedDirectory {
                 {
                     return Err("ordered receiver state binding differs".into());
                 }
+                // Finish a first publication interrupted after the state rename.
+                lock.finish_publication()?;
                 saved
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if std::fs::symlink_metadata(&next).is_ok() {
-                    return Err("incomplete initial ordered receiver publication".into());
+                match std::fs::symlink_metadata(&next) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(error(e)),
+                    Ok(_) => return Err("incomplete initial ordered receiver publication".into()),
+                }
+                let mut marker = Vec::new();
+                // A new lock was just written through this descriptor.
+                std::io::Seek::rewind(&mut &lock.file).map_err(error)?;
+                (&lock.file)
+                    .take((FRESH.len() + 1) as u64)
+                    .read_to_end(&mut marker)
+                    .map_err(error)?;
+                if marker != FRESH {
+                    return Err("published ordered receiver state is missing".into());
                 }
                 let namespace = super::identity();
                 Saved {
@@ -136,6 +175,7 @@ impl LockedDirectory {
 
     fn publish(&self, saved: &Saved) -> Result<(), String> {
         saved.publish(&self.directory)?;
+        self.lock.finish_publication()?;
         File::open(self.directory.parent().unwrap_or(Path::new("/")))
             .map_err(error)?
             .sync_all()
@@ -233,13 +273,13 @@ enum Access {
     Lock,
     New,
 }
-fn regular(path: &Path, access: Access) -> Result<File, String> {
+fn options(access: Access) -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true);
     match access {
         Access::Read => {}
         Access::Lock => {
-            options.write(true).create(true);
+            options.write(true);
         }
         Access::New => {
             options.write(true).create_new(true);
@@ -252,7 +292,10 @@ fn regular(path: &Path, access: Access) -> Result<File, String> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
     }
-    let file = options.open(path).map_err(error)?;
+    options
+}
+fn regular(path: &Path, access: Access) -> Result<File, String> {
+    let file = options(access).open(path).map_err(error)?;
     if !file.metadata().map_err(error)?.is_file() {
         return Err("regular ordered state file required".into());
     }

@@ -81,6 +81,52 @@ fn config(directory: &Path) -> OrderedReceiverState {
     }
 }
 
+#[test]
+fn missing_published_state_cannot_reopen_or_repurpose_a_sealed_receiver() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let cfg = config(source.path());
+    let invitation = handoff::prepare(&config(target.path()), "node").unwrap();
+    drop(ReceiverOwner::open(&cfg, "node").unwrap());
+    let seal = handoff::seal(&cfg, "node", &invitation).unwrap();
+    let path = source.path().join("ordered.state");
+    let saved = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(ReceiverOwner::open(&cfg, "node")
+        .err()
+        .unwrap()
+        .contains("state is missing"));
+    assert!(handoff::prepare(&cfg, "node")
+        .unwrap_err()
+        .contains("state is missing"));
+    assert!(!path.exists());
+    std::fs::write(&path, saved).unwrap();
+    assert_eq!(handoff::seal(&cfg, "node", &invitation).unwrap(), seal);
+}
+
+#[test]
+fn fresh_probe_is_retryable_but_an_empty_legacy_lock_requires_its_state() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let cfg = config(source.path());
+    let invite = handoff::prepare(&config(target.path()), "node").unwrap();
+    assert!(handoff::seal(&cfg, "node", &invite)
+        .unwrap_err()
+        .contains("transferable epoch"));
+    drop(ReceiverOwner::open(&cfg, "node").unwrap());
+    let lock = source.path().join(".parrot-ordered.lock");
+    assert_eq!(std::fs::metadata(lock).unwrap().len(), 0);
+    assert_eq!(ReceiverOwner::open(&cfg, "node").unwrap().epoch(), 2);
+
+    let legacy = tempfile::tempdir().unwrap();
+    std::fs::write(legacy.path().join(".parrot-ordered.lock"), []).unwrap();
+    assert!(ReceiverOwner::open(&config(legacy.path()), "node")
+        .err()
+        .unwrap()
+        .contains("state is missing"));
+    assert!(!legacy.path().join("ordered.state").exists());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn live_registration_pins_the_source_directory_and_a_single_destination() {
