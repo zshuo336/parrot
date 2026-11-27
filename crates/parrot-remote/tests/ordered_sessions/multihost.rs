@@ -104,11 +104,17 @@ async fn receive(bind: SocketAddr, routed: bool) {
         target
             .remote_ref("parrot://flow-source/target")
             .unwrap()
-            .deliver_with_ack(Box::new(Work(round as u64)), TIMEOUT)
+            .deliver_ordered(Box::new(Work(round as u64)), Default::default())
             .await
             .unwrap();
     }
     assert_eq!(received.recv().await, Some(FINISH));
+    target
+        .remote_ref("parrot://flow-source/target")
+        .unwrap()
+        .deliver_ordered(Box::new(Work(FINISH)), Default::default())
+        .await
+        .unwrap();
     // Keep the return path alive until the source has its final ACK and disconnects.
     while entry
         .links_snapshot()
@@ -127,7 +133,11 @@ async fn receive(bind: SocketAddr, routed: bool) {
 
 async fn send(addr: SocketAddr, routed: bool) {
     let (ack_state, mut acks) = state();
-    let source = start(config(SOURCE, None), Arc::new(Target(ack_state))).await;
+    let source = start(
+        config(SOURCE, None).with_ordered_relays([HUB.into()]),
+        Arc::new(Target(ack_state)),
+    )
+    .await;
     let peer = if routed { HUB } else { TARGET };
     source.connect(&NodeAddr::tcp(peer, addr)).await.unwrap();
     let reference = source.remote_ref("parrot://flow-target/target").unwrap();
@@ -181,9 +191,11 @@ async fn send(addr: SocketAddr, routed: bool) {
             .unwrap();
     }
     reference
-        .deliver_with_ack(Box::new(Work(FINISH)), TIMEOUT)
+        .deliver_ordered(Box::new(Work(FINISH)), Default::default())
         .await
         .unwrap();
+    assert_eq!(acks.recv().await, Some(FINISH));
+    reference.close_ordered_session(TIMEOUT).await.unwrap();
     source.shutdown().await.unwrap();
     assert!(acks.try_recv().is_err(), "extra round receipt");
 }
