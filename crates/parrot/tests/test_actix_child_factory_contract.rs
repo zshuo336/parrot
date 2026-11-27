@@ -522,6 +522,88 @@ impl Drop for Release {
         self.0.release();
     }
 }
+
+#[path = "support/isolated.rs"]
+mod isolated;
+
+#[test]
+fn original_host_exit_preserves_parent_stop_while_grandchild_is_being_disposed() {
+    isolated::run(
+        "original_host_exit_preserves_parent_stop_while_grandchild_is_being_disposed",
+        "PARROT_ACTIX_DYNAMIC_TREE_CHILD",
+        Duration::from_secs(30),
+        || {
+            let host = actix::System::new();
+            let counts = Arc::new(Counts::default());
+            let (sys, parent, child) = host.block_on(async {
+                let sys = ActixActorSystem::with_arbiter_count(2).await.unwrap();
+                let parent = sys
+                    .spawn_root_typed(Parent(counts.clone()), EmptyConfig)
+                    .await
+                    .unwrap();
+                let child = *parent
+                    .send(Box::new(Create {
+                        factory: factory(&counts, false),
+                        maximum: 1,
+                        dynamic: true,
+                    }))
+                    .await
+                    .unwrap()
+                    .downcast::<BoxedActorRef>()
+                    .unwrap();
+                assert_eq!(generation(&*child, 0).await, parent.path());
+                (sys, parent, child)
+            });
+            drop(host);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let gate = Arc::new(Gate::default());
+                    let _release = Release(gate.clone());
+                    let drops = Arc::new(AtomicUsize::new(0));
+                    let leaf = *child
+                        .send(Box::new(MakeSlowLeaf {
+                            gate: gate.clone(),
+                            dropped: drops.clone(),
+                        }))
+                        .await
+                        .unwrap()
+                        .downcast::<BoxedActorRef>()
+                        .unwrap();
+                    leaf.send(Box::new(())).await.unwrap();
+                    let mut cancelled = Box::pin(parent.stop());
+                    assert!(futures::poll!(&mut cancelled).is_pending());
+                    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+                        .await
+                        .unwrap();
+                    let mut remaining = Box::pin(parent.stop());
+                    assert!(
+                        futures::poll!(&mut remaining).is_pending(),
+                        "a second parent stop must wait for grandchild disposal"
+                    );
+                    drop(cancelled);
+                    assert!(sys.get_actor(&parent.path()).await.is_some());
+                    assert_eq!(drops.load(Ordering::SeqCst), 0);
+                    gate.release();
+                    remaining.await.unwrap();
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    assert_eq!(counts.dropped.load(Ordering::SeqCst), 1);
+                    for actor in [parent.as_ref(), child.as_ref(), leaf.as_ref()] {
+                        assert!(matches!(
+                            actor.retirement_status(),
+                            parrot_api::address::RetirementStatus::Retired(Ok(()))
+                        ));
+                        assert!(sys.get_actor(&actor.path()).await.is_none());
+                        actor.stop().await.unwrap();
+                    }
+                    sys.shutdown().await.unwrap();
+                });
+        },
+    );
+}
+
 #[actix::test]
 async fn shutdown_waits_for_pending_actix_constructor_and_never_initializes_cancelled_output() {
     let sys = ActixActorSystem::with_settings(ActixSystemSettings {
