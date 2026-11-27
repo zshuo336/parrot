@@ -441,35 +441,9 @@ async fn plain_tcp_falls_back_without_claiming_authenticated_ordering() {
     }
 }
 
-struct Pki {
-    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
-    ca: Vec<u8>,
-}
-impl Pki {
-    fn new() -> Self {
-        let mut params = rcgen::CertificateParams::default();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let key = rcgen::KeyPair::generate().unwrap();
-        let ca = params.self_signed(&key).unwrap().pem().into_bytes();
-        Self {
-            issuer: rcgen::Issuer::new(params, key),
-            ca,
-        }
-    }
-    fn node(&self, name: &str) -> parrot_remote::tls::TlsConfig {
-        let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, name);
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, &self.issuer).unwrap();
-        parrot_remote::tls::TlsConfig {
-            cert_pem: cert.pem().into_bytes(),
-            key_pem: key.serialize_pem().into_bytes(),
-            ca_pem: self.ca.clone(),
-        }
-    }
-}
+#[path = "ordered_sessions/pki.rs"]
+mod pki;
+use pki::Pki;
 #[tokio::test]
 async fn strict_sessions_execute_over_real_mtls_tcp_and_quic() {
     let pki = Pki::new();

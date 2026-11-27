@@ -107,6 +107,19 @@ impl RemoteInner {
             self.sender_of(node_id)
         }
     }
+
+    pub(crate) async fn retirement_sender(
+        &self,
+        first: &str,
+        destination: &str,
+    ) -> Option<FrameSender> {
+        if let Some(system) = &self.system {
+            crate::system::RemoteActorSystem::sender_for_retirement(system, first, destination)
+                .await
+        } else {
+            self.sender_of(first)
+        }
+    }
 }
 
 #[derive(Clone)]

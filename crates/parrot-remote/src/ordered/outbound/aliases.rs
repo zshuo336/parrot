@@ -211,7 +211,7 @@ impl Outbound {
         } else if endpoint.path != frame.path {
             self.close_matching(
                 destination,
-                |first| async move { inner.ensure_sender(&first).await },
+                |first| async move { inner.retirement_sender(&first, destination).await },
                 &inner.callbacks,
                 deadline,
                 CloseScope::Path(&frame.path),
@@ -255,7 +255,7 @@ impl Outbound {
             crate::actor_path::split(&binding.endpoint.path).expect("validated endpoint");
         self.close_matching(
             node,
-            |first| async move { inner.ensure_sender(&first).await },
+            |first| async move { inner.retirement_sender(&first, node).await },
             &inner.callbacks,
             deadline,
             CloseScope::Binding(binding),
@@ -290,7 +290,7 @@ impl Outbound {
             } else {
                 self.close_matching(
                     destination,
-                    |first| async move { inner.ensure_sender(&first).await },
+                    |first| async move { inner.retirement_sender(&first, destination).await },
                     &inner.callbacks,
                     deadline,
                     CloseScope::Reference(path),

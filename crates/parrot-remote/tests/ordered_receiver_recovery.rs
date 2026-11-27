@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "ordered_sessions/pki.rs"]
+mod pki;
 #[path = "ordered_sessions/sender_restart.rs"]
 mod sender_restart;
 use parrot_api::{

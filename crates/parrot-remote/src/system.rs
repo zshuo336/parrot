@@ -1760,6 +1760,22 @@ impl RemoteActorSystem {
         Self::resolve_sender(weak, node, true).await
     }
 
+    pub(crate) async fn sender_for_retirement(
+        weak: &std::sync::Weak<Self>,
+        first: &str,
+        destination: &str,
+    ) -> Option<FrameSender> {
+        let route = Self::sender_for(weak, first).await;
+        if route.is_some() || first == destination {
+            return route;
+        }
+        // A vanished alias can leave a topology-permitted direct link to the
+        // saved terminal. Never forward a stripped route over an unrelated peer.
+        Self::sender_for(weak, destination)
+            .await
+            .filter(|peer| peer.node_id() == destination)
+    }
+
     // Management frames carry no relay destination. They share discovery
     // admission with business calls but must resolve a direct physical peer.
     pub(crate) async fn resolve_sender(

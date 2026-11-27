@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
 use std::os::unix::process::ExitStatusExt;
+#[path = "sender_alias_restart.rs"]
+mod alias_restart;
 
 fn sender_config(directory: &Path) -> RemoteConfig {
     let mut cfg = RemoteConfig::tcp("recovery-source", None)
