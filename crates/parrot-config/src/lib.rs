@@ -213,6 +213,7 @@ pub struct ReorderSection {
     pub byte_capacity: Option<usize>,
     pub ordered_relays: Option<Vec<String>>,
     pub receiver_state: Option<OrderedReceiverState>,
+    pub persist_sender_sessions: Option<bool>,
 }
 
 /// Cooperative, stable local directory for ordered receiver restart ownership.
@@ -533,6 +534,7 @@ pub struct ReorderResolved {
     pub byte_capacity: usize,
     pub ordered_relays: Vec<String>,
     pub receiver_state: Option<OrderedReceiverState>,
+    pub persist_sender_sessions: bool,
 }
 
 // ============================================================================
@@ -608,7 +610,7 @@ impl ParrotConfig {
             max_context_tasks, default_ask_timeout_ms, shutdown_timeout_ms);
         merge!(self.remote.node, fallback.remote.node; node_id, bind, topology_role, direct_addr, seeds, scheme);
         merge!(self.remote.transport, fallback.remote.transport; connection_capacity, handshake_capacity, heartbeat_interval_ms, heartbeat_max_loss, outbound_queue, inbound_ask_capacity, inbound_ask_bytes, inbound_dispatch_capacity, inbound_dispatch_per_connection, inbound_dispatch_bytes, default_hop_limit);
-        merge!(self.remote.reorder, fallback.remote.reorder; gap_timeout_ms, buffer_cap, stream_capacity, frame_capacity, byte_capacity, ordered_relays, receiver_state);
+        merge!(self.remote.reorder, fallback.remote.reorder; gap_timeout_ms, buffer_cap, stream_capacity, frame_capacity, byte_capacity, ordered_relays, receiver_state, persist_sender_sessions);
         merge!(self.remote.codec, fallback.remote.codec; extra_caps);
         merge!(self.remote.security, fallback.remote.security; mode, cert_path, key_path, ca_path, admin_nodes);
         merge!(self.remote.receptionist, fallback.remote.receptionist; default_deny, roles, relays, max_subscriptions, max_subscription_bytes, max_registrations, max_registration_bytes);
@@ -726,6 +728,14 @@ impl ParrotConfig {
                     reason: "must contain at most 4096 valid relay node IDs".into(),
                 });
             }
+        }
+        if self.remote.reorder.persist_sender_sessions == Some(true)
+            && self.remote.reorder.receiver_state.is_none()
+        {
+            return Err(ConfigError::Invalid {
+                key: "remote.reorder.persist_sender_sessions".into(),
+                reason: "requires remote.reorder.receiver_state".into(),
+            });
         }
         if let Some(state) = &self.remote.reorder.receiver_state {
             state.validate().map_err(|reason| ConfigError::Invalid {
@@ -956,6 +966,11 @@ impl ParrotConfig {
                         .clone()
                         .unwrap_or_default(),
                     receiver_state: self.remote.reorder.receiver_state.clone(),
+                    persist_sender_sessions: self
+                        .remote
+                        .reorder
+                        .persist_sender_sessions
+                        .unwrap_or(false),
                 },
                 extra_caps: self.remote.codec.extra_caps.unwrap_or(0),
             },
@@ -1166,6 +1181,10 @@ impl ParrotConfig {
         m.insert(
             "remote.reorder.ordered_relays",
             "可为有序TELL原始来源背书的已认证中继节点（默认空）",
+        );
+        m.insert(
+            "remote.reorder.persist_sender_sessions",
+            "将发送会话的关闭信息持久化到实例恢复目录（默认关闭）",
         );
         m.insert(
             "remote.reorder.receiver_state.directory",
@@ -1625,6 +1644,7 @@ stream_capacity = 17
 frame_capacity = 257
 byte_capacity = 262144
 ordered_relays = ["hub-1", "relay-1"]
+persist_sender_sessions = true
 [remote.reorder.receiver_state]
 directory = "/var/lib/parrot/ordered-receiver"
 realm = "contract-cluster"
@@ -1752,6 +1772,7 @@ rpc_timeout_ms = 2400
         assert_eq!(r.remote.reorder.gap_timeout_ms, 100);
         assert_eq!(r.remote.reorder.buffer_cap, 128);
         assert_eq!(r.remote.reorder.stream_capacity, 17);
+        assert!(r.remote.reorder.persist_sender_sessions);
         assert_eq!(r.remote.reorder.frame_capacity, 257);
         assert_eq!(r.remote.reorder.byte_capacity, 262144);
         assert_eq!(r.remote.reorder.ordered_relays, ["hub-1", "relay-1"]);

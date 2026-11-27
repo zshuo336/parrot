@@ -146,6 +146,11 @@ impl Outbound {
         mut frame: Frame,
         required: bool,
     ) -> ActorResult<Option<Frame>> {
+        if let Some(journal) = &self.journal {
+            journal
+                .wait_for_source(&self.source, Instant::now() + Duration::from_secs(5))
+                .await?;
+        }
         let alias_key = self.table_key(&frame.path).into_owned();
         let gate = self.aliases.gate(&alias_key);
         let read = gate.read().await;
@@ -266,6 +271,9 @@ impl Outbound {
         deadline: Instant,
     ) -> ActorResult<()> {
         tokio::time::timeout_at(deadline, async {
+            if let Some(journal) = &self.journal {
+                journal.wait_for_source(&self.source, deadline).await?;
+            }
             let key = self.table_key(path);
             let _write = self.aliases.gate(&key).write().await;
             let binding = self

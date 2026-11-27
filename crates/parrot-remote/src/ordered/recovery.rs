@@ -1,5 +1,6 @@
 //! Cooperative local-filesystem ownership, retained through real worker cleanup.
 use super::Identity;
+pub(crate) mod sender;
 use parrot_config::OrderedReceiverState;
 use sha2::{Digest, Sha256};
 use std::{
@@ -38,6 +39,7 @@ impl Drop for Lock {
 }
 
 pub(crate) struct ReceiverOwner {
+    directory: std::path::PathBuf,
     receiver: Identity,
     namespace: Identity,
     epoch: u64,
@@ -152,6 +154,7 @@ impl ReceiverOwner {
             return Err("invalid ordered receiver identity".into());
         }
         Ok(Arc::new(Self {
+            directory,
             receiver,
             namespace: saved.namespace,
             epoch: saved.epoch,

@@ -86,6 +86,8 @@ pub struct RemoteConfig {
     pub ordered_relays: std::collections::BTreeSet<String>,
     /// Opt-in local-filesystem receiver ownership; opened and synced by `new`.
     pub ordered_receiver_state: Option<parrot_config::OrderedReceiverState>,
+    /// Persist outbound ordered tickets under the receiver state's exclusive lock.
+    pub persist_sender_sessions: bool,
     pub swim: crate::swim::SwimConfig,
 }
 
@@ -142,6 +144,7 @@ impl RemoteConfig {
             knobs: None,
             ordered_relays: Default::default(),
             ordered_receiver_state: None,
+            persist_sender_sessions: false,
             swim: Default::default(),
         }
     }
@@ -221,6 +224,7 @@ impl RemoteConfig {
             knobs: None,
             ordered_relays: Default::default(),
             ordered_receiver_state: None,
+            persist_sender_sessions: false,
             swim: Default::default(),
         }
     }
@@ -248,6 +252,7 @@ impl RemoteConfig {
             knobs: None,
             ordered_relays: Default::default(),
             ordered_receiver_state: None,
+            persist_sender_sessions: false,
             swim: Default::default(),
         }
     }
@@ -395,6 +400,7 @@ impl RemoteConfig {
         cfg.extra_caps = r.remote.extra_caps;
         cfg.ordered_relays = r.remote.reorder.ordered_relays.iter().cloned().collect();
         cfg.ordered_receiver_state = r.remote.reorder.receiver_state.clone();
+        cfg.persist_sender_sessions = r.remote.reorder.persist_sender_sessions;
         cfg.knobs = Some(crate::transport::RuntimeKnobs {
             connection_capacity: r.remote.transport.connection_capacity,
             handshake_capacity: r.remote.transport.handshake_capacity,
@@ -536,6 +542,11 @@ impl RemoteConfig {
     }
 
     fn validate(&self) -> Result<(), RemoteError> {
+        if self.persist_sender_sessions && self.ordered_receiver_state.is_none() {
+            return Err(RemoteError::Transport(
+                "persist_sender_sessions requires ordered receiver state".into(),
+            ));
+        }
         if let Some(state) = &self.ordered_receiver_state {
             state.validate().map_err(RemoteError::Transport)?;
         }
@@ -827,6 +838,18 @@ impl RemoteActorSystem {
             .transpose()
             .map_err(RemoteError::Transport)?;
         let callbacks = Arc::new(CallbackRegistry::new(config.callback_capacity));
+        let journal = receiver_owner
+            .as_ref()
+            .map(|owner| {
+                crate::ordered::recovery::sender::Journal::open(
+                    owner,
+                    config.persist_sender_sessions,
+                    knobs.reorder_stream_capacity,
+                )
+            })
+            .transpose()
+            .map_err(RemoteError::Transport)?
+            .flatten();
         let ingress = Arc::new(
             Ingress::with_ask_limits(
                 local,
@@ -937,9 +960,10 @@ impl RemoteActorSystem {
         let subscription_limits = config.receptionist_subscriptions;
         let registration_limits = config.receptionist_registrations;
         let system = Arc::new(Self {
-            outbound_ordered: Arc::new(crate::ordered::Outbound::new(
+            outbound_ordered: Arc::new(crate::ordered::Outbound::with_journal(
                 config.node_id.clone(),
                 knobs.reorder_stream_capacity,
+                journal,
             )),
             config,
             nodes,

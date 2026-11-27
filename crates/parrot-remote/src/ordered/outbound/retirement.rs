@@ -38,6 +38,47 @@ impl Outbound {
         callbacks: Arc<CallbackRegistry>,
     ) {
         loop {
+            let pending = self
+                .journal
+                .as_ref()
+                .map(|j| j.pending())
+                .unwrap_or_default();
+            let recovering = !pending.is_empty();
+            stream::iter(pending)
+                .for_each_concurrent(8, |saved| {
+                    let system = &system;
+                    let callbacks = &callbacks;
+                    async move {
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        let attempt = async {
+                            let first =
+                                crate::actor_path::split(crate::ordered::route::head(&saved.path))
+                                    .map_or(saved.destination.as_str(), |(node, _)| node);
+                            if let Some(current) =
+                                RemoteActorSystem::sender_for(system, first).await
+                            {
+                                let original = Self {
+                                    source: saved.source.clone(),
+                                    incarnation: saved.incarnation,
+                                    context: SenderContext::Node,
+                                    tables: self.tables.clone(),
+                                };
+                                let _ = original
+                                    .retire_ticket(
+                                        &saved,
+                                        None,
+                                        &current,
+                                        callbacks,
+                                        crate::frame::DEFAULT_HOP_LIMIT,
+                                        deadline,
+                                    )
+                                    .await;
+                            }
+                        };
+                        let _ = tokio::time::timeout_at(deadline, attempt).await;
+                    }
+                })
+                .await;
             let (has_owners, stopped) = {
                 let lanes = self.lanes.lock().unwrap();
                 let owners = lanes.values().filter_map(|entry| entry.owner.as_ref());
@@ -50,7 +91,7 @@ impl Outbound {
                         .collect::<Vec<_>>(),
                 )
             };
-            if !has_owners {
+            if !has_owners && !recovering {
                 self.sender_added.notified().await;
                 continue;
             }

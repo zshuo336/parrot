@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "ordered_sessions/sender_restart.rs"]
+mod sender_restart;
 use parrot_api::{
     address::ActorRef,
     types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage},
@@ -71,11 +73,19 @@ impl Future for Held {
 impl Drop for Held {
     fn drop(&mut self) {
         self.0.dropping.notify_one();
-        let mut gate = self.0.gate.0.lock().unwrap();
-        while !*gate {
-            gate = self.0.gate.1.wait(gate).unwrap();
-        }
-        self.0.dropped.store(true, Ordering::SeqCst);
+        tokio::task::block_in_place(|| {
+            let (gate, _) = self
+                .0
+                .gate
+                .1
+                .wait_timeout_while(
+                    self.0.gate.0.lock().unwrap(),
+                    Duration::from_secs(25),
+                    |released| !*released,
+                )
+                .unwrap();
+            self.0.dropped.store(*gate, Ordering::SeqCst);
+        });
     }
 }
 #[derive(Clone)]

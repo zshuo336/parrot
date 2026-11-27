@@ -21,6 +21,7 @@ use tokio::time::Instant;
 
 mod aliases;
 mod retirement;
+use super::recovery::sender::{Journal, Ticket};
 use retirement::{LaneEntry, SenderLane};
 
 enum Attempt {
@@ -65,14 +66,6 @@ struct Grant {
     renew_at: Instant,
 }
 
-impl Grant {
-    fn retired_by(&self, receipt: &Receipt) -> bool {
-        !receipt.active
-            && receipt.ticket == self.receipt.ticket
-            && receipt.receiver == self.receipt.receiver
-    }
-}
-
 struct Lane {
     stream: Identity,
     sequence: u64,
@@ -111,6 +104,7 @@ pub(crate) struct Outbound {
 }
 
 pub(crate) struct SessionTables {
+    journal: Option<Journal>,
     capacity: usize,
     lanes: Mutex<HashMap<String, LaneEntry>>,
     sender_added: tokio::sync::Notify,
@@ -175,12 +169,17 @@ impl Drop for LaneUse<'_> {
 }
 
 impl Outbound {
+    #[cfg(test)]
     pub fn new(source: String, capacity: usize) -> Self {
+        Self::with_journal(source, capacity, None)
+    }
+    pub fn with_journal(source: String, capacity: usize, journal: Option<Journal>) -> Self {
         Self {
             source,
             incarnation: identity(),
             context: SenderContext::Node,
             tables: Arc::new(SessionTables {
+                journal,
                 capacity,
                 lanes: Mutex::new(HashMap::new()),
                 sender_added: Default::default(),
@@ -369,6 +368,9 @@ impl Outbound {
         self.aliases.clear();
         let retired = std::mem::take(&mut *self.lanes.lock().unwrap());
         drop(retired);
+        if let Some(journal) = &self.journal {
+            journal.close();
+        }
     }
 
     fn lane(
@@ -632,11 +634,10 @@ impl Outbound {
                         return Err(ErrCode::Stopped
                             .to_actor_error("resolved ordered receiver changed".into()));
                     }
-                    if let Some(previous) = state
-                        .grant
-                        .as_ref()
-                        .filter(|grant| grant.receipt.receiver != receipt.receiver)
-                    {
+                    if let Some(previous) = state.grant.as_ref().filter(|grant| {
+                        grant.receipt.receiver != receipt.receiver
+                            || (self.journal.is_some() && grant.receipt.ticket != receipt.ticket)
+                    }) {
                         // Only the original receiver can certify its workers retired.
                         // Keep its grant on cancellation or failure so a new route
                         // cannot silently erase an unresolved predecessor.
@@ -667,22 +668,39 @@ impl Outbound {
                     }
                     bind_ticket(receipt.ticket)?;
                     usage.retained = true;
+                    if state.grant.as_ref().is_none_or(|prior| {
+                        prior.receipt.ticket != receipt.ticket
+                            || prior.receipt.receiver != receipt.receiver
+                    }) {
+                        state.sequence = 0;
+                    }
+                    // A cancelled disk write or COMMIT must leave the challenge available to Close.
+                    state.grant = Some(Grant {
+                        receipt,
+                        actor,
+                        sender: sender.clone(),
+                        path: frame.path.clone(),
+                        renew_at: Instant::now(),
+                    });
+                    if let Some(journal) = &self.journal {
+                        journal
+                            .record(
+                                Ticket {
+                                    source: self.source.clone(),
+                                    incarnation: self.incarnation,
+                                    stream: state.stream,
+                                    receiver: receipt.receiver,
+                                    ticket: receipt.ticket,
+                                    epoch: receipt.epoch,
+                                    actor,
+                                    destination: destination.into(),
+                                    path: frame.path.clone(),
+                                },
+                                false,
+                            )
+                            .await?;
+                    }
                     if !receipt.active {
-                        if state.grant.as_ref().is_none_or(|grant| {
-                            grant.receipt.ticket != receipt.ticket
-                                || grant.receipt.receiver != receipt.receiver
-                        }) {
-                            state.sequence = 0;
-                        }
-                        // Cancellation after COMMIT publication must still leave enough
-                        // identity for explicit close to join the receiver's handoff.
-                        state.grant = Some(Grant {
-                            receipt,
-                            actor,
-                            sender: sender.clone(),
-                            path: frame.path.clone(),
-                            renew_at: Instant::now(),
-                        });
                         control.operation = if actor {
                             Operation::CommitActor
                         } else {
@@ -712,20 +730,10 @@ impl Outbound {
                         }
                         receipt = committed;
                     }
-                    if state.grant.as_ref().is_none_or(|grant| {
-                        grant.receipt.ticket != receipt.ticket
-                            || grant.receipt.receiver != receipt.receiver
-                    }) {
-                        state.sequence = 0;
-                    }
-                    state.grant = Some(Grant {
-                        receipt,
-                        actor,
-                        sender: sender.clone(),
-                        path: frame.path.clone(),
-                        renew_at: Instant::now()
-                            + Duration::from_millis((receipt.lease_ms / 2).max(1) as u64),
-                    });
+                    let grant = state.grant.as_mut().expect("opened grant");
+                    grant.receipt = receipt;
+                    grant.renew_at = Instant::now()
+                        + Duration::from_millis((receipt.lease_ms / 2).max(1) as u64);
                 } else {
                     bind_ticket(state.grant.as_ref().expect("active grant").receipt.ticket)?;
                 }
@@ -982,6 +990,57 @@ impl Outbound {
         control: &Control,
         deadline: Instant,
     ) -> ActorResult<()> {
+        let saved = Ticket {
+            source: control.source.clone(),
+            incarnation: control.incarnation,
+            stream: control.stream,
+            receiver: grant.receipt.receiver,
+            ticket: control.ticket,
+            epoch: grant.receipt.epoch,
+            actor: grant.actor,
+            destination: route.destination.into(),
+            path: route.path.into(),
+        };
+        self.retire_ticket(
+            &saved,
+            Some(&grant.sender),
+            current,
+            callbacks,
+            route.hops,
+            deadline,
+        )
+        .await
+    }
+
+    async fn retire_ticket(
+        &self,
+        saved: &Ticket,
+        original: Option<&FrameSender>,
+        current: &FrameSender,
+        callbacks: &CallbackRegistry,
+        hops: u8,
+        deadline: Instant,
+    ) -> ActorResult<()> {
+        let control = Control {
+            source: saved.source.clone(),
+            incarnation: saved.incarnation,
+            stream: saved.stream,
+            ticket: saved.ticket,
+            operation: if saved.actor {
+                Operation::CloseActor
+            } else {
+                Operation::Close
+            },
+        };
+        let control = &control;
+        let route = Route {
+            destination: &saved.destination,
+            path: &saved.path,
+            hops,
+        };
+        let retired_by = |receipt: &Receipt| {
+            !receipt.active && receipt.ticket == saved.ticket && receipt.receiver == saved.receiver
+        };
         let current_path = if current.node_id() == route.destination && route.path.contains('#') {
             super::route::terminal(route.path)
                 .map_err(|code| code.to_actor_error("invalid saved ordered route".into()))?
@@ -994,12 +1053,12 @@ impl Outbound {
             (!control.source.contains('@') || sender.supports_sender_sessions())
                 && (!path.contains('#') || sender.supports_ordered_route())
         };
-        if let Some(epoch) = grant.receipt.epoch.filter(|_| {
+        if let Some(epoch) = saved.epoch.filter(|_| {
             current.supports_ordered_recovery() && carries_identity(current, current_path)
         }) {
             let mut recovery = control.clone();
             recovery.operation = Operation::Recover {
-                receiver: grant.receipt.receiver,
+                receiver: saved.receiver,
                 epoch,
             };
             match request(
@@ -1013,7 +1072,7 @@ impl Outbound {
             )
             .await
             {
-                Ok(receipt) if grant.retired_by(&receipt) => return Ok(()),
+                Ok(receipt) if retired_by(&receipt) => return self.forget_ticket(saved).await,
                 Ok(_) => {
                     return Err(ErrCode::ProtocolViolation
                         .to_actor_error("ordered recovery identity differs".into()))
@@ -1022,14 +1081,13 @@ impl Outbound {
                 Err((code, detail)) => return Err(code.to_actor_error(detail)),
             }
         }
-        let (sender, path) = if grant.sender.is_closed() {
-            (current, current_path)
-        } else {
-            (&grant.sender, route.path)
+        let (sender, path) = match original.filter(|sender| !sender.is_closed()) {
+            Some(sender) => (sender, route.path),
+            None => (current, current_path),
         };
         if !carries_identity(sender, path)
             || !sender.supports_ordered_tell()
-            || (grant.actor && !sender.supports_actor_sessions())
+            || (saved.actor && !sender.supports_actor_sessions())
         {
             return Err(ErrCode::NotRemotable
                 .to_actor_error("route cannot retire the original ordered session".into()));
@@ -1071,14 +1129,13 @@ impl Outbound {
                     .filter(|fresh| fresh != path && endpoint.path == terminal)
                     .ok_or_else(|| ErrCode::Forbidden.to_actor_error(detail.clone()))?;
                 let mut retry = control.clone();
-                if endpoint.receiver != grant.receipt.receiver {
-                    let epoch = grant
-                        .receipt
+                if endpoint.receiver != saved.receiver {
+                    let epoch = saved
                         .epoch
                         .filter(|_| current.supports_ordered_recovery())
                         .ok_or_else(|| ErrCode::Forbidden.to_actor_error(detail))?;
                     retry.operation = Operation::Recover {
-                        receiver: grant.receipt.receiver,
+                        receiver: saved.receiver,
                         epoch,
                     };
                 }
@@ -1096,9 +1153,16 @@ impl Outbound {
             other => other,
         }
         .map_err(|(code, detail)| code.to_actor_error(detail))?;
-        if !grant.retired_by(&receipt) {
+        if !retired_by(&receipt) {
             return Err(ErrCode::ProtocolViolation
                 .to_actor_error("ordered retirement identity differs".into()));
+        }
+        self.forget_ticket(saved).await
+    }
+
+    async fn forget_ticket(&self, saved: &Ticket) -> ActorResult<()> {
+        if let Some(journal) = &self.journal {
+            journal.record(saved.clone(), true).await?;
         }
         Ok(())
     }
