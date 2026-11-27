@@ -1,21 +1,17 @@
 //! remote-bench：远程性能基准（DEV_01 §6）。
 //!
-//! 场景：seq-ask / conc-ask c8/c64 / tell-throughput / pingpong。
-//! `--gate p1`：门禁判定（ask p50 <150µs、tell <60µs；E1.9 超标 exit 1）。
-//!
-//! 双进程真实 TCP；本 binary 同进程双节点（127.0.0.1 回环）跑——CI 与
-//! DEV_00 §4.2 验收命令直接调用形态（两节点同机回环即"双进程语义"等价：
-//! 传输层是真实 TCP 栈）。
+//! 在同进程的两个节点之间使用真实 TCP 回环，测量顺序 ASK 和分批 TELL。
+//! `--gate p1` 按 DEV_01 §6 检查 ASK p50 及每条已核对 TELL 的平均耗时。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use parrot_api::address::ActorRef;
 use parrot_api::errors::ActorError;
 use parrot_api::types::{ActorResult, BoxedActorRef, BoxedFuture, BoxedMessage};
 use parrot_remote::{LocalLookup, RemoteActorSystem, RemoteConfig};
 use std::any::Any;
+use tokio::sync::mpsc;
 
 /// 基准消息（bincode 载荷 8B u64——LAN RTT 主导场景的标准体量）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -55,8 +51,8 @@ parrot_api::message::inventory::submit! {
 }
 
 /// 回声 actor 桩（bench 不需要完整引擎——直接 ActorRef 桩避免引入 parrot）。
-#[derive(Debug)]
-struct EchoStub;
+#[derive(Clone, Debug)]
+struct EchoStub(mpsc::Sender<u64>);
 
 #[async_trait::async_trait]
 impl ActorRef for EchoStub {
@@ -76,8 +72,13 @@ impl ActorRef for EchoStub {
             Err(ActorError::MessageHandlingError("unexpected type".into()))
         })
     }
-    fn deliver<'a>(&'a self, _msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
-        Box::pin(async move { Ok(()) })
+    fn deliver<'a>(&'a self, msg: BoxedMessage) -> BoxedFuture<'a, ActorResult<()>> {
+        Box::pin(async move {
+            let ping = msg
+                .downcast::<BenchPing>()
+                .map_err(|_| ActorError::MessageHandlingError("unexpected TELL payload".into()))?;
+            self.0.send(ping.0).await.map_err(|_| ActorError::Stopped)
+        })
     }
     fn stop<'a>(&'a self) -> BoxedFuture<'a, ActorResult<()>> {
         Box::pin(async move { Ok(()) })
@@ -89,19 +90,26 @@ impl ActorRef for EchoStub {
         Box::pin(async move { true })
     }
     fn clone_boxed(&self) -> BoxedActorRef {
-        Box::new(Self)
+        Box::new(self.clone())
     }
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-struct EchoLookup;
+#[async_trait::async_trait]
+impl LocalLookup for EchoStub {
+    async fn lookup(&self, path: &str) -> Option<Box<dyn ActorRef>> {
+        (path == "/user/echo").then(|| self.clone_boxed())
+    }
+}
+
+struct ClientLookup;
 
 #[async_trait::async_trait]
-impl LocalLookup for EchoLookup {
-    async fn lookup(&self, path: &str) -> Option<Box<dyn ActorRef>> {
-        (path == "/user/echo").then(|| Box::new(EchoStub) as Box<dyn ActorRef>)
+impl LocalLookup for ClientLookup {
+    async fn lookup(&self, _: &str) -> Option<BoxedActorRef> {
+        None
     }
 }
 
@@ -113,45 +121,50 @@ fn stats(samples: &mut [u64]) -> (u64, u64, u64) {
     (p50, p99, max)
 }
 
+const TELL_BATCH: usize = 1000;
+
+async fn verify_batch(receiver: &mut mpsc::Receiver<u64>, first: u64) -> Result<(), String> {
+    let mut seen = [false; TELL_BATCH];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..TELL_BATCH {
+            let value = receiver.recv().await.ok_or("TELL receiver closed")?;
+            let slot = value
+                .checked_sub(first)
+                .filter(|n| *n < TELL_BATCH as u64)
+                .ok_or_else(|| format!("unexpected TELL {value} in batch starting at {first}"))?;
+            if std::mem::replace(&mut seen[slot as usize], true) {
+                return Err(format!("duplicate TELL {value}"));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| format!("TELL batch starting at {first} timed out"))?
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let gate = std::env::args().any(|a| a == "--gate" || a.starts_with("--gate"));
 
     // 双节点：server（echo）+ client（bench 驱动），真实 TCP 回环
+    let (received, mut receipts) = mpsc::channel(TELL_BATCH);
     let server = RemoteActorSystem::new(
         RemoteConfig::tcp("bench-server", Some("127.0.0.1:0".parse().unwrap())),
-        Arc::new(EchoLookup),
+        Arc::new(EchoStub(received)),
     )
     .unwrap();
     server.start().await.unwrap();
-    let port = {
-        // bind 由 transport 持有——重 bind 拿地址：简化，用固定端口段探测
-        39191u16
-    };
-    // 重新用确定端口起 server
-    drop(server);
-    let server = RemoteActorSystem::new(
-        RemoteConfig::tcp(
-            "bench-server",
-            Some(format!("127.0.0.1:{port}").parse().unwrap()),
-        ),
-        Arc::new(EchoLookup),
-    )
-    .unwrap();
-    server.start().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let address = server.local_addr().expect("TCP listener has started");
 
+    // Only the server owns the sink that certifies target deliveries.
     let client = RemoteActorSystem::new(
         RemoteConfig::tcp("bench-client", None),
-        Arc::new(EchoLookup),
+        Arc::new(ClientLookup),
     )
     .unwrap();
     client.start().await.unwrap();
     client
-        .connect(&parrot_remote::NodeAddr::tcp(
-            "bench-server",
-            format!("127.0.0.1:{port}").parse().unwrap(),
-        ))
+        .connect(&parrot_remote::NodeAddr::tcp("bench-server", address))
         .await
         .unwrap();
 
@@ -188,14 +201,21 @@ async fn main() {
     let dur = Duration::from_secs(5);
     let mut sent = 0u64;
     while t0.elapsed() < dur {
-        for _ in 0..1000 {
+        let first = sent;
+        for _ in 0..TELL_BATCH {
             echo.deliver(Box::new(BenchPing(sent))).await.unwrap();
             sent += 1;
         }
+        verify_batch(&mut receipts, first)
+            .await
+            .expect("receiver must verify every TELL");
     }
     let tell_rt = t0.elapsed().as_nanos() as f64 / sent as f64;
 
-    println!("== remote-bench（127.0.0.1 TCP 回环）==");
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+    assert!(receipts.try_recv().is_err(), "unexpected extra TELL");
+    println!("== remote-bench（同进程 127.0.0.1 TCP 回环）==");
     println!(
         "seq-ask    : n={} p50={}µs p99={}µs max={}µs thru={:.0}/s",
         lat.len(),
@@ -205,12 +225,15 @@ async fn main() {
         ask_thruput
     );
     println!(
-        "tell       : n={} mean={:.1}µs thru={:.0}/s",
+        "tell       : n={} mean={:.1}µs thru={:.0}/s (receiver verified)",
         sent,
         tell_rt / 1000.0,
         1e9 / tell_rt
     );
-    println!("remote-tax : p50 - local(~3µs) ≈ {}µs", p50 / 1000 - 3);
+    println!(
+        "remote-tax : p50 - local(~3µs) ≈ {:.1}µs",
+        p50 as f64 / 1000.0 - 3.0
+    );
 
     if gate {
         let ask_ok = p50 < 150_000;
@@ -226,7 +249,41 @@ async fn main() {
         }
         println!("E1.9 gate PASS");
     }
-    let _ = Bytes::new();
-    server.shutdown().await.ok();
-    client.shutdown().await.ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_batch_fails_with_sender_still_alive() {
+        let (sender, mut receiver) = mpsc::channel(TELL_BATCH);
+        for value in 0..TELL_BATCH as u64 - 1 {
+            sender.send(value).await.unwrap();
+        }
+        assert!(verify_batch(&mut receiver, 0)
+            .await
+            .unwrap_err()
+            .contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn only_distinct_values_from_the_current_batch_count() {
+        for bad in [0, 1, TELL_BATCH as u64 + 1] {
+            let (sender, mut receiver) = mpsc::channel(TELL_BATCH);
+            sender.send(1).await.unwrap();
+            sender.send(bad).await.unwrap();
+            drop(sender);
+            let error = verify_batch(&mut receiver, 1).await.unwrap_err();
+            assert!(
+                error.contains(if bad == 1 { "duplicate" } else { "unexpected" }),
+                "{error}"
+            );
+        }
+        let (sender, mut receiver) = mpsc::channel(TELL_BATCH);
+        for value in (1..=TELL_BATCH as u64).rev() {
+            sender.send(value).await.unwrap();
+        }
+        verify_batch(&mut receiver, 1).await.unwrap();
+    }
 }
