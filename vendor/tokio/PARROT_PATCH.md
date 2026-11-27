@@ -156,7 +156,10 @@ repair itself remains specific to Linux GNU. `parrot-remote` separately requires
 consumers that depend on the remote layer. Those consumers also need the root
 patch. The core `parrot` crate also requires `tokio/parrot-blocking-ownership`
 for failed blocking-dispatch cleanup, including applications without remote or
-native loading. The API crate requires `tokio/parrot-worker-startup` for fallible
+native loading. The core crate uses `tokio/parrot-blocking-context` to identify
+current-thread and LocalSet callers before synchronous shared-pool shutdown.
+Such callers can await `ThreadScheduler::shutdown_async` while their executor
+continues to progress. The API crate requires `tokio/parrot-worker-startup` for fallible
 scheduler worker launch. Pure ABI without the loader requires neither marker nor Tokio.
 
 If a consumer already locks a newer registry version, merely adding the patch
@@ -246,7 +249,7 @@ the underlying wake and permit-distribution paths change.
 Keep the upstream source and license intact. When upgrading, verify the new
 archive checksum, review the five native runtime changes, three deferred-channel
 changes, three documentation corrections, blocking task ownership, notification
-fanout, fallible scheduler worker launch and all four
+fanout, blocking-context detection, fallible scheduler worker launch and all five
 capability requirements, and
 run `native_runtime_progress` and `dylib_assembly` with the real workspace
 feature union on Linux GNU. The former must detect both cold-thread defects in

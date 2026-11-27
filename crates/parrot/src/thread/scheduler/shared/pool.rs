@@ -751,6 +751,7 @@ impl SharedThreadPool {
         timeout_ms: u64,
         runtime: &Handle,
     ) -> Result<(), SystemError> {
+        self.cleanups.check_wait()?;
         let mut receipt = self.ensure_shutdown_on(timeout_ms, runtime);
         loop {
             if let Some(result) = receipt.borrow_and_update().clone() {
@@ -790,59 +791,61 @@ impl SharedThreadPool {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         drop(_gate);
         drop(receipt);
-        runtime.spawn(async move {
-            let mut closing = FuturesUnordered::new();
-            // Close the queue BEFORE taking the path index: a concurrent schedule
-            // holding that index must either finish registration or see closed.
-            for mailbox in queue.close_and_take() {
-                failures.isolate("mailbox schedule release", || {
-                    mailbox.schedule_state().force_release()
-                });
-                closing.push(MailboxClose::new(
-                    mailbox,
-                    failures.clone(),
-                    "queued mailbox close",
-                ));
-            }
-            let registrations = std::mem::take(&mut *registrations.lock().unwrap());
-            for mailbox in registrations.into_values() {
-                closing.push(MailboxClose::new(
-                    mailbox.0.clone(),
-                    failures.clone(),
-                    "registered mailbox close",
-                ));
-            }
-            // A grace expiry stops waiting here, not the individual close
-            // operations. Join/abort workers before awaiting the remaining drain,
-            // since a mailbox destructor can depend on worker retirement.
-            while let Ok(Some(())) = tokio::time::timeout_at(deadline, closing.next()).await {}
-            if let Some(patrol) = patrol {
-                let already_finished = patrol.is_finished();
-                patrol.abort();
-                failures.join(patrol.await, !already_finished);
-            }
-            for mut worker in workers.into_iter().rev() {
-                let result = tokio::time::timeout_at(deadline, &mut worker).await;
-                match result {
-                    Ok(result) => failures.join(result, false),
-                    Err(_) => {
-                        let already_finished = worker.is_finished();
-                        worker.abort();
-                        failures.join(worker.await, !already_finished);
+        runtime.spawn(
+            super::worker::RETIRING_POOL.scope(cleanups.id(), async move {
+                let mut closing = FuturesUnordered::new();
+                // Close the queue BEFORE taking the path index: a concurrent schedule
+                // holding that index must either finish registration or see closed.
+                for mailbox in queue.close_and_take() {
+                    failures.isolate("mailbox schedule release", || {
+                        mailbox.schedule_state().force_release()
+                    });
+                    closing.push(MailboxClose::new(
+                        mailbox,
+                        failures.clone(),
+                        "queued mailbox close",
+                    ));
+                }
+                let registrations = std::mem::take(&mut *registrations.lock().unwrap());
+                for mailbox in registrations.into_values() {
+                    closing.push(MailboxClose::new(
+                        mailbox.0.clone(),
+                        failures.clone(),
+                        "registered mailbox close",
+                    ));
+                }
+                // A grace expiry stops waiting here, not the individual close
+                // operations. Join/abort workers before awaiting the remaining drain,
+                // since a mailbox destructor can depend on worker retirement.
+                while let Ok(Some(())) = tokio::time::timeout_at(deadline, closing.next()).await {}
+                if let Some(patrol) = patrol {
+                    let already_finished = patrol.is_finished();
+                    patrol.abort();
+                    failures.join(patrol.await, !already_finished);
+                }
+                for mut worker in workers.into_iter().rev() {
+                    let result = tokio::time::timeout_at(deadline, &mut worker).await;
+                    match result {
+                        Ok(result) => failures.join(result, false),
+                        Err(_) => {
+                            let already_finished = worker.is_finished();
+                            worker.abort();
+                            failures.join(worker.await, !already_finished);
+                        }
                     }
                 }
-            }
-            if let Some(retirement) = retirement {
-                failures.join(retirement.await, false);
-            }
-            while closing.next().await.is_some() {}
-            // Worker task joins do not imply that a cancelled user future's
-            // destructor has run. Wait for this pool's actual poll/disposal
-            // owners before publishing its terminal shutdown state.
-            cleanups.wait().await;
-            status.store(SchedulerStatus::Shutdown as usize, Ordering::Release);
-            crate::owned_payload::publish_watch(&sender, failures.result());
-        });
+                if let Some(retirement) = retirement {
+                    failures.join(retirement.await, false);
+                }
+                while closing.next().await.is_some() {}
+                // Worker task joins do not imply that a cancelled user future's
+                // destructor has run. Wait for this pool's actual poll/disposal
+                // owners before publishing its terminal shutdown state.
+                cleanups.wait().await;
+                status.store(SchedulerStatus::Shutdown as usize, Ordering::Release);
+                crate::owned_payload::publish_watch(&sender, failures.result());
+            }),
+        );
         receiver
     }
 
@@ -948,9 +951,42 @@ impl ThreadScheduler for SharedThreadPool {
     }
 
     fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.runtime_handle
-            .block_on(async { self.shutdown(5000).await })
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        self.cleanups.check_wait()?;
+        if let Some(result) = self
+            .shutdown_receipt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|receipt| receipt.borrow().clone())
+        {
+            return Ok(result.map_err(SystemError::ShutdownError)?);
+        }
+        if !Handle::parrot_allows_block_in_place() {
+            return Err(Box::new(SystemError::WorkerStateError(
+                "shared scheduler shutdown needs executor progress; await shutdown_async() in this context".into(),
+            )));
+        }
+        // A current-thread host can be alive but undriven. Its own timer
+        // cannot bound the synchronous wait. Cleanup remains on the host
+        // and keeps its receipt if this caller's deadline expires.
+        let clock = crate::thread::native_budget::join_runtime()?;
+        tokio::task::block_in_place(|| {
+            clock.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), self.shutdown(5000))
+                    .await
+                    .map_err(|_| SystemError::Timeout(
+                        "shared scheduler shutdown is still pending; drive its host and await shutdown_async()".into(),
+                    ))?
+            })
+        })?;
+        Ok(())
+    }
+
+    fn shutdown_async(
+        &self,
+    ) -> parrot_api::types::BoxedFuture<'_, Result<(), Box<dyn std::error::Error + Send + Sync>>>
+    {
+        Box::pin(async move { Ok(self.shutdown(5000).await?) })
     }
 }
 

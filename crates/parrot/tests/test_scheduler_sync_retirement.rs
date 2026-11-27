@@ -46,6 +46,25 @@ impl Actor for Probe {
         _: &'a mut Self::Context,
     ) -> BoxedFuture<'a, ActorResult<BoxedMessage>> {
         Box::pin(async move {
+            let msg = match msg.downcast::<(Arc<DedicatedThreadScheduler>, mpsc::Sender<bool>)>() {
+                Ok(input) => {
+                    let (owner, reply) = *input;
+                    let scheduler: &dyn ThreadScheduler = owner.as_ref();
+                    for result in [
+                        scheduler.deschedule(PATH),
+                        scheduler.deschedule_async(PATH).await,
+                        scheduler.shutdown(),
+                        scheduler.shutdown_async().await,
+                    ] {
+                        let error = result.unwrap_err();
+                        assert!(matches!(error.downcast_ref::<SystemError>(),
+                            Some(SystemError::WorkerStateError(message)) if message.contains("own worker")));
+                    }
+                    reply.send(scheduler.is_scheduled(PATH)).unwrap();
+                    return Ok(Box::new(()) as BoxedMessage);
+                }
+                Err(msg) => msg,
+            };
             let (guard, reply) = *msg
                 .downcast::<(ThreadExit, mpsc::Sender<std::thread::ThreadId>)>()
                 .unwrap();
@@ -54,6 +73,38 @@ impl Actor for Probe {
             Ok(Box::new(()) as BoxedMessage)
         })
     }
+}
+
+#[test]
+fn dedicated_worker_refuses_its_own_removal_and_shutdown_before_changing_state() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let scheduler = Arc::new(DedicatedThreadScheduler::new(None));
+    let mailbox = Arc::new(MpscMailbox::new(2, ActorPath::placeholder(PATH)));
+    mailbox.set_processor(Arc::new(ActorProcessor::new(
+        ThreadActor::new_for_test(Probe),
+        ThreadContext::new_for_test(PATH),
+        PATH.into(),
+        ThreadActorConfig::default(),
+    )));
+    ThreadScheduler::schedule(scheduler.as_ref(), PATH, mailbox.clone(), None).unwrap();
+    for _ in 0..2 {
+        let (reply, observed) = mpsc::channel::<bool>();
+        runtime
+            .block_on(mailbox.push(
+                Box::new((scheduler.clone(), reply)),
+                BackpressureStrategy::Error,
+            ))
+            .unwrap();
+        assert!(observed.recv_timeout(WAIT).unwrap());
+    }
+    runtime
+        .block_on(ThreadScheduler::shutdown_async(scheduler.as_ref()))
+        .unwrap();
+    assert_eq!(scheduler.worker_count(), 0);
 }
 
 #[derive(Clone, Copy)]

@@ -74,6 +74,7 @@ parrot-native-progress = []
 parrot-deferred-mpsc = []
 # Core cleanup requires failed blocking dispatch to release task ownership.
 parrot-blocking-ownership = []
+parrot-blocking-context = []
 # Owned API executors require every scheduler worker OS spawn to succeed.
 parrot-worker-startup = []
 default = []

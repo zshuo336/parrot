@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -312,6 +312,7 @@ impl DedicatedThreadScheduler {
             .get(path)
             .filter(|w| processor.is_none_or(|p| Arc::ptr_eq(&w.processor, p)))
         {
+            worker.check_wait()?;
             return Ok(Some(worker.clone()));
         }
         // Keep the registry lock through lookup: reaping records the receipt
@@ -435,7 +436,7 @@ impl DedicatedThreadScheduler {
 
     pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> Result<(), SystemError> {
         let mut failure = None;
-        for worker in self.begin_shutdown() {
+        for worker in self.begin_shutdown()? {
             if let Err(error) = worker.stop_until(deadline).await {
                 failure = Some(error);
             }
@@ -444,19 +445,21 @@ impl DedicatedThreadScheduler {
         self.finish_shutdown(failure)
     }
 
-    fn begin_shutdown(&self) -> Vec<Arc<DedicatedWorker>> {
-        self.status.store(2, Ordering::SeqCst); // ShuttingDown
-        self.is_shutting_down.store(true, Ordering::SeqCst);
-
+    fn begin_shutdown(&self) -> Result<Vec<Arc<DedicatedWorker>>, SystemError> {
         let workers: Vec<Arc<DedicatedWorker>> = {
             let workers = self.workers.lock().unwrap();
+            for worker in workers.values() {
+                worker.check_wait()?;
+            }
+            self.status.store(2, Ordering::SeqCst); // ShuttingDown
+            self.is_shutting_down.store(true, Ordering::SeqCst);
             workers.values().cloned().collect()
         };
 
         for worker in &workers {
             worker.request_stop();
         }
-        workers
+        Ok(workers)
     }
 
     fn finish_shutdown(&self, mut failure: Option<SystemError>) -> Result<(), SystemError> {
@@ -524,10 +527,23 @@ impl ThreadScheduler for DedicatedThreadScheduler {
         self.is_scheduled(path)
     }
 
+    fn deschedule_async<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> parrot_api::types::BoxedFuture<'a, Result<(), Box<dyn Error + Send + Sync>>> {
+        Box::pin(async move { Ok(self.deschedule(path).await?) })
+    }
+
+    fn shutdown_async(
+        &self,
+    ) -> parrot_api::types::BoxedFuture<'_, Result<(), Box<dyn Error + Send + Sync>>> {
+        Box::pin(async move { Ok(self.shutdown().await?) })
+    }
+
     fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut failure = None;
-        for worker in self.begin_shutdown() {
+        for worker in self.begin_shutdown()? {
             if let Err(error) = worker.stop_blocking_until(deadline) {
                 failure = Some(error);
             }
@@ -666,6 +682,8 @@ struct DedicatedWorker {
 
     /// Join slot for the OS thread
     join_slot: Mutex<Option<std::thread::JoinHandle<DedicatedExit>>>,
+    // TLS destruction can reenter after the handle has moved to the join owner.
+    thread_id: OnceLock<std::thread::ThreadId>,
     join_claimed: AtomicBool,
     join_receipt: Arc<Mutex<Option<DedicatedExit>>>,
     join_runtime: Handle,
@@ -836,6 +854,7 @@ impl DedicatedWorker {
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             state: Arc::new(AtomicUsize::new(WorkerState::Initializing as usize)),
             join_slot: Mutex::new(None),
+            thread_id: OnceLock::new(),
             join_claimed: AtomicBool::new(false),
             join_receipt: Arc::new(Mutex::new(None)),
             join_runtime: crate::thread::native_budget::join_runtime()?,
@@ -1002,7 +1021,20 @@ impl DedicatedWorker {
             })
             .map_err(|e| e.to_string())?;
 
+        self.thread_id
+            .set(handle.thread().id())
+            .expect("dedicated worker started twice");
         *self.join_slot.lock().unwrap() = Some(handle);
+        Ok(())
+    }
+
+    fn check_wait(&self) -> Result<(), SystemError> {
+        if self.thread_id.get() == Some(&std::thread::current().id()) {
+            return Err(SystemError::WorkerStateError(format!(
+                "dedicated actor {} cannot join its own worker",
+                self.path
+            )));
+        }
         Ok(())
     }
 

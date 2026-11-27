@@ -37,6 +37,18 @@ pub struct EnterGuard<'a> {
 }
 
 impl Handle {
+    /// Whether the calling thread can hand off its executor to enter a
+    /// blocking section. This also detects a LocalSet driven on the caller.
+    #[cfg(all(feature = "rt-multi-thread", feature = "parrot-blocking-context"))]
+    pub fn parrot_allows_block_in_place() -> bool {
+        !matches!(
+            context::current_enter_context(),
+            context::EnterRuntime::Entered {
+                allow_block_in_place: false
+            }
+        )
+    }
+
     /// Enters the runtime context. This allows you to construct types that must
     /// have an executor available on creation such as [`Sleep`] or
     /// [`TcpStream`]. It will also allow you to call methods such as

@@ -20,6 +20,7 @@ import time
 MARKER = 'parrot-native-progress'
 REMOTE_MARKER = 'parrot-deferred-mpsc'
 BLOCKING_MARKER = 'parrot-blocking-ownership'
+BLOCKING_CONTEXT_MARKER = 'parrot-blocking-context'
 STARTUP_MARKER = 'parrot-worker-startup'
 CASES = [
     ('parrot-api', [], False),
@@ -142,7 +143,7 @@ class Check:
     def metadata(self, name, consumer, native, patch, pure_abi=False, locked=False, remote=False,
                  blocking=False, startup=False):
         required = (({MARKER} if native else set()) | ({REMOTE_MARKER} if remote else set())
-                    | ({BLOCKING_MARKER} if blocking else set())
+                    | ({BLOCKING_MARKER, BLOCKING_CONTEXT_MARKER} if blocking else set())
                     | ({STARTUP_MARKER} if startup else set()))
         stdout, stderr = self.run(name, consumer, ['metadata', '--format-version', '1']
                                   + (['--locked'] if locked else []),

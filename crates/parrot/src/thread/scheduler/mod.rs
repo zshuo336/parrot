@@ -357,11 +357,31 @@ pub trait ThreadScheduler: fmt::Debug + Send + Sync {
     /// Deschedule an actor from the thread pool
     fn deschedule(&self, path: &str) -> Result<(), Box<dyn Error + Send + Sync>>;
 
+    /// Remove a scheduled path from an async caller. Implementations with
+    /// asynchronous retirement should override the synchronous fallback.
+    fn deschedule_async<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> parrot_api::types::BoxedFuture<'a, Result<(), Box<dyn Error + Send + Sync>>> {
+        Box::pin(async move { self.deschedule(path) })
+    }
+
     /// Check if an actor is currently scheduled
     fn is_scheduled(&self, path: &str) -> bool;
 
-    /// Shut down the thread pool
+    /// Shut down the thread pool. The native shared pool returns a state error
+    /// inside a current-thread executor or LocalSet while retirement is pending.
+    /// Other synchronous callers wait up to five seconds and can retry a timeout.
+    /// A worker cannot join its own retirement.
     fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
+
+    /// Await retirement. The native shared and dedicated pools yield to the
+    /// executor. The default calls the implementation's synchronous shutdown.
+    fn shutdown_async(
+        &self,
+    ) -> parrot_api::types::BoxedFuture<'_, Result<(), Box<dyn Error + Send + Sync>>> {
+        Box::pin(async move { self.shutdown() })
+    }
 
     /// Owned OS worker threads (including retirement until joined). Tasks on
     /// an external executor do not constitute owned OS threads.

@@ -745,7 +745,25 @@ pub(super) struct IsolatedCleanupTracker {
     pending: AtomicUsize,
     changed: Notify,
 }
+tokio::task_local! {
+    pub(super) static RETIRING_POOL: usize;
+}
 impl IsolatedCleanupTracker {
+    pub(super) fn id(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    pub(super) fn check_wait(&self) -> Result<(), crate::thread::error::SystemError> {
+        if RETIRING_POOL
+            .try_with(|id| *id == self.id())
+            .unwrap_or(false)
+        {
+            return Err(crate::thread::error::SystemError::WorkerStateError(
+                "a shared scheduler callback cannot await its own retirement".into(),
+            ));
+        }
+        Ok(())
+    }
     fn enter(self: &Arc<Self>) -> IsolatedCleanupGuard {
         self.pending.fetch_add(1, Ordering::AcqRel);
         IsolatedCleanupGuard(self.clone())
@@ -822,10 +840,17 @@ struct CaughtDisposal<T> {
 }
 impl<T> Drop for CaughtDisposal<T> {
     fn drop(&mut self) {
-        if let Err(payload) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.value.take())))
-        {
-            let _ = crate::owned_payload::panic_message(payload);
+        let id = self._cleanup.as_ref().map(|guard| guard.0.id());
+        let mut dispose = || {
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.value.take())))
+            {
+                let _ = crate::owned_payload::panic_message(payload);
+            }
+        };
+        match id {
+            Some(id) => RETIRING_POOL.sync_scope(id, dispose),
+            None => dispose(),
         }
     }
 }
@@ -888,6 +913,7 @@ where
     F: Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
+    let owner = cleanups.as_deref().map(IsolatedCleanupTracker::id);
     let mut future = IsolatedFuture::new(future, slots.clone(), retirement_runtime, cleanups);
     let wake = Arc::new(PollWake(Notify::new()));
     let mut permit = Some(first_permit);
@@ -898,7 +924,7 @@ where
         };
         let poll_wake = wake.clone();
         let finished = poll_finished.clone();
-        let task = tokio::task::spawn_blocking(move || {
+        let poll = move || {
             let waker = waker_ref(&poll_wake);
             let mut result = crate::owned_payload::PublicationInput::new(
                 future.poll(&mut Context::from_waker(&waker)),
@@ -927,6 +953,10 @@ where
             drop(slot);
             finished.notify_one();
             (future, result.take())
+        };
+        let task = tokio::task::spawn_blocking(move || match owner {
+            Some(id) => RETIRING_POOL.sync_scope(id, poll),
+            None => poll(),
         });
         let cancel_on_drop = AbortQueuedPoll(task.abort_handle());
         let (returned_future, result) = task
