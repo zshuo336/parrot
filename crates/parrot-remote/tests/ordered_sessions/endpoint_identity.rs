@@ -3,6 +3,7 @@ use super::{seen, start, state, strict, Empty, HeldDrop, Release, State, Target,
 use parrot_api::errors::ActorError;
 use parrot_api::types::BoxedActorRef;
 use parrot_remote::{handshake::TopologyRole, transport::RuntimeKnobs, LocalLookup, RemoteConfig};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -120,6 +121,67 @@ async fn missing_actor_does_not_consume_the_next_sequence() {
         .close_ordered_session(Duration::from_secs(3))
         .await
         .unwrap();
+    source.shutdown().await.unwrap();
+    target.shutdown().await.unwrap();
+}
+
+struct FallibleRoute {
+    actor: Target,
+    fail_next: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl LocalLookup for FallibleRoute {
+    async fn lookup(&self, path: &str) -> Option<BoxedActorRef> {
+        self.actor.lookup(path).await
+    }
+
+    fn forwarding_target(&self, _: &str) -> Option<String> {
+        assert!(
+            !self.fail_next.swap(false, Ordering::AcqRel),
+            "injected route lookup failure"
+        );
+        None
+    }
+}
+
+#[tokio::test]
+async fn failed_route_lookup_preserves_the_next_ordered_delivery() {
+    let (actor, mut received) = state();
+    let lookup = Arc::new(FallibleRoute {
+        actor: Target(actor),
+        fail_next: AtomicBool::new(false),
+    });
+    let source = start(RemoteConfig::mem("route-failure-source"), Arc::new(Empty)).await;
+    let target = start(
+        RemoteConfig::mem("route-failure-target").with_knobs(RuntimeKnobs {
+            reorder_gap_timeout_ms: 20_000,
+            ..Default::default()
+        }),
+        lookup.clone(),
+    )
+    .await;
+    source.connect_mem_pair(&target).await.unwrap();
+    let reference = source
+        .remote_ref("parrot://route-failure-target/target")
+        .unwrap();
+    strict(&reference, 21).await;
+    seen(&mut received, 21).await;
+    lookup.fail_next.store(true, Ordering::Release);
+    let error = reference
+        .deliver_ordered(Box::new(Work(22)), Default::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ActorError::InternalError(ref detail) if detail.contains("protocol violation"))
+    );
+    strict(&reference, 23).await;
+    seen(&mut received, 23).await;
+    reference
+        .close_ordered_session(Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(received.try_recv().is_err());
     source.shutdown().await.unwrap();
     target.shutdown().await.unwrap();
 }

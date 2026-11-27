@@ -820,7 +820,7 @@ impl Ingress {
                 let detail = if code == ErrCode::NotRemotable {
                     id.alias_error()
                 } else {
-                    "ordered endpoint lookup failed".into()
+                    id.endpoint_error()
                 };
                 back.send_reply(Frame::reply_err(cid, "", code, &detail));
             }
