@@ -40,6 +40,11 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def missing_tokio_capability(diagnostic, required):
+    return any(f'depends on `tokio` with feature `{feature}` but `tokio` does not have that feature'
+               in diagnostic for feature in required)
+
+
 class Check:
     def __init__(self, args):
         self.args = args
@@ -149,7 +154,7 @@ class Check:
                                   + (['--locked'] if locked else []),
                                   expected=101 if required and not patch else 0)
         if required and not patch:
-            require(any(marker in stderr for marker in required) and 'does not have that feature' in stderr,
+            require(missing_tokio_capability(stderr, required),
                     f'{name}: failure must identify the missing capability, not a network/compiler error')
             return
         data = json.loads(stdout)
@@ -219,7 +224,7 @@ class Check:
         # the failure and then perform the documented explicit selection.
         _, stderr = self.run('newer-lock-patched-not-selected', consumer,
                              ['metadata', '--format-version', '1', '--locked'], expected=101)
-        missing_capability = (MARKER in stderr or STARTUP_MARKER in stderr) and 'does not have that feature' in stderr
+        missing_capability = missing_tokio_capability(stderr, (MARKER, STARTUP_MARKER))
         locked_change = '--locked' in stderr and ('lock file' in stderr or 'lockfile' in stderr)
         require(missing_capability or locked_change,
                 'locked migration must fail on capability or required lock update, not an unrelated error')

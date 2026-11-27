@@ -14,6 +14,10 @@ ROOT = Path(os.environ.get('PARROT_NATIVE_CONSUMER_ROOT', Path(__file__).resolve
 GATE = Path(os.environ.get('PARROT_NATIVE_CONSUMER_GATE', ROOT / 'scripts/check_native_runtime_dependency.py'))
 
 
+def missing_feature(feature, package='tokio'):
+    return f"package `consumer` depends on `{package}` with feature `{feature}` but `{package}` does not have that feature."
+
+
 def gate_module():
     spec = importlib.util.spec_from_file_location('consumer_gate_contract', GATE)
     module = importlib.util.module_from_spec(spec)
@@ -90,11 +94,13 @@ class ConsumerGateContracts(unittest.TestCase):
 
     def test_remote_only_missing_patch_must_identify_the_deferred_mpsc_capability(self):
         gate = gate_module()
-        expected, resolutions = self.check_metadata('', gate.REMOTE_MARKER + ': does not have that feature', patch=False)
+        expected, resolutions = self.check_metadata('', missing_feature(gate.REMOTE_MARKER), patch=False)
         self.assertEqual(expected, 101)
         self.assertEqual(resolutions, [])
-        for stderr in ['network unavailable', gate.MARKER + ': does not have that feature',
-                       gate.REMOTE_MARKER + ': unrelated compiler failure']:
+        for stderr in ['network unavailable', missing_feature(gate.MARKER),
+                       gate.REMOTE_MARKER + ': unrelated compiler failure',
+                       missing_feature('unrelated') + '\nhelp: available features: ' + gate.REMOTE_MARKER,
+                       missing_feature(gate.REMOTE_MARKER, 'unrelated-package')]:
             with self.subTest(stderr=stderr), self.assertRaisesRegex(RuntimeError, 'missing capability'):
                 self.check_metadata('', stderr, patch=False)
 
@@ -115,20 +121,22 @@ class ConsumerGateContracts(unittest.TestCase):
 
     def test_core_consumer_cannot_silently_use_an_unpatched_blocking_pool(self):
         gate = gate_module()
-        expected, resolutions = self.check_metadata(
-            '', gate.BLOCKING_MARKER + ': does not have that feature',
-            patch=False, remote=False, blocking=True)
-        self.assertEqual((expected, resolutions), (101, []))
-        for stderr in ['network unavailable', gate.MARKER + ': does not have that feature']:
+        required = [gate.BLOCKING_MARKER, gate.BLOCKING_CONTEXT_MARKER]
+        for capability in required:
+            with self.subTest(capability=capability):
+                result = self.check_metadata('', missing_feature(capability), patch=False, remote=False, blocking=True)
+                self.assertEqual(result, (101, []))
+        for stderr in ['network unavailable', missing_feature(gate.MARKER)]:
             with self.subTest(stderr=stderr), self.assertRaisesRegex(RuntimeError, 'missing capability'):
                 self.check_metadata('', stderr, patch=False, remote=False, blocking=True)
         def metadata(features):
             return json.dumps(dict(packages=[dict(name='tokio', id='patched', version='1.53.3',
                 source=None, manifest_path=str(ROOT / 'vendor/tokio/Cargo.toml'))],
                 resolve=dict(nodes=[dict(id='patched', features=features)])))
-        with self.assertRaisesRegex(RuntimeError, 'capabilities missing'):
-            self.check_metadata(metadata([]), '', patch=True, remote=False, blocking=True)
-        self.check_metadata(metadata([gate.BLOCKING_MARKER]), '', patch=True, remote=False, blocking=True)
+        for features in ([], [required[0]], [required[1]]):
+            with self.subTest(features=features), self.assertRaisesRegex(RuntimeError, 'capabilities missing'):
+                self.check_metadata(metadata(features), '', patch=True, remote=False, blocking=True)
+        self.check_metadata(metadata(required), '', patch=True, remote=False, blocking=True)
 
     def migrate(self, versions):
         gate = gate_module()
@@ -167,10 +175,10 @@ class ConsumerGateContracts(unittest.TestCase):
     def test_api_consumer_requires_worker_startup_capability(self):
         gate = gate_module()
         expected, resolutions = self.check_metadata(
-            '', gate.STARTUP_MARKER + ': does not have that feature',
+            '', missing_feature(gate.STARTUP_MARKER),
             patch=False, remote=False, startup=True)
         self.assertEqual((expected, resolutions), (101, []))
-        for stderr in ['network unavailable', gate.BLOCKING_MARKER + ': does not have that feature']:
+        for stderr in ['network unavailable', missing_feature(gate.BLOCKING_MARKER)]:
             with self.subTest(stderr=stderr), self.assertRaisesRegex(RuntimeError, 'missing capability'):
                 self.check_metadata('', stderr, patch=False, remote=False, startup=True)
         data = dict(packages=[dict(name='tokio', id='patched', version='1.53.3',
