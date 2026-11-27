@@ -126,9 +126,7 @@ def evaluate(root, selected):
                                              resource.findall('m:includes/m:include', POM_NS)]
                             and Path(directory).resolve() == root):
                         found = True
-                # The websearch dependency-resolution POM does not produce a jar.
-                require(found or name == 'apps/websearch/jvm/config-dependencies.pom.xml',
-                        'missing Maven packaged license resource: ' + name)
+                require(found, 'missing Maven packaged license resource: ' + name)
             counts['maven_projects'] += 1
     require(all(counts.values()), 'missing language package coverage')
     return {'schema': 'parrot-license-consistency-v1', 'success': True,

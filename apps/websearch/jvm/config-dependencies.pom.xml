@@ -4,6 +4,7 @@
   <groupId>parrot.websearch</groupId>
   <artifactId>search-config-dependencies</artifactId>
   <version>1.0.0</version>
+  <packaging>pom</packaging>
   <licenses>
     <license>
       <name>AGPL-3.0-only</name>

@@ -23,14 +23,20 @@ GW_JAR="../../../interop/jvm/target/parrot-protocol-jvm-0.1.0.jar"
 
 [ -f "$GW_JAR" ] || { echo "缺网关 jar——先 make build-jvm"; exit 1; }
 
-mkdir -p target/classes
+mkdir -p target
+build_dir=$(mktemp -d "$PWD/target/build.XXXXXX")
+trap 'rm -rf "$build_dir"' EXIT
+mkdir "$build_dir/classes"
 echo "==> scalac 编译 crawler.search.SearchComponent"
 java -cp "$SCALA_CMP:$SCALA_LIB:$SCALA_REF" scala.tools.nsc.Main \
   -usejavacp -encoding UTF-8 \
   -classpath "$AKKA:$GW_JAR" \
-  -d target/classes \
+  -d "$build_dir/classes" \
   src/main/scala/crawler/search/SearchComponent.scala
 
 echo "==> 打 thin jar"
-jar cf target/crawler-lab-jvm-1.0.0.jar -C target/classes .
+mkdir -p "$build_dir/classes/META-INF"
+cp ../../../LICENSE "$build_dir/classes/META-INF/LICENSE"
+jar --create --file "$build_dir/crawler-lab-jvm-1.0.0.jar" --date=2020-01-01T00:00:00Z -C "$build_dir/classes" .
+mv "$build_dir/crawler-lab-jvm-1.0.0.jar" target/crawler-lab-jvm-1.0.0.jar
 echo "✓ apps/crawler-lab/jvm/target/crawler-lab-jvm-1.0.0.jar"

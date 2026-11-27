@@ -100,6 +100,12 @@ class LicenseContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'missing Maven packaged license resource'):
             self.check()
 
+    def test_dependency_pom_cannot_implicitly_package_an_unlicensed_jar(self):
+        self.replace('apps/websearch/jvm/config-dependencies.pom.xml',
+                     '<packaging>pom</packaging>', '')
+        with self.assertRaisesRegex(ValueError, 'missing Maven packaged license resource'):
+            self.check()
+
     def test_license_copy_change_or_missing_selection_is_rejected(self):
         self.replace('interop/python/LICENSE', 'GNU AFFERO', 'ALTERED')
         with self.assertRaisesRegex(ValueError, 'nonstandard or stale license text'):

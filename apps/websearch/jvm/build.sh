@@ -2,7 +2,7 @@
 # ============================================================================
 #  build.sh —— websearch jvm 检索组件构建（同 crawler-lab/jvm 模式）
 #
-#  产物：apps/websearch/jvm/target/websearch-jvm-1.0.0.jar（thin）
+#  产物：apps/websearch/jvm/target/websearch-jvm-1.0.0.jar（包含分词与配置依赖）
 #  classpath 含 lib/jieba-analysis-1.0.2.jar（中文分词——child-first 数据源）
 # ============================================================================
 set -euo pipefail
@@ -86,6 +86,7 @@ for entry in ['org/tomlj/Toml.class', 'org/antlr/v4/runtime/Lexer.class', 'org/c
 PACK
 
 echo "==> 打 fat jar"
+cp ../../../LICENSE "$BUILD_DIR/classes/META-INF/LICENSE"
 jar --create --file "$BUILD_DIR/websearch-jvm-1.0.0.jar" --date=2020-01-01T00:00:00Z -C "$BUILD_DIR/classes" .
 mv "$BUILD_DIR/websearch-jvm-1.0.0.jar" target/websearch-jvm-1.0.0.jar
 ls -la target/websearch-jvm-1.0.0.jar

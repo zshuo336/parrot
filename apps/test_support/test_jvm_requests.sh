@@ -4,6 +4,20 @@ cd "$(dirname "$0")/../.."
 mvn -q -s interop/jvm/settings-central.xml -f interop/jvm/pom.xml package dependency:build-classpath -Dmdep.outputFile=target/cp.txt -DskipTests
 mvn -q -s interop/jvm/settings-central.xml -f apps/crawler-lab/jvm/pom.xml package -DskipTests
 bash apps/websearch/jvm/build.sh
+python3 - <<'PY'
+from pathlib import Path
+from zipfile import ZipFile
+
+license_text = Path("LICENSE").read_bytes()
+for name in (
+    "interop/jvm/target/parrot-protocol-jvm-0.1.0.jar",
+    "apps/crawler-lab/jvm/target/crawler-lab-jvm-1.0.0.jar",
+    "apps/websearch/jvm/target/websearch-jvm-1.0.0.jar",
+):
+    with ZipFile(name) as jar:
+        if jar.namelist().count("META-INF/LICENSE") != 1 or jar.read("META-INF/LICENSE") != license_text:
+            raise SystemExit(f"{name}: missing, duplicate or incorrect project license")
+PY
 classes=$(mktemp -d)
 trap 'rm -rf "$classes"' EXIT
 scala_jars="$HOME/.m2/repository/org/scala-lang"
