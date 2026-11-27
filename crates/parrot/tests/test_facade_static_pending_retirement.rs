@@ -21,8 +21,11 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[path = "support/isolated.rs"]
+mod isolated;
 
 #[derive(Default)]
 struct Gate {
@@ -312,52 +315,41 @@ async fn check(backend: usize, factory: bool) {
 }
 
 macro_rules! cases {
-    ($module:ident, $backend:expr, $test:path) => {
+    ($module:ident, $backend:expr) => {
         mod $module {
             use super::*;
-            #[$test]
-            async fn cancelled_static_instance_retains_actual_retirement_reservation() {
-                isolated($backend, false).await;
+            #[test]
+            fn cancelled_static_instance_retains_actual_retirement_reservation() {
+                run_case(stringify!($module), $backend, false);
             }
-            #[$test]
-            async fn cancelled_static_factory_retains_actual_retirement_reservation() {
-                isolated($backend, true).await;
+            #[test]
+            fn cancelled_static_factory_retains_actual_retirement_reservation() {
+                run_case(stringify!($module), $backend, true);
             }
         }
     };
 }
-async fn isolated(backend: usize, factory: bool) {
-    let identity = format!("{backend}-{factory}");
-    if std::env::var("PARROT_STATIC_RETIREMENT_CHILD").as_deref() == Ok(&identity) {
-        check(backend, factory).await;
-        return;
-    }
-    let module = ["shared", "dedicated", "sharded", "actix_backend"][backend];
+fn run_case(module: &str, backend: usize, factory: bool) {
     let kind = if factory { "factory" } else { "instance" };
     let name = format!("{module}::cancelled_static_{kind}_retains_actual_retirement_reservation");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &name, "--nocapture"])
-        .env("PARROT_STATIC_RETIREMENT_CHILD", identity)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(
-                status.success(),
-                "static retirement contract failed: {status}"
-            );
-            return;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("static retirement child exceeded its watchdog");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    isolated::run(
+        &name,
+        "PARROT_STATIC_RETIREMENT_CHILD",
+        Duration::from_secs(30),
+        || {
+            if backend == 3 {
+                actix::System::new().block_on(check(backend, factory));
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(check(backend, factory));
+            }
+        },
+    );
 }
-cases!(shared, 0, tokio::test);
-cases!(dedicated, 1, tokio::test);
-cases!(sharded, 2, tokio::test);
-cases!(actix_backend, 3, actix::test);
+cases!(shared, 0);
+cases!(dedicated, 1);
+cases!(sharded, 2);
+cases!(actix_backend, 3);
