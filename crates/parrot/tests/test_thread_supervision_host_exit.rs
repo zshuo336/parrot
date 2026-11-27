@@ -107,6 +107,10 @@ impl Drop for Generation {
 }
 struct Fail(bool);
 struct SpawnChild(Arc<State>);
+struct SpawnFactoryChild {
+    state: Arc<State>,
+    capture: Arc<()>,
+}
 struct View(usize, usize, String);
 impl Actor for Generation {
     type Config = EmptyConfig;
@@ -135,6 +139,18 @@ impl Actor for Generation {
                 let child = ctx
                     .spawner()
                     .spawn_supervised(Self::new(state), EmptyConfig, strategy)
+                    .await?;
+                return Ok(Box::new(child) as BoxedMessage);
+            }
+            if message.is::<SpawnFactoryChild>() {
+                let SpawnFactoryChild { state, capture } =
+                    *message.downcast::<SpawnFactoryChild>().unwrap();
+                let child = ctx
+                    .spawner()
+                    .spawn_factory(move || {
+                        let _keep = &capture;
+                        Self::new(state.clone())
+                    })
                     .await?;
                 return Ok(Box::new(child) as BoxedMessage);
             }
@@ -449,6 +465,65 @@ fn escalation_with_child(
         shutdown(&system).await;
     });
 }
+fn retire_mixed_tree(sharded: bool) {
+    let host = runtime();
+    let root_state = Arc::new(State::default());
+    let middle_state = Arc::new(State::default());
+    let leaf_state = Arc::new(State::default());
+    let capture = Arc::new(());
+    let factory_capture = Arc::downgrade(&capture);
+    let (system, parent, middle) = host.block_on(async {
+        let system = system(sharded);
+        let parent = system
+            .spawn_at(
+                Generation::new(root_state.clone()),
+                "/tree",
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let reply = parent
+            .send(Box::new(SpawnFactoryChild {
+                state: middle_state.clone(),
+                capture,
+            }))
+            .await
+            .unwrap();
+        let middle = *reply.downcast::<BoxedActorRef>().unwrap();
+        assert_eq!(query(middle.as_ref(), 0, sharded).await.1, 10);
+        (system, parent, middle)
+    });
+    drop(host);
+    runtime().block_on(async {
+        let leaf = spawn_child(middle.as_ref(), &leaf_state).await;
+        let members: [&dyn ActorRef; 3] = [&parent, middle.as_ref(), leaf.as_ref()];
+        for (member, expected) in members.iter().zip([10, 11, 10]) {
+            assert_eq!(query(*member, 0, sharded).await.1, expected);
+            assert!(system.get_actor_ref(&member.path()).is_some());
+        }
+        assert!(factory_capture.upgrade().is_some());
+        tokio::time::timeout(WAIT, parent.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        for (member, state) in members
+            .iter()
+            .zip([&root_state, &middle_state, &leaf_state])
+        {
+            assert!(matches!(
+                member.retirement_status(),
+                RetirementStatus::Retired(Ok(()))
+            ));
+            assert!(system.get_actor_ref(&member.path()).is_none());
+            assert!(member.send(Box::new(())).await.is_err());
+            assert_eq!(state.built.load(Ordering::SeqCst), 1);
+            assert_eq!(state.drops[0].load(Ordering::SeqCst), 1);
+        }
+        assert!(factory_capture.upgrade().is_none());
+        shutdown(&system).await;
+    });
+}
 macro_rules! contract {
     ($name:ident, $scenario:expr) => {
         #[test]
@@ -458,6 +533,14 @@ macro_rules! contract {
     };
 }
 contract!(dedicated_legacy_error, root(false, false, false));
+contract!(
+    dedicated_mixed_tree_stop_after_host_exit,
+    retire_mixed_tree(false)
+);
+contract!(
+    sharded_mixed_tree_stop_after_host_exit,
+    retire_mixed_tree(true)
+);
 contract!(dedicated_legacy_panic, root(false, true, false));
 contract!(sharded_legacy_error, root(true, false, false));
 contract!(sharded_legacy_panic, root(true, true, false));
