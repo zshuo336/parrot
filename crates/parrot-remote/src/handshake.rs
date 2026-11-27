@@ -79,6 +79,8 @@ pub mod caps {
     pub const ORDERED_RECOVERY: u32 = 1 << 25;
     /// Correlated receiver queue admission for routed ordered data.
     pub const ORDERED_ADMISSION: u32 = 1 << 26;
+    /// Resolve an application alias through authorized ordered relay hops.
+    pub const ORDERED_ENDPOINT: u32 = 1 << 27;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

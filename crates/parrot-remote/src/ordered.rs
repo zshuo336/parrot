@@ -7,6 +7,7 @@ pub(crate) use outbound::Outbound;
 
 pub const CONTROL_KEY: &str = "parrot:ordered-control#v2";
 pub const RECEIPT_KEY: &str = "parrot:ordered-control-receipt#v2";
+pub const ENDPOINT_KEY: &str = "parrot:ordered-endpoint#v1";
 pub const DATA_KEY: &str = "parrot:ordered-tell#v2";
 pub const ADMIT_KEY: &str = "parrot:ordered-admit#v1";
 pub const ADMISSION_RECEIPT_KEY: &str = "parrot:ordered-admission-receipt#v1";
@@ -22,6 +23,7 @@ pub(crate) fn identity() -> Identity {
 pub(crate) enum Operation {
     Open,
     OpenAdmission,
+    ResolveEndpoint,
     Commit,
     Close,
     Recover { receiver: Identity, epoch: u64 },
@@ -44,6 +46,39 @@ pub(crate) struct Receipt {
     pub generation: u64,
     pub lease_ms: u32,
     pub epoch: Option<u64>,
+}
+
+/// The qualified actor path and receiving node incarnation observed by an
+/// authenticated lookup. The route may change after the observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OrderedEndpoint {
+    pub path: String,
+    pub receiver: [u8; 16],
+}
+
+impl OrderedEndpoint {
+    pub(crate) fn encode(&self, challenge: Identity) -> Bytes {
+        let mut output = BytesMut::with_capacity(32 + self.path.len());
+        output.extend_from_slice(&challenge);
+        output.extend_from_slice(&self.receiver);
+        output.extend_from_slice(self.path.as_bytes());
+        output.freeze()
+    }
+
+    pub(crate) fn decode(bytes: &[u8], challenge: Identity) -> Option<Self> {
+        if bytes.len() > 32 + 4096 || bytes.get(..16)? != challenge {
+            return None;
+        }
+        let receiver = bytes.get(16..32)?.try_into().ok()?;
+        nonzero(receiver).ok()?;
+        let path = std::str::from_utf8(bytes.get(32..)?).ok()?;
+        crate::actor_path::split(path)?;
+        Some(Self {
+            receiver,
+            path: path.to_owned(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,8 +168,10 @@ impl Control {
         node(&self.source)?;
         nonzero(self.incarnation)?;
         nonzero(self.stream)?;
-        if matches!(self.operation, Operation::Open | Operation::OpenAdmission)
-            != (self.ticket == [0; 16])
+        if matches!(
+            self.operation,
+            Operation::Open | Operation::OpenAdmission | Operation::ResolveEndpoint
+        ) != (self.ticket == [0; 16])
         {
             return Err("ordered control ticket disagrees with operation".into());
         }
@@ -157,6 +194,7 @@ impl Control {
             Operation::Close => 2,
             Operation::Recover { .. } => 3,
             Operation::OpenAdmission => 4,
+            Operation::ResolveEndpoint => 5,
         });
         output.extend_from_slice(&self.incarnation);
         output.extend_from_slice(&self.stream);
@@ -185,6 +223,7 @@ impl Control {
                 1 => Operation::Commit,
                 2 => Operation::Close,
                 4 => Operation::OpenAdmission,
+                5 => Operation::ResolveEndpoint,
                 3 => Operation::Recover {
                     receiver: input[52 + length..68 + length].try_into().unwrap(),
                     epoch: u64::from_le_bytes(input[68 + length..].try_into().unwrap()),
@@ -387,10 +426,46 @@ mod tests {
     }
 
     #[test]
+    fn observed_endpoint_requires_the_exact_challenge_and_canonical_path() {
+        let endpoint = OrderedEndpoint {
+            path: "parrot://node/target".into(),
+            receiver: [1; 16],
+        };
+        let encoded = endpoint.encode([2; 16]);
+        assert_eq!(
+            OrderedEndpoint::decode(&encoded, [2; 16]),
+            Some(endpoint.clone())
+        );
+        assert!(OrderedEndpoint::decode(&encoded, [3; 16]).is_none());
+        for len in 0..32 {
+            assert!(OrderedEndpoint::decode(&encoded[..len], [2; 16]).is_none());
+        }
+        for path in [
+            "/local".to_string(),
+            "parrot://node/../x".into(),
+            format!("parrot://node/{}", "x".repeat(4096)),
+        ] {
+            let bytes = OrderedEndpoint {
+                path,
+                ..endpoint.clone()
+            }
+            .encode([2; 16]);
+            assert!(OrderedEndpoint::decode(&bytes, [2; 16]).is_none());
+        }
+        let bytes = OrderedEndpoint {
+            receiver: [0; 16],
+            ..endpoint
+        }
+        .encode([2; 16]);
+        assert!(OrderedEndpoint::decode(&bytes, [2; 16]).is_none());
+    }
+
+    #[test]
     fn identity_control_and_receipts_are_versioned_and_exact() {
         for operation in [
             Operation::Open,
             Operation::OpenAdmission,
+            Operation::ResolveEndpoint,
             Operation::Commit,
             Operation::Close,
             Operation::Recover {
@@ -403,7 +478,10 @@ mod tests {
                 source: "origin".into(),
                 incarnation: [1; 16],
                 stream: [2; 16],
-                ticket: if matches!(operation, Operation::Open | Operation::OpenAdmission) {
+                ticket: if matches!(
+                    operation,
+                    Operation::Open | Operation::OpenAdmission | Operation::ResolveEndpoint
+                ) {
                     [0; 16]
                 } else {
                     [3; 16]

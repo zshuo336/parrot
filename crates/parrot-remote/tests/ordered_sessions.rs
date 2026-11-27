@@ -493,6 +493,12 @@ async fn strict_sessions_execute_over_real_mtls_tcp_and_quic() {
         let reference = source
             .remote_ref(&format!("parrot://{target_name}/target"))
             .unwrap();
+        let endpoint = reference
+            .resolve_ordered_endpoint(Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(endpoint.path, format!("parrot://{target_name}/target"));
+        assert_ne!(endpoint.receiver, [0; 16]);
         for value in 1..=3 {
             strict(&reference, value).await;
             seen(&mut receiver, value).await;

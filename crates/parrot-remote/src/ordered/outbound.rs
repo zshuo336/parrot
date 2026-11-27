@@ -126,6 +126,44 @@ impl Outbound {
     pub fn close_admission(&self) {
         self.closed.store(true, Ordering::Release);
     }
+
+    pub(crate) async fn resolve_endpoint(
+        &self,
+        destination: &str,
+        path: &str,
+        sender: &FrameSender,
+        callbacks: &CallbackRegistry,
+        hops: u8,
+        deadline: Instant,
+    ) -> ActorResult<super::OrderedEndpoint> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ActorError::Stopped);
+        }
+        if !sender.supports_ordered_endpoint() {
+            return Err(
+                ErrCode::NotRemotable.to_actor_error("ordered endpoint lookup unavailable".into())
+            );
+        }
+        let control = Control {
+            operation: Operation::ResolveEndpoint,
+            source: self.source.clone(),
+            incarnation: self.incarnation,
+            stream: identity(),
+            ticket: [0; 16],
+        };
+        let (bytes, key) = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(ActorError::Stopped),
+            reply = exchange(sender, callbacks, destination, path, hops, &control, deadline) =>
+                reply.map_err(|(code, detail)| code.to_actor_error(detail))?,
+        };
+        if key == super::ENDPOINT_KEY {
+            if let Some(endpoint) = super::OrderedEndpoint::decode(&bytes, control.stream) {
+                return Ok(endpoint);
+            }
+        }
+        Err(ErrCode::ProtocolViolation.to_actor_error("invalid ordered endpoint receipt".into()))
+    }
     pub fn close(&self) {
         self.close_admission();
         self.cancel.cancel();
@@ -618,6 +656,41 @@ async fn request(
     control: &Control,
     deadline: Instant,
 ) -> Result<Receipt, (ErrCode, String)> {
+    let (bytes, key) = exchange(
+        sender,
+        callbacks,
+        destination,
+        path,
+        hops,
+        control,
+        deadline,
+    )
+    .await?;
+    if key != RECEIPT_KEY {
+        return Err((
+            ErrCode::ProtocolViolation,
+            "invalid ordered control response".into(),
+        ));
+    }
+    let receipt = Receipt::decode(&bytes).map_err(|detail| (ErrCode::ProtocolViolation, detail))?;
+    if receipt.epoch.is_some() && !sender.supports_ordered_recovery() {
+        return Err((
+            ErrCode::ProtocolViolation,
+            "unnegotiated ordered recovery receipt".into(),
+        ));
+    }
+    Ok(receipt)
+}
+
+async fn exchange(
+    sender: &FrameSender,
+    callbacks: &CallbackRegistry,
+    destination: &str,
+    path: &str,
+    hops: u8,
+    control: &Control,
+    deadline: Instant,
+) -> Result<(bytes::Bytes, String), (ErrCode, String)> {
     let operation = async {
         let payload = control
             .encode()
@@ -636,13 +709,7 @@ async fn request(
             biased;
             _ = sender.closed() => Err((ErrCode::ConnectionLost, "ordered control connection closed".into())),
             reply = receiver => match reply {
-                Ok(ReplyPayload::Ok(bytes, key)) if key == RECEIPT_KEY => {
-                    let receipt = Receipt::decode(&bytes).map_err(|detail| (ErrCode::ProtocolViolation, detail))?;
-                    if receipt.epoch.is_some() && !sender.supports_ordered_recovery() {
-                        return Err((ErrCode::ProtocolViolation, "unnegotiated ordered recovery receipt".into()));
-                    }
-                    Ok(receipt)
-                },
+                Ok(ReplyPayload::Ok(bytes, key)) => Ok((bytes, key)),
                 Ok(ReplyPayload::Err(code, detail)) => Err((code, detail)),
                 _ => Err((ErrCode::ProtocolViolation, "invalid ordered control response".into())),
             },

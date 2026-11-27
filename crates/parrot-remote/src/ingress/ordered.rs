@@ -345,6 +345,62 @@ impl Ingress {
         }
     }
 
+    async fn resolve_ordered_endpoint(
+        &self,
+        frame: &Frame,
+        back: &FrameSender,
+        challenge: Identity,
+    ) -> Result<(), ErrCode> {
+        let alias = |path: &str| {
+            Cleanup::default()
+                .call(|| self.local.forwarding_target(super::local_path(path)))
+                .map_err(|_| ErrCode::ProtocolViolation)
+        };
+        if let Some(target) = alias(&frame.path)? {
+            if crate::actor_path::split(&target).is_none() || !self.is_remote_target(&target) {
+                return Err(ErrCode::NotRemotable);
+            }
+            let mut forwarded = frame.clone();
+            forwarded.path = target;
+            self.try_relay_request(&forwarded, back, frame.header.correlation_id)
+                .await;
+            return Ok(());
+        }
+        let cleanup = Cleanup::default();
+        let actor = tokio::time::timeout(
+            Duration::from_secs(5),
+            unwind::run(&cleanup, || {
+                self.local.lookup(super::local_path(&frame.path))
+            }),
+        )
+        .await
+        .map_err(|_| ErrCode::Timeout)?
+        .map_err(|_| ErrCode::ProtocolViolation)?;
+        let present = actor.is_some();
+        cleanup.dispose(actor);
+        if cleanup.failed() {
+            return Err(ErrCode::ProtocolViolation);
+        }
+        if alias(&frame.path)?.is_some() {
+            return Err(ErrCode::NotRemotable);
+        }
+        if !present {
+            return Err(ErrCode::ActorNotFound);
+        }
+        let receiver = self.ordered.lock().unwrap().receiver;
+        let endpoint = ordered::OrderedEndpoint {
+            path: frame.path.clone(),
+            receiver,
+        };
+        back.send_reply(Frame::reply(
+            frame.header.correlation_id,
+            "",
+            ordered::ENDPOINT_KEY,
+            endpoint.encode(challenge),
+        ));
+        Ok(())
+    }
+
     pub(super) async fn on_ordered_control(self: &Arc<Self>, frame: Frame, back: &FrameSender) {
         let result = async {
             let (_, payload) = frame
@@ -352,6 +408,10 @@ impl Ingress {
                 .map_err(|_| ErrCode::ProtocolViolation)?;
             let control = Control::decode(&payload).map_err(|_| ErrCode::ProtocolViolation)?;
             self.ordered_origin(&control.source, &frame, back)?;
+            if control.operation == Operation::ResolveEndpoint && !back.supports_ordered_endpoint()
+            {
+                return Err(ErrCode::NotRemotable);
+            }
             if control.operation == Operation::OpenAdmission && !back.supports_ordered_admission() {
                 return Err(ErrCode::NotRemotable);
             }
@@ -395,6 +455,11 @@ impl Ingress {
                     self.open_ordered(control).await.map(Some)
                 }
                 Operation::Commit => self.commit_ordered(control).await.map(Some),
+                Operation::ResolveEndpoint => {
+                    self.resolve_ordered_endpoint(&frame, back, control.stream)
+                        .await?;
+                    Ok(None)
+                }
                 Operation::Close => self.close_ordered_lease(control).await.map(Some),
                 Operation::Recover { receiver, epoch } => {
                     let sessions = self.ordered.lock().unwrap();

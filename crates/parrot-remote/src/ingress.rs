@@ -2265,6 +2265,20 @@ impl Ingress {
                 .await;
             return Some(ErrCode::RouteUnreachable);
         };
+        if frame.type_key == crate::ordered::CONTROL_KEY
+            && frame
+                .borrowed_ask_payload()
+                .is_ok_and(|p| p.starts_with(&[2, 5]))
+            && !sender.supports_ordered_endpoint()
+        {
+            back.send_reply(Frame::reply_err(
+                orig_cid,
+                &frame.path,
+                ErrCode::NotRemotable,
+                "next hop does not support ordered endpoint lookup",
+            ));
+            return Some(ErrCode::NotRemotable);
+        }
         if (frame.type_key == crate::ordered::ADMIT_KEY
             || (frame.type_key == crate::ordered::CONTROL_KEY
                 && frame
@@ -3366,6 +3380,18 @@ mod tests {
             payload: Bytes::new(),
         };
         for frame in [
+            Frame::ask(
+                4,
+                path,
+                ordered::CONTROL_KEY,
+                ordered::Control {
+                    operation: ordered::Operation::ResolveEndpoint,
+                    ..control.clone()
+                }
+                .encode()
+                .unwrap(),
+                None,
+            ),
             Frame::ask(
                 5,
                 path,

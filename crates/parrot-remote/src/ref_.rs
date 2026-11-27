@@ -148,6 +148,57 @@ impl RemoteActorRef {
         &self.node_id
     }
 
+    /// Observe the final qualified path and receiver incarnation through the configured
+    /// application aliases. This read does not create a ticket or reserve the actor.
+    pub async fn resolve_ordered_endpoint(
+        &self,
+        timeout: Duration,
+    ) -> ActorResult<crate::ordered::OrderedEndpoint> {
+        if crate::actor_path::split(&self.path).map(|(node, _)| node) != Some(self.node_id.as_str())
+        {
+            return Err(
+                ErrCode::ProtocolViolation.to_actor_error("invalid ordered endpoint path".into())
+            );
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .filter(|_| !timeout.is_zero())
+            .ok_or_else(|| {
+                ErrCode::ProtocolViolation
+                    .to_actor_error("invalid ordered endpoint deadline".into())
+            })?;
+        let system = self
+            .inner
+            .system
+            .as_ref()
+            .and_then(|s| s.upgrade())
+            .ok_or(ActorError::Stopped)?;
+        let hops = system.config.knobs.unwrap_or_default().default_hop_limit;
+        tokio::time::timeout_at(deadline, async {
+            let sender = self
+                .inner
+                .ensure_sender(&self.node_id)
+                .await
+                .ok_or_else(|| {
+                    ErrCode::ConnectionLost
+                        .to_actor_error("ordered endpoint connection unavailable".into())
+                })?;
+            system
+                .outbound_ordered
+                .resolve_endpoint(
+                    &self.node_id,
+                    &self.path,
+                    &sender,
+                    &self.inner.callbacks,
+                    hops,
+                    deadline,
+                )
+                .await
+        })
+        .await
+        .unwrap_or(Err(ActorError::Timeout))
+    }
+
     /// Require an authenticated, end-to-end confirmed TELL session. Ordering
     /// starts with this node session; admission is not a business completion
     /// receipt. Unsupported routes fail before publishing the business frame.
