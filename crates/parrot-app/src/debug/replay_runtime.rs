@@ -303,25 +303,18 @@ impl ReplayLog {
                     .validate_payload_flags()
                     .map_err(|e| failed(record.seq, 0, e))?;
             }
-            if matches!(
+            let ordered = matches!(
                 frame.type_key.as_str(),
                 parrot_remote::ordered::CONTROL_KEY
                     | parrot_remote::ordered::DATA_KEY
                     | parrot_remote::ordered::ADMIT_KEY
-            ) {
-                if record.wire.is_none() {
-                    return Err(failed(
-                        record.seq,
-                        0,
-                        "ordered capture requires complete wire metadata",
-                    ));
-                }
-                let Some(business) = parrot_remote::ordered::business_frame(frame)
-                    .map_err(|error| failed(record.seq, 0, error))?
-                else {
-                    continue;
-                };
-                frame = business;
+            );
+            if ordered && record.wire.is_none() {
+                return Err(failed(
+                    record.seq,
+                    0,
+                    "ordered capture requires complete wire metadata",
+                ));
             }
             let members: Box<dyn Iterator<Item = (Option<usize>, Frame)> + Send + '_> =
                 if frame.header.flags & flags::BATCH != 0 {
@@ -336,6 +329,17 @@ impl ReplayLog {
                     Box::new(std::iter::once((None, frame.clone())))
                 };
             for (batch_index, member) in members {
+                let cid = member.header.correlation_id;
+                let member = if ordered {
+                    let Some(business) = parrot_remote::ordered::business_frame(member)
+                        .map_err(|error| failed(record.seq, 0, error))?
+                    else {
+                        continue;
+                    };
+                    business
+                } else {
+                    member
+                };
                 if prepared.len() == options.limits.max_records {
                     return Err(failed(
                         record.seq,
@@ -407,7 +411,7 @@ impl ReplayLog {
                 check_cleanup(&cleanup_failed, record.seq, 0)?;
                 prepared.push(Prepared {
                     record,
-                    cid: member.header.correlation_id,
+                    cid,
                     batch_index,
                     completion: member.header.flags & flags::TELL_ACK != 0,
                     actor,

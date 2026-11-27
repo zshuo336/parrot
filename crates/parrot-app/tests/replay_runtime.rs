@@ -952,6 +952,7 @@ async fn truncated_batch_and_expanded_count_budget_have_no_business_effects() {
 }
 #[tokio::test]
 async fn real_batch_capture_replays_each_business_message_once() {
+    use parrot_api::address::ActorRef;
     use parrot_app::debug::Recording;
     use parrot_remote::{frame::Frame, RemoteActorSystem, RemoteConfig};
     let path =
@@ -982,8 +983,12 @@ async fn real_batch_capture_replays_each_business_message_once() {
         .send(Frame::batch(&frames).unwrap())
         .await
         .unwrap();
+    let reference = a.remote_ref("parrot://batch-target/counter").unwrap();
+    for delta in [1, 2, 3] {
+        reference.deliver(Box::new(Delta(delta))).await.unwrap();
+    }
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while value(&lookup).await != 9 {
+        while value(&lookup).await != 15 {
             tokio::task::yield_now().await;
         }
     })
@@ -997,15 +1002,24 @@ async fn real_batch_capture_replays_each_business_message_once() {
         .unwrap()
         .unwrap();
     let log = ReplayLog::load_capture(&path).unwrap();
+    assert!(log.records.iter().any(|r| r.dir == "rx"
+        && r.type_key == parrot_remote::ordered::DATA_KEY
+        && r.wire.as_ref().unwrap().flags & parrot_remote::frame::flags::BATCH != 0));
     let (fresh, lookup) = engine().await;
     assert_eq!(
-        log.replay_local(&lookup, Default::default())
-            .await
-            .unwrap()
-            .delivered,
-        3
+        log.replay_local(
+            &lookup,
+            ReplayOptions {
+                target_node: Some("batch-target".into()),
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap()
+        .delivered,
+        6
     );
-    assert_eq!(value(&lookup).await, 9);
+    assert_eq!(value(&lookup).await, 15);
     fresh.shutdown_internal().await.unwrap();
     std::fs::remove_file(path).unwrap();
 }
