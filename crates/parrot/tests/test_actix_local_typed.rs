@@ -1,3 +1,6 @@
+#[path = "support/isolated.rs"]
+mod isolated;
+
 use futures::stream;
 use parrot::actix::{ActixActorSystem, ActixSystemSettings};
 use parrot_api::{
@@ -1148,29 +1151,6 @@ impl ParrotMsgVariant<LocalProtocol<LocalFault>> for FaultRequest {
     }
 }
 
-fn isolated(test: &str) -> bool {
-    if std::env::var("PARROT_LOCAL_CONTRACT_CHILD").as_deref() == Ok(test) {
-        return false;
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
-        .env("PARROT_LOCAL_CONTRACT_CHILD", test)
-        .spawn()
-        .unwrap();
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "isolated contract {test}: {status}");
-            return true;
-        }
-        if start.elapsed() > Duration::from_secs(15) {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("isolated contract timed out: {test}");
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
 async fn fault_contract(fault: Fault) {
     let caller = std::thread::current().id();
     let system = Arc::new(ActixActorSystem::with_arbiter_count(1).await.unwrap());
@@ -1237,12 +1217,14 @@ async fn fault_contract(fault: Fault) {
 }
 macro_rules! fault_test {
     ($name:ident, $fault:expr) => {
-        #[actix::test]
-        async fn $name() {
-            if isolated(stringify!($name)) {
-                return;
-            }
-            fault_contract($fault).await;
+        #[test]
+        fn $name() {
+            isolated::run(
+                stringify!($name),
+                "PARROT_LOCAL_CONTRACT_CHILD",
+                Duration::from_secs(15),
+                || actix::System::new().block_on(fault_contract($fault)),
+            );
         }
     };
 }
