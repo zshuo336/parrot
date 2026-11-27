@@ -903,10 +903,16 @@ async fn retire(
     } else {
         route.path
     };
+    // Recovery and Close must carry the original sender and any signed route.
+    // A replacement link can advertise node recovery without either feature.
+    let carries_identity = |sender: &FrameSender, path: &str| {
+        (!control.source.contains('@') || sender.supports_sender_sessions())
+            && (!path.contains('#') || sender.supports_ordered_route())
+    };
     if let Some(epoch) = grant
         .receipt
         .epoch
-        .filter(|_| current.supports_ordered_recovery())
+        .filter(|_| current.supports_ordered_recovery() && carries_identity(current, current_path))
     {
         let mut recovery = control.clone();
         recovery.operation = Operation::Recover {
@@ -938,6 +944,13 @@ async fn retire(
     } else {
         (&grant.sender, route.path)
     };
+    if !carries_identity(sender, path)
+        || !sender.supports_ordered_tell()
+        || (grant.actor && !sender.supports_actor_sessions())
+    {
+        return Err(ErrCode::NotRemotable
+            .to_actor_error("route cannot retire the original ordered session".into()));
+    }
     let receipt = request(
         sender,
         callbacks,

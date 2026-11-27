@@ -3,6 +3,8 @@ use bytes::Bytes;
 mod admission_measurements;
 #[path = "ordered_sessions/endpoint_identity.rs"]
 mod endpoint_identity;
+#[path = "ordered_sessions/first_hop.rs"]
+mod first_hop;
 use parrot_api::{
     address::ActorRef,
     message::{MessageOptions, RemoteMessage},
