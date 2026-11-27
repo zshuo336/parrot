@@ -5,6 +5,8 @@ mod admission_measurements;
 mod endpoint_identity;
 #[path = "ordered_sessions/first_hop.rs"]
 mod first_hop;
+#[path = "ordered_sessions/multihost.rs"]
+mod multihost;
 use parrot_api::{
     address::ActorRef,
     message::{MessageOptions, RemoteMessage},
