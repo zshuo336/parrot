@@ -249,6 +249,41 @@ async fn strict_delivery_rejects_missing_relay_grants_but_ordinary_delivery_can_
 }
 
 #[tokio::test]
+async fn plain_tcp_destinations_do_not_consume_ordered_session_capacity() {
+    let source = start(
+        RemoteConfig::tcp("plain-source", None).with_knobs(RuntimeKnobs {
+            reorder_stream_capacity: 1,
+            ..Default::default()
+        }),
+        Arc::new(Empty),
+    )
+    .await;
+    let mut targets = Vec::new();
+    for (name, value) in [("plain-first", 1), ("plain-second", 2)] {
+        let (target_state, mut receiver) = state();
+        let target = start(
+            RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())),
+            Arc::new(Target(target_state)),
+        )
+        .await;
+        source
+            .connect(&NodeAddr::tcp(name, target.local_addr().unwrap()))
+            .await
+            .unwrap();
+        let reference = source
+            .remote_ref(&format!("parrot://{name}/target"))
+            .unwrap();
+        reference.deliver(Box::new(Work(value))).await.unwrap();
+        seen(&mut receiver, value).await;
+        targets.push(target);
+    }
+    source.shutdown().await.unwrap();
+    for target in targets {
+        target.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn plain_tcp_falls_back_without_claiming_authenticated_ordering() {
     let (state, mut receiver) = state();
     let target = start(

@@ -23,6 +23,7 @@ struct Grant {
     sender: FrameSender,
     renew_at: Instant,
 }
+
 impl Grant {
     fn retired_by(&self, receipt: &Receipt) -> bool {
         !receipt.active
@@ -81,13 +82,20 @@ impl Outbound {
         drop(retired);
     }
 
-    fn lane(&self, destination: &str) -> ActorResult<Arc<tokio::sync::Mutex<Lane>>> {
+    fn lane(
+        &self,
+        destination: &str,
+        supports_ordered: bool,
+    ) -> ActorResult<Option<Arc<tokio::sync::Mutex<Lane>>>> {
         let mut lanes = self.lanes.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return Err(ActorError::Stopped);
         }
         if let Some(lane) = lanes.get(destination) {
-            return Ok(lane.clone());
+            return Ok(Some(lane.clone()));
+        }
+        if !supports_ordered {
+            return Ok(None);
         }
         if lanes.len() >= self.capacity {
             return Err(ErrCode::Overloaded
@@ -95,7 +103,7 @@ impl Outbound {
         }
         let lane = Arc::new(tokio::sync::Mutex::new(Lane::default()));
         lanes.insert(destination.into(), lane.clone());
-        Ok(lane)
+        Ok(Some(lane))
     }
 
     /// Some(frame) is an explicit pre-session compatibility fallback. Once any
@@ -126,17 +134,16 @@ impl Outbound {
         mut frame: Frame,
         required: bool,
     ) -> ActorResult<Option<Frame>> {
-        let lane = self.lane(destination)?;
+        let supports_ordered = sender.supports_ordered_tell();
+        let Some(lane) = self.lane(destination, supports_ordered)? else {
+            return legacy_fallback(frame, required);
+        };
         let mut state = lane.lock().await;
         if state.closed || self.closed.load(Ordering::Acquire) {
             return Err(ActorError::Stopped);
         }
-        if !sender.supports_ordered_tell() {
-            if required || state.sent_ordered {
-                return Err(ErrCode::NotRemotable
-                    .to_actor_error("route does not support ordered TELL sessions".into()));
-            }
-            return Ok(Some(frame));
+        if !supports_ordered {
+            return legacy_fallback(frame, required || state.sent_ordered);
         }
         if state.sequence == u64::MAX {
             if let Some(grant) = &state.grant {
@@ -369,6 +376,14 @@ impl Outbound {
         })
         .await
     }
+}
+
+fn legacy_fallback(frame: Frame, requires_ordered: bool) -> ActorResult<Option<Frame>> {
+    if requires_ordered {
+        return Err(ErrCode::NotRemotable
+            .to_actor_error("route does not support ordered TELL sessions".into()));
+    }
+    Ok(Some(frame))
 }
 
 struct Route<'a> {
