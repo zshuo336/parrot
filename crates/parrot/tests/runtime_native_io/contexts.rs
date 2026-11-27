@@ -154,10 +154,15 @@ async fn dynamic_context(actix: bool) {
 enum TypedRequest {
     Tcp,
     Context,
+    Block(
+        tokio::sync::oneshot::Sender<ThreadId>,
+        std::sync::mpsc::Receiver<()>,
+    ),
 }
 enum TypedReply {
     Threads(ThreadId, ThreadId),
     Context(TypedContext),
+    Released,
 }
 impl Message for TypedRequest {
     type Result = TypedReply;
@@ -177,6 +182,12 @@ impl ParrotTypedDispatch for TypedProbe {
         Box::pin(async move {
             match msg {
                 TypedRequest::Context => Ok(TypedReply::Context(ctx.clone())),
+                TypedRequest::Block(entered, release) => {
+                    let owner = std::thread::current().id();
+                    entered.send(owner).unwrap();
+                    release.recv_timeout(LIMIT).unwrap();
+                    Ok(TypedReply::Released)
+                }
                 TypedRequest::Tcp => {
                     let actor = std::thread::current().id();
                     let io = ctx
@@ -262,3 +273,6 @@ async fn thread_typed_io_belongs_to_the_actor_generation() {
 async fn actix_typed_io_belongs_to_the_actor_generation() {
     typed_context(true).await;
 }
+
+#[path = "shared_retirement.rs"]
+mod shared_retirement;

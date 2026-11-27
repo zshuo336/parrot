@@ -53,6 +53,10 @@ impl Drop for Probe {
 enum Op {
     Identity,
     Hang,
+    Block(
+        tokio::sync::oneshot::Sender<ThreadId>,
+        std::sync::mpsc::Receiver<()>,
+    ),
 }
 impl Actor for Probe {
     type Config = Box<dyn Any + Send>;
@@ -80,6 +84,11 @@ impl Actor for Probe {
                     self.0.started.fetch_add(1, Ordering::SeqCst);
                     std::future::pending().await
                 }
+                Op::Block(entered, release) => {
+                    let _ = entered.send(std::thread::current().id());
+                    let _ = release.recv_timeout(WAIT);
+                    Ok(Box::new(()) as BoxedMessage)
+                }
             }
         })
     }
@@ -99,7 +108,7 @@ fn actix_settings() -> ActixSystemSettings {
     }
 }
 
-async fn exercise_thread(system: &ThreadActorSystem) {
+async fn exercise_thread(system: &ThreadActorSystem, local_queues: bool) {
     let metrics = system.scheduler_metrics().unwrap();
     assert_eq!(metrics.pool_size, 2);
     assert_eq!(metrics.queue_capacity, 7);
@@ -117,19 +126,67 @@ async fn exercise_thread(system: &ThreadActorSystem) {
         .unwrap()
         .unwrap();
     assert!(reply.downcast::<(ThreadId, ThreadId)>().is_ok());
+    let peer = system
+        .spawn(
+            Box::new(Probe(plan.clone())),
+            Box::new(()),
+            SpawnOptions::at("/configured-peer"),
+        )
+        .await
+        .unwrap();
+    let mut releases = Vec::new();
+    let mut owners = HashSet::new();
+    for reference in [&actor, &peer] {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        reference
+            .deliver(Box::new(Op::Block(entered, wait)))
+            .await
+            .unwrap();
+        releases.push(release);
+        owners.insert(
+            tokio::time::timeout(WAIT / 2, observed)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        owners.len(),
+        2,
+        "two blocking handlers must execute concurrently"
+    );
+    let metrics = system.scheduler_metrics().unwrap();
+    assert_eq!(
+        metrics.local_selections + metrics.work_steals > 0,
+        local_queues,
+        "startup did not forward the queue placement strategy"
+    );
+    drop(releases);
     tokio::time::timeout(WAIT, AsyncEngineRuntime::shutdown(system))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(plan.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(plan.dropped.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
 async fn thread_generic_settings_reach_scheduler_on_every_startup_entry() {
+    for strategy in [
+        LoadBalancingStrategy::RoundRobin,
+        LoadBalancingStrategy::Random,
+        LoadBalancingStrategy::LeastLoaded,
+    ] {
+        check_thread_startup(strategy).await;
+    }
+}
+async fn check_thread_startup(strategy: LoadBalancingStrategy) {
+    let local_queues = !matches!(strategy, LoadBalancingStrategy::RoundRobin);
     for entry in 0..4 {
         let mut config = ActorSystemConfig::default();
         config.runtime_config.worker_threads = Some(2);
         config.runtime_config.scheduler_config.task_queue_capacity = 7;
+        config.runtime_config.scheduler_config.load_balancing = strategy.clone();
         if entry == 0 {
             let system = Arc::new(
                 <ThreadActorSystem as ActorSystem>::start(config)
@@ -137,7 +194,7 @@ async fn thread_generic_settings_reach_scheduler_on_every_startup_entry() {
                     .unwrap(),
             );
             system.set_self_weak(Arc::downgrade(&system));
-            exercise_thread(&system).await;
+            exercise_thread(&system, local_queues).await;
         } else {
             let facade = match entry {
                 1 => ParrotActorSystem::start(config),
@@ -151,6 +208,7 @@ async fn thread_generic_settings_reach_scheduler_on_every_startup_entry() {
                 (runtime.as_ref() as &dyn Any)
                     .downcast_ref::<ThreadActorSystem>()
                     .unwrap(),
+                local_queues,
             )
             .await;
             facade.shutdown_runtime().await.unwrap();
