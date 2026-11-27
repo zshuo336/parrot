@@ -5,7 +5,7 @@ mod isolated;
 use parrot::{
     actix::ActixActorSystem,
     system::{FacadeRootCohort, ParrotActorSystem},
-    thread::{ThreadActorSystem, typed::SingleVariant},
+    thread::{ThreadActorSystem, config::SchedulingMode, typed::SingleVariant},
 };
 use parrot_api::{
     actor::{Actor, ActorState},
@@ -86,16 +86,30 @@ impl Member {
             failures: 0,
         }
     }
-    fn handle(&mut self, op: Op, path: String, root: bool) -> ActorResult<Report> {
+    async fn handle(&mut self, op: Op, path: String, root: bool) -> ActorResult<Report> {
         assert!(root, "cohort introduced a synthetic parent");
-        if matches!(op, Op::ObserveWorker) {
-            *self.plan.observed_worker.lock().unwrap() = Some(std::thread::current());
-        }
-        if matches!(op, Op::Fail) {
-            self.failures += 1;
-            return Err(ActorError::MessageHandlingError(
-                "cohort requested failure".into(),
-            ));
+        match op {
+            Op::Read => {}
+            Op::ObserveWorker => {
+                *self.plan.observed_worker.lock().unwrap() = Some(std::thread::current());
+            }
+            Op::Fail => {
+                self.failures += 1;
+                return Err(ActorError::MessageHandlingError(
+                    "cohort requested failure".into(),
+                ));
+            }
+            Op::Hold(entered, release, _payload) => {
+                entered.send(self.generation).unwrap();
+                release.notified().await;
+            }
+            Op::Queued(delivered, _payload) => {
+                delivered.send(self.generation).unwrap();
+            }
+            Op::InstallExit(gate, live) => {
+                WORKER_EXIT
+                    .with(|slot| assert!(slot.replace(Some((BlockedDrop(gate), live))).is_none()));
+            }
         }
         Ok(Report(self.generation, self.failures, path))
     }
@@ -111,11 +125,28 @@ impl Drop for Member {
         assert!(!self.plan.bad_drop, "cohort member disposal witness");
     }
 }
-#[derive(Clone, Copy)]
+struct BlockedDrop(Arc<BlockGate>);
+impl Drop for BlockedDrop {
+    fn drop(&mut self) {
+        self.0.wait();
+    }
+}
+thread_local! {
+    static WORKER_EXIT: std::cell::Cell<Option<(BlockedDrop, Arc<()>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 enum Op {
     Read,
     Fail,
     ObserveWorker,
+    Hold(
+        tokio::sync::oneshot::Sender<usize>,
+        Arc<tokio::sync::Notify>,
+        Arc<()>,
+    ),
+    Queued(tokio::sync::oneshot::Sender<usize>, BlockedDrop),
+    InstallExit(Arc<BlockGate>, Arc<()>),
 }
 #[derive(Debug, PartialEq, Eq)]
 struct Report(usize, usize, String);
@@ -134,14 +165,14 @@ impl ParrotTypedDispatch for Member {
     type Msg = Op;
     type Reply = Report;
     fn dispatch(&mut self, op: Op) -> BoxedFuture<'_, ActorResult<Report>> {
-        Box::pin(async move { self.handle(op, String::new(), true) })
+        Box::pin(self.handle(op, String::new(), true))
     }
     fn dispatch_with_context<'a>(
         &'a mut self,
         op: Op,
         context: &'a TypedContext,
     ) -> BoxedFuture<'a, ActorResult<Report>> {
-        Box::pin(async move { self.handle(op, context.path().into(), context.parent().is_none()) })
+        Box::pin(self.handle(op, context.path().into(), context.parent().is_none()))
     }
     fn init_with_context<'a>(
         &'a mut self,
@@ -190,6 +221,7 @@ impl Actor for Member {
                 context.path().path.clone(),
                 context.parent().is_none(),
             )
+            .await
             .map(|reply| Box::new(reply) as BoxedMessage)
         })
     }
@@ -234,6 +266,7 @@ impl LocalActor for LocalMember {
                     context.path().into(),
                     context.parent().is_none(),
                 )
+                .await
                 .map(|reply| Box::new(reply) as BoxedMessage)
         })
     }
@@ -861,6 +894,293 @@ async fn cancelled_mixed_stop(system: ParrotActorSystem) {
 async fn cancelled_group_stop_waiter_keeps_blocked_member_retirement_owned() {
     for actix in [false, true] {
         cancelled_mixed_stop(facade(actix).await).await;
+    }
+}
+
+async fn mixed_group_with_unread_tell(
+    mode: Option<SchedulingMode>,
+    restart: bool,
+    dynamic_receiver: bool,
+) {
+    let graceful = dynamic_receiver && mode.is_some();
+    let system = cohort_facade(mode).await;
+    let group = system.native_root_cohort(all()).await.unwrap();
+    let typed_plan = Arc::new(Plan::default());
+    let dynamic_plan = Arc::new(Plan::default());
+    let made = typed_plan.clone();
+    let typed = group
+        .spawn_typed_factory::<_, Op, _>(move || Member::new(&made), "/receiver")
+        .await
+        .unwrap();
+    let made = dynamic_plan.clone();
+    let peer = group
+        .spawn_factory(
+            Box::new(move || Box::new(Member::new(&made))),
+            SpawnOptions::at("/peer"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dynamic(&peer, Op::Read).await.unwrap().0, 0);
+    assert_eq!(typed.ask(Op::Read).await.unwrap().0, 0);
+    let (started, mut entered) = tokio::sync::oneshot::channel();
+    let active = Arc::new(());
+    let live = Arc::downgrade(&active);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let hold = Op::Hold(started, release.clone(), active);
+    let mut held: BoxedFuture<'_, ActorResult<Report>> = if dynamic_receiver {
+        Box::pin(dynamic(&peer, hold))
+    } else {
+        Box::pin(typed.ask_unbounded(hold))
+    };
+    tokio::select! {
+        result = &mut held => panic!("held request finished early: {result:?}"),
+        generation = &mut entered => assert_eq!(generation.unwrap(), 0),
+    }
+    let gate = Arc::new(BlockGate::default());
+    let _release = Release(gate.clone());
+    let (delivered, arrived) = tokio::sync::oneshot::channel();
+    let queued = Op::Queued(delivered, BlockedDrop(gate.clone()));
+    if dynamic_receiver {
+        peer.deliver(Box::new(queued)).await.unwrap();
+    } else {
+        typed.tell(queued).await.unwrap();
+    }
+    assert!(live.upgrade().is_some());
+    if restart {
+        let failure = if dynamic_receiver {
+            typed.ask(Op::Fail).await
+        } else {
+            dynamic(&peer, Op::Fail).await
+        };
+        assert!(matches!(failure,
+            Err(ActorError::MessageHandlingError(ref reason)) if reason.contains("cohort requested failure")));
+        if graceful {
+            release.notify_one();
+        }
+        gate.entered.notified().await;
+        gate.release();
+        match arrived.await {
+            Ok(generation) if graceful => assert!(generation <= 1),
+            Ok(generation) => assert_eq!(generation, 1),
+            Err(_) => assert!(dynamic_receiver, "unread static TELL lost during recovery"),
+        }
+    } else {
+        let mut stopped = group.stop();
+        tokio::select! {
+            result = &mut stopped => panic!("group retired before queued input: {result:?}"),
+            _ = gate.entered.notified() => {}
+        }
+        assert!(futures::poll!(&mut stopped).is_pending());
+        if graceful {
+            release.notify_one();
+        }
+        gate.release();
+        stopped.await.unwrap();
+        assert!(arrived.await.is_err(), "a queued TELL ran after stop");
+    }
+    let reply = held.await;
+    if graceful {
+        assert_eq!(reply.unwrap(), Report(0, 0, "/peer".into()));
+    } else {
+        let error = reply.unwrap_err();
+        assert!(
+            match error {
+                ActorError::Stopped => !restart || dynamic_receiver,
+                ActorError::ReplyChannelError(_) => restart || dynamic_receiver,
+                _ => false,
+            },
+            "unexpected cancellation: {error:?}"
+        );
+    }
+    assert!(live.upgrade().is_none());
+    if restart {
+        while [&typed_plan, &dynamic_plan]
+            .iter()
+            .any(|p| p.initialized.load(Ordering::SeqCst) < 2)
+        {
+            tokio::task::yield_now().await;
+        }
+        recovered(&typed.clone().into_dyn(), "/receiver").await;
+        recovered(&peer, "/peer").await;
+        group.stop().await.unwrap();
+    }
+    assert!(group.members().is_empty());
+    for plan in [typed_plan, dynamic_plan] {
+        let generations = if restart { 2 } else { 1 };
+        assert_eq!(plan.built.load(Ordering::SeqCst), generations);
+        assert_eq!(plan.dropped.load(Ordering::SeqCst), generations);
+    }
+    shutdown(&system).await;
+}
+
+#[actix::test]
+async fn mixed_root_stop_joins_unread_tell_disposal_and_settles_active_ask() {
+    for mode in placements() {
+        for dynamic_receiver in [false, true] {
+            bounded(mixed_group_with_unread_tell(
+                mode.clone(),
+                false,
+                dynamic_receiver,
+            ))
+            .await;
+        }
+    }
+}
+
+#[actix::test]
+async fn mixed_root_restart_preserves_static_queue_and_settles_active_ask() {
+    for mode in placements() {
+        for dynamic_receiver in [false, true] {
+            bounded(mixed_group_with_unread_tell(
+                mode.clone(),
+                true,
+                dynamic_receiver,
+            ))
+            .await;
+        }
+    }
+}
+
+fn placements() -> [Option<SchedulingMode>; 4] {
+    [
+        None,
+        Some(parrot::thread::ThreadActorSystemConfig::default().default_scheduling_mode),
+        Some(SchedulingMode::DedicatedThread),
+        Some(SchedulingMode::Sharded {
+            affinity_key: "traffic".into(),
+        }),
+    ]
+}
+
+async fn cohort_facade(mode: Option<SchedulingMode>) -> ParrotActorSystem {
+    let Some(mode) = mode else {
+        return facade(true).await;
+    };
+    thread_cohort_facade(
+        mode,
+        parrot::thread::ThreadActorSystemConfig::default().shutdown_timeout,
+    )
+    .await
+}
+
+async fn thread_cohort_facade(
+    mode: SchedulingMode,
+    shutdown_timeout: Duration,
+) -> ParrotActorSystem {
+    let system = ParrotActorSystem::new(Default::default()).await.unwrap();
+    let engine = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
+        default_scheduling_mode: mode,
+        shutdown_timeout,
+        shared_pool_size: 2,
+        shared_burst_workers_max: 0,
+        ..Default::default()
+    });
+    system
+        .register_thread_system("native".into(), engine, true)
+        .await
+        .unwrap();
+    system
+}
+
+#[actix::test]
+async fn thread_root_stop_retires_stalled_dynamic_ask_and_keeps_timeout() {
+    for mode in placements().into_iter().flatten() {
+        bounded(async {
+            let system = thread_cohort_facade(mode, Duration::from_millis(350)).await;
+            let group = system.native_root_cohort(all()).await.unwrap();
+            let plan = Arc::new(Plan::default());
+            let made = plan.clone();
+            let peer = group
+                .spawn_factory(
+                    Box::new(move || Box::new(Member::new(&made))),
+                    SpawnOptions::at("/stalled"),
+                )
+                .await
+                .unwrap();
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let active = Arc::new(());
+            let live = Arc::downgrade(&active);
+            let request = dynamic(&peer, Op::Hold(started, Default::default(), active));
+            tokio::pin!(request);
+            tokio::select! {
+                result = &mut request => panic!("held request finished early: {result:?}"),
+                generation = entered => assert_eq!(generation.unwrap(), 0),
+            }
+            let timeout = group.stop().await.unwrap_err().to_string();
+            assert!(
+                timeout.contains("/stalled") && timeout.contains("deadline"),
+                "{timeout}"
+            );
+            assert_eq!(group.stop().await.unwrap_err().to_string(), timeout);
+            assert!(live.upgrade().is_none());
+            assert_eq!(plan.dropped.load(Ordering::SeqCst), 1);
+            assert!(group.members().is_empty());
+            let interrupted = request.await.unwrap_err();
+            assert!(
+                matches!(
+                    interrupted,
+                    ActorError::Stopped | ActorError::ReplyChannelError(_)
+                ),
+                "{interrupted:?}"
+            );
+            assert!(
+                AsyncEngineRuntime::get_actor(&system, "/stalled")
+                    .await
+                    .is_none()
+            );
+            system.shutdown_runtime().await.unwrap();
+        })
+        .await;
+    }
+}
+
+#[actix::test]
+async fn facade_shutdown_waits_for_mixed_root_worker_tls_after_waiter_cancellation() {
+    for mode in placements() {
+        // SharedPool can run on the caller's runtime, whose threads belong to the caller.
+        if matches!(mode, Some(SchedulingMode::SharedPool { .. })) {
+            continue;
+        }
+        for use_typed in [false, true] {
+            let system = cohort_facade(mode.clone()).await;
+            bounded(async {
+                let group = system.native_root_cohort(all()).await.unwrap();
+                let typed_plan = Arc::new(Plan::default());
+                let dynamic_plan = Arc::new(Plan::default());
+                let typed = group.spawn_typed::<_, Op>(Member::new(&typed_plan), "/typed").await.unwrap();
+                let made = dynamic_plan.clone();
+                let peer = group.spawn_factory(Box::new(move || Box::new(Member::new(&made))),
+                    SpawnOptions::at("/peer")).await.unwrap();
+                let gate = Arc::new(BlockGate::default());
+                let _release = Release(gate.clone());
+                let token = Arc::new(());
+                let live = Arc::downgrade(&token);
+                let install = Op::InstallExit(gate.clone(), token);
+                if use_typed {
+                    dynamic(&peer, Op::Read).await.unwrap();
+                    typed.ask(install).await.unwrap();
+                } else {
+                    typed.ask(Op::Read).await.unwrap();
+                    dynamic(&peer, install).await.unwrap();
+                }
+                let mut first = system.shutdown_runtime();
+                tokio::select! {
+                    result = &mut first => panic!("shutdown preceded worker TLS disposal: {result:?}"),
+                    _ = gate.entered.notified() => {}
+                }
+                drop(first);
+                let mut second = system.shutdown_runtime();
+                assert!(futures::poll!(&mut second).is_pending());
+                assert!(live.upgrade().is_some());
+                gate.release();
+                second.await.unwrap();
+                assert!(live.upgrade().is_none());
+                assert_eq!(typed_plan.dropped.load(Ordering::SeqCst), 1);
+                assert_eq!(dynamic_plan.dropped.load(Ordering::SeqCst), 1);
+                assert!(group.members().is_empty());
+                system.shutdown_runtime().await.unwrap();
+            }).await;
+        }
     }
 }
 
