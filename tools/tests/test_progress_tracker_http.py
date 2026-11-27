@@ -14,6 +14,55 @@ SPEC.loader.exec_module(tracker)
 
 
 class TaskDetails(unittest.TestCase):
+    def test_verified_task_must_be_named_in_the_pinned_report(self):
+        with tempfile.TemporaryDirectory(prefix='parrot-tracker-verdict-') as directory:
+            root = Path(directory)
+            docs = root / 'docs'
+            progress = docs / 'progress'
+            progress.mkdir(parents=True)
+            task_id = 'T00-01'
+            task = (f'### {task_id} 原始报告裁定\n状态：已验证\n剩余人日：0-0\n依赖：无\n'
+                    '已做：完成检查\n待做：无\n验收：报告指名本任务\n证据：receipt\n')
+            for filename in ('TASKS.md', 'EXECUTION-PLAN.md'):
+                (docs / filename).write_text(task, encoding='utf-8')
+            def save(path, value):
+                path.write_text(json.dumps(value), encoding='utf-8')
+            save(progress / 'config.json', {
+                'schema_version': 1, 'project_name': 'verdict', 'scope': 'test', 'port': 0,
+                'repositories': {'main': '.'}, 'phases': {'T00': '验收'},
+                'documents': {'tasks': {'name': 'tasks', 'repository': 'main', 'path': 'docs/TASKS.md'}},
+            })
+            save(progress / 'scope.json', {'schema_version': 1, 'revision': 'test',
+                                           'active_task_ids': [task_id], 'removed_tasks': []})
+            report = docs / 'report.json'
+            batch = dict(id='receipt', title='证据', detail='实际裁定', repository='main',
+                         report='docs/report.json', document='tasks', task_ids=[task_id],
+                         verified_task_ids=[task_id])
+            notes = dict(schema_version=1, updated='2026-11-27', scope_change='test', headline='test',
+                         current_task_id=task_id, current_detail='test', boundary='test', queue=[task_id],
+                         delivery_groups=[], batches=[batch], limits=[])
+            cases = [
+                ({}, False),
+                ({'verified_task_ids': []}, False),
+                ({'verified_task_ids': ['T00-02']}, False),
+                ({'verified_task_ids': task_id}, False),
+                ({'verified_task_ids': [task_id], 'passed': False}, False),
+                ({'verified_task_ids': [task_id], 'stages': [{'exit_code': 1}]}, False),
+                ({'verified_task_ids': [task_id]}, True),
+                ({'verified_task_ids': [task_id], 'stages': [{'code': 101, 'expected_code': 101}]}, True),
+            ]
+            for fields, valid in cases:
+                with self.subTest(fields=fields):
+                    raw = {'passed': True, **fields}
+                    save(report, raw)
+                    batch['sha256'] = tracker.digest(report)
+                    save(progress / 'current.json', notes)
+                    if valid:
+                        self.assertEqual(tracker.load_state(root)['states'], {'已验证': 1})
+                    else:
+                        with self.assertRaisesRegex(ValueError, '裁定'):
+                            tracker.load_state(root)
+
     def test_expected_nonzero_controls_and_timeouts_have_distinct_results(self):
         stages = [
             dict(name="historical control", exit_code=1, expected_exit_code=1),

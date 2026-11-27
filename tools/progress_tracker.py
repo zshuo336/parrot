@@ -26,11 +26,19 @@ def read_text(path):
     return path.read_text(encoding="utf-8")
 
 
-def read_json(path):
-    value = json.loads(read_text(path))
+def read_json_with_digest(path):
+    with path.open("rb") as stream:
+        data = stream.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise ValueError("读取来源超过4MiB：" + path.name)
+    value = json.loads(data.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("JSON 顶层必须是对象：" + path.name)
-    return value
+    return value, hashlib.sha256(data).hexdigest()
+
+
+def read_json(path):
+    return read_json_with_digest(path)[0]
 
 
 def digest(path):
@@ -224,12 +232,11 @@ def load_state(root):
         if batch["document"] not in documents:
             raise ValueError(identity + " 文档入口未配置")
         covered = task_ids(batch.get("task_ids", []), set(by_id), "批次任务")
-        task_ids(batch.get("verified_task_ids", []), set(covered), "完整验收裁定")
+        verified = task_ids(batch.get("verified_task_ids", []), set(covered), "完整验收裁定")
         path = within(repositories[batch["repository"]], batch["report"])
         batch.update(report_exists=path.is_file(), passed=False, failed_stages=[], check_count=0)
         if path.is_file():
-            raw = read_json(path)
-            batch["report_sha256"] = digest(path)
+            raw, batch["report_sha256"] = read_json_with_digest(path)
             if batch.get("sha256") is not None and batch["sha256"] != batch["report_sha256"]:
                 raise ValueError(identity + " 原始报告摘要已改变")
             batch["passed"] = raw.get("passed", raw.get("success")) is True
@@ -238,6 +245,12 @@ def load_state(root):
             if not isinstance(stages, list) or any(not isinstance(stage, dict) for stage in stages):
                 raise ValueError(identity + " 报告stages须为对象数组")
             batch["failed_stages"] = failed_stage_names(stages)
+            if verified:
+                report_ids = raw.get("verified_task_ids")
+                if (not isinstance(report_ids, list)
+                        or not all(task_id in report_ids for task_id in verified)
+                        or not batch["passed"] or batch["failed_stages"]):
+                    raise ValueError(identity + " 的完整验收裁定与原始报告不符")
             checks = raw.get("checks", [])
             batch["check_count"] = checks if type(checks) is int else len(checks) if isinstance(checks, list) else 0
         else:
