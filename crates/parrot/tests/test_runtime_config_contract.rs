@@ -470,6 +470,7 @@ async fn actix_rejects_scheduler_capacity_without_substituting_mailbox_capacity(
 
 #[tokio::test]
 async fn tokio_runtime_applies_explicit_counts_and_supports_placement_policies() {
+    let host = tokio::runtime::Handle::current().id();
     for config in [
         RuntimeConfig {
             worker_threads: Some(1),
@@ -480,9 +481,23 @@ async fn tokio_runtime_applies_explicit_counts_and_supports_placement_policies()
             ..RuntimeConfig::default()
         },
     ] {
+        let separate_io = config.io_threads.is_some();
         let runtime = TokioActorRuntime::start(config)
             .await
             .expect("explicit Tokio thread settings must be applied");
+        let identity = || async {
+            let handle = tokio::runtime::Handle::current();
+            (handle.id(), handle.metrics().num_workers())
+        };
+        let (actor, actor_workers) = runtime.spawn(identity()).await.unwrap();
+        let (io, io_workers) = runtime.spawn_io(identity()).await.unwrap();
+        assert_ne!(actor, host);
+        assert_ne!(io, host);
+        assert_eq!(actor == io, !separate_io);
+        assert_eq!(io_workers, 1);
+        if !separate_io {
+            assert_eq!(actor_workers, 1);
+        }
         runtime.shutdown().await.unwrap();
     }
     for strategy in [
@@ -492,13 +507,47 @@ async fn tokio_runtime_applies_explicit_counts_and_supports_placement_policies()
         let runtime = TokioActorRuntime::start(RuntimeConfig {
             worker_threads: Some(2),
             scheduler_config: parrot_api::runtime::SchedulerConfig {
-                load_balancing: strategy,
+                load_balancing: strategy.clone(),
                 ..Default::default()
             },
             ..RuntimeConfig::default()
         })
         .await
         .expect("Tokio placement policy must create an owned worker pool");
+        let worker = || async {
+            let handle = tokio::runtime::Handle::current();
+            assert_eq!(handle.metrics().num_workers(), 1);
+            let id = std::thread::current().id();
+            tokio::task::yield_now().await;
+            assert_eq!(std::thread::current().id(), id);
+            (handle.id(), id)
+        };
+        if matches!(strategy, LoadBalancingStrategy::Random) {
+            fastrand::seed(42);
+            let mut owners = HashSet::new();
+            for _ in 0..64 {
+                owners.insert(runtime.spawn(worker()).await.unwrap());
+            }
+            assert_eq!(owners.len(), 2);
+            assert!(owners.iter().all(|(runtime, _)| *runtime != host));
+        } else {
+            let (entered, observed) = tokio::sync::oneshot::channel();
+            let (release, held) = tokio::sync::oneshot::channel();
+            let busy = runtime.spawn(async move {
+                entered.send(worker().await).unwrap();
+                held.await.unwrap();
+            });
+            tokio::pin!(busy);
+            assert!(futures::poll!(&mut busy).is_pending());
+            let occupied = tokio::time::timeout(WAIT, observed).await.unwrap().unwrap();
+            let available = runtime.spawn(worker()).await.unwrap();
+            assert_ne!(occupied.0, host);
+            assert_ne!(available.0, host);
+            assert_ne!(occupied.1, available.1);
+            assert_eq!(runtime.spawn(worker()).await.unwrap(), available);
+            release.send(()).unwrap();
+            busy.await.unwrap();
+        }
         runtime.shutdown().await.unwrap();
     }
 }
