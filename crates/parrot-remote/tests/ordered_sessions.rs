@@ -793,6 +793,115 @@ async fn explicit_close_reclaims_the_bounded_outgoing_destination_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_closes_observe_one_completed_retirement() {
+    let (state, _rx) = state();
+    let release = Release(state.clone());
+    let target = start(
+        RemoteConfig::mem("joined-target"),
+        Arc::new(Target(state.clone())),
+    )
+    .await;
+    let source = start(RemoteConfig::mem("joined-source"), Arc::new(Empty)).await;
+    source.connect_mem_pair(&target).await.unwrap();
+    let reference = source.remote_ref("parrot://joined-target/target").unwrap();
+    strict(&reference, 700).await;
+    let timeout = Duration::from_secs(3);
+    tokio::time::timeout(timeout, state.entered.notified())
+        .await
+        .unwrap();
+    let first = tokio::spawn({
+        let reference = reference.clone();
+        async move { reference.close_ordered_session(timeout).await }
+    });
+    tokio::time::timeout(timeout, state.dropping.notified())
+        .await
+        .unwrap();
+    let mut second = Box::pin(reference.close_ordered_session(timeout));
+    assert!(futures::poll!(&mut second).is_pending());
+    assert!(!state.dropped.load(Ordering::SeqCst));
+    release.release();
+    first.await.unwrap().unwrap();
+    target.shutdown().await.unwrap();
+    second.await.unwrap();
+    assert!(state.dropped.load(Ordering::SeqCst));
+    source.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn repeated_close_after_peer_disconnect_requires_no_new_route() {
+    for retired in [true, false] {
+        check_disconnected_close(retired).await;
+    }
+}
+
+async fn check_disconnected_close(retired: bool) {
+    let (target_state, mut rx) = state();
+    let target = start(
+        RemoteConfig::mem("departing-target"),
+        Arc::new(Target(target_state)),
+    )
+    .await;
+    let source = start(
+        RemoteConfig::mem("closing-source").with_knobs(RuntimeKnobs {
+            reorder_stream_capacity: 1,
+            ..Default::default()
+        }),
+        Arc::new(Empty),
+    )
+    .await;
+    source.connect_mem_pair(&target).await.unwrap();
+    let reference = source
+        .remote_ref("parrot://departing-target/target")
+        .unwrap();
+    strict(&reference, 1).await;
+    seen(&mut rx, 1).await;
+    let timeout = Duration::from_secs(3);
+    if retired {
+        reference.close_ordered_session(timeout).await.unwrap();
+    }
+    target.shutdown().await.unwrap();
+    tokio::time::timeout(timeout, async {
+        while source
+            .missing_direct_connections(&["departing-target"])
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        reference.close_ordered_session(timeout).await.is_ok(),
+        retired
+    );
+    assert!(reference
+        .close_ordered_session(Duration::ZERO)
+        .await
+        .is_err());
+    let (other_state, mut other_rx) = state();
+    let other = start(
+        RemoteConfig::mem("other-target"),
+        Arc::new(Target(other_state)),
+    )
+    .await;
+    source.connect_mem_pair(&other).await.unwrap();
+    let dest = source.remote_ref("parrot://other-target/target").unwrap();
+    let result = dest
+        .deliver_ordered(Box::new(Work(2)), Default::default())
+        .await;
+    if retired {
+        result.unwrap();
+        seen(&mut other_rx, 2).await;
+    } else {
+        assert!(result.unwrap_err().to_string().contains("capacity"));
+        assert!(other_rx.try_recv().is_err());
+    }
+    source.shutdown().await.unwrap();
+    other.shutdown().await.unwrap();
+    assert!(reference.close_ordered_session(timeout).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_request_admission_is_not_a_session_retirement_receipt() {
     let (state, _receiver) = state();
     let release = Release(state.clone());

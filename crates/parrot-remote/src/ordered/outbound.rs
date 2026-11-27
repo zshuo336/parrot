@@ -373,28 +373,33 @@ impl Outbound {
     pub async fn close_lane(
         &self,
         destination: &str,
-        sender: &FrameSender,
+        resolve_sender: impl std::future::Future<Output = Option<FrameSender>>,
         callbacks: &CallbackRegistry,
         path: &str,
-        timeout: Duration,
+        deadline: Instant,
     ) -> ActorResult<()> {
-        let lane = { self.lanes.lock().unwrap().get(destination).cloned() };
+        let lane = {
+            let lanes = self.lanes.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(ActorError::Stopped);
+            }
+            lanes.get(destination).cloned()
+        };
         let Some(lane) = lane else {
             return Ok(());
         };
         let mut usage = LaneUse::new(self, destination, lane);
         let lane = usage.lane.as_ref().expect("live lane handle");
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .filter(|_| !timeout.is_zero())
-            .ok_or_else(|| {
-                ErrCode::ProtocolViolation.to_actor_error("invalid ordered close deadline".into())
-            })?;
         crate::transport::notify_safely(async {
             tokio::time::timeout_at(deadline, async {
                 let mut state = lane.lock().await;
                 usage.retained = state.grant.is_some() || state.sent_ordered;
+                if state.closed {
+                    return Ok(());
+                }
                 if let Some(grant) = &state.grant {
+                    let current = resolve_sender.await;
+                    let sender = current.as_ref().unwrap_or(&grant.sender);
                     let control = Control {
                         operation: Operation::Close,
                         source: self.source.clone(),
@@ -575,10 +580,10 @@ mod tests {
         assert!(futures::poll!(&mut retry).is_pending());
         let mut closing = Box::pin(outbound.close_lane(
             "first",
-            &sender,
+            std::future::ready(Some(sender.clone())),
             &callbacks,
             "/target",
-            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5),
         ));
         assert!(futures::poll!(&mut closing).is_pending());
 

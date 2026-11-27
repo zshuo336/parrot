@@ -161,7 +161,9 @@ impl RemoteActorRef {
 
     /// Cancel this destination's session and wait for its actual receiver worker
     /// to retire. Already admitted actor work is not retracted. Explicit close
-    /// frees the bounded source-side destination slot.
+    /// frees the bounded source-side destination slot. Concurrent callers join
+    /// the same retirement. While the source is running, closing an absent
+    /// session succeeds without contacting the destination.
     pub async fn close_ordered_session(&self, timeout: Duration) -> ActorResult<()> {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
@@ -169,36 +171,25 @@ impl RemoteActorRef {
             .ok_or_else(|| {
                 ErrCode::ProtocolViolation.to_actor_error("invalid ordered close deadline".into())
             })?;
-        tokio::time::timeout_at(deadline, async {
-            let outbound = self
-                .inner
-                .system
-                .as_ref()
-                .and_then(|system| system.upgrade())
-                .map(|system| system.outbound_ordered.clone())
-                .ok_or_else(|| {
-                    ErrCode::NotRemotable
-                        .to_actor_error("ordered sessions require an owning remote system".into())
-                })?;
-            let sender = self
-                .inner
-                .ensure_sender(&self.node_id)
-                .await
-                .ok_or_else(|| {
-                    ErrCode::ConnectionLost.to_actor_error("ordered close route unavailable".into())
-                })?;
-            outbound
-                .close_lane(
-                    &self.node_id,
-                    &sender,
-                    &self.inner.callbacks,
-                    &self.path,
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                )
-                .await
-        })
-        .await
-        .unwrap_or(Err(ActorError::Timeout))
+        let outbound = self
+            .inner
+            .system
+            .as_ref()
+            .and_then(|system| system.upgrade())
+            .map(|system| system.outbound_ordered.clone())
+            .ok_or_else(|| {
+                ErrCode::NotRemotable
+                    .to_actor_error("ordered sessions require an owning remote system".into())
+            })?;
+        outbound
+            .close_lane(
+                &self.node_id,
+                self.inner.ensure_sender(&self.node_id),
+                &self.inner.callbacks,
+                &self.path,
+                deadline,
+            )
+            .await
     }
 
     fn deliver_mode<'a>(
