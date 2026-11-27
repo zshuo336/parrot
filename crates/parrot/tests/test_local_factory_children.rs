@@ -65,12 +65,16 @@ pub struct Hold(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 impl Message for Hold {
     type Result = usize;
 }
+pub struct Queued(Arc<()>);
+impl Message for Queued {
+    type Result = ();
+}
 pub struct Fail;
 impl Message for Fail {
     type Result = ();
 }
 #[derive(ParrotTypedActor)]
-#[ParrotTypedActor(msgs(Info, Fail, Hold), local, lifecycle)]
+#[ParrotTypedActor(msgs(Info, Fail, Hold, Queued), local, lifecycle)]
 struct Node {
     generation: usize,
     local: Rc<Cell<usize>>,
@@ -818,6 +822,23 @@ async fn local_and_send_factory_siblings_share_one_real_recovery_cohort() {
     s.as_ref().clone().shutdown().await.unwrap();
 }
 
+impl LocalTypedReceive<Queued> for Node {
+    fn receive_typed(&mut self, message: Queued) -> LocalBoxedFuture<'_, ActorResult<()>> {
+        Box::pin(async move {
+            let Queued(_payload) = message;
+            self.stats.record(self.generation, "queued");
+            Ok(())
+        })
+    }
+}
+
+struct HeldDispatch<'a>(&'a Node);
+impl Drop for HeldDispatch<'_> {
+    fn drop(&mut self) {
+        self.0.stats.record(self.0.generation, "dispatch_drop");
+    }
+}
+
 impl LocalTypedReceive<Hold> for Node {
     fn receive_typed(
         &mut self,
@@ -825,6 +846,7 @@ impl LocalTypedReceive<Hold> for Node {
     ) -> LocalBoxedFuture<'_, ActorResult<usize>> {
         let local = self.local.clone();
         Box::pin(async move {
+            let _dispatch = HeldDispatch(self);
             self.stats.record(self.generation, "hold");
             entered.notify_one();
             release.notified().await;
@@ -859,20 +881,44 @@ async fn local_cohort_cancels_in_flight_sibling_request_but_preserves_unread_mes
     let pending = held.ask(Hold(entered.clone(), release));
     tokio::pin!(pending);
     tokio::select! { _ = entered.notified() => {}, result = &mut pending => panic!("held request ended early: {result:?}") }
-    local.tell(Info).await.unwrap();
+    let payload = Arc::new(());
+    let queued = Arc::downgrade(&payload);
+    local
+        .ref_for::<Queued>()
+        .tell(Queued(payload))
+        .await
+        .unwrap();
+    assert!(queued.upgrade().is_some());
     assert!(send.ref_for::<Fail>().ask(Fail).await.is_err());
     assert!(matches!(
         pending.await,
         Err(ActorError::ReplyChannelError(_))
     ));
-    until(|| local_stats.count(1, "init") == 1).await;
+    until(|| local_stats.count(1, "queued") == 1).await;
     assert_eq!(local.ask(Info).await.unwrap().0, 1);
-    assert_eq!(local_stats.count(0, "hold"), 1);
-    assert_eq!(local_stats.count(1, "hold"), 0);
+    assert!(queued.upgrade().is_none());
+    let observed: Vec<_> = local_stats
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|&(generation, phase, _)| (generation, phase))
+        .filter(|(_, phase)| *phase != "hook")
+        .collect();
     assert_eq!(
-        local_stats.count(1, "message"),
-        2,
-        "unread TELL must execute before the new ASK"
+        observed,
+        [
+            (0, "construct"),
+            (0, "init"),
+            (0, "message"),
+            (0, "hold"),
+            (0, "dispatch_drop"),
+            (0, "drop"),
+            (1, "construct"),
+            (1, "init"),
+            (1, "queued"),
+            (1, "message"),
+        ]
     );
     parent.stop().await.unwrap();
     s.as_ref().clone().shutdown().await.unwrap();
