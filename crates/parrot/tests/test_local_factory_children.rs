@@ -156,6 +156,88 @@ impl Drop for Node {
     }
 }
 type Ref = LocalTypedActorRef<Node, Info>;
+
+#[path = "support/isolated.rs"]
+mod isolated;
+
+#[test]
+fn local_factory_tree_retires_on_its_arbiters_after_original_host_exit() {
+    isolated::run(
+        "local_factory_tree_retires_on_its_arbiters_after_original_host_exit",
+        "PARROT_LOCAL_FACTORY_TREE_CHILD",
+        Duration::from_secs(30),
+        || {
+            let host = actix::System::new();
+            let stats = [Arc::new(Stats::default()), Arc::default(), Arc::default()];
+            let factory = |stats: &Arc<Stats>| {
+                let stats = stats.clone();
+                let capture = Arc::new(());
+                let weak = Arc::downgrade(&capture);
+                (
+                    move || {
+                        let _keep = &capture;
+                        Node::new(stats.clone())
+                    },
+                    weak,
+                )
+            };
+            let (system, actors, captures) = host.block_on(async {
+                let system = Arc::new(ActixActorSystem::with_arbiter_count(2).await.unwrap());
+                let (root_factory, root_capture) = factory(&stats[0]);
+                let root: Ref = system
+                    .spawn_local_typed_factory(root_factory, "/local-tree")
+                    .await
+                    .unwrap();
+                let (generation, root_ctx) = root.ask(Info).await.unwrap();
+                assert_eq!(generation, 0);
+                let (child_factory, child_capture) = factory(&stats[1]);
+                let child: Ref = root_ctx
+                    .spawn_local_typed_child_factory(child_factory)
+                    .await
+                    .unwrap();
+                let (generation, child_ctx) = child.ask(Info).await.unwrap();
+                assert_eq!(generation, 0);
+                assert_eq!(child_ctx.parent().unwrap().path(), root.path());
+                let leaf_state = stats[2].clone();
+                let leaf: Ref = child_ctx
+                    .spawn_local_typed_child(move || Node::new(leaf_state.clone()))
+                    .await
+                    .unwrap();
+                let (generation, leaf_ctx) = leaf.ask(Info).await.unwrap();
+                assert_eq!(generation, 0);
+                assert_eq!(leaf_ctx.parent().unwrap().path(), child.path());
+                assert!(root_capture.upgrade().is_some() && child_capture.upgrade().is_some());
+                (system, [root, child, leaf], [root_capture, child_capture])
+            });
+            drop(host);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), actors[0].stop())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    for (actor, state) in actors.iter().zip(&stats) {
+                        assert!(matches!(
+                            actor.retirement_status(),
+                            parrot_api::address::RetirementStatus::Retired(Ok(()))
+                        ));
+                        assert!(system.get_actor(&actor.path().to_owned()).await.is_none());
+                        assert_eq!(state.phases("construct"), 1);
+                        assert_eq!(state.phases("message"), 1);
+                        assert_eq!(state.phases("drop"), 1);
+                        state.assert_affinity();
+                        assert!(actor.ask(Info).await.is_err());
+                    }
+                    assert!(captures.iter().all(|capture| capture.upgrade().is_none()));
+                    system.as_ref().clone().shutdown().await.unwrap();
+                });
+        },
+    );
+}
+
 fn one() -> SupervisorStrategyType {
     SupervisorStrategyType::OneForOne(OneForOneStrategy {
         max_restarts: 2,
