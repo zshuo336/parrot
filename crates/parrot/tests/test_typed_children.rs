@@ -891,6 +891,145 @@ impl ParrotMsgVariant<BlockedChild> for Ping {
         Ok(())
     }
 }
+
+#[test]
+fn named_instance_and_factory_retire_on_original_engine_after_host_exit() {
+    use parrot::thread::config::SchedulingMode;
+    isolated::run(
+        "named_instance_and_factory_retire_on_original_engine_after_host_exit",
+        "PARROT_NAMED_TREE_HOST_EXIT",
+        Duration::from_secs(40),
+        || {
+            for mode in [
+                SchedulingMode::DedicatedThread,
+                SchedulingMode::Sharded {
+                    affinity_key: "replacement".into(),
+                },
+            ] {
+                for factory in [false, true] {
+                    check_named_host_exit(mode.clone(), factory);
+                }
+            }
+        },
+    );
+}
+
+fn check_named_host_exit(mode: parrot::thread::config::SchedulingMode, factory: bool) {
+    use parrot::system::ParrotActorSystem;
+    use parrot_api::address::RetirementStatus;
+
+    let make_system = || {
+        ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {
+            default_scheduling_mode: mode.clone(),
+            shared_pool_size: 1,
+            shared_burst_workers_max: 0,
+            ..Default::default()
+        })
+    };
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let host = runtime();
+    let observer = runtime();
+    let gate = Arc::new(DropGate::default());
+    let _release = ReleaseGate(gate.clone());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let old_stats = Arc::new(Stats::default());
+    let (facade, original, root, child) = host.block_on(async {
+        let facade = ParrotActorSystem::new(Default::default()).await.unwrap();
+        let original = make_system();
+        facade
+            .register_thread_system("named".into(), original.clone(), false)
+            .await
+            .unwrap();
+        let stats = old_stats.clone();
+        let root = if factory {
+            facade
+                .spawn_typed_factory_on::<_, Op, _>(
+                    "named",
+                    move || Family::new(stats.clone(), 0),
+                    "/same",
+                )
+                .await
+        } else {
+            facade
+                .spawn_typed_on::<_, Op>("named", Family::new(stats, 0), "/same")
+                .await
+        }
+        .unwrap();
+        let child = context(&root)
+            .await
+            .spawn_typed_child::<_, Ping>(BlockedChild {
+                gate: gate.clone(),
+                drops: drops.clone(),
+            })
+            .await
+            .unwrap();
+        child.ask(Ping).await.unwrap();
+        assert_eq!(info(&root).await, ("/same".into(), None, 1));
+        (facade, original, root, child)
+    });
+
+    let new_stats = Arc::new(Stats::default());
+    let replacement = observer.block_on(async {
+        facade
+            .register_thread_system("named".into(), make_system(), false)
+            .await
+            .unwrap();
+        let new = facade
+            .spawn_typed_on::<_, Op>("named", Family::new(new_stats.clone(), 0), "/same")
+            .await
+            .unwrap();
+        assert_eq!(info(&new).await, ("/same".into(), None, 0));
+        assert_eq!(info(&root).await.2, 1);
+        new
+    });
+    drop(host);
+    observer.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified()).await.unwrap();
+                        let root_stop = root.stop();
+                        let child_stop = child.stop();
+                        tokio::pin!(root_stop, child_stop);
+                        assert!(futures::poll!(&mut root_stop).is_pending());
+                        assert!(futures::poll!(&mut child_stop).is_pending());
+                        assert!(matches!(child.retirement_status(), RetirementStatus::Pending));
+                        assert_eq!(drops.load(Ordering::SeqCst), 0);
+                        assert_eq!(info(&replacement).await, ("/same".into(), None, 0));
+                        gate.release();
+                        let (parent_result, child_result) = tokio::time::timeout(Duration::from_secs(4), async {
+                            tokio::join!(root_stop, child_stop)
+                        }).await.unwrap();
+                        for (result, path) in [(parent_result, root.path()), (child_result, child.path())] {
+                            let error = result.unwrap_err();
+                            let ActorError::Other(source) = error else { panic!("{error:?}") };
+                            let Some(parrot::thread::error::SystemError::ActorCreationError(detail)) =
+                                source.downcast_ref::<parrot::thread::error::SystemError>() else { panic!("{source:?}") };
+                            let prefix = format!("typed actor {path} execution failed without a disposal receipt: Err(JoinError::Cancelled(Id(");
+                            assert!(detail.strip_prefix(&prefix).and_then(|text| text.strip_suffix(")))"))
+                                .is_some_and(|id| id.parse::<u64>().is_ok()), "{detail}");
+                        }
+                        assert!(matches!(root.retirement_status(), RetirementStatus::Retired(Ok(()))));
+                        assert!(matches!(child.retirement_status(), RetirementStatus::Retired(Ok(()))));
+                        assert_eq!(drops.load(Ordering::SeqCst), 1);
+                        assert_eq!(old_stats.drops.load(Ordering::SeqCst), 1);
+                        assert_eq!(original.actor_count(), 0);
+                        assert!(root.ask(Op::Info).await.is_err());
+                        assert!(child.ask(Ping).await.is_err());
+                        assert_eq!(info(&replacement).await, ("/same".into(), None, 0));
+                        assert_eq!(new_stats.drops.load(Ordering::SeqCst), 0);
+                        replacement.stop().await.unwrap();
+                        assert_eq!(new_stats.drops.load(Ordering::SeqCst), 1);
+                        facade.shutdown_runtime().await.unwrap();
+                        let shutdown = original.shutdown_internal().await;
+                        assert!(matches!(&shutdown,
+                            Err(parrot::thread::error::SystemError::ShutdownError(message))
+                            if message == "1 shared cleanup failure(s): shared task unexpectedly cancelled"), "{shutdown:?}");
+                    });
+}
+
 #[tokio::test]
 async fn typed_parent_timeout_keeps_both_paths_until_blocked_child_really_retires() {
     let s = ThreadActorSystem::shared(parrot::thread::ThreadActorSystemConfig {

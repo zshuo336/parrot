@@ -201,6 +201,7 @@ fn instance(stats: &Arc<Stats>) -> Child {
 enum Op {
     Hold(Arc<Hold>),
     Read,
+    Increment,
     Fail,
     FailWait(Arc<Notify>, Arc<Notify>),
 }
@@ -208,6 +209,7 @@ struct Info {
     generation: usize,
     value: usize,
     context: TypedContext,
+    worker: std::thread::Thread,
 }
 impl Message for Op {
     type Result = Info;
@@ -263,11 +265,17 @@ impl ParrotTypedDispatch for Child {
                     hold.entered.notify_one();
                     std::future::pending().await
                 }
-                Op::Read => Ok(Info {
-                    generation: self.generation,
-                    value: self.value,
-                    context: ctx.clone(),
-                }),
+                Op::Read | Op::Increment => {
+                    if matches!(op, Op::Increment) {
+                        self.value += 1;
+                    }
+                    Ok(Info {
+                        generation: self.generation,
+                        value: self.value,
+                        context: ctx.clone(),
+                        worker: std::thread::current(),
+                    })
+                }
                 Op::Fail | Op::FailWait(..) => {
                     self.value += 1;
                     if let Op::FailWait(entered, release) = op {
@@ -345,50 +353,83 @@ fn fixtures() -> (Events, Arc<Stats>, Arc<Stats>, Arc<AtomicUsize>) {
 async fn inherited_restart_preserves_child_identity_queue_and_generation_isolation() {
     for actix in [false, true] {
         let e = Engine::new(actix, 2, Duration::from_secs(3)).await;
-        let (root, _) = e.root().await;
-        let ctx = root.ask(Context).await.unwrap();
-        let (_, stats, _, calls) = fixtures();
-        ctx.set_child_strategy(policy(false, 1, SupervisionDecision::Restart, &calls));
-        let child = spawn(&ctx, &stats).await;
-        let old = child.ask(Op::Read).await.unwrap().context;
-        let path = child.path().to_owned();
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let failed = child.ask(Op::FailWait(entered.clone(), release.clone()));
-        tokio::pin!(failed);
-        assert!(futures::poll!(&mut failed).is_pending());
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
-            .await
-            .unwrap();
-        let queued = child.ask(Op::Read);
-        tokio::pin!(queued);
-        assert!(futures::poll!(&mut queued).is_pending());
-        release.notify_one();
-        assert!(failed.await.is_err());
-        let current = queued.await.unwrap();
-        assert_eq!((current.generation, current.value), (1, 0));
-        assert_eq!(child.path(), path);
-        assert_eq!(ctx.children().len(), 1);
-        old.stop();
-        assert_eq!(child.ask(Op::Read).await.unwrap().generation, 1);
-        let rejected = stats.clone();
-        assert!(
-            old.spawn_typed_child_factory::<_, Op, _>(move || instance(&rejected))
-                .await
-                .is_err()
-        );
-        assert_eq!(stats.built.load(Ordering::SeqCst), 2);
-        assert_eq!(stats.drops.load(Ordering::SeqCst), 1);
-        assert!(child.ask(Op::Fail).await.is_err());
-        until(|| ctx.children().is_empty()).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(stats.built.load(Ordering::SeqCst), 2);
-        assert_eq!(stats.drops.load(Ordering::SeqCst), 2);
-        assert_eq!(stats.hooks.load(Ordering::SeqCst), 0);
-        root.stop().await.unwrap();
-        assert_eq!(e.count(), 0);
-        e.shutdown().await;
+        check_inherited_restart(e, None).await;
     }
+}
+
+#[tokio::test]
+async fn dedicated_and_sharded_child_factories_preserve_admitted_messages_on_restart() {
+    use parrot::thread::config::SchedulingMode;
+    for (mode, prefix) in [
+        (SchedulingMode::DedicatedThread, "parrot-dedicated-"),
+        (
+            SchedulingMode::Sharded {
+                affinity_key: "child-restart".into(),
+            },
+            "parrot-shard-",
+        ),
+    ] {
+        let e = Engine::Thread(ThreadActorSystem::shared(ThreadActorSystemConfig {
+            default_scheduling_mode: mode,
+            ..Default::default()
+        }));
+        check_inherited_restart(e, Some(prefix)).await;
+    }
+}
+
+async fn check_inherited_restart(e: Engine, prefix: Option<&str>) {
+    let (root, _) = e.root().await;
+    let ctx = root.ask(Context).await.unwrap();
+    let (_, stats, _, calls) = fixtures();
+    ctx.set_child_strategy(policy(false, 1, SupervisionDecision::Restart, &calls));
+    let child = spawn(&ctx, &stats).await;
+    let first = child.ask(Op::Read).await.unwrap();
+    assert_eq!((first.generation, first.value), (0, 0));
+    let old = first.context;
+    let path = child.path().to_owned();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let failed = child.ask(Op::FailWait(entered.clone(), release.clone()));
+    tokio::pin!(failed);
+    assert!(futures::poll!(&mut failed).is_pending());
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    child.tell(Op::Increment).await.unwrap();
+    let queued = child.ask(Op::Read);
+    tokio::pin!(queued);
+    assert!(futures::poll!(&mut queued).is_pending());
+    release.notify_one();
+    assert!(
+        matches!(failed.await, Err(ActorError::MessageHandlingError(ref message)) if message == "static child failure")
+    );
+    let current = queued.await.unwrap();
+    assert_eq!((current.generation, current.value), (1, 1));
+    if let Some(prefix) = prefix {
+        assert!(first.worker.name().unwrap_or_default().starts_with(prefix));
+        assert_eq!(first.worker.id(), current.worker.id());
+    }
+    assert_eq!(child.path(), path);
+    assert_eq!(ctx.children().len(), 1);
+    old.stop();
+    assert_eq!(child.ask(Op::Read).await.unwrap().generation, 1);
+    let rejected = stats.clone();
+    assert!(
+        old.spawn_typed_child_factory::<_, Op, _>(move || instance(&rejected))
+            .await
+            .is_err()
+    );
+    assert_eq!(stats.built.load(Ordering::SeqCst), 2);
+    assert_eq!(stats.drops.load(Ordering::SeqCst), 1);
+    assert!(child.ask(Op::Fail).await.is_err());
+    until(|| ctx.children().is_empty()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(stats.built.load(Ordering::SeqCst), 2);
+    assert_eq!(stats.drops.load(Ordering::SeqCst), 2);
+    assert_eq!(stats.hooks.load(Ordering::SeqCst), 0);
+    root.stop().await.unwrap();
+    assert_eq!(e.count(), 0);
+    e.shutdown().await;
 }
 
 #[actix::test]
