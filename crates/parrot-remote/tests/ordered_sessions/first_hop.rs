@@ -272,3 +272,78 @@ async fn node_wide_shared_ticket_fences_sender_upgrade() {
 async fn destination_actor_shared_ticket_fences_sender_upgrade() {
     upgrade_shared_sender(true).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_direct_link_keeps_actor_fifo_and_sibling_progress_through_tls_hub() {
+    use parrot_remote::topology::{TopologyConfig, TopologyMode};
+    let pki = Pki::new();
+    let config = |name| {
+        RemoteConfig::tcp(name, Some("127.0.0.1:0".parse().unwrap())).with_mtls(pki.node(name), [])
+    };
+    let hub = start(
+        config("fifo-hub").with_role(TopologyRole::Hub),
+        Arc::new(Empty),
+    )
+    .await;
+    let (target_state, mut received) = state();
+    let target = start(
+        config("fifo-end").with_ordered_relays(["fifo-hub".into()]),
+        Arc::new(Target(target_state.clone())),
+    )
+    .await;
+    let source = start(
+        config("fifo-source").with_topology(TopologyConfig {
+            mode: TopologyMode::Hybrid,
+            ..Default::default()
+        }),
+        Arc::new(Empty),
+    )
+    .await;
+    let hub_addr = NodeAddr::tcp("fifo-hub", hub.local_addr().unwrap());
+    target.connect(&hub_addr).await.unwrap();
+    source
+        .connect(&NodeAddr::tcp("fifo-end", target.local_addr().unwrap()))
+        .await
+        .unwrap();
+    let direct = source.links_snapshot().await.pop().unwrap().1;
+    assert_eq!(direct.node_id(), "fifo-end");
+    let reference = source.remote_ref("parrot://fifo-end/target").unwrap();
+    let writer = ActorSenderOwner::new("/user/writer");
+    let sibling = ActorSenderOwner::new("/user/sibling");
+    let timeout = Duration::from_secs(4);
+    writer.sender().scope(strict(&reference, 701)).await;
+    tokio::time::timeout(timeout, target_state.entered.notified())
+        .await
+        .unwrap();
+    source.connect(&hub_addr).await.unwrap();
+    direct.close();
+    tokio::time::timeout(timeout, async {
+        loop {
+            let peers = source.links_snapshot().await;
+            if peers.len() == 1 && peers[0].0 == "fifo-hub" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    writer.sender().scope(strict(&reference, 2)).await;
+    sibling.sender().scope(strict(&reference, 3)).await;
+    seen(&mut received, 3).await;
+    target_state.resume.notify_one();
+    seen(&mut received, 701).await;
+    seen(&mut received, 2).await;
+    assert_eq!(source.links_snapshot().await.len(), 1);
+    for owner in [&writer, &sibling] {
+        owner
+            .sender()
+            .in_scope(|| reference.close_ordered_session(timeout))
+            .await
+            .unwrap();
+    }
+    for system in [&source, &target, &hub] {
+        system.shutdown().await.unwrap();
+    }
+    assert!(received.try_recv().is_err());
+}
